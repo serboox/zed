@@ -48,6 +48,8 @@ members = [
     "crates/dap",
     "crates/dap_adapters",
     "crates/db",
+    "crates/db_client",
+    "crates/db_client_ui",
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
     "crates/debugger_ui",
@@ -314,6 +316,8 @@ csv_preview = { path = "crates/csv_preview"}
 dap = { path = "crates/dap" }
 dap_adapters = { path = "crates/dap_adapters" }
 db = { path = "crates/db" }
+db_client = { path = "crates/db_client" }
+db_client_ui = { path = "crates/db_client_ui" }
 debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
@@ -810,6 +814,7 @@ tree-sitter-regex = "0.24"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = { git = "https://github.com/zed-industries/tree-sitter-typescript", rev = "e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899" } # https://github.com/tree-sitter/tree-sitter-typescript/pull/347
+tree-sitter-sequel = "0.3"
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
 tracing = "0.1.40"
 unicase = "2.6"
@@ -845,6 +850,7 @@ windows-core = "0.61"
 yaml-rust2 = "0.8"
 yawc = "0.2.5"
 zeroize = "1.8"
+zip = { version = "0.6", features = ["deflate"] }
 zstd = "0.11"
 
 

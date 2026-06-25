@@ -214,6 +214,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             ..Default::default()
         },
         LanguageInfo {
+            name: "sql",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
             name: "zed-keybind-context",
             ..Default::default()
         },

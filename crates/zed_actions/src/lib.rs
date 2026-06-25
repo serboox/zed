@@ -769,6 +769,21 @@ pub mod debug_panel {
     );
 }
 
+pub mod database_panel {
+    use gpui::actions;
+    actions!(
+        database_panel,
+        [
+            /// Toggles focus on the database panel.
+            ToggleFocus,
+            /// Executes the current SQL query or selection against the active database connection.
+            RunQuery,
+            /// Opens a new blank SQL query editor tab.
+            NewQuery,
+        ]
+    );
+}
+
 actions!(
     debugger,
     [
