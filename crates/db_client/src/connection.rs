@@ -63,6 +63,13 @@ pub struct ConnectionConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_private_key_path: Option<String>,
+    /// Optional folder name for grouping in the connection tree. None = top level.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Optional hex color (e.g. `"#e74c3c"`) identifying the environment
+    /// (LOCAL / STAGE / PROD). Shown as a colored circle next to the connection.
+    #[serde(default)]
+    pub env_color: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -95,6 +102,8 @@ impl Default for ConnectionConfig {
             ssh_port: 22,
             ssh_username: None,
             ssh_private_key_path: None,
+            folder: None,
+            env_color: None,
         }
     }
 }

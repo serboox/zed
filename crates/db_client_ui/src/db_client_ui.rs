@@ -1,10 +1,14 @@
-mod connection_modal;
+mod connection_view;
+mod driver_icon;
 mod panel;
 mod result_view;
 mod sql_completion_provider;
 mod store;
 
-pub use panel::DatabasePanel;
+pub use panel::{
+    DatabasePanel, explain_current_sql_query, new_query_for_active_connection,
+    open_new_sql_query, run_current_sql_query,
+};
 
 use gpui::App;
 

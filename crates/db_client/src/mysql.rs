@@ -1,12 +1,48 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use futures::TryStreamExt as _;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
+/// Hard ceiling on rows decoded from a single result, independent of any SQL
+/// LIMIT. A safety net so a query that slips past the UI's default limit cannot
+/// pull an unbounded result into memory and freeze the client.
+const MAX_RESULT_ROWS: usize = 2_000;
+
+/// Per-cell byte cap kept in memory. A single BLOB/TEXT cell can be many
+/// megabytes; streaming decode truncates each value here so the in-memory
+/// result stays bounded (the grid only previews ~200 chars anyway).
+pub const MAX_CELL_BYTES: usize = 8 * 1024;
+
+/// Truncates an over-long cell value on a UTF-8 boundary so the result set
+/// cannot balloon from huge cells. Appends an ellipsis to signal truncation.
+fn cap_cell(mut value: String) -> String {
+    if value.len() > MAX_CELL_BYTES {
+        let mut end = MAX_CELL_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+        value.push('…');
+    }
+    value
+}
+
+/// True when `value` may have been clipped by `cap_cell`, so it is unsafe to use
+/// as a key in a WHERE clause (a truncated value would match the wrong row or
+/// none). A clipped value ends with the ellipsis marker and is at least the cap
+/// in length; a genuinely short value ending in an ellipsis is not flagged.
+pub fn is_cell_possibly_truncated(value: &str) -> bool {
+    value.ends_with('…') && value.len() >= MAX_CELL_BYTES
+}
+
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
-use crate::schema::{ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo};
+use crate::schema::{
+    ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult,
+    TableInfo, TableKind, TriggerInfo, UserInfo,
+};
 
 pub struct MySqlProvider {
     pool: MySqlPool,
@@ -22,13 +58,26 @@ impl MySqlProvider {
             config.port,
             config.database.as_deref().unwrap_or(""),
         );
+        // Single connection: `execute_query` relies on `USE` staying applied
+        // for the query that follows it, which only holds when both run on the
+        // same physical connection. The metadata queries are fully qualified,
+        // so serializing them through one connection is acceptable for a
+        // single-user GUI client.
         let pool = MySqlPoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect(&url)
             .await
             .context("Failed to connect to MySQL")?;
         Ok(Self { pool })
     }
+}
+
+// MySQL reports string columns from SHOW/information_schema with a binary
+// collation on some servers, so sqlx types them as VARBINARY and a direct
+// String decode fails. Reading the raw bytes works for both VARCHAR and
+// VARBINARY; convert lossily so non-UTF-8 bytes never abort a query.
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(crate) fn urlencoding_encode(input: &str) -> String {
@@ -46,6 +95,43 @@ pub(crate) fn urlencoding_encode(input: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::{MAX_CELL_BYTES, cap_cell, is_cell_possibly_truncated};
+
+    #[test]
+    fn cap_cell_bounds_huge_values_on_char_boundary() {
+        // Small values pass through unchanged.
+        assert_eq!(cap_cell("hello".to_string()), "hello");
+
+        // A value over the cap is truncated; the kept part never exceeds the cap
+        // and the result is valid UTF-8 ending in an ellipsis.
+        let huge = "x".repeat(MAX_CELL_BYTES * 4);
+        let capped = cap_cell(huge);
+        assert!(capped.len() <= MAX_CELL_BYTES + 4);
+        assert!(capped.ends_with('…'));
+
+        // Truncation must land on a char boundary even with multi-byte input.
+        let multibyte = "д".repeat(MAX_CELL_BYTES);
+        let capped = cap_cell(multibyte);
+        assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    #[test]
+    fn detects_capped_values_but_not_genuine_ellipsis() {
+        // A clipped value (output of cap_cell on oversized input) is flagged.
+        let capped = cap_cell("x".repeat(MAX_CELL_BYTES * 2));
+        assert!(is_cell_possibly_truncated(&capped));
+
+        // A short value that simply ends in an ellipsis is not flagged.
+        assert!(!is_cell_possibly_truncated("done…"));
+        assert!(!is_cell_possibly_truncated(""));
+
+        // A value with no ellipsis is never flagged, even at the cap length.
+        assert!(!is_cell_possibly_truncated(&"y".repeat(MAX_CELL_BYTES)));
+    }
 }
 
 #[cfg(test)]
@@ -88,18 +174,20 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
-        let rows = sqlx::query_as::<_, (String,)>("SHOW DATABASES")
+        let rows = sqlx::query_as::<_, (Vec<u8>,)>("SHOW DATABASES")
             .fetch_all(&self.pool)
             .await
             .context("Failed to list databases")?;
         Ok(rows
             .into_iter()
-            .map(|(name,)| DatabaseInfo { name })
+            .map(|(name,)| DatabaseInfo {
+                name: bytes_to_string(name),
+            })
             .collect())
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
-        let rows = sqlx::query_as::<_, (String, String)>(
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
             "SELECT TABLE_NAME, TABLE_TYPE \
              FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? \
@@ -113,8 +201,8 @@ impl DbProvider for MySqlProvider {
         Ok(rows
             .into_iter()
             .map(|(name, table_type)| TableInfo {
-                name,
-                kind: if table_type == "VIEW" {
+                name: bytes_to_string(name),
+                kind: if bytes_to_string(table_type) == "VIEW" {
                     TableKind::View
                 } else {
                     TableKind::Table
@@ -123,8 +211,59 @@ impl DbProvider for MySqlProvider {
             .collect())
     }
 
+    async fn list_views(&self, database: &str) -> Result<Vec<String>> {
+        // SHOW FULL TABLES IN <db> does not support bind params.
+        let escaped = database.replace('`', "``");
+        let sql = format!(
+            "-- name: ListViews :many\n\
+             SHOW FULL TABLES IN `{escaped}` WHERE Table_type = 'VIEW'"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list views")?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.try_get::<Vec<u8>, _>(0)
+                    .ok()
+                    .map(bytes_to_string)
+                    .or_else(|| row.try_get::<String, _>(0).ok())
+            })
+            .collect())
+    }
+
+    async fn list_foreign_keys(&self, database: &str, table: &str) -> Result<Vec<FkInfo>> {
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>(
+            "-- name: ListForeignKeys :many
+             SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+             FROM information_schema.KEY_COLUMN_USAGE
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
+             ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list foreign keys")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, from_col, to_table, to_col)| FkInfo {
+                name: bytes_to_string(name),
+                from_column: bytes_to_string(from_col),
+                to_table: bytes_to_string(to_table),
+                to_column: bytes_to_string(to_col),
+            })
+            .collect())
+    }
+
     async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, String)>(
+        let rows = sqlx::query_as::<
+            _,
+            (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>),
+        >(
             "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA \
              FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
@@ -138,13 +277,16 @@ impl DbProvider for MySqlProvider {
 
         Ok(rows
             .into_iter()
-            .map(|(name, data_type, nullable, key, default_value, extra)| ColumnInfo {
-                name,
-                data_type,
-                is_nullable: nullable == "YES",
-                column_key: if key.is_empty() { None } else { Some(key) },
-                default_value,
-                extra,
+            .map(|(name, data_type, nullable, key, default_value, extra)| {
+                let key = bytes_to_string(key);
+                ColumnInfo {
+                    name: bytes_to_string(name),
+                    data_type: bytes_to_string(data_type),
+                    is_nullable: bytes_to_string(nullable) == "YES",
+                    column_key: if key.is_empty() { None } else { Some(key) },
+                    default_value: default_value.map(bytes_to_string),
+                    extra: bytes_to_string(extra),
+                }
             })
             .collect())
     }
@@ -155,14 +297,17 @@ impl DbProvider for MySqlProvider {
             .fetch_one(&self.pool)
             .await
             .context("Failed to get table DDL")?;
-        let ddl: String = row.try_get(1).context("Failed to read DDL from result")?;
-        Ok(ddl)
+        let ddl: Vec<u8> = row.try_get(1).context("Failed to read DDL from result")?;
+        Ok(bytes_to_string(ddl))
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         if !database.is_empty() {
+            // USE must use the text protocol; MySQL rejects it in the
+            // prepared-statement protocol (error 1295). The single-connection
+            // pool keeps it applied for the query below.
             let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            sqlx::query(&use_stmt)
+            sqlx::raw_sql(&use_stmt)
                 .execute(&self.pool)
                 .await
                 .context("Failed to switch database")?;
@@ -175,60 +320,64 @@ impl DbProvider for MySqlProvider {
             || trimmed_upper.starts_with("DESCRIBE")
             || trimmed_upper.starts_with("EXPLAIN")
             || trimmed_upper.starts_with("DESC");
+        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
 
         if is_read_query {
-            let rows = sqlx::query(sql)
-                .fetch_all(&self.pool)
+            // Stream rows instead of buffering the whole result. Each row is
+            // decoded and its cells capped before the next row is read, so a huge
+            // result (many rows or multi-megabyte BLOB cells) cannot be pulled
+            // into memory all at once and freeze the client.
+            let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
+            let mut columns: Vec<String> = Vec::new();
+            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+
+            while let Some(row) = stream
+                .try_next()
                 .await
-                .context("Query execution failed")?;
+                .context("Query execution failed")?
+            {
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
+                        .iter()
+                        .map(|column| column.name().to_string())
+                        .collect();
+                }
 
-            let execution_time_ms = start.elapsed().as_millis() as u64;
+                let decoded: Vec<Option<String>> = (0..columns.len())
+                    .map(|index| {
+                        row.try_get::<Option<String>, _>(index)
+                            .ok()
+                            .flatten()
+                            .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
+                            .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
+                            .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
+                            .or_else(|| {
+                                row.try_get::<Option<Vec<u8>>, _>(index)
+                                    .ok()
+                                    .flatten()
+                                    .map(bytes_to_string)
+                            })
+                            .map(cap_cell)
+                    })
+                    .collect();
+                result_rows.push(decoded);
 
-            if rows.is_empty() {
-                return Ok(QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                    rows_affected: 0,
-                    execution_time_ms,
-                });
+                if result_rows.len() >= MAX_RESULT_ROWS {
+                    break;
+                }
             }
 
-            let columns: Vec<String> = rows[0]
-                .columns()
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect();
-
-            let result_rows: Vec<Vec<Option<String>>> = rows
-                .iter()
-                .map(|row| {
-                    (0..columns.len())
-                        .map(|index| {
-                            row.try_get::<Option<String>, _>(index)
-                                .ok()
-                                .flatten()
-                                .or_else(|| {
-                                    row.try_get::<i64, _>(index).ok().map(|v| v.to_string())
-                                })
-                                .or_else(|| {
-                                    row.try_get::<f64, _>(index).ok().map(|v| v.to_string())
-                                })
-                                .or_else(|| {
-                                    row.try_get::<bool, _>(index).ok().map(|v| v.to_string())
-                                })
-                        })
-                        .collect()
-                })
-                .collect();
-
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            let rows_affected = result_rows.len() as u64;
             Ok(QueryResult {
                 columns,
                 rows: result_rows,
-                rows_affected: rows.len() as u64,
+                rows_affected,
                 execution_time_ms,
             })
         } else {
-            let result = sqlx::query(sql)
+            let result = sqlx::query(&prefixed)
                 .execute(&self.pool)
                 .await
                 .context("Query execution failed")?;
@@ -243,11 +392,11 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
-        let rows = sqlx::query_as::<_, (String, String, i64, String)>(
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, Vec<u8>)>(
             "-- name: ListIndexes :many
              SELECT INDEX_NAME,
                     GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ','),
-                    MAX(CAST(NON_UNIQUE = 0 AS UNSIGNED)),
+                    MAX(CAST(NON_UNIQUE = 0 AS SIGNED)),
                     MAX(INDEX_TYPE)
              FROM information_schema.STATISTICS
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -262,16 +411,19 @@ impl DbProvider for MySqlProvider {
         Ok(rows
             .into_iter()
             .map(|(name, cols_concat, unique_flag, index_type)| IndexInfo {
-                name,
-                columns: cols_concat.split(',').map(|s| s.to_string()).collect(),
+                name: bytes_to_string(name),
+                columns: bytes_to_string(cols_concat)
+                    .split(',')
+                    .map(|s| s.to_string())
+                    .collect(),
                 unique: unique_flag == 1,
-                index_type,
+                index_type: bytes_to_string(index_type),
             })
             .collect())
     }
 
     async fn list_procedures(&self, database: &str) -> Result<Vec<ProcedureInfo>> {
-        let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Option<Vec<u8>>)>(
             "-- name: ListProcedures :many
              SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION
              FROM information_schema.ROUTINES
@@ -286,19 +438,19 @@ impl DbProvider for MySqlProvider {
         Ok(rows
             .into_iter()
             .map(|(name, routine_type, definition)| ProcedureInfo {
-                name,
-                kind: if routine_type == "FUNCTION" {
+                name: bytes_to_string(name),
+                kind: if bytes_to_string(routine_type) == "FUNCTION" {
                     ProcedureKind::Function
                 } else {
                     ProcedureKind::Procedure
                 },
-                definition,
+                definition: definition.map(bytes_to_string),
             })
             .collect())
     }
 
     async fn list_triggers(&self, database: &str, table: &str) -> Result<Vec<TriggerInfo>> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>(
             "-- name: ListTriggers :many
              SELECT TRIGGER_NAME, EVENT_MANIPULATION, ACTION_TIMING, EVENT_OBJECT_TABLE, ACTION_STATEMENT
              FROM information_schema.TRIGGERS
@@ -314,17 +466,17 @@ impl DbProvider for MySqlProvider {
         Ok(rows
             .into_iter()
             .map(|(name, event, timing, table_name, definition)| TriggerInfo {
-                name,
-                event,
-                timing,
-                table_name,
-                definition: Some(definition),
+                name: bytes_to_string(name),
+                event: bytes_to_string(event),
+                timing: bytes_to_string(timing),
+                table_name: bytes_to_string(table_name),
+                definition: Some(bytes_to_string(definition)),
             })
             .collect())
     }
 
     async fn list_users(&self) -> Result<Vec<UserInfo>> {
-        let rows = sqlx::query_as::<_, (String, String)>(
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
             "-- name: ListUsers :many
              SELECT User, Host FROM mysql.user ORDER BY User, Host",
         )
@@ -335,8 +487,8 @@ impl DbProvider for MySqlProvider {
         Ok(rows
             .into_iter()
             .map(|(name, host)| UserInfo {
-                name,
-                host,
+                name: bytes_to_string(name),
+                host: bytes_to_string(host),
                 grants: Vec::new(),
             })
             .collect())
@@ -506,6 +658,41 @@ mod integration_tests {
         assert_eq!(result.rows[0][1].as_deref(), Some("hello"));
     }
 
+    // Verifies the streaming decode bounds memory: an unbounded SELECT over a
+    // very large table must stop at the hard row cap instead of pulling the
+    // whole table, and every cell must respect the byte cap. This is the
+    // regression guard for the "app freezes / OS offers to kill it on a big
+    // query" report.
+    #[tokio::test]
+    #[ignore]
+    async fn test_unbounded_select_is_bounded() {
+        use super::{MAX_CELL_BYTES, MAX_RESULT_ROWS};
+        let config = test_config_from_env()
+            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let result = provider
+            .execute_query("instruments", "SELECT * FROM company_owners")
+            .await
+            .expect("Failed to execute query");
+
+        assert!(
+            result.rows.len() <= MAX_RESULT_ROWS,
+            "unbounded SELECT must stop at the hard row cap, got {} rows",
+            result.rows.len()
+        );
+        for row in &result.rows {
+            for cell in row.iter().flatten() {
+                assert!(
+                    cell.len() <= MAX_CELL_BYTES + 4,
+                    "cell exceeded the byte cap: {} bytes",
+                    cell.len()
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_execute_show_databases() {
@@ -520,5 +707,29 @@ mod integration_tests {
             .expect("Failed to execute SHOW DATABASES");
         assert!(!result.columns.is_empty());
         assert!(!result.rows.is_empty());
+    }
+
+    // Regression test for the "this functionality requires a Tokio context"
+    // panic: connecting from a non-Tokio executor (as GPUI does) must work
+    // through RuntimeProvider. A plain #[test] with futures::executor::block_on
+    // means there is no ambient Tokio runtime, mirroring the real call site.
+    #[test]
+    #[ignore]
+    fn test_connect_from_non_tokio_executor() {
+        let Some(config) = test_config_from_env() else {
+            panic!("MYSQL_TEST_URL env var required for integration tests");
+        };
+        futures::executor::block_on(async move {
+            let raw = crate::on_runtime(async move { MySqlProvider::connect(&config).await })
+                .await
+                .expect("connect via runtime");
+            let provider = crate::RuntimeProvider::new(std::sync::Arc::new(raw));
+            provider.ping().await.expect("ping via runtime");
+            let result = provider
+                .execute_query("", "SELECT 1 AS one")
+                .await
+                .expect("query via runtime");
+            assert!(!result.columns.is_empty());
+        });
     }
 }

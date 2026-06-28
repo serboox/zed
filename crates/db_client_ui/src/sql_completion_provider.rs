@@ -41,7 +41,7 @@ impl SqlCompletionProvider {
     fn extract_prefix(buffer: &Entity<Buffer>, position: Anchor, cx: &App) -> String {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
-        let text: String = snapshot.chars_at(0).take(offset).collect();
+        let text: String = snapshot.text_for_range(0..offset).collect();
         text.chars()
             .rev()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -54,7 +54,7 @@ impl SqlCompletionProvider {
     fn extract_table_qualifier(buffer: &Entity<Buffer>, position: Anchor, cx: &App) -> Option<String> {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
-        let text: String = snapshot.chars_at(0).take(offset).collect();
+        let text: String = snapshot.text_for_range(0..offset).collect();
         // Check if there is `<table>.` before the cursor (after stripping the current word)
         let before_word = text.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
         if let Some(before_dot) = before_word.strip_suffix('.') {
@@ -76,15 +76,8 @@ impl SqlCompletionProvider {
     fn compute_replace_range(buffer: &Entity<Buffer>, position: Anchor, cx: &App) -> Range<Anchor> {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
-        let word_len = snapshot
-            .chars_at(0)
-            .take(offset)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .count();
-        let start = snapshot.anchor_before(offset - word_len);
+        let text_before: String = snapshot.text_for_range(0..offset).collect();
+        let start = snapshot.anchor_before(offset - trailing_identifier_byte_len(&text_before));
         let end = snapshot.anchor_after(offset);
         start..end
     }
@@ -234,6 +227,17 @@ impl CompletionProvider for SqlCompletionProvider {
     }
 }
 
+// Byte length of the trailing identifier in `text`. Summing per-char byte
+// lengths keeps a derived start offset on a UTF-8 boundary; mixing a byte
+// offset with a char count lands mid-character and panics the rope.
+fn trailing_identifier_byte_len(text: &str) -> usize {
+    text.chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .map(|c| c.len_utf8())
+        .sum()
+}
+
 pub fn install_on_editor(editor: Entity<Editor>, store: WeakEntity<DatabaseStore>, cx: &mut App) {
     editor.update(cx, |editor, cx| {
         let is_sql = editor
@@ -245,4 +249,31 @@ pub fn install_on_editor(editor: Entity<Editor>, store: WeakEntity<DatabaseStore
             editor.set_completion_provider(Some(provider));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trailing_identifier_byte_len;
+
+    #[test]
+    fn ascii_identifier_length_is_byte_count() {
+        assert_eq!(trailing_identifier_byte_len("SELECT * FROM use"), 3);
+        assert_eq!(trailing_identifier_byte_len("col_name"), 8);
+        assert_eq!(trailing_identifier_byte_len(""), 0);
+    }
+
+    #[test]
+    fn stops_at_non_identifier_char() {
+        assert_eq!(trailing_identifier_byte_len("a.b"), 1);
+        assert_eq!(trailing_identifier_byte_len("SELECT "), 0);
+        assert_eq!(trailing_identifier_byte_len("t1.col"), 3);
+    }
+
+    #[test]
+    fn multibyte_identifier_counts_bytes_not_chars() {
+        // Each Cyrillic char is 2 bytes; subtracting this from a byte offset
+        // must stay on a char boundary (the original crash).
+        assert_eq!(trailing_identifier_byte_len("таблица"), 14);
+        assert_eq!(trailing_identifier_byte_len("SELECT поле"), 8);
+    }
 }

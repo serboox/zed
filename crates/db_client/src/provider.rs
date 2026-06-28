@@ -1,7 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::schema::{ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, QueryResult, TableInfo, TriggerInfo, UserInfo};
+use crate::schema::{
+    ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, QueryResult, TableInfo,
+    TriggerInfo, UserInfo,
+};
 
 #[async_trait]
 pub trait DbProvider: Send + Sync {
@@ -12,7 +15,15 @@ pub trait DbProvider: Send + Sync {
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
 
+    async fn list_views(&self, _database: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn list_indexes(&self, _database: &str, _table: &str) -> Result<Vec<IndexInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_foreign_keys(&self, _database: &str, _table: &str) -> Result<Vec<FkInfo>> {
         Ok(Vec::new())
     }
 

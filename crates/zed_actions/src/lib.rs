@@ -778,8 +778,12 @@ pub mod database_panel {
             ToggleFocus,
             /// Executes the current SQL query or selection against the active database connection.
             RunQuery,
+            /// Runs EXPLAIN on the current SQL query or selection and shows the query plan.
+            ExplainQuery,
             /// Opens a new blank SQL query editor tab.
             NewQuery,
+            /// Toggles focus on the database query results panel.
+            ToggleResultsFocus,
         ]
     );
 }

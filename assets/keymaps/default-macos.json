@@ -753,6 +753,7 @@
       "cmd-shift-b": "outline_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "cmd-shift-d": "debug_panel::ToggleFocus",
+      "cmd-alt-8": "database_panel::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
@@ -1687,5 +1688,34 @@
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
     },
+  },
+  // Runs the SQL query in a database console. Placed last so it wins cmd-enter
+  // over the inline assistant binding at equal context depth (later index wins).
+  {
+    "context": "Editor && mode == full",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "database_panel::RunQuery",
+      "cmd-shift-e": "database_panel::ExplainQuery"
+    }
+  },
+  {
+    "context": "DbResultView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "db_result_view::SubmitEdits",
+      "cmd-alt-z": "db_result_view::RevertEdits",
+      "alt-insert": "db_result_view::AddRow",
+      "ctrl-y": "db_result_view::DeleteRow",
+      "ctrl-d": "db_result_view::CloneRow",
+      "cmd-alt-n": "db_result_view::SetNull",
+      "cmd-alt-d": "db_result_view::SetDefault",
+      "cmd-f": "db_result_view::ToggleFind",
+      "cmd-g": "db_result_view::FindNext",
+      "shift-cmd-g": "db_result_view::FindPrevious",
+      "ctrl-f5": "db_result_view::ToggleLocalFilters",
+      "ctrl-f12": "db_result_view::ToggleColumnList",
+      "ctrl-q": "db_result_view::QuickDoc"
+    }
   },
 ]

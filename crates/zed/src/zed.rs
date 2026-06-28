@@ -1189,6 +1189,30 @@ fn register_actions(
                 workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
             },
         )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::NewQuery,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::new_query_for_active_connection(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::RunQuery,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::run_current_sql_query(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::ExplainQuery,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::explain_current_sql_query(workspace, window, cx);
+            },
+        )
         .register_action({
             let app_state = app_state.clone();
             move |_, _: &NewWindow, _, cx| {

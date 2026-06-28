@@ -133,13 +133,14 @@
       "cmd-5": "debug_panel::ToggleFocus",
       "cmd-6": "diagnostics::Deploy",
       "cmd-7": "outline_panel::ToggleFocus",
+      "cmd-2": "database_panel::ToggleFocus",
     },
   },
   {
     "context": "Pane", // this is to override the default Pane mappings to switch tabs
     "bindings": {
       "cmd-1": "project_panel::ToggleFocus",
-      "cmd-2": null, // Bookmarks (left dock)
+      "cmd-2": "database_panel::ToggleFocus",
       "cmd-3": null, // Find Panel (bottom dock)
       "cmd-4": null, // Run Panel (bottom dock)
       "cmd-5": "debug_panel::ToggleFocus",
@@ -206,5 +207,12 @@
     "bindings": {
       "escape": "editor::Cancel",
     },
+  },
+  {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "cmd-enter": "database_panel::RunQuery",
+      "cmd-shift-e": "database_panel::ExplainQuery"
+    }
   },
 ]

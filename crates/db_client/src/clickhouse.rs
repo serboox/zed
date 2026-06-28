@@ -7,6 +7,8 @@ use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
 use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
 
+const MAX_RESULT_ROWS: usize = 2_000;
+
 pub struct ClickHouseProvider {
     client: reqwest::Client,
     base_url: String,
@@ -92,7 +94,6 @@ impl ClickHouseProvider {
 struct ClickHouseJsonResponse {
     meta: Vec<ClickHouseColumnMeta>,
     data: Vec<Vec<serde_json::Value>>,
-    rows: u64,
 }
 
 #[derive(Deserialize)]
@@ -252,22 +253,30 @@ impl DbProvider for ClickHouseProvider {
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let db_opt = if database.is_empty() { None } else { Some(database) };
+        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
 
         if is_read_query(sql) {
-            let resp = self.query_json(sql, db_opt).await?;
+            let resp = self.query_json(&prefixed, db_opt).await?;
             let execution_time_ms = start.elapsed().as_millis() as u64;
             let columns: Vec<String> = resp.meta.into_iter().map(|m| m.name).collect();
-            let rows: Vec<Vec<Option<String>>> = resp.data.into_iter().map(|row| {
-                row.into_iter().map(|val| match val {
-                    serde_json::Value::Null => None,
-                    serde_json::Value::String(s) => Some(s),
-                    other => Some(other.to_string()),
-                }).collect()
-            }).collect();
-            let rows_affected = resp.rows;
+            let rows: Vec<Vec<Option<String>>> = resp
+                .data
+                .into_iter()
+                .take(MAX_RESULT_ROWS)
+                .map(|row| {
+                    row.into_iter()
+                        .map(|val| match val {
+                            serde_json::Value::Null => None,
+                            serde_json::Value::String(s) => Some(s),
+                            other => Some(other.to_string()),
+                        })
+                        .collect()
+                })
+                .collect();
+            let rows_affected = rows.len() as u64;
             Ok(QueryResult { columns, rows, rows_affected, execution_time_ms })
         } else {
-            let rows_affected = self.execute_dml(sql, db_opt).await?;
+            let rows_affected = self.execute_dml(&prefixed, db_opt).await?;
             Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],

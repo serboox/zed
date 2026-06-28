@@ -1,8 +1,9 @@
 use anyhow::Result;
 use db_client::{
-    ConnectionConfig, ConnectionId, DatabaseDriver, SshTunnel,
+    ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, RuntimeProvider, SshTunnel,
     clickhouse::ClickHouseProvider,
     mysql::MySqlProvider,
+    on_runtime,
     postgres::PostgresProvider,
     provider::DbProvider,
     redis_provider::RedisProvider,
@@ -11,7 +12,7 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
-use gpui::{AppContext as _, Context, EventEmitter, Task, TaskExt as _};
+use gpui::{App, AppContext as _, Context, EventEmitter, Task, TaskExt as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use util::ResultExt;
@@ -34,7 +35,11 @@ pub struct ActiveConnection {
     pub provider: Option<Arc<dyn DbProvider>>,
     pub databases: Option<Vec<DatabaseInfo>>,
     pub expanded_databases: HashMap<String, Vec<TableInfo>>,
+    pub db_views: HashMap<String, Vec<String>>,
     pub expanded_tables: HashMap<(String, String), Vec<ColumnInfo>>,
+    pub table_indexes: HashMap<(String, String), Vec<IndexInfo>>,
+    pub table_fks: HashMap<(String, String), Vec<FkInfo>>,
+    pub table_triggers: HashMap<(String, String), Vec<TriggerInfo>>,
     pub expanded_database_set: HashSet<String>,
     pub expanded_table_set: HashSet<(String, String)>,
 }
@@ -47,7 +52,11 @@ impl ActiveConnection {
             provider: None,
             databases: None,
             expanded_databases: HashMap::new(),
+            db_views: HashMap::new(),
             expanded_tables: HashMap::new(),
+            table_indexes: HashMap::new(),
+            table_fks: HashMap::new(),
+            table_triggers: HashMap::new(),
             expanded_database_set: HashSet::new(),
             expanded_table_set: HashSet::new(),
         }
@@ -68,34 +77,39 @@ pub struct DatabaseStore {
 
 impl DatabaseStore {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async { load_connections_from_disk() })
-                .await;
-            if let Ok(configs) = result {
-                let auto_connect_ids: Vec<_> = configs
-                    .iter()
-                    .filter(|c| c.auto_connect)
-                    .map(|c| c.id)
-                    .collect();
+        // Skip disk load under test: it would read the user's real config dir
+        // (non-hermetic) and auto-connect, which drives Tokio work whose
+        // cross-thread wakes trip GPUI's deterministic test scheduler.
+        if !cfg!(test) {
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async { load_connections_from_disk() })
+                    .await;
+                if let Ok(configs) = result {
+                    let auto_connect_ids: Vec<_> = configs
+                        .iter()
+                        .filter(|c| c.auto_connect)
+                        .map(|c| c.id)
+                        .collect();
 
-                this.update(cx, |store, cx| {
-                    for config in configs {
-                        store.connections.push(ActiveConnection::new(config));
-                    }
-                    if !store.connections.is_empty() {
-                        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
-                        cx.notify();
-                    }
-                    for id in auto_connect_ids {
-                        store.connect(id, cx).detach_and_log_err(cx);
-                    }
-                })
-                .ok();
-            }
-        })
-        .detach();
+                    this.update(cx, |store, cx| {
+                        for config in configs {
+                            store.connections.push(ActiveConnection::new(config));
+                        }
+                        if !store.connections.is_empty() {
+                            cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                            cx.notify();
+                        }
+                        for id in auto_connect_ids {
+                            store.connect(id, cx).detach_and_log_err(cx);
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
 
         Self {
             connections: Vec::new(),
@@ -128,6 +142,23 @@ impl DatabaseStore {
 
     pub fn query_history(&self) -> &[String] {
         &self.query_history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_connected_for_test(
+        &mut self,
+        config: ConnectionConfig,
+        provider: Arc<dyn DbProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = config.id;
+        let mut conn = ActiveConnection::new(config);
+        conn.status = ConnectionStatus::Connected;
+        conn.provider = Some(provider);
+        self.connections.push(conn);
+        self.active_connection_id = Some(id);
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
     }
 
     pub fn add_connection(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
@@ -262,11 +293,13 @@ impl DatabaseStore {
 
         cx.spawn(async move |this, cx| {
             let tables = provider.list_tables(&database).await?;
+            let views = provider.list_views(&database).await.unwrap_or_default();
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
                 };
-                conn.expanded_databases.insert(database, tables);
+                conn.expanded_databases.insert(database.clone(), tables);
+                conn.db_views.insert(database, views);
                 cx.emit(DatabaseStoreEvent::SchemaChanged);
                 cx.notify();
             })
@@ -304,11 +337,27 @@ impl DatabaseStore {
 
         cx.spawn(async move |this, cx| {
             let columns = provider.describe_table(&database, &table).await?;
+            let indexes = provider
+                .list_indexes(&database, &table)
+                .await
+                .unwrap_or_default();
+            let fks = provider
+                .list_foreign_keys(&database, &table)
+                .await
+                .unwrap_or_default();
+            let triggers = provider
+                .list_triggers(&database, &table)
+                .await
+                .unwrap_or_default();
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
                 };
-                conn.expanded_tables.insert((database, table), columns);
+                let key = (database, table);
+                conn.expanded_tables.insert(key.clone(), columns);
+                conn.table_indexes.insert(key.clone(), indexes);
+                conn.table_fks.insert(key.clone(), fks);
+                conn.table_triggers.insert(key, triggers);
                 cx.emit(DatabaseStoreEvent::SchemaChanged);
                 cx.notify();
             })
@@ -363,6 +412,22 @@ impl DatabaseStore {
         cx.background_spawn(async move { provider.execute_query(&database, &sql).await })
     }
 
+    pub fn describe_table(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<ColumnInfo>>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("Not connected")));
+        };
+        cx.background_spawn(async move { provider.describe_table(&database, &table).await })
+    }
+
     pub fn get_table_ddl(
         &mut self,
         id: ConnectionId,
@@ -393,6 +458,22 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow::anyhow!("Not connected")));
         };
         cx.background_spawn(async move { provider.list_indexes(&database, &table).await })
+    }
+
+    pub fn list_foreign_keys(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<FkInfo>>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("Not connected")));
+        };
+        cx.background_spawn(async move { provider.list_foreign_keys(&database, &table).await })
     }
 
     pub fn list_procedures(
@@ -486,6 +567,15 @@ impl DatabaseStore {
 
 impl EventEmitter<DatabaseStoreEvent> for DatabaseStore {}
 
+/// Connects with `config` and pings the server, without storing the connection.
+/// Used by the connection form's "Test Connection" button.
+pub fn test_connection(config: ConnectionConfig, cx: &App) -> Task<Result<()>> {
+    cx.background_spawn(async move {
+        let (provider, _tunnel) = build_provider(&config).await?;
+        provider.ping().await
+    })
+}
+
 async fn build_provider(
     config: &ConnectionConfig,
 ) -> Result<(Arc<dyn DbProvider>, Option<SshTunnel>)> {
@@ -509,23 +599,29 @@ async fn build_provider(
         (config.clone(), None)
     };
 
-    let provider: Arc<dyn DbProvider> = match effective_config.driver {
-        DatabaseDriver::MySQL => MySqlProvider::connect(&effective_config)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn DbProvider>)?,
-        DatabaseDriver::PostgreSQL => PostgresProvider::connect(&effective_config)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn DbProvider>)?,
-        DatabaseDriver::SQLite => SqliteProvider::connect(&effective_config)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn DbProvider>)?,
-        DatabaseDriver::ClickHouse => ClickHouseProvider::connect(&effective_config)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn DbProvider>)?,
-        DatabaseDriver::Redis => RedisProvider::connect(&effective_config)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn DbProvider>)?,
+    let raw: Arc<dyn DbProvider> = match effective_config.driver {
+        DatabaseDriver::MySQL => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { MySqlProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::PostgreSQL => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { PostgresProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::SQLite => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { SqliteProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::ClickHouse => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { ClickHouseProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::Redis => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { RedisProvider::connect(&config).await }).await?)
+        }
     };
+    let provider: Arc<dyn DbProvider> = Arc::new(RuntimeProvider::new(raw));
     Ok((provider, tunnel))
 }
 

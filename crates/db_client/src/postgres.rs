@@ -1,8 +1,11 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use futures::TryStreamExt as _;
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
+
+const MAX_RESULT_ROWS: usize = 2_000;
 
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
@@ -14,17 +17,15 @@ pub struct PostgresProvider {
 
 impl PostgresProvider {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
-        let url = format!(
-            "postgres://{}:{}@{}:{}/{}",
-            config.username,
-            config.password,
-            config.host,
-            config.port,
-            config.database.as_deref().unwrap_or("postgres"),
-        );
+        let opts = PgConnectOptions::new()
+            .host(&config.host)
+            .port(config.port)
+            .username(&config.username)
+            .password(&config.password)
+            .database(config.database.as_deref().unwrap_or("postgres"));
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect_with(opts)
             .await
             .context("Failed to connect to PostgreSQL")?;
         Ok(Self { pool })
@@ -171,47 +172,45 @@ impl DbProvider for PostgresProvider {
             || trimmed_upper.starts_with("DESC")
             || trimmed_upper.starts_with("TABLE")
             || trimmed_upper.starts_with("WITH");
+        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
 
         if is_read_query {
-            let rows = sqlx::query(sql)
-                .fetch_all(&self.pool)
+            let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
+            let mut columns: Vec<String> = Vec::new();
+            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+
+            while let Some(row) = stream
+                .try_next()
                 .await
-                .context("Query execution failed")?;
+                .context("Query execution failed")?
+            {
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
+                        .iter()
+                        .map(|column| column.name().to_string())
+                        .collect();
+                }
+                let decoded: Vec<Option<String>> = (0..columns.len())
+                    .map(|index| Self::extract_cell(&row, index))
+                    .collect();
+                result_rows.push(decoded);
 
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-
-            if rows.is_empty() {
-                return Ok(QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                    rows_affected: 0,
-                    execution_time_ms,
-                });
+                if result_rows.len() >= MAX_RESULT_ROWS {
+                    break;
+                }
             }
 
-            let columns: Vec<String> = rows[0]
-                .columns()
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect();
-
-            let result_rows: Vec<Vec<Option<String>>> = rows
-                .iter()
-                .map(|row| {
-                    (0..columns.len())
-                        .map(|index| Self::extract_cell(row, index))
-                        .collect()
-                })
-                .collect();
-
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            let rows_affected = result_rows.len() as u64;
             Ok(QueryResult {
                 columns,
                 rows: result_rows,
-                rows_affected: rows.len() as u64,
+                rows_affected,
                 execution_time_ms,
             })
         } else {
-            let result = sqlx::query(sql)
+            let result = sqlx::query(&prefixed)
                 .execute(&self.pool)
                 .await
                 .context("Query execution failed")?;
