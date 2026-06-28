@@ -10,7 +10,9 @@ const MAX_RESULT_ROWS: usize = 2_000;
 
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
-use crate::schema::{ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind, TriggerInfo};
+use crate::schema::{
+    ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind, TriggerInfo,
+};
 
 pub struct SqliteProvider {
     pool: SqlitePool,
@@ -237,11 +239,7 @@ impl DbProvider for SqliteProvider {
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
-            while let Some(row) = stream
-                .try_next()
-                .await
-                .context("Query execution failed")?
-            {
+            while let Some(row) = stream.try_next().await.context("Query execution failed")? {
                 if columns.is_empty() {
                     columns = row
                         .columns()

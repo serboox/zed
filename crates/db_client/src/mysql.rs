@@ -260,20 +260,18 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
-        let rows = sqlx::query_as::<
-            _,
-            (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>),
-        >(
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA \
+        let rows =
+            sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>)>(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA \
              FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
              ORDER BY ORDINAL_POSITION",
-        )
-        .bind(database)
-        .bind(table)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to describe table")?;
+            )
+            .bind(database)
+            .bind(table)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to describe table")?;
 
         Ok(rows
             .into_iter()
@@ -292,7 +290,11 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
-        let sql = format!("SHOW CREATE TABLE `{}`.`{}`", database.replace('`', "``"), table.replace('`', "``"));
+        let sql = format!(
+            "SHOW CREATE TABLE `{}`.`{}`",
+            database.replace('`', "``"),
+            table.replace('`', "``")
+        );
         let row = sqlx::query(&sql)
             .fetch_one(&self.pool)
             .await
@@ -320,7 +322,11 @@ impl DbProvider for MySqlProvider {
             || trimmed_upper.starts_with("DESCRIBE")
             || trimmed_upper.starts_with("EXPLAIN")
             || trimmed_upper.starts_with("DESC");
-        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            sql
+        );
 
         if is_read_query {
             // Stream rows instead of buffering the whole result. Each row is
@@ -331,11 +337,7 @@ impl DbProvider for MySqlProvider {
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
-            while let Some(row) = stream
-                .try_next()
-                .await
-                .context("Query execution failed")?
-            {
+            while let Some(row) = stream.try_next().await.context("Query execution failed")? {
                 if columns.is_empty() {
                     columns = row
                         .columns()
@@ -465,13 +467,15 @@ impl DbProvider for MySqlProvider {
 
         Ok(rows
             .into_iter()
-            .map(|(name, event, timing, table_name, definition)| TriggerInfo {
-                name: bytes_to_string(name),
-                event: bytes_to_string(event),
-                timing: bytes_to_string(timing),
-                table_name: bytes_to_string(table_name),
-                definition: Some(bytes_to_string(definition)),
-            })
+            .map(
+                |(name, event, timing, table_name, definition)| TriggerInfo {
+                    name: bytes_to_string(name),
+                    event: bytes_to_string(event),
+                    timing: bytes_to_string(timing),
+                    table_name: bytes_to_string(table_name),
+                    definition: Some(bytes_to_string(definition)),
+                },
+            )
             .collect())
     }
 
@@ -543,8 +547,8 @@ impl DbProvider for MySqlProvider {
 #[cfg(test)]
 mod integration_tests {
     use super::MySqlProvider;
-    use crate::{ConnectionConfig, DatabaseDriver};
     use crate::provider::DbProvider;
+    use crate::{ConnectionConfig, DatabaseDriver};
     use uuid::Uuid;
 
     fn test_config_from_env() -> Option<ConnectionConfig> {
@@ -578,8 +582,8 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_ping() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
@@ -589,12 +593,15 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_list_databases() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
-        let databases = provider.list_databases().await.expect("Failed to list databases");
+        let databases = provider
+            .list_databases()
+            .await
+            .expect("Failed to list databases");
         assert!(!databases.is_empty(), "Expected at least one database");
         assert!(
             databases.iter().any(|db| db.name == "information_schema"),
@@ -605,8 +612,8 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_list_tables() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
@@ -624,8 +631,8 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_describe_table() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
@@ -643,13 +650,16 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_execute_select_query() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
         let result = provider
-            .execute_query("information_schema", "SELECT 1 AS value, 'hello' AS greeting")
+            .execute_query(
+                "information_schema",
+                "SELECT 1 AS value, 'hello' AS greeting",
+            )
             .await
             .expect("Failed to execute query");
         assert_eq!(result.columns, vec!["value", "greeting"]);
@@ -667,8 +677,8 @@ mod integration_tests {
     #[ignore]
     async fn test_unbounded_select_is_bounded() {
         use super::{MAX_CELL_BYTES, MAX_RESULT_ROWS};
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");
@@ -696,8 +706,8 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_execute_show_databases() {
-        let config = test_config_from_env()
-            .expect("MYSQL_TEST_URL env var required for integration tests");
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
             .await
             .expect("Failed to connect");

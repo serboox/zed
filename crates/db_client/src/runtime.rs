@@ -238,7 +238,10 @@ mod tests {
                 .describe_table("db", "t")
                 .await
                 .expect("describe_table");
-            provider.execute_query("db", "SELECT 1").await.expect("query");
+            provider
+                .execute_query("db", "SELECT 1")
+                .await
+                .expect("query");
         });
 
         let recorded = calls.lock().expect("poisoned").clone();

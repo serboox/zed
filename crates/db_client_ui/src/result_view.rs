@@ -3262,6 +3262,7 @@ impl ResultView {
         let history_open = self.history_open;
         let limit_editor = self.limit_editor.clone();
         let weak_this = cx.weak_entity();
+        let weak_for_gutter = weak_this.clone();
 
         div()
             .flex()
@@ -4012,6 +4013,7 @@ impl ResultView {
                         .into_any_element()
                 });
                 let gb = grid_border;
+                let gutter_row_ops = row_ops_enabled;
                 let gutter_body = uniform_list(
                     "result-gutter",
                     row_count,
@@ -4033,7 +4035,7 @@ impl ResultView {
                             } else {
                                 format!("+{}", display_idx - loaded_display_count + 1).into()
                             };
-                            div()
+                            let gutter_row = div()
                                 .id(ElementId::from(SharedString::from(format!("gtr-{display_idx}"))))
                                 .flex_none()
                                 .w(px(ROW_GUTTER_WIDTH))
@@ -4076,8 +4078,42 @@ impl ResultView {
                                         this.last_selected_row = Some(display_idx);
                                     }
                                     cx.notify();
-                                }))
-                                .into_any_element()
+                                }));
+                            if gutter_row_ops {
+                                let wt = weak_for_gutter.clone();
+                                right_click_menu(ElementId::from(SharedString::from(format!("gtr-ctx-{display_idx}"))))
+                                    .trigger(move |_, _, _| gutter_row)
+                                    .menu(move |window, cx| {
+                                        let wt_add = wt.clone();
+                                        let wt_del = wt.clone();
+                                        let wt_clone = wt.clone();
+                                        ContextMenu::build(window, cx, move |menu, _, _| {
+                                            menu
+                                                .entry("Add Row", None, move |_, cx| {
+                                                    wt_add.update(cx, |this, cx| this.add_blank_row(cx)).ok();
+                                                })
+                                                .entry("Clone Row", None, move |_, cx| {
+                                                    wt_clone
+                                                        .update(cx, |this, cx| {
+                                                            this.selected_cell = Some((abs_idx, 0));
+                                                            this.clone_selected_row(cx);
+                                                        })
+                                                        .ok();
+                                                })
+                                                .entry("Delete Row", None, move |_, cx| {
+                                                    wt_del
+                                                        .update(cx, |this, cx| {
+                                                            this.selected_cell = Some((abs_idx, 0));
+                                                            this.toggle_delete_selected_row(cx);
+                                                        })
+                                                        .ok();
+                                                })
+                                        })
+                                    })
+                                    .into_any_element()
+                            } else {
+                                gutter_row.into_any_element()
+                            }
                         })
                         .collect()
                     }),

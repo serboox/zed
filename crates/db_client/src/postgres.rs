@@ -9,7 +9,10 @@ const MAX_RESULT_ROWS: usize = 2_000;
 
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
-use crate::schema::{ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo};
+use crate::schema::{
+    ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult, TableInfo,
+    TableKind, TriggerInfo, UserInfo,
+};
 
 pub struct PostgresProvider {
     pool: PgPool,
@@ -113,14 +116,16 @@ impl DbProvider for PostgresProvider {
         .context("Failed to describe table")?;
         Ok(rows
             .into_iter()
-            .map(|(name, data_type, nullable, default_value, _extra)| ColumnInfo {
-                name,
-                data_type,
-                is_nullable: nullable == "YES",
-                column_key: None,
-                default_value,
-                extra: String::new(),
-            })
+            .map(
+                |(name, data_type, nullable, default_value, _extra)| ColumnInfo {
+                    name,
+                    data_type,
+                    is_nullable: nullable == "YES",
+                    column_key: None,
+                    default_value,
+                    extra: String::new(),
+                },
+            )
             .collect())
     }
 
@@ -148,7 +153,10 @@ impl DbProvider for PostgresProvider {
                 String::new()
             };
             let comma = if i < last { "," } else { "" };
-            ddl.push_str(&format!("  \"{}\" {}{}{}{}\n", col, dtype, default_str, null_str, comma));
+            ddl.push_str(&format!(
+                "  \"{}\" {}{}{}{}\n",
+                col, dtype, default_str, null_str, comma
+            ));
         }
         ddl.push(')');
         Ok(ddl)
@@ -172,18 +180,18 @@ impl DbProvider for PostgresProvider {
             || trimmed_upper.starts_with("DESC")
             || trimmed_upper.starts_with("TABLE")
             || trimmed_upper.starts_with("WITH");
-        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            sql
+        );
 
         if is_read_query {
             let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
-            while let Some(row) = stream
-                .try_next()
-                .await
-                .context("Query execution failed")?
-            {
+            while let Some(row) = stream.try_next().await.context("Query execution failed")? {
                 if columns.is_empty() {
                     columns = row
                         .columns()
@@ -274,7 +282,11 @@ impl DbProvider for PostgresProvider {
             .into_iter()
             .map(|(name, prokind, definition)| ProcedureInfo {
                 name,
-                kind: if prokind == "f" { ProcedureKind::Function } else { ProcedureKind::Procedure },
+                kind: if prokind == "f" {
+                    ProcedureKind::Function
+                } else {
+                    ProcedureKind::Procedure
+                },
                 definition,
             })
             .collect())
@@ -301,13 +313,15 @@ impl DbProvider for PostgresProvider {
 
         Ok(rows
             .into_iter()
-            .map(|(name, event, timing, table_name, definition)| TriggerInfo {
-                name,
-                event,
-                timing,
-                table_name,
-                definition: Some(definition),
-            })
+            .map(
+                |(name, event, timing, table_name, definition)| TriggerInfo {
+                    name,
+                    event,
+                    timing,
+                    table_name,
+                    definition: Some(definition),
+                },
+            )
             .collect())
     }
 

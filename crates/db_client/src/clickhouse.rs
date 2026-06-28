@@ -30,19 +30,31 @@ impl ClickHouseProvider {
             password: config.password.clone(),
         };
 
-        provider.ping().await.context("Failed to connect to ClickHouse")?;
+        provider
+            .ping()
+            .await
+            .context("Failed to connect to ClickHouse")?;
         Ok(provider)
     }
 
-    async fn query_json(&self, sql: &str, database: Option<&str>) -> Result<ClickHouseJsonResponse> {
+    async fn query_json(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> Result<ClickHouseJsonResponse> {
         let url = if let Some(db) = database {
-            format!("{}/?database={}&default_format=JSONCompact", self.base_url, urlencoding::encode(db))
+            format!(
+                "{}/?database={}&default_format=JSONCompact",
+                self.base_url,
+                urlencoding::encode(db)
+            )
         } else {
             format!("{}/?default_format=JSONCompact", self.base_url)
         };
 
         let full_sql = format!("{} FORMAT JSONCompact", sql.trim_end_matches(';'));
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("X-ClickHouse-User", &self.username)
             .header("X-ClickHouse-Key", &self.password)
@@ -57,9 +69,12 @@ impl ClickHouseProvider {
             anyhow::bail!("ClickHouse error ({}): {}", status, body);
         }
 
-        let body = response.text().await.context("Failed to read ClickHouse response body")?;
-        let parsed: ClickHouseJsonResponse = serde_json::from_str(&body)
-            .context("Failed to parse ClickHouse JSON response")?;
+        let body = response
+            .text()
+            .await
+            .context("Failed to read ClickHouse response body")?;
+        let parsed: ClickHouseJsonResponse =
+            serde_json::from_str(&body).context("Failed to parse ClickHouse JSON response")?;
         Ok(parsed)
     }
 
@@ -70,7 +85,8 @@ impl ClickHouseProvider {
             self.base_url.clone()
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("X-ClickHouse-User", &self.username)
             .header("X-ClickHouse-Key", &self.password)
@@ -155,7 +171,8 @@ mod tests {
 impl DbProvider for ClickHouseProvider {
     async fn ping(&self) -> Result<()> {
         let url = format!("{}/?query=SELECT+1", self.base_url);
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("X-ClickHouse-User", &self.username)
             .header("X-ClickHouse-Key", &self.password)
@@ -176,10 +193,14 @@ impl DbProvider for ClickHouseProvider {
         let resp = self
             .query_json("SELECT name FROM system.databases WHERE name NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name", None)
             .await?;
-        Ok(resp.data.into_iter().filter_map(|row| {
-            let name = row.into_iter().next()?.as_str()?.to_string();
-            Some(DatabaseInfo { name })
-        }).collect())
+        Ok(resp
+            .data
+            .into_iter()
+            .filter_map(|row| {
+                let name = row.into_iter().next()?.as_str()?.to_string();
+                Some(DatabaseInfo { name })
+            })
+            .collect())
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
@@ -188,17 +209,21 @@ impl DbProvider for ClickHouseProvider {
             database.replace('\'', "\\'")
         );
         let resp = self.query_json(&sql, Some(database)).await?;
-        Ok(resp.data.into_iter().filter_map(|row| {
-            let mut iter = row.into_iter();
-            let name = iter.next()?.as_str()?.to_string();
-            let engine = iter.next()?.as_str().unwrap_or("").to_string();
-            let kind = if engine.contains("View") {
-                TableKind::View
-            } else {
-                TableKind::Table
-            };
-            Some(TableInfo { name, kind })
-        }).collect())
+        Ok(resp
+            .data
+            .into_iter()
+            .filter_map(|row| {
+                let mut iter = row.into_iter();
+                let name = iter.next()?.as_str()?.to_string();
+                let engine = iter.next()?.as_str().unwrap_or("").to_string();
+                let kind = if engine.contains("View") {
+                    TableKind::View
+                } else {
+                    TableKind::Table
+                };
+                Some(TableInfo { name, kind })
+            })
+            .collect())
     }
 
     async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
@@ -208,20 +233,24 @@ impl DbProvider for ClickHouseProvider {
             table.replace('\'', "\\'"),
         );
         let resp = self.query_json(&sql, Some(database)).await?;
-        Ok(resp.data.into_iter().filter_map(|row| {
-            let mut iter = row.into_iter();
-            let name = iter.next()?.as_str()?.to_string();
-            let data_type = iter.next()?.as_str()?.to_string();
-            let is_pk = iter.next().and_then(|v| v.as_u64()).unwrap_or(0) == 1;
-            Some(ColumnInfo {
-                name,
-                data_type,
-                is_nullable: false,
-                column_key: if is_pk { Some("PRI".to_string()) } else { None },
-                default_value: None,
-                extra: String::new(),
+        Ok(resp
+            .data
+            .into_iter()
+            .filter_map(|row| {
+                let mut iter = row.into_iter();
+                let name = iter.next()?.as_str()?.to_string();
+                let data_type = iter.next()?.as_str()?.to_string();
+                let is_pk = iter.next().and_then(|v| v.as_u64()).unwrap_or(0) == 1;
+                Some(ColumnInfo {
+                    name,
+                    data_type,
+                    is_nullable: false,
+                    column_key: if is_pk { Some("PRI".to_string()) } else { None },
+                    default_value: None,
+                    extra: String::new(),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
@@ -230,8 +259,13 @@ impl DbProvider for ClickHouseProvider {
             database.replace('`', "\\`"),
             table.replace('`', "\\`"),
         );
-        let url = format!("{}/?database={}&default_format=TabSeparatedRaw", self.base_url, urlencoding::encode(database));
-        let response = self.client
+        let url = format!(
+            "{}/?database={}&default_format=TabSeparatedRaw",
+            self.base_url,
+            urlencoding::encode(database)
+        );
+        let response = self
+            .client
             .post(&url)
             .header("X-ClickHouse-User", &self.username)
             .header("X-ClickHouse-Key", &self.password)
@@ -246,14 +280,25 @@ impl DbProvider for ClickHouseProvider {
             anyhow::bail!("ClickHouse error ({}): {}", status, body);
         }
 
-        let ddl = response.text().await.context("Failed to read DDL response")?;
+        let ddl = response
+            .text()
+            .await
+            .context("Failed to read DDL response")?;
         Ok(ddl.trim().to_string())
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
-        let db_opt = if database.is_empty() { None } else { Some(database) };
-        let prefixed = format!("{}{}", crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME), sql);
+        let db_opt = if database.is_empty() {
+            None
+        } else {
+            Some(database)
+        };
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            sql
+        );
 
         if is_read_query(sql) {
             let resp = self.query_json(&prefixed, db_opt).await?;
@@ -274,7 +319,12 @@ impl DbProvider for ClickHouseProvider {
                 })
                 .collect();
             let rows_affected = rows.len() as u64;
-            Ok(QueryResult { columns, rows, rows_affected, execution_time_ms })
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected,
+                execution_time_ms,
+            })
         } else {
             let rows_affected = self.execute_dml(&prefixed, db_opt).await?;
             Ok(QueryResult {

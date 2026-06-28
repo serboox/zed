@@ -1,0 +1,43 @@
+[tasks."build:dev"]
+description = "Build the zed binary (dev profile, unoptimized)"
+run = "cargo build -p zed"
+
+[tasks."build:release"]
+description = "Build the zed binary (release profile, optimized)"
+run = "cargo build -p zed --release"
+
+[tasks."run:dev"]
+description = "Build and run zed (dev profile)"
+run = "cargo run -p zed"
+
+[tasks."run:release"]
+description = "Build and run zed (release profile)"
+run = "cargo run -p zed --release"
+
+[tasks.check]
+description = "Fast type-check without linking"
+run = "cargo check -p zed"
+
+[tasks.clippy]
+description = "Run clippy with project settings (all targets, deny warnings)"
+run = "./script/clippy"
+
+[tasks.fmt]
+description = "Format all crates with rustfmt"
+run = "cargo fmt"
+
+[tasks.fmt-check]
+description = "Check formatting without applying changes"
+run = "cargo fmt -- --check"
+
+[tasks.test]
+description = "Run unit tests for db_client and db_client_ui"
+run = "cargo test -p db_client -p db_client_ui"
+
+[tasks.pre-commit]
+description = "Full pre-commit validation: fmt, clippy, build:dev"
+run = """
+cargo fmt
+./script/clippy
+cargo build -p zed
+"""

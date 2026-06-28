@@ -6,14 +6,22 @@ use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseSt
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, ProcedureKind, QueryResult, schema::ColumnInfo,
 };
-use editor::{Editor, EditorEvent, ToOffset};
+use editor::{Editor, EditorEvent, GotoDefinitionKind, SemanticsProvider, ToOffset};
+use futures::future::Shared;
 use gpui::{
     App, AsyncWindowContext, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, px,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
+use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
-use std::collections::HashSet;
+use project::{
+    DocumentHighlight, InlayHint, InvalidationStrategy, Location, LocationLink, ProjectTransaction,
+    lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
+};
+use collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{ContextMenu, Icon, IconButton, IconName, IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
@@ -59,6 +67,201 @@ struct DbQueryEditorAddon {
 impl editor::Addon for DbQueryEditorAddon {
     fn to_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+struct DbSemanticsProvider {
+    connection_id: ConnectionId,
+    store: WeakEntity<DatabaseStore>,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl SemanticsProvider for DbSemanticsProvider {
+    fn hover(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: Anchor,
+        _cx: &mut App,
+    ) -> Option<Task<Option<Vec<project::Hover>>>> {
+        None
+    }
+
+    fn inline_values(
+        &self,
+        _buffer: Entity<Buffer>,
+        _range: std::ops::Range<Anchor>,
+        _cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Vec<InlayHint>>>> {
+        None
+    }
+
+    fn applicable_inlay_chunks(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _ranges: &[std::ops::Range<Anchor>],
+        _cx: &mut App,
+    ) -> Vec<std::ops::Range<BufferRow>> {
+        vec![]
+    }
+
+    fn invalidate_inlay_hints(&self, _for_buffers: &HashSet<BufferId>, _cx: &mut App) {}
+
+    fn inlay_hints(
+        &self,
+        _invalidate: InvalidationStrategy,
+        _buffer: Entity<Buffer>,
+        _ranges: Vec<std::ops::Range<Anchor>>,
+        _known_chunks: Option<(clock::Global, HashSet<std::ops::Range<BufferRow>>)>,
+        _cx: &mut App,
+    ) -> Option<HashMap<std::ops::Range<BufferRow>, Task<anyhow::Result<CacheInlayHints>>>> {
+        None
+    }
+
+    fn semantic_tokens(
+        &self,
+        _buffer: Entity<Buffer>,
+        _refresh: Option<RefreshForServer>,
+        _cx: &mut App,
+    ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
+        None
+    }
+
+    fn supports_inlay_hints(&self, _buffer: &Entity<Buffer>, _cx: &mut App) -> bool {
+        false
+    }
+
+    fn supports_semantic_tokens(&self, _buffer: &Entity<Buffer>, _cx: &mut App) -> bool {
+        false
+    }
+
+    fn document_highlights(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: Anchor,
+        _cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Vec<DocumentHighlight>>>> {
+        None
+    }
+
+    fn definitions(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: Anchor,
+        _kind: GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Option<Vec<LocationLink>>>>> {
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = snapshot.offset_for_anchor(&position);
+        let text = snapshot.text();
+        let bytes = text.as_bytes();
+
+        fn is_sql_ident(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+
+        let mut start = offset;
+        while start > 0 && (is_sql_ident(bytes[start - 1]) || bytes[start - 1] == b'.') {
+            start -= 1;
+        }
+        let mut end = offset;
+        while end < bytes.len() && (is_sql_ident(bytes[end]) || bytes[end] == b'.') {
+            end += 1;
+        }
+
+        if start == end {
+            return None;
+        }
+
+        let word = text[start..end].to_string();
+        let (database_opt, table_name) = if let Some(dot) = word.rfind('.') {
+            (Some(word[..dot].to_string()), word[dot + 1..].to_string())
+        } else {
+            (None, word)
+        };
+
+        if table_name.is_empty() {
+            return None;
+        }
+
+        let matched = self
+            .store
+            .read_with(cx, |store, _| {
+                let conn = store
+                    .connections
+                    .iter()
+                    .find(|c| c.config.id == self.connection_id)?;
+                if let Some(ref db) = database_opt {
+                    let tables = conn.expanded_databases.get(db)?;
+                    if tables.iter().any(|t| t.name == table_name) {
+                        return Some((db.clone(), table_name.clone()));
+                    }
+                    return None;
+                }
+                for (db, tables) in &conn.expanded_databases {
+                    if tables.iter().any(|t| t.name == table_name) {
+                        return Some((db.clone(), table_name.clone()));
+                    }
+                }
+                None
+            })
+            .ok()
+            .flatten()?;
+
+        let (database, table) = matched;
+        let word_start = snapshot.anchor_before(start);
+        let word_end = snapshot.anchor_after(end);
+        let source_buffer = buffer.clone();
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        let connection_id = self.connection_id;
+
+        Some(cx.spawn(async move |cx| {
+            let ddl_task = store.update(cx, |store, cx| {
+                store.get_table_ddl(connection_id, database, table.clone(), cx)
+            })?;
+            let ddl = ddl_task.await?;
+
+            let language_task =
+                workspace.read_with(cx, |ws, _| ws.app_state().languages.language_for_name("SQL"))?;
+            let language = language_task.await.ok();
+
+            let ddl_buffer = workspace.update(cx, |ws, cx| {
+                ws.project()
+                    .update(cx, |project, cx| project.create_local_buffer(&ddl, language, false, cx))
+            })?;
+
+            let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(0));
+
+            Ok(Some(vec![LocationLink {
+                origin: Some(Location {
+                    buffer: source_buffer,
+                    range: word_start..word_end,
+                }),
+                target: Location {
+                    buffer: ddl_buffer,
+                    range: target_anchor..target_anchor,
+                },
+            }]))
+        }))
+    }
+
+    fn range_for_rename(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: Anchor,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<Option<std::ops::Range<Anchor>>>> {
+        Task::ready(Ok(None))
+    }
+
+    fn perform_rename(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: Anchor,
+        _new_name: String,
+        _cx: &mut App,
+    ) -> Option<Task<anyhow::Result<ProjectTransaction>>> {
+        None
     }
 }
 
@@ -616,7 +819,7 @@ impl DatabasePanel {
             .child(Label::new(folder).size(LabelSize::Small))
     }
 
-    fn open_sql_query_with_text(workspace: WeakEntity<Workspace>, connection_id: ConnectionId, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_sql_query_with_text(workspace: WeakEntity<Workspace>, store: WeakEntity<DatabaseStore>, connection_id: ConnectionId, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let languages = workspace
             .update(cx, |ws, _cx| ws.app_state().languages.clone())
             .log_err();
@@ -629,6 +832,7 @@ impl DatabasePanel {
                 let buffer_task = project.update(cx, move |project, cx| {
                     project.create_buffer(language, false, cx)
                 });
+                let workspace_weak = workspace.weak_handle();
                 cx.spawn_in(window, async move |workspace, cx| {
                     let buffer = buffer_task.await?;
                     let multi = cx.new(|cx| {
@@ -639,6 +843,11 @@ impl DatabasePanel {
                             let mut ed = Editor::for_multibuffer(multi, None, window, cx);
                             ed.set_text(text.clone(), window, cx);
                             ed.register_addon(DbQueryEditorAddon { connection_id });
+                            ed.set_semantics_provider(Some(Rc::new(DbSemanticsProvider {
+                                connection_id,
+                                store: store.clone(),
+                                workspace: workspace_weak.clone(),
+                            })));
                             ed
                         });
                         workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
@@ -1061,8 +1270,7 @@ impl DatabasePanel {
                                         move |window, cx| {
                                             let sql = format!("SELECT * FROM {db} LIMIT 1;");
                                             entity.update(cx, |panel, cx| {
-                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                let _ = panel;
+                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                             });
                                         }
                                     })
@@ -1216,8 +1424,8 @@ impl DatabasePanel {
                                                     let ws = workspace.clone();
                                                     cx.spawn_in(window, async move |this, cx| {
                                                         let ddl = ddl_task.await?;
-                                                        this.update_in(cx, |_, window, cx| {
-                                                            Self::open_sql_query_with_text(ws.clone(), id, ddl, window, cx);
+                                                        this.update_in(cx, |panel, window, cx| {
+                                                            Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
                                                         }).log_err();
                                                         anyhow::Ok(())
                                                     })
@@ -1314,8 +1522,8 @@ impl DatabasePanel {
                                                     let ws = workspace.clone();
                                                     cx.spawn_in(window, async move |this, cx| {
                                                         let ddl = ddl_task.await?;
-                                                        this.update_in(cx, |_, window, cx| {
-                                                            Self::open_sql_query_with_text(ws.clone(), id, ddl, window, cx);
+                                                        this.update_in(cx, |panel, window, cx| {
+                                                            Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
                                                             let _ = tbl_title;
                                                         }).log_err();
                                                         anyhow::Ok(())
@@ -1335,12 +1543,12 @@ impl DatabasePanel {
                                                 let tbl = table_name.clone();
                                                 let cols = table_columns.clone().unwrap_or_default();
                                                 let workspace = self.workspace.clone();
-                                                move |_, _, window, cx| {
+                                                move |this, _, window, cx| {
                                                     let insert = Self::generate_insert_template(&tbl, driver, &cols);
                                                     let update = Self::generate_update_template(&tbl, driver, &cols);
                                                     let delete = Self::generate_delete_template(&tbl, driver, &cols);
                                                     let sql = format!("{}\n\n{}\n\n{}", insert, update, delete);
-                                                    Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
+                                                    Self::open_sql_query_with_text(workspace.clone(), this.store.downgrade(), id, sql, window, cx);
                                                 }
                                             })),
                                         );
@@ -1418,8 +1626,7 @@ impl DatabasePanel {
                                                                 Self::quote_ident(&tbl, driver)
                                                             );
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1437,8 +1644,8 @@ impl DatabasePanel {
                                                                 let ws = workspace.clone();
                                                                 cx.spawn_in(window, async move |this, cx| {
                                                                     let ddl = ddl_task.await?;
-                                                                    this.update_in(cx, |_, window, cx| {
-                                                                        Self::open_sql_query_with_text(ws.clone(), id, ddl, window, cx);
+                                                                    this.update_in(cx, |panel, window, cx| {
+                                                                        Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
                                                                     }).log_err();
                                                                     anyhow::Ok(())
                                                                 })
@@ -1474,8 +1681,7 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             let sql = Self::generate_insert_template(&tbl, driver, &cols);
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1487,8 +1693,7 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             let sql = Self::generate_update_template(&tbl, driver, &cols);
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1500,8 +1705,7 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             let sql = Self::generate_delete_template(&tbl, driver, &cols);
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1600,8 +1804,7 @@ impl DatabasePanel {
                                                                 Self::quote_ident(&format!("{}_renamed", tbl), driver),
                                                             );
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1664,8 +1867,7 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             let sql = Self::generate_mock_data(&tbl, driver, &cols, 10);
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1685,8 +1887,7 @@ impl DatabasePanel {
                                                                     "-- name: RenameTable :exec\nALTER TABLE \"{db}\".\"{tbl}\" RENAME TO \"new_name\";"),
                                                             };
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), id, sql, window, cx);
-                                                                let _ = panel;
+                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
                                                         }
                                                     })
@@ -1966,8 +2167,8 @@ impl DatabasePanel {
                                                                             let ws = workspace.clone();
                                                                             cx.spawn_in(window, async move |this, cx| {
                                                                                 let ddl = ddl_task.await?;
-                                                                                this.update_in(cx, |_, window, cx| {
-                                                                                    Self::open_sql_query_with_text(ws.clone(), id, ddl, window, cx);
+                                                                                this.update_in(cx, |panel, window, cx| {
+                                                                                    Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
                                                                                 }).log_err();
                                                                                 anyhow::Ok(())
                                                                             })
@@ -2076,8 +2277,9 @@ impl DatabasePanel {
                     .hover(|style| style.bg(gpui::transparent_white()))
                     .on_click(cx.listener({
                         let workspace = self.workspace.clone();
+                        let store = self.store.downgrade();
                         move |_, _, window, cx| {
-                            Self::open_sql_query_with_text(workspace.clone(), history_conn_id, query.clone(), window, cx);
+                            Self::open_sql_query_with_text(workspace.clone(), store.clone(), history_conn_id, query.clone(), window, cx);
                         }
                     }))
                     .child(Label::new(display).size(LabelSize::XSmall).color(Color::Muted));

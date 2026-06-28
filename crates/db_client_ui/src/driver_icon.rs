@@ -67,7 +67,10 @@ mod tests {
                 path.starts_with("icons/db_brands/") && path.ends_with(".svg"),
                 "unexpected asset path for {driver}: {path}"
             );
-            assert!(seen.insert(path), "duplicate asset path for {driver}: {path}");
+            assert!(
+                seen.insert(path),
+                "duplicate asset path for {driver}: {path}"
+            );
         }
     }
 

@@ -40,17 +40,23 @@ pub trait DbProvider: Send + Sync {
     }
 
     async fn truncate_table(&self, database: &str, table: &str) -> Result<()> {
-        self.execute_query(database, &format!("TRUNCATE TABLE {}", table)).await?;
+        self.execute_query(database, &format!("TRUNCATE TABLE {}", table))
+            .await?;
         Ok(())
     }
 
     async fn drop_table(&self, database: &str, table: &str) -> Result<()> {
-        self.execute_query(database, &format!("DROP TABLE {}", table)).await?;
+        self.execute_query(database, &format!("DROP TABLE {}", table))
+            .await?;
         Ok(())
     }
 
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        self.execute_query(database, &format!("ALTER TABLE {} RENAME TO {}", old_name, new_name)).await?;
+        self.execute_query(
+            database,
+            &format!("ALTER TABLE {} RENAME TO {}", old_name, new_name),
+        )
+        .await?;
         Ok(())
     }
 }

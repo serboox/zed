@@ -4,7 +4,10 @@ use editor::Editor;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
 };
-use ui::{Button, ButtonCommon, ButtonStyle, Checkbox, Icon, IconName, Label, LabelSize, ToggleState, prelude::*};
+use ui::{
+    Button, ButtonCommon, ButtonStyle, Checkbox, Icon, IconName, Label, LabelSize, ToggleState,
+    prelude::*,
+};
 use uuid::Uuid;
 use workspace::{Item, item::ItemEvent};
 
@@ -264,7 +267,10 @@ impl ConnectionView {
 
         let color_raw = Self::read_text(&self.color_editor, cx);
         let env_color = if parse_hex_color(color_raw.trim()).is_some() {
-            let normalized = format!("#{}", color_raw.trim().trim_start_matches('#').to_lowercase());
+            let normalized = format!(
+                "#{}",
+                color_raw.trim().trim_start_matches('#').to_lowercase()
+            );
             Some(normalized)
         } else {
             None
@@ -412,13 +418,11 @@ impl ConnectionView {
                 row.hover(|row| row.bg(colors.element_hover))
             })
             .child(brand_icon(driver, IconSize::Small))
-            .child(
-                Label::new(label).color(if is_selected {
-                    Color::Default
-                } else {
-                    Color::Muted
-                }),
-            )
+            .child(Label::new(label).color(if is_selected {
+                Color::Default
+            } else {
+                Color::Muted
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_driver(driver, window, cx);
             }))
@@ -511,8 +515,7 @@ impl Render for ConnectionView {
             .items_center()
             .child(brand_icon(selected_driver, IconSize::Medium))
             .child(
-                Label::new(format!("{} — {}", self.title, selected_driver))
-                    .size(LabelSize::Large),
+                Label::new(format!("{} — {}", self.title, selected_driver)).size(LabelSize::Large),
             );
 
         let fields = v_flex()
@@ -688,10 +691,12 @@ impl Render for ConnectionView {
                                         ToggleState::Unselected
                                     },
                                 )
-                                .on_click(cx.listener(|this, _state, _, cx| {
-                                    this.auto_connect = !this.auto_connect;
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _state, _, cx| {
+                                        this.auto_connect = !this.auto_connect;
+                                        cx.notify();
+                                    },
+                                )),
                             )
                             .child(
                                 Label::new("Auto-connect on startup")
@@ -846,8 +851,9 @@ mod tests {
                     .update(cx, |ed, cx| ed.set_text("2222", window, cx));
                 view.ssh_username_editor
                     .update(cx, |ed, cx| ed.set_text("tunnel", window, cx));
-                view.ssh_key_path_editor
-                    .update(cx, |ed, cx| ed.set_text("/home/u/.ssh/id_ed25519", window, cx));
+                view.ssh_key_path_editor.update(cx, |ed, cx| {
+                    ed.set_text("/home/u/.ssh/id_ed25519", window, cx)
+                });
             })
             .unwrap();
 

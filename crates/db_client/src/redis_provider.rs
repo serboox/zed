@@ -24,12 +24,16 @@ impl RedisProvider {
             .unwrap_or(0);
 
         let provider = Self { client, db_index };
-        provider.ping().await.context("Failed to connect to Redis")?;
+        provider
+            .ping()
+            .await
+            .context("Failed to connect to Redis")?;
         Ok(provider)
     }
 
     async fn connection(&self) -> Result<redis::aio::MultiplexedConnection> {
-        let mut conn = self.client
+        let mut conn = self
+            .client
             .get_multiplexed_async_connection()
             .await
             .context("Failed to get Redis connection")?;
@@ -89,11 +93,14 @@ fn redis_value_to_string(value: &redis::Value) -> Option<String> {
             Some(parts.join(", "))
         }
         redis::Value::Map(pairs) => {
-            let parts: Vec<String> = pairs.iter().map(|(k, v)| {
-                let key = redis_value_to_string(k).unwrap_or_default();
-                let val = redis_value_to_string(v).unwrap_or_default();
-                format!("{}: {}", key, val)
-            }).collect();
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    let key = redis_value_to_string(k).unwrap_or_default();
+                    let val = redis_value_to_string(v).unwrap_or_default();
+                    format!("{}: {}", key, val)
+                })
+                .collect();
             Some(parts.join(", "))
         }
         _ => Some(format!("{:?}", value)),
@@ -101,14 +108,53 @@ fn redis_value_to_string(value: &redis::Value) -> Option<String> {
 }
 
 fn is_read_command(cmd: &str) -> bool {
-    matches!(cmd.to_uppercase().as_str(),
-        "GET" | "MGET" | "GETRANGE" | "STRLEN" | "HGET" | "HMGET" | "HGETALL" |
-        "HKEYS" | "HVALS" | "HLEN" | "HEXISTS" | "LRANGE" | "LLEN" | "LINDEX" |
-        "SMEMBERS" | "SCARD" | "SISMEMBER" | "SUNION" | "SINTER" | "SDIFF" |
-        "ZRANGE" | "ZRANGEBYSCORE" | "ZRANK" | "ZCARD" | "ZSCORE" | "ZCOUNT" |
-        "KEYS" | "SCAN" | "TYPE" | "TTL" | "PTTL" | "EXISTS" | "OBJECT" |
-        "DEBUG" | "INFO" | "CONFIG" | "DBSIZE" | "TIME" | "PING" | "ECHO" |
-        "RANDOMKEY" | "DUMP" | "PERSIST" | "EXPIRETIME" | "PEXPIRETIME"
+    matches!(
+        cmd.to_uppercase().as_str(),
+        "GET"
+            | "MGET"
+            | "GETRANGE"
+            | "STRLEN"
+            | "HGET"
+            | "HMGET"
+            | "HGETALL"
+            | "HKEYS"
+            | "HVALS"
+            | "HLEN"
+            | "HEXISTS"
+            | "LRANGE"
+            | "LLEN"
+            | "LINDEX"
+            | "SMEMBERS"
+            | "SCARD"
+            | "SISMEMBER"
+            | "SUNION"
+            | "SINTER"
+            | "SDIFF"
+            | "ZRANGE"
+            | "ZRANGEBYSCORE"
+            | "ZRANK"
+            | "ZCARD"
+            | "ZSCORE"
+            | "ZCOUNT"
+            | "KEYS"
+            | "SCAN"
+            | "TYPE"
+            | "TTL"
+            | "PTTL"
+            | "EXISTS"
+            | "OBJECT"
+            | "DEBUG"
+            | "INFO"
+            | "CONFIG"
+            | "DBSIZE"
+            | "TIME"
+            | "PING"
+            | "ECHO"
+            | "RANDOMKEY"
+            | "DUMP"
+            | "PERSIST"
+            | "EXPIRETIME"
+            | "PEXPIRETIME"
     )
 }
 
@@ -132,7 +178,9 @@ impl DbProvider for RedisProvider {
             .context("INFO keyspace failed")?;
 
         let mut databases: Vec<DatabaseInfo> = (0..16)
-            .map(|i| DatabaseInfo { name: format!("db{}", i) })
+            .map(|i| DatabaseInfo {
+                name: format!("db{}", i),
+            })
             .collect();
 
         for line in info.lines() {
@@ -144,7 +192,9 @@ impl DbProvider for RedisProvider {
                             let keys: u64 = rest[colon + 1..]
                                 .split(',')
                                 .find_map(|part| {
-                                    part.trim().strip_prefix("keys=").and_then(|k| k.parse().ok())
+                                    part.trim()
+                                        .strip_prefix("keys=")
+                                        .and_then(|k| k.parse().ok())
                                 })
                                 .unwrap_or(0);
                             databases[idx].name = format!("db{} ({} keys)", idx, keys);
@@ -181,8 +231,15 @@ impl DbProvider for RedisProvider {
 
         let mut tables = Vec::with_capacity(keys.len());
         for key in keys {
-            let key_type: String = conn.key_type(&key).await.unwrap_or_else(|_| "string".to_string());
-            let kind = if key_type == "hash" { TableKind::Table } else { TableKind::View };
+            let key_type: String = conn
+                .key_type(&key)
+                .await
+                .unwrap_or_else(|_| "string".to_string());
+            let kind = if key_type == "hash" {
+                TableKind::Table
+            } else {
+                TableKind::View
+            };
             tables.push(TableInfo { name: key, kind });
         }
 
@@ -211,14 +268,17 @@ impl DbProvider for RedisProvider {
         match key_type.as_str() {
             "hash" => {
                 let fields: Vec<String> = conn.hkeys(table).await.context("HKEYS failed")?;
-                Ok(fields.into_iter().map(|name| ColumnInfo {
-                    name,
-                    data_type: "string".to_string(),
-                    is_nullable: true,
-                    column_key: None,
-                    default_value: None,
-                    extra: String::new(),
-                }).collect())
+                Ok(fields
+                    .into_iter()
+                    .map(|name| ColumnInfo {
+                        name,
+                        data_type: "string".to_string(),
+                        is_nullable: true,
+                        column_key: None,
+                        default_value: None,
+                        extra: String::new(),
+                    })
+                    .collect())
             }
             "list" => Ok(vec![ColumnInfo {
                 name: "element".to_string(),
@@ -237,8 +297,22 @@ impl DbProvider for RedisProvider {
                 extra: "set".to_string(),
             }]),
             "zset" => Ok(vec![
-                ColumnInfo { name: "member".to_string(), data_type: "string".to_string(), is_nullable: false, column_key: None, default_value: None, extra: "zset".to_string() },
-                ColumnInfo { name: "score".to_string(), data_type: "float".to_string(), is_nullable: false, column_key: None, default_value: None, extra: String::new() },
+                ColumnInfo {
+                    name: "member".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: "zset".to_string(),
+                },
+                ColumnInfo {
+                    name: "score".to_string(),
+                    data_type: "float".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
             ]),
             _ => Ok(vec![ColumnInfo {
                 name: "value".to_string(),
@@ -268,35 +342,86 @@ impl DbProvider for RedisProvider {
             .context("SELECT database failed")?;
 
         let key_type: String = conn.key_type(table).await.context("TYPE failed")?;
-        let ttl: i64 = redis::cmd("TTL").arg(table).query_async(&mut conn).await.unwrap_or(-1);
-        let ttl_note = if ttl < 0 { "no expiry".to_string() } else { format!("TTL {}s", ttl) };
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(table)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(-1);
+        let ttl_note = if ttl < 0 {
+            "no expiry".to_string()
+        } else {
+            format!("TTL {}s", ttl)
+        };
 
         let content = match key_type.as_str() {
             "hash" => {
-                let pairs: Vec<(String, String)> = conn.hgetall(table).await.context("HGETALL failed")?;
-                let fields: Vec<String> = pairs.iter().map(|(k, v)| format!("  {} = {:?}", k, v)).collect();
-                format!("-- hash ({})\nHSET {}\n{}", ttl_note, table, fields.join("\n"))
+                let pairs: Vec<(String, String)> =
+                    conn.hgetall(table).await.context("HGETALL failed")?;
+                let fields: Vec<String> = pairs
+                    .iter()
+                    .map(|(k, v)| format!("  {} = {:?}", k, v))
+                    .collect();
+                format!(
+                    "-- hash ({})\nHSET {}\n{}",
+                    ttl_note,
+                    table,
+                    fields.join("\n")
+                )
             }
             "list" => {
-                let items: Vec<String> = redis::cmd("LRANGE").arg(table).arg(0i64).arg(-1i64)
-                    .query_async(&mut conn).await.context("LRANGE failed")?;
+                let items: Vec<String> = redis::cmd("LRANGE")
+                    .arg(table)
+                    .arg(0i64)
+                    .arg(-1i64)
+                    .query_async(&mut conn)
+                    .await
+                    .context("LRANGE failed")?;
                 let elements: Vec<String> = items.iter().map(|v| format!("  {:?}", v)).collect();
-                format!("-- list ({})\nRPUSH {}\n{}", ttl_note, table, elements.join("\n"))
+                format!(
+                    "-- list ({})\nRPUSH {}\n{}",
+                    ttl_note,
+                    table,
+                    elements.join("\n")
+                )
             }
             "set" => {
                 let members: Vec<String> = conn.smembers(table).await.context("SMEMBERS failed")?;
                 let elements: Vec<String> = members.iter().map(|v| format!("  {:?}", v)).collect();
-                format!("-- set ({})\nSADD {}\n{}", ttl_note, table, elements.join("\n"))
+                format!(
+                    "-- set ({})\nSADD {}\n{}",
+                    ttl_note,
+                    table,
+                    elements.join("\n")
+                )
             }
             "zset" => {
-                let pairs: Vec<(String, f64)> = redis::cmd("ZRANGE").arg(table).arg(0i64).arg(-1i64).arg("WITHSCORES")
-                    .query_async(&mut conn).await.context("ZRANGE failed")?;
-                let elements: Vec<String> = pairs.iter().map(|(m, s)| format!("  {:?} {}", m, s)).collect();
-                format!("-- zset ({})\nZADD {}\n{}", ttl_note, table, elements.join("\n"))
+                let pairs: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                    .arg(table)
+                    .arg(0i64)
+                    .arg(-1i64)
+                    .arg("WITHSCORES")
+                    .query_async(&mut conn)
+                    .await
+                    .context("ZRANGE failed")?;
+                let elements: Vec<String> = pairs
+                    .iter()
+                    .map(|(m, s)| format!("  {:?} {}", m, s))
+                    .collect();
+                format!(
+                    "-- zset ({})\nZADD {}\n{}",
+                    ttl_note,
+                    table,
+                    elements.join("\n")
+                )
             }
             _ => {
                 let val: Option<String> = conn.get(table).await.context("GET failed")?;
-                format!("-- string ({})\nSET {} {:?}", ttl_note, table, val.unwrap_or_default())
+                format!(
+                    "-- string ({})\nSET {} {:?}",
+                    ttl_note,
+                    table,
+                    val.unwrap_or_default()
+                )
             }
         };
 
@@ -326,7 +451,12 @@ impl DbProvider for RedisProvider {
 
         let tokens: Vec<&str> = sql.split_whitespace().collect();
         if tokens.is_empty() {
-            return Ok(QueryResult { columns: vec![], rows: vec![], rows_affected: 0, execution_time_ms: 0 });
+            return Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: 0,
+                execution_time_ms: 0,
+            });
         }
 
         let cmd_name = tokens[0];
@@ -350,22 +480,33 @@ impl DbProvider for RedisProvider {
                 redis::Value::SimpleString(_) => 1,
                 _ => 0,
             };
-            return Ok(QueryResult { columns: vec![], rows: vec![], rows_affected, execution_time_ms });
+            return Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected,
+                execution_time_ms,
+            });
         }
 
         let (columns, rows) = format_redis_result(cmd_name, &value);
         let rows_affected = rows.len() as u64;
-        Ok(QueryResult { columns, rows, rows_affected, execution_time_ms })
+        Ok(QueryResult {
+            columns,
+            rows,
+            rows_affected,
+            execution_time_ms,
+        })
     }
 }
 
 fn format_redis_result(cmd: &str, value: &redis::Value) -> (Vec<String>, Vec<Vec<Option<String>>>) {
     let cmd_upper = cmd.to_uppercase();
     match value {
-        redis::Value::Array(items) => {
-            match cmd_upper.as_str() {
-                "HGETALL" => {
-                    let pairs: Vec<_> = items.chunks(2).filter_map(|chunk| {
+        redis::Value::Array(items) => match cmd_upper.as_str() {
+            "HGETALL" => {
+                let pairs: Vec<_> = items
+                    .chunks(2)
+                    .filter_map(|chunk| {
                         if chunk.len() == 2 {
                             let field = redis_value_to_string(&chunk[0]);
                             let val = redis_value_to_string(&chunk[1]);
@@ -373,29 +514,39 @@ fn format_redis_result(cmd: &str, value: &redis::Value) -> (Vec<String>, Vec<Vec
                         } else {
                             None
                         }
-                    }).collect();
-                    (vec!["field".to_string(), "value".to_string()], pairs)
-                }
-                "ZRANGE" if items.len() % 2 == 0 => {
-                    let pairs: Vec<_> = items.chunks(2).filter_map(|chunk| {
+                    })
+                    .collect();
+                (vec!["field".to_string(), "value".to_string()], pairs)
+            }
+            "ZRANGE" if items.len() % 2 == 0 => {
+                let pairs: Vec<_> = items
+                    .chunks(2)
+                    .filter_map(|chunk| {
                         if chunk.len() == 2 {
-                            Some(vec![redis_value_to_string(&chunk[0]), redis_value_to_string(&chunk[1])])
+                            Some(vec![
+                                redis_value_to_string(&chunk[0]),
+                                redis_value_to_string(&chunk[1]),
+                            ])
                         } else {
                             None
                         }
-                    }).collect();
-                    (vec!["member".to_string(), "score".to_string()], pairs)
-                }
-                _ => {
-                    let rows: Vec<_> = items.iter().map(|v| vec![redis_value_to_string(v)]).collect();
-                    (vec!["value".to_string()], rows)
-                }
+                    })
+                    .collect();
+                (vec!["member".to_string(), "score".to_string()], pairs)
             }
-        }
+            _ => {
+                let rows: Vec<_> = items
+                    .iter()
+                    .map(|v| vec![redis_value_to_string(v)])
+                    .collect();
+                (vec!["value".to_string()], rows)
+            }
+        },
         redis::Value::Map(pairs) => {
-            let rows: Vec<_> = pairs.iter().map(|(k, v)| {
-                vec![redis_value_to_string(k), redis_value_to_string(v)]
-            }).collect();
+            let rows: Vec<_> = pairs
+                .iter()
+                .map(|(k, v)| vec![redis_value_to_string(k), redis_value_to_string(v)])
+                .collect();
             (vec!["field".to_string(), "value".to_string()], rows)
         }
         _ => {
