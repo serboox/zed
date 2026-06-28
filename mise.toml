@@ -1,18 +1,26 @@
 [tasks."build:dev"]
 description = "Build the zed binary (dev profile, unoptimized)"
-run = "cargo build -p zed"
+run = "nice -n 10 cargo build -p zed --jobs $(nproc --ignore=2)"
 
 [tasks."build:release"]
 description = "Build the zed binary (release profile, optimized)"
-run = "cargo build -p zed --release"
+run = "nice -n 10 cargo build -p zed --release --jobs $(nproc --ignore=2)"
 
 [tasks."run:dev"]
-description = "Build and run zed (dev profile)"
-run = "cargo run -p zed"
+description = "Build (if needed) and run zed (dev profile)"
+run = "nice -n 10 cargo run -p zed --jobs $(nproc --ignore=2)"
 
 [tasks."run:release"]
-description = "Build and run zed (release profile)"
-run = "cargo run -p zed --release"
+description = "Build (if needed) and run zed (release profile)"
+run = "nice -n 10 cargo run -p zed --release --jobs $(nproc --ignore=2)"
+
+[tasks."exec:dev"]
+description = "Run the already-built dev binary directly (no recompile)"
+run = "./target/debug/zed"
+
+[tasks."exec:release"]
+description = "Run the already-built release binary directly (no recompile)"
+run = "./target/release/zed"
 
 [tasks.check]
 description = "Fast type-check without linking"
