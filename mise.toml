@@ -1,18 +1,18 @@
 [tasks."build:dev"]
 description = "Build the zed binary (dev profile, unoptimized)"
-run = "nice -n 10 cargo build -p zed --jobs $(nproc --ignore=2)"
+run = "cargo build -p zed"
 
 [tasks."build:release"]
 description = "Build the zed binary (release profile, optimized)"
-run = "nice -n 10 cargo build -p zed --release --jobs $(nproc --ignore=2)"
+run = "cargo build -p zed --release"
 
 [tasks."run:dev"]
 description = "Build (if needed) and run zed (dev profile)"
-run = "nice -n 10 cargo run -p zed --jobs $(nproc --ignore=2)"
+run = "cargo run -p zed"
 
 [tasks."run:release"]
 description = "Build (if needed) and run zed (release profile)"
-run = "nice -n 10 cargo run -p zed --release --jobs $(nproc --ignore=2)"
+run = "cargo run -p zed --release"
 
 [tasks."exec:dev"]
 description = "Run the already-built dev binary directly (no recompile)"
