@@ -25,8 +25,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{
-    CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize, Indicator, Label,
-    LabelSize, Tooltip, prelude::*, right_click_menu,
+    CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
+    Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -1118,6 +1118,10 @@ pub struct DatabasePanel {
     table_indexes_expanded: HashSet<(ConnectionId, String, String)>,
     table_fks_expanded: HashSet<(ConnectionId, String, String)>,
     table_triggers_expanded: HashSet<(ConnectionId, String, String)>,
+    server_objects_expanded: HashSet<ConnectionId>,
+    server_users: HashMap<ConnectionId, Vec<(String, String)>>,
+    table_filter_is_regex: bool,
+    quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1186,6 +1190,10 @@ impl DatabasePanel {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    quick_doc: None,
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -1351,6 +1359,202 @@ impl DatabasePanel {
             DatabaseDriver::MySQL => format!("`{}`", name.replace('`', "``")),
             _ => format!("\"{}\"", name.replace('"', "\"\"")),
         }
+    }
+
+    /// Stacked tree overlays for a column: gold star = primary key,
+    /// blue link = foreign key, hash = unique/secondary index,
+    /// dot = NOT NULL. Order is stable so icons line up across rows.
+    fn column_overlay_icons(col: &ColumnInfo, is_fk: bool) -> Vec<(IconName, Color)> {
+        let mut icons = Vec::new();
+        if col.column_key.as_deref() == Some("PRI") {
+            icons.push((IconName::StarFilled, Color::Warning));
+        }
+        if is_fk {
+            icons.push((IconName::Link, Color::Info));
+        }
+        match col.column_key.as_deref() {
+            Some("UNI") => icons.push((IconName::Hash, Color::Accent)),
+            Some("MUL") if !is_fk => icons.push((IconName::Hash, Color::Muted)),
+            _ => {}
+        }
+        if !col.is_nullable {
+            icons.push((IconName::SquareDot, Color::Muted));
+        }
+        icons
+    }
+
+    fn open_table_ddl(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ddl_task = self
+            .store
+            .update(cx, |store, cx| store.get_table_ddl(id, database, table, cx));
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let ddl = ddl_task.await?;
+            this.update_in(cx, |panel, window, cx| {
+                Self::open_sql_query_with_text(
+                    workspace.clone(),
+                    panel.store.downgrade(),
+                    id,
+                    ddl,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_quick_doc(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) {
+        let title = SharedString::from(format!("{database}.{table}"));
+        let task = self
+            .store
+            .update(cx, |store, cx| store.describe_table(id, database, table, cx));
+        cx.spawn(async move |this, cx| {
+            let columns = task.await.unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.quick_doc = Some((title, columns));
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_quick_doc_popup(
+        &self,
+        title: SharedString,
+        columns: &[ColumnInfo],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rows: Vec<_> = columns
+            .iter()
+            .map(|col| {
+                let is_fk = false;
+                let overlays = Self::column_overlay_icons(col, is_fk);
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .py_0p5()
+                    .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(col.data_type.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(
+                        overlays
+                            .into_iter()
+                            .map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
+                    )
+            })
+            .collect();
+        div()
+            .absolute()
+            .top_8()
+            .right_2()
+            .w(px(320.))
+            .max_h(px(420.))
+            .overflow_hidden()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
+            .shadow_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .child(
+                        IconButton::new("quick-doc-close", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.quick_doc = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().flex().flex_col().px_2().py_1().children(rows))
+    }
+
+    /// Decides whether a table name passes the explorer filter and, if so,
+    /// which byte range to highlight. `None` means the table is filtered out.
+    /// In regex mode an invalid pattern (passed as `filter_regex == None` while
+    /// `is_regex == true`) shows everything without highlight rather than panicking.
+    fn table_filter_match(
+        name: &str,
+        filter_raw: &str,
+        filter_regex: Option<&regex::Regex>,
+        is_regex: bool,
+    ) -> Option<Vec<usize>> {
+        if filter_raw.is_empty() {
+            return Some(Vec::new());
+        }
+        if let Some(regex) = filter_regex {
+            return regex.find(name).map(|matched| matched.range().collect());
+        }
+        if is_regex {
+            return Some(Vec::new());
+        }
+        let lower = name.to_lowercase();
+        let needle = filter_raw.to_lowercase();
+        lower
+            .find(&needle)
+            .map(|start| (start..start + needle.len()).collect())
+    }
+
+    fn toggle_server_objects(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if self.server_objects_expanded.contains(&id) {
+            self.server_objects_expanded.remove(&id);
+            cx.notify();
+            return;
+        }
+        self.server_objects_expanded.insert(id);
+        if !self.server_users.contains_key(&id) {
+            let task = self
+                .store
+                .update(cx, |store, cx| store.list_users(id, cx));
+            cx.spawn(async move |this, cx| {
+                let users = task.await;
+                this.update(cx, |this, cx| {
+                    if let Ok(users) = users {
+                        this.server_users.insert(
+                            id,
+                            users.into_iter().map(|u| (u.name, u.host)).collect(),
+                        );
+                        cx.notify();
+                    }
+                })
+                .log_err();
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+        cx.notify();
     }
 
     fn generate_insert_template(
@@ -1559,7 +1763,17 @@ impl DatabasePanel {
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .child(div().flex_1().child(self.table_filter_editor.clone())),
+                    .child(div().flex_1().child(self.table_filter_editor.clone()))
+                    .child(
+                        IconButton::new("table-filter-regex", IconName::Regex)
+                            .icon_size(IconSize::XSmall)
+                            .toggle_state(self.table_filter_is_regex)
+                            .tooltip(Tooltip::text("Match table names by regular expression"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.table_filter_is_regex = !this.table_filter_is_regex;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 
@@ -1582,6 +1796,8 @@ impl DatabasePanel {
             ConnectionStatus::Error(_) => Color::Error,
         };
         let is_connected = matches!(conn.status, ConnectionStatus::Connected);
+        let is_server_objects_expanded = self.server_objects_expanded.contains(&id);
+        let server_users = self.server_users.get(&id).cloned();
         let error_message = if let ConnectionStatus::Error(ref msg) = conn.status {
             Some(msg.clone())
         } else {
@@ -1594,7 +1810,13 @@ impl DatabasePanel {
         let expanded_database_set = conn.expanded_database_set.clone();
         let expanded_tables = conn.expanded_tables.clone();
         let expanded_table_set = conn.expanded_table_set;
-        let table_filter = self.table_filter_editor.read(cx).text(cx).to_lowercase();
+        let table_filter_raw = self.table_filter_editor.read(cx).text(cx);
+        let filter_is_regex = self.table_filter_is_regex;
+        let filter_regex = if filter_is_regex && !table_filter_raw.is_empty() {
+            regex::Regex::new(&table_filter_raw).ok()
+        } else {
+            None
+        };
         let entity = cx.entity();
         let env_color = conn.config.env_color.clone();
         let db_views = conn.db_views.clone();
@@ -1754,6 +1976,79 @@ impl DatabasePanel {
                         .px_4()
                         .py_1()
                         .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error)),
+                )
+            })
+            .when(is_connected, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .id(ElementId::from(SharedString::from(format!("server-objects-{}", id))))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .pl(px(16.))
+                                .pr_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(gpui::transparent_white()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_server_objects(id, cx);
+                                }))
+                                .child(
+                                    Icon::new(if is_server_objects_expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                                )
+                                .child(Icon::new(IconName::Server).size(IconSize::XSmall).color(Color::Muted))
+                                .child(Label::new("Server Objects").size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                        .when(is_server_objects_expanded, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .pl(px(32.))
+                                    .pr_2()
+                                    .py_1()
+                                    .child(Icon::new(IconName::Person).size(IconSize::XSmall).color(Color::Muted))
+                                    .child(
+                                        Label::new(format!(
+                                            "Users ({})",
+                                            server_users.as_ref().map_or(0, |u| u.len())
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
+                            )
+                            .when_some(server_users, |el, users| {
+                                el.children(users.into_iter().map(|(name, host)| {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .pl(px(48.))
+                                        .pr_2()
+                                        .py_1()
+                                        .child(Label::new(name).size(LabelSize::XSmall))
+                                        .child(
+                                            Label::new(format!("@{host}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                }))
+                            })
+                        }),
                 )
             })
             .when_some(databases, |el, dbs| {
@@ -1936,15 +2231,25 @@ impl DatabasePanel {
                             el.when_some(db_tables, |el, tables| {
                                 el.children(tables.into_iter().filter_map(|table| {
                                     let table_name = table.name;
-                                    if !table_filter.is_empty() && !table_name.to_lowercase().contains(&table_filter) {
-                                        return None;
-                                    }
+                                    let highlight_indices = match Self::table_filter_match(
+                                        &table_name,
+                                        &table_filter_raw,
+                                        filter_regex.as_ref(),
+                                        filter_is_regex,
+                                    ) {
+                                        Some(indices) => indices,
+                                        None => return None,
+                                    };
                                     let tbl_key = (db_name.clone(), table_name.clone());
                                     let is_table_expanded = expanded_table_set.contains(&tbl_key);
                                     let table_columns = expanded_tables.get(&tbl_key).cloned();
                                     let db_for_table = db_name.clone();
                                     let table_idx_data = table_indexes.get(&tbl_key).cloned().unwrap_or_default();
                                     let table_fk_data = table_fks.get(&tbl_key).cloned().unwrap_or_default();
+                                    let fk_columns: HashSet<String> = table_fk_data
+                                        .iter()
+                                        .map(|fk| fk.from_column.clone())
+                                        .collect();
                                     let table_trig_data = table_triggers.get(&tbl_key).cloned().unwrap_or_default();
                                     let is_idx_expanded = indexes_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
                                     let is_fk_expanded = fks_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
@@ -2006,7 +2311,7 @@ impl DatabasePanel {
                                         .child(
                                             div()
                                                 .id(ElementId::from(SharedString::from(format!("tbl-label-{}-{}-{}", id, db_for_table, table_name))))
-                                                .child(Label::new(table_name.clone()).size(LabelSize::Small))
+                                                .child(HighlightedLabel::new(table_name.clone(), highlight_indices).size(LabelSize::Small))
                                                 .tooltip(Tooltip::text("Ctrl+click to view DDL")),
                                         )
                                         .child(
@@ -2179,6 +2484,26 @@ impl DatabasePanel {
                                                         }
                                                     })
                                                     .separator()
+                                                    .entry("Go to DDL", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_table_ddl(id, db.clone(), tbl.clone(), window, cx);
+                                                            });
+                                                        }
+                                                    })
+                                                    .entry("Quick Documentation", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |_window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_quick_doc(id, db.clone(), tbl.clone(), cx);
+                                                            });
+                                                        }
+                                                    })
                                                     .entry("Script as CREATE", None, {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
@@ -2454,12 +2779,10 @@ impl DatabasePanel {
                                         )
                                         .when(is_table_expanded, |el| {
                                             el.when_some(table_columns, |el, columns| {
-                                                el.children(columns.into_iter().map(|col| {
-                                                    let key_indicator = col
-                                                        .column_key
-                                                        .as_deref()
-                                                        .unwrap_or("")
-                                                        .to_string();
+                                                let fk_columns = fk_columns.clone();
+                                                el.children(columns.into_iter().map(move |col| {
+                                                    let is_fk = fk_columns.contains(&col.name);
+                                                    let overlays = Self::column_overlay_icons(&col, is_fk);
                                                     div()
                                                         .flex()
                                                         .flex_row()
@@ -2477,13 +2800,13 @@ impl DatabasePanel {
                                                                 .size(LabelSize::XSmall)
                                                                 .color(Color::Muted),
                                                         )
-                                                        .when(!key_indicator.is_empty(), |el| {
-                                                            el.child(
-                                                                Label::new(key_indicator)
-                                                                    .size(LabelSize::XSmall)
-                                                                    .color(Color::Accent),
-                                                            )
-                                                        })
+                                                        .children(overlays.into_iter().map(
+                                                            |(icon, color)| {
+                                                                Icon::new(icon)
+                                                                    .size(IconSize::XSmall)
+                                                                    .color(color)
+                                                            },
+                                                        ))
                                                 }))
                                             })
                                             .when(!table_idx_data.is_empty(), |el| {
@@ -2914,7 +3237,11 @@ impl Render for DatabasePanel {
             .key_context("DatabasePanel")
             .track_focus(&self.focus_handle)
             .size_full()
+            .relative()
             .overflow_hidden()
+            .when_some(self.quick_doc.clone(), |el, (title, columns)| {
+                el.child(self.render_quick_doc_popup(title, &columns, cx))
+            })
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -3363,6 +3690,69 @@ mod tests {
         assert_eq!(folders[0].1.len(), 2);
     }
 
+    fn test_column(key: Option<&str>, is_nullable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: "c".to_string(),
+            data_type: "int".to_string(),
+            is_nullable,
+            column_key: key.map(|s| s.to_string()),
+            default_value: None,
+            extra: String::new(),
+        }
+    }
+
+    #[test]
+    fn column_overlay_icons_reflect_key_and_nullability() {
+        let pk = DatabasePanel::column_overlay_icons(&test_column(Some("PRI"), false), false);
+        assert!(pk.iter().any(|(icon, _)| matches!(icon, IconName::StarFilled)));
+        assert!(pk.iter().any(|(icon, _)| matches!(icon, IconName::SquareDot)));
+
+        let fk = DatabasePanel::column_overlay_icons(&test_column(Some("MUL"), true), true);
+        assert!(fk.iter().any(|(icon, _)| matches!(icon, IconName::Link)));
+        assert!(
+            !fk.iter().any(|(icon, _)| matches!(icon, IconName::Hash)),
+            "an FK column must not also render a plain index hash"
+        );
+
+        let unique = DatabasePanel::column_overlay_icons(&test_column(Some("UNI"), true), false);
+        assert!(unique.iter().any(|(icon, _)| matches!(icon, IconName::Hash)));
+
+        let plain = DatabasePanel::column_overlay_icons(&test_column(None, true), false);
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn table_filter_match_substring_and_regex() {
+        assert_eq!(
+            DatabasePanel::table_filter_match("users", "", None, false),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            DatabasePanel::table_filter_match("payment_log", "PAY", None, false),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            DatabasePanel::table_filter_match("orders", "xyz", None, false),
+            None
+        );
+
+        let regex = regex::Regex::new("^pay").expect("valid regex");
+        assert_eq!(
+            DatabasePanel::table_filter_match("payment", "^pay", Some(&regex), true),
+            Some(vec![0, 1, 2])
+        );
+        let regex_miss = regex::Regex::new("^zzz").expect("valid regex");
+        assert_eq!(
+            DatabasePanel::table_filter_match("payment", "^zzz", Some(&regex_miss), true),
+            None
+        );
+        assert_eq!(
+            DatabasePanel::table_filter_match("payment", "(", None, true),
+            Some(Vec::new()),
+            "an invalid regex pattern must show all rows without panicking"
+        );
+    }
+
     // Returns a fixed result row so the end-to-end test runs deterministically
     // without a live database or a Tokio runtime (which would break the
     // GPUI test scheduler's determinism).
@@ -3577,6 +3967,10 @@ mod tests {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    quick_doc: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -3722,6 +4116,10 @@ mod tests {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    quick_doc: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -3859,6 +4257,10 @@ mod tests {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    quick_doc: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4255,6 +4657,10 @@ mod tests {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    quick_doc: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4399,6 +4805,103 @@ mod tests {
             assert!(
                 dock.panel::<DatabasePanel>().is_some(),
                 "DatabasePanel must be in left dock"
+            );
+        });
+    }
+
+    async fn load_connected_panel(
+        cx: &mut TestAppContext,
+        config: db_client::ConnectionConfig,
+    ) -> (Entity<DatabasePanel>, VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut visual_cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut visual_cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut visual_cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            });
+        });
+        visual_cx.run_until_parked();
+        (panel, visual_cx)
+    }
+
+    #[gpui::test]
+    async fn quick_doc_populates_title_from_table(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "quick-doc".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.open_quick_doc(connection_id, "public".to_string(), "users".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            let (title, _columns) = panel
+                .quick_doc
+                .as_ref()
+                .expect("quick doc state must be set after opening it");
+            assert_eq!(title.as_ref(), "public.users");
+        });
+    }
+
+    #[gpui::test]
+    async fn server_objects_expand_loads_users(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "server-objects".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.toggle_server_objects(connection_id, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.server_objects_expanded.contains(&connection_id),
+                "Server Objects node must be expanded after toggle"
+            );
+            assert!(
+                panel.server_users.contains_key(&connection_id),
+                "users must be fetched and cached when Server Objects expands"
+            );
+        });
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.toggle_server_objects(connection_id, cx);
+        });
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                !panel.server_objects_expanded.contains(&connection_id),
+                "toggling again must collapse the Server Objects node"
             );
         });
     }
