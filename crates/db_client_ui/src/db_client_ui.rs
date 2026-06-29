@@ -1,3 +1,4 @@
+mod compare_data;
 mod connection_view;
 mod driver_icon;
 mod modify_table;
