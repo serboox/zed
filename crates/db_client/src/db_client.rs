@@ -49,6 +49,14 @@ pub fn is_read_only_query(sql: &str) -> bool {
         || upper.starts_with("EXPLAIN")
 }
 
+/// True when `sql` can be wrapped in a subquery for client-side paging.
+/// Metadata statements such as SHOW/DESCRIBE/EXPLAIN may return rows, but most
+/// databases do not allow them inside `SELECT * FROM (...)`.
+pub fn is_pageable_query(sql: &str) -> bool {
+    let upper = sql.trim_start().to_uppercase();
+    upper.starts_with("SELECT") || upper.starts_with("WITH")
+}
+
 /// True when `sql` already contains a `LIMIT` keyword, so appending another
 /// would produce invalid SQL. Tokenizes on non-alphanumerics so a column named
 /// like "delimiter" is not mistaken for a LIMIT clause.
@@ -64,7 +72,7 @@ fn has_limit_clause(sql: &str) -> bool {
 /// are returned unchanged.
 pub fn apply_default_limit(sql: &str, limit: usize) -> String {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    if !is_read_only_query(trimmed) || has_limit_clause(trimmed) {
+    if !is_pageable_query(trimmed) || has_limit_clause(trimmed) {
         return sql.to_string();
     }
     format!("{trimmed} LIMIT {limit}")
@@ -76,6 +84,9 @@ mod tests {
 
     #[test]
     fn appends_limit_only_to_unbounded_read_queries() {
+        assert!(is_read_only_query("SHOW CREATE TABLE instruments.splits"));
+        assert!(!is_pageable_query("SHOW CREATE TABLE instruments.splits"));
+
         assert_eq!(
             apply_default_limit("SELECT * FROM users", 500),
             "SELECT * FROM users LIMIT 500"
@@ -94,6 +105,12 @@ mod tests {
         assert_eq!(
             apply_default_limit("UPDATE users SET name = 'a'", 500),
             "UPDATE users SET name = 'a'"
+        );
+        // Metadata statements can return rows, but they are not valid subqueries
+        // and must be sent to the database unchanged.
+        assert_eq!(
+            apply_default_limit("SHOW CREATE TABLE instruments.splits", 500),
+            "SHOW CREATE TABLE instruments.splits"
         );
         // A column whose name merely contains "limit" is not a LIMIT clause.
         assert_eq!(

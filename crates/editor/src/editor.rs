@@ -761,6 +761,16 @@ impl BufferSerialization {
 pub trait Addon: 'static {
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
+    fn render_gutter_indicator(
+        &self,
+        _: u32,
+        _: Option<u32>,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn render_buffer_header_controls(
         &self,
         _: &ExcerptBoundaryInfo,

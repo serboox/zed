@@ -299,8 +299,10 @@ impl DbProvider for MySqlProvider {
             .fetch_one(&self.pool)
             .await
             .context("Failed to get table DDL")?;
-        let ddl: Vec<u8> = row.try_get(1).context("Failed to read DDL from result")?;
-        Ok(bytes_to_string(ddl))
+        row.try_get::<Vec<u8>, _>(1)
+            .map(bytes_to_string)
+            .or_else(|_| row.try_get::<String, _>(1))
+            .context("Failed to read DDL from result")
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
@@ -333,7 +335,7 @@ impl DbProvider for MySqlProvider {
             // decoded and its cells capped before the next row is read, so a huge
             // result (many rows or multi-megabyte BLOB cells) cannot be pulled
             // into memory all at once and freeze the client.
-            let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
+            let mut stream = sqlx::raw_sql(&prefixed).fetch(&self.pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -717,6 +719,59 @@ mod integration_tests {
             .expect("Failed to execute SHOW DATABASES");
         assert!(!result.columns.is_empty());
         assert!(!result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_execute_show_create_table() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zed_db_client_test_{}", Uuid::new_v4().simple());
+        let table = "show_create_smoke";
+        let quoted_database = format!("`{}`", database.replace('`', "``"));
+        let quoted_table = format!("`{}`", table.replace('`', "``"));
+
+        provider
+            .execute_query("", &format!("CREATE DATABASE {quoted_database}"))
+            .await
+            .expect("Failed to create temporary database");
+
+        let test_result = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "CREATE TABLE {quoted_table} (
+                            id INT NOT NULL PRIMARY KEY,
+                            name VARCHAR(64) NULL
+                        )"
+                    ),
+                )
+                .await?;
+            provider
+                .execute_query(&database, &format!("SHOW CREATE TABLE {quoted_table}"))
+                .await
+        }
+        .await;
+
+        provider
+            .execute_query("", &format!("DROP DATABASE {quoted_database}"))
+            .await
+            .expect("Failed to clean up temporary database");
+
+        let result = test_result.expect("Failed to execute SHOW CREATE TABLE");
+        assert!(result.columns.len() >= 2);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_deref(), Some(table));
+        assert!(
+            result.rows[0].iter().flatten().any(|cell| {
+                cell.contains("CREATE TABLE") && cell.contains(&format!("`{table}`"))
+            }),
+            "SHOW CREATE TABLE should return a DDL cell"
+        );
     }
 
     // Regression test for the "this functionality requires a Tokio context"

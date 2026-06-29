@@ -2611,6 +2611,49 @@ impl EditorElement {
         })
     }
 
+    fn layout_addon_gutter_indicators(
+        &self,
+        gutter: &Gutter,
+        occupied_rows: &HashSet<DisplayRow>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        if self.split_side == Some(SplitSide::Left) {
+            return Vec::new();
+        }
+
+        let visible_rows = gutter
+            .row_infos
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, row_info)| {
+                let display_row = DisplayRow(gutter.range.start.0 + ix as u32);
+                if occupied_rows.contains(&display_row) {
+                    return None;
+                }
+                Some((display_row, row_info.buffer_row))
+            })
+            .collect_vec();
+
+        self.editor.update(cx, |editor, cx| {
+            visible_rows
+                .into_iter()
+                .filter_map(|(display_row, buffer_row)| {
+                    gutter.layout_optional_item_after_line_numbers(
+                        display_row,
+                        |cx, window| {
+                            editor.addons.values().find_map(|addon| {
+                                addon.render_gutter_indicator(display_row.0, buffer_row, window, cx)
+                            })
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .collect_vec()
+        })
+    }
+
     fn layout_expand_toggles(
         &self,
         gutter_hitbox: &Hitbox,
@@ -6645,6 +6688,21 @@ impl Gutter<'_> {
         window: &mut Window,
         cx: &mut Context<'_, Editor>,
     ) -> Option<AnyElement> {
+        self.layout_optional_item(
+            display_row,
+            |cx, window| Some(render_item(cx, window)),
+            window,
+            cx,
+        )
+    }
+
+    fn layout_optional_item(
+        &self,
+        display_row: DisplayRow,
+        render_item: impl Fn(&mut Context<'_, Editor>, &mut Window) -> Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut Context<'_, Editor>,
+    ) -> Option<AnyElement> {
         if !self.range.contains(&display_row) {
             return None;
         }
@@ -6662,7 +6720,40 @@ impl Gutter<'_> {
             return None;
         }
 
-        let button = self.prepaint_button(render_item(cx, window), display_row, window, cx);
+        let button = self.prepaint_button(render_item(cx, window)?, display_row, window, cx);
+        Some(button)
+    }
+
+    fn layout_optional_item_after_line_numbers(
+        &self,
+        display_row: DisplayRow,
+        render_item: impl Fn(&mut Context<'_, Editor>, &mut Window) -> Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut Context<'_, Editor>,
+    ) -> Option<AnyElement> {
+        if !self.range.contains(&display_row) {
+            return None;
+        }
+
+        if self
+            .row_infos
+            .get((display_row.0.saturating_sub(self.range.start.0)) as usize)
+            .is_some_and(|row_info| {
+                row_info.expand_info.is_some()
+                    || row_info
+                        .diff_status
+                        .is_some_and(|status| status.is_deleted())
+            })
+        {
+            return None;
+        }
+
+        let button = self.prepaint_button_after_line_numbers(
+            render_item(cx, window)?,
+            display_row,
+            window,
+            cx,
+        );
         Some(button)
     }
 
@@ -6682,6 +6773,35 @@ impl Gutter<'_> {
             + self.dimensions.git_blame_entries_width.unwrap_or_default();
 
         let x = git_gutter_width + px(2.);
+
+        let mut y = Pixels::from(
+            (row.as_f64() - self.scroll_position.y) * ScrollPixelOffset::from(self.line_height),
+        );
+        y += (self.line_height - indicator_size.height) / 2.;
+
+        button.prepaint_as_root(
+            self.hitbox.origin + point(x, y),
+            available_space,
+            window,
+            cx,
+        );
+        button
+    }
+
+    fn prepaint_button_after_line_numbers(
+        &self,
+        mut button: AnyElement,
+        row: DisplayRow,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let available_space = size(
+            AvailableSpace::MinContent,
+            AvailableSpace::Definite(self.line_height),
+        );
+        let indicator_size = button.layout_as_root(available_space, window, cx);
+        let x = self.hitbox.size.width - self.dimensions.right_padding + px(8.);
+        let x = if x < px(0.) { px(0.) } else { x };
 
         let mut y = Pixels::from(
             (row.as_f64() - self.scroll_position.y) * ScrollPixelOffset::from(self.line_height),
@@ -9034,7 +9154,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
-                    let test_indicators = if gutter_settings.runnables {
+                    let mut test_indicators = if gutter_settings.runnables {
                         self.layout_run_indicators(
                             &gutter,
                             &run_indicator_rows,
@@ -9072,6 +9192,16 @@ impl Element for EditorElement {
                     } else {
                         Vec::new()
                     };
+
+                    let mut occupied_indicator_rows = run_indicator_rows.clone();
+                    occupied_indicator_rows.extend(breakpoint_rows.keys().copied());
+                    occupied_indicator_rows.extend(bookmark_rows.iter().copied());
+                    test_indicators.extend(self.layout_addon_gutter_indicators(
+                        &gutter,
+                        &occupied_indicator_rows,
+                        window,
+                        cx,
+                    ));
 
                     let gutter_hover_button = self
                         .editor

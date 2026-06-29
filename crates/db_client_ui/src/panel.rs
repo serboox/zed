@@ -3,6 +3,7 @@ use crate::driver_icon::brand_icon;
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent};
+use collections::{HashMap, HashSet};
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, ProcedureKind, QueryResult, schema::ColumnInfo,
 };
@@ -19,11 +20,14 @@ use project::{
     DocumentHighlight, InlayHint, InvalidationStrategy, Location, LocationLink, ProjectTransaction,
     lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
 };
-use collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
-use ui::{ContextMenu, Icon, IconButton, IconName, IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize, Indicator, Label,
+    LabelSize, Tooltip, prelude::*, right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::{
     Event as WorkspaceEvent, ItemHandle, OpenOptions, OpenVisible, Pane, Workspace,
@@ -60,20 +64,299 @@ pub(crate) fn init(_cx: &mut App) {
 // against that exact connection. The RunQuery handler reads this addon first;
 // when it is absent (e.g. a console restored from a session) the handler falls
 // back to the console file path, so the binding can never silently break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryExecutionStatus {
+    Running,
+    Success,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryExecutionMarker {
+    row: u32,
+    status: QueryExecutionStatus,
+}
+
 struct DbQueryEditorAddon {
     connection_id: ConnectionId,
+    query_markers: Vec<QueryExecutionMarker>,
 }
 
 impl editor::Addon for DbQueryEditorAddon {
+    fn render_gutter_indicator(
+        &self,
+        _: u32,
+        buffer_row: Option<u32>,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) -> Option<gpui::AnyElement> {
+        let row = buffer_row?;
+        let status = self
+            .query_markers
+            .iter()
+            .find(|marker| marker.row == row)?
+            .status;
+
+        Some(render_query_status_indicator(row, status).into_any_element())
+    }
+
     fn to_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+impl DbQueryEditorAddon {
+    fn new(connection_id: ConnectionId) -> Self {
+        Self {
+            connection_id,
+            query_markers: Vec::new(),
+        }
+    }
+
+    fn clear_query_markers(&mut self) {
+        self.query_markers.clear();
+    }
+
+    fn mark_query(&mut self, row: u32, status: QueryExecutionStatus) {
+        if let Some(marker) = self
+            .query_markers
+            .iter_mut()
+            .find(|marker| marker.row == row)
+        {
+            marker.status = status;
+        } else {
+            self.query_markers
+                .push(QueryExecutionMarker { row, status });
+        }
+    }
+
+    #[cfg(test)]
+    fn query_markers(&self) -> &[QueryExecutionMarker] {
+        &self.query_markers
+    }
+}
+
+fn render_query_status_indicator(row: u32, status: QueryExecutionStatus) -> impl IntoElement {
+    let id = ElementId::from(SharedString::from(format!("sql-query-status-{row}")));
+    div()
+        .id(id.clone())
+        .debug_selector(move || format!("SQL_QUERY_STATUS-{row}"))
+        .size_5()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(match status {
+            QueryExecutionStatus::Running => Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Small)
+                .color(Color::Hint)
+                .with_keyed_rotate_animation(id, 1)
+                .into_any_element(),
+            QueryExecutionStatus::Success => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            QueryExecutionStatus::Error => Icon::new(IconName::XCircle)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+        })
 }
 
 struct DbSemanticsProvider {
     connection_id: ConnectionId,
     store: WeakEntity<DatabaseStore>,
     workspace: WeakEntity<Workspace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlTableReference {
+    database: Option<String>,
+    table: String,
+    start: usize,
+    end: usize,
+}
+
+fn is_sql_reference_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'
+}
+
+fn is_sql_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn keyword_at(bytes: &[u8], index: usize, keyword: &[u8]) -> bool {
+    if index + keyword.len() > bytes.len() {
+        return false;
+    }
+    if index > 0 && is_sql_word_byte(bytes[index - 1]) {
+        return false;
+    }
+    if index + keyword.len() < bytes.len() && is_sql_word_byte(bytes[index + keyword.len()]) {
+        return false;
+    }
+    bytes[index..index + keyword.len()]
+        .iter()
+        .zip(keyword)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn skip_sql_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn parse_table_reference(
+    text: &str,
+    reference_start: usize,
+    reference_end: usize,
+    required_offset: Option<usize>,
+) -> Option<SqlTableReference> {
+    if reference_start >= reference_end || reference_end > text.len() {
+        return None;
+    }
+
+    let reference = &text[reference_start..reference_end];
+    if reference.is_empty() || reference.starts_with('.') || reference.ends_with('.') {
+        return None;
+    }
+
+    let (database, table, table_start) = if let Some(dot) = reference.rfind('.') {
+        let database = &reference[..dot];
+        let table = &reference[dot + 1..];
+        if database.is_empty() || table.is_empty() {
+            return None;
+        }
+        (
+            Some(database.to_string()),
+            table.to_string(),
+            reference_start + dot + 1,
+        )
+    } else {
+        (None, reference.to_string(), reference_start)
+    };
+
+    if table.is_empty() {
+        return None;
+    }
+
+    let table_end = table_start + table.len();
+    if let Some(offset) = required_offset {
+        if offset < table_start || offset > table_end {
+            return None;
+        }
+    }
+
+    Some(SqlTableReference {
+        database,
+        table,
+        start: table_start,
+        end: table_end,
+    })
+}
+
+fn lexical_table_reference_at_offset(text: &str, offset: usize) -> Option<SqlTableReference> {
+    if offset > text.len() {
+        return None;
+    }
+
+    let bytes = text.as_bytes();
+    let mut start = offset;
+    while start > 0 && is_sql_reference_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+
+    let mut end = offset;
+    while end < bytes.len() && is_sql_reference_byte(bytes[end]) {
+        end += 1;
+    }
+
+    if start == end {
+        return None;
+    }
+
+    parse_table_reference(text, start, end, Some(offset))
+}
+
+fn table_reference_at_offset(text: &str, offset: usize) -> Option<SqlTableReference> {
+    lexical_table_reference_at_offset(text, offset)
+}
+
+fn table_reference_after(
+    bytes: &[u8],
+    sql: &str,
+    mut reference_start: usize,
+) -> Option<SqlTableReference> {
+    reference_start = skip_sql_whitespace(bytes, reference_start);
+    let mut reference_end = reference_start;
+    while reference_end < bytes.len() && is_sql_reference_byte(bytes[reference_end]) {
+        reference_end += 1;
+    }
+    parse_table_reference(sql, reference_start, reference_end, None)
+}
+
+fn select_table_reference(sql: &str) -> Option<SqlTableReference> {
+    let bytes = sql.as_bytes();
+    let select_start = skip_sql_whitespace(bytes, 0);
+    if !keyword_at(bytes, select_start, b"select") {
+        return None;
+    }
+
+    let mut index = select_start + b"select".len();
+    while index < bytes.len() {
+        if keyword_at(bytes, index, b"from") {
+            return table_reference_after(bytes, sql, index + b"from".len());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn show_create_table_reference(sql: &str) -> Option<SqlTableReference> {
+    let bytes = sql.as_bytes();
+    let mut index = skip_sql_whitespace(bytes, 0);
+    if !keyword_at(bytes, index, b"show") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"show".len());
+    if !keyword_at(bytes, index, b"create") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"create".len());
+    if !keyword_at(bytes, index, b"table") {
+        return None;
+    }
+    table_reference_after(bytes, sql, index + b"table".len())
+}
+
+fn statement_table_reference_at_offset(text: &str, offset: usize) -> Option<SqlTableReference> {
+    let lexical_reference = lexical_table_reference_at_offset(text, offset)?;
+    let cursor = offset.min(text.len());
+    let statement_start = text[..cursor]
+        .rfind(';')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let statement_end = text[cursor..]
+        .find(';')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len());
+    let statement = &text[statement_start..statement_end];
+    let mut statement_reference =
+        show_create_table_reference(statement).or_else(|| select_table_reference(statement))?;
+    statement_reference.start += statement_start;
+    statement_reference.end += statement_start;
+    if lexical_reference.start == statement_reference.start
+        && lexical_reference.end == statement_reference.end
+    {
+        Some(statement_reference)
+    } else {
+        None
+    }
 }
 
 impl SemanticsProvider for DbSemanticsProvider {
@@ -153,35 +436,10 @@ impl SemanticsProvider for DbSemanticsProvider {
         let snapshot = buffer.read(cx).snapshot();
         let offset = snapshot.offset_for_anchor(&position);
         let text = snapshot.text();
-        let bytes = text.as_bytes();
-
-        fn is_sql_ident(b: u8) -> bool {
-            b.is_ascii_alphanumeric() || b == b'_'
-        }
-
-        let mut start = offset;
-        while start > 0 && (is_sql_ident(bytes[start - 1]) || bytes[start - 1] == b'.') {
-            start -= 1;
-        }
-        let mut end = offset;
-        while end < bytes.len() && (is_sql_ident(bytes[end]) || bytes[end] == b'.') {
-            end += 1;
-        }
-
-        if start == end {
-            return None;
-        }
-
-        let word = text[start..end].to_string();
-        let (database_opt, table_name) = if let Some(dot) = word.rfind('.') {
-            (Some(word[..dot].to_string()), word[dot + 1..].to_string())
-        } else {
-            (None, word)
-        };
-
-        if table_name.is_empty() {
-            return None;
-        }
+        let table_reference = statement_table_reference_at_offset(&text, offset)
+            .or_else(|| table_reference_at_offset(&text, offset))?;
+        let database_opt = table_reference.database;
+        let table_name = table_reference.table;
 
         let (database, table) = self
             .store
@@ -200,8 +458,8 @@ impl SemanticsProvider for DbSemanticsProvider {
             })
             .ok()
             .flatten()?;
-        let word_start = snapshot.anchor_before(start);
-        let word_end = snapshot.anchor_after(end);
+        let word_start = snapshot.anchor_before(table_reference.start);
+        let word_end = snapshot.anchor_after(table_reference.end);
         let source_buffer = buffer.clone();
         let store = self.store.clone();
         let workspace = self.workspace.clone();
@@ -213,13 +471,15 @@ impl SemanticsProvider for DbSemanticsProvider {
             })?;
             let ddl = ddl_task.await?;
 
-            let language_task =
-                workspace.read_with(cx, |ws, _| ws.app_state().languages.language_for_name("SQL"))?;
+            let language_task = workspace.read_with(cx, |ws, _| {
+                ws.app_state().languages.language_for_name("SQL")
+            })?;
             let language = language_task.await.ok();
 
             let ddl_buffer = workspace.update(cx, |ws, cx| {
-                ws.project()
-                    .update(cx, |project, cx| project.create_local_buffer(&ddl, language, false, cx))
+                ws.project().update(cx, |project, cx| {
+                    project.create_local_buffer(&ddl, language, false, cx)
+                })
             })?;
 
             let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(0));
@@ -259,6 +519,7 @@ impl SemanticsProvider for DbSemanticsProvider {
 
 // Returns the `;`-delimited SQL statement that contains the byte offset
 // `cursor`, trimmed. `;` is ASCII so byte scanning stays on char boundaries.
+#[cfg(test)]
 fn statement_at_cursor(text: &str, cursor: usize) -> String {
     let cursor = cursor.min(text.len());
     let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
@@ -267,6 +528,77 @@ fn statement_at_cursor(text: &str, cursor: usize) -> String {
         .map(|i| cursor + i)
         .unwrap_or(text.len());
     text[start..end].trim().to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SqlStatementRun {
+    sql: String,
+    start_row: u32,
+}
+
+fn row_for_byte_offset(text: &str, offset: usize) -> u32 {
+    text.as_bytes()
+        .get(..offset.min(text.len()))
+        .unwrap_or_default()
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count() as u32
+}
+
+fn trim_sql_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len());
+    if start >= end {
+        return None;
+    }
+    let segment = text.get(start..end)?;
+    let leading = segment.len() - segment.trim_start().len();
+    let trailing = segment.len() - segment.trim_end().len();
+    let trimmed_start = start + leading;
+    let trimmed_end = end.saturating_sub(trailing);
+    (trimmed_start < trimmed_end).then_some(trimmed_start..trimmed_end)
+}
+
+fn statement_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
+    let cursor = cursor.min(text.len());
+    let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
+    let end = text[cursor..]
+        .find(';')
+        .map(|i| cursor + i)
+        .unwrap_or(text.len());
+    trim_sql_range(text, start..end)
+}
+
+fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementRun> {
+    let Some(range) = trim_sql_range(text, range) else {
+        return Vec::new();
+    };
+    let mut statements = Vec::new();
+    let mut start = range.start;
+    let Some(selected_text) = text.get(range.clone()) else {
+        return Vec::new();
+    };
+    for relative_semicolon in selected_text.match_indices(';').map(|(ix, _)| ix) {
+        let end = range.start + relative_semicolon;
+        if let Some(trimmed) = trim_sql_range(text, start..end)
+            && let Some(sql) = text.get(trimmed.clone())
+        {
+            statements.push(SqlStatementRun {
+                sql: sql.to_string(),
+                start_row: row_for_byte_offset(text, trimmed.start),
+            });
+        }
+        start = end + 1;
+    }
+    if let Some(trimmed) = trim_sql_range(text, start..range.end)
+        && let Some(sql) = text.get(trimmed.clone())
+    {
+        statements.push(SqlStatementRun {
+            sql: sql.to_string(),
+            start_row: row_for_byte_offset(text, trimmed.start),
+        });
+    }
+    statements
 }
 
 // Splits connections into the top-level group (folder == None) and named
@@ -380,17 +712,49 @@ fn connection_id_from_console_path(
     })
 }
 
+fn install_db_editor_features(
+    editor: Entity<Editor>,
+    store: WeakEntity<DatabaseStore>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut App,
+) {
+    install_on_editor(editor.clone(), store.clone(), cx);
+
+    let Some(store_entity) = store.upgrade() else {
+        return;
+    };
+    let Some(connection_id) = console_connection_for_editor(&editor, &store_entity, cx) else {
+        return;
+    };
+
+    editor.update(cx, |editor, cx| {
+        if editor.addon::<DbQueryEditorAddon>().is_none() {
+            editor.register_addon(DbQueryEditorAddon::new(connection_id));
+        }
+        editor.set_show_runnables(true, cx);
+        editor.set_semantics_provider(Some(Rc::new(DbSemanticsProvider {
+            connection_id,
+            store,
+            workspace,
+        })));
+    });
+}
+
 /// Opens the persistent SQL console for `connection_id`. The file lives on disk
 /// (openable even when the database is not connected) and auto-saves whenever
 /// the editor loses focus, so there is never a save prompt. Ctrl+Enter runs the
 /// statement under the cursor against this connection.
 pub fn open_new_sql_query(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     connection_id: ConnectionId,
     connection_label: String,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let store = workspace
+        .panel::<DatabasePanel>(cx)
+        .map(|panel| panel.read(cx).store.downgrade());
+    let workspace_handle = workspace.weak_handle();
     let path = connection_query_path(connection_id, &connection_label);
     cx.spawn_in(window, async move |workspace, cx| {
         // Make sure the file exists before opening it (blocking fs off the main thread).
@@ -419,28 +783,33 @@ pub fn open_new_sql_query(
         })?;
         let item = open.await?;
 
-        workspace.update_in(cx, |_workspace, _window, cx| {
-            let Some(editor) = item.act_as::<Editor>(cx) else {
-                return;
-            };
-            editor.update(cx, |editor, _| {
-                editor.register_addon(DbQueryEditorAddon { connection_id });
-            });
-            // Auto-save on focus loss: write the buffer back to its file so the
-            // console never prompts to save.
-            cx.subscribe(&editor, |workspace, editor, event, cx| {
-                if matches!(event, EditorEvent::Blurred) {
-                    let project = workspace.project().clone();
-                    if let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() {
-                        project
-                            .update(cx, |project, cx| project.save_buffer(buffer, cx))
-                            .detach_and_log_err(cx);
-                    }
+        workspace
+            .update_in(cx, |_workspace, _window, cx| {
+                let Some(editor) = item.act_as::<Editor>(cx) else {
+                    return;
+                };
+                editor.update(cx, |editor, cx| {
+                    editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                    editor.set_show_runnables(true, cx);
+                });
+                if let Some(store) = store.clone() {
+                    install_db_editor_features(editor.clone(), store, workspace_handle.clone(), cx);
                 }
+                // Auto-save on focus loss: write the buffer back to its file so the
+                // console never prompts to save.
+                cx.subscribe(&editor, |workspace, editor, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) {
+                        let project = workspace.project().clone();
+                        if let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() {
+                            project
+                                .update(cx, |project, cx| project.save_buffer(buffer, cx))
+                                .detach_and_log_err(cx);
+                        }
+                    }
+                })
+                .detach();
             })
-            .detach();
-        })
-        .log_err();
+            .log_err();
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -531,7 +900,7 @@ fn run_sql_from_editor(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-    transform: impl FnOnce(String) -> String,
+    transform: impl Fn(String) -> String,
 ) {
     let panel = workspace.panel::<DatabasePanel>(cx);
     let panel = match panel {
@@ -567,9 +936,7 @@ fn run_sql_from_editor(
         }
     };
 
-    // Run the selection if there is one, otherwise just the statement under the
-    // cursor — never the whole editor, which would fire every query at once.
-    let sql = editor.update(cx, |editor, cx| {
+    let mut statements = editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let selection = editor.selections.newest_anchor();
         let start = selection.start.to_offset(&snapshot).0;
@@ -577,17 +944,37 @@ fn run_sql_from_editor(
         let full = editor.text(cx);
         if start != end {
             let (lo, hi) = (start.min(end), start.max(end));
-            full.get(lo..hi).map(|s| s.to_string()).unwrap_or(full)
+            statement_runs_in_range(&full, lo..hi)
         } else {
             let cursor = selection.head().to_offset(&snapshot).0;
-            statement_at_cursor(&full, cursor)
+            statement_range_at_cursor(&full, cursor)
+                .map(|range| statement_runs_in_range(&full, range))
+                .unwrap_or_default()
         }
     });
-    if sql.trim().is_empty() {
+    if statements.is_empty() {
         return;
     }
-    let sql = sql.trim().trim_end_matches(';').trim().to_string();
-    let sql = transform(sql);
+    statements = statements
+        .into_iter()
+        .filter_map(|statement| {
+            let sql = transform(statement.sql);
+            let sql = sql.trim().trim_end_matches(';').trim().to_string();
+            (!sql.is_empty()).then_some(SqlStatementRun {
+                sql,
+                start_row: statement.start_row,
+            })
+        })
+        .collect();
+    if statements.is_empty() {
+        return;
+    }
+    editor.update(cx, |editor, cx| {
+        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+            addon.clear_query_markers();
+            cx.notify();
+        }
+    });
 
     let connection = {
         let store_ref = store.read(cx);
@@ -625,30 +1012,96 @@ fn run_sql_from_editor(
     let Some(pane) = terminal_panel.read(cx).pane() else {
         return;
     };
-    let result_view =
-        show_result_in_pane(&pane, conn_id, format!("{conn_label} — Results").into(), window, cx);
-    result_view.update(cx, |view, cx| view.set_loading(cx));
+    let result_view = show_result_in_pane(
+        &pane,
+        conn_id,
+        format!("{conn_label} — Results").into(),
+        window,
+        cx,
+    );
+    result_view.update(cx, |view, cx| {
+        view.clear_table_context();
+        view.set_loading(cx);
+    });
     workspace.open_panel::<TerminalPanel>(window, cx);
 
     cx.spawn_in(window, async move |_workspace, cx| {
-        // Auto-connect if the database is not connected (covers both a fresh
-        // session and a dropped connection).
-        if !connected {
-            let connect = store.update(cx, |store, cx| store.connect(conn_id, cx));
-            if let Err(err) = connect.await {
-                result_view.update(cx, |view, cx| {
-                    view.set_error(format!("Could not connect to '{conn_label}': {err}"), cx);
-                });
-                return anyhow::Ok(());
+        let mut connected = connected;
+        for statement in statements {
+            editor.update(cx, |editor, cx| {
+                if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                    addon.mark_query(statement.start_row, QueryExecutionStatus::Running);
+                    cx.notify();
+                }
+            });
+            result_view.update(cx, |view, cx| {
+                view.clear_table_context();
+                view.set_loading(cx);
+            });
+
+            // Auto-connect if the database is not connected (covers both a fresh
+            // session and a dropped connection).
+            if !connected {
+                let connect = store.update(cx, |store, cx| store.connect(conn_id, cx));
+                if let Err(err) = connect.await {
+                    editor.update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                            addon.mark_query(statement.start_row, QueryExecutionStatus::Error);
+                            cx.notify();
+                        }
+                    });
+                    result_view.update(cx, |view, cx| {
+                        view.set_error(format!("Could not connect to '{conn_label}': {err}"), cx);
+                    });
+                    return anyhow::Ok(());
+                }
+                connected = true;
+            }
+
+            let sql = statement.sql.clone();
+            let task = store.update(cx, |store, cx| {
+                store.execute_query(conn_id, db_name.clone(), sql.clone(), cx)
+            });
+            let result = task.await;
+            match result {
+                Ok(result) => {
+                    editor.update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                            addon.mark_query(statement.start_row, QueryExecutionStatus::Success);
+                            cx.notify();
+                        }
+                    });
+                    let table_context = select_table_reference(&sql).map(|reference| {
+                        let database = reference.database.unwrap_or_else(|| db_name.clone());
+                        (database, reference.table)
+                    });
+                    let store = store.downgrade();
+                    result_view.update_in(cx, |view, window, cx| {
+                        view.set_query_result(
+                            store.clone(),
+                            conn_id,
+                            db_name.clone(),
+                            sql.clone(),
+                            result,
+                            cx,
+                        );
+                        if let Some((database, table)) = table_context {
+                            view.set_table_context(store, conn_id, database, table, window, cx);
+                        }
+                    })?;
+                }
+                Err(err) => {
+                    editor.update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                            addon.mark_query(statement.start_row, QueryExecutionStatus::Error);
+                            cx.notify();
+                        }
+                    });
+                    result_view.update(cx, |view, cx| view.set_error(err.to_string(), cx));
+                    return anyhow::Ok(());
+                }
             }
         }
-
-        // The result view owns fetching from here on: it pages the statement in
-        // chunks and fills the grid, with its own Stop control.
-        let store = store.downgrade();
-        result_view.update(cx, |view, cx| {
-            view.run_sql(store, conn_id, db_name.clone(), sql.clone(), cx);
-        });
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -686,24 +1139,39 @@ impl DatabasePanel {
             cx.new(|cx| {
                 let store_subscription = cx.subscribe(
                     &store,
-                    |_this: &mut DatabasePanel, _store: Entity<DatabaseStore>, _event: &DatabaseStoreEvent, cx: &mut Context<DatabasePanel>| {
+                    |_this: &mut DatabasePanel,
+                     _store: Entity<DatabaseStore>,
+                     _event: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
                         cx.notify();
                     },
                 );
                 let store_weak = store.downgrade();
+                let workspace_weak = workspace_entity.downgrade();
                 let workspace_subscription = cx.subscribe(
                     &workspace_entity,
-                    move |_this: &mut DatabasePanel, _workspace: Entity<Workspace>, event: &WorkspaceEvent, cx: &mut Context<DatabasePanel>| {
+                    move |_this: &mut DatabasePanel,
+                          _workspace: Entity<Workspace>,
+                          event: &WorkspaceEvent,
+                          cx: &mut Context<DatabasePanel>| {
                         if let WorkspaceEvent::ItemAdded { item } = event {
                             if let Some(editor) = item.act_as::<Editor>(cx) {
-                                install_on_editor(editor, store_weak.clone(), cx);
+                                install_db_editor_features(
+                                    editor,
+                                    store_weak.clone(),
+                                    workspace_weak.clone(),
+                                    cx,
+                                );
                             }
                         }
                     },
                 );
                 let filter_subscription = cx.subscribe(
                     &table_filter_editor,
-                    |_this: &mut DatabasePanel, _editor: Entity<Editor>, _event: &editor::EditorEvent, cx: &mut Context<DatabasePanel>| {
+                    |_this: &mut DatabasePanel,
+                     _editor: Entity<Editor>,
+                     _event: &editor::EditorEvent,
+                     cx: &mut Context<DatabasePanel>| {
                         cx.notify();
                     },
                 );
@@ -718,7 +1186,11 @@ impl DatabasePanel {
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
-                    _subscriptions: vec![store_subscription, workspace_subscription, filter_subscription],
+                    _subscriptions: vec![
+                        store_subscription,
+                        workspace_subscription,
+                        filter_subscription,
+                    ],
                 }
             })
         });
@@ -741,7 +1213,12 @@ impl DatabasePanel {
             .log_err();
     }
 
-    fn open_edit_connection_modal(&self, existing: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_edit_connection_modal(
+        &self,
+        existing: ConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.clone();
         let original_id = existing.id;
         self.workspace
@@ -811,7 +1288,14 @@ impl DatabasePanel {
             .child(Label::new(folder).size(LabelSize::Small))
     }
 
-    fn open_sql_query_with_text(workspace: WeakEntity<Workspace>, store: WeakEntity<DatabaseStore>, connection_id: ConnectionId, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_sql_query_with_text(
+        workspace: WeakEntity<Workspace>,
+        store: WeakEntity<DatabaseStore>,
+        connection_id: ConnectionId,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let languages = workspace
             .update(cx, |ws, _cx| ws.app_state().languages.clone())
             .log_err();
@@ -819,36 +1303,44 @@ impl DatabasePanel {
         let language_task = languages.language_for_name("SQL");
         cx.spawn_in(window, async move |_, cx| {
             let language = language_task.await.log_err();
-            workspace.update_in(cx, |workspace, window, cx| {
-                let project = workspace.project().clone();
-                let buffer_task = project.update(cx, move |project, cx| {
-                    project.create_buffer(language, false, cx)
-                });
-                let workspace_weak = workspace.weak_handle();
-                cx.spawn_in(window, async move |workspace, cx| {
-                    let buffer = buffer_task.await?;
-                    let multi = cx.new(|cx| {
-                        MultiBuffer::singleton(buffer, cx).with_title("query.sql".into())
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let project = workspace.project().clone();
+                    let buffer_task = project.update(cx, move |project, cx| {
+                        project.create_buffer(language, false, cx)
                     });
-                    workspace.update_in(cx, |workspace, window, cx| {
-                        let editor = cx.new(|cx| {
-                            let mut ed = Editor::for_multibuffer(multi, None, window, cx);
-                            ed.set_text(text.clone(), window, cx);
-                            ed.register_addon(DbQueryEditorAddon { connection_id });
-                            ed.set_semantics_provider(Some(Rc::new(DbSemanticsProvider {
-                                connection_id,
-                                store: store.clone(),
-                                workspace: workspace_weak.clone(),
-                            })));
-                            ed
+                    let workspace_weak = workspace.weak_handle();
+                    cx.spawn_in(window, async move |workspace, cx| {
+                        let buffer = buffer_task.await?;
+                        let multi = cx.new(|cx| {
+                            MultiBuffer::singleton(buffer, cx).with_title("query.sql".into())
                         });
-                        workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
-                    })?;
-                    anyhow::Ok(())
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            let editor = cx.new(|cx| {
+                                let mut ed = Editor::for_multibuffer(multi, None, window, cx);
+                                ed.set_text(text.clone(), window, cx);
+                                ed.register_addon(DbQueryEditorAddon::new(connection_id));
+                                ed.set_show_runnables(true, cx);
+                                ed.set_semantics_provider(Some(Rc::new(DbSemanticsProvider {
+                                    connection_id,
+                                    store: store.clone(),
+                                    workspace: workspace_weak.clone(),
+                                })));
+                                ed
+                            });
+                            workspace.add_item_to_active_pane(
+                                Box::new(editor),
+                                None,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
                 })
-                .detach_and_log_err(cx);
-            })
-            .log_err();
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -861,12 +1353,19 @@ impl DatabasePanel {
         }
     }
 
-    fn generate_insert_template(table: &str, driver: DatabaseDriver, columns: &[ColumnInfo]) -> String {
+    fn generate_insert_template(
+        table: &str,
+        driver: DatabaseDriver,
+        columns: &[ColumnInfo],
+    ) -> String {
         let qt = Self::quote_ident(table, driver);
         if columns.is_empty() {
             return format!("INSERT INTO {} () VALUES ();", qt);
         }
-        let cols: Vec<String> = columns.iter().map(|c| Self::quote_ident(&c.name, driver)).collect();
+        let cols: Vec<String> = columns
+            .iter()
+            .map(|c| Self::quote_ident(&c.name, driver))
+            .collect();
         let placeholders: Vec<String> = columns.iter().map(|c| format!("'{}'", c.name)).collect();
         format!(
             "INSERT INTO {} ({})\nVALUES ({});",
@@ -876,30 +1375,52 @@ impl DatabasePanel {
         )
     }
 
-    fn generate_update_template(table: &str, driver: DatabaseDriver, columns: &[ColumnInfo]) -> String {
+    fn generate_update_template(
+        table: &str,
+        driver: DatabaseDriver,
+        columns: &[ColumnInfo],
+    ) -> String {
         let qt = Self::quote_ident(table, driver);
         if columns.is_empty() {
             return format!("UPDATE {} SET  WHERE ;", qt);
         }
-        let pk = columns.iter().find(|c| c.column_key.as_deref() == Some("PRI"));
-        let non_pk_cols: Vec<&ColumnInfo> = columns.iter().filter(|c| c.column_key.as_deref() != Some("PRI")).collect();
+        let pk = columns
+            .iter()
+            .find(|c| c.column_key.as_deref() == Some("PRI"));
+        let non_pk_cols: Vec<&ColumnInfo> = columns
+            .iter()
+            .filter(|c| c.column_key.as_deref() != Some("PRI"))
+            .collect();
         let set_clause: Vec<String> = non_pk_cols
             .iter()
             .map(|c| format!("{} = '{}'", Self::quote_ident(&c.name, driver), c.name))
             .collect();
         let where_clause = if let Some(pk_col) = pk {
-            format!("{} = '{}'", Self::quote_ident(&pk_col.name, driver), pk_col.name)
+            format!(
+                "{} = '{}'",
+                Self::quote_ident(&pk_col.name, driver),
+                pk_col.name
+            )
         } else {
             "1 = 1".to_string()
         };
-        format!("UPDATE {} SET {}\nWHERE {};", qt, set_clause.join(",\n       "), where_clause)
+        format!(
+            "UPDATE {} SET {}\nWHERE {};",
+            qt,
+            set_clause.join(",\n       "),
+            where_clause
+        )
     }
 
     fn mock_value(data_type: &str, row_num: usize) -> String {
         let upper = data_type.to_uppercase();
-        if upper.starts_with("INT") || upper.starts_with("BIGINT") || upper.starts_with("SMALLINT")
-            || upper.starts_with("TINYINT") || upper.starts_with("MEDIUMINT")
-            || upper.starts_with("SERIAL") || upper.starts_with("INTEGER")
+        if upper.starts_with("INT")
+            || upper.starts_with("BIGINT")
+            || upper.starts_with("SMALLINT")
+            || upper.starts_with("TINYINT")
+            || upper.starts_with("MEDIUMINT")
+            || upper.starts_with("SERIAL")
+            || upper.starts_with("INTEGER")
         {
             return row_num.to_string();
         }
@@ -910,13 +1431,28 @@ impl DatabasePanel {
             return format!("{}.{}", row_num, row_num % 10);
         }
         if upper.starts_with("BOOL") {
-            return if row_num.is_multiple_of(2) { "true".to_string() } else { "false".to_string() };
+            return if row_num.is_multiple_of(2) {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            };
         }
         if upper.starts_with("DATE") && !upper.contains("TIME") {
-            return format!("'{}-{:02}-{:02}'", 2024, (row_num % 12) + 1, (row_num % 28) + 1);
+            return format!(
+                "'{}-{:02}-{:02}'",
+                2024,
+                (row_num % 12) + 1,
+                (row_num % 28) + 1
+            );
         }
         if upper.starts_with("TIMESTAMP") || upper.starts_with("DATETIME") {
-            return format!("'{}-{:02}-{:02} {:02}:00:00'", 2024, (row_num % 12) + 1, (row_num % 28) + 1, row_num % 24);
+            return format!(
+                "'{}-{:02}-{:02} {:02}:00:00'",
+                2024,
+                (row_num % 12) + 1,
+                (row_num % 28) + 1,
+                row_num % 24
+            );
         }
         if upper.starts_with("TIME") {
             return format!("'{:02}:{:02}:00'", row_num % 24, row_num % 60);
@@ -930,7 +1466,12 @@ impl DatabasePanel {
         format!("'value_{row_num}'")
     }
 
-    fn generate_mock_data(table: &str, driver: DatabaseDriver, columns: &[ColumnInfo], count: usize) -> String {
+    fn generate_mock_data(
+        table: &str,
+        driver: DatabaseDriver,
+        columns: &[ColumnInfo],
+        count: usize,
+    ) -> String {
         let qt = Self::quote_ident(table, driver);
         let insertable_cols: Vec<&ColumnInfo> = columns
             .iter()
@@ -952,17 +1493,32 @@ impl DatabasePanel {
                     .iter()
                     .map(|c| Self::mock_value(&c.data_type, i))
                     .collect();
-                format!("INSERT INTO {} ({}) VALUES ({});", qt, col_list.join(", "), values.join(", "))
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({});",
+                    qt,
+                    col_list.join(", "),
+                    values.join(", ")
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn generate_delete_template(table: &str, driver: DatabaseDriver, columns: &[ColumnInfo]) -> String {
+    fn generate_delete_template(
+        table: &str,
+        driver: DatabaseDriver,
+        columns: &[ColumnInfo],
+    ) -> String {
         let qt = Self::quote_ident(table, driver);
-        let pk = columns.iter().find(|c| c.column_key.as_deref() == Some("PRI"));
+        let pk = columns
+            .iter()
+            .find(|c| c.column_key.as_deref() == Some("PRI"));
         let where_clause = if let Some(pk_col) = pk {
-            format!("{} = '{}'", Self::quote_ident(&pk_col.name, driver), pk_col.name)
+            format!(
+                "{} = '{}'",
+                Self::quote_ident(&pk_col.name, driver),
+                pk_col.name
+            )
         } else {
             "1 = 1".to_string()
         };
@@ -1465,7 +2021,7 @@ impl DatabasePanel {
                                                 let tbl = table_name.clone();
                                                 move |this, _, window, cx| {
                                                     let sql = format!(
-                                                        "SELECT * FROM {} LIMIT 200",
+                                                        "SELECT * FROM {} LIMIT 500",
                                                         Self::quote_ident(&tbl, driver)
                                                     );
                                                     let store_weak = this.store.downgrade();
@@ -1568,7 +2124,7 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
                                                                 let sql = format!(
-                                                                    "SELECT * FROM {} LIMIT 200",
+                                                                    "SELECT * FROM {} LIMIT 500",
                                                                     Self::quote_ident(&tbl, driver)
                                                                 );
                                                                 let store_weak = panel.store.downgrade();
@@ -2196,7 +2752,7 @@ impl DatabasePanel {
                                                                     move |window, cx| {
                                                                         entity.update(cx, |panel, cx| {
                                                                             let sql = format!(
-                                                                                "SELECT * FROM `{}`.`{}` LIMIT 200",
+                                                                                "SELECT * FROM `{}`.`{}` LIMIT 500",
                                                                                 db, vw
                                                                             );
                                                                             let task = panel.store.update(cx, |store, cx| {
@@ -2271,10 +2827,21 @@ impl DatabasePanel {
                         let workspace = self.workspace.clone();
                         let store = self.store.downgrade();
                         move |_, _, window, cx| {
-                            Self::open_sql_query_with_text(workspace.clone(), store.clone(), history_conn_id, query.clone(), window, cx);
+                            Self::open_sql_query_with_text(
+                                workspace.clone(),
+                                store.clone(),
+                                history_conn_id,
+                                query.clone(),
+                                window,
+                                cx,
+                            );
                         }
                     }))
-                    .child(Label::new(display).size(LabelSize::XSmall).color(Color::Muted));
+                    .child(
+                        Label::new(display)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    );
                 history_items.push(item);
             }
         }
@@ -2305,7 +2872,11 @@ impl DatabasePanel {
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                     )
-                    .child(Label::new("Query History").size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(
+                        Label::new("Query History")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             )
             .children(history_items)
     }
@@ -2313,13 +2884,8 @@ impl DatabasePanel {
 
 impl Render for DatabasePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let connections: Vec<ActiveConnection> = self
-            .store
-            .read(cx)
-            .connections()
-            .iter()
-            .cloned()
-            .collect();
+        let connections: Vec<ActiveConnection> =
+            self.store.read(cx).connections().iter().cloned().collect();
 
         let (top_level, folders) = group_connections_by_folder(&connections);
 
@@ -2367,8 +2933,16 @@ impl Render for DatabasePanel {
                         .flex_1()
                         .gap_2()
                         .p_4()
-                        .child(Icon::new(IconName::DatabaseZap).size(IconSize::Medium).color(Color::Muted))
-                        .child(Label::new("No connections").size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::Medium)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("No connections")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
                         .child(
                             Label::new("Click + to add a connection")
                                 .size(LabelSize::XSmall)
@@ -2503,6 +3077,172 @@ mod tests {
         assert_eq!(super::statement_at_cursor("SELECT 42", 4), "SELECT 42");
     }
 
+    #[test]
+    fn statement_runs_in_range_split_sql_and_track_first_rows() {
+        let text = "SELECT 1;\n\nSELECT *\nFROM schema.table;\n  SHOW CREATE TABLE schema.table;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+
+        assert_eq!(
+            runs,
+            vec![
+                super::SqlStatementRun {
+                    sql: "SELECT 1".to_string(),
+                    start_row: 0,
+                },
+                super::SqlStatementRun {
+                    sql: "SELECT *\nFROM schema.table".to_string(),
+                    start_row: 2,
+                },
+                super::SqlStatementRun {
+                    sql: "SHOW CREATE TABLE schema.table".to_string(),
+                    start_row: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn table_reference_at_offset_resolves_schema_qualified_table() {
+        let text = "SELECT * FROM public.users WHERE id = 1";
+        let offset = text.find("users").expect("users in sql") + 2;
+
+        assert_eq!(
+            super::table_reference_at_offset(text, offset),
+            Some(super::SqlTableReference {
+                database: Some("public".to_string()),
+                table: "users".to_string(),
+                start: text.find("users").expect("users in sql"),
+                end: text.find(" WHERE").expect("where in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn table_reference_at_offset_rejects_schema_part() {
+        let text = "SELECT * FROM public.users WHERE id = 1";
+        let offset = text.find("public").expect("public in sql") + 2;
+
+        assert_eq!(super::table_reference_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn table_reference_at_offset_resolves_unqualified_table() {
+        let text = "SELECT * FROM users WHERE id = 1";
+        let offset = text.find("users").expect("users in sql") + 1;
+
+        assert_eq!(
+            super::table_reference_at_offset(text, offset),
+            Some(super::SqlTableReference {
+                database: None,
+                table: "users".to_string(),
+                start: text.find("users").expect("users in sql"),
+                end: text.find(" WHERE").expect("where in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn table_reference_at_offset_resolves_show_create_table() {
+        let text = "SHOW CREATE TABLE instruments.splits;";
+        let offset = text.find("splits").expect("splits in sql") + 2;
+
+        assert_eq!(
+            super::table_reference_at_offset(text, offset),
+            Some(super::SqlTableReference {
+                database: Some("instruments".to_string()),
+                table: "splits".to_string(),
+                start: text.find("splits").expect("splits in sql"),
+                end: text.find(';').expect("semicolon in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn table_reference_at_offset_rejects_incomplete_reference() {
+        let text = "SELECT * FROM public.";
+        assert_eq!(super::table_reference_at_offset(text, text.len()), None);
+    }
+
+    #[test]
+    fn select_table_reference_resolves_multiline_schema_qualified_table() {
+        let text = "SELECT *\n  FROM public.users\nWHERE id = 1";
+
+        assert_eq!(
+            super::select_table_reference(text),
+            Some(super::SqlTableReference {
+                database: Some("public".to_string()),
+                table: "users".to_string(),
+                start: text.find("users").expect("users in sql"),
+                end: text.find("\nWHERE").expect("where in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn select_table_reference_resolves_unqualified_table() {
+        let text = " select id, name from users where active = 1";
+
+        assert_eq!(
+            super::select_table_reference(text),
+            Some(super::SqlTableReference {
+                database: None,
+                table: "users".to_string(),
+                start: text.find("users").expect("users in sql"),
+                end: text.find(" where").expect("where in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn select_table_reference_rejects_non_select_statement() {
+        assert_eq!(
+            super::select_table_reference("EXPLAIN SELECT * FROM users"),
+            None
+        );
+    }
+
+    #[test]
+    fn show_create_table_reference_resolves_schema_qualified_table() {
+        let text = "SHOW CREATE TABLE instruments.splits;";
+
+        assert_eq!(
+            super::show_create_table_reference(text),
+            Some(super::SqlTableReference {
+                database: Some("instruments".to_string()),
+                table: "splits".to_string(),
+                start: text.find("splits").expect("splits in sql"),
+                end: text.find(';').expect("semicolon in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn statement_table_reference_at_offset_resolves_show_create_table() {
+        let text = "SHOW CREATE TABLE instruments.splits;";
+        let offset = text.find("splits").expect("splits in sql") + 2;
+
+        assert_eq!(
+            super::statement_table_reference_at_offset(text, offset),
+            Some(super::SqlTableReference {
+                database: Some("instruments".to_string()),
+                table: "splits".to_string(),
+                start: text.find("splits").expect("splits in sql"),
+                end: text.find(';').expect("semicolon in sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn statement_table_reference_at_offset_rejects_show_create_schema_part() {
+        let text = "SHOW CREATE TABLE instruments.splits;";
+        let offset = text.find("instruments").expect("schema in sql") + 2;
+
+        assert_eq!(
+            super::statement_table_reference_at_offset(text, offset),
+            None
+        );
+    }
+
     // Guards the live Ctrl+Enter path: the RunQuery handler resolves a file-backed
     // console (no addon) by mapping its file path back to the connection. This
     // round-trips the real path builder so a refactor of either side is caught.
@@ -2600,7 +3340,11 @@ mod tests {
 
         let (top_level, folders) = super::group_connections_by_folder(&connections);
 
-        assert_eq!(top_level.len(), 2, "blank folder names fall back to top level");
+        assert_eq!(
+            top_level.len(),
+            2,
+            "blank folder names fall back to top level"
+        );
         assert!(folders.is_empty());
     }
 
@@ -2632,10 +3376,7 @@ mod tests {
         async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
             Ok(Vec::new())
         }
-        async fn list_tables(
-            &self,
-            _database: &str,
-        ) -> anyhow::Result<Vec<db_client::TableInfo>> {
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
             Ok(Vec::new())
         }
         async fn describe_table(
@@ -2657,11 +3398,89 @@ mod tests {
                 execution_time_ms: 0,
             })
         }
-        async fn get_table_ddl(
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    struct RecordingMockProvider {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl db_client::DbProvider for RecordingMockProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
             &self,
             _database: &str,
             _table: &str,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            self.calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .push(sql.to_string());
+            Ok(db_client::schema::QueryResult {
+                columns: vec!["sql".to_string()],
+                rows: vec![vec![Some(sql.to_string())]],
+                rows_affected: 1,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    struct ErroringMockProvider {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        error: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl db_client::DbProvider for ErroringMockProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            database: &str,
+            sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            self.calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .push((database.to_string(), sql.to_string()));
+            anyhow::bail!(self.error)
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
             Ok(String::new())
         }
     }
@@ -2784,14 +3603,18 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c.status, ConnectionStatus::Connected))
         });
-        assert!(connected, "connection must be established before running the query");
+        assert!(
+            connected,
+            "connection must be established before running the query"
+        );
 
         let editor = workspace.update_in(cx, |workspace, window, cx| {
-            let buffer = cx.new(|cx| language::Buffer::local("SELECT 1 AS one", cx));
+            let buffer = cx.new(|cx| language::Buffer::local("SELECT * FROM public.users", cx));
             let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
             let editor = cx.new(|cx| {
                 let mut editor = Editor::for_multibuffer(multi, None, window, cx);
-                editor.register_addon(DbQueryEditorAddon { connection_id });
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor.set_show_runnables(true, cx);
                 editor
             });
             workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
@@ -2809,18 +3632,39 @@ mod tests {
             cx.simulate_keystrokes("ctrl-enter");
             cx.run_until_parked();
         }
+        let markers = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .map(|addon| addon.query_markers().to_vec())
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            markers,
+            vec![QueryExecutionMarker {
+                row: 0,
+                status: QueryExecutionStatus::Success,
+            }]
+        );
 
         let pane = terminal_panel
             .read_with(cx, |panel, _| panel.pane())
             .expect("terminal panel must have a pane");
-        let result = pane.read_with(cx, |pane, cx| {
-            pane.items_of_type::<crate::result_view::ResultView>()
-                .next()
-                .and_then(|view| view.read(cx).result.clone())
+        let (result, table_context) = pane.read_with(cx, |pane, cx| {
+            let view = pane
+                .items_of_type::<crate::result_view::ResultView>()
+                .next();
+            let result = view.as_ref().and_then(|view| view.read(cx).result.clone());
+            let table_context = view.and_then(|view| view.read(cx).table_context_for_test());
+            (result, table_context)
         });
 
         let result =
             result.expect("Ctrl+Enter must execute the query and open a results table below");
+        assert_eq!(
+            table_context,
+            Some(("public".to_string(), "users".to_string())),
+            "SELECT * FROM schema.table must make the result view table-backed"
+        );
         assert!(
             result
                 .rows
@@ -2830,6 +3674,289 @@ mod tests {
             "the results table must contain the query output, got rows {:?}",
             result.rows
         );
+    }
+
+    #[gpui::test]
+    async fn ctrl_enter_runs_selected_statements_sequentially(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "batch".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    views_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel, window, cx);
+        });
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls.clone(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(sql, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor.set_show_runnables(true, cx);
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([
+                    editor::MultiBufferOffset(0)..editor::MultiBufferOffset(sql.len())
+                ]);
+            });
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_current_sql_query(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .as_slice(),
+            &[
+                "SELECT 1".to_string(),
+                "SELECT 2".to_string(),
+                "SELECT 3".to_string(),
+            ]
+        );
+        let markers = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .map(|addon| addon.query_markers().to_vec())
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            markers,
+            vec![
+                QueryExecutionMarker {
+                    row: 0,
+                    status: QueryExecutionStatus::Success,
+                },
+                QueryExecutionMarker {
+                    row: 1,
+                    status: QueryExecutionStatus::Success,
+                },
+                QueryExecutionMarker {
+                    row: 2,
+                    status: QueryExecutionStatus::Success,
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn run_query_sends_unrecognized_sql_to_database_and_shows_error(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "invalid sql".to_string(),
+            database: Some("scratch".to_string()),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = std::sync::Arc::new(ErroringMockProvider {
+            calls: calls.clone(),
+            error: "database rejected statement",
+        });
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    views_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider, cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local("трали вали", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor.set_show_runnables(true, cx);
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_current_sql_query(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .as_slice(),
+            &[("scratch".to_string(), "трали вали".to_string())],
+            "unrecognized SQL must be sent to the database unchanged"
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("SHOW CREATE TABLE instruments.splits", window, cx);
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_current_sql_query(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .as_slice(),
+            &[
+                ("scratch".to_string(), "трали вали".to_string()),
+                (
+                    "scratch".to_string(),
+                    "SHOW CREATE TABLE instruments.splits".to_string()
+                )
+            ],
+            "SHOW CREATE TABLE must be sent to the database unchanged"
+        );
+        let markers = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .map(|addon| addon.query_markers().to_vec())
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            markers,
+            vec![QueryExecutionMarker {
+                row: 0,
+                status: QueryExecutionStatus::Error,
+            }]
+        );
+
+        let pane = terminal_panel
+            .read_with(cx, |panel, _| panel.pane())
+            .expect("terminal panel must have a pane");
+        let error = pane.read_with(cx, |pane, cx| {
+            pane.items_of_type::<crate::result_view::ResultView>()
+                .next()
+                .and_then(|view| view.read(cx).error.clone())
+        });
+        assert_eq!(error.as_deref(), Some("database rejected statement"));
     }
 
     // Guards the bottom-dock requirement: each connection gets exactly one
@@ -2893,7 +4020,8 @@ mod tests {
         );
 
         let tab_count = pane.read_with(cx, |pane, _| {
-            pane.items_of_type::<crate::result_view::ResultView>().count()
+            pane.items_of_type::<crate::result_view::ResultView>()
+                .count()
         });
         assert_eq!(
             tab_count, 2,
@@ -2989,18 +4117,11 @@ mod tests {
             let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
             let editor = cx.new(|cx| {
                 let mut editor = Editor::for_multibuffer(multi, None, window, cx);
-                editor.register_addon(DbQueryEditorAddon {
-                    connection_id: uuid::Uuid::new_v4(),
-                });
+                editor.register_addon(DbQueryEditorAddon::new(uuid::Uuid::new_v4()));
+                editor.set_show_runnables(true, cx);
                 editor
             });
-            workspace.add_item_to_active_pane(
-                Box::new(editor.clone()),
-                None,
-                true,
-                window,
-                cx,
-            );
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
             editor
         });
 
@@ -3061,11 +4182,9 @@ mod tests {
             let fell_through = fell_through.clone();
             move |workspace, _window, _cx| {
                 // The real RunQuery handler — with no panel/addon it must propagate.
-                workspace.register_action(
-                    |workspace, _: &RunQuery, window, cx| {
-                        run_current_sql_query(workspace, window, cx);
-                    },
-                );
+                workspace.register_action(|workspace, _: &RunQuery, window, cx| {
+                    run_current_sql_query(workspace, window, cx);
+                });
                 workspace.register_action(move |_, _: &CompetingAssistProbe, _, _| {
                     fell_through.set(true);
                 });
@@ -3152,8 +4271,14 @@ mod tests {
 
         workspace.read_with(cx, |workspace, cx| {
             let dock = workspace.left_dock().read(cx);
-            assert!(dock.is_open(), "left dock must be open after toggle_panel_focus");
-            assert!(dock.panel::<DatabasePanel>().is_some(), "DatabasePanel must be in left dock");
+            assert!(
+                dock.is_open(),
+                "left dock must be open after toggle_panel_focus"
+            );
+            assert!(
+                dock.panel::<DatabasePanel>().is_some(),
+                "DatabasePanel must be in left dock"
+            );
         });
     }
 
@@ -3179,9 +4304,12 @@ mod tests {
         // spawn_in requires &mut AsyncWindowContext; load takes owned, so we clone.
         let panel = workspace
             .update_in(cx, |_, window, cx| {
-                cx.spawn_in(window, async move |workspace_handle, cx: &mut AsyncWindowContext| {
-                    DatabasePanel::load(workspace_handle, cx.clone()).await
-                })
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
             })
             .await
             .expect("DatabasePanel::load must succeed");
@@ -3202,8 +4330,14 @@ mod tests {
 
         workspace.read_with(cx, |workspace, cx| {
             let dock = workspace.left_dock().read(cx);
-            assert!(dock.is_open(), "left dock must be open after ToggleFocus action dispatch");
-            assert!(dock.panel::<DatabasePanel>().is_some(), "DatabasePanel must be in left dock");
+            assert!(
+                dock.is_open(),
+                "left dock must be open after ToggleFocus action dispatch"
+            );
+            assert!(
+                dock.panel::<DatabasePanel>().is_some(),
+                "DatabasePanel must be in left dock"
+            );
         });
     }
 
@@ -3236,9 +4370,12 @@ mod tests {
 
         let panel = workspace
             .update_in(cx, |_, window, cx| {
-                cx.spawn_in(window, async move |workspace_handle, cx: &mut AsyncWindowContext| {
-                    DatabasePanel::load(workspace_handle, cx.clone()).await
-                })
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
             })
             .await
             .expect("DatabasePanel::load must succeed");
