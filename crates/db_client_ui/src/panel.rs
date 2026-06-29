@@ -1,5 +1,6 @@
 use crate::connection_view::ConnectionView;
 use crate::driver_icon::brand_icon;
+use crate::modify_table::{ModifyTableEvent, ModifyTableView};
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent};
@@ -25,8 +26,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{
-    CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
-    Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu,
+    CommonAnimationExt, ContextMenu, Divider, HighlightedLabel, Icon, IconButton, IconName,
+    IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -885,6 +886,117 @@ fn show_result_in_pane(
     view
 }
 
+fn is_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// Extracts named query parameters (`:name` or `?name`) in first-seen order,
+/// ignoring occurrences inside string literals and PostgreSQL `::type` casts.
+pub fn extract_query_parameters(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut parameters = Vec::new();
+    let mut seen = HashSet::default();
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ':' && chars.get(index + 1) == Some(&':') {
+            index += 2;
+            continue;
+        }
+        if ch == ':' || ch == '?' {
+            let mut end = index + 1;
+            while end < chars.len() && is_ident_char(chars[end]) {
+                end += 1;
+            }
+            if end > index + 1 {
+                let name: String = chars[index + 1..end].iter().collect();
+                if seen.insert(name.clone()) {
+                    parameters.push(name);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    parameters
+}
+
+fn format_parameter_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return "NULL".to_string();
+    }
+    if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+        return trimmed.to_string();
+    }
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Substitutes named parameters with their (quoted) values. Numeric values and
+/// `NULL` are inserted verbatim; everything else is single-quoted and escaped.
+/// Tokens without a provided value are left untouched.
+pub fn substitute_query_parameters(sql: &str, values: &HashMap<String, String>) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut output = String::with_capacity(sql.len());
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(active_quote) = quote {
+            output.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ':' && chars.get(index + 1) == Some(&':') {
+            output.push_str("::");
+            index += 2;
+            continue;
+        }
+        if ch == ':' || ch == '?' {
+            let mut end = index + 1;
+            while end < chars.len() && is_ident_char(chars[end]) {
+                end += 1;
+            }
+            if end > index + 1 {
+                let name: String = chars[index + 1..end].iter().collect();
+                if let Some(value) = values.get(&name) {
+                    output.push_str(&format_parameter_value(value));
+                } else {
+                    output.extend(&chars[index..end]);
+                }
+                index = end;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
 pub fn run_current_sql_query(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -974,6 +1086,21 @@ fn run_sql_from_editor(
     if statements.is_empty() {
         return;
     }
+
+    // A statement with named parameters can't run as-is; collect values from
+    // the user first, then re-run the substituted SQL.
+    let combined_sql = statements
+        .iter()
+        .map(|statement| statement.sql.clone())
+        .collect::<Vec<_>>()
+        .join(";\n");
+    if !extract_query_parameters(&combined_sql).is_empty() {
+        panel.update(cx, |panel, cx| {
+            panel.open_query_params_prompt(bound_connection_id, combined_sql.clone(), window, cx);
+        });
+        return;
+    }
+
     editor.update(cx, |editor, cx| {
         if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
             addon.clear_query_markers();
@@ -1133,7 +1260,15 @@ pub struct DatabasePanel {
     server_users: HashMap<ConnectionId, Vec<(String, String)>>,
     table_filter_is_regex: bool,
     quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
+    modify_table: Option<Entity<ModifyTableView>>,
+    query_params: Option<QueryParamsPrompt>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct QueryParamsPrompt {
+    connection_id: ConnectionId,
+    sql: String,
+    inputs: Vec<(String, Entity<Editor>)>,
 }
 
 impl DatabasePanel {
@@ -1205,6 +1340,8 @@ impl DatabasePanel {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
+                    modify_table: None,
+                    query_params: None,
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -1445,6 +1582,161 @@ impl DatabasePanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn open_modify_table(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let driver = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .map(|connection| connection.config.driver);
+        let Some(driver) = driver else { return };
+        let describe = self.store.update(cx, |store, cx| {
+            store.describe_table(id, database.clone(), table.clone(), cx)
+        });
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let columns = describe.await.unwrap_or_default();
+            this.update_in(cx, |panel, window, cx| {
+                let view = cx.new(|cx| {
+                    ModifyTableView::new(
+                        store.clone(),
+                        id,
+                        driver,
+                        database.clone(),
+                        table.clone(),
+                        &columns,
+                        window,
+                        cx,
+                    )
+                });
+                let subscription =
+                    cx.subscribe(&view, |panel, _view, event, cx| match event {
+                        ModifyTableEvent::Dismissed => {
+                            panel.modify_table = None;
+                            cx.notify();
+                        }
+                    });
+                panel._subscriptions.push(subscription);
+                panel.modify_table = Some(view);
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_query_params_prompt(
+        &mut self,
+        connection_id: ConnectionId,
+        sql: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inputs = extract_query_parameters(&sql)
+            .into_iter()
+            .map(|name| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("value", window, cx);
+                    editor
+                });
+                (name, editor)
+            })
+            .collect();
+        self.query_params = Some(QueryParamsPrompt {
+            connection_id,
+            sql,
+            inputs,
+        });
+        cx.notify();
+    }
+
+    fn run_query_params(&mut self, strip: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.query_params.take() else {
+            return;
+        };
+        let final_sql = if strip {
+            prompt.sql.clone()
+        } else {
+            let values: HashMap<String, String> = prompt
+                .inputs
+                .iter()
+                .map(|(name, editor)| (name.clone(), editor.read(cx).text(cx)))
+                .collect();
+            substitute_query_parameters(&prompt.sql, &values)
+        };
+        let workspace = self.workspace.clone();
+        let store = self.store.downgrade();
+        Self::open_sql_query_with_text(
+            workspace,
+            store,
+            prompt.connection_id,
+            final_sql,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn render_query_params_popup(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = self
+            .query_params
+            .iter()
+            .flat_map(|prompt| prompt.inputs.iter())
+            .map(|(name, editor)| {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .child(Label::new(name.clone()).size(LabelSize::Small)),
+                    )
+                    .child(div().flex_1().child(editor.clone()))
+            })
+            .collect();
+        v_flex()
+            .elevation_3(cx)
+            .w(px(420.))
+            .p_3()
+            .gap_2()
+            .child(Label::new("Query Parameters").size(LabelSize::Large))
+            .child(Divider::horizontal())
+            .child(v_flex().gap_1().children(rows))
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("params-cancel", "Cancel").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.query_params = None;
+                            cx.notify();
+                        },
+                    )))
+                    .child(Button::new("params-strip", "Run as-is").on_click(cx.listener(
+                        |this, _, window, cx| this.run_query_params(true, window, cx),
+                    )))
+                    .child(
+                        Button::new("params-run", "Run")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.run_query_params(false, window, cx)
+                            })),
+                    ),
+            )
     }
 
     fn render_quick_doc_popup(
@@ -2510,6 +2802,16 @@ impl DatabasePanel {
                                                             });
                                                         }
                                                     })
+                                                    .entry("Modify Table…", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_modify_table(id, db.clone(), tbl.clone(), window, cx);
+                                                            });
+                                                        }
+                                                    })
                                                     .entry("Script as CREATE", None, {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
@@ -3286,6 +3588,32 @@ impl Render for DatabasePanel {
             .when(!self.store.read(cx).query_history().is_empty(), |el| {
                 el.child(self.render_history(cx))
             })
+            .when_some(self.modify_table.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
+            })
+            .when(self.query_params.is_some(), |el| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(self.render_query_params_popup(cx)),
+                )
+            })
     }
 }
 
@@ -3996,6 +4324,8 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
+                    modify_table: None,
+                    query_params: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4145,6 +4475,8 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
+                    modify_table: None,
+                    query_params: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4286,6 +4618,8 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
+                    modify_table: None,
+                    query_params: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4686,6 +5020,8 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
+                    modify_table: None,
+                    query_params: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -4928,6 +5264,112 @@ mod tests {
                 !panel.server_objects_expanded.contains(&connection_id),
                 "toggling again must collapse the Server Objects node"
             );
+        });
+    }
+
+    #[test]
+    fn extract_parameters_skips_string_literals_and_casts() {
+        let sql = "SELECT * FROM t WHERE id = :id AND name = ':notparam' AND x = value::int AND y = ?limit";
+        let params = extract_query_parameters(sql);
+        assert_eq!(params, vec!["id".to_string(), "limit".to_string()]);
+    }
+
+    #[test]
+    fn extract_parameters_dedupes_in_first_seen_order() {
+        let sql = "SELECT :b, :a, :b, :a";
+        assert_eq!(
+            extract_query_parameters(sql),
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitute_parameters_quotes_strings_and_keeps_numbers() {
+        let mut values = HashMap::default();
+        values.insert("name".to_string(), "O'Brien".to_string());
+        values.insert("age".to_string(), "42".to_string());
+        let sql = "SELECT * FROM t WHERE name = :name AND age > :age";
+        assert_eq!(
+            substitute_query_parameters(sql, &values),
+            "SELECT * FROM t WHERE name = 'O''Brien' AND age > 42"
+        );
+    }
+
+    #[test]
+    fn substitute_parameters_preserves_casts_and_missing_values() {
+        let values = HashMap::default();
+        let sql = "SELECT x::int, :missing FROM t";
+        assert_eq!(
+            substitute_query_parameters(sql, &values),
+            "SELECT x::int, :missing FROM t"
+        );
+    }
+
+    #[test]
+    fn substitute_parameter_null_is_inserted_verbatim() {
+        let mut values = HashMap::default();
+        values.insert("v".to_string(), "null".to_string());
+        assert_eq!(
+            substitute_query_parameters("SELECT :v", &values),
+            "SELECT NULL"
+        );
+    }
+
+    #[gpui::test]
+    async fn open_modify_table_populates_overlay(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "modify".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_modify_table(
+                connection_id,
+                "public".to_string(),
+                "users".to_string(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.modify_table.is_some(),
+                "modify table overlay must be set after opening it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn open_query_params_prompt_lists_detected_parameters(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "params".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_query_params_prompt(
+                connection_id,
+                "SELECT * FROM t WHERE id = :id AND name = :name".to_string(),
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            let prompt = panel
+                .query_params
+                .as_ref()
+                .expect("params prompt must be set");
+            let names: Vec<_> = prompt.inputs.iter().map(|(name, _)| name.clone()).collect();
+            assert_eq!(names, vec!["id".to_string(), "name".to_string()]);
         });
     }
 }
