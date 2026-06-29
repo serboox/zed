@@ -2,6 +2,7 @@ use crate::connection_view::ConnectionView;
 use crate::driver_icon::brand_icon;
 use crate::compare_data::{CompareDataEvent, CompareDataView};
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
+use crate::data_import::{DataImportEvent, ImportDataView};
 use crate::explain_plan::{
     ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
     plan_text_from_result,
@@ -1351,6 +1352,7 @@ pub struct DatabasePanel {
     erd_view: Option<Entity<ErdView>>,
     compare_view: Option<Entity<CompareDataView>>,
     explain_view: Option<Entity<ExplainPlanView>>,
+    data_import: Option<Entity<ImportDataView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     _subscriptions: Vec<Subscription>,
@@ -1444,6 +1446,7 @@ impl DatabasePanel {
                     erd_view: None,
                     compare_view: None,
                     explain_view: None,
+                    data_import: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![
@@ -1732,6 +1735,58 @@ impl DatabasePanel {
                     });
                 panel._subscriptions.push(subscription);
                 panel.modify_table = Some(view);
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_data_import(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let driver = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .map(|connection| connection.config.driver);
+        let Some(driver) = driver else { return };
+        let describe = self.store.update(cx, |store, cx| {
+            store.describe_table(id, database.clone(), table.clone(), cx)
+        });
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let columns = describe.await.unwrap_or_default();
+            let target_columns = columns.into_iter().map(|column| column.name).collect();
+            this.update_in(cx, |panel, window, cx| {
+                let view = cx.new(|cx| {
+                    ImportDataView::new(
+                        store.clone(),
+                        id,
+                        database.clone(),
+                        table.clone(),
+                        driver,
+                        target_columns,
+                        window,
+                        cx,
+                    )
+                });
+                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
+                    DataImportEvent::Dismissed => {
+                        panel.data_import = None;
+                        cx.notify();
+                    }
+                });
+                panel._subscriptions.push(subscription);
+                panel.data_import = Some(view);
                 cx.notify();
             })
             .log_err();
@@ -3214,6 +3269,16 @@ impl DatabasePanel {
                                                             });
                                                         }
                                                     })
+                                                    .entry("Import Data…", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_data_import(id, db.clone(), tbl.clone(), window, cx);
+                                                            });
+                                                        }
+                                                    })
                                                     .entry("Compare Data…", None, {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
@@ -4079,6 +4144,19 @@ impl Render for DatabasePanel {
                         .child(view),
                 )
             })
+            .when_some(self.data_import.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
+            })
             .when(self.compare_pick.is_some(), |el| {
                 el.child(
                     div()
@@ -4806,6 +4884,7 @@ mod tests {
                     erd_view: None,
                     compare_view: None,
                     explain_view: None,
+                    data_import: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -4961,6 +5040,7 @@ mod tests {
                     erd_view: None,
                     compare_view: None,
                     explain_view: None,
+                    data_import: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5108,6 +5188,7 @@ mod tests {
                     erd_view: None,
                     compare_view: None,
                     explain_view: None,
+                    data_import: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5583,6 +5664,7 @@ mod tests {
                     erd_view: None,
                     compare_view: None,
                     explain_view: None,
+                    data_import: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
