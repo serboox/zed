@@ -2,6 +2,10 @@ use crate::connection_view::ConnectionView;
 use crate::driver_icon::brand_icon;
 use crate::compare_data::{CompareDataEvent, CompareDataView};
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
+use crate::explain_plan::{
+    ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
+    plan_text_from_result,
+};
 use crate::modify_table::{ModifyTableEvent, ModifyTableView};
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
@@ -860,10 +864,15 @@ fn show_result_in_pane(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ResultView> {
+    // Reuse this connection's tab only if it is not pinned. A pinned tab is left
+    // untouched, so the query lands in a fresh, numbered tab instead.
     let existing = pane
         .read(cx)
         .items_of_type::<ResultView>()
-        .find(|view| view.read(cx).connection_id() == Some(connection_id));
+        .find(|view| {
+            let view = view.read(cx);
+            view.connection_id() == Some(connection_id) && !view.is_pinned()
+        });
 
     if let Some(view) = existing {
         let index = pane
@@ -877,6 +886,19 @@ fn show_result_in_pane(
         }
         return view;
     }
+
+    // Number additional tabs for the same connection: "… — Results", then
+    // "… — Results 2", "… — Results 3", and so on.
+    let existing_count = pane
+        .read(cx)
+        .items_of_type::<ResultView>()
+        .filter(|view| view.read(cx).connection_id() == Some(connection_id))
+        .count();
+    let title: SharedString = if existing_count == 0 {
+        title
+    } else {
+        format!("{title} {}", existing_count + 1).into()
+    };
 
     let view = cx.new(|cx| {
         ResultView::new(title, cx)
@@ -1013,7 +1035,69 @@ pub fn explain_current_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    run_sql_from_editor(workspace, window, cx, |sql| format!("EXPLAIN {sql}"));
+    let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
+        cx.propagate();
+        return;
+    };
+    let store = panel.read(cx).store.clone();
+    let active_item = workspace.active_item(cx);
+    let editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
+    let Some(editor) = editor else {
+        cx.propagate();
+        return;
+    };
+    let Some(connection_id) = console_connection_for_editor(&editor, &store, cx) else {
+        cx.propagate();
+        return;
+    };
+
+    let statement = editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let start = selection.start.to_offset(&snapshot).0;
+        let end = selection.end.to_offset(&snapshot).0;
+        let full = editor.text(cx);
+        let range = if start != end {
+            (start.min(end), start.max(end))
+        } else {
+            let cursor = selection.head().to_offset(&snapshot).0;
+            match statement_range_at_cursor(&full, cursor) {
+                Some(range) => (range.start, range.end),
+                None => return String::new(),
+            }
+        };
+        statement_runs_in_range(&full, range.0..range.1)
+            .into_iter()
+            .next()
+            .map(|run| run.sql)
+            .unwrap_or_default()
+    });
+    let sql = statement.trim().trim_end_matches(';').trim().to_string();
+    if sql.is_empty() {
+        return;
+    }
+
+    let resolved = {
+        let store_ref = store.read(cx);
+        store_ref
+            .connections()
+            .iter()
+            .find(|c| c.config.id == connection_id)
+            .or_else(|| store_ref.active_connection())
+            .map(|c| {
+                (
+                    c.config.id,
+                    c.config.database.clone().unwrap_or_default(),
+                    c.config.driver,
+                )
+            })
+    };
+    let Some((id, database, driver)) = resolved else {
+        return;
+    };
+    panel.update(cx, |panel, cx| {
+        panel.open_explain_plan(id, database, driver, sql, window, cx);
+    });
 }
 
 fn run_sql_from_editor(
@@ -1266,6 +1350,7 @@ pub struct DatabasePanel {
     modify_table: Option<Entity<ModifyTableView>>,
     erd_view: Option<Entity<ErdView>>,
     compare_view: Option<Entity<CompareDataView>>,
+    explain_view: Option<Entity<ExplainPlanView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     _subscriptions: Vec<Subscription>,
@@ -1358,6 +1443,7 @@ impl DatabasePanel {
                     modify_table: None,
                     erd_view: None,
                     compare_view: None,
+                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![
@@ -1646,6 +1732,49 @@ impl DatabasePanel {
                     });
                 panel._subscriptions.push(subscription);
                 panel.modify_table = Some(view);
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_explain_plan(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        driver: DatabaseDriver,
+        sql: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let explain_sql = explain_sql_for_driver(driver, &sql);
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let connect = store.update(cx, |store, cx| store.connect(id, cx));
+            connect.await.log_err();
+            let task = store.update(cx, |store, cx| {
+                store.execute_query(id, database.clone(), explain_sql, cx)
+            });
+            let result = task.await;
+            let roots = match result {
+                Ok(result) => parse_plan_tree(&plan_text_from_result(&result)),
+                Err(error) => vec![PlanNode {
+                    text: format!("EXPLAIN failed: {error}"),
+                    children: Vec::new(),
+                }],
+            };
+            this.update_in(cx, |panel, window, cx| {
+                let view = cx.new(|cx| ExplainPlanView::new(roots, window, cx));
+                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
+                    ExplainPlanEvent::Dismissed => {
+                        panel.explain_view = None;
+                        cx.notify();
+                    }
+                });
+                panel._subscriptions.push(subscription);
+                panel.explain_view = Some(view);
                 cx.notify();
             })
             .log_err();
@@ -3936,6 +4065,20 @@ impl Render for DatabasePanel {
                         .child(view),
                 )
             })
+            .when_some(self.explain_view.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .p_8()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
+            })
             .when(self.compare_pick.is_some(), |el| {
                 el.child(
                     div()
@@ -4662,6 +4805,7 @@ mod tests {
                     modify_table: None,
                     erd_view: None,
                     compare_view: None,
+                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -4816,6 +4960,7 @@ mod tests {
                     modify_table: None,
                     erd_view: None,
                     compare_view: None,
+                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -4962,6 +5107,7 @@ mod tests {
                     modify_table: None,
                     erd_view: None,
                     compare_view: None,
+                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5131,6 +5277,75 @@ mod tests {
         assert_eq!(
             tab_count, 2,
             "two connections must produce exactly two result tabs"
+        );
+    }
+
+    #[gpui::test]
+    async fn pinned_result_tab_is_not_reused(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use workspace::Item;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let pane = workspace.update_in(cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            let handle = workspace.weak_handle();
+            cx.new(|cx| {
+                Pane::new(
+                    handle,
+                    project,
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Box::new(zed_actions::database_panel::NewQuery),
+                    false,
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        let conn = uuid::Uuid::new_v4();
+        let view_1 = workspace.update_in(cx, |_, window, cx| {
+            show_result_in_pane(&pane, conn, "Conn — Results".into(), None, window, cx)
+        });
+        // Pinning the tab means the next query for the same connection must not
+        // reuse it.
+        view_1.update(cx, |view, _| view.set_pinned_for_test(true));
+        let view_2 = workspace.update_in(cx, |_, window, cx| {
+            show_result_in_pane(&pane, conn, "Conn — Results".into(), None, window, cx)
+        });
+
+        assert_ne!(
+            view_1.entity_id(),
+            view_2.entity_id(),
+            "a pinned tab must not be reused; a new tab opens instead"
+        );
+        let (count, second_title) = pane.read_with(cx, |pane, cx| {
+            let views: Vec<_> = pane
+                .items_of_type::<crate::result_view::ResultView>()
+                .collect();
+            (
+                views.len(),
+                views
+                    .iter()
+                    .map(|view| view.read(cx).tab_content_text(0, cx).to_string())
+                    .find(|title| title.ends_with(" 2")),
+            )
+        });
+        assert_eq!(count, 2, "pinning then re-running must yield two tabs");
+        assert_eq!(
+            second_title.as_deref(),
+            Some("Conn — Results 2"),
+            "the second tab must be numbered"
         );
     }
 
@@ -5367,6 +5582,7 @@ mod tests {
                     modify_table: None,
                     erd_view: None,
                     compare_view: None,
+                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],

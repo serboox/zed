@@ -2,6 +2,7 @@ mod compare_data;
 mod connection_view;
 mod driver_icon;
 mod erd_diagram;
+mod explain_plan;
 mod modify_table;
 mod panel;
 mod result_view;

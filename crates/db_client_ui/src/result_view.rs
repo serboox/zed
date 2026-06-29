@@ -116,6 +116,8 @@ actions!(
         OpenExportDialog,
         /// Opens or closes the chart view for the current result.
         ToggleChart,
+        /// Pins this result tab so the next query opens a new tab instead of reusing it.
+        TogglePinResult,
     ]
 );
 
@@ -517,6 +519,9 @@ pub struct ResultView {
     sort_columns: Vec<SortColumn>,
     store: Option<WeakEntity<DatabaseStore>>,
     connection_id: Option<ConnectionId>,
+    // A pinned tab is never reused by show_result_in_pane, so the next query for
+    // the same connection opens a fresh tab instead of overwriting this one.
+    pinned: bool,
     env_accent: Option<gpui::Hsla>,
     database: Option<String>,
     table_name: Option<String>,
@@ -794,6 +799,7 @@ impl ResultView {
             sort_columns: Vec::new(),
             store: None,
             connection_id: None,
+            pinned: false,
             env_accent: None,
             database: None,
             table_name: None,
@@ -1526,6 +1532,20 @@ impl ResultView {
 
     pub fn connection_id(&self) -> Option<ConnectionId> {
         self.connection_id
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    fn toggle_pinned(&mut self, cx: &mut Context<Self>) {
+        self.pinned = !self.pinned;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pinned_for_test(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     #[cfg(test)]
@@ -5027,6 +5047,7 @@ impl ResultView {
         let history_open = self.history_open;
         let transposed = self.transposed;
         let chart_open = self.chart_open;
+        let pinned = self.pinned;
         let limit_editor = self.limit_editor.clone();
         let copy_format = self.copy_format;
         let weak_this = cx.weak_entity();
@@ -5343,6 +5364,7 @@ impl ResultView {
                                         .action("Copy Aggregation", Box::new(CopyAggregation))
                                         .action("Preview Pending Changes", Box::new(PreviewPendingChanges))
                                         .separator()
+                                        .action_checked("Pin Tab", Box::new(TogglePinResult), pinned)
                                         .action("Reset View", Box::new(ResetView))
                                 }))
                             })
@@ -8565,7 +8587,12 @@ impl Item for ResultView {
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
-        Some(Icon::new(IconName::DatabaseZap))
+        let icon = if self.pinned {
+            IconName::Pin
+        } else {
+            IconName::DatabaseZap
+        };
+        Some(Icon::new(icon))
     }
 }
 
@@ -8751,6 +8778,9 @@ impl Render for ResultView {
             }))
             .on_action(cx.listener(|this, _: &OpenExportDialog, _window, cx| {
                 this.open_export_dialog(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TogglePinResult, _window, cx| {
+                this.toggle_pinned(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleChart, _window, cx| {
                 this.toggle_chart(cx);
