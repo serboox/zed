@@ -5,37 +5,8 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
-/// Hard ceiling on rows decoded from a single result, independent of any SQL
-/// LIMIT. A safety net so a query that slips past the UI's default limit cannot
-/// pull an unbounded result into memory and freeze the client.
-const MAX_RESULT_ROWS: usize = 2_000;
-
-/// Per-cell byte cap kept in memory. A single BLOB/TEXT cell can be many
-/// megabytes; streaming decode truncates each value here so the in-memory
-/// result stays bounded (the grid only previews ~200 chars anyway).
-pub const MAX_CELL_BYTES: usize = 8 * 1024;
-
-/// Truncates an over-long cell value on a UTF-8 boundary so the result set
-/// cannot balloon from huge cells. Appends an ellipsis to signal truncation.
-fn cap_cell(mut value: String) -> String {
-    if value.len() > MAX_CELL_BYTES {
-        let mut end = MAX_CELL_BYTES;
-        while end > 0 && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        value.truncate(end);
-        value.push('…');
-    }
-    value
-}
-
-/// True when `value` may have been clipped by `cap_cell`, so it is unsafe to use
-/// as a key in a WHERE clause (a truncated value would match the wrong row or
-/// none). A clipped value ends with the ellipsis marker and is at least the cap
-/// in length; a genuinely short value ending in an ellipsis is not flagged.
-pub fn is_cell_possibly_truncated(value: &str) -> bool {
-    value.ends_with('…') && value.len() >= MAX_CELL_BYTES
-}
+pub use crate::{MAX_CELL_BYTES, is_cell_possibly_truncated};
+use crate::{MAX_RESULT_ROWS, cap_cell};
 
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
@@ -70,6 +41,30 @@ impl MySqlProvider {
             .context("Failed to connect to MySQL")?;
         Ok(Self { pool })
     }
+
+    /// Reads the grant statements for a single account. SHOW GRANTS does not
+    /// accept bind parameters, so the account is quoted inline; single quotes
+    /// are escaped to keep the statement well-formed.
+    async fn show_grants(&self, user: &str, host: &str) -> Result<Vec<String>> {
+        let sql = format!(
+            "SHOW GRANTS FOR '{}'@'{}'",
+            user.replace('\'', "''"),
+            host.replace('\'', "''"),
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read grants")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.try_get::<Vec<u8>, _>(0)
+                    .ok()
+                    .map(bytes_to_string)
+                    .or_else(|| row.try_get::<String, _>(0).ok())
+            })
+            .collect())
+    }
 }
 
 // MySQL reports string columns from SHOW/information_schema with a binary
@@ -95,43 +90,6 @@ pub(crate) fn urlencoding_encode(input: &str) -> String {
         }
     }
     output
-}
-
-#[cfg(test)]
-mod cap_tests {
-    use super::{MAX_CELL_BYTES, cap_cell, is_cell_possibly_truncated};
-
-    #[test]
-    fn cap_cell_bounds_huge_values_on_char_boundary() {
-        // Small values pass through unchanged.
-        assert_eq!(cap_cell("hello".to_string()), "hello");
-
-        // A value over the cap is truncated; the kept part never exceeds the cap
-        // and the result is valid UTF-8 ending in an ellipsis.
-        let huge = "x".repeat(MAX_CELL_BYTES * 4);
-        let capped = cap_cell(huge);
-        assert!(capped.len() <= MAX_CELL_BYTES + 4);
-        assert!(capped.ends_with('…'));
-
-        // Truncation must land on a char boundary even with multi-byte input.
-        let multibyte = "д".repeat(MAX_CELL_BYTES);
-        let capped = cap_cell(multibyte);
-        assert!(capped.is_char_boundary(capped.len()));
-    }
-
-    #[test]
-    fn detects_capped_values_but_not_genuine_ellipsis() {
-        // A clipped value (output of cap_cell on oversized input) is flagged.
-        let capped = cap_cell("x".repeat(MAX_CELL_BYTES * 2));
-        assert!(is_cell_possibly_truncated(&capped));
-
-        // A short value that simply ends in an ellipsis is not flagged.
-        assert!(!is_cell_possibly_truncated("done…"));
-        assert!(!is_cell_possibly_truncated(""));
-
-        // A value with no ellipsis is never flagged, even at the cap length.
-        assert!(!is_cell_possibly_truncated(&"y".repeat(MAX_CELL_BYTES)));
-    }
 }
 
 #[cfg(test)]
@@ -490,14 +448,14 @@ impl DbProvider for MySqlProvider {
         .await
         .context("Failed to list users")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|(name, host)| UserInfo {
-                name: bytes_to_string(name),
-                host: bytes_to_string(host),
-                grants: Vec::new(),
-            })
-            .collect())
+        let mut users = Vec::with_capacity(rows.len());
+        for (name, host) in rows {
+            let name = bytes_to_string(name);
+            let host = bytes_to_string(host);
+            let grants = self.show_grants(&name, &host).await.unwrap_or_default();
+            users.push(UserInfo { name, host, grants });
+        }
+        Ok(users)
     }
 
     async fn truncate_table(&self, database: &str, table: &str) -> Result<()> {
@@ -678,7 +636,7 @@ mod integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_unbounded_select_is_bounded() {
-        use super::{MAX_CELL_BYTES, MAX_RESULT_ROWS};
+        use crate::{MAX_CELL_BYTES, MAX_RESULT_ROWS};
         let config =
             test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
@@ -703,6 +661,23 @@ mod integration_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_users_populates_grants() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let users = provider.list_users().await.expect("Failed to list users");
+        assert!(!users.is_empty(), "Expected at least one MySQL account");
+        // A privileged test account should see grants for at least one user.
+        assert!(
+            users.iter().any(|user| !user.grants.is_empty()),
+            "Expected SHOW GRANTS to populate grants for at least one account"
+        );
     }
 
     #[tokio::test]

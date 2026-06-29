@@ -4957,6 +4957,7 @@ dependencies = [
  "async-trait",
  "clock",
  "collections",
+ "credentials_provider",
  "db_client",
  "editor",
  "fs",
@@ -4980,6 +4981,7 @@ dependencies = [
  "uuid",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
  "zip",
 ]
 
