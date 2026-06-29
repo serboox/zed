@@ -1,5 +1,7 @@
 use crate::connection_view::ConnectionView;
 use crate::driver_icon::brand_icon;
+use crate::compare_data::{CompareDataEvent, CompareDataView};
+use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::modify_table::{ModifyTableEvent, ModifyTableView};
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
@@ -37,6 +39,7 @@ use workspace::{
 use zed_actions::database_panel::ToggleFocus;
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
+const ERD_TABLE_LIMIT: usize = 50;
 
 fn parse_env_color(s: &str) -> Option<gpui::Rgba> {
     let hex = s.trim().trim_start_matches('#');
@@ -1261,8 +1264,20 @@ pub struct DatabasePanel {
     table_filter_is_regex: bool,
     quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
     modify_table: Option<Entity<ModifyTableView>>,
+    erd_view: Option<Entity<ErdView>>,
+    compare_view: Option<Entity<CompareDataView>>,
+    compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Pending second-table selection for the Compare Data flow: the user picked a
+/// source table and now chooses what to compare it against.
+struct ComparePick {
+    connection_id: ConnectionId,
+    database: String,
+    left_table: String,
+    candidates: Vec<String>,
 }
 
 struct QueryParamsPrompt {
@@ -1341,6 +1356,9 @@ impl DatabasePanel {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
+                    erd_view: None,
+                    compare_view: None,
+                    compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![
                         store_subscription,
@@ -1636,6 +1654,183 @@ impl DatabasePanel {
         .detach_and_log_err(cx);
     }
 
+    fn open_erd_diagram(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .and_then(|connection| connection.provider.clone());
+        let Some(provider) = provider else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let tables = provider
+                .list_tables(&database)
+                .await
+                .log_err()
+                .unwrap_or_default();
+            // Describing every table is one round-trip each; cap the diagram so a
+            // large schema cannot freeze the introspection or the layout.
+            let mut erd_tables = Vec::new();
+            let mut relationships = Vec::new();
+            for table in tables.into_iter().take(ERD_TABLE_LIMIT) {
+                let columns = provider
+                    .describe_table(&database, &table.name)
+                    .await
+                    .log_err()
+                    .unwrap_or_default();
+                let foreign_keys = provider
+                    .list_foreign_keys(&database, &table.name)
+                    .await
+                    .log_err()
+                    .unwrap_or_default();
+                let fk_columns: HashSet<String> = foreign_keys
+                    .iter()
+                    .map(|fk| fk.from_column.clone())
+                    .collect();
+                for fk in &foreign_keys {
+                    relationships.push(ErdRelationship {
+                        from_table: table.name.clone(),
+                        from_column: fk.from_column.clone(),
+                        to_table: fk.to_table.clone(),
+                        to_column: fk.to_column.clone(),
+                    });
+                }
+                erd_tables.push(ErdTable {
+                    name: table.name.clone(),
+                    columns: columns
+                        .into_iter()
+                        .map(|column| ErdColumn {
+                            is_primary_key: column.column_key.as_deref() == Some("PRI"),
+                            is_foreign_key: fk_columns.contains(&column.name),
+                            name: column.name,
+                            data_type: column.data_type,
+                        })
+                        .collect(),
+                });
+            }
+            this.update_in(cx, |panel, window, cx| {
+                let view =
+                    cx.new(|cx| ErdView::new(erd_tables, relationships, window, cx));
+                panel.erd_view = Some(view);
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_compare_picker(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        left_table: String,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .and_then(|connection| connection.provider.clone());
+        let Some(provider) = provider else { return };
+        let left_for_filter = left_table.clone();
+        cx.spawn(async move |this, cx| {
+            let candidates: Vec<String> = provider
+                .list_tables(&database)
+                .await
+                .log_err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|table| table.name)
+                .filter(|name| name != &left_for_filter)
+                .collect();
+            this.update(cx, |panel, cx| {
+                panel.compare_pick = Some(ComparePick {
+                    connection_id: id,
+                    database,
+                    left_table,
+                    candidates,
+                });
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn start_compare(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        left_table: String,
+        right_table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compare_pick = None;
+        let provider = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .and_then(|connection| connection.provider.clone());
+        let Some(provider) = provider else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let left = provider
+                .execute_query(&database, &format!("SELECT * FROM {left_table}"))
+                .await;
+            let right = provider
+                .execute_query(&database, &format!("SELECT * FROM {right_table}"))
+                .await;
+            // Match rows by the left table's primary key when it has one, so a
+            // value change reads as Changed rather than Added+Removed.
+            let key_columns = provider
+                .describe_table(&database, &left_table)
+                .await
+                .log_err()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, column)| column.column_key.as_deref() == Some("PRI"))
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|keys| !keys.is_empty());
+            let (Ok(left), Ok(right)) = (left, right) else {
+                return anyhow::Ok(());
+            };
+            this.update_in(cx, |panel, window, cx| {
+                let view = cx
+                    .new(|cx| CompareDataView::new(left, right, key_columns, window, cx));
+                let subscription =
+                    cx.subscribe(&view, |panel, _view, event, cx| match event {
+                        CompareDataEvent::Dismissed => {
+                            panel.compare_view = None;
+                            cx.notify();
+                        }
+                    });
+                panel._subscriptions.push(subscription);
+                panel.compare_view = Some(view);
+                cx.notify();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn open_query_params_prompt(
         &mut self,
         connection_id: ConnectionId,
@@ -1687,6 +1882,75 @@ impl DatabasePanel {
             cx,
         );
         cx.notify();
+    }
+
+    fn render_compare_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(pick) = self.compare_pick.as_ref() else {
+            return div();
+        };
+        let id = pick.connection_id;
+        let database = pick.database.clone();
+        let left_table = pick.left_table.clone();
+        let rows: Vec<_> = pick
+            .candidates
+            .iter()
+            .cloned()
+            .map(|candidate| {
+                let database = database.clone();
+                let left_table = left_table.clone();
+                Button::new(SharedString::from(format!("cmp-{candidate}")), candidate.clone())
+                    .style(ButtonStyle::Subtle)
+                    .full_width()
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        panel.start_compare(
+                            id,
+                            database.clone(),
+                            left_table.clone(),
+                            candidate.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+            })
+            .collect();
+        div().child(
+            v_flex()
+                .elevation_3(cx)
+                .w(px(420.))
+                .max_h(px(480.))
+                .p_3()
+                .gap_2()
+                .child(
+                    Label::new(format!("Compare {left_table} with"))
+                        .size(LabelSize::Large),
+                )
+                .child(Divider::horizontal())
+                .when(rows.is_empty(), |column| {
+                    column.child(
+                        Label::new("No other tables to compare")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .child(
+                    v_flex()
+                        .id("compare-candidates")
+                        .gap_0p5()
+                        .max_h(px(360.))
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
+                .child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("compare-cancel", "Cancel").on_click(cx.listener(
+                            |panel, _, _, cx| {
+                                panel.compare_pick = None;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+                ),
+        )
     }
 
     fn render_query_params_popup(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2506,6 +2770,15 @@ impl DatabasePanel {
                                             });
                                         }
                                     })
+                                    .entry("Show Diagram", None, {
+                                        let entity = entity.clone();
+                                        let db = db.clone();
+                                        move |window, cx| {
+                                            entity.update(cx, |panel, cx| {
+                                                panel.open_erd_diagram(id, db.clone(), window, cx);
+                                            });
+                                        }
+                                    })
                                     .separator()
                                     .entry("Copy Name", None, {
                                         move |_, cx| {
@@ -2809,6 +3082,16 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
                                                                 panel.open_modify_table(id, db.clone(), tbl.clone(), window, cx);
+                                                            });
+                                                        }
+                                                    })
+                                                    .entry("Compare Data…", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |_window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_compare_picker(id, db.clone(), tbl.clone(), cx);
                                                             });
                                                         }
                                                     })
@@ -3614,6 +3897,58 @@ impl Render for DatabasePanel {
                         .child(self.render_query_params_popup(cx)),
                 )
             })
+            .when_some(self.erd_view.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .p_1()
+                                .child(
+                                    IconButton::new("close-erd", IconName::Close)
+                                        .tooltip(Tooltip::text("Close diagram"))
+                                        .on_click(cx.listener(|panel, _, _, cx| {
+                                            panel.erd_view = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(div().flex_1().child(view)),
+                )
+            })
+            .when_some(self.compare_view.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
+            })
+            .when(self.compare_pick.is_some(), |el| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(self.render_compare_picker(cx)),
+                )
+            })
     }
 }
 
@@ -4325,6 +4660,9 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
+                    erd_view: None,
+                    compare_view: None,
+                    compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
                 }
@@ -4476,6 +4814,9 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
+                    erd_view: None,
+                    compare_view: None,
+                    compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
                 }
@@ -4619,6 +4960,9 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
+                    erd_view: None,
+                    compare_view: None,
+                    compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
                 }
@@ -5021,6 +5365,9 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
+                    erd_view: None,
+                    compare_view: None,
+                    compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
                 }
