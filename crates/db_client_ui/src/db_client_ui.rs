@@ -1,5 +1,6 @@
 mod connection_view;
 mod driver_icon;
+mod erd_diagram;
 mod modify_table;
 mod panel;
 mod result_view;
