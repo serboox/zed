@@ -6,9 +6,8 @@ use sqlx::{Column as _, Row as _};
 use std::path::Path;
 use std::time::Instant;
 
-const MAX_RESULT_ROWS: usize = 2_000;
-
 use crate::connection::ConnectionConfig;
+use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
     ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind, TriggerInfo,
@@ -256,6 +255,7 @@ impl DbProvider for SqliteProvider {
                             .or_else(|| row.try_get::<i32, _>(index).ok().map(|v| v.to_string()))
                             .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
                             .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
+                            .map(cap_cell)
                     })
                     .collect();
                 result_rows.push(decoded);

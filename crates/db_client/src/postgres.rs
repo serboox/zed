@@ -5,9 +5,8 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
-const MAX_RESULT_ROWS: usize = 2_000;
-
 use crate::connection::ConnectionConfig;
+use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
     ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult, TableInfo,
@@ -200,7 +199,7 @@ impl DbProvider for PostgresProvider {
                         .collect();
                 }
                 let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| Self::extract_cell(&row, index))
+                    .map(|index| Self::extract_cell(&row, index).map(cap_cell))
                     .collect();
                 result_rows.push(decoded);
 

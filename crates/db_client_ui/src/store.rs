@@ -12,13 +12,54 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
-use gpui::{App, AppContext as _, Context, EventEmitter, Task, TaskExt as _};
+use credentials_provider::CredentialsProvider;
+use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, Task, TaskExt as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
 const CONNECTIONS_FILE: &str = "db_connections.json";
+
+/// Keychain key for a connection's password. The connection id keeps the entry
+/// stable across label/host edits.
+fn connection_credentials_url(id: ConnectionId) -> String {
+    format!("db_client://connection/{id}")
+}
+
+/// Returns a copy of `config` with the password cleared. The on-disk JSON must
+/// never hold the plaintext password; the secret lives in the OS keychain.
+fn redact_password(config: &ConnectionConfig) -> ConnectionConfig {
+    let mut redacted = config.clone();
+    redacted.password = String::new();
+    redacted
+}
+
+async fn store_connection_password(
+    provider: &Arc<dyn CredentialsProvider>,
+    config: &ConnectionConfig,
+    cx: &AsyncApp,
+) -> Result<()> {
+    provider
+        .write_credentials(
+            &connection_credentials_url(config.id),
+            &config.username,
+            config.password.as_bytes(),
+            cx,
+        )
+        .await
+}
+
+async fn read_connection_password(
+    provider: &Arc<dyn CredentialsProvider>,
+    id: ConnectionId,
+    cx: &AsyncApp,
+) -> Result<Option<String>> {
+    let credentials = provider
+        .read_credentials(&connection_credentials_url(id), cx)
+        .await?;
+    Ok(credentials.map(|(_username, password)| String::from_utf8_lossy(&password).into_owned()))
+}
 
 #[derive(Debug, Clone)]
 pub enum ConnectionStatus {
@@ -86,7 +127,24 @@ impl DatabaseStore {
                     .background_executor()
                     .spawn(async { load_connections_from_disk() })
                     .await;
-                if let Ok(configs) = result {
+                if let Ok(mut configs) = result {
+                    // Passwords are stored in the OS keychain, not the JSON. Read
+                    // each one back before auto-connecting. A config that still
+                    // carries a non-empty password is a legacy plaintext entry;
+                    // keep it so the next save migrates it into the keychain.
+                    let provider = cx.update(|cx| zed_credentials_provider::global(cx));
+                    for config in &mut configs {
+                        if config.password.is_empty() {
+                            if let Some(password) =
+                                read_connection_password(&provider, config.id, cx)
+                                    .await
+                                    .log_err()
+                                    .flatten()
+                            {
+                                config.password = password;
+                            }
+                        }
+                    }
                     let auto_connect_ids: Vec<_> = configs
                         .iter()
                         .filter(|c| c.auto_connect)
@@ -197,14 +255,37 @@ impl DatabaseStore {
         self.ssh_tunnels.remove(&id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
+        cx.spawn(async move |_this, cx| {
+            let provider = cx.update(|cx| zed_credentials_provider::global(cx));
+            provider
+                .delete_credentials(&connection_credentials_url(id), cx)
+                .await
+                .log_err();
+        })
+        .detach();
         self.persist_connections(cx);
     }
 
     fn persist_connections(&self, cx: &mut Context<Self>) {
         let configs: Vec<ConnectionConfig> =
             self.connections.iter().map(|c| c.config.clone()).collect();
-        cx.background_spawn(async move {
-            save_connections_to_disk(configs).log_err();
+        // Credentials I/O runs on the foreground (the keychain provider returns
+        // non-Send futures); the JSON write is moved to a background thread.
+        cx.spawn(async move |_this, cx| {
+            let provider = cx.update(|cx| zed_credentials_provider::global(cx));
+            for config in &configs {
+                if !config.password.is_empty() {
+                    store_connection_password(&provider, config, cx)
+                        .await
+                        .log_err();
+                }
+            }
+            let redacted: Vec<ConnectionConfig> = configs.iter().map(redact_password).collect();
+            cx.background_executor()
+                .spawn(async move {
+                    save_connections_to_disk(redacted).log_err();
+                })
+                .await;
         })
         .detach();
     }
@@ -638,4 +719,112 @@ fn save_connections_to_disk(configs: Vec<ConnectionConfig>) -> Result<()> {
     let json = serde_json::to_vec_pretty(&configs)?;
     std::fs::write(connections_file_path(), json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockCredentials {
+        store: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    }
+
+    impl CredentialsProvider for MockCredentials {
+        fn read_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+            Box::pin(async move {
+                Ok(self
+                    .store
+                    .lock()
+                    .expect("credentials mock lock")
+                    .get(url)
+                    .cloned())
+            })
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            username: &'a str,
+            password: &'a [u8],
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            Box::pin(async move {
+                self.store
+                    .lock()
+                    .expect("credentials mock lock")
+                    .insert(url.to_string(), (username.to_string(), password.to_vec()));
+                Ok(())
+            })
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            Box::pin(async move {
+                self.store
+                    .lock()
+                    .expect("credentials mock lock")
+                    .remove(url);
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn redacts_password_but_keeps_other_fields() {
+        let config = ConnectionConfig {
+            password: "secret".to_string(),
+            ..ConnectionConfig::default()
+        };
+        let redacted = redact_password(&config);
+        assert!(redacted.password.is_empty());
+        assert_eq!(redacted.username, config.username);
+        assert_eq!(redacted.id, config.id);
+    }
+
+    #[test]
+    fn credentials_url_is_stable_per_id() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            connection_credentials_url(id),
+            format!("db_client://connection/{id}")
+        );
+    }
+
+    #[gpui::test]
+    async fn password_roundtrips_through_provider(cx: &mut gpui::TestAppContext) {
+        let provider: Arc<dyn CredentialsProvider> = Arc::new(MockCredentials::default());
+        let config = ConnectionConfig {
+            password: "p@ss:w/rd ".to_string(),
+            ..ConnectionConfig::default()
+        };
+        let async_cx = cx.to_async();
+
+        store_connection_password(&provider, &config, &async_cx)
+            .await
+            .expect("write password");
+        let loaded = read_connection_password(&provider, config.id, &async_cx)
+            .await
+            .expect("read password");
+        assert_eq!(loaded.as_deref(), Some("p@ss:w/rd "));
+
+        provider
+            .delete_credentials(&connection_credentials_url(config.id), &async_cx)
+            .await
+            .expect("delete password");
+        let after = read_connection_password(&provider, config.id, &async_cx)
+            .await
+            .expect("read password");
+        assert_eq!(after, None);
+    }
 }

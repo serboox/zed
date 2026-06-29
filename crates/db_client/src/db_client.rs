@@ -10,7 +10,6 @@ pub mod sqlite;
 pub mod ssh_tunnel;
 
 pub use connection::{ConnectionConfig, ConnectionId, DatabaseDriver};
-pub use mysql::{MAX_CELL_BYTES, is_cell_possibly_truncated};
 pub use provider::DbProvider;
 pub use runtime::{RuntimeProvider, on_runtime};
 pub use schema::{
@@ -35,6 +34,39 @@ pub fn application_name_comment(application_name: &str) -> String {
 /// "result pages" default of GUI database clients. Caps memory and render cost
 /// for unbounded SELECTs.
 pub const DEFAULT_PAGE_SIZE: usize = 500;
+
+/// Hard ceiling on rows decoded from a single result, independent of any SQL
+/// LIMIT. A safety net so a query that slips past the UI's default limit cannot
+/// pull an unbounded result into memory and freeze the client. Shared by every
+/// provider so the cap is uniform across drivers.
+pub const MAX_RESULT_ROWS: usize = 2_000;
+
+/// Per-cell byte cap kept in memory. A single BLOB/TEXT cell can be many
+/// megabytes; decode truncates each value here so the in-memory result stays
+/// bounded (the grid only previews ~200 chars anyway).
+pub const MAX_CELL_BYTES: usize = 8 * 1024;
+
+/// Truncates an over-long cell value on a UTF-8 boundary so the result set
+/// cannot balloon from huge cells. Appends an ellipsis to signal truncation.
+pub fn cap_cell(mut value: String) -> String {
+    if value.len() > MAX_CELL_BYTES {
+        let mut end = MAX_CELL_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+        value.push('…');
+    }
+    value
+}
+
+/// True when `value` may have been clipped by `cap_cell`, so it is unsafe to use
+/// as a key in a WHERE clause (a truncated value would match the wrong row or
+/// none). A clipped value ends with the ellipsis marker and is at least the cap
+/// in length; a genuinely short value ending in an ellipsis is not flagged.
+pub fn is_cell_possibly_truncated(value: &str) -> bool {
+    value.ends_with('…') && value.len() >= MAX_CELL_BYTES
+}
 
 /// True when `sql` only reads data, so it is safe to wrap or limit. A leading
 /// keyword check mirrors the per-provider detection used for the read/write
@@ -81,6 +113,30 @@ pub fn apply_default_limit(sql: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_cell_bounds_huge_values_on_char_boundary() {
+        assert_eq!(cap_cell("hello".to_string()), "hello");
+
+        let huge = "x".repeat(MAX_CELL_BYTES * 4);
+        let capped = cap_cell(huge);
+        assert!(capped.len() <= MAX_CELL_BYTES + 4);
+        assert!(capped.ends_with('…'));
+
+        let multibyte = "д".repeat(MAX_CELL_BYTES);
+        let capped = cap_cell(multibyte);
+        assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    #[test]
+    fn detects_capped_values_but_not_genuine_ellipsis() {
+        let capped = cap_cell("x".repeat(MAX_CELL_BYTES * 2));
+        assert!(is_cell_possibly_truncated(&capped));
+
+        assert!(!is_cell_possibly_truncated("done…"));
+        assert!(!is_cell_possibly_truncated(""));
+        assert!(!is_cell_possibly_truncated(&"y".repeat(MAX_CELL_BYTES)));
+    }
 
     #[test]
     fn appends_limit_only_to_unbounded_read_queries() {
