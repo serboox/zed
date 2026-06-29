@@ -348,6 +348,8 @@ pub struct ResultView {
     // Currently selected cell as (absolute row index, column index), highlighted
     // like a spreadsheet/grid selection.
     selected_cell: Option<(usize, usize)>,
+    // Rectangular cell range selected via Shift+click: anchor..end in (abs_row, col_idx).
+    selected_cell_range: Option<((usize, usize), (usize, usize))>,
     // Set of absolute row indices that are currently selected (via click /
     // shift-click / ctrl-click). Shown with a row-level highlight.
     selected_rows: std::collections::HashSet<usize>,
@@ -529,6 +531,7 @@ impl ResultView {
             column_edges: Vec::new(),
             total_width: 0.0,
             selected_cell: None,
+            selected_cell_range: None,
             selected_rows: std::collections::HashSet::new(),
             last_selected_row: None,
             frame_instants: std::collections::VecDeque::new(),
@@ -2720,7 +2723,12 @@ impl ResultView {
                 }
                 continue;
             }
-            let is_selected = self.selected_cell == Some((abs_idx, cell_idx));
+            let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
+                || self.selected_cell_range.map_or(false, |((r1, c1), (r2, c2))| {
+                    let (row_lo, row_hi) = (r1.min(r2), r1.max(r2));
+                    let (col_lo, col_hi) = (c1.min(c2), c1.max(c2));
+                    abs_idx >= row_lo && abs_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
+                });
             let is_modified = self.pending_edits.contains_key(&(abs_idx, cell_idx));
             let editing = self
                 .cell_edit
@@ -2983,13 +2991,18 @@ impl ResultView {
                 // Multi-row selection: shift extends range in display space so
                 // sorted/filtered views select what the user sees, not abs indices.
                 if mouse.down.modifiers.shift {
-                    let anchor_disp = this.last_selected_row.unwrap_or(display_idx);
-                    let lo = anchor_disp.min(display_idx);
-                    let hi = anchor_disp.max(display_idx);
-                    this.selected_rows.clear();
-                    for d in lo..=hi {
-                        if let Some(&a) = this.filtered_display_order.get(d) {
-                            this.selected_rows.insert(a);
+                    if let Some(anchor) = this.selected_cell {
+                        // Shift+click on a cell: extend the rectangular cell range.
+                        this.selected_cell_range = Some((anchor, (abs_idx, cell_idx)));
+                    } else {
+                        let anchor_disp = this.last_selected_row.unwrap_or(display_idx);
+                        let lo = anchor_disp.min(display_idx);
+                        let hi = anchor_disp.max(display_idx);
+                        this.selected_rows.clear();
+                        for d in lo..=hi {
+                            if let Some(&a) = this.filtered_display_order.get(d) {
+                                this.selected_rows.insert(a);
+                            }
                         }
                     }
                     // Don't update anchor on shift-click — keep extending from original pivot.
@@ -3000,10 +3013,12 @@ impl ResultView {
                         this.selected_rows.insert(abs_idx);
                     }
                     this.last_selected_row = Some(display_idx);
+                    this.selected_cell_range = None;
                 } else {
                     this.selected_rows.clear();
                     this.selected_rows.insert(abs_idx);
                     this.last_selected_row = Some(display_idx);
+                    this.selected_cell_range = None;
                 }
                 this.selected_cell = Some((abs_idx, cell_idx));
                 if let Some(disp) = this.display_idx_of(abs_idx) {
@@ -3118,7 +3133,12 @@ impl ResultView {
                 }
                 continue;
             }
-            let is_selected = self.selected_cell == Some((abs_idx, cell_idx));
+            let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
+                || self.selected_cell_range.map_or(false, |((r1, c1), (r2, c2))| {
+                    let (row_lo, row_hi) = (r1.min(r2), r1.max(r2));
+                    let (col_lo, col_hi) = (c1.min(c2), c1.max(c2));
+                    abs_idx >= row_lo && abs_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
+                });
             let editing = self
                 .cell_edit
                 .as_ref()
@@ -4077,6 +4097,8 @@ impl ResultView {
                                         this.selected_rows.insert(abs_idx);
                                         this.last_selected_row = Some(display_idx);
                                     }
+                                    this.selected_cell = None;
+                                    this.selected_cell_range = None;
                                     cx.notify();
                                 }));
                             if gutter_row_ops {

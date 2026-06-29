@@ -183,31 +183,23 @@ impl SemanticsProvider for DbSemanticsProvider {
             return None;
         }
 
-        let matched = self
+        let (database, table) = self
             .store
             .read_with(cx, |store, _| {
                 let conn = store
                     .connections
                     .iter()
                     .find(|c| c.config.id == self.connection_id)?;
-                if let Some(ref db) = database_opt {
-                    let tables = conn.expanded_databases.get(db)?;
-                    if tables.iter().any(|t| t.name == table_name) {
-                        return Some((db.clone(), table_name.clone()));
-                    }
-                    return None;
-                }
-                for (db, tables) in &conn.expanded_databases {
-                    if tables.iter().any(|t| t.name == table_name) {
-                        return Some((db.clone(), table_name.clone()));
-                    }
-                }
-                None
+                let db = database_opt.clone().or_else(|| {
+                    conn.config
+                        .database
+                        .clone()
+                        .or_else(|| conn.expanded_databases.keys().next().cloned())
+                })?;
+                Some((db, table_name.clone()))
             })
             .ok()
             .flatten()?;
-
-        let (database, table) = matched;
         let word_start = snapshot.anchor_before(start);
         let word_end = snapshot.anchor_after(end);
         let source_buffer = buffer.clone();
