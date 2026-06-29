@@ -852,6 +852,7 @@ fn show_result_in_pane(
     pane: &Entity<Pane>,
     connection_id: ConnectionId,
     title: SharedString,
+    env_color: Option<gpui::Hsla>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ResultView> {
@@ -873,7 +874,11 @@ fn show_result_in_pane(
         return view;
     }
 
-    let view = cx.new(|cx| ResultView::new(title, cx).with_connection(connection_id));
+    let view = cx.new(|cx| {
+        ResultView::new(title, cx)
+            .with_connection(connection_id)
+            .with_env_color(env_color)
+    });
     pane.update(cx, |pane, cx| {
         pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
     });
@@ -995,10 +1000,15 @@ fn run_sql_from_editor(
                 c.config.database.clone().unwrap_or_default(),
                 c.config.label.clone(),
                 matches!(c.status, ConnectionStatus::Connected),
+                c.config
+                    .env_color
+                    .as_deref()
+                    .and_then(parse_env_color)
+                    .map(gpui::Hsla::from),
             )
         })
     };
-    let (conn_id, db_name, conn_label, connected) = match connection {
+    let (conn_id, db_name, conn_label, connected, env_color) = match connection {
         Some(connection) => connection,
         None => return,
     };
@@ -1016,6 +1026,7 @@ fn run_sql_from_editor(
         &pane,
         conn_id,
         format!("{conn_label} — Results").into(),
+        env_color,
         window,
         cx,
     );
@@ -1421,9 +1432,9 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) {
         let title = SharedString::from(format!("{database}.{table}"));
-        let task = self
-            .store
-            .update(cx, |store, cx| store.describe_table(id, database, table, cx));
+        let task = self.store.update(cx, |store, cx| {
+            store.describe_table(id, database, table, cx)
+        });
         cx.spawn(async move |this, cx| {
             let columns = task.await.unwrap_or_default();
             this.update(cx, |this, cx| {
@@ -1442,30 +1453,29 @@ impl DatabasePanel {
         columns: &[ColumnInfo],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let rows: Vec<_> = columns
-            .iter()
-            .map(|col| {
-                let is_fk = false;
-                let overlays = Self::column_overlay_icons(col, is_fk);
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .py_0p5()
-                    .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
-                    .child(
-                        Label::new(col.data_type.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .children(
-                        overlays
-                            .into_iter()
-                            .map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
-                    )
-            })
-            .collect();
+        let rows: Vec<_> =
+            columns
+                .iter()
+                .map(|col| {
+                    let is_fk = false;
+                    let overlays = Self::column_overlay_icons(col, is_fk);
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .py_0p5()
+                        .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
+                        .child(
+                            Label::new(col.data_type.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .children(overlays.into_iter().map(|(icon, color)| {
+                            Icon::new(icon).size(IconSize::XSmall).color(color)
+                        }))
+                })
+                .collect();
         div()
             .absolute()
             .top_8()
@@ -1535,17 +1545,13 @@ impl DatabasePanel {
         }
         self.server_objects_expanded.insert(id);
         if !self.server_users.contains_key(&id) {
-            let task = self
-                .store
-                .update(cx, |store, cx| store.list_users(id, cx));
+            let task = self.store.update(cx, |store, cx| store.list_users(id, cx));
             cx.spawn(async move |this, cx| {
                 let users = task.await;
                 this.update(cx, |this, cx| {
                     if let Ok(users) = users {
-                        this.server_users.insert(
-                            id,
-                            users.into_iter().map(|u| (u.name, u.host)).collect(),
-                        );
+                        this.server_users
+                            .insert(id, users.into_iter().map(|u| (u.name, u.host)).collect());
                         cx.notify();
                     }
                 })
@@ -3392,6 +3398,15 @@ mod tests {
     actions!(db_console_probe, [CompetingAssistProbe]);
 
     #[test]
+    fn parse_env_color_accepts_valid_hex_and_rejects_junk() {
+        assert!(parse_env_color("#f85149").is_some());
+        assert!(parse_env_color("3fb950").is_some());
+        assert!(parse_env_color("").is_none());
+        assert!(parse_env_color("#fff").is_none());
+        assert!(parse_env_color("#zzzzzz").is_none());
+    }
+
+    #[test]
     fn statement_at_cursor_picks_only_the_statement_under_the_cursor() {
         let text = "SELECT 1;\nSELECT 2;\nSELECT 3;";
         // cursor inside the second statement (after the first ';')
@@ -3704,8 +3719,14 @@ mod tests {
     #[test]
     fn column_overlay_icons_reflect_key_and_nullability() {
         let pk = DatabasePanel::column_overlay_icons(&test_column(Some("PRI"), false), false);
-        assert!(pk.iter().any(|(icon, _)| matches!(icon, IconName::StarFilled)));
-        assert!(pk.iter().any(|(icon, _)| matches!(icon, IconName::SquareDot)));
+        assert!(
+            pk.iter()
+                .any(|(icon, _)| matches!(icon, IconName::StarFilled))
+        );
+        assert!(
+            pk.iter()
+                .any(|(icon, _)| matches!(icon, IconName::SquareDot))
+        );
 
         let fk = DatabasePanel::column_overlay_icons(&test_column(Some("MUL"), true), true);
         assert!(fk.iter().any(|(icon, _)| matches!(icon, IconName::Link)));
@@ -3715,7 +3736,11 @@ mod tests {
         );
 
         let unique = DatabasePanel::column_overlay_icons(&test_column(Some("UNI"), true), false);
-        assert!(unique.iter().any(|(icon, _)| matches!(icon, IconName::Hash)));
+        assert!(
+            unique
+                .iter()
+                .any(|(icon, _)| matches!(icon, IconName::Hash))
+        );
 
         let plain = DatabasePanel::column_overlay_icons(&test_column(None, true), false);
         assert!(plain.is_empty());
@@ -4401,13 +4426,13 @@ mod tests {
         let conn_b = uuid::Uuid::new_v4();
 
         let view_a1 = workspace.update_in(cx, |_, window, cx| {
-            show_result_in_pane(&pane, conn_a, "A — Results".into(), window, cx)
+            show_result_in_pane(&pane, conn_a, "A — Results".into(), None, window, cx)
         });
         let view_a2 = workspace.update_in(cx, |_, window, cx| {
-            show_result_in_pane(&pane, conn_a, "A — Results".into(), window, cx)
+            show_result_in_pane(&pane, conn_a, "A — Results".into(), None, window, cx)
         });
         let view_b = workspace.update_in(cx, |_, window, cx| {
-            show_result_in_pane(&pane, conn_b, "B — Results".into(), window, cx)
+            show_result_in_pane(&pane, conn_b, "B — Results".into(), None, window, cx)
         });
 
         assert_eq!(

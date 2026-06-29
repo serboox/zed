@@ -31,6 +31,16 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
+/// Named environment color presets. The hex is what gets stored in
+/// `ConnectionConfig::env_color`; the label is what the user picks by.
+pub(crate) const ENV_COLOR_PRESETS: &[(&str, &str)] = &[
+    ("Local", "#3fb950"),
+    ("Development", "#2dd4bf"),
+    ("Staging", "#d29922"),
+    ("Production", "#f85149"),
+    ("Neutral", "#8b949e"),
+];
+
 #[derive(Clone)]
 enum TestState {
     Idle,
@@ -541,28 +551,78 @@ impl Render for ConnectionView {
             )
             .child({
                 let color_raw = Self::read_text(&self.color_editor, cx);
+                let current_norm = parse_hex_color(color_raw.trim())
+                    .map(|_| format!("#{}", color_raw.trim().trim_start_matches('#').to_lowercase()));
                 let swatch_color = parse_hex_color(color_raw.trim())
                     .map(|(r, g, b)| gpui::rgb(rgb_to_u32(r, g, b)));
-                h_flex()
+                let accent = cx.theme().colors().text_accent;
+
+                let mut presets = h_flex().gap_3().flex_wrap();
+                for (name, hex) in ENV_COLOR_PRESETS {
+                    let hex = *hex;
+                    let is_selected = current_norm.as_deref() == Some(hex);
+                    let dot_color = parse_hex_color(hex)
+                        .map(|(r, g, b)| gpui::rgb(rgb_to_u32(r, g, b)));
+                    presets = presets.child(
+                        h_flex()
+                            .id(SharedString::from(format!("env-preset-{name}")))
+                            .gap_1p5()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.color_editor.update(cx, |editor, cx| {
+                                    editor.set_text(hex, window, cx);
+                                });
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(if is_selected { accent } else { field_border })
+                                    .when_some(dot_color, |el, color| el.bg(color)),
+                            )
+                            .child(Label::new(SharedString::from(*name)).size(LabelSize::Small)),
+                    );
+                }
+                presets = presets.child(
+                    Button::new("env-preset-none", "No Color")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.color_editor.update(cx, |editor, cx| {
+                                editor.set_text("", window, cx);
+                            });
+                            cx.notify();
+                        })),
+                );
+
+                v_flex()
                     .gap_2()
-                    .items_end()
-                    .child(div().flex_1().child(Self::render_field(
-                        "Environment Color",
-                        self.color_editor.clone(),
-                        field_border,
-                        field_bg,
-                    )))
                     .child(
-                        div()
-                            .w(px(24.))
-                            .h(px(24.))
-                            .mb(px(2.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(field_border)
-                            .when_some(swatch_color, |el, color| el.bg(color))
-                            .when(swatch_color.is_none(), |el| el.bg(field_bg)),
+                        h_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(div().flex_1().child(Self::render_field(
+                                "Environment Color",
+                                self.color_editor.clone(),
+                                field_border,
+                                field_bg,
+                            )))
+                            .child(
+                                div()
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .mb(px(2.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(field_border)
+                                    .when_some(swatch_color, |el, color| el.bg(color))
+                                    .when(swatch_color.is_none(), |el| el.bg(field_bg)),
+                            ),
                     )
+                    .child(presets)
             })
             .child(if is_file_based {
                 div().w_full().child(Self::render_field(
@@ -793,6 +853,46 @@ mod tests {
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
+    }
+
+    #[test]
+    fn env_color_presets_parse_to_valid_hex() {
+        for (name, hex) in ENV_COLOR_PRESETS {
+            assert!(
+                parse_hex_color(hex).is_some(),
+                "preset {name} has invalid hex {hex}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn build_config_uses_selected_env_color_preset(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        let production_hex = ENV_COLOR_PRESETS
+            .iter()
+            .find(|(name, _)| *name == "Production")
+            .map(|(_, hex)| *hex)
+            .expect("Production preset exists");
+
+        window
+            .update(cx, |view, window, cx| {
+                view.host_editor
+                    .update(cx, |ed, cx| ed.set_text("db.example.com", window, cx));
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("alice", window, cx));
+                // Picking a preset sets the color editor to its hex.
+                view.color_editor
+                    .update(cx, |ed, cx| ed.set_text(production_hex, window, cx));
+            })
+            .unwrap();
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert_eq!(config.env_color.as_deref(), Some(production_hex));
     }
 
     #[gpui::test]

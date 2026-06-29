@@ -436,6 +436,7 @@ pub struct ResultView {
     sort_columns: Vec<SortColumn>,
     store: Option<WeakEntity<DatabaseStore>>,
     connection_id: Option<ConnectionId>,
+    env_accent: Option<gpui::Hsla>,
     database: Option<String>,
     table_name: Option<String>,
     filter_editor: Option<Entity<Editor>>,
@@ -694,6 +695,7 @@ impl ResultView {
             sort_columns: Vec::new(),
             store: None,
             connection_id: None,
+            env_accent: None,
             database: None,
             table_name: None,
             filter_editor: None,
@@ -1405,6 +1407,11 @@ impl ResultView {
 
     pub fn with_connection(mut self, connection_id: ConnectionId) -> Self {
         self.connection_id = Some(connection_id);
+        self
+    }
+
+    pub fn with_env_color(mut self, color: Option<gpui::Hsla>) -> Self {
+        self.env_accent = color;
         self
     }
 
@@ -7794,6 +7801,20 @@ impl Render for ResultView {
             .key_context("DbResultView")
             .track_focus(&self.focus_handle)
             .size_full()
+            .when_some(self.env_accent, |el, color| {
+                // Ambient environment cue: a thin top stripe plus a faint wash so
+                // a production connection is recognizable at a glance without
+                // hurting cell legibility.
+                el.bg(color.opacity(0.05)).child(
+                    div()
+                        .id("env-accent-bar")
+                        .debug_selector(|| "ENV_ACCENT_BAR".to_string())
+                        .h(px(2.))
+                        .w_full()
+                        .flex_none()
+                        .bg(color),
+                )
+            })
             .on_action(cx.listener(|this, _: &SubmitEdits, window, cx| {
                 this.submit_pending_edits(window, cx);
             }))
@@ -8902,6 +8923,39 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_result_view(window, &mut cx);
         (window, view, cx)
+    }
+
+    #[gpui::test]
+    fn env_accent_bar_shown_only_when_color_set(cx: &mut gpui::TestAppContext) {
+        init_result_view_test(cx);
+        let window = cx.add_window(|_window, cx| {
+            let mut view =
+                ResultView::new("query", cx).with_env_color(Some(gpui::rgb(0xf85149).into()));
+            view.set_result(sample_table_result(), cx);
+            view
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("ENV_ACCENT_BAR").is_some(),
+            "env accent bar must render when a color is set"
+        );
+    }
+
+    #[gpui::test]
+    fn env_accent_bar_absent_without_color(cx: &mut gpui::TestAppContext) {
+        init_result_view_test(cx);
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("query", cx);
+            view.set_result(sample_table_result(), cx);
+            view
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("ENV_ACCENT_BAR").is_none(),
+            "env accent bar must not render without a color"
+        );
     }
 
     #[gpui::test]
