@@ -108,6 +108,10 @@ actions!(
         CopyAggregation,
         /// Toggles whether find hides rows without a match.
         ToggleFindFilterRows,
+        /// Toggles the transposed view (columns become rows, records become columns).
+        ToggleTranspose,
+        /// Resets column order, hidden columns, sort, filters, and transpose to defaults.
+        ResetView,
     ]
 );
 
@@ -566,6 +570,20 @@ pub struct ResultView {
     // When true, the find bar hides rows without a match instead of only
     // highlighting them.
     find_filter_rows: bool,
+    // The cell whose value currently populates the value editor. Used to detect
+    // when to reload the editor text on a cell change without clobbering edits
+    // the user is typing into the same cell.
+    value_editor_cell: Option<(usize, usize)>,
+    // When true, the grid is shown transposed: original columns become rows and
+    // each record becomes a column.
+    transposed: bool,
+    // Data column indices in the user's chosen display order. Drives
+    // `visible_columns` (which also drops hidden columns). Identity by default.
+    column_order: Vec<usize>,
+    // Substring that filters the query history list (case-insensitive).
+    history_search: String,
+    // Editor widget for the history search input, created lazily.
+    history_search_editor: Option<Entity<Editor>>,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -739,6 +757,11 @@ impl ResultView {
             goto_row_visible: false,
             goto_row_editor: None,
             find_filter_rows: false,
+            value_editor_cell: None,
+            transposed: false,
+            column_order: Vec::new(),
+            history_search: String::new(),
+            history_search_editor: None,
         }
     }
 
@@ -926,8 +949,20 @@ impl ResultView {
             indices
         };
 
-        // Visible columns: all columns except those hidden by the user.
-        self.visible_columns = (0..total_cols)
+        // Column order defaults to identity and is reset whenever the result's
+        // column count changes, so a stale order from a previous result never
+        // points past the new column range.
+        let order_matches = self.column_order.len() == total_cols
+            && self.column_order.iter().all(|&c| c < total_cols);
+        if !order_matches {
+            self.column_order = (0..total_cols).collect();
+        }
+
+        // Visible columns: the chosen column order minus those hidden by the user.
+        self.visible_columns = self
+            .column_order
+            .iter()
+            .copied()
             .filter(|i| !self.hidden_columns.contains(i))
             .collect();
 
@@ -3728,9 +3763,8 @@ impl ResultView {
         }
 
         let items: Vec<AnyElement> = self
-            .query_history
-            .iter()
-            .enumerate()
+            .filtered_history()
+            .into_iter()
             .map(|(i, sql)| {
                 let preview: String = sql.chars().take(80).collect();
                 let preview = if sql.chars().count() > 80 {
@@ -3766,12 +3800,31 @@ impl ResultView {
             })
             .collect();
 
+        let search_box = self.history_search_editor.clone().map(|editor| {
+            h_flex()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1().child(editor))
+        });
+
         Some(
             div()
                 .id("query-history-popup")
+                .debug_selector(|| "QUERY_HISTORY_POPUP".to_string())
                 .absolute()
                 .top_8()
                 .left_0()
+                .flex()
+                .flex_col()
                 .bg(cx.theme().colors().surface_background)
                 .border_1()
                 .border_color(cx.theme().colors().border)
@@ -3779,8 +3832,14 @@ impl ResultView {
                 .shadow_md()
                 .min_w(px(360.0))
                 .max_h(px(360.0))
-                .overflow_y_scroll()
-                .children(items)
+                .when_some(search_box, |el, box_| el.child(box_))
+                .child(
+                    div()
+                        .id("query-history-list")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .children(items),
+                )
                 .into_any_element(),
         )
     }
@@ -4666,10 +4725,12 @@ impl ResultView {
         let record_view_open = self.record_view_open;
         let quick_doc_open = self.quick_doc_open;
         let history_open = self.history_open;
+        let transposed = self.transposed;
         let limit_editor = self.limit_editor.clone();
         let copy_format = self.copy_format;
         let weak_this = cx.weak_entity();
         let weak_for_gutter = weak_this.clone();
+        let weak_for_header = weak_this.clone();
         let weak_for_copy_menu = weak_this.clone();
 
         div()
@@ -4971,6 +5032,7 @@ impl ResultView {
                                     menu
                                         .action_checked("Value Editor", Box::new(ToggleValueEditor), value_editor_open)
                                         .action_checked("Record View", Box::new(ToggleRecordView), record_view_open)
+                                        .action_checked("Transpose", Box::new(ToggleTranspose), transposed)
                                         .action_checked("Column Info", Box::new(QuickDoc), quick_doc_open)
                                         .separator()
                                         .action_checked("Query History", Box::new(OpenQueryHistory), history_open)
@@ -4978,6 +5040,8 @@ impl ResultView {
                                         .action("Go to Row", Box::new(GoToRow))
                                         .action("Copy Aggregation", Box::new(CopyAggregation))
                                         .action("Preview Pending Changes", Box::new(PreviewPendingChanges))
+                                        .separator()
+                                        .action("Reset View", Box::new(ResetView))
                                 }))
                             })
                             .anchor(Anchor::TopRight)
@@ -5136,7 +5200,9 @@ impl ResultView {
                             )
                     })
             )
-            .child({
+            .child(if self.transposed {
+                self.render_transposed(cx)
+            } else {
                 // Use filtered_display_order so per-column filters narrow the list.
                 let display_rows = self.display_row_entries();
                 let row_count = display_rows.len();
@@ -5247,9 +5313,11 @@ impl ResultView {
                     } else {
                         header_hover_bg
                     };
-                    header_cells.push(
-                        div()
+                    let header_cell = {
+                        let wt_header = weak_for_header.clone();
+                        let header_inner = div()
                             .id(ElementId::from(SharedString::from(format!("col-header-{col_idx}"))))
+                            .debug_selector(move || format!("COL_HEADER-{col_idx}"))
                             .px_2()
                             .h(px(Self::GRID_HEADER_H))
                             .w(width)
@@ -5326,9 +5394,40 @@ impl ResultView {
                                             )
                                         },
                                     ),
-                            )
-                            .into_any_element(),
-                    );
+                            );
+                        right_click_menu(ElementId::from(SharedString::from(format!(
+                            "col-header-ctx-{col_idx}"
+                        ))))
+                        .trigger(move |_, _, _| header_inner)
+                        .menu(move |window, cx| {
+                            let wt_left = wt_header.clone();
+                            let wt_right = wt_header.clone();
+                            let wt_hide = wt_header.clone();
+                            ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.entry("Move Left", None, move |_, cx| {
+                                    wt_left
+                                        .update(cx, |this, cx| this.move_column(col_idx, -1, cx))
+                                        .ok();
+                                })
+                                .entry("Move Right", None, move |_, cx| {
+                                    wt_right
+                                        .update(cx, |this, cx| this.move_column(col_idx, 1, cx))
+                                        .ok();
+                                })
+                                .entry("Hide Column", None, move |_, cx| {
+                                    wt_hide
+                                        .update(cx, |this, cx| {
+                                            this.hidden_columns.insert(col_idx);
+                                            this.recompute_layout();
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                })
+                            })
+                        })
+                        .into_any_element()
+                    };
+                    header_cells.push(header_cell);
                     header_last_end = end;
                 }
                 let header_right = (hx - header_last_end).max(0.0);
@@ -5753,7 +5852,119 @@ impl ResultView {
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_column_list_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_query_history_popup(cx), |el, popup| el.child(popup))
+                    .into_any_element()
             })
+            .into_any_element()
+    }
+
+    // Renders the result transposed: the first column lists the original column
+    // names and each following column is one record. Bounded to the loaded rows
+    // so a large result does not build an unbounded number of columns.
+    fn render_transposed(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(result) = self.result.as_ref() else {
+            return div().into_any_element();
+        };
+        let grid_border = cx.theme().colors().border.opacity(0.46);
+        let header_bg = cx.theme().colors().editor_subheader_background;
+        let name_bg = cx.theme().colors().editor_gutter_background;
+
+        const MAX_RECORDS: usize = 500;
+        let record_count = result.rows.len().min(MAX_RECORDS);
+
+        let header = h_flex()
+            .flex_none()
+            .h(px(Self::GRID_HEADER_H))
+            .border_b_1()
+            .border_color(grid_border)
+            .bg(header_bg)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(180.0))
+                    .px_2()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(grid_border)
+                    .child(
+                        Label::new("Column")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .children((0..record_count).map(|record_idx| {
+                div()
+                    .flex_none()
+                    .w(px(180.0))
+                    .px_2()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(grid_border)
+                    .child(
+                        Label::new(format!("Row {}", record_idx + 1))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }));
+
+        let rows = result.columns.iter().enumerate().map(|(col_idx, col_name)| {
+            h_flex()
+                .flex_none()
+                .h(px(Self::GRID_ROW_H))
+                .border_b_1()
+                .border_color(grid_border)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(180.0))
+                        .px_2()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(grid_border)
+                        .bg(name_bg)
+                        .child(
+                            Label::new(col_name.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        ),
+                )
+                .children((0..record_count).map(|record_idx| {
+                    let (display, color) = render_loaded_value(
+                        result
+                            .rows
+                            .get(record_idx)
+                            .and_then(|row| row.get(col_idx))
+                            .and_then(|cell| cell.as_deref()),
+                    );
+                    div()
+                        .flex_none()
+                        .w(px(180.0))
+                        .px_2()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(grid_border)
+                        .overflow_hidden()
+                        .child(Label::new(display).size(LabelSize::Small).color(color))
+                        .into_any_element()
+                }))
+                .into_any_element()
+        });
+
+        div()
+            .id("result-transpose")
+            .debug_selector(|| "TRANSPOSE_VIEW".to_string())
+            .flex_1()
+            .min_h_0()
+            .overflow_scroll()
+            .child(div().flex().flex_col().child(header).children(rows))
             .into_any_element()
     }
 
@@ -5779,36 +5990,168 @@ impl ResultView {
             .or_else(|| Some(NULL_MARKER.to_string()))
     }
 
+    // The value editor is writable only for table-backed results, where an edit
+    // can be turned into an UPDATE/INSERT. Plain query results stay read-only.
+    fn value_editor_is_editable(&self) -> bool {
+        self.table_name.is_some() && self.selected_cell.is_some()
+    }
+
     fn sync_value_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.value_editor_open {
             return;
         }
         let value = self.selected_cell_full_value().unwrap_or_default();
-        let editor = match self.value_editor.clone() {
-            Some(editor) => editor,
+        let editable = self.value_editor_is_editable();
+        let (editor, created) = match self.value_editor.clone() {
+            Some(editor) => (editor, false),
             None => {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::multi_line(window, cx);
                     editor.set_show_gutter(false, cx);
                     editor.disable_expand_excerpt_buttons(cx);
                     editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
-                    editor.set_soft_wrap_mode(SoftWrap::None, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
                     editor.set_show_indent_guides(false, cx);
                     editor.disable_mouse_wheel_zoom();
-                    editor.set_read_only(true);
                     editor
                 });
                 self.value_editor = Some(editor.clone());
-                editor
+                (editor, true)
             }
         };
-        if editor.read(cx).text(cx) != value {
+        // Reload the text only when the editor opens or the targeted cell
+        // changes. While the user is typing in the same cell, leave it alone so
+        // a re-render does not discard the in-progress edit.
+        let cell_changed = self.value_editor_cell != self.selected_cell;
+        if created || cell_changed {
             editor.update(cx, |editor, cx| {
                 editor.set_read_only(false);
                 editor.set_text(value, window, cx);
-                editor.set_read_only(true);
             });
+            self.value_editor_cell = self.selected_cell;
         }
+        editor.update(cx, |editor, _cx| editor.set_read_only(!editable));
+    }
+
+    // Writes the value-editor text into the pending buffer for the selected cell
+    // and closes the popup. No-op for read-only (plain query) results.
+    fn commit_value_editor(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.value_editor_is_editable() {
+            return;
+        }
+        let Some((abs_idx, col_idx)) = self.selected_cell else {
+            return;
+        };
+        let Some(editor) = self.value_editor.clone() else {
+            return;
+        };
+        let raw_text = editor.read(cx).text(cx);
+        let new_value = CellValue::from_text(raw_text);
+
+        let added_idx = self
+            .result
+            .as_ref()
+            .map(|result| result.rows.len())
+            .filter(|loaded| abs_idx >= *loaded)
+            .map(|loaded| abs_idx - loaded);
+        if let Some(added_idx) = added_idx {
+            if let Some(cell) = self
+                .added_rows
+                .get_mut(added_idx)
+                .and_then(|row| row.get_mut(col_idx))
+            {
+                *cell = new_value;
+            }
+        } else {
+            self.buffer_loaded_cell_value(abs_idx, col_idx, new_value, cx);
+        }
+        self.value_editor_open = false;
+        self.value_editor_resize_drag = None;
+        cx.notify();
+    }
+
+    // Reformats the value-editor text as indented JSON when it parses as JSON.
+    // Leaves the text unchanged otherwise.
+    fn format_value_editor_json(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.value_editor.clone() else {
+            return;
+        };
+        let text = editor.read(cx).text(cx);
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Ok(pretty) = serde_json::to_string_pretty(&parsed) else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            let was_read_only = editor.read_only(cx);
+            editor.set_read_only(false);
+            editor.set_text(pretty, window, cx);
+            editor.set_read_only(was_read_only);
+        });
+        cx.notify();
+    }
+
+    fn value_editor_text_is_json(&self, cx: &App) -> bool {
+        self.value_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx))
+            .is_some_and(|text| serde_json::from_str::<serde_json::Value>(&text).is_ok())
+    }
+
+    // Moves a data column left (delta -1) or right (delta +1) in the display
+    // order, skipping over hidden columns so the move is visible to the user.
+    fn move_column(&mut self, data_col: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.column_order.iter().position(|&c| c == data_col) else {
+            return;
+        };
+        let mut target = current as isize;
+        loop {
+            target += delta;
+            if target < 0 || target as usize >= self.column_order.len() {
+                return;
+            }
+            let candidate = self.column_order[target as usize];
+            if !self.hidden_columns.contains(&candidate) {
+                break;
+            }
+        }
+        let item = self.column_order.remove(current);
+        self.column_order.insert(target as usize, item);
+        self.recompute_layout();
+        cx.notify();
+    }
+
+    fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.hidden_columns.clear();
+        self.sort_columns.clear();
+        self.local_filters.clear();
+        self.local_filter_editors.clear();
+        self.transposed = false;
+        if let Some(result) = self.result.as_ref() {
+            self.column_order = (0..result.columns.len()).collect();
+        } else {
+            self.column_order.clear();
+        }
+        self.recompute_layout();
+        cx.notify();
+    }
+
+    fn toggle_transpose(&mut self, cx: &mut Context<Self>) {
+        self.transposed = !self.transposed;
+        cx.notify();
+    }
+
+    // Query history filtered by the search box, newest first, paired with the
+    // original index so a click still maps to the right entry.
+    fn filtered_history(&self) -> Vec<(usize, String)> {
+        let needle = self.history_search.trim().to_lowercase();
+        self.query_history
+            .iter()
+            .enumerate()
+            .filter(|(_, sql)| needle.is_empty() || sql.to_lowercase().contains(&needle))
+            .map(|(index, sql)| (index, sql.clone()))
+            .collect()
     }
 
     fn render_value_editor_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5817,6 +6160,8 @@ impl ResultView {
         }
         let value = self.selected_cell_full_value().unwrap_or_default();
         let editor = self.value_editor.clone()?;
+        let editable = self.value_editor_is_editable();
+        let show_format_json = self.value_editor_text_is_json(cx);
         let (abs_idx, col_idx) = self.selected_cell?;
         let display_idx = self.display_idx_of(abs_idx)?;
         let display_pos = self
@@ -5898,6 +6243,28 @@ impl ResultView {
                             .color(Color::Muted),
                         )
                         .child(div().flex_1())
+                        .when(show_format_json, |row| {
+                            row.child(
+                                Button::new("value-editor-format-json", "Format JSON")
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text("Pretty-print the JSON value"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.format_value_editor_json(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(editable, |row| {
+                            row.child(
+                                Button::new("value-editor-save", "Save")
+                                    .style(ButtonStyle::Filled)
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text("Apply to pending edits (Ctrl+Enter)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.commit_value_editor(window, cx);
+                                    })),
+                            )
+                        })
                         .child(
                             IconButton::new("value-editor-copy", IconName::Copy)
                                 .icon_size(IconSize::Small)
@@ -5934,6 +6301,26 @@ impl ResultView {
                         .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
                             cx.stop_propagation();
                         }))
+                        // Ctrl+Enter applies the edit; Escape closes the panel.
+                        // Enter alone inserts a newline (multi-line values).
+                        .when(editable, |container| {
+                            container.capture_key_down(cx.listener(
+                                |this, event: &KeyDownEvent, window, cx| {
+                                    let modifiers = &event.keystroke.modifiers;
+                                    match event.keystroke.key.as_str() {
+                                        "enter" if modifiers.secondary() => {
+                                            this.commit_value_editor(window, cx);
+                                        }
+                                        "escape" => {
+                                            this.value_editor_open = false;
+                                            this.value_editor_resize_drag = None;
+                                            cx.notify();
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ))
+                        })
                         .child(editor),
                 )
                 .child(
@@ -6295,6 +6682,33 @@ impl ResultView {
         } else {
             self.open_find(window, cx);
         }
+    }
+
+    fn toggle_query_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_open = !self.history_open;
+        if !self.history_open {
+            cx.notify();
+            return;
+        }
+        self.history_search.clear();
+        if self.history_search_editor.is_none() {
+            let editor = cx.new(|cx| Editor::single_line(window, cx));
+            cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    this.history_search = editor.read(cx).text(cx);
+                    cx.notify();
+                }
+            })
+            .detach();
+            self.history_search_editor = Some(editor);
+        } else if let Some(editor) = &self.history_search_editor {
+            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+        }
+        if let Some(editor) = &self.history_search_editor {
+            let handle = editor.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
     }
 
     fn update_find_matches(&mut self, cx: &mut Context<Self>) {
@@ -7423,9 +7837,8 @@ impl Render for ResultView {
             .on_action(cx.listener(|this, _: &ToggleColumnList, _window, cx| {
                 this.toggle_column_list(cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenQueryHistory, _window, cx| {
-                this.history_open = !this.history_open;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &OpenQueryHistory, window, cx| {
+                this.toggle_query_history(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleRecordView, _window, cx| {
                 this.record_view_open = !this.record_view_open;
@@ -7471,6 +7884,15 @@ impl Render for ResultView {
             }))
             .on_action(cx.listener(|this, _: &ToggleFindFilterRows, _window, cx| {
                 this.toggle_find_filter_rows(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTranspose, _window, cx| {
+                this.toggle_transpose(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResetView, window, cx| {
+                this.reset_view(cx);
+                if this.table_name.is_some() {
+                    this.refresh_table_data(window, cx);
+                }
             }))
             .when_some(filter_bar, |el, bar| el.child(bar))
             .child(div().flex_1().overflow_hidden().child(content))
@@ -9289,6 +9711,123 @@ mod tests {
         view.update(&mut cx, |view, _cx| {
             assert_eq!(view.filtered_display_order.len(), 2);
             assert!(!view.filtered_display_order.contains(&1));
+        });
+    }
+
+    #[gpui::test]
+    fn value_editor_writes_edit_into_pending_buffer(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.selected_cell = Some((0, 1));
+            view.value_editor_open = true;
+            view.sync_value_editor(window, cx);
+            let editor = view.value_editor.clone().expect("value editor created");
+            editor.update(cx, |editor, cx| editor.set_text("Updated", window, cx));
+            view.commit_value_editor(window, cx);
+        });
+        view.update(&mut cx, |view, _cx| {
+            assert!(!view.value_editor_open);
+            let edit = view
+                .pending_edits
+                .get(&(0, 1))
+                .expect("pending edit buffered");
+            assert_eq!(edit.new_value, CellValue::Text("Updated".to_string()));
+        });
+    }
+
+    #[gpui::test]
+    fn value_editor_pretty_prints_json(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.selected_cell = Some((0, 1));
+            view.value_editor_open = true;
+            view.sync_value_editor(window, cx);
+            let editor = view.value_editor.clone().expect("value editor created");
+            editor.update(cx, |editor, cx| {
+                editor.set_text(r#"{"a":1,"b":2}"#, window, cx)
+            });
+            assert!(view.value_editor_text_is_json(cx));
+            view.format_value_editor_json(window, cx);
+            let text = view
+                .value_editor
+                .as_ref()
+                .expect("value editor present")
+                .read(cx)
+                .text(cx);
+            assert!(text.contains('\n'), "expected pretty-printed JSON: {text}");
+        });
+    }
+
+    #[gpui::test]
+    fn toggle_transpose_switches_view(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            assert!(!view.transposed);
+            view.toggle_transpose(cx);
+            assert!(view.transposed);
+        });
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("TRANSPOSE_VIEW").is_some(),
+            "transposed view should render"
+        );
+    }
+
+    #[gpui::test]
+    fn move_column_reorders_visible_columns(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(view.visible_columns, vec![0, 1]);
+            view.move_column(0, 1, cx);
+            assert_eq!(view.column_order, vec![1, 0]);
+            assert_eq!(view.visible_columns, vec![1, 0]);
+        });
+    }
+
+    #[gpui::test]
+    fn reset_view_restores_defaults(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            view.hidden_columns.insert(1);
+            view.sort_columns = vec![SortColumn {
+                col_idx: 0,
+                ascending: false,
+            }];
+            view.local_filters = vec!["x".to_string(), String::new()];
+            view.transposed = true;
+            view.move_column(0, 1, cx);
+            view.reset_view(cx);
+            assert!(view.hidden_columns.is_empty());
+            assert!(view.sort_columns.is_empty());
+            assert!(view.local_filters.is_empty());
+            assert!(!view.transposed);
+            assert_eq!(view.column_order, vec![0, 1]);
+            assert_eq!(view.visible_columns, vec![0, 1]);
+        });
+    }
+
+    #[gpui::test]
+    fn history_search_filters_entries(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            view.query_history = vec![
+                "select * from users".to_string(),
+                "select * from orders".to_string(),
+                "update users set x = 1".to_string(),
+            ];
+            assert_eq!(view.filtered_history().len(), 3);
+
+            view.history_search = "users".to_string();
+            let filtered = view.filtered_history();
+            assert_eq!(filtered.len(), 2);
+            assert!(filtered.iter().all(|(_, sql)| sql.contains("users")));
+
+            // The original index is preserved so a click maps to the right entry.
+            view.history_search = "orders".to_string();
+            assert_eq!(
+                view.filtered_history(),
+                vec![(1, "select * from orders".to_string())]
+            );
         });
     }
 }
