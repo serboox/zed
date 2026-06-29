@@ -1604,6 +1604,7 @@
     "context": "DbResultView",
     "bindings": {
       "ctrl-enter": "db_result_view::SubmitEdits",
+      "ctrl-c": "db_result_view::CopySelection",
       "ctrl-alt-z": "db_result_view::RevertEdits",
       "alt-insert": "db_result_view::AddRow",
       "ctrl-y": "db_result_view::DeleteRow",
@@ -1613,6 +1614,9 @@
       "ctrl-f": "db_result_view::ToggleFind",
       "ctrl-g": "db_result_view::FindNext",
       "shift-ctrl-g": "db_result_view::FindPrevious",
+      "alt-g": "db_result_view::GoToRow",
+      "ctrl-shift-c": "db_result_view::CopyAggregation",
+      "ctrl-alt-shift-enter": "db_result_view::CommitTransaction",
       "ctrl-f5": "db_result_view::ToggleLocalFilters",
       "ctrl-f12": "db_result_view::ToggleColumnList",
       "ctrl-q": "db_result_view::QuickDoc"

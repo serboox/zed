@@ -1621,6 +1621,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-enter": "db_result_view::SubmitEdits",
+      "ctrl-c": "db_result_view::CopySelection",
       "ctrl-alt-z": "db_result_view::RevertEdits",
       "alt-insert": "db_result_view::AddRow",
       "ctrl-y": "db_result_view::DeleteRow",

@@ -1,14 +1,28 @@
 use crate::store::DatabaseStore;
-use db_client::{ConnectionId, DatabaseDriver, schema::{ColumnInfo, FkInfo, QueryResult}};
-use editor::{Editor, EditorEvent};
-use gpui::{Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PromptLevel, Render, SharedString, StatefulInteractiveElement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, uniform_list};
-use ui::{Button, ButtonCommon, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu, ScrollableHandle, Tooltip, prelude::*, right_click_menu};
-use util::ResultExt as _;
-use workspace::{Item, Workspace};
+use db_client::{
+    ConnectionId, DatabaseDriver,
+    schema::{ColumnInfo, FkInfo, QueryResult},
+};
+use editor::{Editor, EditorEvent, MinimapVisibility};
+use gpui::{
+    Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PromptLevel, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    actions, uniform_list,
+};
+use language::language_settings::SoftWrap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use ui::{
+    Button, ButtonCommon, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Icon, IconButton,
+    IconName, IconSize, Label, LabelSize, PopoverMenu, ScrollableHandle, Tooltip, prelude::*,
+    right_click_menu,
+};
+use util::ResultExt as _;
+use workspace::{Item, Workspace};
 
 /// Rows fetched per network round-trip while the result grid fills (chunked
 /// loading, as common GUI database clients do).
@@ -26,7 +40,16 @@ const FETCH_TARGET_CHOICES: [(usize, &str); 6] = [
     (usize::MAX, "All"),
 ];
 
-const DEFAULT_LIMIT: usize = 200;
+const COPY_FORMAT_CHOICES: [(CopyFormat, &str); 6] = [
+    (CopyFormat::Tsv, "TSV"),
+    (CopyFormat::Csv, "CSV"),
+    (CopyFormat::Json, "JSON"),
+    (CopyFormat::Markdown, "Markdown"),
+    (CopyFormat::Insert, "Insert"),
+    (CopyFormat::MultiInsert, "Multi Insert"),
+];
+
+const DEFAULT_LIMIT: usize = 500;
 
 actions!(
     db_result_view,
@@ -69,6 +92,22 @@ actions!(
         QuickDoc,
         /// Navigates to the referenced row in the target table for the selected FK cell.
         NavigateToFkRow,
+        /// Copies the selected cells or rows using the selected copy format.
+        CopySelection,
+        /// Opens a popup showing the SQL that the pending changes would run.
+        PreviewPendingChanges,
+        /// Switches the result between auto-commit and manual-commit modes.
+        ToggleTransactionMode,
+        /// Commits the staged statements in manual-commit mode.
+        CommitTransaction,
+        /// Discards the staged statements in manual-commit mode.
+        RollbackTransaction,
+        /// Opens the go-to-row input to jump to a row by its number.
+        GoToRow,
+        /// Copies the aggregate summary of the selected column to the clipboard.
+        CopyAggregation,
+        /// Toggles whether find hides rows without a match.
+        ToggleFindFilterRows,
     ]
 );
 
@@ -81,7 +120,7 @@ pub(crate) static RENDERED_ROW_COUNT: std::sync::atomic::AtomicUsize =
 // JSON) would otherwise shape a giant label and freeze the main thread, so the
 // grid shows a bounded one-line preview; the full value is still copyable.
 const MAX_CELL_DISPLAY_CHARS: usize = 200;
-const ROW_GUTTER_WIDTH: f32 = 40.0;
+const ROW_GUTTER_WIDTH: f32 = 48.0;
 
 // A lively rotating loading indicator. A short rotation period reads as active
 // work; kept in one place so every spinner in the grid looks the same.
@@ -92,22 +131,38 @@ fn loading_spinner(id: impl Into<ElementId>, size: IconSize) -> impl IntoElement
         .with_keyed_rotate_animation(id, 1)
 }
 
-// One-line, length-bounded preview of a cell value. Iterates at most
+// Length-bounded preview of a cell value. Iterates at most
 // MAX_CELL_DISPLAY_CHARS + 1 characters, so cost never scales with cell size.
 fn display_cell(value: &str) -> String {
     let mut out = String::new();
     let mut truncated = false;
+    let mut previous_was_cr = false;
     for (index, ch) in value.chars().enumerate() {
         if index >= MAX_CELL_DISPLAY_CHARS {
             truncated = true;
             break;
         }
-        out.push(if matches!(ch, '\n' | '\r' | '\t') { ' ' } else { ch });
+        if ch == '\r' {
+            out.push('\n');
+            previous_was_cr = true;
+        } else if ch == '\n' && previous_was_cr {
+            previous_was_cr = false;
+        } else {
+            out.push(ch);
+            previous_was_cr = false;
+        }
     }
     if truncated {
         out.push('…');
     }
     out
+}
+
+fn cell_value_needs_expanded_editor(value: &str) -> bool {
+    value.chars().count() > MAX_CELL_DISPLAY_CHARS
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains('\t')
 }
 
 // Dim markers for the absence of a value, so a NULL or DEFAULT reads differently
@@ -171,8 +226,17 @@ fn column_editor_kind(data_type: &str) -> CellEditorKind {
         return CellEditorKind::Date;
     }
     let numeric_prefixes = [
-        "int", "bigint", "smallint", "mediumint", "tinyint",
-        "decimal", "float", "double", "numeric", "real", "number",
+        "int",
+        "bigint",
+        "smallint",
+        "mediumint",
+        "tinyint",
+        "decimal",
+        "float",
+        "double",
+        "numeric",
+        "real",
+        "number",
         "integer",
     ];
     for prefix in &numeric_prefixes {
@@ -188,9 +252,11 @@ fn column_editor_kind(data_type: &str) -> CellEditorKind {
 
 // Parses the value list from an enum('a','b') or set('x','y') type string.
 fn parse_enum_values(data_type: &str) -> Vec<String> {
-    let inner = data_type
-        .find('(')
-        .and_then(|open| data_type.rfind(')').map(|close| &data_type[open + 1..close]));
+    let inner = data_type.find('(').and_then(|open| {
+        data_type
+            .rfind(')')
+            .map(|close| &data_type[open + 1..close])
+    });
     let Some(inner) = inner else {
         return Vec::new();
     };
@@ -261,8 +327,14 @@ fn is_valid_date(text: &str) -> bool {
         return false;
     }
     let ok_year = parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit());
-    let ok_month = parts[1].len() == 2 && parts[1].parse::<u8>().map_or(false, |m| (1..=12).contains(&m));
-    let ok_day = parts[2].len() == 2 && parts[2].parse::<u8>().map_or(false, |d| (1..=31).contains(&d));
+    let ok_month = parts[1].len() == 2
+        && parts[1]
+            .parse::<u8>()
+            .map_or(false, |m| (1..=12).contains(&m));
+    let ok_day = parts[2].len() == 2
+        && parts[2]
+            .parse::<u8>()
+            .map_or(false, |d| (1..=31).contains(&d));
     ok_year && ok_month && ok_day
 }
 
@@ -278,7 +350,9 @@ fn is_valid_datetime(text: &str) -> bool {
     if !is_valid_date(date_part) {
         return false;
     }
-    let time_base = time_part.split_once('.').map_or(time_part, |(base, _)| base);
+    let time_base = time_part
+        .split_once('.')
+        .map_or(time_part, |(base, _)| base);
     let hms: Vec<&str> = time_base.splitn(3, ':').collect();
     if hms.len() != 3 {
         return false;
@@ -293,6 +367,46 @@ fn is_valid_datetime(text: &str) -> bool {
 struct SortColumn {
     col_idx: usize,
     ascending: bool,
+}
+
+// Auto commits each Submit immediately. Manual stages the generated SQL so it
+// runs only on an explicit Commit (and Roll Back discards it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionMode {
+    Auto,
+    Manual,
+}
+
+impl TransactionMode {
+    fn label(self) -> &'static str {
+        match self {
+            TransactionMode::Auto => "Auto",
+            TransactionMode::Manual => "Manual",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyFormat {
+    Tsv,
+    Csv,
+    Json,
+    Markdown,
+    Insert,
+    MultiInsert,
+}
+
+impl CopyFormat {
+    fn label(self) -> &'static str {
+        match self {
+            CopyFormat::Tsv => "TSV",
+            CopyFormat::Csv => "CSV",
+            CopyFormat::Json => "JSON",
+            CopyFormat::Markdown => "Markdown",
+            CopyFormat::Insert => "Insert",
+            CopyFormat::MultiInsert => "Multi Insert",
+        }
+    }
 }
 
 // An open enum/set dropdown popup waiting for the user to pick a value.
@@ -327,6 +441,7 @@ pub struct ResultView {
     base_sql: Option<String>,
     // Rows to load before pausing; chosen via the page-size selector.
     fetch_target: usize,
+    copy_format: CopyFormat,
     // Number of rows loaded so far, shown as a live count while filling.
     loaded_rows: usize,
     // Set true to stop an in-progress fill (Stop button or a new query).
@@ -348,8 +463,10 @@ pub struct ResultView {
     // Currently selected cell as (absolute row index, column index), highlighted
     // like a spreadsheet/grid selection.
     selected_cell: Option<(usize, usize)>,
-    // Rectangular cell range selected via Shift+click: anchor..end in (abs_row, col_idx).
+    // Rectangular cell range selected as anchor..end in (abs_row, col_idx).
     selected_cell_range: Option<((usize, usize), (usize, usize))>,
+    cell_drag_anchor: Option<(usize, usize)>,
+    suppress_next_cell_click: bool,
     // Set of absolute row indices that are currently selected (via click /
     // shift-click / ctrl-click). Shown with a row-level highlight.
     selected_rows: std::collections::HashSet<usize>,
@@ -379,9 +496,12 @@ pub struct ResultView {
     fk_columns: std::collections::HashMap<usize, FkInfo>,
     // An open enum/set dropdown popup, if any. At most one at a time.
     enum_popup: Option<EnumPopup>,
-    // When true, a read-only Value Editor panel is shown below the grid, displaying
-    // the full content of the selected cell (bypasses the MAX_CELL_DISPLAY_CHARS cap).
+    // When true, a read-only value editor popup is shown near the selected cell,
+    // displaying the full content of the selected cell.
     value_editor_open: bool,
+    value_editor: Option<Entity<Editor>>,
+    value_editor_size: Option<(f32, f32)>,
+    value_editor_resize_drag: Option<ValueEditorResizeDrag>,
     // Find-on-page state: None = bar hidden, Some(text) = bar open with this query.
     find_query: Option<String>,
     // Ordered list of (abs_row, col_idx) for cells that match `find_query`.
@@ -398,9 +518,10 @@ pub struct ResultView {
     // Loaded rows (by absolute index) marked for deletion. Submitted as one
     // DELETE per row; discarded on Revert.
     deleted_rows: std::collections::HashSet<usize>,
-    // New rows appended after the loaded rows, each sized to the result columns.
-    // Submitted as one INSERT per row; discarded on Revert.
+    // Pending INSERT rows, each sized to the result columns. Anchors control
+    // where they appear in the current display order.
     added_rows: Vec<Vec<CellValue>>,
+    added_row_anchors: Vec<AddedRowAnchor>,
     // Last-read filter text per data column index (empty = no filter).
     local_filters: Vec<String>,
     // Editor widget per column, created lazily when the filter row first opens.
@@ -430,6 +551,21 @@ pub struct ResultView {
     // Single-line editor displayed next to the row-limit dropdown for custom
     // values. Created lazily on first render (requires window).
     limit_editor: Option<Entity<Editor>>,
+    // Whether Submit commits immediately (Auto) or stages for an explicit
+    // Commit (Manual).
+    transaction_mode: TransactionMode,
+    // In Manual mode, the SQL staged by Submit and run as one transaction on
+    // Commit. Empty in Auto mode.
+    staged_statements: Vec<String>,
+    // Whether the pending-changes preview popup is open.
+    preview_open: bool,
+    // Go-to-row bar state: None = hidden, Some = open. The editor is created
+    // lazily when the bar first opens (requires window).
+    goto_row_visible: bool,
+    goto_row_editor: Option<Entity<Editor>>,
+    // When true, the find bar hides rows without a match instead of only
+    // highlighting them.
+    find_filter_rows: bool,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -456,15 +592,33 @@ struct CellEdit {
 // happen at SQL-build time); `Null` is SQL NULL; `Default` is the column DEFAULT
 // keyword. Loaded NULLs in the result stay as `None` in the data — this enum is
 // only for buffered edits and added-row cells.
-//
-// Seam: type-aware editors (date picker, checkbox, enum, numeric-only input) will
-// extend this with richer variants; the inline editor and Set NULL/DEFAULT feed
-// it today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CellValue {
     Text(String),
     Null,
     Default,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddedRowAnchor {
+    End,
+    AfterLoaded(usize),
+    AfterAdded(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultDisplayRow {
+    Loaded(usize),
+    Added(usize),
+}
+
+impl ResultDisplayRow {
+    fn abs_idx(self, loaded_count: usize) -> usize {
+        match self {
+            Self::Loaded(abs_idx) => abs_idx,
+            Self::Added(added_idx) => loaded_count + added_idx,
+        }
+    }
 }
 
 impl CellValue {
@@ -504,6 +658,14 @@ struct ScrollDrag {
     grab_offset: f32,
 }
 
+#[derive(Clone, Copy)]
+struct ValueEditorResizeDrag {
+    grab_x: f32,
+    grab_y: f32,
+    start_width: f32,
+    start_height: f32,
+}
+
 impl ResultView {
     pub fn new(title: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
@@ -521,6 +683,7 @@ impl ResultView {
             is_loading: false,
             base_sql: None,
             fetch_target: DEFAULT_FETCH_TARGET,
+            copy_format: CopyFormat::Tsv,
             loaded_rows: 0,
             fill_cancel: Arc::new(AtomicBool::new(false)),
             fill_task: None,
@@ -532,6 +695,8 @@ impl ResultView {
             total_width: 0.0,
             selected_cell: None,
             selected_cell_range: None,
+            cell_drag_anchor: None,
+            suppress_next_cell_click: false,
             selected_rows: std::collections::HashSet::new(),
             last_selected_row: None,
             frame_instants: std::collections::VecDeque::new(),
@@ -544,6 +709,9 @@ impl ResultView {
             fk_columns: std::collections::HashMap::new(),
             enum_popup: None,
             value_editor_open: false,
+            value_editor: None,
+            value_editor_size: None,
+            value_editor_resize_drag: None,
             find_query: None,
             find_matches: Vec::new(),
             find_current: 0,
@@ -551,6 +719,7 @@ impl ResultView {
             pending_edits: std::collections::HashMap::new(),
             deleted_rows: std::collections::HashSet::new(),
             added_rows: Vec::new(),
+            added_row_anchors: Vec::new(),
             local_filters: Vec::new(),
             local_filter_editors: Vec::new(),
             filtered_display_order: Vec::new(),
@@ -564,6 +733,12 @@ impl ResultView {
             record_view_row: None,
             quick_doc_open: false,
             limit_editor: None,
+            transaction_mode: TransactionMode::Auto,
+            staged_statements: Vec::new(),
+            preview_open: false,
+            goto_row_visible: false,
+            goto_row_editor: None,
+            find_filter_rows: false,
         }
     }
 
@@ -593,8 +768,8 @@ impl ResultView {
         let grab_offset = if (thumb_start..=thumb_end).contains(&window_pos) {
             offset
         } else {
-            let jumped =
-                gutter_scroll_offset(window_pos, origin, viewport_len, content_len).unwrap_or(offset);
+            let jumped = gutter_scroll_offset(window_pos, origin, viewport_len, content_len)
+                .unwrap_or(offset);
             self.scroll_to_gutter_pos(vertical, window_pos);
             jumped
         };
@@ -640,13 +815,57 @@ impl ResultView {
         self.scroll_drag = None;
     }
 
+    fn value_editor_auto_size(
+        value: &str,
+        available_width: f32,
+        available_height: f32,
+    ) -> (f32, f32) {
+        let longest_line = value
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let line_count = value.lines().count().max(1);
+        let max_width = available_width.max(420.0) - 16.0;
+        let max_height = available_height.max(320.0) - 16.0;
+        let width = (longest_line as f32 * 7.5 + 96.0).clamp(420.0, max_width.max(420.0));
+        let height = (line_count as f32 * 18.0 + 68.0).clamp(300.0, max_height.max(300.0));
+        (width, height)
+    }
+
+    fn begin_value_editor_resize(&mut self, grab_x: f32, grab_y: f32, width: f32, height: f32) {
+        self.value_editor_size = Some((width, height));
+        self.value_editor_resize_drag = Some(ValueEditorResizeDrag {
+            grab_x,
+            grab_y,
+            start_width: width,
+            start_height: height,
+        });
+    }
+
+    fn update_value_editor_resize(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.value_editor_resize_drag else {
+            return;
+        };
+        let width = (drag.start_width + x - drag.grab_x).clamp(360.0, 1400.0);
+        let height = (drag.start_height + y - drag.grab_y).clamp(220.0, 900.0);
+        self.value_editor_size = Some((width, height));
+    }
+
+    fn end_value_editor_resize(&mut self) {
+        self.value_editor_resize_drag = None;
+    }
+
     // Resolves which data column a window-space x coordinate falls in. Returns the
     // data column index (into result.rows[row]) rather than the display position.
     fn column_at_x(&self, window_x: f32) -> Option<usize> {
         let content_x = window_x
             - f32::from(self.h_scroll.bounds().origin.x)
             - f32::from(self.h_scroll.offset().x);
-        let display_pos = self.column_edges.iter().position(|&edge| content_x < edge)?;
+        let display_pos = self
+            .column_edges
+            .iter()
+            .position(|&edge| content_x < edge)?;
         // Map display position to data column (identity when no columns are hidden).
         self.visible_columns.get(display_pos).copied()
     }
@@ -688,8 +907,14 @@ impl ResultView {
             let mut indices: Vec<usize> = (0..total_rows).collect();
             indices.sort_by(|&a, &b| {
                 for sc in &sorts {
-                    let a_val = result.rows[a].get(sc.col_idx).and_then(|v| v.as_deref()).unwrap_or("");
-                    let b_val = result.rows[b].get(sc.col_idx).and_then(|v| v.as_deref()).unwrap_or("");
+                    let a_val = result.rows[a]
+                        .get(sc.col_idx)
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("");
+                    let b_val = result.rows[b]
+                        .get(sc.col_idx)
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("");
                     let ord = a_val.cmp(b_val);
                     let ord = if sc.ascending { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
@@ -712,13 +937,21 @@ impl ResultView {
             .visible_columns
             .iter()
             .map(|&data_col| {
-                let col = result.columns.get(data_col).map(|s| s.as_str()).unwrap_or("");
+                let col = result
+                    .columns
+                    .get(data_col)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 let widest = result.rows[..sample]
                     .iter()
                     .map(|row| {
                         row.get(data_col)
                             .map(|cell| {
-                                cell.as_deref().unwrap_or("<null>").chars().take(MAX_CELL_DISPLAY_CHARS).count()
+                                cell.as_deref()
+                                    .unwrap_or("<null>")
+                                    .chars()
+                                    .take(MAX_CELL_DISPLAY_CHARS)
+                                    .count()
                             })
                             .unwrap_or(0)
                     })
@@ -741,8 +974,7 @@ impl ResultView {
                 running
             })
             .collect();
-        let has_table_context = self.table_name.is_some() && self.workspace.is_some();
-        self.total_width = running + if has_table_context { 64.0 } else { 0.0 };
+        self.total_width = running;
 
         self.recompute_local_filter_inner();
     }
@@ -753,15 +985,35 @@ impl ResultView {
             return;
         };
 
-        let active: Vec<(usize, String)> = self
+        // A leading `!` negates the predicate (used by the "Exclude" quick
+        // filter and typeable by hand), so a value starting with `!` cannot be
+        // matched literally — an acceptable trade for an inline exclude.
+        let active: Vec<(usize, String, bool)> = self
             .local_filters
             .iter()
             .enumerate()
             .filter(|(_, f)| !f.trim().is_empty())
-            .map(|(i, f)| (i, f.to_lowercase()))
+            .map(|(i, f)| {
+                let lowered = f.to_lowercase();
+                match lowered.strip_prefix('!') {
+                    Some(rest) => (i, rest.trim().to_string(), true),
+                    None => (i, lowered, false),
+                }
+            })
+            .filter(|(_, needle, _)| !needle.is_empty())
             .collect();
 
-        if active.is_empty() {
+        // When find's "filter rows" mode is on, also hide rows with no match.
+        let find_needle = if self.find_filter_rows {
+            self.find_query
+                .as_ref()
+                .map(|query| query.trim().to_lowercase())
+                .filter(|query| !query.is_empty())
+        } else {
+            None
+        };
+
+        if active.is_empty() && find_needle.is_none() {
             self.filtered_display_order = self.order.clone();
             return;
         }
@@ -771,7 +1023,7 @@ impl ResultView {
             .iter()
             .copied()
             .filter(|&abs_idx| {
-                active.iter().all(|(vis_pos, needle)| {
+                let local_ok = active.iter().all(|(vis_pos, needle, negate)| {
                     let data_col = match self.visible_columns.get(*vis_pos).copied() {
                         Some(c) => c,
                         None => return true,
@@ -782,10 +1034,333 @@ impl ResultView {
                         .and_then(|row| row.get(data_col))
                         .and_then(|v| v.as_deref())
                         .unwrap_or("");
-                    cell.to_lowercase().contains(needle.as_str())
-                })
+                    let contains = cell.to_lowercase().contains(needle.as_str());
+                    contains != *negate
+                });
+                if !local_ok {
+                    return false;
+                }
+                if let Some(needle) = &find_needle {
+                    let row_matches = result.rows.get(abs_idx).is_some_and(|row| {
+                        row.iter().any(|cell| {
+                            cell.as_deref()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(needle.as_str())
+                        })
+                    });
+                    if !row_matches {
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
+    }
+
+    fn added_row_anchor(&self, added_idx: usize) -> AddedRowAnchor {
+        self.added_row_anchors
+            .get(added_idx)
+            .copied()
+            .unwrap_or(AddedRowAnchor::End)
+    }
+
+    fn anchor_for_abs_idx(&self, abs_idx: usize) -> AddedRowAnchor {
+        let loaded_count = self.loaded_row_count();
+        if abs_idx < loaded_count {
+            AddedRowAnchor::AfterLoaded(abs_idx)
+        } else {
+            AddedRowAnchor::AfterAdded(abs_idx - loaded_count)
+        }
+    }
+
+    fn push_added_rows_after_anchor(
+        &self,
+        anchor: AddedRowAnchor,
+        entries: &mut Vec<ResultDisplayRow>,
+        placed: &mut [bool],
+    ) {
+        loop {
+            let Some(added_idx) = self.added_rows.iter().enumerate().position(|(idx, _)| {
+                !placed.get(idx).copied().unwrap_or(true) && self.added_row_anchor(idx) == anchor
+            }) else {
+                break;
+            };
+            if let Some(placed) = placed.get_mut(added_idx) {
+                *placed = true;
+            }
+            entries.push(ResultDisplayRow::Added(added_idx));
+            self.push_added_rows_after_anchor(
+                AddedRowAnchor::AfterAdded(added_idx),
+                entries,
+                placed,
+            );
+        }
+    }
+
+    fn display_row_entries(&self) -> Vec<ResultDisplayRow> {
+        let mut entries =
+            Vec::with_capacity(self.filtered_display_order.len() + self.added_rows.len());
+        let mut placed = vec![false; self.added_rows.len()];
+        for &abs_idx in &self.filtered_display_order {
+            entries.push(ResultDisplayRow::Loaded(abs_idx));
+            self.push_added_rows_after_anchor(
+                AddedRowAnchor::AfterLoaded(abs_idx),
+                &mut entries,
+                &mut placed,
+            );
+        }
+
+        for added_idx in 0..self.added_rows.len() {
+            if !placed.get(added_idx).copied().unwrap_or(true) {
+                entries.push(ResultDisplayRow::Added(added_idx));
+                if let Some(placed) = placed.get_mut(added_idx) {
+                    *placed = true;
+                }
+                self.push_added_rows_after_anchor(
+                    AddedRowAnchor::AfterAdded(added_idx),
+                    &mut entries,
+                    &mut placed,
+                );
+            }
+        }
+
+        entries
+    }
+
+    fn abs_idx_at_display_idx(&self, display_idx: usize) -> Option<usize> {
+        self.display_row_entries()
+            .get(display_idx)
+            .copied()
+            .map(|row| row.abs_idx(self.loaded_row_count()))
+    }
+
+    fn remove_added_row(&mut self, added_idx: usize) {
+        if added_idx >= self.added_rows.len() {
+            return;
+        }
+        self.added_rows.remove(added_idx);
+        if added_idx < self.added_row_anchors.len() {
+            self.added_row_anchors.remove(added_idx);
+        }
+        for anchor in &mut self.added_row_anchors {
+            match *anchor {
+                AddedRowAnchor::AfterAdded(anchor_idx) if anchor_idx == added_idx => {
+                    *anchor = AddedRowAnchor::End;
+                }
+                AddedRowAnchor::AfterAdded(anchor_idx) if anchor_idx > added_idx => {
+                    *anchor = AddedRowAnchor::AfterAdded(anchor_idx - 1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn last_selectable_column(&self) -> Option<usize> {
+        self.result
+            .as_ref()
+            .and_then(|result| result.columns.len().checked_sub(1))
+    }
+
+    fn select_entire_row(&mut self, abs_idx: usize, display_idx: usize) {
+        self.selected_rows.clear();
+        self.selected_rows.insert(abs_idx);
+        self.last_selected_row = Some(display_idx);
+        self.selected_cell = None;
+        self.selected_cell_range = self
+            .last_selectable_column()
+            .map(|last_col| ((abs_idx, 0), (abs_idx, last_col)));
+        self.record_view_row = Some(display_idx);
+    }
+
+    fn select_row_range(&mut self, anchor_display_idx: usize, display_idx: usize) {
+        let lo = anchor_display_idx.min(display_idx);
+        let hi = anchor_display_idx.max(display_idx);
+        self.selected_rows.clear();
+        for display_idx in lo..=hi {
+            if let Some(abs_idx) = self.abs_idx_at_display_idx(display_idx) {
+                self.selected_rows.insert(abs_idx);
+            }
+        }
+        self.selected_cell = None;
+        self.selected_cell_range = match (
+            self.abs_idx_at_display_idx(lo),
+            self.abs_idx_at_display_idx(hi),
+            self.last_selectable_column(),
+        ) {
+            (Some(start_abs_idx), Some(end_abs_idx), Some(last_col)) => {
+                Some(((start_abs_idx, 0), (end_abs_idx, last_col)))
+            }
+            _ => None,
+        };
+    }
+
+    fn select_cell_from_click(
+        &mut self,
+        abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+        shift: bool,
+        control: bool,
+    ) {
+        if shift {
+            if let Some(anchor) = self.selected_cell {
+                self.selected_rows.clear();
+                self.selected_cell_range = Some((anchor, (abs_idx, cell_idx)));
+            } else {
+                let anchor_display_idx = self.last_selected_row.unwrap_or(display_idx);
+                self.select_row_range(anchor_display_idx, display_idx);
+            }
+        } else if control {
+            self.selected_rows.clear();
+            self.last_selected_row = Some(display_idx);
+            self.selected_cell_range = None;
+        } else {
+            self.selected_rows.clear();
+            self.last_selected_row = Some(display_idx);
+            self.selected_cell_range = None;
+        }
+        self.selected_cell = Some((abs_idx, cell_idx));
+        self.record_view_row = Some(display_idx);
+        self.value_editor_open = self
+            .selected_cell_full_value()
+            .as_deref()
+            .is_some_and(cell_value_needs_expanded_editor);
+    }
+
+    fn begin_cell_drag(&mut self, abs_idx: usize, cell_idx: usize) {
+        self.cell_drag_anchor = Some((abs_idx, cell_idx));
+        self.suppress_next_cell_click = false;
+    }
+
+    fn update_cell_drag(
+        &mut self,
+        abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.cell_drag_anchor else {
+            return;
+        };
+        self.selected_rows.clear();
+        self.last_selected_row = Some(display_idx);
+        self.selected_cell = Some((abs_idx, cell_idx));
+        self.selected_cell_range = Some((anchor, (abs_idx, cell_idx)));
+        self.record_view_row = Some(display_idx);
+        self.suppress_next_cell_click = true;
+        cx.notify();
+    }
+
+    fn end_cell_drag(&mut self) {
+        self.cell_drag_anchor = None;
+    }
+
+    fn should_suppress_cell_click(&mut self) -> bool {
+        if self.suppress_next_cell_click {
+            self.suppress_next_cell_click = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn click_loaded_cell(
+        &mut self,
+        abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+        click_count: usize,
+        shift: bool,
+        control: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.should_suppress_cell_click() {
+            cx.notify();
+            return;
+        }
+        let repeated_selected_cell_click = !shift
+            && !control
+            && self.selected_cell == Some((abs_idx, cell_idx))
+            && self.selected_cell_range.is_none();
+        self.select_cell_from_click(abs_idx, display_idx, cell_idx, shift, control);
+        if (click_count >= 2 || repeated_selected_cell_click)
+            && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
+        {
+            self.begin_cell_edit(abs_idx, cell_idx, window, cx);
+        } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
+            self.toggle_boolean_cell_loaded(abs_idx, cell_idx, cx);
+        } else if let Some(value) = self
+            .result
+            .as_ref()
+            .and_then(|result| result.rows.get(abs_idx))
+            .and_then(|row| row.get(cell_idx))
+            .and_then(|cell| cell.clone())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(value));
+        }
+        cx.notify();
+    }
+
+    fn click_added_cell(
+        &mut self,
+        abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+        added_idx: usize,
+        click_count: usize,
+        shift: bool,
+        control: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.should_suppress_cell_click() {
+            cx.notify();
+            return;
+        }
+        let repeated_selected_cell_click = !shift
+            && !control
+            && self.selected_cell == Some((abs_idx, cell_idx))
+            && self.selected_cell_range.is_none();
+        self.select_cell_from_click(abs_idx, display_idx, cell_idx, shift, control);
+        if (click_count >= 2 || repeated_selected_cell_click)
+            && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
+        {
+            self.begin_added_cell_edit(abs_idx, cell_idx, added_idx, window, cx);
+        } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
+            self.toggle_boolean_cell_added(cell_idx, added_idx, cx);
+        } else if let Some(CellValue::Text(value)) = self
+            .added_rows
+            .get(added_idx)
+            .and_then(|row| row.get(cell_idx))
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+        }
+        cx.notify();
+    }
+
+    fn selected_cell_range_contains(
+        &self,
+        _abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+    ) -> bool {
+        let Some(((anchor_abs_idx, anchor_col_idx), (end_abs_idx, end_col_idx))) =
+            self.selected_cell_range
+        else {
+            return false;
+        };
+
+        let anchor_display_idx = self
+            .display_idx_of(anchor_abs_idx)
+            .unwrap_or(anchor_abs_idx);
+        let end_display_idx = self.display_idx_of(end_abs_idx).unwrap_or(end_abs_idx);
+        let row_lo = anchor_display_idx.min(end_display_idx);
+        let row_hi = anchor_display_idx.max(end_display_idx);
+        let col_lo = anchor_col_idx.min(end_col_idx);
+        let col_hi = anchor_col_idx.max(end_col_idx);
+        display_idx >= row_lo && display_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
     }
 
     pub fn with_workspace(mut self, workspace: WeakEntity<Workspace>) -> Self {
@@ -802,6 +1377,11 @@ impl ResultView {
         self.connection_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn table_context_for_test(&self) -> Option<(String, String)> {
+        Some((self.database.clone()?, self.table_name.clone()?))
+    }
+
     pub fn with_table_context(
         mut self,
         store: WeakEntity<DatabaseStore>,
@@ -811,6 +1391,19 @@ impl ResultView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        self.set_table_context(store, connection_id, database, table_name, window, cx);
+        self
+    }
+
+    pub fn set_table_context(
+        &mut self,
+        store: WeakEntity<DatabaseStore>,
+        connection_id: ConnectionId,
+        database: String,
+        table_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = cx.new(|cx| {
             let mut ed = Editor::single_line(window, cx);
             ed.set_placeholder_text("WHERE clause (e.g. id > 100)", window, cx);
@@ -826,7 +1419,15 @@ impl ResultView {
         self.fk_columns.clear();
         self.enum_popup = None;
         self.sort_columns.clear();
-        self
+    }
+
+    pub fn clear_table_context(&mut self) {
+        self.table_name = None;
+        self.filter_editor = None;
+        self.primary_key_columns = None;
+        self.column_infos = None;
+        self.fk_columns.clear();
+        self.enum_popup = None;
     }
 
     pub fn refresh_table_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -840,12 +1441,20 @@ impl ResultView {
             _ => return,
         };
 
-        let filter_text = self.filter_editor.as_ref().map(|ed| ed.read(cx).text(cx)).unwrap_or_default();
+        let filter_text = self
+            .filter_editor
+            .as_ref()
+            .map(|ed| ed.read(cx).text(cx))
+            .unwrap_or_default();
         let filter_text = filter_text.trim().to_string();
 
         let quote = match store.upgrade().and_then(|s| {
             let store_ref = s.read(cx);
-            store_ref.connections().iter().find(|c| c.config.id == conn_id).map(|c| c.config.driver)
+            store_ref
+                .connections()
+                .iter()
+                .find(|c| c.config.id == conn_id)
+                .map(|c| c.config.driver)
         }) {
             Some(db_client::DatabaseDriver::MySQL) => '`',
             _ => '"',
@@ -898,7 +1507,8 @@ impl ResultView {
                     Ok(result) => this.set_result(result, cx),
                     Err(err) => this.set_error(err.to_string(), cx),
                 }
-            }).log_err();
+            })
+            .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -910,6 +1520,11 @@ impl ResultView {
         self.is_loading = true;
         self.result = None;
         self.error = None;
+        self.cell_drag_anchor = None;
+        self.suppress_next_cell_click = false;
+        self.value_editor_open = false;
+        self.value_editor = None;
+        self.value_editor_resize_drag = None;
         cx.notify();
     }
 
@@ -921,6 +1536,15 @@ impl ResultView {
         self.pending_edits.clear();
         self.deleted_rows.clear();
         self.added_rows.clear();
+        self.added_row_anchors.clear();
+        self.cell_drag_anchor = None;
+        self.suppress_next_cell_click = false;
+        self.selected_cell = None;
+        self.selected_cell_range = None;
+        self.selected_rows.clear();
+        self.last_selected_row = None;
+        self.value_editor_open = false;
+        self.value_editor_resize_drag = None;
         self.is_loading = false;
         // Reset per-column filter editors when the result schema changes.
         self.local_filter_editors.clear();
@@ -939,6 +1563,11 @@ impl ResultView {
         self.result = None;
         self.is_loading = false;
         self.fill_task = None;
+        self.cell_drag_anchor = None;
+        self.suppress_next_cell_click = false;
+        self.value_editor_open = false;
+        self.value_editor = None;
+        self.value_editor_resize_drag = None;
         cx.emit(ResultViewEvent::ResultChanged);
         cx.notify();
     }
@@ -966,8 +1595,36 @@ impl ResultView {
             self.query_history.truncate(50);
         }
         self.base_sql = Some(base_sql);
+        self.fetch_target = DEFAULT_FETCH_TARGET;
         self.sort_columns.clear();
         self.start_fill(cx);
+    }
+
+    pub fn set_query_result(
+        &mut self,
+        store: WeakEntity<DatabaseStore>,
+        connection_id: ConnectionId,
+        database: String,
+        base_sql: String,
+        result: QueryResult,
+        cx: &mut Context<Self>,
+    ) {
+        self.fill_cancel.store(true, Ordering::SeqCst);
+        self.fill_task = None;
+        self.store = Some(store);
+        self.connection_id = Some(connection_id);
+        self.database = Some(database);
+        let trimmed = base_sql.trim().to_string();
+        if !trimmed.is_empty() {
+            self.query_history.retain(|query| query != &trimmed);
+            self.query_history.insert(0, trimmed);
+            self.query_history.truncate(50);
+        }
+        self.base_sql = Some(base_sql);
+        self.fetch_target = DEFAULT_FETCH_TARGET;
+        self.sort_columns.clear();
+        self.loaded_rows = result.rows.len();
+        self.set_result(result, cx);
     }
 
     fn start_fill(&mut self, cx: &mut Context<Self>) {
@@ -985,7 +1642,7 @@ impl ResultView {
         };
         let database = self.database.clone().unwrap_or_default();
         let target = self.fetch_target;
-        let read_only = db_client::is_read_only_query(&base_sql);
+        let pageable = db_client::is_pageable_query(&base_sql);
 
         self.result = None;
         self.error = None;
@@ -999,7 +1656,7 @@ impl ResultView {
                 if cancel.load(Ordering::SeqCst) {
                     break;
                 }
-                let sql = if read_only {
+                let sql = if pageable {
                     Self::wrap_paged(&base_sql, FETCH_BATCH, offset)
                 } else {
                     base_sql.clone()
@@ -1012,22 +1669,28 @@ impl ResultView {
                 match task.await {
                     Ok(batch) => {
                         let fetched = batch.rows.len();
-                        if this.update(cx, |view, cx| view.append_batch(batch, cx)).is_err() {
+                        if this
+                            .update(cx, |view, cx| view.append_batch(batch, cx))
+                            .is_err()
+                        {
                             break;
                         }
                         offset += fetched;
-                        if !read_only || fetched < FETCH_BATCH || offset >= target {
+                        if !pageable || fetched < FETCH_BATCH || offset >= target {
                             break;
                         }
                     }
                     Err(err) => {
-                        this.update(cx, |view, cx| view.set_error(err.to_string(), cx)).ok();
+                        this.update(cx, |view, cx| view.set_error(err.to_string(), cx))
+                            .ok();
                         return;
                     }
                 }
                 // Yield briefly between chunks so the grid visibly fills and the
                 // UI stays responsive (the Stop button keeps working).
-                cx.background_executor().timer(Duration::from_millis(30)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
             }
             this.update(cx, |view, cx| {
                 view.is_loading = false;
@@ -1104,10 +1767,9 @@ impl ResultView {
         }
     }
 
-    // Double-click handler: starts inline editing of one loaded cell. The cell
-    // turns into a single-line editor prefilled with the cell's full value.
-    // Editing is offered only for table-backed results (where a write has a
-    // target); arbitrary query results have no row to write back to.
+    // Starts inline editing of one loaded cell. For table-backed results the
+    // commit buffers a pending update; for arbitrary results the editor still
+    // opens so the user can select/copy part of a large value.
     fn begin_cell_edit(
         &mut self,
         abs_idx: usize,
@@ -1115,10 +1777,9 @@ impl ResultView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.table_name.is_none() {
-            return;
+        if self.table_name.is_some() {
+            self.ensure_primary_key_columns(cx);
         }
-        self.ensure_primary_key_columns(cx);
 
         match self.column_kind_at(col_idx) {
             CellEditorKind::Boolean => {
@@ -1150,7 +1811,14 @@ impl ResultView {
             return;
         };
 
-        self.spawn_cell_editor(abs_idx, col_idx, CellEditTarget::Loaded, initial, window, cx);
+        self.spawn_cell_editor(
+            abs_idx,
+            col_idx,
+            CellEditTarget::Loaded,
+            initial,
+            window,
+            cx,
+        );
     }
 
     // Starts inline editing of a cell in an added row. The added row has no
@@ -1186,7 +1854,11 @@ impl ResultView {
             _ => {}
         }
         // A Null/Default cell prefills empty; typing a value turns it into Text.
-        let initial = match self.added_rows.get(added_idx).and_then(|row| row.get(col_idx)) {
+        let initial = match self
+            .added_rows
+            .get(added_idx)
+            .and_then(|row| row.get(col_idx))
+        {
             Some(CellValue::Text(text)) => text.clone(),
             _ => String::new(),
         };
@@ -1200,6 +1872,88 @@ impl ResultView {
         );
     }
 
+    fn first_added_row_edit_column(&self) -> Option<usize> {
+        self.visible_columns
+            .iter()
+            .copied()
+            .find(|&col_idx| {
+                if matches!(self.column_kind_at(col_idx), CellEditorKind::Boolean) {
+                    return false;
+                }
+                !self.column_infos.as_ref().is_some_and(|infos| {
+                    self.result
+                        .as_ref()
+                        .and_then(|result| result.columns.get(col_idx))
+                        .and_then(|column_name| infos.iter().find(|info| &info.name == column_name))
+                        .is_some_and(|info| {
+                            info.extra.to_ascii_lowercase().contains("auto_increment")
+                        })
+                })
+            })
+            .or_else(|| self.visible_columns.first().copied())
+    }
+
+    fn begin_added_row_edit(
+        &mut self,
+        added_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(col_idx) = self.first_added_row_edit_column() else {
+            return;
+        };
+        let abs_idx = self.loaded_row_count() + added_idx;
+        if let Some(display_idx) = self.display_idx_of(abs_idx) {
+            self.select_cell_from_click(abs_idx, display_idx, col_idx, false, false);
+        }
+        self.begin_added_cell_edit(abs_idx, col_idx, added_idx, window, cx);
+    }
+
+    fn render_cell_editor(editor: Entity<Editor>, kind: CellEditorKind) -> AnyElement {
+        h_flex()
+            .size_full()
+            .gap_1()
+            .items_center()
+            .when_some(Self::cell_kind_icon(&kind), |element, (icon_name, _)| {
+                element.child(
+                    div().flex_none().child(
+                        Icon::new(icon_name)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .child(div().flex_1().min_w_0().child(editor))
+            .into_any_element()
+    }
+
+    fn cell_kind_icon(kind: &CellEditorKind) -> Option<(IconName, &'static str)> {
+        match kind {
+            CellEditorKind::Numeric => Some((IconName::Binary, "Number")),
+            CellEditorKind::Date => Some((IconName::CountdownTimer, "Date: YYYY-MM-DD")),
+            CellEditorKind::DateTime => Some((IconName::Clock, "Date-time: YYYY-MM-DD HH:MM:SS")),
+            _ => None,
+        }
+    }
+
+    fn render_typed_cell_body(body: AnyElement, kind: CellEditorKind) -> AnyElement {
+        h_flex()
+            .size_full()
+            .gap_1()
+            .items_center()
+            .when_some(Self::cell_kind_icon(&kind), |element, (icon_name, _)| {
+                element.child(
+                    div().flex_none().child(
+                        Icon::new(icon_name)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .child(div().flex_1().min_w_0().overflow_hidden().child(body))
+            .into_any_element()
+    }
+
     // Builds the overlay editor shared by loaded and added cell edits.
     fn spawn_cell_editor(
         &mut self,
@@ -1210,8 +1964,17 @@ impl ResultView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let placeholder = match self.column_kind_at(col_idx) {
+            CellEditorKind::Numeric => Some("number"),
+            CellEditorKind::Date => Some("YYYY-MM-DD"),
+            CellEditorKind::DateTime => Some("YYYY-MM-DD HH:MM:SS"),
+            _ => None,
+        };
         let editor = cx.new(|cx| {
             let mut ed = Editor::single_line(window, cx);
+            if let Some(placeholder) = placeholder {
+                ed.set_placeholder_text(placeholder, window, cx);
+            }
             ed.set_text(initial, window, cx);
             ed.select_all(&Default::default(), window, cx);
             ed
@@ -1260,8 +2023,12 @@ impl ResultView {
         let Some(s) = store.upgrade() else {
             return;
         };
-        let col_task = s.update(cx, |store, cx| store.describe_table(conn_id, db.clone(), table.clone(), cx));
-        let fk_task = s.update(cx, |store, cx| store.list_foreign_keys(conn_id, db, table, cx));
+        let col_task = s.update(cx, |store, cx| {
+            store.describe_table(conn_id, db.clone(), table.clone(), cx)
+        });
+        let fk_task = s.update(cx, |store, cx| {
+            store.list_foreign_keys(conn_id, db, table, cx)
+        });
         cx.spawn(async move |this, cx| {
             let (columns, fks) = futures::join!(col_task, fk_task);
             this.update(cx, |this, cx| {
@@ -1278,7 +2045,10 @@ impl ResultView {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, col)| {
-                        fk_list.iter().find(|fk| fk.from_column == col.name).map(|fk| (i, fk.clone()))
+                        fk_list
+                            .iter()
+                            .find(|fk| fk.from_column == col.name)
+                            .map(|fk| (i, fk.clone()))
                     })
                     .collect();
                 this.column_infos = Some(all_cols);
@@ -1299,9 +2069,19 @@ impl ResultView {
     // Commits the current cell edit then immediately opens the editor on an
     // adjacent cell. delta_col / delta_row are -1, 0, or +1.
     // Only navigates within loaded rows; added rows are committed with no move.
-    fn commit_and_move(&mut self, delta_col: i64, delta_row: i64, window: &mut Window, cx: &mut Context<Self>) {
+    fn commit_and_move(
+        &mut self,
+        delta_col: i64,
+        delta_row: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let edit = match self.cell_edit.as_ref() {
-            Some(e) => (e.abs_idx, e.col_idx, matches!(e.target, CellEditTarget::Loaded)),
+            Some(e) => (
+                e.abs_idx,
+                e.col_idx,
+                matches!(e.target, CellEditTarget::Loaded),
+            ),
             None => return,
         };
         let (abs_idx, col_idx, is_loaded) = edit;
@@ -1356,8 +2136,7 @@ impl ResultView {
 
         if matches!(self.column_kind_at(col_idx), CellEditorKind::Date) {
             if !is_valid_date(&raw_text) {
-                self.status_message =
-                    Some(format!("Expected YYYY-MM-DD, got: {raw_text}"));
+                self.status_message = Some(format!("Expected YYYY-MM-DD, got: {raw_text}"));
                 cx.notify();
                 return false;
             }
@@ -1491,7 +2270,12 @@ impl ResultView {
             .unwrap_or(false)
     }
 
-    fn toggle_boolean_cell_loaded(&mut self, abs_idx: usize, col_idx: usize, cx: &mut Context<Self>) {
+    fn toggle_boolean_cell_loaded(
+        &mut self,
+        abs_idx: usize,
+        col_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
         if self.table_name.is_none() {
             return;
         }
@@ -1503,15 +2287,28 @@ impl ResultView {
         self.buffer_loaded_cell_value(abs_idx, col_idx, new, cx);
     }
 
-    fn toggle_boolean_cell_added(&mut self, col_idx: usize, added_idx: usize, cx: &mut Context<Self>) {
+    fn toggle_boolean_cell_added(
+        &mut self,
+        col_idx: usize,
+        added_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
         if self.table_name.is_none() {
             return;
         }
-        let Some(cell) = self.added_rows.get(added_idx).and_then(|row| row.get(col_idx)) else {
+        let Some(cell) = self
+            .added_rows
+            .get(added_idx)
+            .and_then(|row| row.get(col_idx))
+        else {
             return;
         };
         let new = toggle_bool_value(cell);
-        if let Some(cell) = self.added_rows.get_mut(added_idx).and_then(|row| row.get_mut(col_idx)) {
+        if let Some(cell) = self
+            .added_rows
+            .get_mut(added_idx)
+            .and_then(|row| row.get_mut(col_idx))
+        {
             *cell = new;
         }
         cx.notify();
@@ -1523,7 +2320,11 @@ impl ResultView {
             return;
         };
         if let Some(added_idx) = popup.added_idx {
-            if let Some(cell) = self.added_rows.get_mut(added_idx).and_then(|row| row.get_mut(popup.col_idx)) {
+            if let Some(cell) = self
+                .added_rows
+                .get_mut(added_idx)
+                .and_then(|row| row.get_mut(popup.col_idx))
+            {
                 *cell = value;
             }
         } else {
@@ -1537,8 +2338,7 @@ impl ResultView {
     // `commit_cell_edit`'s no-op handling for loaded cells.
     fn set_selected_cell_value(&mut self, value: CellValue, cx: &mut Context<Self>) {
         if self.table_name.is_none() {
-            self.status_message =
-                Some("Row operations need a table-backed result.".to_string());
+            self.status_message = Some("Row operations need a table-backed result.".to_string());
             cx.notify();
             return;
         }
@@ -1572,7 +2372,10 @@ impl ResultView {
     // needs only the table; DELETE additionally needs a usable primary key,
     // which the submit-time guard enforces per row.
     fn row_ops_enabled(&self) -> bool {
-        self.table_name.is_some() && self.workspace.is_some()
+        self.table_name.is_some()
+            && self.store.is_some()
+            && self.connection_id.is_some()
+            && self.database.is_some()
     }
 
     // Number of loaded rows in the result (0 when there is no result). Added rows
@@ -1581,40 +2384,69 @@ impl ResultView {
         self.result.as_ref().map_or(0, |result| result.rows.len())
     }
 
+    fn select_row_for_context_action(&mut self, abs_idx: usize, cell_idx: usize) {
+        self.selected_rows.clear();
+        self.selected_rows.insert(abs_idx);
+        self.last_selected_row = self.display_idx_of(abs_idx);
+        self.selected_cell = Some((abs_idx, cell_idx));
+        self.selected_cell_range = None;
+    }
+
     // Toggles deletion for all selected loaded rows. A second toggle un-marks
     // them. Falls back to the selected cell when no rows are selected.
     // Added rows are not deletable this way; they are dropped via Revert.
     fn toggle_delete_selected_row(&mut self, cx: &mut Context<Self>) {
         if !self.row_ops_enabled() {
-            self.status_message =
-                Some("Row operations need a table-backed result.".to_string());
+            self.status_message = Some("Row operations need a table-backed result.".to_string());
             cx.notify();
             return;
         }
         let loaded_count = self.loaded_row_count();
-        let rows: Vec<usize> = if !self.selected_rows.is_empty() {
-            self.selected_rows
-                .iter()
-                .copied()
-                .filter(|&r| r < loaded_count)
-                .collect()
+        let selected_abs_rows: Vec<usize> = if !self.selected_rows.is_empty() {
+            self.selected_rows.iter().copied().collect()
         } else if let Some((abs_idx, _)) = self.selected_cell {
-            if abs_idx < loaded_count {
-                vec![abs_idx]
-            } else {
-                vec![]
-            }
+            vec![abs_idx]
         } else {
             vec![]
         };
-        if rows.is_empty() {
+        let mut loaded_rows = Vec::new();
+        let mut added_rows = Vec::new();
+        for abs_idx in selected_abs_rows {
+            if abs_idx < loaded_count {
+                loaded_rows.push(abs_idx);
+            } else if let Some(added_idx) = abs_idx.checked_sub(loaded_count) {
+                if added_idx < self.added_rows.len() {
+                    added_rows.push(added_idx);
+                }
+            }
+        }
+        if loaded_rows.is_empty() && added_rows.is_empty() {
             self.status_message = Some("Select a row to delete first.".to_string());
             cx.notify();
             return;
         }
-        for abs_idx in rows {
+        for abs_idx in loaded_rows {
             if !self.deleted_rows.remove(&abs_idx) {
                 self.deleted_rows.insert(abs_idx);
+            }
+        }
+        let removed_added_rows = !added_rows.is_empty();
+        added_rows.sort_unstable();
+        added_rows.dedup();
+        for added_idx in added_rows.into_iter().rev() {
+            self.remove_added_row(added_idx);
+        }
+        if removed_added_rows {
+            self.selected_rows.retain(|&abs_idx| abs_idx < loaded_count);
+            if let Some((abs_idx, _)) = self.selected_cell {
+                if abs_idx >= loaded_count {
+                    self.selected_cell = None;
+                }
+            }
+            self.selected_cell_range = None;
+        } else if let Some((abs_idx, _)) = self.selected_cell {
+            if abs_idx >= loaded_count + self.added_rows.len() {
+                self.selected_cell = None;
             }
         }
         self.ensure_primary_key_columns(cx);
@@ -1622,22 +2454,35 @@ impl ResultView {
         cx.notify();
     }
 
-    // Appends a blank editable row that is submitted as an INSERT on Submit.
     fn add_blank_row(&mut self, cx: &mut Context<Self>) {
+        self.add_blank_row_after(None, cx);
+    }
+
+    fn add_blank_row_after(
+        &mut self,
+        after_abs_idx: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
         if !self.row_ops_enabled() {
-            self.status_message =
-                Some("Row operations need a table-backed result.".to_string());
+            self.status_message = Some("Row operations need a table-backed result.".to_string());
             cx.notify();
-            return;
+            return None;
         }
         let Some(col_count) = self.result.as_ref().map(|result| result.columns.len()) else {
             self.status_message = Some("No result to add a row to.".to_string());
             cx.notify();
-            return;
+            return None;
         };
+        let added_idx = self.added_rows.len();
         self.added_rows.push(vec![CellValue::Null; col_count]);
+        self.added_row_anchors.push(
+            after_abs_idx
+                .map(|abs_idx| self.anchor_for_abs_idx(abs_idx))
+                .unwrap_or(AddedRowAnchor::End),
+        );
         self.status_message = None;
         cx.notify();
+        Some(added_idx)
     }
 
     // Duplicates the selected row (loaded or added) into a new added row, so it
@@ -1645,43 +2490,66 @@ impl ResultView {
     // Pending cell edits are carried into the clone for loaded rows.
     fn clone_selected_row(&mut self, cx: &mut Context<Self>) {
         if !self.row_ops_enabled() {
-            self.status_message =
-                Some("Row operations need a table-backed result.".to_string());
+            self.status_message = Some("Row operations need a table-backed result.".to_string());
             cx.notify();
             return;
         }
-        let abs_idx = self
-            .selected_rows
-            .iter()
-            .copied()
-            .next()
-            .or_else(|| self.selected_cell.map(|(r, _)| r));
-        let Some(abs_idx) = abs_idx else {
+        let source_abs_idx = if self.selected_rows.is_empty() {
+            self.selected_cell.map(|(row, _)| row)
+        } else {
+            self.selected_rows
+                .iter()
+                .copied()
+                .min_by_key(|abs_idx| self.display_idx_of(*abs_idx).unwrap_or(*abs_idx))
+        };
+        let Some(source_abs_idx) = source_abs_idx else {
             self.status_message = Some("Select a row to clone first.".to_string());
             cx.notify();
             return;
         };
+        self.clone_row_after(source_abs_idx, source_abs_idx, cx);
+    }
+
+    fn clone_row_after(
+        &mut self,
+        source_abs_idx: usize,
+        after_abs_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        if !self.row_ops_enabled() {
+            self.status_message = Some("Row operations need a table-backed result.".to_string());
+            cx.notify();
+            return None;
+        }
         let loaded_count = self.loaded_row_count();
-        let clone = if abs_idx < loaded_count {
+        let clone = if source_abs_idx < loaded_count {
             let Some(col_count) = self.result.as_ref().map(|result| result.columns.len()) else {
-                return;
+                return None;
             };
             (0..col_count)
-                .map(|col_idx| match self.pending_cell_value(abs_idx, col_idx) {
-                    Some(value) => value.clone(),
-                    None => CellValue::from_loaded(&self.loaded_cell_value(abs_idx, col_idx)),
-                })
+                .map(
+                    |col_idx| match self.pending_cell_value(source_abs_idx, col_idx) {
+                        Some(value) => value.clone(),
+                        None => {
+                            CellValue::from_loaded(&self.loaded_cell_value(source_abs_idx, col_idx))
+                        }
+                    },
+                )
                 .collect()
         } else {
-            let added_idx = abs_idx - loaded_count;
+            let added_idx = source_abs_idx - loaded_count;
             let Some(row) = self.added_rows.get(added_idx) else {
-                return;
+                return None;
             };
             row.clone()
         };
+        let added_idx = self.added_rows.len();
         self.added_rows.push(clone);
+        self.added_row_anchors
+            .push(self.anchor_for_abs_idx(after_abs_idx));
         self.status_message = None;
         cx.notify();
+        Some(added_idx)
     }
 
     // Checks whether a single row can be safely targeted by a PK-based WHERE
@@ -1732,24 +2600,12 @@ impl ResultView {
     // store. DELETE runs before INSERT so a re-inserted unique key cannot collide
     // with a row that is about to be removed. On any error the buffers are kept
     // so the user does not lose work.
-    fn submit_pending_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_edits.is_empty()
-            && self.deleted_rows.is_empty()
-            && self.added_rows.is_empty()
-        {
-            return;
-        }
-        let (Some(store), Some(conn_id), Some(db), Some(table), Some(result)) = (
-            self.store.clone(),
-            self.connection_id,
-            self.database.clone(),
-            self.table_name.clone(),
-            self.result.as_ref(),
-        ) else {
-            self.status_message =
-                Some("Edit kept in grid: no table connection to write to.".to_string());
-            cx.notify();
-            return;
+    // Builds the DELETE/UPDATE/INSERT statements for the current buffered
+    // changes, in the safe execution order. Pure with respect to the database;
+    // shared by Submit, Preview, and Manual-mode staging so they never diverge.
+    fn build_pending_statements(&self, cx: &App) -> Result<Vec<String>, String> {
+        let (Some(table), Some(result)) = (self.table_name.as_ref(), self.result.as_ref()) else {
+            return Err("No table connection to write to.".to_string());
         };
         let key_columns = self.primary_key_columns.clone().unwrap_or_default();
         let quote = self.identifier_quote(cx);
@@ -1764,29 +2620,38 @@ impl ResultView {
         let mut deleted: Vec<usize> = self.deleted_rows.iter().copied().collect();
         deleted.sort_unstable();
 
-        let updates = match build_pending_updates(
+        let updates = build_pending_updates(
             quote,
-            &table,
+            table,
             &result.columns,
             &key_columns,
             &result.rows,
             &edits,
-        ) {
-            Ok(statements) => statements,
-            Err(note) => {
-                self.status_message = Some(note);
-                cx.notify();
-                return;
-            }
-        };
-        let deletes = match build_pending_deletes(
+        )?;
+        let deletes = build_pending_deletes(
             quote,
-            &table,
+            table,
             &result.columns,
             &key_columns,
             &result.rows,
             &deleted,
-        ) {
+        )?;
+        let inserts: Vec<String> = self
+            .added_rows
+            .iter()
+            .map(|row| build_insert_sql(quote, table, &result.columns, row))
+            .collect();
+        Ok(combine_row_statements(deletes, updates, inserts))
+    }
+
+    fn submit_pending_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_edits.is_empty()
+            && self.deleted_rows.is_empty()
+            && self.added_rows.is_empty()
+        {
+            return;
+        }
+        let statements = match self.build_pending_statements(cx) {
             Ok(statements) => statements,
             Err(note) => {
                 self.status_message = Some(note);
@@ -1794,12 +2659,28 @@ impl ResultView {
                 return;
             }
         };
-        let inserts: Vec<String> = self
-            .added_rows
-            .iter()
-            .map(|row| build_insert_sql(quote, &table, &result.columns, row))
-            .collect();
-        let statements = combine_row_statements(deletes, updates, inserts);
+
+        // Manual mode does not touch the database here; it stages the SQL so the
+        // grid keeps showing the pending highlights until an explicit Commit.
+        if self.transaction_mode == TransactionMode::Manual {
+            let count = statements.len();
+            self.staged_statements = statements;
+            self.status_message = Some(format!(
+                "{count} statement{} staged — Commit to apply.",
+                if count == 1 { "" } else { "s" }
+            ));
+            cx.notify();
+            return;
+        }
+
+        let (Some(store), Some(conn_id), Some(db)) =
+            (self.store.clone(), self.connection_id, self.database.clone())
+        else {
+            self.status_message =
+                Some("Edit kept in grid: no table connection to write to.".to_string());
+            cx.notify();
+            return;
+        };
 
         // A row insert or delete changes which rows exist, so refreshing keeps the
         // grid in sync with the database (and shows real auto-increment keys). A
@@ -1833,6 +2714,7 @@ impl ResultView {
                     this.pending_edits.clear();
                     this.deleted_rows.clear();
                     this.added_rows.clear();
+                    this.added_row_anchors.clear();
                     this.status_message = None;
                     this.refresh_table_data(window, cx);
                 } else {
@@ -1885,6 +2767,7 @@ impl ResultView {
         self.pending_edits.clear();
         self.deleted_rows.clear();
         self.added_rows.clear();
+        self.added_row_anchors.clear();
         self.status_message = None;
         cx.notify();
     }
@@ -1892,6 +2775,186 @@ impl ResultView {
     // Total number of buffered changes shown in the toolbar.
     fn pending_change_count(&self) -> usize {
         self.pending_edits.len() + self.deleted_rows.len() + self.added_rows.len()
+    }
+
+    fn toggle_transaction_mode(&mut self, cx: &mut Context<Self>) {
+        self.transaction_mode = match self.transaction_mode {
+            TransactionMode::Auto => TransactionMode::Manual,
+            TransactionMode::Manual => {
+                // Leaving Manual with staged work would silently drop it, so
+                // discard it explicitly and tell the user.
+                if !self.staged_statements.is_empty() {
+                    self.staged_statements.clear();
+                    self.status_message =
+                        Some("Switched to Auto; staged changes were discarded.".to_string());
+                }
+                TransactionMode::Auto
+            }
+        };
+        cx.notify();
+    }
+
+    // Runs the staged statements as one transaction. On success the buffers and
+    // staged list clear and the grid refreshes from the database.
+    fn commit_transaction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.staged_statements.is_empty() {
+            return;
+        }
+        let (Some(store), Some(conn_id), Some(db)) =
+            (self.store.clone(), self.connection_id, self.database.clone())
+        else {
+            self.status_message = Some("No table connection to commit to.".to_string());
+            cx.notify();
+            return;
+        };
+        let transaction = wrap_in_transaction(&self.staged_statements);
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(task) = store.upgrade().map(|s| {
+                s.update(cx, |store, cx| {
+                    store.execute_query(conn_id, db.clone(), transaction, cx)
+                })
+            }) else {
+                return Ok(());
+            };
+            if let Err(err) = task.await {
+                this.update(cx, |this, cx| this.set_error(err.to_string(), cx))
+                    .log_err();
+                return Ok(());
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.staged_statements.clear();
+                this.pending_edits.clear();
+                this.deleted_rows.clear();
+                this.added_rows.clear();
+                this.added_row_anchors.clear();
+                this.status_message = None;
+                this.refresh_table_data(window, cx);
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    // Discards the staged statements and the buffered changes that produced them.
+    fn rollback_transaction(&mut self, cx: &mut Context<Self>) {
+        if self.staged_statements.is_empty()
+            && self.pending_edits.is_empty()
+            && self.deleted_rows.is_empty()
+            && self.added_rows.is_empty()
+        {
+            return;
+        }
+        self.staged_statements.clear();
+        self.pending_edits.clear();
+        self.deleted_rows.clear();
+        self.added_rows.clear();
+        self.added_row_anchors.clear();
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Copies the selected column's aggregate summary (the same text shown in the
+    // status bar) to the clipboard.
+    fn copy_aggregation_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(result) = self.result.as_ref() else {
+            return;
+        };
+        let Some((_, col_idx)) = self.selected_cell else {
+            self.status_message =
+                Some("Select a cell to copy its column aggregates.".to_string());
+            cx.notify();
+            return;
+        };
+        if col_idx >= result.columns.len() {
+            return;
+        }
+        let column_name = result.columns.get(col_idx).cloned().unwrap_or_default();
+        let summary =
+            Self::compute_column_aggregates(result, col_idx, &self.filtered_display_order);
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("{column_name}  {summary}")));
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Sets a column's local filter to match (or exclude) the given cell value.
+    // Opens the filter row if hidden so the predicate is visible and editable.
+    fn apply_quick_filter(
+        &mut self,
+        col_idx: usize,
+        value: String,
+        exclude: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.local_filter_visible {
+            self.toggle_local_filter_row(window, cx);
+        }
+        let text = if exclude { format!("!{value}") } else { value };
+        if let Some(editor) = self.local_filter_editors.get(col_idx).cloned() {
+            editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+        }
+        self.recompute_local_filter(cx);
+    }
+
+    fn toggle_goto_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.goto_row_visible {
+            self.close_goto_row(cx);
+        } else {
+            self.open_goto_row(window, cx);
+        }
+    }
+
+    fn open_goto_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.goto_row_editor.is_none() {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Row number", window, cx);
+                editor
+            });
+            self.goto_row_editor = Some(editor);
+        }
+        self.goto_row_visible = true;
+        if let Some(editor) = self.goto_row_editor.clone() {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_goto_row(&mut self, cx: &mut Context<Self>) {
+        self.goto_row_visible = false;
+        cx.notify();
+    }
+
+    // Parses the go-to-row input (a plain row number, or `column:row`), then
+    // scrolls to and selects that row in the current display order.
+    fn confirm_goto_row(&mut self, cx: &mut Context<Self>) {
+        let raw = self
+            .goto_row_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx))
+            .unwrap_or_default();
+        let row_token = raw.rsplit(':').next().unwrap_or("").trim();
+        let Ok(row_number) = row_token.parse::<usize>() else {
+            self.status_message = Some("Enter a row number to jump to.".to_string());
+            cx.notify();
+            return;
+        };
+        let total = self.filtered_display_order.len();
+        if total == 0 {
+            return;
+        }
+        let display_idx = row_number.saturating_sub(1).min(total - 1);
+        if let Some(&abs_idx) = self.filtered_display_order.get(display_idx) {
+            self.selected_rows.clear();
+            self.selected_rows.insert(abs_idx);
+            self.last_selected_row = Some(display_idx);
+        }
+        self.scroll_handle
+            .scroll_to_item(display_idx, gpui::ScrollStrategy::Center);
+        self.goto_row_visible = false;
+        cx.notify();
     }
 
     // The identifier-quoting character for the active connection's driver.
@@ -1911,7 +2974,8 @@ impl ResultView {
             });
         match driver {
             Some(DatabaseDriver::MySQL) => '`',
-            _ => '"',
+            Some(_) => '"',
+            None => '`',
         }
     }
 
@@ -1935,31 +2999,65 @@ impl ResultView {
     }
 
     fn export_sql_insert(result: &QueryResult, table: &str) -> String {
+        Self::export_sql_insert_with_quote(result, table, '`')
+    }
+
+    fn export_sql_insert_with_quote(result: &QueryResult, table: &str, quote: char) -> String {
         if result.rows.is_empty() {
             return String::new();
         }
         let cols = result
             .columns
             .iter()
-            .map(|c| format!("`{}`", c))
+            .map(|column| quote_identifier(quote, column))
             .collect::<Vec<_>>()
             .join(", ");
         let mut out = String::new();
         for row in &result.rows {
-            let values = row
-                .iter()
-                .map(|c| match c.as_deref() {
-                    None => "NULL".to_string(),
-                    Some(v) => format!("'{}'", v.replace('\'', "''")),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values = Self::row_sql_values(row);
             out.push_str(&format!(
-                "INSERT INTO `{}` ({}) VALUES ({});\n",
-                table, cols, values
+                "INSERT INTO {} ({}) VALUES ({});\n",
+                quote_identifier(quote, table),
+                cols,
+                values
             ));
         }
         out
+    }
+
+    fn export_sql_multi_insert(result: &QueryResult, table: &str, quote: char) -> String {
+        if result.rows.is_empty() {
+            return String::new();
+        }
+        let cols = result
+            .columns
+            .iter()
+            .map(|column| quote_identifier(quote, column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = result
+            .rows
+            .iter()
+            .map(|row| format!("({})", Self::row_sql_values(row)))
+            .collect::<Vec<_>>()
+            .join(",\n  ");
+
+        format!(
+            "INSERT INTO {} ({}) VALUES\n  {};\n",
+            quote_identifier(quote, table),
+            cols,
+            values
+        )
+    }
+
+    fn row_sql_values(row: &[Option<String>]) -> String {
+        row.iter()
+            .map(|cell| match cell.as_deref() {
+                None => "NULL".to_string(),
+                Some(value) => format!("'{}'", value.replace('\'', "''")),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn export_markdown(result: &QueryResult) -> String {
@@ -2006,14 +3104,17 @@ impl ResultView {
         out.push_str(&result.columns.join(","));
         out.push('\n');
         for row in &result.rows {
-            let cells: Vec<String> = row.iter().map(|c| {
-                let s = c.as_deref().unwrap_or("");
-                if s.contains(',') || s.contains('"') || s.contains('\n') {
-                    format!("\"{}\"", s.replace('"', "\"\""))
-                } else {
-                    s.to_string()
-                }
-            }).collect();
+            let cells: Vec<String> = row
+                .iter()
+                .map(|c| {
+                    let s = c.as_deref().unwrap_or("");
+                    if s.contains(',') || s.contains('"') || s.contains('\n') {
+                        format!("\"{}\"", s.replace('"', "\"\""))
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .collect();
             out.push_str(&cells.join(","));
             out.push('\n');
         }
@@ -2021,16 +3122,156 @@ impl ResultView {
     }
 
     fn export_json(result: &QueryResult) -> String {
-        let rows: Vec<String> = result.rows.iter().map(|row| {
-            let pairs: Vec<String> = result.columns.iter().zip(row.iter()).map(|(col, cell)| {
-                match cell {
-                    Some(v) => format!("\"{}\":\"{}\"", col, v.replace('"', "\\\"")),
-                    None => format!("\"{}\":null", col),
-                }
-            }).collect();
-            format!("{{{}}}", pairs.join(","))
-        }).collect();
+        let rows: Vec<String> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let pairs: Vec<String> = result
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, cell)| match cell {
+                        Some(v) => format!("\"{}\":\"{}\"", col, v.replace('"', "\\\"")),
+                        None => format!("\"{}\":null", col),
+                    })
+                    .collect();
+                format!("{{{}}}", pairs.join(","))
+            })
+            .collect();
         format!("[{}]", rows.join(","))
+    }
+
+    fn copy_cell_value(&self, abs_idx: usize, col_idx: usize) -> Option<String> {
+        if let Some(value) = self.pending_cell_value(abs_idx, col_idx) {
+            return match value {
+                CellValue::Text(text) => Some(text.clone()),
+                CellValue::Null => None,
+                CellValue::Default => Some(DEFAULT_MARKER.to_string()),
+            };
+        }
+        let loaded_count = self.loaded_row_count();
+        if abs_idx < loaded_count {
+            return self.loaded_cell_value(abs_idx, col_idx);
+        }
+        let added_idx = abs_idx.checked_sub(loaded_count)?;
+        self.added_rows
+            .get(added_idx)
+            .and_then(|row| row.get(col_idx))
+            .and_then(|value| match value {
+                CellValue::Text(text) => Some(text.clone()),
+                CellValue::Null => None,
+                CellValue::Default => Some(DEFAULT_MARKER.to_string()),
+            })
+    }
+
+    fn selected_display_rows_for_copy(&self) -> Vec<usize> {
+        if !self.selected_rows.is_empty() {
+            let loaded_count = self.loaded_row_count();
+            return self
+                .display_row_entries()
+                .into_iter()
+                .map(|row| row.abs_idx(loaded_count))
+                .filter(|abs_idx| self.selected_rows.contains(abs_idx))
+                .collect();
+        }
+
+        if let Some(((anchor_abs_idx, _), (end_abs_idx, _))) = self.selected_cell_range {
+            let anchor_display_idx = self
+                .display_idx_of(anchor_abs_idx)
+                .unwrap_or(anchor_abs_idx);
+            let end_display_idx = self.display_idx_of(end_abs_idx).unwrap_or(end_abs_idx);
+            let lo = anchor_display_idx.min(end_display_idx);
+            let hi = anchor_display_idx.max(end_display_idx);
+            return (lo..=hi)
+                .filter_map(|display_idx| self.abs_idx_at_display_idx(display_idx))
+                .collect();
+        }
+
+        self.selected_cell
+            .map(|(abs_idx, _)| vec![abs_idx])
+            .unwrap_or_default()
+    }
+
+    fn selected_columns_for_copy(&self, result: &QueryResult) -> Vec<usize> {
+        if !self.selected_rows.is_empty() {
+            return (0..result.columns.len()).collect();
+        }
+
+        if let Some(((_, anchor_col_idx), (_, end_col_idx))) = self.selected_cell_range {
+            let lo = anchor_col_idx.min(end_col_idx);
+            let hi = anchor_col_idx.max(end_col_idx);
+            return (lo..=hi)
+                .filter(|col_idx| *col_idx < result.columns.len())
+                .collect();
+        }
+
+        self.selected_cell
+            .and_then(|(_, col_idx)| (col_idx < result.columns.len()).then_some(vec![col_idx]))
+            .unwrap_or_default()
+    }
+
+    fn selected_result_for_copy(&self) -> Option<QueryResult> {
+        let result = self.result.as_ref()?;
+        let columns = self.selected_columns_for_copy(result);
+        let rows = self.selected_display_rows_for_copy();
+        if columns.is_empty() || rows.is_empty() {
+            return None;
+        }
+
+        Some(QueryResult {
+            columns: columns
+                .iter()
+                .filter_map(|col_idx| result.columns.get(*col_idx).cloned())
+                .collect(),
+            rows: rows
+                .into_iter()
+                .map(|abs_idx| {
+                    columns
+                        .iter()
+                        .map(|col_idx| self.copy_cell_value(abs_idx, *col_idx))
+                        .collect()
+                })
+                .collect(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+        })
+    }
+
+    fn copy_selected_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(result) = self.selected_result_for_copy() else {
+            self.status_message = Some("Select cells or rows to copy.".to_string());
+            cx.notify();
+            return;
+        };
+        let table_name = self.table_name.clone();
+        let quote = self.identifier_quote(cx);
+        let text = match self.copy_format {
+            CopyFormat::Tsv => Self::export_tsv(&result),
+            CopyFormat::Csv => Self::export_csv(&result),
+            CopyFormat::Json => Self::export_json(&result),
+            CopyFormat::Markdown => Self::export_markdown(&result),
+            CopyFormat::Insert => {
+                let Some(table) = table_name else {
+                    self.status_message =
+                        Some("Copy as INSERT requires a table-backed result.".to_string());
+                    cx.notify();
+                    return;
+                };
+                Self::export_sql_insert_with_quote(&result, &table, quote)
+            }
+            CopyFormat::MultiInsert => {
+                let Some(table) = table_name else {
+                    self.status_message =
+                        Some("Copy as INSERT requires a table-backed result.".to_string());
+                    cx.notify();
+                    return;
+                };
+                Self::export_sql_multi_insert(&result, &table, quote)
+            }
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status_message = None;
+        cx.notify();
     }
 
     fn export_html(result: &QueryResult) -> String {
@@ -2098,8 +3339,8 @@ impl ResultView {
     fn export_xlsx(result: &QueryResult) -> Vec<u8> {
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
-        let opts = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -2160,29 +3401,49 @@ impl ResultView {
             name
         }
 
-        let mut sheet = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>");
+        let mut sheet = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+        );
 
-        let header_row: Vec<String> = result.columns.iter()
+        let header_row: Vec<String> = result
+            .columns
+            .iter()
             .enumerate()
-            .map(|(i, col)| format!("<c r=\"{}1\" t=\"inlineStr\" s=\"1\"><is><t>{}</t></is></c>", col_name(i), xml_escape(col)))
+            .map(|(i, col)| {
+                format!(
+                    "<c r=\"{}1\" t=\"inlineStr\" s=\"1\"><is><t>{}</t></is></c>",
+                    col_name(i),
+                    xml_escape(col)
+                )
+            })
             .collect();
         sheet.push_str(&format!("<row r=\"1\">{}</row>", header_row.join("")));
 
         for (row_idx, row) in result.rows.iter().enumerate() {
             let row_num = row_idx + 2;
-            let cells: Vec<String> = row.iter().enumerate().map(|(col_idx, cell)| {
-                let cell_ref = format!("{}{}", col_name(col_idx), row_num);
-                match cell {
-                    Some(v) => {
-                        if v.parse::<f64>().is_ok() {
-                            format!("<c r=\"{}\"><v>{}</v></c>", cell_ref, xml_escape(v))
-                        } else {
-                            format!("<c r=\"{}\" t=\"inlineStr\"><is><t>{}</t></is></c>", cell_ref, xml_escape(v))
+            let cells: Vec<String> = row
+                .iter()
+                .enumerate()
+                .map(|(col_idx, cell)| {
+                    let cell_ref = format!("{}{}", col_name(col_idx), row_num);
+                    match cell {
+                        Some(v) => {
+                            if v.parse::<f64>().is_ok() {
+                                format!("<c r=\"{}\"><v>{}</v></c>", cell_ref, xml_escape(v))
+                            } else {
+                                format!(
+                                    "<c r=\"{}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                                    cell_ref,
+                                    xml_escape(v)
+                                )
+                            }
+                        }
+                        None => {
+                            format!("<c r=\"{}\" t=\"inlineStr\"><is><t></t></is></c>", cell_ref)
                         }
                     }
-                    None => format!("<c r=\"{}\" t=\"inlineStr\"><is><t></t></is></c>", cell_ref),
-                }
-            }).collect();
+                })
+                .collect();
             sheet.push_str(&format!("<row r=\"{}\">{}</row>", row_num, cells.join("")));
         }
         sheet.push_str("</sheetData></worksheet>");
@@ -2277,9 +3538,10 @@ impl ResultView {
             if let Some(first) = lines.peek() {
                 let fields = parse_row(first);
                 fields.len() == column_names.len()
-                    && fields.iter().zip(column_names.iter()).all(|(f, col)| {
-                        f.trim().eq_ignore_ascii_case(col.trim())
-                    })
+                    && fields
+                        .iter()
+                        .zip(column_names.iter())
+                        .all(|(f, col)| f.trim().eq_ignore_ascii_case(col.trim()))
             } else {
                 false
             }
@@ -2331,21 +3593,30 @@ impl ResultView {
         let mut numeric_count = 0usize;
 
         for &abs_idx in display_order {
-            let cell = result
-                .rows
-                .get(abs_idx)
-                .and_then(|row| row.get(col_idx));
+            let cell = result.rows.get(abs_idx).and_then(|row| row.get(col_idx));
             match cell.and_then(|c| c.as_deref()) {
                 None => null_count += 1,
                 Some(val) => {
                     count += 1;
                     min_str = Some(match min_str.take() {
                         None => val.to_string(),
-                        Some(m) => if val < m.as_str() { val.to_string() } else { m },
+                        Some(m) => {
+                            if val < m.as_str() {
+                                val.to_string()
+                            } else {
+                                m
+                            }
+                        }
                     });
                     max_str = Some(match max_str.take() {
                         None => val.to_string(),
-                        Some(m) => if val > m.as_str() { val.to_string() } else { m },
+                        Some(m) => {
+                            if val > m.as_str() {
+                                val.to_string()
+                            } else {
+                                m
+                            }
+                        }
                     });
                     if let Ok(n) = val.parse::<f64>() {
                         numeric_sum += n;
@@ -2355,14 +3626,16 @@ impl ResultView {
             }
         }
 
-        let min_s = min_str.as_deref().unwrap_or("—");
-        let max_s = max_str.as_deref().unwrap_or("—");
-        let mut out = format!("COUNT {count} | NULLS {null_count} | MIN {min_s} | MAX {max_s}");
         if numeric_count == count && count > 0 {
+            let min_s = min_str.as_deref().unwrap_or("—");
+            let max_s = max_str.as_deref().unwrap_or("—");
+            let mut out = format!("COUNT {count} | NULLS {null_count} | MIN {min_s} | MAX {max_s}");
             let avg = numeric_sum / count as f64;
             out.push_str(&format!(" | SUM {numeric_sum} | AVG {avg:.2}"));
+            out
+        } else {
+            format!("COUNT {count} | NULLS {null_count}")
         }
-        out
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -2384,7 +3657,11 @@ impl ResultView {
             if col_idx < total_cols {
                 Some(format!(
                     "{}  {}",
-                    result.columns.get(col_idx).map(|s| s.as_str()).unwrap_or(""),
+                    result
+                        .columns
+                        .get(col_idx)
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
                     Self::compute_column_aggregates(result, col_idx, &self.filtered_display_order),
                 ))
             } else {
@@ -2508,7 +3785,7 @@ impl ResultView {
         )
     }
 
-
+    #[allow(dead_code)]
     fn generate_update_sql(table: &str, columns: &[String], row: &[Option<String>]) -> String {
         if columns.is_empty() {
             return format!("UPDATE {} SET  WHERE ;", table);
@@ -2529,9 +3806,15 @@ impl ResultView {
                 None => format!("{} IS NULL", col),
             })
             .unwrap_or_else(|| "1 = 1".to_string());
-        format!("UPDATE {} SET {} WHERE {};", table, set_clauses.join(", "), where_clause)
+        format!(
+            "UPDATE {} SET {} WHERE {};",
+            table,
+            set_clauses.join(", "),
+            where_clause
+        )
     }
 
+    #[allow(dead_code)]
     fn generate_delete_sql(table: &str, columns: &[String], row: &[Option<String>]) -> String {
         let where_clause = columns
             .first()
@@ -2544,14 +3827,29 @@ impl ResultView {
         format!("DELETE FROM {} WHERE {};", table, where_clause)
     }
 
-    fn edit_row_as_sql(&self, row: &[Option<String>], columns: &[String], window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.clone() else { return };
+    #[allow(dead_code)]
+    fn edit_row_as_sql(
+        &self,
+        row: &[Option<String>],
+        columns: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
         let table = self.table_name.clone().unwrap_or_default();
         let sql = Self::generate_update_sql(&table, columns, row);
         Self::open_sql_in_workspace(workspace, sql, window, cx);
     }
 
-    fn open_sql_in_workspace(workspace: WeakEntity<Workspace>, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    #[allow(dead_code)]
+    fn open_sql_in_workspace(
+        workspace: WeakEntity<Workspace>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let languages = workspace
             .update(cx, |ws, _cx| ws.app_state().languages.clone())
             .log_err();
@@ -2559,35 +3857,50 @@ impl ResultView {
         let language_task = languages.language_for_name("SQL");
         cx.spawn_in(window, async move |_, cx| {
             let language = language_task.await.log_err();
-            workspace.update_in(cx, |workspace, window, cx| {
-                let project = workspace.project().clone();
-                let buffer_task = project.update(cx, move |project, cx| {
-                    project.create_buffer(language, false, cx)
-                });
-                cx.spawn_in(window, async move |workspace, cx| {
-                    let buffer = buffer_task.await?;
-                    let multi = cx.new(|cx| {
-                        multi_buffer::MultiBuffer::singleton(buffer, cx).with_title("query.sql".into())
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let project = workspace.project().clone();
+                    let buffer_task = project.update(cx, move |project, cx| {
+                        project.create_buffer(language, false, cx)
                     });
-                    workspace.update_in(cx, |workspace, window, cx| {
-                        let editor = cx.new(|cx| {
-                            let mut ed = Editor::for_multibuffer(multi, None, window, cx);
-                            ed.set_text(text.clone(), window, cx);
-                            ed
+                    cx.spawn_in(window, async move |workspace, cx| {
+                        let buffer = buffer_task.await?;
+                        let multi = cx.new(|cx| {
+                            multi_buffer::MultiBuffer::singleton(buffer, cx)
+                                .with_title("query.sql".into())
                         });
-                        workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
-                    })?;
-                    anyhow::Ok(())
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            let editor = cx.new(|cx| {
+                                let mut ed = Editor::for_multibuffer(multi, None, window, cx);
+                                ed.set_text(text.clone(), window, cx);
+                                ed
+                            });
+                            workspace.add_item_to_active_pane(
+                                Box::new(editor),
+                                None,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
                 })
-                .detach_and_log_err(cx);
-            })
-            .log_err();
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
-    fn delete_row(&mut self, row: Vec<Option<String>>, columns: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    #[allow(dead_code)]
+    fn delete_row(
+        &mut self,
+        row: Vec<Option<String>>,
+        columns: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (store, conn_id, db, table) = match (
             self.store.clone(),
             self.connection_id,
@@ -2607,13 +3920,13 @@ impl ResultView {
         );
         cx.spawn_in(window, async move |this, cx| {
             if answer.await.ok() == Some(0) {
-                let task = store.update(cx, |store, cx| {
-                    store.execute_query(conn_id, db, sql, cx)
-                })?;
+                let task =
+                    store.update(cx, |store, cx| store.execute_query(conn_id, db, sql, cx))?;
                 task.await.log_err();
                 this.update_in(cx, |this, window, cx| {
                     this.refresh_table_data(window, cx);
-                }).log_err();
+                })
+                .log_err();
             }
             anyhow::Ok(())
         })
@@ -2632,15 +3945,12 @@ impl ResultView {
                 .py_1()
                 .gap_2()
                 .border_b_1()
-                .child(Label::new("WHERE").size(LabelSize::Small).color(Color::Muted))
                 .child(
-                    div()
-                        .flex_1()
-                        .border_1()
-                        .rounded_md()
-                        .px_1()
-                        .child(editor),
+                    Label::new("WHERE")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 )
+                .child(div().flex_1().border_1().rounded_md().px_1().child(editor))
                 .child(
                     IconButton::new("refresh-data", IconName::RefreshTitle)
                         .icon_size(IconSize::Small)
@@ -2660,22 +3970,26 @@ impl ResultView {
             .size_full()
             .items_center()
             .justify_center()
-            .child(Label::new("No results").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new("No results")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
     }
 
     fn render_error(&self, error: &str) -> impl IntoElement {
-        div()
-            .p_4()
-            .child(Label::new(error.to_string()).size(LabelSize::Small).color(Color::Error))
+        div().p_4().child(
+            Label::new(error.to_string())
+                .size(LabelSize::Small)
+                .color(Color::Error),
+        )
     }
 
     // Builds ONE grid row (by absolute index), horizontally virtualized: only the
     // columns intersecting the current horizontal viewport are built; off-screen
     // columns collapse into left/right spacer divs so total width and alignment
-    // with the header are preserved. Cells are plain (non-interactive) — a single
-    // per-row click handler resolves the column from the click x — because
-    // per-cell hitboxes/listeners are the dominant per-frame cost. Reads the row
-    // from `self.result` so nothing is cloned wholesale during scroll.
+    // with the header are preserved. Reads the row from `self.result` so nothing
+    // is cloned wholesale during scroll.
     fn render_grid_row(
         &self,
         abs_idx: usize,
@@ -2684,11 +3998,16 @@ impl ResultView {
         zebra_bg: gpui::Hsla,
         modified_bg: gpui::Hsla,
         deleted_bg: gpui::Hsla,
+        cell_hover_bg: gpui::Hsla,
         has_table_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Bounds-check only; actual cell access goes through self.result inside closures.
-        let Some(_row) = self.result.as_ref().and_then(|result| result.rows.get(abs_idx)) else {
+        let Some(_row) = self
+            .result
+            .as_ref()
+            .and_then(|result| result.rows.get(abs_idx))
+        else {
             return div().into_any_element();
         };
         let selection_bg = cx.theme().colors().element_selected;
@@ -2713,7 +4032,11 @@ impl ResultView {
         let mut cells: Vec<AnyElement> = Vec::new();
         // Iterate display positions; visible_columns[display_pos] is the data column.
         for (display_pos, &cell_idx) in self.visible_columns.iter().enumerate() {
-            let width = self.col_widths.get(display_pos).copied().unwrap_or(px(120.));
+            let width = self
+                .col_widths
+                .get(display_pos)
+                .copied()
+                .unwrap_or(px(120.));
             let start = x;
             x += f32::from(width);
             let end = x;
@@ -2724,11 +4047,7 @@ impl ResultView {
                 continue;
             }
             let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
-                || self.selected_cell_range.map_or(false, |((r1, c1), (r2, c2))| {
-                    let (row_lo, row_hi) = (r1.min(r2), r1.max(r2));
-                    let (col_lo, col_hi) = (c1.min(c2), c1.max(c2));
-                    abs_idx >= row_lo && abs_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
-                });
+                || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
             let is_modified = self.pending_edits.contains_key(&(abs_idx, cell_idx));
             let editing = self
                 .cell_edit
@@ -2736,27 +4055,26 @@ impl ResultView {
                 .filter(|edit| edit.abs_idx == abs_idx && edit.col_idx == cell_idx);
             let cell_body: AnyElement = if let Some(edit) = editing {
                 let editor = edit.editor.clone();
+                let editor_kind = self.column_kind_at(cell_idx);
                 div()
                     // Capture phase: intercept before the editor processes them.
                     // Enter → commit + next row; Tab/Shift-Tab → commit + next/prev column.
-                    .capture_key_down(cx.listener(
-                        |this, event: &KeyDownEvent, window, cx| {
-                            match event.keystroke.key.as_str() {
-                                "enter" if !event.keystroke.modifiers.modified() => {
-                                    this.commit_and_move(0, 1, window, cx);
-                                }
-                                "tab" if !event.keystroke.modifiers.shift => {
-                                    this.commit_and_move(1, 0, window, cx);
-                                }
-                                "tab" if event.keystroke.modifiers.shift => {
-                                    this.commit_and_move(-1, 0, window, cx);
-                                }
-                                "escape" => this.cancel_cell_edit(window, cx),
-                                _ => {}
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "enter" if !event.keystroke.modifiers.modified() => {
+                                this.commit_and_move(0, 1, window, cx);
                             }
-                        },
-                    ))
-                    .child(editor)
+                            "tab" if !event.keystroke.modifiers.shift => {
+                                this.commit_and_move(1, 0, window, cx);
+                            }
+                            "tab" if event.keystroke.modifiers.shift => {
+                                this.commit_and_move(-1, 0, window, cx);
+                            }
+                            "escape" => this.cancel_cell_edit(window, cx),
+                            _ => {}
+                        }
+                    }))
+                    .child(Self::render_cell_editor(editor, editor_kind))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
                 let cell_val = match self.pending_cell_value(abs_idx, cell_idx) {
@@ -2780,7 +4098,7 @@ impl ResultView {
                             .and_then(|cell| cell.as_deref()),
                     ),
                 };
-                Label::new(display.clone())
+                let label = Label::new(display.clone())
                     .size(LabelSize::Small)
                     .color(color)
                     .when(
@@ -2788,31 +4106,38 @@ impl ResultView {
                         |label| label.italic(),
                     )
                     .when(is_deleted, |label| label.strikethrough())
-                    .into_any_element()
+                    .into_any_element();
+                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx))
             };
-            let is_find_match = self
-                .find_query
-                .as_ref()
-                .is_some_and(|q| !q.is_empty())
+            let is_find_match = self.find_query.as_ref().is_some_and(|q| !q.is_empty())
                 && self.find_matches.contains(&(abs_idx, cell_idx));
             let is_current_find = is_find_match
                 && self.find_matches.get(self.find_current) == Some(&(abs_idx, cell_idx));
+            let cell_display_idx = display_idx;
 
             let cell_div = div()
+                .id(ElementId::from(SharedString::from(format!(
+                    "cell-{abs_idx}-{cell_idx}"
+                ))))
+                .debug_selector(move || format!("CELL-{abs_idx}-{cell_idx}"))
                 .px_2()
-                .py_1()
+                .h(px(Self::GRID_ROW_H))
                 .w(width)
                 .flex_none()
+                .flex()
+                .items_center()
                 .border_r_1()
                 .border_color(grid_border)
                 .overflow_hidden()
                 // Priority (high→low): selection, find, row-selected, modified.
-                .when(is_row_selected && !is_selected && !is_find_match, move |this| {
-                    this.bg(row_selected_bg)
-                })
-                .when(is_find_match && !is_selected && !is_current_find, move |this| {
-                    this.bg(search_match_bg)
-                })
+                .when(
+                    is_row_selected && !is_selected && !is_find_match,
+                    move |this| this.bg(row_selected_bg),
+                )
+                .when(
+                    is_find_match && !is_selected && !is_current_find,
+                    move |this| this.bg(search_match_bg),
+                )
                 .when(is_current_find && !is_selected, move |this| {
                     this.bg(active_line_bg)
                 })
@@ -2822,7 +4147,50 @@ impl ResultView {
                         .border_color(gpui::rgb(0xD97706))
                 })
                 .when(is_selected, |this| this.bg(selection_bg))
-                .child(cell_body);
+                .when(is_deleted, |this| this.bg(deleted_bg))
+                .when(
+                    !is_selected && !is_find_match && !is_modified && !is_deleted,
+                    |this| this.hover(move |style| style.bg(cell_hover_bg)),
+                )
+                .child(cell_body)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.begin_cell_drag(abs_idx, cell_idx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        cx.stop_propagation();
+                        this.update_cell_drag(abs_idx, cell_display_idx, cell_idx, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.end_cell_drag();
+                    }),
+                )
+                .on_click(
+                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        let gpui::ClickEvent::Mouse(mouse) = event else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        this.click_loaded_cell(
+                            abs_idx,
+                            cell_display_idx,
+                            cell_idx,
+                            event.click_count(),
+                            mouse.down.modifiers.shift,
+                            mouse.down.modifiers.control,
+                            window,
+                            cx,
+                        );
+                    }),
+                );
 
             let cell_value_copy = self
                 .pending_cell_value(abs_idx, cell_idx)
@@ -2856,6 +4224,10 @@ impl ResultView {
                         let wt_del = wt.clone();
                         let wt_clone = wt.clone();
                         let wt_qdoc = wt.clone();
+                        let wt_filter = wt.clone();
+                        let wt_exclude = wt.clone();
+                        let filter_value = cv.clone();
+                        let exclude_value = cv.clone();
                         let menu = menu
                             .header("View")
                             .entry("Edit", None, move |window, cx| {
@@ -2886,6 +4258,24 @@ impl ResultView {
                             .header("Clipboard")
                             .entry("Copy", None, move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(cv.clone()));
+                            })
+                            .separator()
+                            .header("Filter")
+                            .entry(format!("Filter by \"{}\"", display_cell(&filter_value)), None, move |window, cx| {
+                                let value = filter_value.clone();
+                                wt_filter
+                                    .update(cx, |this, cx| {
+                                        this.apply_quick_filter(cell_idx, value, false, window, cx);
+                                    })
+                                    .ok();
+                            })
+                            .entry(format!("Exclude \"{}\"", display_cell(&exclude_value)), None, move |window, cx| {
+                                let value = exclude_value.clone();
+                                wt_exclude
+                                    .update(cx, |this, cx| {
+                                        this.apply_quick_filter(cell_idx, value, true, window, cx);
+                                    })
+                                    .ok();
                             })
                             .separator()
                             .header("Quick Help")
@@ -2930,29 +4320,42 @@ impl ResultView {
                             })
                             .separator()
                             .header("Row")
-                            .entry("Add Row", None, move |_, cx| {
+                            .entry("Add Row", None, move |window, cx| {
                                 wt_add
                                     .update(cx, |this, cx| {
-                                        this.add_blank_row(cx);
+                                        this.select_row_for_context_action(abs_idx, cell_idx);
+                                        if let Some(added_idx) =
+                                            this.add_blank_row_after(Some(abs_idx), cx)
+                                        {
+                                            this.begin_added_row_edit(added_idx, window, cx);
+                                        }
                                     })
                                     .ok();
                             })
                             .entry("Delete Row", None, move |_, cx| {
                                 wt_del
                                     .update(cx, |this, cx| {
-                                        this.selected_cell = Some((abs_idx, cell_idx));
+                                        this.select_row_for_context_action(abs_idx, cell_idx);
                                         this.toggle_delete_selected_row(cx);
                                     })
                                     .ok();
                             })
-                            .entry("Clone Row", None, move |_, cx| {
-                                wt_clone
-                                    .update(cx, |this, cx| {
-                                        this.selected_cell = Some((abs_idx, cell_idx));
-                                        this.clone_selected_row(cx);
-                                    })
-                                    .ok();
-                            })
+                            .entry(
+                                "Clone Row",
+                                None,
+                                move |window, cx| {
+                                    wt_clone
+                                        .update(cx, |this, cx| {
+                                            this.select_row_for_context_action(abs_idx, cell_idx);
+                                            if let Some(added_idx) =
+                                                this.clone_row_after(abs_idx, abs_idx, cx)
+                                            {
+                                                this.begin_added_row_edit(added_idx, window, cx);
+                                            }
+                                        })
+                                        .ok();
+                                },
+                            )
                         } else {
                             menu
                         }
@@ -2966,10 +4369,13 @@ impl ResultView {
         // the row keeps its full content width and lines up with the header.
         let right_spacer = (x - last_visible_end).max(0.0);
 
-        let mut row_el = div()
-            .id(ElementId::from(SharedString::from(format!("row-{abs_idx}"))))
+        let row_el = div()
+            .id(ElementId::from(SharedString::from(format!(
+                "row-{abs_idx}"
+            ))))
             .flex()
             .flex_row()
+            .h(px(Self::GRID_ROW_H))
             .border_b_1()
             .border_color(grid_border)
             .when(display_idx % 2 == 1, |this| this.bg(zebra_bg))
@@ -2979,107 +4385,28 @@ impl ResultView {
             .child(div().w(px(left_spacer)).flex_none())
             .children(cells)
             .child(div().w(px(right_spacer)).flex_none())
-            // One per-row click handler (≈ visible rows only) resolves the column
-            // from the click x; cells stay non-interactive for scroll speed.
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                let gpui::ClickEvent::Mouse(mouse) = event else {
-                    return;
-                };
-                let Some(cell_idx) = this.column_at_x(f32::from(mouse.up.position.x)) else {
-                    return;
-                };
-                // Multi-row selection: shift extends range in display space so
-                // sorted/filtered views select what the user sees, not abs indices.
-                if mouse.down.modifiers.shift {
-                    if let Some(anchor) = this.selected_cell {
-                        // Shift+click on a cell: extend the rectangular cell range.
-                        this.selected_cell_range = Some((anchor, (abs_idx, cell_idx)));
-                    } else {
-                        let anchor_disp = this.last_selected_row.unwrap_or(display_idx);
-                        let lo = anchor_disp.min(display_idx);
-                        let hi = anchor_disp.max(display_idx);
-                        this.selected_rows.clear();
-                        for d in lo..=hi {
-                            if let Some(&a) = this.filtered_display_order.get(d) {
-                                this.selected_rows.insert(a);
-                            }
-                        }
-                    }
-                    // Don't update anchor on shift-click — keep extending from original pivot.
-                } else if mouse.down.modifiers.control {
-                    if this.selected_rows.contains(&abs_idx) {
-                        this.selected_rows.remove(&abs_idx);
-                    } else {
-                        this.selected_rows.insert(abs_idx);
-                    }
-                    this.last_selected_row = Some(display_idx);
-                    this.selected_cell_range = None;
-                } else {
-                    this.selected_rows.clear();
-                    this.selected_rows.insert(abs_idx);
-                    this.last_selected_row = Some(display_idx);
-                    this.selected_cell_range = None;
-                }
-                this.selected_cell = Some((abs_idx, cell_idx));
-                if let Some(disp) = this.display_idx_of(abs_idx) {
-                    this.record_view_row = Some(disp);
-                }
-                if event.click_count() >= 2 && !matches!(this.column_kind_at(cell_idx), CellEditorKind::Boolean) {
-                    this.begin_cell_edit(abs_idx, cell_idx, window, cx);
-                } else if matches!(this.column_kind_at(cell_idx), CellEditorKind::Boolean) {
-                    this.toggle_boolean_cell_loaded(abs_idx, cell_idx, cx);
-                } else if let Some(value) = this
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.rows.get(abs_idx))
-                    .and_then(|row| row.get(cell_idx))
-                    .and_then(|cell| cell.clone())
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(value));
-                }
-                cx.notify();
-            }));
-
-        if has_table_context {
-            row_el = row_el.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .w(px(64.))
-                    .flex_none()
-                    .child(
-                        IconButton::new(
-                            ElementId::from(SharedString::from(format!("edit-row-{abs_idx}"))),
-                            IconName::Pencil,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Edit row (opens UPDATE in editor)"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(row) = this.result.as_ref().and_then(|r| r.rows.get(abs_idx)).cloned() {
-                                let columns = this.result.as_ref().map(|r| r.columns.clone()).unwrap_or_default();
-                                this.edit_row_as_sql(&row, &columns, window, cx);
-                            }
-                        })),
-                    )
-                    .child(
-                        IconButton::new(
-                            ElementId::from(SharedString::from(format!("del-row-{abs_idx}"))),
-                            IconName::Trash,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Delete row"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(row) = this.result.as_ref().and_then(|r| r.rows.get(abs_idx)).cloned() {
-                                let columns = this.result.as_ref().map(|r| r.columns.clone()).unwrap_or_default();
-                                this.delete_row(row, columns, window, cx);
-                            }
-                        })),
-                    ),
+            // Fallback for clicks that land on row whitespace rather than a cell.
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    let gpui::ClickEvent::Mouse(mouse) = event else {
+                        return;
+                    };
+                    let Some(cell_idx) = this.column_at_x(f32::from(mouse.up.position.x)) else {
+                        return;
+                    };
+                    this.click_loaded_cell(
+                        abs_idx,
+                        display_idx,
+                        cell_idx,
+                        event.click_count(),
+                        mouse.down.modifiers.shift,
+                        mouse.down.modifiers.control,
+                        window,
+                        cx,
+                    );
+                }),
             );
-        }
+
         row_el.into_any_element()
     }
 
@@ -3094,7 +4421,8 @@ impl ResultView {
         grid_border: gpui::Hsla,
         zebra_bg: gpui::Hsla,
         added_bg: gpui::Hsla,
-        has_table_context: bool,
+        cell_hover_bg: gpui::Hsla,
+        _has_table_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(row) = self.added_rows.get(added_idx) else {
@@ -3123,7 +4451,11 @@ impl ResultView {
             if cell_idx >= column_count {
                 continue;
             }
-            let width = self.col_widths.get(display_pos).copied().unwrap_or(px(120.));
+            let width = self
+                .col_widths
+                .get(display_pos)
+                .copied()
+                .unwrap_or(px(120.));
             let start = x;
             x += f32::from(width);
             let end = x;
@@ -3134,36 +4466,31 @@ impl ResultView {
                 continue;
             }
             let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
-                || self.selected_cell_range.map_or(false, |((r1, c1), (r2, c2))| {
-                    let (row_lo, row_hi) = (r1.min(r2), r1.max(r2));
-                    let (col_lo, col_hi) = (c1.min(c2), c1.max(c2));
-                    abs_idx >= row_lo && abs_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
-                });
+                || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
             let editing = self
                 .cell_edit
                 .as_ref()
                 .filter(|edit| edit.abs_idx == abs_idx && edit.col_idx == cell_idx);
             let cell_body: AnyElement = if let Some(edit) = editing {
                 let editor = edit.editor.clone();
+                let editor_kind = self.column_kind_at(cell_idx);
                 div()
-                    .capture_key_down(cx.listener(
-                        |this, event: &KeyDownEvent, window, cx| {
-                            match event.keystroke.key.as_str() {
-                                "enter" if !event.keystroke.modifiers.modified() => {
-                                    this.commit_and_move(0, 1, window, cx);
-                                }
-                                "tab" if !event.keystroke.modifiers.shift => {
-                                    this.commit_and_move(1, 0, window, cx);
-                                }
-                                "tab" if event.keystroke.modifiers.shift => {
-                                    this.commit_and_move(-1, 0, window, cx);
-                                }
-                                "escape" => this.cancel_cell_edit(window, cx),
-                                _ => {}
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "enter" if !event.keystroke.modifiers.modified() => {
+                                this.commit_and_move(0, 1, window, cx);
                             }
-                        },
-                    ))
-                    .child(editor)
+                            "tab" if !event.keystroke.modifiers.shift => {
+                                this.commit_and_move(1, 0, window, cx);
+                            }
+                            "tab" if event.keystroke.modifiers.shift => {
+                                this.commit_and_move(-1, 0, window, cx);
+                            }
+                            "escape" => this.cancel_cell_edit(window, cx),
+                            _ => {}
+                        }
+                    }))
+                    .child(Self::render_cell_editor(editor, editor_kind))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
                 let cell_val = row.get(cell_idx).cloned().unwrap_or(CellValue::Null);
@@ -3177,32 +4504,85 @@ impl ResultView {
                     Some(value) => render_cell_value(value),
                     None => (NULL_MARKER.to_string(), Color::Muted),
                 };
-                Label::new(display)
+                let label = Label::new(display)
                     .size(LabelSize::Small)
                     .color(color)
-                    .into_any_element()
+                    .into_any_element();
+                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx))
             };
+            let cell_display_idx = display_idx;
             cells.push(
                 div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "added-cell-{added_idx}-{cell_idx}"
+                    ))))
+                    .debug_selector(move || format!("ADDED_CELL-{added_idx}-{cell_idx}"))
                     .px_2()
-                    .py_1()
+                    .h(px(Self::GRID_ROW_H))
                     .w(width)
                     .flex_none()
+                    .flex()
+                    .items_center()
                     .border_r_1()
                     .border_color(grid_border)
                     .overflow_hidden()
                     .when(is_selected, |this| this.bg(selection_bg))
+                    .when(!is_selected, |this| {
+                        this.hover(move |style| style.bg(cell_hover_bg))
+                    })
                     .child(cell_body)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_cell_drag(abs_idx, cell_idx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            cx.stop_propagation();
+                            this.update_cell_drag(abs_idx, cell_display_idx, cell_idx, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.end_cell_drag();
+                        }),
+                    )
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            let gpui::ClickEvent::Mouse(mouse) = event else {
+                                return;
+                            };
+                            cx.stop_propagation();
+                            this.click_added_cell(
+                                abs_idx,
+                                cell_display_idx,
+                                cell_idx,
+                                added_idx,
+                                event.click_count(),
+                                mouse.down.modifiers.shift,
+                                mouse.down.modifiers.control,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     .into_any_element(),
             );
             last_visible_end = end;
         }
         let right_spacer = (x - last_visible_end).max(0.0);
 
-        let mut row_el = div()
-            .id(ElementId::from(SharedString::from(format!("added-row-{added_idx}"))))
+        let row_el = div()
+            .id(ElementId::from(SharedString::from(format!(
+                "added-row-{added_idx}"
+            ))))
             .flex()
             .flex_row()
+            .h(px(Self::GRID_ROW_H))
             .border_b_1()
             .border_color(grid_border)
             .when(display_idx % 2 == 1, |this| this.bg(zebra_bg))
@@ -3210,36 +4590,28 @@ impl ResultView {
             .child(div().w(px(left_spacer)).flex_none())
             .children(cells)
             .child(div().w(px(right_spacer)).flex_none())
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                let gpui::ClickEvent::Mouse(mouse) = event else {
-                    return;
-                };
-                let Some(cell_idx) = this.column_at_x(f32::from(mouse.up.position.x)) else {
-                    return;
-                };
-                this.selected_cell = Some((abs_idx, cell_idx));
-                if let Some(disp) = this.display_idx_of(abs_idx) {
-                    this.record_view_row = Some(disp);
-                }
-                if event.click_count() >= 2 && !matches!(this.column_kind_at(cell_idx), CellEditorKind::Boolean) {
-                    this.begin_added_cell_edit(abs_idx, cell_idx, added_idx, window, cx);
-                } else if matches!(this.column_kind_at(cell_idx), CellEditorKind::Boolean) {
-                    this.toggle_boolean_cell_added(cell_idx, added_idx, cx);
-                } else if let Some(CellValue::Text(value)) = this
-                    .added_rows
-                    .get(added_idx)
-                    .and_then(|row| row.get(cell_idx))
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
-                }
-                cx.notify();
-            }));
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    let gpui::ClickEvent::Mouse(mouse) = event else {
+                        return;
+                    };
+                    let Some(cell_idx) = this.column_at_x(f32::from(mouse.up.position.x)) else {
+                        return;
+                    };
+                    this.click_added_cell(
+                        abs_idx,
+                        display_idx,
+                        cell_idx,
+                        added_idx,
+                        event.click_count(),
+                        mouse.down.modifiers.shift,
+                        mouse.down.modifiers.control,
+                        window,
+                        cx,
+                    );
+                }),
+            );
 
-        if has_table_context {
-            // Match the loaded-row layout so columns line up; the action gutter is
-            // intentionally empty for an unsaved row.
-            row_el = row_el.child(div().w(px(64.)).flex_none());
-        }
         row_el.into_any_element()
     }
 
@@ -3248,7 +4620,7 @@ impl ResultView {
             return div().into_any_element();
         };
         let sort_columns = self.sort_columns.clone();
-        let has_table_context = self.table_name.is_some() && self.workspace.is_some();
+        let has_table_context = self.row_ops_enabled();
         let total_rows = result.rows.len();
         // Column names for the header (small; the Table sizes/positions columns).
         let columns = result.columns.clone();
@@ -3266,14 +4638,28 @@ impl ResultView {
         let is_loading = self.is_loading;
         let fetch_target = self.fetch_target;
         let pending_count = self.pending_change_count();
+        let transaction_mode = self.transaction_mode;
+        let staged_count = self.staged_statements.len();
         let row_ops_enabled = self.row_ops_enabled();
         let has_selected_cell = self.selected_cell.is_some();
-        let selected_col_nullable = self.selected_cell.and_then(|(_, col_idx)| {
-            self.column_infos.as_deref()?.get(col_idx).map(|c| c.is_nullable)
-        }).unwrap_or(has_selected_cell);
-        let selected_col_has_default = self.selected_cell.and_then(|(_, col_idx)| {
-            self.column_infos.as_deref()?.get(col_idx).map(|c| c.default_value.is_some())
-        }).unwrap_or(has_selected_cell);
+        let selected_col_nullable = self
+            .selected_cell
+            .and_then(|(_, col_idx)| {
+                self.column_infos
+                    .as_deref()?
+                    .get(col_idx)
+                    .map(|c| c.is_nullable)
+            })
+            .unwrap_or(has_selected_cell);
+        let selected_col_has_default = self
+            .selected_cell
+            .and_then(|(_, col_idx)| {
+                self.column_infos
+                    .as_deref()?
+                    .get(col_idx)
+                    .map(|c| c.default_value.is_some())
+            })
+            .unwrap_or(has_selected_cell);
         let result_for_export = self.result.clone();
         let table_for_export = self.table_name.clone();
         let value_editor_open = self.value_editor_open;
@@ -3281,8 +4667,10 @@ impl ResultView {
         let quick_doc_open = self.quick_doc_open;
         let history_open = self.history_open;
         let limit_editor = self.limit_editor.clone();
+        let copy_format = self.copy_format;
         let weak_this = cx.weak_entity();
         let weak_for_gutter = weak_this.clone();
+        let weak_for_copy_menu = weak_this.clone();
 
         div()
             .flex()
@@ -3351,7 +4739,7 @@ impl ResultView {
                     .when_some(limit_editor, |el, editor| {
                         let weak_for_limit = weak_this.clone();
                         let limit_text_len = Self::limit_display_text(self.fetch_target).len();
-                        let limit_input_w = px(9.0 * limit_text_len as f32 + 18.0).max(px(52.));
+                        let limit_input_w = px(8.0 * limit_text_len as f32 + 18.0).max(px(34.));
                         el.child(
                             div()
                                 .flex()
@@ -3436,35 +4824,42 @@ impl ResultView {
                                 ),
                         )
                     })
-                    .when(row_ops_enabled, |el| {
-                        el.child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
-                        .child(
-                            Button::new("add-row", "Add Row")
+                    .child(
+                        PopoverMenu::new("copy-format-dropdown")
+                            .menu(move |window, cx| {
+                                let weak_for_copy = weak_for_copy_menu.clone();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
+                                    COPY_FORMAT_CHOICES.iter().fold(
+                                        menu.header("Ctrl+C format"),
+                                        |menu, (format, label)| {
+                                            let weak = weak_for_copy.clone();
+                                            let format = *format;
+                                            let is_active = copy_format == format;
+                                            menu.entry(SharedString::from(*label), None, move |_, cx| {
+                                                weak.update(cx, |this, cx| {
+                                                    this.copy_format = format;
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            })
+                                            .when(is_active, |menu| menu)
+                                        },
+                                    )
+                                }))
+                            })
+                            .anchor(Anchor::TopRight)
+                            .attach(Anchor::BottomRight)
+                            .trigger_with_tooltip(
+                                Button::new(
+                                    "copy-format-menu-btn",
+                                    format!("Copy: {}", copy_format.label()),
+                                )
+                                .width(px(148.0))
                                 .style(ButtonStyle::Subtle)
-                                .tooltip(Tooltip::text("Append a new row (INSERT on Submit)"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_blank_row(cx);
-                                })),
-                        )
-                        .when(has_selected_cell, |el| {
-                            el.child(
-                                Button::new("delete-row", "Delete Row")
-                                    .style(ButtonStyle::Subtle)
-                                    .tooltip(Tooltip::text("Mark the selected row for deletion (DELETE on Submit)"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_delete_selected_row(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("clone-row", "Clone Row")
-                                    .style(ButtonStyle::Subtle)
-                                    .tooltip(Tooltip::text("Duplicate the selected row (INSERT on Submit)"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.clone_selected_row(cx);
-                                    })),
-                            )
-                        })
-                    })
+                                .label_size(LabelSize::Small),
+                                Tooltip::text("Format used by Ctrl+C"),
+                            ),
+                    )
                     .when(has_selected_cell, |el| {
                         el.child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
                         .when(selected_col_nullable, |el| {
@@ -3499,11 +4894,53 @@ impl ResultView {
                                 })),
                         )
                         .child(
+                            Button::new("preview-pending", "Preview")
+                                .style(ButtonStyle::Subtle)
+                                .tooltip(Tooltip::text("Preview the SQL these changes will run"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.preview_open = !this.preview_open;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
                             Button::new("revert-edits", "Revert")
                                 .style(ButtonStyle::Subtle)
                                 .tooltip(Tooltip::text("Discard pending changes"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.revert_pending_edits(cx);
+                                })),
+                        )
+                    })
+                    .child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                    .child(
+                        Button::new("transaction-mode", transaction_mode.label())
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .toggle_state(transaction_mode == TransactionMode::Manual)
+                            .tooltip(Tooltip::text(
+                                "Transaction mode: Auto commits on Submit; Manual stages until Commit",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_transaction_mode(cx);
+                            })),
+                    )
+                    .when(staged_count > 0, |el| {
+                        el.child(
+                            Button::new("commit-transaction", "Commit")
+                                .style(ButtonStyle::Filled)
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text("Run the staged statements as one transaction"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.commit_transaction(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("rollback-transaction", "Roll Back")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text("Discard the staged statements"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rollback_transaction(cx);
                                 })),
                         )
                     })
@@ -3537,6 +4974,10 @@ impl ResultView {
                                         .action_checked("Column Info", Box::new(QuickDoc), quick_doc_open)
                                         .separator()
                                         .action_checked("Query History", Box::new(OpenQueryHistory), history_open)
+                                        .separator()
+                                        .action("Go to Row", Box::new(GoToRow))
+                                        .action("Copy Aggregation", Box::new(CopyAggregation))
+                                        .action("Preview Pending Changes", Box::new(PreviewPendingChanges))
                                 }))
                             })
                             .anchor(Anchor::TopRight)
@@ -3633,6 +5074,9 @@ impl ResultView {
                                                         .unwrap_or_default();
                                                     let rows = Self::parse_clipboard_rows(&text, col_count, &column_names);
                                                     if rows.is_empty() { return; }
+                                                    this.added_row_anchors.extend(
+                                                        std::iter::repeat_n(AddedRowAnchor::End, rows.len()),
+                                                    );
                                                     this.added_rows.extend(rows);
                                                     cx.notify();
                                                 }).log_err();
@@ -3694,16 +5138,36 @@ impl ResultView {
             )
             .child({
                 // Use filtered_display_order so per-column filters narrow the list.
-                let loaded_display_count = self.filtered_display_order.len();
-                let row_count = loaded_display_count + self.added_rows.len();
+                let display_rows = self.display_row_entries();
+                let row_count = display_rows.len();
+                let loaded_count = self.loaded_row_count();
                 let total_width = self.total_width;
-                let grid_border = cx.theme().colors().border_variant;
-                let header_bg = cx.theme().colors().editor_subheader_background;
-                let zebra_bg = cx.theme().colors().elevated_surface_background;
+                let grid_border = cx.theme().colors().border.opacity(0.46);
+                let strong_grid_border = cx.theme().colors().border.opacity(0.82);
+                let header_bg = cx
+                    .theme()
+                    .colors()
+                    .editor_subheader_background
+                    .blend(cx.theme().colors().text.opacity(0.035));
+                let header_hover_bg = header_bg.blend(cx.theme().colors().element_hover);
+                let sorted_header_bg = header_bg.blend(cx.theme().colors().element_selected);
+                let gutter_bg = cx
+                    .theme()
+                    .colors()
+                    .editor_gutter_background
+                    .blend(cx.theme().colors().text.opacity(0.018));
+                let gutter_header_bg = gutter_bg.blend(cx.theme().colors().text.opacity(0.035));
+                let gutter_hover_bg = cx.theme().colors().element_hover.opacity(0.78);
+                let zebra_bg = cx.theme().colors().text.opacity(0.025);
+                let cell_hover_bg = cx.theme().colors().element_hover.opacity(0.62);
                 // Theme-aware fills for buffered changes. Read once here so render
                 // does not touch the theme per cell or per row.
                 let modified_bg = cx.theme().status().modified_background;
-                let deleted_bg = cx.theme().status().deleted_background;
+                let deleted_bg = cx
+                    .theme()
+                    .status()
+                    .deleted_background
+                    .blend(cx.theme().status().deleted.opacity(0.16));
                 let added_bg = cx.theme().status().created_background;
                 // A clearly visible thumb (hover shade) on a distinct track, so the
                 // scrollbars read as solid controls rather than faint overlays.
@@ -3712,6 +5176,8 @@ impl ResultView {
                 let track_border = cx.theme().colors().scrollbar_track_border;
                 let filter_dot_color = cx.theme().colors().text_accent;
                 let local_filters = self.local_filters.clone();
+                let display_rows_for_body = display_rows.clone();
+                let display_rows_for_gutter = display_rows.clone();
 
                 // Horizontal viewport window, shared by header and rows, so only
                 // on-screen columns are built per frame.
@@ -3775,18 +5241,29 @@ impl ResultView {
                         }
                         None => String::new(),
                     };
+                    let is_sorted = sort_pos.is_some();
+                    let header_cell_hover_bg = if is_sorted {
+                        sorted_header_bg.blend(header_hover_bg)
+                    } else {
+                        header_hover_bg
+                    };
                     header_cells.push(
                         div()
                             .id(ElementId::from(SharedString::from(format!("col-header-{col_idx}"))))
                             .px_2()
-                            .py_1()
+                            .h(px(Self::GRID_HEADER_H))
                             .w(width)
                             .flex_none()
+                            .flex()
+                            .items_center()
                             .border_r_1()
-                            .border_color(grid_border)
+                            .border_color(strong_grid_border)
+                            .bg(header_bg)
                             .overflow_hidden()
                             .cursor_pointer()
                             .font_weight(gpui::FontWeight::BOLD)
+                            .hover(move |style| style.bg(header_cell_hover_bg))
+                            .when(is_sorted, move |this| this.bg(sorted_header_bg))
                             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 let shift = if let gpui::ClickEvent::Mouse(m) = event {
                                     m.down.modifiers.shift
@@ -3829,7 +5306,12 @@ impl ResultView {
                                     .items_center()
                                     .child(
                                         Label::new(format!("{}{}", col, sort_label))
-                                            .size(LabelSize::Small),
+                                            .size(LabelSize::Small)
+                                            .color(if is_sorted {
+                                                Color::Accent
+                                            } else {
+                                                Color::Default
+                                            }),
                                     )
                                     .when(
                                         local_filters
@@ -3855,23 +5337,13 @@ impl ResultView {
                     .flex_row()
                     .flex_none()
                     .w(px(total_width))
+                    .h(px(Self::GRID_HEADER_H))
                     .border_b_1()
-                    .border_color(grid_border)
+                    .border_color(strong_grid_border)
                     .bg(header_bg)
                     .child(div().w(px(header_left)).flex_none())
                     .children(header_cells)
-                    .child(div().w(px(header_right)).flex_none())
-                    .when(has_table_context, |el| {
-                        el.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .w(px(64.))
-                                .flex_none()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child(Label::new("Actions").size(LabelSize::Small).color(Color::Muted)),
-                        )
-                    });
+                    .child(div().w(px(header_right)).flex_none());
 
                 // Virtualized body: bounded, overflow-hidden box so uniform_list
                 // builds only the visible rows.
@@ -3885,14 +5357,8 @@ impl ResultView {
                                 .fetch_add(range.len(), std::sync::atomic::Ordering::Relaxed);
                             range
                                 .map(|display_idx| {
-                                    // Loaded rows come first (in sort order), added
-                                    // rows render after them.
-                                    if display_idx < loaded_display_count {
-                                        let abs_idx = this
-                                            .filtered_display_order
-                                            .get(display_idx)
-                                            .copied()
-                                            .unwrap_or(display_idx);
+                                    match display_rows_for_body.get(display_idx).copied() {
+                                        Some(ResultDisplayRow::Loaded(abs_idx)) => {
                                         this.render_grid_row(
                                             abs_idx,
                                             display_idx,
@@ -3900,20 +5366,24 @@ impl ResultView {
                                             zebra_bg,
                                             modified_bg,
                                             deleted_bg,
+                                            cell_hover_bg,
                                             has_table_context,
                                             cx,
                                         )
-                                    } else {
-                                        let added_idx = display_idx - loaded_display_count;
+                                        }
+                                        Some(ResultDisplayRow::Added(added_idx)) => {
                                         this.render_added_row(
                                             added_idx,
                                             display_idx,
                                             grid_border,
                                             zebra_bg,
                                             added_bg,
+                                            cell_hover_bg,
                                             has_table_context,
                                             cx,
                                         )
+                                        }
+                                        None => div().into_any_element(),
                                     }
                                 })
                                 .collect()
@@ -3936,9 +5406,10 @@ impl ResultView {
                 let mut h_scroll_div = div()
                     .id("result-grid")
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .h_full()
-                    .overflow_x_scroll()
+                    .overflow_x_hidden()
                     .track_scroll(&self.h_scroll)
                     .child(table);
                 h_scroll_div.style().restrict_scroll_to_axis = Some(true);
@@ -3950,6 +5421,7 @@ impl ResultView {
                 // tracking happens on the drag overlay below.
                 let vertical_gutter = div()
                     .id("result-vscroll")
+                    .debug_selector(|| "VSCROLL".to_string())
                     .flex_none()
                     .w(px(SCROLLBAR_SIZE))
                     .h_full()
@@ -3960,6 +5432,7 @@ impl ResultView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             this.begin_scroll_drag(true, f32::from(event.position.y));
                             cx.notify();
                         }),
@@ -3967,6 +5440,7 @@ impl ResultView {
                     .child(scroll_thumb(&self.scroll_handle, true, thumb_color));
                 let horizontal_gutter = div()
                     .id("result-hscroll")
+                    .debug_selector(|| "HSCROLL".to_string())
                     .flex_1()
                     .h(px(SCROLLBAR_SIZE))
                     .bg(track_color)
@@ -3976,6 +5450,7 @@ impl ResultView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             this.begin_scroll_drag(false, f32::from(event.position.x));
                             cx.notify();
                         }),
@@ -3990,6 +5465,12 @@ impl ResultView {
                         .absolute()
                         .inset_0()
                         .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            cx.stop_propagation();
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                this.end_scroll_drag();
+                                cx.notify();
+                                return;
+                            }
                             let pos = if drag.vertical {
                                 f32::from(event.position.y)
                             } else {
@@ -4001,6 +5482,7 @@ impl ResultView {
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                cx.stop_propagation();
                                 this.end_scroll_drag();
                                 cx.notify();
                             }),
@@ -4012,15 +5494,18 @@ impl ResultView {
                 let gutter_header = div()
                     .flex_none()
                     .w(px(ROW_GUTTER_WIDTH))
-                    .py_1()
+                    .h(px(Self::GRID_HEADER_H))
                     .border_b_1()
-                    .border_color(grid_border)
-                    .bg(header_bg)
+                    .border_color(strong_grid_border)
+                    .bg(gutter_header_bg)
                     .flex()
-                    .justify_end()
-                    .pr_1()
+                    .justify_center()
                     .items_center()
-                    .child(Label::new("#").size(LabelSize::Small).color(Color::Muted));
+                    .child(
+                        Label::new("Row")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    );
                 let show_filter_spacer = self.local_filter_visible && self.result.is_some();
                 let gutter_filter_spacer = show_filter_spacer.then(|| {
                     div()
@@ -4028,77 +5513,103 @@ impl ResultView {
                         .w(px(ROW_GUTTER_WIDTH))
                         .h(px(22.))
                         .border_b_1()
-                        .border_color(grid_border)
-                        .bg(cx.theme().colors().editor_background)
+                        .border_color(strong_grid_border)
+                        .bg(gutter_bg)
                         .into_any_element()
                 });
                 let gb = grid_border;
+                let gutter_row_bg = gutter_bg;
+                let gutter_row_hover_bg = gutter_hover_bg;
+                let gutter_selected_bg = cx.theme().colors().element_selected;
+                let gutter_deleted_bg = deleted_bg;
+                let gutter_selected_bar = cx.theme().colors().text_accent;
+                let gutter_unselected_bar = cx.theme().colors().border_transparent;
                 let gutter_row_ops = row_ops_enabled;
                 let gutter_body = uniform_list(
                     "result-gutter",
                     row_count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                        let row_sel_bg = cx.theme().colors().editor_highlighted_line_background;
                         range.map(|display_idx| {
-                            let abs_idx = if display_idx < loaded_display_count {
-                                this.filtered_display_order
-                                    .get(display_idx)
-                                    .copied()
-                                    .unwrap_or(display_idx)
-                            } else {
-                                let added_idx = display_idx - loaded_display_count;
-                                this.result.as_ref().map_or(0, |r| r.rows.len()) + added_idx
+                            let Some(display_row) = display_rows_for_gutter.get(display_idx).copied() else {
+                                return div().into_any_element();
                             };
+                            let abs_idx = display_row.abs_idx(loaded_count);
                             let is_selected = this.selected_rows.contains(&abs_idx);
-                            let row_num: SharedString = if display_idx < loaded_display_count {
-                                (display_idx + 1).to_string().into()
-                            } else {
-                                format!("+{}", display_idx - loaded_display_count + 1).into()
+                            let is_deleted = this.deleted_rows.contains(&abs_idx);
+                            let row_num: SharedString = match display_row {
+                                ResultDisplayRow::Loaded(loaded_abs_idx) => this
+                                    .filtered_display_order
+                                    .iter()
+                                    .position(|&row| row == loaded_abs_idx)
+                                    .map_or(display_idx + 1, |idx| idx + 1)
+                                    .to_string()
+                                    .into(),
+                                ResultDisplayRow::Added(added_idx) => {
+                                    format!("+{}", added_idx + 1).into()
+                                }
                             };
                             let gutter_row = div()
                                 .id(ElementId::from(SharedString::from(format!("gtr-{display_idx}"))))
+                                .debug_selector(move || format!("GUTTER-{display_idx}"))
                                 .flex_none()
                                 .w(px(ROW_GUTTER_WIDTH))
-                                .py_1()
+                                .h(px(Self::GRID_ROW_H))
                                 .border_b_1()
                                 .border_color(gb)
                                 .flex()
-                                .justify_end()
-                                .pr_1()
                                 .items_center()
-                                .when(is_selected, |el| el.bg(row_sel_bg))
+                                .bg(gutter_row_bg)
+                                .cursor_pointer()
+                                .when(!is_deleted, move |el| {
+                                    el.hover(move |style| style.bg(gutter_row_hover_bg))
+                                })
+                                .when(is_selected, move |el| el.bg(gutter_selected_bg))
+                                .when(is_deleted, move |el| el.bg(gutter_deleted_bg))
                                 .child(
-                                    Label::new(row_num)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    div()
+                                        .w(px(3.))
+                                        .h_full()
+                                        .flex_none()
+                                        .bg(if is_selected {
+                                            gutter_selected_bar
+                                        } else {
+                                            gutter_unselected_bar
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .pr_1()
+                                        .flex()
+                                        .justify_end()
+                                        .child(
+                                            Label::new(row_num)
+                                                .size(LabelSize::Small)
+                                                .color(if is_selected {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                        ),
                                 )
                                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
                                     let gpui::ClickEvent::Mouse(mouse) = event else { return; };
                                     if mouse.down.modifiers.shift {
-                                        let anchor_disp = this.last_selected_row.unwrap_or(display_idx);
-                                        let lo = anchor_disp.min(display_idx);
-                                        let hi = anchor_disp.max(display_idx);
-                                        this.selected_rows.clear();
-                                        for d in lo..=hi {
-                                            if let Some(&a) = this.filtered_display_order.get(d) {
-                                                this.selected_rows.insert(a);
-                                            }
-                                        }
+                                        let anchor_display_idx = this.last_selected_row.unwrap_or(display_idx);
+                                        this.select_row_range(anchor_display_idx, display_idx);
                                         // Don't update anchor — keep extending from original pivot.
                                     } else if mouse.down.modifiers.control {
                                         if this.selected_rows.contains(&abs_idx) {
                                             this.selected_rows.remove(&abs_idx);
+                                            this.selected_cell = None;
+                                            this.selected_cell_range = None;
                                         } else {
-                                            this.selected_rows.insert(abs_idx);
+                                            this.select_entire_row(abs_idx, display_idx);
                                         }
                                         this.last_selected_row = Some(display_idx);
                                     } else {
-                                        this.selected_rows.clear();
-                                        this.selected_rows.insert(abs_idx);
-                                        this.last_selected_row = Some(display_idx);
+                                        this.select_entire_row(abs_idx, display_idx);
                                     }
-                                    this.selected_cell = None;
-                                    this.selected_cell_range = None;
                                     cx.notify();
                                 }));
                             if gutter_row_ops {
@@ -4111,21 +5622,34 @@ impl ResultView {
                                         let wt_clone = wt.clone();
                                         ContextMenu::build(window, cx, move |menu, _, _| {
                                             menu
-                                                .entry("Add Row", None, move |_, cx| {
-                                                    wt_add.update(cx, |this, cx| this.add_blank_row(cx)).ok();
+                                                .entry("Add Row", None, move |window, cx| {
+                                                    wt_add
+                                                        .update(cx, |this, cx| {
+                                                            this.select_row_for_context_action(abs_idx, 0);
+                                                            if let Some(added_idx) =
+                                                                this.add_blank_row_after(Some(abs_idx), cx)
+                                                            {
+                                                                this.begin_added_row_edit(added_idx, window, cx);
+                                                            }
+                                                        })
+                                                        .ok();
                                                 })
-                                                .entry("Clone Row", None, move |_, cx| {
+                                                .entry("Clone Row", None, move |window, cx| {
                                                     wt_clone
                                                         .update(cx, |this, cx| {
-                                                            this.selected_cell = Some((abs_idx, 0));
-                                                            this.clone_selected_row(cx);
+                                                            this.select_row_for_context_action(abs_idx, 0);
+                                                            if let Some(added_idx) =
+                                                                this.clone_row_after(abs_idx, abs_idx, cx)
+                                                            {
+                                                                this.begin_added_row_edit(added_idx, window, cx);
+                                                            }
                                                         })
                                                         .ok();
                                                 })
                                                 .entry("Delete Row", None, move |_, cx| {
                                                     wt_del
                                                         .update(cx, |this, cx| {
-                                                            this.selected_cell = Some((abs_idx, 0));
+                                                            this.select_row_for_context_action(abs_idx, 0);
                                                             this.toggle_delete_selected_row(cx);
                                                         })
                                                         .ok();
@@ -4150,8 +5674,8 @@ impl ResultView {
                     .flex()
                     .flex_col()
                     .border_r_1()
-                    .border_color(grid_border)
-                    .bg(cx.theme().colors().editor_gutter_background)
+                    .border_color(strong_grid_border)
+                    .bg(gutter_bg)
                     .child(gutter_header)
                     .when_some(gutter_filter_spacer, |el, spacer| el.child(spacer))
                     .child(
@@ -4172,9 +5696,11 @@ impl ResultView {
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                         if event.keystroke.key.as_str() == "escape"
                             && !event.keystroke.modifiers.modified()
-                            && !this.selected_rows.is_empty()
+                            && (!this.selected_rows.is_empty()
+                                || this.selected_cell_range.is_some())
                         {
                             this.selected_rows.clear();
+                            this.selected_cell_range = None;
                             this.last_selected_row = None;
                             cx.notify();
                         }
@@ -4189,6 +5715,7 @@ impl ResultView {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
                                     .min_h_0()
                                     .flex()
                                     .flex_col()
@@ -4197,6 +5724,7 @@ impl ResultView {
                                             .flex()
                                             .flex_row()
                                             .flex_1()
+                                            .min_w_0()
                                             .min_h_0()
                                             .child(h_scroll_div)
                                             .child(vertical_gutter),
@@ -4218,6 +5746,10 @@ impl ResultView {
                             ),
                     )
                     .children(drag_overlay)
+                    .when_some(self.render_value_editor_popup(cx), |el, popup| el.child(popup))
+                    .when_some(self.render_value_editor_resize_overlay(cx), |el, overlay| {
+                        el.child(overlay)
+                    })
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_column_list_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_query_history_popup(cx), |el, popup| el.child(popup))
@@ -4247,11 +5779,83 @@ impl ResultView {
             .or_else(|| Some(NULL_MARKER.to_string()))
     }
 
-    fn render_value_editor_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    fn sync_value_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.value_editor_open {
+            return;
+        }
+        let value = self.selected_cell_full_value().unwrap_or_default();
+        let editor = match self.value_editor.clone() {
+            Some(editor) => editor,
+            None => {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::multi_line(window, cx);
+                    editor.set_show_gutter(false, cx);
+                    editor.disable_expand_excerpt_buttons(cx);
+                    editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::None, cx);
+                    editor.set_show_indent_guides(false, cx);
+                    editor.disable_mouse_wheel_zoom();
+                    editor.set_read_only(true);
+                    editor
+                });
+                self.value_editor = Some(editor.clone());
+                editor
+            }
+        };
+        if editor.read(cx).text(cx) != value {
+            editor.update(cx, |editor, cx| {
+                editor.set_read_only(false);
+                editor.set_text(value, window, cx);
+                editor.set_read_only(true);
+            });
+        }
+    }
+
+    fn render_value_editor_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.value_editor_open {
             return None;
         }
         let value = self.selected_cell_full_value().unwrap_or_default();
+        let editor = self.value_editor.clone()?;
+        let (abs_idx, col_idx) = self.selected_cell?;
+        let display_idx = self.display_idx_of(abs_idx)?;
+        let display_pos = self
+            .visible_columns
+            .iter()
+            .position(|&col| col == col_idx)?;
+        let col_left = display_pos
+            .checked_sub(1)
+            .and_then(|pos| self.column_edges.get(pos).copied())
+            .unwrap_or(0.0);
+        let col_width = self
+            .col_widths
+            .get(display_pos)
+            .copied()
+            .map(f32::from)
+            .unwrap_or(160.0);
+        let (_, _, _, scroll_y) = axis_metrics(&self.scroll_handle, true);
+        let filter_offset = if self.local_filter_visible { 22.0 } else { 0.0 };
+        let cell_top =
+            Self::GRID_HEADER_H + filter_offset + display_idx as f32 * Self::GRID_ROW_H + scroll_y;
+        let grid_width = f32::from(self.h_scroll.bounds().size.width).max(560.0);
+        let grid_height = f32::from(self.scroll_handle.viewport().size.height).max(360.0);
+        let (auto_width, auto_height) =
+            Self::value_editor_auto_size(&value, grid_width, grid_height);
+        let (popup_width, popup_height) = self
+            .value_editor_size
+            .unwrap_or((auto_width.max(col_width), auto_height));
+        let popup_width = popup_width.clamp(360.0, (grid_width - 16.0).max(360.0));
+        let popup_height = popup_height.clamp(220.0, (grid_height - 16.0).max(220.0));
+        let screen_x = col_left + f32::from(self.h_scroll.offset().x);
+        let left = screen_x
+            .max(4.0)
+            .min((grid_width - popup_width - 8.0).max(4.0));
+        let top = if cell_top > popup_height + 8.0 {
+            cell_top - popup_height - 4.0
+        } else {
+            cell_top + Self::GRID_ROW_H + 4.0
+        }
+        .max(4.0);
         let col_name = self
             .selected_cell
             .and_then(|(_, col_idx)| {
@@ -4262,63 +5866,138 @@ impl ResultView {
             })
             .unwrap_or_default();
 
-        let panel = v_flex()
-            .h(gpui::px(160.0))
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().surface_background)
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(
-                        Label::new(if col_name.is_empty() {
-                            "Value".to_string()
-                        } else {
-                            col_name
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("value-editor-copy", IconName::Copy)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Copy full value"))
-                            .on_click({
-                                let value = value.clone();
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
-                                })
-                            }),
-                    )
-                    .child(
-                        IconButton::new("value-editor-close", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Close value panel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.value_editor_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("value-editor-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_2()
-                    .child(
-                        Label::new(value)
+        Some(
+            v_flex()
+                .id("value-editor-popup")
+                .debug_selector(|| "VALUE_EDITOR_POPUP".to_string())
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(popup_width))
+                .h(px(popup_height))
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().surface_background)
+                .shadow_md()
+                .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(
+                            Label::new(if col_name.is_empty() {
+                                "Value".to_string()
+                            } else {
+                                col_name
+                            })
                             .size(LabelSize::Small)
-                            .line_height_style(ui::LineHeightStyle::UiLabel),
-                    ),
-            );
+                            .color(Color::Muted),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            IconButton::new("value-editor-copy", IconName::Copy)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Copy full value"))
+                                .on_click({
+                                    let value = value.clone();
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            value.clone(),
+                                        ));
+                                    })
+                                }),
+                        )
+                        .child(
+                            IconButton::new("value-editor-close", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Close value panel"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.value_editor_open = false;
+                                    this.value_editor_resize_drag = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("value-editor-scroll")
+                        .debug_selector(|| "VALUE_EDITOR_SCROLL".to_string())
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_x_scroll()
+                        .overflow_y_scroll()
+                        .p_2()
+                        .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(editor),
+                )
+                .child(
+                    div()
+                        .id("value-editor-resize")
+                        .debug_selector(|| "VALUE_EDITOR_RESIZE".to_string())
+                        .absolute()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .cursor_nwse_resize()
+                        .border_r_2()
+                        .border_b_2()
+                        .border_color(cx.theme().colors().text_muted)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.begin_value_editor_resize(
+                                    f32::from(event.position.x),
+                                    f32::from(event.position.y),
+                                    popup_width,
+                                    popup_height,
+                                );
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
 
-        Some(panel)
+    fn render_value_editor_resize_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.value_editor_resize_drag?;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .cursor_nwse_resize()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    cx.stop_propagation();
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.end_value_editor_resize();
+                        cx.notify();
+                        return;
+                    }
+                    this.update_value_editor_resize(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    );
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.end_value_editor_resize();
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     // ---------- record view panel ---------------------------------------------
@@ -4359,20 +6038,13 @@ impl ResultView {
                     .border_color(cx.theme().colors().border_variant)
                     .gap_2()
                     .child(
-                        div()
-                            .w(gpui::px(160.0))
-                            .flex_none()
-                            .child(
-                                Label::new(col_name.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
+                        div().w(gpui::px(160.0)).flex_none().child(
+                            Label::new(col_name.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                     )
-                    .child(
-                        Label::new(text)
-                            .size(LabelSize::Small)
-                            .color(color),
-                    )
+                    .child(Label::new(text).size(LabelSize::Small).color(color))
                     .into_any_element()
             })
             .collect();
@@ -4493,10 +6165,11 @@ impl ResultView {
                     .border_color(cx.theme().colors().border_variant)
                     .gap_2()
                     .child(
-                        div()
-                            .w(gpui::px(80.0))
-                            .flex_none()
-                            .child(Label::new("Extra").size(LabelSize::Small).color(Color::Muted)),
+                        div().w(gpui::px(80.0)).flex_none().child(
+                            Label::new("Extra")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                     )
                     .child(Label::new(info.extra.clone()).size(LabelSize::Small))
                     .into_any_element(),
@@ -4538,7 +6211,10 @@ impl ResultView {
     // Resolves the display-order index of an absolute row index. Used to keep
     // the record view in sync when the user clicks a cell.
     fn display_idx_of(&self, abs_idx: usize) -> Option<usize> {
-        self.filtered_display_order.iter().position(|&a| a == abs_idx)
+        let loaded_count = self.loaded_row_count();
+        self.display_row_entries()
+            .into_iter()
+            .position(|row| row.abs_idx(loaded_count) == abs_idx)
     }
 
     fn navigate_to_fk_row(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -4565,7 +6241,10 @@ impl ResultView {
             return;
         };
         let escaped = value.replace('\'', "''");
-        let sql = format!("SELECT * FROM `{}` WHERE `{}` = '{}'", fk.to_table, fk.to_column, escaped);
+        let sql = format!(
+            "SELECT * FROM `{}` WHERE `{}` = '{}'",
+            fk.to_table, fk.to_column, escaped
+        );
         self.run_sql(store, conn_id, db, sql, cx);
     }
 
@@ -4604,6 +6283,9 @@ impl ResultView {
         self.find_query = None;
         self.find_matches.clear();
         self.find_current = 0;
+        if self.find_filter_rows {
+            self.recompute_local_filter_inner();
+        }
         cx.notify();
     }
 
@@ -4627,28 +6309,34 @@ impl ResultView {
         self.find_current = 0;
 
         if query.is_empty() {
+            if self.find_filter_rows {
+                self.recompute_local_filter_inner();
+            }
             cx.notify();
             return;
         }
 
-        let Some(result) = &self.result else {
-            cx.notify();
-            return;
-        };
-
-        for &abs_idx in &self.order {
-            if let Some(row) = result.rows.get(abs_idx) {
-                for (col_idx, cell) in row.iter().enumerate() {
-                    let text = cell
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if text.contains(&query) {
-                        self.find_matches.push((abs_idx, col_idx));
+        if let Some(result) = &self.result {
+            for &abs_idx in &self.order {
+                if let Some(row) = result.rows.get(abs_idx) {
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        let text = cell.as_deref().unwrap_or("").to_lowercase();
+                        if text.contains(&query) {
+                            self.find_matches.push((abs_idx, col_idx));
+                        }
                     }
                 }
             }
         }
+        if self.find_filter_rows {
+            self.recompute_local_filter_inner();
+        }
+        cx.notify();
+    }
+
+    fn toggle_find_filter_rows(&mut self, cx: &mut Context<Self>) {
+        self.find_filter_rows = !self.find_filter_rows;
+        self.recompute_local_filter_inner();
         cx.notify();
     }
 
@@ -4717,16 +6405,23 @@ impl ResultView {
                         this.find_next(cx);
                     })),
             )
-            .child(
-                div()
-                    .w(gpui::px(200.0))
-                    .child(editor),
-            )
+            .child(div().w(gpui::px(200.0)).child(editor))
             .child(
                 Label::new(current_label)
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .child(
+                Button::new("find-filter-rows", "Filter rows")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .toggle_state(self.find_filter_rows)
+                    .tooltip(Tooltip::text("Hide rows without a match"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.toggle_find_filter_rows(cx);
+                    })),
+            )
+            .child(div().flex_1())
             .child(
                 IconButton::new("find-close", IconName::Close)
                     .icon_size(IconSize::Small)
@@ -4737,6 +6432,148 @@ impl ResultView {
             );
 
         Some(bar)
+    }
+
+    // Renders the go-to-row input bar shown above the find bar. Enter jumps to
+    // the entered row; Escape closes it.
+    fn render_goto_row_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if !self.goto_row_visible {
+            return None;
+        }
+        let editor = self.goto_row_editor.as_ref()?.clone();
+        let total = self.filtered_display_order.len();
+        let bar = h_flex()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().surface_background)
+            .child(
+                Label::new("Go to row")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .w(gpui::px(120.0))
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "enter" if !event.keystroke.modifiers.modified() => {
+                                this.confirm_goto_row(cx);
+                            }
+                            "escape" if !event.keystroke.modifiers.modified() => {
+                                this.close_goto_row(cx);
+                            }
+                            _ => {}
+                        }
+                    }))
+                    .child(editor),
+            )
+            .child(
+                Label::new(format!("of {total}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("goto-row-close", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Close (Escape)"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.close_goto_row(cx);
+                    })),
+            );
+        Some(bar)
+    }
+
+    // Renders the pending-changes preview: the SQL that Submit (or Commit) would
+    // run, shown read-only so the user can review before writing.
+    fn render_pending_preview_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.preview_open {
+            return None;
+        }
+        let body = match self.build_pending_statements(cx) {
+            Ok(statements) if statements.is_empty() => "No pending changes.".to_string(),
+            Ok(statements) => statements
+                .iter()
+                .map(|statement| format!("{statement};"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Err(note) => note,
+        };
+        let lines: Vec<AnyElement> = body
+            .lines()
+            .map(|line| {
+                Label::new(line.to_string())
+                    .size(LabelSize::Small)
+                    .buffer_font(cx)
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            div()
+                .id("pending-preview-popup")
+                .absolute()
+                .top_8()
+                .right_2()
+                .w(px(520.0))
+                .max_h(px(400.0))
+                .bg(cx.theme().colors().elevated_surface_background)
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .rounded_md()
+                .shadow_md()
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("Pending changes")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("preview-submit", "Submit")
+                                        .style(ButtonStyle::Filled)
+                                        .label_size(LabelSize::Small)
+                                        .tooltip(Tooltip::text(
+                                            "Write pending changes to the database",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.preview_open = false;
+                                            this.submit_pending_edits(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("preview-close", IconName::Close)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Close"))
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.preview_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("pending-preview-scroll")
+                        .p_2()
+                        .max_h(px(340.0))
+                        .overflow_y_scroll()
+                        .child(v_flex().children(lines)),
+                )
+                .into_any_element(),
+        )
     }
 
     // ---------- per-column local filters ------------------------------------
@@ -4791,14 +6628,24 @@ impl ResultView {
             return None;
         }
 
-        let grid_border = cx.theme().colors().border_variant;
+        let grid_border = cx.theme().colors().border.opacity(0.46);
+        let filter_bg = cx
+            .theme()
+            .colors()
+            .editor_subheader_background
+            .blend(cx.theme().colors().text.opacity(0.018));
         let mut cells: Vec<AnyElement> = Vec::new();
 
         for (display_pos, &data_col) in self.visible_columns.iter().enumerate() {
-            let width = self.col_widths.get(display_pos).copied().unwrap_or(px(120.));
+            let width = self
+                .col_widths
+                .get(display_pos)
+                .copied()
+                .unwrap_or(px(120.));
             let cell: AnyElement = if let Some(editor) = self.local_filter_editors.get(data_col) {
                 div()
                     .w(width)
+                    .h(px(22.0))
                     .flex_none()
                     .px_1()
                     .py_px()
@@ -4809,6 +6656,7 @@ impl ResultView {
             } else {
                 div()
                     .w(width)
+                    .h(px(22.0))
                     .flex_none()
                     .border_r_1()
                     .border_color(grid_border)
@@ -4823,7 +6671,7 @@ impl ResultView {
                 .overflow_x_hidden()
                 .border_b_1()
                 .border_color(grid_border)
-                .bg(cx.theme().colors().editor_background)
+                .bg(filter_bg)
                 .children(cells),
         )
     }
@@ -4857,7 +6705,9 @@ impl ResultView {
             let name = col_name.clone();
             items.push(
                 div()
-                    .id(ElementId::from(SharedString::from(format!("col-vis-{col_idx}"))))
+                    .id(ElementId::from(SharedString::from(format!(
+                        "col-vis-{col_idx}"
+                    ))))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -4870,9 +6720,17 @@ impl ResultView {
                         this.toggle_column_visibility(col_idx, cx);
                     }))
                     .child(
-                        Icon::new(if is_visible { IconName::Check } else { IconName::Dash })
-                            .size(IconSize::Small)
-                            .color(if is_visible { Color::Accent } else { Color::Muted }),
+                        Icon::new(if is_visible {
+                            IconName::Check
+                        } else {
+                            IconName::Dash
+                        })
+                        .size(IconSize::Small)
+                        .color(if is_visible {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        }),
                     )
                     .child(Label::new(name).size(LabelSize::Small))
                     .into_any_element(),
@@ -4966,21 +6824,18 @@ impl ResultView {
         }
 
         // An invisible full-area backdrop closes the popup on any outside click.
-        let backdrop = div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    // Dismiss without selecting, unless the click landed on the
-                    // popup itself (the popup has a higher z-index so it captures
-                    // its own mouse-down before this backdrop does).
-                    // Suppress unused-variable warnings:
-                    let _ = (popup_abs, popup_col, popup_added);
-                    this.enum_popup = None;
-                    cx.notify();
-                }),
-            );
+        let backdrop = div().absolute().inset_0().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                // Dismiss without selecting, unless the click landed on the
+                // popup itself (the popup has a higher z-index so it captures
+                // its own mouse-down before this backdrop does).
+                // Suppress unused-variable warnings:
+                let _ = (popup_abs, popup_col, popup_added);
+                this.enum_popup = None;
+                cx.notify();
+            }),
+        );
 
         Some(
             div()
@@ -5007,7 +6862,9 @@ impl ResultView {
 }
 
 // Width/height of the scrollbar gutters.
-const SCROLLBAR_SIZE: f32 = 14.0;
+const SCROLLBAR_SIZE: f32 = 18.0;
+const SCROLLBAR_THUMB_MIN: f32 = 36.0;
+const SCROLLBAR_THUMB_INSET: f32 = 3.0;
 
 // Maps a window coordinate on a scrollbar gutter to a scroll offset and applies
 // it (jump-to-position), used when the empty track is clicked outside the thumb.
@@ -5083,13 +6940,16 @@ fn axis_metrics(handle: &impl ui::ScrollableHandle, vertical: bool) -> (f32, f32
 // Window-coordinate range [start, end] the thumb occupies on the gutter. Mirrors
 // the sizing in `scroll_thumb`, so hit-testing matches what is drawn.
 fn thumb_range(origin: f32, viewport_len: f32, content_len: f32, offset: f32) -> (f32, f32) {
-    if content_len <= 0.0 {
+    if viewport_len <= 0.0 || content_len <= viewport_len {
         return (origin, origin + viewport_len);
     }
-    let size_frac = (viewport_len / content_len).clamp(0.05, 1.0);
-    let pos_frac = (-offset / content_len).clamp(0.0, 1.0 - size_frac);
-    let start = origin + pos_frac * viewport_len;
-    (start, start + size_frac * viewport_len)
+    let max_offset = content_len - viewport_len;
+    let thumb_len =
+        ((viewport_len * viewport_len) / content_len).clamp(SCROLLBAR_THUMB_MIN, viewport_len);
+    let travel = (viewport_len - thumb_len).max(0.0);
+    let pos_frac = (-offset / max_offset).clamp(0.0, 1.0);
+    let start = origin + pos_frac * travel;
+    (start, start + thumb_len)
 }
 
 // New scroll offset for a relative drag: the content moves in proportion to how
@@ -5107,7 +6967,10 @@ fn drag_scroll_offset(
         return None;
     }
     let delta = current_pos - grab_pos;
-    let new_offset = grab_offset - delta * (content_len / viewport_len);
+    let thumb_len =
+        ((viewport_len * viewport_len) / content_len).clamp(SCROLLBAR_THUMB_MIN, viewport_len);
+    let travel = (viewport_len - thumb_len).max(1.0);
+    let new_offset = grab_offset - delta * (max_offset / travel);
     Some(new_offset.clamp(-max_offset, 0.0))
 }
 
@@ -5134,33 +6997,38 @@ fn scroll_thumb(
             f32::from(handle.offset().x),
         )
     };
-    let size_frac = if content_len > 0.0 {
-        (viewport_len / content_len).clamp(0.05, 1.0)
+    let (start, end) = thumb_range(0.0, viewport_len, content_len, offset);
+    let size_frac = if viewport_len > 0.0 {
+        ((end - start) / viewport_len).clamp(0.0, 1.0)
     } else {
-        1.0
+        0.0
     };
-    let pos_frac = if content_len > 0.0 {
-        (-offset / content_len).clamp(0.0, 1.0 - size_frac)
+    let pos_frac = if viewport_len > 0.0 {
+        (start / viewport_len).clamp(0.0, 1.0)
     } else {
         0.0
     };
 
     let thumb = div()
-        .id(if vertical { "v-scrollbar" } else { "h-scrollbar" })
+        .id(if vertical {
+            "v-scrollbar"
+        } else {
+            "h-scrollbar"
+        })
         .absolute()
         .bg(color)
         .rounded_sm();
     if vertical {
         thumb
             .top(gpui::relative(pos_frac))
-            .left(px(2.))
-            .w(px(SCROLLBAR_SIZE - 4.0))
+            .left(px(SCROLLBAR_THUMB_INSET))
+            .w(px(SCROLLBAR_SIZE - SCROLLBAR_THUMB_INSET * 2.0))
             .h(gpui::relative(size_frac))
     } else {
         thumb
             .left(gpui::relative(pos_frac))
-            .top(px(2.))
-            .h(px(SCROLLBAR_SIZE - 4.0))
+            .top(px(SCROLLBAR_THUMB_INSET))
+            .h(px(SCROLLBAR_SIZE - SCROLLBAR_THUMB_INSET * 2.0))
             .w(gpui::relative(size_frac))
     }
 }
@@ -5246,7 +7114,11 @@ fn build_update_sql(
     let predicate: Vec<String> = key_columns
         .iter()
         .map(|(col, value)| match value {
-            Some(_) => format!("{} = {}", quote_identifier(quote, col), sql_literal(value.as_deref())),
+            Some(_) => format!(
+                "{} = {}",
+                quote_identifier(quote, col),
+                sql_literal(value.as_deref())
+            ),
             None => format!("{} IS NULL", quote_identifier(quote, col)),
         })
         .collect();
@@ -5331,15 +7203,15 @@ fn build_pending_updates(
 // Builds a `DELETE FROM table WHERE <key predicate>` statement. Pure and side
 // effect free. The caller must ensure the key predicate uniquely identifies the
 // row and that no key value was truncated.
-fn build_delete_sql(
-    quote: char,
-    table: &str,
-    key_columns: &[(String, Option<String>)],
-) -> String {
+fn build_delete_sql(quote: char, table: &str, key_columns: &[(String, Option<String>)]) -> String {
     let predicate: Vec<String> = key_columns
         .iter()
         .map(|(col, value)| match value {
-            Some(_) => format!("{} = {}", quote_identifier(quote, col), sql_literal(value.as_deref())),
+            Some(_) => format!(
+                "{} = {}",
+                quote_identifier(quote, col),
+                sql_literal(value.as_deref())
+            ),
             None => format!("{} IS NULL", quote_identifier(quote, col)),
         })
         .collect();
@@ -5383,12 +7255,7 @@ fn build_pending_deletes(
 
 // Builds an `INSERT INTO table (cols) VALUES (literals)` statement. Pure and
 // side effect free. INSERT needs no key, so any added row can be inserted.
-fn build_insert_sql(
-    quote: char,
-    table: &str,
-    columns: &[String],
-    values: &[CellValue],
-) -> String {
+fn build_insert_sql(quote: char, table: &str, columns: &[String], values: &[CellValue]) -> String {
     let column_list: Vec<String> = columns
         .iter()
         .map(|col| quote_identifier(quote, col))
@@ -5418,6 +7285,19 @@ fn combine_row_statements(
     deletes.extend(updates);
     deletes.extend(inserts);
     deletes
+}
+
+// Joins staged statements into one BEGIN/COMMIT block so Manual-mode Commit
+// applies them atomically. Each statement keeps its `-- name:` marker; a
+// trailing semicolon separates them.
+fn wrap_in_transaction(statements: &[String]) -> String {
+    let mut out = String::from("BEGIN;\n");
+    for statement in statements {
+        out.push_str(statement);
+        out.push_str(";\n");
+    }
+    out.push_str("COMMIT;");
+    out
 }
 
 impl EventEmitter<ResultViewEvent> for ResultView {}
@@ -5473,6 +7353,7 @@ impl Render for ResultView {
                 }
             }
         }
+        self.sync_value_editor(window, cx);
         let filter_bar = self.render_filter_bar(cx);
         let content = if self.is_loading {
             div()
@@ -5522,6 +7403,9 @@ impl Render for ResultView {
             }))
             .on_action(cx.listener(|this, _: &ToggleValueEditor, _window, cx| {
                 this.value_editor_open = !this.value_editor_open;
+                if !this.value_editor_open {
+                    this.value_editor_resize_drag = None;
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleFind, window, cx| {
@@ -5563,11 +7447,41 @@ impl Render for ResultView {
             .on_action(cx.listener(|this, _: &NavigateToFkRow, window, cx| {
                 this.navigate_to_fk_row(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| {
+                this.copy_selected_to_clipboard(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviewPendingChanges, _window, cx| {
+                this.preview_open = !this.preview_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTransactionMode, _window, cx| {
+                this.toggle_transaction_mode(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CommitTransaction, window, cx| {
+                this.commit_transaction(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RollbackTransaction, _window, cx| {
+                this.rollback_transaction(cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToRow, window, cx| {
+                this.toggle_goto_row(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyAggregation, _window, cx| {
+                this.copy_aggregation_to_clipboard(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFindFilterRows, _window, cx| {
+                this.toggle_find_filter_rows(cx);
+            }))
             .when_some(filter_bar, |el, bar| el.child(bar))
             .child(div().flex_1().overflow_hidden().child(content))
-            .when_some(self.render_value_editor_panel(cx), |el, panel| el.child(panel))
-            .when_some(self.render_record_view_panel(cx), |el, panel| el.child(panel))
+            .when_some(self.render_record_view_panel(cx), |el, panel| {
+                el.child(panel)
+            })
             .when_some(self.render_quick_doc_panel(cx), |el, panel| el.child(panel))
+            .when_some(self.render_pending_preview_popup(cx), |el, popup| {
+                el.child(popup)
+            })
+            .when_some(self.render_goto_row_bar(cx), |el, bar| el.child(bar))
             .when_some(self.render_find_bar(cx), |el, bar| el.child(bar))
             .when_some(self.render_status_bar(cx), |el, bar| el.child(bar))
     }
@@ -5578,13 +7492,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_cell_bounds_huge_values_and_flattens_newlines() {
+    fn display_cell_bounds_huge_values_and_preserves_formatting() {
         // Short values pass through unchanged.
         assert_eq!(display_cell("hello"), "hello");
 
-        // Newlines, carriage returns and tabs collapse to spaces so a row stays
-        // on one line.
-        assert_eq!(display_cell("a\nb\tc\rd"), "a b c d");
+        assert_eq!(display_cell("a\nb\tc\rd"), "a\nb\tc\nd");
+        assert_eq!(display_cell("a\r\nb"), "a\nb");
+        assert!(cell_value_needs_expanded_editor("a\nb"));
+        assert!(cell_value_needs_expanded_editor("a\tb"));
 
         // A value longer than the cap is truncated and gets an ellipsis. The
         // result must never exceed the cap (+1 for the ellipsis), no matter how
@@ -5593,10 +7508,55 @@ mod tests {
         let shown = display_cell(&huge);
         assert_eq!(shown.chars().count(), MAX_CELL_DISPLAY_CHARS + 1);
         assert!(shown.ends_with('…'));
+        assert!(cell_value_needs_expanded_editor(&huge));
 
         // A value exactly at the cap is not marked as truncated.
         let exact = "y".repeat(MAX_CELL_DISPLAY_CHARS);
         assert_eq!(display_cell(&exact), exact);
+        assert!(!cell_value_needs_expanded_editor(&exact));
+    }
+
+    #[test]
+    fn column_aggregates_do_not_embed_text_values() {
+        let result = QueryResult {
+            columns: vec!["Create Table".to_string()],
+            rows: vec![vec![Some(
+                "CREATE TABLE `splits` (\n  `split_id` int NOT NULL\n)".to_string(),
+            )]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+
+        assert_eq!(
+            ResultView::compute_column_aggregates(&result, 0, &[0]),
+            "COUNT 1 | NULLS 0"
+        );
+    }
+
+    #[gpui::test]
+    fn set_query_result_resets_row_limit_to_default(cx: &mut gpui::TestAppContext) {
+        init_result_view_test(cx);
+        let store = cx.update(|cx| cx.new(DatabaseStore::new));
+        let connection_id = uuid::Uuid::new_v4();
+        let result = sample_table_result();
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.fetch_target = 599;
+            view.set_query_result(
+                store.downgrade(),
+                connection_id,
+                "public".to_string(),
+                "select * from users".to_string(),
+                result,
+                cx,
+            );
+            view
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                assert_eq!(view.fetch_target, DEFAULT_FETCH_TARGET);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -5872,9 +7832,15 @@ mod tests {
         let primary_key_columns = vec!["id".to_string()];
         let deleted = vec![0usize, 2usize];
 
-        let statements =
-            build_pending_deletes('`', "users", &columns, &primary_key_columns, &rows, &deleted)
-                .expect("deletes build for a keyed table");
+        let statements = build_pending_deletes(
+            '`',
+            "users",
+            &columns,
+            &primary_key_columns,
+            &rows,
+            &deleted,
+        )
+        .expect("deletes build for a keyed table");
         assert_eq!(
             statements,
             vec![
@@ -5884,9 +7850,11 @@ mod tests {
         );
 
         // No deletions yields no statements, even without a primary key.
-        assert!(build_pending_deletes('`', "users", &columns, &[], &rows, &[])
-            .expect("empty deletions need no key")
-            .is_empty());
+        assert!(
+            build_pending_deletes('`', "users", &columns, &[], &rows, &[])
+                .expect("empty deletions need no key")
+                .is_empty()
+        );
 
         // A deletion with no primary key is rejected.
         let err = build_pending_deletes('`', "users", &columns, &[], &rows, &deleted)
@@ -5946,17 +7914,18 @@ mod tests {
             Some(-50.0)
         );
 
-        // Dragging down by 10px (viewport 100, content 300 → ratio 3) scrolls the
-        // content by 30px further.
+        // Dragging down by 10px maps through the thumb's actual travel. With a
+        // 36px minimum thumb in a 100px gutter, 10px of thumb movement maps to
+        // 31.25px of content movement.
         assert_eq!(
             drag_scroll_offset(-50.0, 30.0, 40.0, 100.0, 300.0),
-            Some(-80.0)
+            Some(-81.25)
         );
 
         // Dragging up reduces the offset toward 0.
         assert_eq!(
             drag_scroll_offset(-50.0, 30.0, 20.0, 100.0, 300.0),
-            Some(-20.0)
+            Some(-18.75)
         );
 
         // Offset is clamped to the scrollable range at both ends.
@@ -5975,15 +7944,15 @@ mod tests {
         // Content fits: thumb fills the whole gutter.
         assert_eq!(thumb_range(0.0, 100.0, 100.0, 0.0), (0.0, 100.0));
 
-        // 3× content, scrolled to top: thumb is a third, anchored at the start.
+        // 3× content, scrolled to top: thumb respects the minimum size.
         let (start, end) = thumb_range(0.0, 100.0, 300.0, 0.0);
         assert!((start - 0.0).abs() < 1e-3);
-        assert!((end - 33.333).abs() < 1e-2);
+        assert!((end - SCROLLBAR_THUMB_MIN).abs() < 1e-2);
 
         // Scrolled to the bottom: thumb sits against the gutter end.
         let (start, end) = thumb_range(0.0, 100.0, 300.0, -200.0);
         assert!((end - 100.0).abs() < 1e-2);
-        assert!((start - 66.666).abs() < 1e-2);
+        assert!((start - (100.0 - SCROLLBAR_THUMB_MIN)).abs() < 1e-2);
 
         // The origin offsets the whole range into window coordinates.
         let (start, _) = thumb_range(10.0, 100.0, 300.0, 0.0);
@@ -6052,11 +8021,42 @@ mod tests {
 
     #[test]
     fn column_editor_kind_recognizes_bool_types() {
-        assert!(matches!(column_editor_kind("tinyint(1)"), CellEditorKind::Boolean));
-        assert!(matches!(column_editor_kind("BOOL"), CellEditorKind::Boolean));
-        assert!(matches!(column_editor_kind("boolean"), CellEditorKind::Boolean));
-        assert!(!matches!(column_editor_kind("tinyint(4)"), CellEditorKind::Boolean));
-        assert!(!matches!(column_editor_kind("int"), CellEditorKind::Boolean));
+        assert!(matches!(
+            column_editor_kind("tinyint(1)"),
+            CellEditorKind::Boolean
+        ));
+        assert!(matches!(
+            column_editor_kind("BOOL"),
+            CellEditorKind::Boolean
+        ));
+        assert!(matches!(
+            column_editor_kind("boolean"),
+            CellEditorKind::Boolean
+        ));
+        assert!(!matches!(
+            column_editor_kind("tinyint(4)"),
+            CellEditorKind::Boolean
+        ));
+        assert!(!matches!(
+            column_editor_kind("int"),
+            CellEditorKind::Boolean
+        ));
+    }
+
+    #[test]
+    fn column_editor_kind_recognizes_timestamp_as_datetime() {
+        assert!(matches!(
+            column_editor_kind("timestamp"),
+            CellEditorKind::DateTime
+        ));
+        assert!(matches!(
+            column_editor_kind("timestamp(6)"),
+            CellEditorKind::DateTime
+        ));
+        assert!(matches!(
+            column_editor_kind("datetime"),
+            CellEditorKind::DateTime
+        ));
     }
 
     #[test]
@@ -6226,7 +8226,11 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string(), "val".to_string()],
             rows: vec![
                 vec![Some("1".to_string()), Some("alice".to_string()), None],
-                vec![Some("2".to_string()), Some("bob".to_string()), Some("42".to_string())],
+                vec![
+                    Some("2".to_string()),
+                    Some("bob".to_string()),
+                    Some("42".to_string()),
+                ],
             ],
             rows_affected: 0,
             execution_time_ms: 0,
@@ -6324,5 +8328,967 @@ mod tests {
                 assert_eq!(view.visible_columns, vec![0, 1, 2]);
             })
             .unwrap();
+    }
+
+    fn init_result_view_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    fn sample_table_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), Some("Bob".to_string())],
+                vec![Some("3".to_string()), Some("Claire".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    fn wide_table_result() -> QueryResult {
+        let columns: Vec<String> = (0..18).map(|index| format!("column_{index}")).collect();
+        let rows = (0..6)
+            .map(|row| {
+                (0..columns.len())
+                    .map(|col| Some(format!("row_{row}_column_{col}_wide_value")))
+                    .collect()
+            })
+            .collect();
+        QueryResult {
+            columns,
+            rows,
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    fn draw_result_view(_window: gpui::WindowHandle<ResultView>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    struct ResultViewFrame {
+        view: Entity<ResultView>,
+    }
+
+    impl Render for ResultViewFrame {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(700.)).h(px(500.)).child(self.view.clone())
+        }
+    }
+
+    fn draw_result_view_frame(
+        _window: gpui::WindowHandle<ResultViewFrame>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn debug_center(
+        cx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Point<Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
+            .center()
+    }
+
+    fn table_backed_result_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<ResultView>,
+        Entity<ResultView>,
+        gpui::VisualTestContext,
+    ) {
+        init_result_view_test(cx);
+        let store = cx.update(|cx| cx.new(DatabaseStore::new));
+        let connection_id = uuid::Uuid::new_v4();
+        let window = cx.add_window({
+            let store = store.downgrade();
+            move |window, cx| {
+                let mut view = ResultView::new("users", cx).with_table_context(
+                    store,
+                    connection_id,
+                    "public".to_string(),
+                    "users".to_string(),
+                    window,
+                    cx,
+                );
+                view.set_result(sample_table_result(), cx);
+                view
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        (window, view, cx)
+    }
+
+    fn framed_plain_result_window(
+        cx: &mut gpui::TestAppContext,
+        result: QueryResult,
+    ) -> (
+        gpui::WindowHandle<ResultViewFrame>,
+        Entity<ResultView>,
+        gpui::VisualTestContext,
+    ) {
+        init_result_view_test(cx);
+        let window = cx.add_window(move |_window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = ResultView::new("query", cx);
+                view.set_result(result, cx);
+                view
+            });
+            ResultViewFrame { view }
+        });
+        let view = window
+            .read_with(cx, |frame, _cx| frame.view.clone())
+            .expect("test window should contain a result view");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view_frame(window, &mut cx);
+        (window, view, cx)
+    }
+
+    fn plain_result_window(
+        cx: &mut gpui::TestAppContext,
+        result: QueryResult,
+    ) -> (
+        gpui::WindowHandle<ResultView>,
+        Entity<ResultView>,
+        gpui::VisualTestContext,
+    ) {
+        init_result_view_test(cx);
+        let window = cx.add_window(move |_window, cx| {
+            let mut view = ResultView::new("query", cx);
+            view.set_result(result, cx);
+            view
+        });
+        let view = window.root(cx).unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        (window, view, cx)
+    }
+
+    #[gpui::test]
+    fn visual_double_click_cell_starts_editing(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((0, 1)));
+            assert!(
+                view.cell_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
+                "double-click should open the inline cell editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn visual_double_click_plain_result_cell_starts_editing(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = plain_result_window(cx, sample_table_result());
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((0, 1)));
+            assert!(
+                view.cell_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
+                "double-click should open the inline editor even without table context"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn visual_multiline_cell_click_opens_value_editor_popup(cx: &mut gpui::TestAppContext) {
+        let ddl = "CREATE TABLE `splits` (\n  `split_id` int NOT NULL,\n  PRIMARY KEY (`split_id`)\n) ENGINE=InnoDB";
+        let result = QueryResult {
+            columns: vec!["Create Table".to_string()],
+            rows: vec![vec![Some(ddl.to_string())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("VALUE_EDITOR_POPUP").is_some(),
+            "multiline cell selection should open the value editor popup automatically"
+        );
+        view.update(&mut cx, |view, cx| {
+            assert!(view.value_editor_open);
+            assert_eq!(view.selected_cell, Some((0, 0)));
+            let text = view
+                .value_editor
+                .as_ref()
+                .map(|editor| editor.read(cx).text(cx))
+                .unwrap_or_default();
+            assert!(text.contains("CREATE TABLE `splits`"));
+        });
+    }
+
+    #[gpui::test]
+    fn visual_value_editor_popup_loads_selected_cell_text(cx: &mut gpui::TestAppContext) {
+        let ddl = "CREATE TABLE `splits` (\n  `split_id` int NOT NULL,\n  PRIMARY KEY (`split_id`)\n) ENGINE=InnoDB";
+        let result = QueryResult {
+            columns: vec!["Create Table".to_string()],
+            rows: vec![vec![Some(ddl.to_string())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        view.update(&mut cx, |view, cx| {
+            view.value_editor_open = true;
+            cx.notify();
+        });
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("VALUE_EDITOR_POPUP").is_some(),
+            "explicit value editor open should show the selected cell text"
+        );
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .value_editor
+                .as_ref()
+                .map(|editor| editor.read(cx).text(cx))
+                .unwrap_or_default();
+            assert!(text.contains("CREATE TABLE `splits`"));
+            assert!(text.contains("\n  `split_id` int NOT NULL"));
+        });
+    }
+
+    #[gpui::test]
+    fn visual_value_editor_popup_can_be_resized(cx: &mut gpui::TestAppContext) {
+        let ddl = "line one\nline two\nline three";
+        let result = QueryResult {
+            columns: vec!["DDL".to_string(), "note".to_string()],
+            rows: vec![vec![Some(ddl.to_string()), Some("x".to_string())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        view.update(&mut cx, |view, cx| {
+            view.value_editor_open = true;
+            cx.notify();
+        });
+        draw_result_view(window, &mut cx);
+
+        let before = cx
+            .debug_bounds("VALUE_EDITOR_POPUP")
+            .expect("value editor popup bounds");
+        let resize = debug_center(&mut cx, "VALUE_EDITOR_RESIZE");
+        let end = gpui::point(resize.x + px(80.0), resize.y + px(50.0));
+
+        cx.simulate_mouse_down(resize, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        let after = cx
+            .debug_bounds("VALUE_EDITOR_POPUP")
+            .expect("resized value editor popup bounds");
+        assert!(after.size.width > before.size.width);
+        assert!(after.size.height > before.size.height);
+        view.update(&mut cx, |view, _cx| {
+            assert!(view.value_editor_resize_drag.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn visual_second_click_selected_cell_starts_editing(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((0, 1)));
+            assert!(
+                view.cell_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
+                "second click on an already-selected cell should open the inline editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn visual_shift_click_cells_selects_range(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let last_cell = debug_center(&mut cx, "CELL-2-1");
+
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        cx.simulate_click(last_cell, gpui::Modifiers::shift());
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((2, 1)));
+            assert!(
+                view.selected_rows.is_empty(),
+                "cell range selection must not also select whole rows"
+            );
+            assert!(view.selected_cell_range_contains(0, 0, 0));
+            assert!(view.selected_cell_range_contains(1, 1, 0));
+            assert!(view.selected_cell_range_contains(2, 2, 1));
+            assert!(!view.selected_cell_range_contains(2, 2, 2));
+        });
+    }
+
+    #[gpui::test]
+    fn visual_drag_cells_selects_matrix(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let last_cell = debug_center(&mut cx, "CELL-2-1");
+
+        cx.simulate_mouse_down(first_cell, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            last_cell,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(last_cell, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((2, 1)));
+            assert!(
+                view.selected_rows.is_empty(),
+                "dragged cell range selection must not also select whole rows"
+            );
+            assert!(view.selected_cell_range_contains(0, 0, 0));
+            assert!(view.selected_cell_range_contains(1, 1, 0));
+            assert!(view.selected_cell_range_contains(2, 2, 1));
+            assert!(!view.selected_cell_range_contains(2, 2, 2));
+        });
+    }
+
+    #[gpui::test]
+    fn visual_row_actions_are_menu_only(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        assert!(cx.debug_bounds("EDIT_ROW-0").is_none());
+        assert!(cx.debug_bounds("DELETE_ROW-0").is_none());
+
+        open_gutter_menu_and_click(window, &mut cx, "GUTTER-1", "MENU_ITEM-Delete Row");
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.deleted_rows.contains(&1),
+                "row delete menu item should only mark the row for pending delete"
+            );
+            assert!(view.selected_rows.contains(&1));
+            assert_eq!(view.selected_rows.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn visual_horizontal_scrollbar_drag_changes_offset(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, wide_table_result());
+        let gutter = cx
+            .debug_bounds("HSCROLL")
+            .expect("horizontal scrollbar bounds");
+        let start = gutter.center();
+        let end = gpui::point(gutter.origin.x + gutter.size.width - px(2.), start.y);
+
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            let offset = f32::from(view.h_scroll.offset().x);
+            let bounds_width = f32::from(view.h_scroll.bounds().size.width);
+            assert!(
+                offset < 0.0,
+                "dragging the horizontal scrollbar should move the horizontal offset; offset={offset}, bounds_width={bounds_width}, total_width={}",
+                view.total_width
+            );
+            assert!(view.scroll_drag.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn visual_scrollbar_drag_stops_when_left_button_is_released(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, wide_table_result());
+        let gutter = cx
+            .debug_bounds("HSCROLL")
+            .expect("horizontal scrollbar bounds");
+        let start = gutter.center();
+        let move_after_release = gpui::point(gutter.origin.x + gutter.size.width - px(2.), start.y);
+
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        let offset_after_press = view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.scroll_drag.is_some(),
+                "mouse down on the scrollbar should start a drag"
+            );
+            f32::from(view.h_scroll.offset().x)
+        });
+
+        cx.simulate_mouse_move(move_after_release, None, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.scroll_drag.is_none(),
+                "the scrollbar drag should stop as soon as GPUI reports no pressed left button"
+            );
+            assert_eq!(f32::from(view.h_scroll.offset().x), offset_after_press);
+        });
+    }
+
+    #[gpui::test]
+    fn visual_gutter_click_selects_entire_row(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        let row_number = debug_center(&mut cx, "GUTTER-1");
+
+        cx.simulate_click(row_number, gpui::Modifiers::none());
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(view.selected_rows.contains(&1));
+            assert_eq!(view.selected_rows.len(), 1);
+            assert_eq!(view.selected_cell, None);
+            assert!(view.selected_cell_range_contains(1, 1, 0));
+            assert!(view.selected_cell_range_contains(1, 1, 1));
+            assert!(!view.selected_cell_range_contains(0, 0, 0));
+        });
+    }
+
+    fn open_gutter_menu_and_click(
+        window: gpui::WindowHandle<ResultView>,
+        cx: &mut gpui::VisualTestContext,
+        gutter_selector: &'static str,
+        menu_selector: &'static str,
+    ) {
+        let gutter_center = debug_center(cx, gutter_selector);
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: gutter_center,
+            button: gpui::MouseButton::Right,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        draw_result_view(window, cx);
+        let menu_center = debug_center(cx, menu_selector);
+        cx.simulate_click(menu_center, gpui::Modifiers::none());
+        draw_result_view(window, cx);
+    }
+
+    #[gpui::test]
+    fn visual_gutter_context_menu_adds_clones_and_deletes_rows(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+
+        open_gutter_menu_and_click(window, &mut cx, "GUTTER-1", "MENU_ITEM-Add Row");
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.added_rows.len(),
+                1,
+                "Add Row should create one pending row"
+            );
+            assert_eq!(
+                view.display_row_entries(),
+                vec![
+                    ResultDisplayRow::Loaded(0),
+                    ResultDisplayRow::Loaded(1),
+                    ResultDisplayRow::Added(0),
+                    ResultDisplayRow::Loaded(2),
+                ],
+                "Add Row should place the pending row directly after the clicked row"
+            );
+            assert!(
+                view.cell_edit.as_ref().is_some_and(|edit| {
+                    edit.abs_idx == view.loaded_row_count()
+                        && edit.col_idx == 0
+                        && matches!(edit.target, CellEditTarget::Added(0))
+                }),
+                "Add Row should immediately open an editor in the new pending row"
+            );
+        });
+
+        window
+            .update(&mut cx, |view, window, cx| {
+                let editor = view
+                    .cell_edit
+                    .as_ref()
+                    .expect("pending row editor")
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("10", window, cx);
+                });
+                assert!(view.commit_cell_edit(window, cx));
+                assert_eq!(
+                    view.added_rows.first().and_then(|row| row.first()),
+                    Some(&CellValue::Text("10".to_string()))
+                );
+            })
+            .unwrap();
+
+        open_gutter_menu_and_click(window, &mut cx, "GUTTER-1", "MENU_ITEM-Clone Row");
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.added_rows.len(),
+                2,
+                "Clone Row should create another pending row"
+            );
+            assert_eq!(
+                view.added_rows.last(),
+                Some(&vec![
+                    CellValue::Text("2".to_string()),
+                    CellValue::Text("Bob".to_string())
+                ])
+            );
+            assert_eq!(
+                view.display_row_entries(),
+                vec![
+                    ResultDisplayRow::Loaded(0),
+                    ResultDisplayRow::Loaded(1),
+                    ResultDisplayRow::Added(0),
+                    ResultDisplayRow::Added(1),
+                    ResultDisplayRow::Loaded(2),
+                ],
+                "Clone Row should place the cloned row under the clicked row's pending group"
+            );
+        });
+
+        open_gutter_menu_and_click(window, &mut cx, "GUTTER-4", "MENU_ITEM-Delete Row");
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.deleted_rows.contains(&2),
+                "Delete Row should mark the right-clicked loaded row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn visual_copy_selection_uses_selected_copy_format(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let row_number = debug_center(&mut cx, "GUTTER-1");
+
+        cx.simulate_click(row_number, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.copy_format = CopyFormat::Csv;
+            view.copy_selected_to_clipboard(cx);
+        });
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("copy selection should write text to clipboard");
+        assert_eq!(copied, "id,name\n2,Bob\n");
+    }
+
+    #[gpui::test]
+    fn copy_selection_uses_insert_copy_format(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let row_number = debug_center(&mut cx, "GUTTER-1");
+
+        cx.simulate_click(row_number, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.copy_format = CopyFormat::Insert;
+            view.copy_selected_to_clipboard(cx);
+        });
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("copy selection should write INSERT text to clipboard");
+        assert_eq!(
+            copied,
+            "INSERT INTO `users` (`id`, `name`) VALUES ('2', 'Bob');\n"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_selection_uses_multi_insert_copy_format(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_row = debug_center(&mut cx, "GUTTER-0");
+        let second_row = debug_center(&mut cx, "GUTTER-1");
+
+        cx.simulate_click(first_row, gpui::Modifiers::none());
+        cx.simulate_click(second_row, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.copy_format = CopyFormat::MultiInsert;
+            view.copy_selected_to_clipboard(cx);
+        });
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("copy selection should write multi INSERT text to clipboard");
+        assert_eq!(
+            copied,
+            "INSERT INTO `users` (`id`, `name`) VALUES\n  ('1', 'Alice'),\n  ('2', 'Bob');\n"
+        );
+    }
+
+    #[gpui::test]
+    fn context_row_action_selection_overrides_previous_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), Some("Bob".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.set_result(result, cx);
+            view
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                view.selected_rows.insert(0);
+                view.selected_cell_range = Some(((0, 0), (1, 1)));
+
+                view.select_row_for_context_action(1, 1);
+
+                assert_eq!(
+                    view.selected_rows.iter().copied().collect::<Vec<_>>(),
+                    vec![1]
+                );
+                assert_eq!(view.selected_cell, Some((1, 1)));
+                assert_eq!(view.last_selected_row, Some(1));
+                assert!(view.selected_cell_range.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cell_range_selection_uses_visible_display_order(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), Some("Bob".to_string())],
+                vec![Some("3".to_string()), Some("Claire".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.set_result(result, cx);
+            view
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                view.filtered_display_order = vec![2, 0];
+                view.added_rows.push(vec![CellValue::Null, CellValue::Null]);
+
+                view.select_cell_from_click(2, 0, 0, false, false);
+                view.select_cell_from_click(3, 2, 1, true, false);
+
+                assert!(view.selected_cell_range_contains(2, 0, 0));
+                assert!(view.selected_cell_range_contains(0, 1, 1));
+                assert!(view.selected_cell_range_contains(3, 2, 1));
+                assert!(!view.selected_cell_range_contains(1, 3, 1));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn row_range_selection_includes_added_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let result = QueryResult {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.set_result(result, cx);
+            view
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                view.filtered_display_order = vec![1];
+                view.added_rows.push(vec![CellValue::Null]);
+
+                view.select_row_range(0, 1);
+
+                assert!(view.selected_rows.contains(&1));
+                assert!(view.selected_rows.contains(&2));
+                assert_eq!(view.selected_rows.len(), 2);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn build_pending_statements_emits_delete_update_insert_in_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            view.primary_key_columns = Some(vec!["id".to_string()]);
+            view.pending_edits.insert(
+                (0, 1),
+                PendingEdit {
+                    original: Some("Alice".to_string()),
+                    new_value: CellValue::Text("Alicia".to_string()),
+                },
+            );
+            view.deleted_rows.insert(2);
+            view.added_rows
+                .push(vec![CellValue::Text("9".to_string()), CellValue::Text("Zed".to_string())]);
+
+            let statements = view
+                .build_pending_statements(cx)
+                .expect("statements should build with a primary key");
+            assert_eq!(statements.len(), 3);
+            assert!(
+                statements[0].contains("DELETE FROM `users` WHERE `id` = 3"),
+                "first statement should be the DELETE: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].contains("UPDATE `users` SET `name` = 'Alicia' WHERE `id` = 1"),
+                "second statement should be the UPDATE: {}",
+                statements[1]
+            );
+            assert!(
+                statements[2].contains("INSERT INTO `users` (`id`, `name`) VALUES (9, 'Zed')"),
+                "third statement should be the INSERT: {}",
+                statements[2]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn build_pending_statements_without_primary_key_reports_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            view.primary_key_columns = Some(Vec::new());
+            view.pending_edits.insert(
+                (0, 1),
+                PendingEdit {
+                    original: Some("Alice".to_string()),
+                    new_value: CellValue::Text("Alicia".to_string()),
+                },
+            );
+            assert!(view.build_pending_statements(cx).is_err());
+        });
+    }
+
+    #[gpui::test]
+    fn transaction_mode_toggle_switches_between_auto_and_manual(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(view.transaction_mode, TransactionMode::Auto);
+            view.toggle_transaction_mode(cx);
+            assert_eq!(view.transaction_mode, TransactionMode::Manual);
+            view.toggle_transaction_mode(cx);
+            assert_eq!(view.transaction_mode, TransactionMode::Auto);
+        });
+    }
+
+    #[gpui::test]
+    fn manual_submit_stages_statements_without_executing(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.transaction_mode = TransactionMode::Manual;
+            view.primary_key_columns = Some(vec!["id".to_string()]);
+            view.pending_edits.insert(
+                (0, 1),
+                PendingEdit {
+                    original: Some("Alice".to_string()),
+                    new_value: CellValue::Text("Alicia".to_string()),
+                },
+            );
+            view.submit_pending_edits(window, cx);
+
+            // Manual Submit stages the SQL but keeps the buffered edit and does
+            // not clear it, so the grid still shows the pending change.
+            assert_eq!(view.staged_statements.len(), 1);
+            assert!(view.pending_edits.contains_key(&(0, 1)));
+        });
+    }
+
+    #[gpui::test]
+    fn rollback_clears_staged_and_pending_changes(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            view.staged_statements.push("BEGIN".to_string());
+            view.pending_edits.insert(
+                (0, 1),
+                PendingEdit {
+                    original: Some("Alice".to_string()),
+                    new_value: CellValue::Text("Alicia".to_string()),
+                },
+            );
+            view.rollback_transaction(cx);
+            assert!(view.staged_statements.is_empty());
+            assert!(view.pending_edits.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn goto_row_selects_and_focuses_target_row(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_goto_row(window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            if let Some(editor) = view.goto_row_editor.clone() {
+                editor.update(cx, |editor, cx| editor.set_text("2", window, cx));
+            }
+        });
+        view.update(&mut cx, |view, cx| {
+            view.confirm_goto_row(cx);
+            // Display row 2 is the second row (Bob), absolute index 1.
+            assert!(view.selected_rows.contains(&1));
+            assert!(!view.goto_row_visible);
+        });
+    }
+
+    #[gpui::test]
+    fn copy_aggregation_writes_column_summary_to_clipboard(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            view.selected_cell = Some((0, 0));
+            view.copy_aggregation_to_clipboard(cx);
+        });
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("copy aggregation should write text to clipboard");
+        assert!(copied.starts_with("id"), "summary should name the column: {copied}");
+        assert!(copied.contains("COUNT 3"), "summary should include the count: {copied}");
+        assert!(copied.contains("SUM 6"), "summary should include the sum: {copied}");
+    }
+
+    #[gpui::test]
+    fn find_filter_rows_hides_non_matching_rows(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            view.find_filter_rows = true;
+            view.find_query = Some("bob".to_string());
+            view.recompute_local_filter_inner();
+            assert_eq!(view.filtered_display_order, vec![1]);
+        });
+    }
+
+    #[gpui::test]
+    fn quick_filter_by_cell_narrows_visible_rows(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_quick_filter(1, "Bob".to_string(), false, window, cx);
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(view.local_filter_visible);
+            assert_eq!(view.filtered_display_order, vec![1]);
+        });
+    }
+
+    #[gpui::test]
+    fn quick_filter_exclude_removes_matching_rows(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        draw_result_view(window, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_quick_filter(1, "Bob".to_string(), true, window, cx);
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.filtered_display_order.len(), 2);
+            assert!(!view.filtered_display_order.contains(&1));
+        });
     }
 }
