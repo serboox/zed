@@ -112,6 +112,10 @@ actions!(
         ToggleTranspose,
         /// Resets column order, hidden columns, sort, filters, and transpose to defaults.
         ResetView,
+        /// Opens the Export Data dialog (format, headers, DDL, transpose, destination).
+        OpenExportDialog,
+        /// Opens or closes the chart view for the current result.
+        ToggleChart,
     ]
 );
 
@@ -413,6 +417,83 @@ impl CopyFormat {
     }
 }
 
+// Output format offered by the Export Data dialog. A superset of CopyFormat
+// that also covers the file-oriented formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportChoice {
+    Csv,
+    Tsv,
+    Json,
+    Markdown,
+    Html,
+    SqlInsert,
+    SqlMultiInsert,
+    SqlUpdate,
+}
+
+impl ExportChoice {
+    fn label(self) -> &'static str {
+        match self {
+            ExportChoice::Csv => "CSV",
+            ExportChoice::Tsv => "TSV",
+            ExportChoice::Json => "JSON",
+            ExportChoice::Markdown => "Markdown",
+            ExportChoice::Html => "HTML",
+            ExportChoice::SqlInsert => "SQL Insert",
+            ExportChoice::SqlMultiInsert => "SQL Multi Insert",
+            ExportChoice::SqlUpdate => "SQL Update",
+        }
+    }
+
+    // File extension used as the default name when saving to a file.
+    fn extension(self) -> &'static str {
+        match self {
+            ExportChoice::Csv => "csv",
+            ExportChoice::Tsv => "tsv",
+            ExportChoice::Json => "json",
+            ExportChoice::Markdown => "md",
+            ExportChoice::Html => "html",
+            ExportChoice::SqlInsert | ExportChoice::SqlMultiInsert | ExportChoice::SqlUpdate => {
+                "sql"
+            }
+        }
+    }
+
+    // Whether toggling column headers changes this format's output. SQL and JSON
+    // carry column names intrinsically, so the headers toggle does not apply.
+    fn honors_headers(self) -> bool {
+        matches!(
+            self,
+            ExportChoice::Csv | ExportChoice::Tsv | ExportChoice::Markdown | ExportChoice::Html
+        )
+    }
+
+    // Whether this format names a target table (the SQL writers do).
+    fn needs_table(self) -> bool {
+        matches!(
+            self,
+            ExportChoice::SqlInsert | ExportChoice::SqlMultiInsert | ExportChoice::SqlUpdate
+        )
+    }
+}
+
+const EXPORT_CHOICES: &[ExportChoice] = &[
+    ExportChoice::Csv,
+    ExportChoice::Tsv,
+    ExportChoice::Json,
+    ExportChoice::Markdown,
+    ExportChoice::Html,
+    ExportChoice::SqlInsert,
+    ExportChoice::SqlMultiInsert,
+    ExportChoice::SqlUpdate,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChartKind {
+    Bar,
+    Line,
+}
+
 // An open enum/set dropdown popup waiting for the user to pick a value.
 struct EnumPopup {
     abs_idx: usize,
@@ -585,6 +666,24 @@ pub struct ResultView {
     history_search: String,
     // Editor widget for the history search input, created lazily.
     history_search_editor: Option<Entity<Editor>>,
+    // Export Data dialog state.
+    export_dialog_open: bool,
+    export_format: ExportChoice,
+    export_add_ddl: bool,
+    export_headers: bool,
+    export_transpose: bool,
+    // DDL fetched for the backing table, cached so the dialog can prepend it
+    // without re-querying. Populated when Add DDL is enabled.
+    export_ddl: Option<String>,
+    // Chart view state.
+    chart_open: bool,
+    chart_kind: ChartKind,
+    // Result column index plotted on the value (Y) axis; defaults to the first
+    // numeric column.
+    chart_value_column: Option<usize>,
+    // Optional result column index used for bar/point labels (X axis); None uses
+    // the row number.
+    chart_label_column: Option<usize>,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -764,6 +863,16 @@ impl ResultView {
             column_order: Vec::new(),
             history_search: String::new(),
             history_search_editor: None,
+            export_dialog_open: false,
+            export_format: ExportChoice::Csv,
+            export_add_ddl: false,
+            export_headers: true,
+            export_transpose: false,
+            export_ddl: None,
+            chart_open: false,
+            chart_kind: ChartKind::Bar,
+            chart_value_column: None,
+            chart_label_column: None,
         }
     }
 
@@ -2715,9 +2824,11 @@ impl ResultView {
             return;
         }
 
-        let (Some(store), Some(conn_id), Some(db)) =
-            (self.store.clone(), self.connection_id, self.database.clone())
-        else {
+        let (Some(store), Some(conn_id), Some(db)) = (
+            self.store.clone(),
+            self.connection_id,
+            self.database.clone(),
+        ) else {
             self.status_message =
                 Some("Edit kept in grid: no table connection to write to.".to_string());
             cx.notify();
@@ -2842,9 +2953,11 @@ impl ResultView {
         if self.staged_statements.is_empty() {
             return;
         }
-        let (Some(store), Some(conn_id), Some(db)) =
-            (self.store.clone(), self.connection_id, self.database.clone())
-        else {
+        let (Some(store), Some(conn_id), Some(db)) = (
+            self.store.clone(),
+            self.connection_id,
+            self.database.clone(),
+        ) else {
             self.status_message = Some("No table connection to commit to.".to_string());
             cx.notify();
             return;
@@ -2903,8 +3016,7 @@ impl ResultView {
             return;
         };
         let Some((_, col_idx)) = self.selected_cell else {
-            self.status_message =
-                Some("Select a cell to copy its column aggregates.".to_string());
+            self.status_message = Some("Select a cell to copy its column aggregates.".to_string());
             cx.notify();
             return;
         };
@@ -2914,7 +3026,9 @@ impl ResultView {
         let column_name = result.columns.get(col_idx).cloned().unwrap_or_default();
         let summary =
             Self::compute_column_aggregates(result, col_idx, &self.filtered_display_order);
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("{column_name}  {summary}")));
+        cx.write_to_clipboard(ClipboardItem::new_string(format!(
+            "{column_name}  {summary}"
+        )));
         self.status_message = None;
         cx.notify();
     }
@@ -3181,6 +3295,173 @@ impl ResultView {
             })
             .collect();
         format!("[{}]", rows.join(","))
+    }
+
+    // Builds a result where rows and columns are swapped: the first output
+    // column lists the original column names, and each following column is one
+    // original record. Used by the export "Transpose" option.
+    fn transpose_result(result: &QueryResult) -> QueryResult {
+        let mut columns = Vec::with_capacity(result.rows.len() + 1);
+        columns.push("column".to_string());
+        for index in 0..result.rows.len() {
+            columns.push((index + 1).to_string());
+        }
+        let rows = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col_idx, name)| {
+                let mut row = Vec::with_capacity(result.rows.len() + 1);
+                row.push(Some(name.clone()));
+                for source_row in &result.rows {
+                    row.push(source_row.get(col_idx).cloned().flatten());
+                }
+                row
+            })
+            .collect();
+        QueryResult {
+            columns,
+            rows,
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    fn drop_first_line(text: &str) -> String {
+        match text.split_once('\n') {
+            Some((_, rest)) => rest.to_string(),
+            None => String::new(),
+        }
+    }
+
+    // Removes the <thead>...</thead> block so an HTML export without headers
+    // keeps only the body rows.
+    fn strip_html_thead(html: &str) -> String {
+        if let (Some(start), Some(end)) = (html.find("<thead>"), html.find("</thead>")) {
+            let mut out = String::with_capacity(html.len());
+            out.push_str(&html[..start]);
+            out.push_str(&html[end + "</thead>".len()..]);
+            out
+        } else {
+            html.to_string()
+        }
+    }
+
+    // Assembles the export payload for the dialog: applies transpose, the chosen
+    // format, the header toggle, and an optional DDL prefix. Reuses the existing
+    // per-format writers so there is one source of formatting truth.
+    fn build_export_text(
+        result: &QueryResult,
+        choice: ExportChoice,
+        include_headers: bool,
+        transpose: bool,
+        table: Option<&str>,
+        ddl: Option<&str>,
+    ) -> String {
+        let transposed;
+        let source = if transpose {
+            transposed = Self::transpose_result(result);
+            &transposed
+        } else {
+            result
+        };
+        let table_name = table.unwrap_or("exported_table");
+        let mut body = match choice {
+            ExportChoice::Csv => Self::export_csv(source),
+            ExportChoice::Tsv => Self::export_tsv(source),
+            ExportChoice::Json => Self::export_json(source),
+            ExportChoice::Markdown => Self::export_markdown(source),
+            ExportChoice::Html => Self::export_html(source),
+            ExportChoice::SqlInsert => Self::export_sql_insert(source, table_name),
+            ExportChoice::SqlMultiInsert => Self::export_sql_multi_insert(source, table_name, '`'),
+            ExportChoice::SqlUpdate => Self::export_sql_update(source, table_name),
+        };
+        if !include_headers && choice.honors_headers() {
+            body = match choice {
+                ExportChoice::Html => Self::strip_html_thead(&body),
+                ExportChoice::Markdown => {
+                    // Markdown's first two lines are the header and its separator.
+                    Self::drop_first_line(&Self::drop_first_line(&body))
+                }
+                _ => Self::drop_first_line(&body),
+            };
+        }
+        match ddl {
+            Some(ddl) if !ddl.trim().is_empty() => format!("{}\n\n{}", ddl.trim_end(), body),
+            _ => body,
+        }
+    }
+
+    // Extracts (label, value) points from a numeric column, skipping rows whose
+    // value does not parse as a number. Labels come from `label_column` when set,
+    // otherwise the 1-based row number.
+    fn chart_series(
+        result: &QueryResult,
+        label_column: Option<usize>,
+        value_column: usize,
+    ) -> Vec<(String, f64)> {
+        result
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_idx, row)| {
+                let raw = row.get(value_column)?.as_deref()?;
+                let value: f64 = raw.trim().parse().ok()?;
+                let label = match label_column.and_then(|col| row.get(col)) {
+                    Some(Some(text)) => text.clone(),
+                    _ => (row_idx + 1).to_string(),
+                };
+                Some((label, value))
+            })
+            .collect()
+    }
+
+    // Returns the (min, max) of a series, with the baseline pulled to zero so
+    // bars share a common origin. Returns None for an empty series.
+    fn series_bounds(series: &[(String, f64)]) -> Option<(f64, f64)> {
+        if series.is_empty() {
+            return None;
+        }
+        let mut min = 0.0_f64;
+        let mut max = 0.0_f64;
+        for (_, value) in series {
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+        if (max - min).abs() < f64::EPSILON {
+            max = min + 1.0;
+        }
+        Some((min, max))
+    }
+
+    // First column whose every non-null cell parses as a number. Used as the
+    // default value axis for the chart.
+    fn first_numeric_column(result: &QueryResult) -> Option<usize> {
+        (0..result.columns.len()).find(|&col| {
+            let mut saw_value = false;
+            for row in &result.rows {
+                if let Some(Some(text)) = row.get(col) {
+                    saw_value = true;
+                    if text.trim().parse::<f64>().is_err() {
+                        return false;
+                    }
+                }
+            }
+            saw_value
+        })
+    }
+
+    // Detects latitude/longitude columns by name, returning (lat_col, lon_col).
+    fn detect_lat_lon(result: &QueryResult) -> Option<(usize, usize)> {
+        let find = |names: &[&str]| {
+            result.columns.iter().position(|column| {
+                let lower = column.to_ascii_lowercase();
+                names.iter().any(|name| lower == *name)
+            })
+        };
+        let lat = find(&["lat", "latitude"])?;
+        let lon = find(&["lon", "lng", "long", "longitude"])?;
+        Some((lat, lon))
     }
 
     fn copy_cell_value(&self, abs_idx: usize, col_idx: usize) -> Option<String> {
@@ -4327,22 +4608,34 @@ impl ResultView {
                             })
                             .separator()
                             .header("Filter")
-                            .entry(format!("Filter by \"{}\"", display_cell(&filter_value)), None, move |window, cx| {
-                                let value = filter_value.clone();
-                                wt_filter
-                                    .update(cx, |this, cx| {
-                                        this.apply_quick_filter(cell_idx, value, false, window, cx);
-                                    })
-                                    .ok();
-                            })
-                            .entry(format!("Exclude \"{}\"", display_cell(&exclude_value)), None, move |window, cx| {
-                                let value = exclude_value.clone();
-                                wt_exclude
-                                    .update(cx, |this, cx| {
-                                        this.apply_quick_filter(cell_idx, value, true, window, cx);
-                                    })
-                                    .ok();
-                            })
+                            .entry(
+                                format!("Filter by \"{}\"", display_cell(&filter_value)),
+                                None,
+                                move |window, cx| {
+                                    let value = filter_value.clone();
+                                    wt_filter
+                                        .update(cx, |this, cx| {
+                                            this.apply_quick_filter(
+                                                cell_idx, value, false, window, cx,
+                                            );
+                                        })
+                                        .ok();
+                                },
+                            )
+                            .entry(
+                                format!("Exclude \"{}\"", display_cell(&exclude_value)),
+                                None,
+                                move |window, cx| {
+                                    let value = exclude_value.clone();
+                                    wt_exclude
+                                        .update(cx, |this, cx| {
+                                            this.apply_quick_filter(
+                                                cell_idx, value, true, window, cx,
+                                            );
+                                        })
+                                        .ok();
+                                },
+                            )
                             .separator()
                             .header("Quick Help")
                             .entry("Quick Documentation", None, move |_, cx| {
@@ -4733,6 +5026,7 @@ impl ResultView {
         let quick_doc_open = self.quick_doc_open;
         let history_open = self.history_open;
         let transposed = self.transposed;
+        let chart_open = self.chart_open;
         let limit_editor = self.limit_editor.clone();
         let copy_format = self.copy_format;
         let weak_this = cx.weak_entity();
@@ -5040,6 +5334,7 @@ impl ResultView {
                                         .action_checked("Value Editor", Box::new(ToggleValueEditor), value_editor_open)
                                         .action_checked("Record View", Box::new(ToggleRecordView), record_view_open)
                                         .action_checked("Transpose", Box::new(ToggleTranspose), transposed)
+                                        .action_checked("Show Chart", Box::new(ToggleChart), chart_open)
                                         .action_checked("Column Info", Box::new(QuickDoc), quick_doc_open)
                                         .separator()
                                         .action_checked("Query History", Box::new(OpenQueryHistory), history_open)
@@ -5067,10 +5362,18 @@ impl ResultView {
                                 let r = result_for_export.clone();
                                 let tbl = table_for_export.clone();
                                 let weak_for_paste = weak_this.clone();
+                                let weak_for_dialog = weak_this.clone();
                                 Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
                                     let r = r.clone();
                                     let tbl = tbl.clone();
+                                    let weak_for_dialog = weak_for_dialog.clone();
                                     menu
+                                        .entry("Export Data…", None, move |_, cx| {
+                                            weak_for_dialog
+                                                .update(cx, |this, cx| this.open_export_dialog(cx))
+                                                .ok();
+                                        })
+                                        .separator()
                                         .entry("Copy as CSV", None, {
                                             let r = r.clone();
                                             move |_, cx| {
@@ -5918,52 +6221,56 @@ impl ResultView {
                     .into_any_element()
             }));
 
-        let rows = result.columns.iter().enumerate().map(|(col_idx, col_name)| {
-            h_flex()
-                .flex_none()
-                .h(px(Self::GRID_ROW_H))
-                .border_b_1()
-                .border_color(grid_border)
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(180.0))
-                        .px_2()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .border_r_1()
-                        .border_color(grid_border)
-                        .bg(name_bg)
-                        .child(
-                            Label::new(col_name.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        ),
-                )
-                .children((0..record_count).map(|record_idx| {
-                    let (display, color) = render_loaded_value(
-                        result
-                            .rows
-                            .get(record_idx)
-                            .and_then(|row| row.get(col_idx))
-                            .and_then(|cell| cell.as_deref()),
-                    );
-                    div()
-                        .flex_none()
-                        .w(px(180.0))
-                        .px_2()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .border_r_1()
-                        .border_color(grid_border)
-                        .overflow_hidden()
-                        .child(Label::new(display).size(LabelSize::Small).color(color))
-                        .into_any_element()
-                }))
-                .into_any_element()
-        });
+        let rows = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col_idx, col_name)| {
+                h_flex()
+                    .flex_none()
+                    .h(px(Self::GRID_ROW_H))
+                    .border_b_1()
+                    .border_color(grid_border)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(180.0))
+                            .px_2()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .border_r_1()
+                            .border_color(grid_border)
+                            .bg(name_bg)
+                            .child(
+                                Label::new(col_name.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default),
+                            ),
+                    )
+                    .children((0..record_count).map(|record_idx| {
+                        let (display, color) = render_loaded_value(
+                            result
+                                .rows
+                                .get(record_idx)
+                                .and_then(|row| row.get(col_idx))
+                                .and_then(|cell| cell.as_deref()),
+                        );
+                        div()
+                            .flex_none()
+                            .w(px(180.0))
+                            .px_2()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .border_r_1()
+                            .border_color(grid_border)
+                            .overflow_hidden()
+                            .child(Label::new(display).size(LabelSize::Small).color(color))
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            });
 
         div()
             .id("result-transpose")
@@ -6146,6 +6453,107 @@ impl ResultView {
 
     fn toggle_transpose(&mut self, cx: &mut Context<Self>) {
         self.transposed = !self.transposed;
+        cx.notify();
+    }
+
+    fn open_export_dialog(&mut self, cx: &mut Context<Self>) {
+        self.export_dialog_open = !self.export_dialog_open;
+        if self.export_dialog_open && self.export_format.needs_table() && self.table_name.is_none()
+        {
+            self.export_format = ExportChoice::Csv;
+        }
+        cx.notify();
+    }
+
+    // Loads the backing table's DDL so the Add DDL option can prepend it. No-op
+    // when there is no table context; failures are logged, not surfaced.
+    fn fetch_export_ddl(&mut self, cx: &mut Context<Self>) {
+        if self.export_ddl.is_some() {
+            return;
+        }
+        let (Some(store), Some(connection_id), Some(table)) = (
+            self.store.clone(),
+            self.connection_id,
+            self.table_name.clone(),
+        ) else {
+            return;
+        };
+        let database = self.database.clone().unwrap_or_default();
+        cx.spawn(async move |this, cx| {
+            let ddl = store
+                .update(cx, |store, cx| {
+                    store.get_table_ddl(connection_id, database, table, cx)
+                })
+                .ok();
+            if let Some(task) = ddl {
+                if let Some(text) = task.await.log_err() {
+                    this.update(cx, |this, cx| {
+                        this.export_ddl = Some(text);
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+            }
+        })
+        .detach();
+    }
+
+    // Assembles the export text honoring the current dialog options.
+    fn current_export_text(&self) -> Option<String> {
+        let result = self.result.as_ref()?;
+        let ddl = if self.export_add_ddl {
+            self.export_ddl.as_deref()
+        } else {
+            None
+        };
+        Some(Self::build_export_text(
+            result,
+            self.export_format,
+            self.export_headers,
+            self.export_transpose,
+            self.table_name.as_deref(),
+            ddl,
+        ))
+    }
+
+    fn export_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.current_export_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.status_message = Some("Copied result to clipboard".to_string());
+            self.export_dialog_open = false;
+            cx.notify();
+        }
+    }
+
+    fn export_to_file(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.current_export_text() else {
+            return;
+        };
+        let default_name = format!("result.{}", self.export_format.extension());
+        let home = paths::home_dir().to_path_buf();
+        let path_rx = cx.prompt_for_new_path(&home, Some(&default_name));
+        cx.background_spawn(async move {
+            if let Some(path) = path_rx
+                .await
+                .log_err()
+                .and_then(|result| result.log_err())
+                .flatten()
+            {
+                std::fs::write(path, text).log_err();
+            }
+        })
+        .detach();
+        self.export_dialog_open = false;
+        cx.notify();
+    }
+
+    fn toggle_chart(&mut self, cx: &mut Context<Self>) {
+        self.chart_open = !self.chart_open;
+        if self.chart_open && self.chart_value_column.is_none() {
+            if let Some(result) = self.result.as_ref() {
+                self.chart_value_column = Self::first_numeric_column(result);
+            }
+        }
         cx.notify();
     }
 
@@ -7177,6 +7585,432 @@ impl ResultView {
         )
     }
 
+    fn render_export_dialog_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.export_dialog_open {
+            return None;
+        }
+        let has_table = self.table_name.is_some();
+        let format = self.export_format;
+
+        let format_chips: Vec<AnyElement> = EXPORT_CHOICES
+            .iter()
+            .copied()
+            .filter(|choice| !choice.needs_table() || has_table)
+            .map(|choice| {
+                let selected = choice == format;
+                Button::new(
+                    SharedString::from(format!("export-fmt-{}", choice.label())),
+                    choice.label(),
+                )
+                .style(if selected {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .label_size(LabelSize::Small)
+                .toggle_state(selected)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.export_format = choice;
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        let headers_enabled = format.honors_headers();
+        let add_ddl = self.export_add_ddl;
+        let headers_on = self.export_headers;
+        let transpose_on = self.export_transpose;
+
+        let icon_for = |checked: bool| {
+            Icon::new(if checked {
+                IconName::Check
+            } else {
+                IconName::Dash
+            })
+            .size(IconSize::Small)
+            .color(if checked { Color::Accent } else { Color::Muted })
+        };
+
+        Some(
+            div()
+                .id("export-dialog-popup")
+                .debug_selector(|| "EXPORT_DIALOG_POPUP".to_string())
+                .absolute()
+                .top_8()
+                .right_0()
+                .w(px(320.0))
+                .bg(cx.theme().colors().elevated_surface_background)
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .rounded_md()
+                .shadow_md()
+                .p_3()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .mb_2()
+                        .child(Label::new("Export Data").size(LabelSize::Default))
+                        .child(
+                            IconButton::new("export-dialog-close", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_dialog_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    Label::new("Format")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(h_flex().flex_wrap().gap_1().mb_2().children(format_chips))
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .mb_2()
+                        .child(
+                            h_flex()
+                                .id("export-opt-ddl")
+                                .gap_2()
+                                .items_center()
+                                .px_1()
+                                .py_0p5()
+                                .when(has_table, |row| {
+                                    row.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_add_ddl = !this.export_add_ddl;
+                                        if this.export_add_ddl {
+                                            this.fetch_export_ddl(cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                                })
+                                .child(icon_for(add_ddl))
+                                .child(
+                                    Label::new("Add DDL (CREATE TABLE)")
+                                        .size(LabelSize::Small)
+                                        .color(if has_table {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        }),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .id("export-opt-headers")
+                                .gap_2()
+                                .items_center()
+                                .px_1()
+                                .py_0p5()
+                                .when(headers_enabled, |row| {
+                                    row.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_headers = !this.export_headers;
+                                        cx.notify();
+                                    }))
+                                })
+                                .child(icon_for(headers_on))
+                                .child(Label::new("Column headers").size(LabelSize::Small).color(
+                                    if headers_enabled {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    },
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .id("export-opt-transpose")
+                                .gap_2()
+                                .items_center()
+                                .px_1()
+                                .py_0p5()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_transpose = !this.export_transpose;
+                                    cx.notify();
+                                }))
+                                .child(icon_for(transpose_on))
+                                .child(Label::new("Transpose").size(LabelSize::Small)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("export-clipboard", "Copy to Clipboard")
+                                .style(ButtonStyle::Filled)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_to_clipboard(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("export-file", "Save to File…")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_to_file(cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_chart_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.chart_open {
+            return None;
+        }
+        let result = self.result.as_ref()?;
+        let value_column = self
+            .chart_value_column
+            .or_else(|| Self::first_numeric_column(result));
+        let kind = self.chart_kind;
+
+        let header = h_flex()
+            .justify_between()
+            .items_center()
+            .mb_2()
+            .child(Label::new("Chart").size(LabelSize::Default))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("chart-kind-bar", "Bar")
+                            .style(if kind == ChartKind::Bar {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart_kind = ChartKind::Bar;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("chart-kind-line", "Line")
+                            .style(if kind == ChartKind::Line {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart_kind = ChartKind::Line;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        IconButton::new("chart-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        let geo = Self::detect_lat_lon(result);
+        let body = if let Some(value_column) = value_column {
+            let series = Self::chart_series(result, self.chart_label_column, value_column);
+            self.render_chart_body(&series, kind, cx)
+        } else if let Some((lat, lon)) = geo {
+            self.render_geo_body(result, lat, lon, cx)
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("No numeric column to chart")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("chart-popup")
+                .debug_selector(|| "CHART_POPUP".to_string())
+                .absolute()
+                .top_8()
+                .left_0()
+                .right_0()
+                .bottom_8()
+                .bg(cx.theme().colors().elevated_surface_background)
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .rounded_md()
+                .shadow_md()
+                .p_3()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    fn render_chart_body(
+        &self,
+        series: &[(String, f64)],
+        kind: ChartKind,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((min, max)) = Self::series_bounds(series) else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("No numeric values to chart")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        };
+        let span = max - min;
+        let bar_color = cx.theme().status().info;
+        let grid_color = cx.theme().colors().border;
+
+        match kind {
+            ChartKind::Bar => {
+                let bars: Vec<AnyElement> = series
+                    .iter()
+                    .map(|(label, value)| {
+                        let fraction = ((value - min) / span).clamp(0.0, 1.0) as f32;
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(6.0))
+                            .h_full()
+                            .justify_end()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .h(relative(fraction.max(0.01)))
+                                    .rounded_t_sm()
+                                    .bg(bar_color),
+                            )
+                            .child(
+                                Label::new(SharedString::from(label.clone()))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                h_flex()
+                    .flex_1()
+                    .w_full()
+                    .items_end()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(grid_color)
+                    .children(bars)
+                    .into_any_element()
+            }
+            ChartKind::Line => {
+                let points: Vec<(f32, f32)> = series
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| {
+                        let x = if series.len() <= 1 {
+                            0.0
+                        } else {
+                            index as f32 / (series.len() - 1) as f32
+                        };
+                        let y = ((value - min) / span).clamp(0.0, 1.0) as f32;
+                        (x, y)
+                    })
+                    .collect();
+                let line_color = bar_color;
+                div()
+                    .flex_1()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(grid_color)
+                    .child(
+                        gpui::canvas(
+                            move |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                if points.len() < 2 {
+                                    return;
+                                }
+                                let origin = bounds.origin;
+                                let width = bounds.size.width;
+                                let height = bounds.size.height;
+                                let mut builder = gpui::PathBuilder::stroke(px(1.5));
+                                for (index, (x, y)) in points.iter().enumerate() {
+                                    let point = gpui::point(
+                                        origin.x + width * *x,
+                                        origin.y + height * (1.0 - *y),
+                                    );
+                                    if index == 0 {
+                                        builder.move_to(point);
+                                    } else {
+                                        builder.line_to(point);
+                                    }
+                                }
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, line_color);
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_geo_body(
+        &self,
+        result: &QueryResult,
+        lat: usize,
+        lon: usize,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let points: Vec<(String, String)> = result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let lat_value = row.get(lat)?.clone()?;
+                let lon_value = row.get(lon)?.clone()?;
+                Some((lat_value, lon_value))
+            })
+            .collect();
+        let rows: Vec<AnyElement> = points
+            .iter()
+            .take(500)
+            .map(|(lat_value, lon_value)| {
+                Label::new(SharedString::from(format!("{lat_value}, {lon_value}")))
+                    .size(LabelSize::Small)
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .id("chart-geo-list")
+            .flex_1()
+            .gap_1()
+            .overflow_y_scroll()
+            .child(
+                Label::new(SharedString::from(format!("{} geo points", points.len())))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
     // Approximate row/header heights for enum popup positioning (px).
     // These match the py_1 + LabelSize::Small layout used throughout the grid.
     const GRID_HEADER_H: f32 = 28.0;
@@ -7915,6 +8749,12 @@ impl Render for ResultView {
                     this.refresh_table_data(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &OpenExportDialog, _window, cx| {
+                this.open_export_dialog(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleChart, _window, cx| {
+                this.toggle_chart(cx);
+            }))
             .when_some(filter_bar, |el, bar| el.child(bar))
             .child(div().flex_1().overflow_hidden().child(content))
             .when_some(self.render_record_view_panel(cx), |el, panel| {
@@ -7926,6 +8766,10 @@ impl Render for ResultView {
             })
             .when_some(self.render_goto_row_bar(cx), |el, bar| el.child(bar))
             .when_some(self.render_find_bar(cx), |el, bar| el.child(bar))
+            .when_some(self.render_export_dialog_popup(cx), |el, popup| {
+                el.child(popup)
+            })
+            .when_some(self.render_chart_popup(cx), |el, popup| el.child(popup))
             .when_some(self.render_status_bar(cx), |el, bar| el.child(bar))
     }
 }
@@ -8681,6 +9525,169 @@ mod tests {
         let sql = ResultView::export_sql_update(&result, "users");
         assert!(sql.contains("UPDATE users SET name = 'alice', val = NULL WHERE id = 1;"));
         assert!(sql.contains("UPDATE users SET name = 'bob', val = 42 WHERE id = 2;"));
+    }
+
+    fn export_fixture() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), Some("Bob".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn build_export_text_prepends_ddl_when_present() {
+        let result = export_fixture();
+        let text = ResultView::build_export_text(
+            &result,
+            ExportChoice::Csv,
+            true,
+            false,
+            Some("t"),
+            Some("CREATE TABLE t (id INT);"),
+        );
+        assert!(text.starts_with("CREATE TABLE t (id INT);"));
+        assert!(text.contains("id,name"));
+        assert!(text.contains("1,Alice"));
+
+        // No DDL prefix when not requested.
+        let plain =
+            ResultView::build_export_text(&result, ExportChoice::Csv, true, false, Some("t"), None);
+        assert!(!plain.contains("CREATE TABLE"));
+    }
+
+    #[test]
+    fn build_export_text_drops_header_when_headers_disabled() {
+        let result = export_fixture();
+        let with_headers =
+            ResultView::build_export_text(&result, ExportChoice::Csv, true, false, None, None);
+        assert!(with_headers.starts_with("id,name"));
+
+        let without_headers =
+            ResultView::build_export_text(&result, ExportChoice::Csv, false, false, None, None);
+        assert!(!without_headers.starts_with("id,name"));
+        assert!(without_headers.starts_with("1,Alice"));
+    }
+
+    #[test]
+    fn transpose_result_swaps_rows_and_columns() {
+        let result = export_fixture();
+        let transposed = ResultView::transpose_result(&result);
+        // One label column plus one column per original row.
+        assert_eq!(transposed.columns, vec!["column", "1", "2"]);
+        // One row per original column.
+        assert_eq!(transposed.rows.len(), 2);
+        assert_eq!(
+            transposed.rows[0],
+            vec![
+                Some("id".to_string()),
+                Some("1".to_string()),
+                Some("2".to_string())
+            ]
+        );
+        assert_eq!(
+            transposed.rows[1],
+            vec![
+                Some("name".to_string()),
+                Some("Alice".to_string()),
+                Some("Bob".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn chart_series_extracts_numeric_pairs_and_skips_non_numeric() {
+        let result = QueryResult {
+            columns: vec!["label".to_string(), "value".to_string()],
+            rows: vec![
+                vec![Some("a".to_string()), Some("10".to_string())],
+                vec![Some("b".to_string()), None],
+                vec![Some("c".to_string()), Some("not-a-number".to_string())],
+                vec![Some("d".to_string()), Some("4.5".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let series = ResultView::chart_series(&result, Some(0), 1);
+        assert_eq!(
+            series,
+            vec![("a".to_string(), 10.0), ("d".to_string(), 4.5)]
+        );
+
+        // Without a label column the row number is used.
+        let by_index = ResultView::chart_series(&result, None, 1);
+        assert_eq!(by_index[0].0, "1");
+        assert_eq!(by_index[1].0, "4");
+    }
+
+    #[test]
+    fn series_bounds_pins_baseline_to_zero() {
+        let series = vec![("a".to_string(), 3.0), ("b".to_string(), 8.0)];
+        assert_eq!(ResultView::series_bounds(&series), Some((0.0, 8.0)));
+
+        // Negative values lower the minimum below zero.
+        let negative = vec![("a".to_string(), -2.0), ("b".to_string(), 5.0)];
+        assert_eq!(ResultView::series_bounds(&negative), Some((-2.0, 5.0)));
+
+        assert_eq!(ResultView::series_bounds(&[]), None);
+    }
+
+    #[test]
+    fn first_numeric_column_finds_numeric() {
+        let result = export_fixture();
+        // Column 0 (id) is numeric; column 1 (name) is not.
+        assert_eq!(ResultView::first_numeric_column(&result), Some(0));
+    }
+
+    #[gpui::test]
+    fn toggle_chart_opens_and_picks_numeric_column(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.set_result(export_fixture(), cx);
+            view
+        });
+        window
+            .update(cx, |view, _window, cx| {
+                assert!(!view.chart_open);
+                view.toggle_chart(cx);
+                assert!(view.chart_open);
+                assert_eq!(view.chart_value_column, Some(0));
+                view.toggle_chart(cx);
+                assert!(!view.chart_open);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn open_export_dialog_toggles_state(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("test", cx);
+            view.set_result(export_fixture(), cx);
+            view
+        });
+        window
+            .update(cx, |view, _window, cx| {
+                assert!(!view.export_dialog_open);
+                view.open_export_dialog(cx);
+                assert!(view.export_dialog_open);
+                view.open_export_dialog(cx);
+                assert!(!view.export_dialog_open);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -9575,9 +10582,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn build_pending_statements_emits_delete_update_insert_in_order(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn build_pending_statements_emits_delete_update_insert_in_order(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, cx| {
@@ -9590,8 +10595,10 @@ mod tests {
                 },
             );
             view.deleted_rows.insert(2);
-            view.added_rows
-                .push(vec![CellValue::Text("9".to_string()), CellValue::Text("Zed".to_string())]);
+            view.added_rows.push(vec![
+                CellValue::Text("9".to_string()),
+                CellValue::Text("Zed".to_string()),
+            ]);
 
             let statements = view
                 .build_pending_statements(cx)
@@ -9616,9 +10623,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn build_pending_statements_without_primary_key_reports_error(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn build_pending_statements_without_primary_key_reports_error(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, cx| {
@@ -9635,9 +10640,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn transaction_mode_toggle_switches_between_auto_and_manual(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn transaction_mode_toggle_switches_between_auto_and_manual(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, cx| {
@@ -9723,9 +10726,18 @@ mod tests {
             .read_from_clipboard()
             .and_then(|clipboard| clipboard.text())
             .expect("copy aggregation should write text to clipboard");
-        assert!(copied.starts_with("id"), "summary should name the column: {copied}");
-        assert!(copied.contains("COUNT 3"), "summary should include the count: {copied}");
-        assert!(copied.contains("SUM 6"), "summary should include the sum: {copied}");
+        assert!(
+            copied.starts_with("id"),
+            "summary should name the column: {copied}"
+        );
+        assert!(
+            copied.contains("COUNT 3"),
+            "summary should include the count: {copied}"
+        );
+        assert!(
+            copied.contains("SUM 6"),
+            "summary should include the sum: {copied}"
+        );
     }
 
     #[gpui::test]
