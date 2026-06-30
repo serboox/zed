@@ -1948,10 +1948,13 @@ impl DatabasePanel {
     }
 
     fn go_to_ddl_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(node) = self.selected_tree_node.clone()
-            && let Some(table) = node.table
-        {
-            self.open_table_ddl(node.connection_id, node.database, table, window, cx);
+        if let Some(node) = self.selected_tree_node.clone() {
+            match node.table {
+                Some(table) => {
+                    self.open_table_ddl(node.connection_id, node.database, table, window, cx)
+                }
+                None => self.open_database_ddl(node.connection_id, node.database, window, cx),
+            }
         }
     }
 
@@ -1980,6 +1983,35 @@ impl DatabasePanel {
         let ddl_task = self
             .store
             .update(cx, |store, cx| store.get_table_ddl(id, database, table, cx));
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let ddl = ddl_task.await?;
+            this.update_in(cx, |panel, window, cx| {
+                Self::open_sql_query_with_text(
+                    workspace.clone(),
+                    panel.store.downgrade(),
+                    id,
+                    ddl,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_database_ddl(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ddl_task = self
+            .store
+            .update(cx, |store, cx| store.get_database_ddl(id, database, cx));
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             let ddl = ddl_task.await?;
@@ -3205,17 +3237,21 @@ impl DatabasePanel {
                         .hover(|s| s.bg(gpui::transparent_white()))
                         .on_click(cx.listener({
                             let db_name = db_name_for_click;
-                            move |this, _, _, cx| {
+                            move |this, event: &ClickEvent, window, cx| {
                                 this.selected_tree_node = Some(SelectedTreeNode {
                                     connection_id: id,
                                     database: db_name.clone(),
                                     table: None,
                                 });
-                                this.store.update(cx, |store, cx| {
-                                    store
-                                        .toggle_database_expanded(id, db_name.clone(), cx)
-                                        .detach_and_log_err(cx);
-                                });
+                                if event.modifiers().control && event.click_count() == 1 {
+                                    this.open_database_ddl(id, db_name.clone(), window, cx);
+                                } else if !event.modifiers().control {
+                                    this.store.update(cx, |store, cx| {
+                                        store
+                                            .toggle_database_expanded(id, db_name.clone(), cx)
+                                            .detach_and_log_err(cx);
+                                    });
+                                }
                             }
                         }))
                         .child(
@@ -3253,6 +3289,15 @@ impl DatabasePanel {
                                             let sql = format!("SELECT * FROM {db} LIMIT 1;");
                                             entity.update(cx, |panel, cx| {
                                                 Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
+                                            });
+                                        }
+                                    })
+                                    .entry("Go to DDL", None, {
+                                        let entity = entity.clone();
+                                        let db = db.clone();
+                                        move |window, cx| {
+                                            entity.update(cx, |panel, cx| {
+                                                panel.open_database_ddl(id, db.clone(), window, cx);
                                             });
                                         }
                                     })

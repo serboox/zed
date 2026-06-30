@@ -832,6 +832,21 @@ impl DatabaseStore {
         cx.background_spawn(async move { provider.get_table_ddl(&database, &table).await })
     }
 
+    pub fn get_database_ddl(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<String>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("Not connected")));
+        };
+        cx.background_spawn(async move { provider.get_database_ddl(&database).await })
+    }
+
     pub fn list_indexes(
         &mut self,
         id: ConnectionId,

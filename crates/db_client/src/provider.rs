@@ -15,6 +15,10 @@ pub trait DbProvider: Send + Sync {
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
 
+    async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        Ok(format!("CREATE DATABASE {database};\n"))
+    }
+
     async fn list_views(&self, _database: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }

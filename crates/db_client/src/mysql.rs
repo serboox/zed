@@ -263,6 +263,18 @@ impl DbProvider for MySqlProvider {
             .context("Failed to read DDL from result")
     }
 
+    async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        let sql = format!("SHOW CREATE DATABASE `{}`", database.replace('`', "``"));
+        let row = sqlx::query(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to get database DDL")?;
+        row.try_get::<Vec<u8>, _>(1)
+            .map(bytes_to_string)
+            .or_else(|_| row.try_get::<String, _>(1))
+            .context("Failed to read database DDL from result")
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         if !database.is_empty() {
             // USE must use the text protocol; MySQL rejects it in the
@@ -604,6 +616,24 @@ mod integration_tests {
         assert!(
             columns.iter().any(|c| c.name == "TABLE_NAME"),
             "TABLE_NAME column should exist"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_get_database_ddl() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let ddl = provider
+            .get_database_ddl("information_schema")
+            .await
+            .expect("Failed to get database DDL");
+        assert!(
+            ddl.to_uppercase().contains("CREATE DATABASE"),
+            "DDL should contain CREATE DATABASE, got: {ddl}"
         );
     }
 

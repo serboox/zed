@@ -106,6 +106,10 @@ impl DbProvider for SqliteProvider {
         Ok(columns)
     }
 
+    async fn get_database_ddl(&self, _database: &str) -> Result<String> {
+        Ok("-- SQLite databases are files; there is no CREATE DATABASE statement.\n".to_string())
+    }
+
     async fn get_table_ddl(&self, _database: &str, table: &str) -> Result<String> {
         let row = sqlx::query_as::<_, (Option<String>,)>(
             "-- name: GetTableDDL :one

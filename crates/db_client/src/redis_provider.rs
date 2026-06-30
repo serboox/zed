@@ -325,6 +325,10 @@ impl DbProvider for RedisProvider {
         }
     }
 
+    async fn get_database_ddl(&self, _database: &str) -> Result<String> {
+        Ok("-- Redis is schemaless; there is no CREATE DATABASE statement.\n".to_string())
+    }
+
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
         let mut conn = self.connection().await?;
 
