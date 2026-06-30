@@ -25,24 +25,93 @@ fn store(cx: &App) -> Result<gpui::Entity<DatabaseStore>> {
     DatabaseStore::global(cx).ok_or_else(no_store_message)
 }
 
-/// Read-only guard: only statements that just read data are allowed for the
-/// agent. A `WITH` CTE that ends in a DML statement is not detected here, so
-/// it is allowed by the leading keyword — writes are otherwise blocked.
-fn is_read_only_sql(sql: &str) -> bool {
-    let mut rest = sql.trim_start();
-    while rest.starts_with("--") {
-        let line_end = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
-        rest = rest[line_end..].trim_start();
+const READ_ONLY_STARTERS: [&str; 7] = [
+    "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "USE",
+];
+
+const WRITE_KEYWORDS: [&str; 17] = [
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "TRUNCATE", "DROP", "ALTER", "CREATE",
+    "RENAME", "GRANT", "REVOKE", "SET", "CALL", "LOAD", "IMPORT", "COPY",
+];
+
+/// Splits SQL into uppercased word tokens, skipping line/block comments and the
+/// contents of quoted strings and identifiers, so a keyword is only reported
+/// when it is a real SQL keyword and not text inside a literal or an identifier.
+fn sql_word_tokens(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' || byte == b'`' {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current).to_ascii_uppercase());
+            }
+            let quote = byte;
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' && (quote == b'\'' || quote == b'"') {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == quote {
+                    // A doubled quote is an escaped quote that stays inside the string.
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        let character = byte as char;
+        if character.is_ascii_alphanumeric() || character == '_' {
+            current.push(character);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current).to_ascii_uppercase());
+        }
+        index += 1;
     }
-    let keyword: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    matches!(
-        keyword.as_str(),
-        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
-    )
+    if !current.is_empty() {
+        tokens.push(current.to_ascii_uppercase());
+    }
+    tokens
+}
+
+/// Read-only guard for the agent: the statement must start with a read-only
+/// keyword and contain no data- or schema-modifying keyword anywhere, so a
+/// `WITH ... DELETE` data-modifying CTE or a chained write is rejected. Keywords
+/// inside quotes or comments are ignored. Anything unrecognized is rejected too,
+/// which is the safe default for a read-only agent.
+fn is_read_only_sql(sql: &str) -> bool {
+    let tokens = sql_word_tokens(sql);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    if !READ_ONLY_STARTERS.contains(&first.as_str()) {
+        return false;
+    }
+    !tokens
+        .iter()
+        .any(|token| WRITE_KEYWORDS.contains(&token.as_str()))
 }
 
 fn format_connections(summaries: &[(String, String, String)]) -> String {
@@ -239,6 +308,35 @@ mod tests {
         assert!(!is_read_only_sql("ALTER TABLE t ADD c INT"));
         assert!(!is_read_only_sql("TRUNCATE t"));
         assert!(!is_read_only_sql("CREATE TABLE t (a INT)"));
+    }
+
+    #[test]
+    fn read_only_sql_rejects_data_modifying_cte_and_chained_writes() {
+        // A data-modifying CTE starts with WITH but must still be rejected.
+        assert!(!is_read_only_sql(
+            "WITH t AS (DELETE FROM a RETURNING id) SELECT * FROM t"
+        ));
+        assert!(!is_read_only_sql(
+            "WITH t AS (INSERT INTO a VALUES (1) RETURNING id) SELECT * FROM t"
+        ));
+        // A read-only CTE is still allowed.
+        assert!(is_read_only_sql("WITH t AS (SELECT 1) SELECT * FROM t"));
+        // A write chained after a read is rejected.
+        assert!(!is_read_only_sql("SELECT * FROM t; DROP TABLE x"));
+        assert!(!is_read_only_sql("USE db; UPDATE t SET a = 1"));
+        // Unrecognized leading keyword is rejected (safe default).
+        assert!(!is_read_only_sql("VACUUM"));
+        assert!(!is_read_only_sql("PRAGMA writable_schema = 1"));
+    }
+
+    #[test]
+    fn read_only_sql_ignores_keywords_inside_quotes_and_comments() {
+        // DML keywords inside string literals or quoted identifiers are not keywords.
+        assert!(is_read_only_sql("SELECT 'DROP TABLE x' AS note"));
+        assert!(is_read_only_sql("SELECT \"DELETE\" FROM t"));
+        assert!(is_read_only_sql("SELECT `update` FROM t"));
+        assert!(is_read_only_sql("SELECT /* DROP TABLE x */ 1"));
+        assert!(is_read_only_sql("USE analytics"));
     }
 
     #[test]

@@ -1158,6 +1158,8 @@
           "copy_path": true,
           "create_directory": true,
           "create_thread": true,
+          "db_list_connections": true,
+          "db_run_query": true,
           "delete_path": true,
           "diagnostics": true,
           "apply_code_action": true,
@@ -1186,6 +1188,8 @@
         // "enable_all_context_servers": true,
         "tools": {
           "create_thread": true,
+          "db_list_connections": true,
+          "db_run_query": true,
           "diagnostics": true,
           "fetch": true,
           "list_agents_and_models": true,
