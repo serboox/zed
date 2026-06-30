@@ -4,6 +4,33 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub type ConnectionId = Uuid;
+pub type FolderId = Uuid;
+
+/// Maximum nesting depth for connection folders (root folder = depth 1).
+pub const MAX_FOLDER_DEPTH: usize = 5;
+
+/// A folder node in the connection tree. Folders hold only other folders and
+/// connections; `parent_id == None` means the folder sits at the top level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: FolderId,
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<FolderId>,
+    #[serde(default)]
+    pub order: i64,
+}
+
+impl Folder {
+    pub fn new(name: String, parent_id: Option<FolderId>, order: i64) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            parent_id,
+            order,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DatabaseDriver {
@@ -63,9 +90,16 @@ pub struct ConnectionConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_private_key_path: Option<String>,
-    /// Optional folder name for grouping in the connection tree. None = top level.
-    #[serde(default)]
+    /// Legacy flat folder name, kept only so old config files still load. New
+    /// code groups by `folder_id`; migration converts this into a `Folder`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// Parent folder, or `None` for a top-level connection.
+    #[serde(default)]
+    pub folder_id: Option<FolderId>,
+    /// Sort order within the parent folder (or the top level).
+    #[serde(default)]
+    pub order: i64,
     /// Optional hex color (e.g. `"#e74c3c"`) identifying the environment
     /// (LOCAL / STAGE / PROD). Shown as a colored circle next to the connection.
     #[serde(default)]
@@ -103,6 +137,8 @@ impl Default for ConnectionConfig {
             ssh_username: None,
             ssh_private_key_path: None,
             folder: None,
+            folder_id: None,
+            order: 0,
             env_color: None,
         }
     }

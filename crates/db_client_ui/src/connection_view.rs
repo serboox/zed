@@ -341,6 +341,8 @@ impl ConnectionView {
                 ssh_username,
                 ssh_private_key_path,
                 folder,
+                folder_id: None,
+                order: 0,
                 env_color,
             });
         }
@@ -379,6 +381,8 @@ impl ConnectionView {
             ssh_username,
             ssh_private_key_path,
             folder,
+            folder_id: None,
+            order: 0,
             env_color,
         })
     }

@@ -14,14 +14,16 @@ use crate::sql_completion_provider::install_on_editor;
 use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent};
 use collections::{HashMap, HashSet};
 use db_client::{
-    ConnectionConfig, ConnectionId, DatabaseDriver, ProcedureKind, QueryResult, schema::ColumnInfo,
+    ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
+    schema::ColumnInfo,
 };
 use editor::{Editor, EditorEvent, GotoDefinitionKind, SemanticsProvider, ToOffset};
 use futures::future::Shared;
 use gpui::{
-    App, AsyncWindowContext, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, px,
+    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    WeakEntity, Window, div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -611,45 +613,62 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
     statements
 }
 
-// Splits connections into the top-level group (folder == None) and named
-// folders. Both the top-level list and each folder's contents are sorted by
-// label (case-insensitive, then by id to keep duplicates stable); folders are
-// returned sorted by name. Returns indices into the input slice so callers can
-// render the original `ActiveConnection` without cloning here. Pure so the
-// grouping/sorting is unit-tested without the GPUI render path.
-fn group_connections_by_folder(
-    connections: &[ActiveConnection],
-) -> (Vec<usize>, Vec<(String, Vec<usize>)>) {
-    let mut top_level: Vec<usize> = Vec::new();
-    let mut folders: std::collections::BTreeMap<String, Vec<usize>> =
-        std::collections::BTreeMap::new();
+/// A node in the rendered connection tree. Folders nest other folders and
+/// connections; a connection node carries the index into the `connections`
+/// slice so the caller renders the original `ActiveConnection` without cloning.
+enum TreeNode {
+    Folder { folder: Folder, children: Vec<TreeNode> },
+    Connection { index: usize },
+}
 
-    for (index, connection) in connections.iter().enumerate() {
-        match connection.config.folder.as_deref() {
-            None => top_level.push(index),
-            Some(folder) if folder.trim().is_empty() => top_level.push(index),
-            Some(folder) => folders
-                .entry(folder.trim().to_string())
-                .or_default()
-                .push(index),
-        }
+// Builds the nested tree under `parent_id`: child folders first (sorted by
+// order, then name), then connections (sorted by order, then label). Pure so
+// the grouping/sorting is unit-tested without the GPUI render path. `depth`
+// bounds recursion so cyclic stored data cannot loop forever.
+fn build_folder_tree(
+    folders: &[Folder],
+    connections: &[ActiveConnection],
+    parent_id: Option<FolderId>,
+    depth: usize,
+) -> Vec<TreeNode> {
+    if depth > db_client::MAX_FOLDER_DEPTH {
+        return Vec::new();
+    }
+    let mut nodes: Vec<TreeNode> = Vec::new();
+
+    let mut child_folders: Vec<&Folder> =
+        folders.iter().filter(|f| f.parent_id == parent_id).collect();
+    child_folders.sort_by(|a, b| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    for folder in child_folders {
+        nodes.push(TreeNode::Folder {
+            folder: folder.clone(),
+            children: build_folder_tree(folders, connections, Some(folder.id), depth + 1),
+        });
     }
 
-    let sort_key = |index: &usize| -> (String, ConnectionId) {
-        let config = &connections[*index].config;
-        (config.label.to_lowercase(), config.id)
-    };
-    top_level.sort_by_key(sort_key);
-
-    let folders = folders
-        .into_iter()
-        .map(|(name, mut indices)| {
-            indices.sort_by_key(sort_key);
-            (name, indices)
-        })
+    let mut child_connections: Vec<usize> = connections
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.config.folder_id == parent_id)
+        .map(|(index, _)| index)
         .collect();
+    child_connections.sort_by(|a, b| {
+        let left = &connections[*a].config;
+        let right = &connections[*b].config;
+        left.order
+            .cmp(&right.order)
+            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for index in child_connections {
+        nodes.push(TreeNode::Connection { index });
+    }
 
-    (top_level, folders)
+    nodes
 }
 
 // A persistent .sql scratch file per connection, kept in the config dir so it
@@ -1340,7 +1359,9 @@ pub struct DatabasePanel {
     workspace: WeakEntity<Workspace>,
     history_expanded: bool,
     table_filter_editor: Entity<Editor>,
-    collapsed_folders: HashSet<String>,
+    collapsed_folders: HashSet<FolderId>,
+    editing_folder: Option<EditingFolder>,
+    drag_target: Option<DropTarget>,
     views_expanded: HashSet<(ConnectionId, String)>,
     table_indexes_expanded: HashSet<(ConnectionId, String, String)>,
     table_fks_expanded: HashSet<(ConnectionId, String, String)>,
@@ -1369,6 +1390,52 @@ struct SelectedTreeNode {
     connection_id: ConnectionId,
     database: String,
     table: Option<String>,
+}
+
+/// What is being dragged in the connection tree. Folders and connections are the
+/// only draggable items; both can be dropped onto a folder or the top level.
+#[derive(Clone, Copy)]
+enum DraggedDbItem {
+    Connection(ConnectionId),
+    Folder(FolderId),
+}
+
+/// The folder currently highlighted as a drop target, or the top level when the
+/// pointer is over empty panel space.
+#[derive(Clone, Copy, PartialEq)]
+enum DropTarget {
+    Folder(FolderId),
+    TopLevel,
+}
+
+/// Inline folder rename/create: an editor overlaid on the folder row. The
+/// subscription commits the name when the editor loses focus.
+struct EditingFolder {
+    id: FolderId,
+    editor: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+/// Drag image shown under the cursor while dragging a tree item.
+struct DraggedDbItemPreview {
+    label: SharedString,
+    icon: IconName,
+}
+
+impl Render for DraggedDbItemPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(Icon::new(self.icon).size(IconSize::Small).color(Color::Muted))
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
 }
 
 /// Pending second-table selection for the Compare Data flow: the user picked a
@@ -1447,6 +1514,8 @@ impl DatabasePanel {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
                     views_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
@@ -1516,35 +1585,158 @@ impl DatabasePanel {
             .log_err();
     }
 
-    fn toggle_folder_collapsed(&mut self, folder: &str, cx: &mut Context<Self>) {
-        if !self.collapsed_folders.remove(folder) {
-            self.collapsed_folders.insert(folder.to_string());
+    fn toggle_folder_collapsed(&mut self, folder: FolderId, cx: &mut Context<Self>) {
+        if !self.collapsed_folders.remove(&folder) {
+            self.collapsed_folders.insert(folder);
         }
         cx.notify();
     }
 
-    fn render_folder_header(
+    /// Creates a folder under `parent` and immediately opens its inline editor so
+    /// the name is typed in place (like creating a file in the project panel).
+    /// Silently rejected when nesting would exceed the depth limit.
+    fn start_new_folder(
+        &mut self,
+        parent: Option<FolderId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(parent) = parent {
+            self.collapsed_folders.remove(&parent);
+        }
+        let new_id = self
+            .store
+            .update(cx, |store, cx| store.add_folder("New Folder".into(), parent, cx));
+        if let Some(id) = new_id {
+            self.begin_folder_rename(id, "New Folder", window, cx);
+        }
+    }
+
+    fn begin_folder_rename(
+        &mut self,
+        id: FolderId,
+        current_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            let mut ed = Editor::single_line(window, cx);
+            ed.set_text(current_name, window, cx);
+            ed
+        });
+        let subscription = cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::Blurred) {
+                this.commit_folder_rename(cx);
+            }
+        });
+        let handle = editor.focus_handle(cx);
+        window.focus(&handle, cx);
+        self.editing_folder = Some(EditingFolder {
+            id,
+            editor,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn commit_folder_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing_folder.take() else {
+            return;
+        };
+        let name = editing.editor.read(cx).text(cx).trim().to_string();
+        // An empty name keeps the existing folder name rather than deleting it,
+        // so a stray Enter never destroys a folder.
+        if !name.is_empty() {
+            self.store
+                .update(cx, |store, cx| store.rename_folder(editing.id, name, cx));
+        }
+        cx.notify();
+    }
+
+    fn cancel_folder_rename(&mut self, cx: &mut Context<Self>) {
+        self.editing_folder = None;
+        cx.notify();
+    }
+
+    fn new_connection_in_folder(
         &self,
-        folder: SharedString,
+        folder: Option<FolderId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let view = cx.new(|cx| {
+                    ConnectionView::new(window, cx).with_on_confirm(move |mut config, cx| {
+                        config.folder_id = folder;
+                        store.update(cx, |store, cx| {
+                            store.add_connection(config, cx);
+                        });
+                    })
+                });
+                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+            })
+            .log_err();
+    }
+
+    fn drag_preview(
+        label: SharedString,
+        icon: IconName,
+        cx: &mut App,
+    ) -> Entity<DraggedDbItemPreview> {
+        cx.new(|_| DraggedDbItemPreview { label, icon })
+    }
+
+    /// Applies a drop of `item` onto `target`. Folders reparent (cycle and depth
+    /// are guarded by the store); connections move into the target folder.
+    fn handle_drop(&mut self, item: DraggedDbItem, target: DropTarget, cx: &mut Context<Self>) {
+        let folder = match target {
+            DropTarget::Folder(id) => Some(id),
+            DropTarget::TopLevel => None,
+        };
+        self.drag_target = None;
+        self.store.update(cx, |store, cx| match item {
+            DraggedDbItem::Connection(id) => store.move_connection_to_folder(id, folder, cx),
+            DraggedDbItem::Folder(id) => {
+                store.move_folder(id, folder, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn render_folder_row(
+        &self,
+        folder: &Folder,
+        depth: usize,
         is_collapsed: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let folder_for_click = folder.to_string();
-        div()
+    ) -> AnyElement {
+        let folder_id = folder.id;
+        let name = folder.name.clone();
+        let entity = cx.entity();
+        let is_drop_target = self.drag_target == Some(DropTarget::Folder(folder_id));
+        let editing = self
+            .editing_folder
+            .as_ref()
+            .filter(|editing| editing.id == folder_id)
+            .map(|editing| editing.editor.clone());
+
+        let mut row = h_flex()
             .id(ElementId::from(SharedString::from(format!(
-                "folder-header-{folder}"
+                "folder-row-{folder_id}"
             ))))
-            .flex()
-            .flex_row()
+            .w_full()
             .items_center()
             .gap_1()
-            .px_2()
-            .py_1()
-            .cursor_pointer()
-            .hover(|style| style.bg(gpui::transparent_white()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_folder_collapsed(&folder_for_click, cx);
-            }))
+            .py_0p5()
+            .pr_2()
+            .pl(px(8. + depth as f32 * 12.))
+            .rounded_sm()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .when(is_drop_target, |el| {
+                el.bg(cx.theme().colors().drop_target_background)
+            })
             .child(
                 Icon::new(if is_collapsed {
                     IconName::ChevronRight
@@ -1562,8 +1754,91 @@ impl DatabasePanel {
                 })
                 .size(IconSize::Small)
                 .color(Color::Muted),
-            )
-            .child(Label::new(folder).size(LabelSize::Small))
+            );
+
+        if let Some(editor) = editing {
+            row = row.child(
+                div()
+                    .flex_1()
+                    .key_context("DbFolderRename")
+                    .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
+                        this.commit_folder_rename(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+                        this.cancel_folder_rename(cx);
+                    }))
+                    .child(editor),
+            );
+            return row.into_any_element();
+        }
+
+        let row = row
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_folder_collapsed(folder_id, cx);
+            }))
+            .on_drag(DraggedDbItem::Folder(folder_id), {
+                let name = name.clone();
+                move |_, _, _, cx| Self::drag_preview(name.clone().into(), IconName::Folder, cx)
+            })
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+                    if event.bounds.contains(&event.event.position)
+                        && this.drag_target != Some(DropTarget::Folder(folder_id))
+                    {
+                        this.drag_target = Some(DropTarget::Folder(folder_id));
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
+                this.handle_drop(*item, DropTarget::Folder(folder_id), cx);
+            }))
+            .child(Label::new(name.clone()).size(LabelSize::Small));
+
+        right_click_menu(ElementId::from(SharedString::from(format!(
+            "folder-menu-{folder_id}"
+        ))))
+        .trigger(move |_, _, _| row)
+        .menu(move |window, cx| {
+            let entity = entity.clone();
+            let name = name.clone();
+            ContextMenu::build(window, cx, move |menu, _, _| {
+                menu.entry("New Subfolder", None, {
+                    let entity = entity.clone();
+                    move |window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.start_new_folder(Some(folder_id), window, cx);
+                        });
+                    }
+                })
+                .entry("New Connection", None, {
+                    let entity = entity.clone();
+                    move |window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.new_connection_in_folder(Some(folder_id), window, cx);
+                        });
+                    }
+                })
+                .separator()
+                .entry("Rename", None, {
+                    let entity = entity.clone();
+                    move |window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.begin_folder_rename(folder_id, &name, window, cx);
+                        });
+                    }
+                })
+                .entry("Delete Folder", None, move |_, cx| {
+                    entity.update(cx, |panel, cx| {
+                        panel
+                            .store
+                            .update(cx, |store, cx| store.remove_folder(folder_id, cx));
+                    });
+                })
+            })
+        })
+        .into_any_element()
     }
 
     fn open_sql_query_with_text(
@@ -2584,9 +2859,13 @@ impl DatabasePanel {
     fn render_connection_item(
         &self,
         conn: ActiveConnection,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = conn.config.id;
+        let indent = px(8. + depth as f32 * 12.);
+        let connection_folder = conn.config.folder_id;
+        let drag_label: SharedString = conn.config.label.clone().into();
         let label = conn.config.label.clone();
         let query_label = conn.config.label.clone();
         let driver_label = conn.config.driver.to_string();
@@ -2642,10 +2921,12 @@ impl DatabasePanel {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .px_2()
+                    .pr_2()
+                    .pl(indent)
                     .py_1()
-                    .hover(|style| style.bg(gpui::transparent_white()))
-                    .when(is_active, |el| el.bg(gpui::transparent_black()))
+                    .rounded_sm()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .when(is_active, |el| el.bg(cx.theme().colors().element_selected))
                     .when(is_connected, |el| {
                         el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
                             this.store.update(cx, |store, cx| {
@@ -2653,6 +2934,16 @@ impl DatabasePanel {
                             });
                         }))
                     })
+                    .on_drag(DraggedDbItem::Connection(id), move |_, _, _, cx| {
+                        Self::drag_preview(drag_label.clone(), IconName::DatabaseZap, cx)
+                    })
+                    .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
+                        let target = match connection_folder {
+                            Some(folder_id) => DropTarget::Folder(folder_id),
+                            None => DropTarget::TopLevel,
+                        };
+                        this.handle_drop(*item, target, cx);
+                    }))
                     .child(
                         h_flex()
                             .gap_1()
@@ -2742,6 +3033,26 @@ impl DatabasePanel {
                                 })),
                         )
                     })
+                    .child(
+                        IconButton::new(SharedString::from(format!("move-up-{}", id)), IconName::ChevronUp)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Move Up"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |store, cx| {
+                                    store.reorder_connection(id, -1, cx);
+                                });
+                            })),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("move-down-{}", id)), IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Move Down"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |store, cx| {
+                                    store.reorder_connection(id, 1, cx);
+                                });
+                            })),
+                    )
                     .child(
                         IconButton::new(SharedString::from(format!("edit-conn-{}", id)), IconName::Pencil)
                             .icon_size(IconSize::XSmall)
@@ -4058,33 +4369,106 @@ impl DatabasePanel {
     }
 }
 
+impl DatabasePanel {
+    /// Recursively renders folder and connection rows, indenting by `depth`.
+    /// Collapsed folders skip their children.
+    fn render_tree_nodes(
+        &self,
+        nodes: Vec<TreeNode>,
+        connections: &[ActiveConnection],
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut elements = Vec::new();
+        for node in nodes {
+            match node {
+                TreeNode::Folder { folder, children } => {
+                    let is_collapsed = self.collapsed_folders.contains(&folder.id);
+                    elements.push(self.render_folder_row(&folder, depth, is_collapsed, cx));
+                    if !is_collapsed {
+                        elements.extend(
+                            self.render_tree_nodes(children, connections, depth + 1, cx),
+                        );
+                    }
+                }
+                TreeNode::Connection { index } => {
+                    if let Some(conn) = connections.get(index) {
+                        elements.push(
+                            self.render_connection_item(conn.clone(), depth, cx)
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+        elements
+    }
+
+    /// Right-click target covering the tree and the empty space below it, so a
+    /// click on blank panel space offers New Folder / New Connection at the top
+    /// level, and a drop there moves the item out of any folder.
+    fn render_tree_background(
+        &self,
+        tree_elements: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity();
+        let is_top_level_target = self.drag_target == Some(DropTarget::TopLevel);
+        let background = v_flex()
+            .id("db-tree-background")
+            .size_full()
+            .min_h_full()
+            .when(is_top_level_target, |el| {
+                el.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+                    if event.bounds.contains(&event.event.position)
+                        && this.drag_target != Some(DropTarget::TopLevel)
+                    {
+                        this.drag_target = Some(DropTarget::TopLevel);
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, item: &DraggedDbItem, _, cx| {
+                this.handle_drop(*item, DropTarget::TopLevel, cx);
+            }))
+            .children(tree_elements);
+
+        right_click_menu(ElementId::from("db-tree-background-menu"))
+            .trigger(move |_, _, _| background)
+            .menu(move |window, cx| {
+                let entity = entity.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("New Folder", None, {
+                        let entity = entity.clone();
+                        move |window, cx| {
+                            entity.update(cx, |panel, cx| {
+                                panel.start_new_folder(None, window, cx);
+                            });
+                        }
+                    })
+                    .entry("New Connection", None, move |window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.new_connection_in_folder(None, window, cx);
+                        });
+                    })
+                })
+            })
+            .into_any_element()
+    }
+}
+
 impl Render for DatabasePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connections: Vec<ActiveConnection> =
             self.store.read(cx).connections().iter().cloned().collect();
-
-        let (top_level, folders) = group_connections_by_folder(&connections);
-
-        let mut tree = v_flex().flex_col();
-        for index in top_level {
-            if let Some(conn) = connections.get(index) {
-                tree = tree.child(self.render_connection_item(conn.clone(), cx));
-            }
-        }
-        for (folder, indices) in folders {
-            let is_collapsed = self.collapsed_folders.contains(&folder);
-            tree = tree.child(self.render_folder_header(folder.into(), is_collapsed, cx));
-            if is_collapsed {
-                continue;
-            }
-            let mut group = v_flex().flex_col().pl(px(12.));
-            for index in indices {
-                if let Some(conn) = connections.get(index) {
-                    group = group.child(self.render_connection_item(conn.clone(), cx));
-                }
-            }
-            tree = tree.child(group);
-        }
+        let folders: Vec<Folder> = self.store.read(cx).folders().to_vec();
+        let nodes = build_folder_tree(&folders, &connections, None, 1);
+        let tree_elements = self.render_tree_nodes(nodes, &connections, 0, cx);
+        let tree_background = self.render_tree_background(tree_elements, cx);
+        let is_empty = connections.is_empty() && folders.is_empty();
 
         v_flex()
             .key_context("DatabasePanel")
@@ -4110,9 +4494,9 @@ impl Render for DatabasePanel {
                     .id("db-panel-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .child(tree),
+                    .child(tree_background),
             )
-            .when(self.store.read(cx).connections().is_empty(), |el| {
+            .when(is_empty, |el| {
                 el.child(
                     div()
                         .flex()
@@ -4133,7 +4517,7 @@ impl Render for DatabasePanel {
                                 .color(Color::Muted),
                         )
                         .child(
-                            Label::new("Click + to add a connection")
+                            Label::new("Right-click to add a folder or connection")
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         ),
@@ -4588,10 +4972,15 @@ mod tests {
         );
     }
 
-    fn connection_with(label: &str, folder: Option<&str>) -> ActiveConnection {
+    fn connection_in(
+        label: &str,
+        folder_id: Option<FolderId>,
+        order: i64,
+    ) -> ActiveConnection {
         let config = db_client::ConnectionConfig {
             label: label.to_string(),
-            folder: folder.map(|f| f.to_string()),
+            folder_id,
+            order,
             auto_connect: false,
             ..Default::default()
         };
@@ -4612,71 +5001,73 @@ mod tests {
     }
 
     #[test]
-    fn group_connections_splits_top_level_and_folders() {
+    fn build_folder_tree_nests_folders_first_then_sorted_connections() {
+        let work = Folder::new("Work".into(), None, 0);
+        let personal = Folder::new("Personal".into(), None, 1);
+        let sub = Folder::new("Sub".into(), Some(work.id), 0);
+        let work_id = work.id;
+        let sub_id = sub.id;
+        let folders = vec![work, personal, sub];
         let connections = vec![
-            connection_with("Beta", None),
-            connection_with("alpha", None),
-            connection_with("Staging DB", Some("Work")),
-            connection_with("Prod DB", Some("Work")),
-            connection_with("Scratch", Some("Personal")),
+            connection_in("beta", None, 1),
+            connection_in("alpha", None, 0),
+            connection_in("inner", Some(sub_id), 0),
+            connection_in("w1", Some(work_id), 5),
         ];
 
-        let (top_level, folders) = super::group_connections_by_folder(&connections);
+        let nodes = super::build_folder_tree(&folders, &connections, None, 1);
 
-        // Top level is sorted case-insensitively by label.
-        let top_labels: Vec<&str> = top_level
+        // Folders come first, ordered by `order`: Work then Personal.
+        assert!(matches!(&nodes[0], TreeNode::Folder { folder, .. } if folder.name == "Work"));
+        assert!(matches!(&nodes[1], TreeNode::Folder { folder, .. } if folder.name == "Personal"));
+        // Then top-level connections, ordered by `order`: alpha (0) then beta (1).
+        let labels: Vec<&str> = nodes[2..]
             .iter()
-            .map(|i| connections[*i].config.label.as_str())
+            .filter_map(|node| match node {
+                TreeNode::Connection { index } => Some(connections[*index].config.label.as_str()),
+                _ => None,
+            })
             .collect();
-        assert_eq!(top_labels, vec!["alpha", "Beta"]);
+        assert_eq!(labels, vec!["alpha", "beta"]);
 
-        // Folders are returned sorted by name.
-        let folder_names: Vec<&str> = folders.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(folder_names, vec!["Personal", "Work"]);
-
-        // Connections inside a folder are sorted by label.
-        let work = &folders
-            .iter()
-            .find(|(name, _)| name == "Work")
-            .expect("Work folder must be present")
-            .1;
-        let work_labels: Vec<&str> = work
-            .iter()
-            .map(|i| connections[*i].config.label.as_str())
-            .collect();
-        assert_eq!(work_labels, vec!["Prod DB", "Staging DB"]);
-    }
-
-    #[test]
-    fn group_connections_treats_blank_folder_as_top_level() {
-        let connections = vec![
-            connection_with("Only", Some("   ")),
-            connection_with("Other", None),
-        ];
-
-        let (top_level, folders) = super::group_connections_by_folder(&connections);
-
-        assert_eq!(
-            top_level.len(),
-            2,
-            "blank folder names fall back to top level"
+        // Work nests the Sub folder (which holds "inner") and connection "w1".
+        let TreeNode::Folder { children, .. } = &nodes[0] else {
+            panic!("expected Work folder");
+        };
+        assert!(matches!(&children[0], TreeNode::Folder { folder, .. } if folder.name == "Sub"));
+        let TreeNode::Folder {
+            children: sub_children,
+            ..
+        } = &children[0]
+        else {
+            panic!("expected Sub folder");
+        };
+        assert!(
+            matches!(&sub_children[0], TreeNode::Connection { index } if connections[*index].config.label == "inner")
         );
-        assert!(folders.is_empty());
     }
 
     #[test]
-    fn group_connections_trims_folder_names() {
-        let connections = vec![
-            connection_with("A", Some("  Work  ")),
-            connection_with("B", Some("Work")),
-        ];
+    fn build_folder_tree_stops_below_max_depth() {
+        // A chain deeper than the limit must not recurse forever; folders past
+        // MAX_FOLDER_DEPTH simply are not rendered.
+        let mut folders = Vec::new();
+        let mut parent = None;
+        for level in 0..(db_client::MAX_FOLDER_DEPTH + 2) {
+            let folder = Folder::new(format!("L{level}"), parent, 0);
+            parent = Some(folder.id);
+            folders.push(folder);
+        }
+        let connections: Vec<ActiveConnection> = Vec::new();
 
-        let (top_level, folders) = super::group_connections_by_folder(&connections);
-
-        assert!(top_level.is_empty());
-        assert_eq!(folders.len(), 1, "padded and exact folder names must merge");
-        assert_eq!(folders[0].0, "Work");
-        assert_eq!(folders[0].1.len(), 2);
+        let nodes = super::build_folder_tree(&folders, &connections, None, 1);
+        let mut depth = 0;
+        let mut current = nodes;
+        while let Some(TreeNode::Folder { children, .. }) = current.into_iter().next() {
+            depth += 1;
+            current = children;
+        }
+        assert_eq!(depth, db_client::MAX_FOLDER_DEPTH);
     }
 
     fn test_column(key: Option<&str>, is_nullable: bool) -> ColumnInfo {
@@ -4962,6 +5353,8 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
                     views_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
@@ -5120,6 +5513,8 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
                     views_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
@@ -5270,6 +5665,8 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
                     views_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
@@ -5488,6 +5885,8 @@ mod tests {
                 history_expanded: false,
                 table_filter_editor,
                 collapsed_folders: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
                 views_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
@@ -5534,6 +5933,97 @@ mod tests {
             Some("public.users"),
             "Quick Documentation must act on the selected tree node"
         );
+    }
+
+    #[gpui::test]
+    async fn new_folder_creates_and_renames_then_collapses(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                erd_view: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        // New Folder creates a folder and opens its inline editor.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_new_folder(None, window, cx);
+        });
+        let folder_id = store.read_with(cx, |store, _| {
+            assert_eq!(store.folders().len(), 1, "a folder must be created");
+            store.folders()[0].id
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.editing_folder.is_some(),
+                "the new folder opens its rename editor"
+            );
+        });
+
+        // Typing a name and committing renames the folder.
+        panel.update_in(cx, |panel, window, cx| {
+            if let Some(editing) = panel.editing_folder.as_ref() {
+                editing
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text("Production", window, cx));
+            }
+            panel.commit_folder_rename(cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.folders()[0].name, "Production");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.editing_folder.is_none(), "rename closes the editor");
+        });
+
+        // Collapsing and expanding toggles the folder's collapsed state.
+        panel.update(cx, |panel, cx| panel.toggle_folder_collapsed(folder_id, cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.collapsed_folders.contains(&folder_id));
+        });
+        panel.update(cx, |panel, cx| panel.toggle_folder_collapsed(folder_id, cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.collapsed_folders.contains(&folder_id));
+        });
     }
 
     #[gpui::test]
@@ -5827,6 +6317,8 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
                     views_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),

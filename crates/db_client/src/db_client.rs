@@ -9,7 +9,9 @@ pub mod schema;
 pub mod sqlite;
 pub mod ssh_tunnel;
 
-pub use connection::{ConnectionConfig, ConnectionId, DatabaseDriver};
+pub use connection::{
+    ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, MAX_FOLDER_DEPTH,
+};
 pub use provider::DbProvider;
 pub use runtime::{RuntimeProvider, on_runtime};
 pub use schema::{

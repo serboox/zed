@@ -1,6 +1,7 @@
 use anyhow::Result;
 use db_client::{
-    ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, RuntimeProvider, SshTunnel,
+    ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
+    RuntimeProvider, SshTunnel,
     clickhouse::ClickHouseProvider,
     mysql::MySqlProvider,
     on_runtime,
@@ -14,12 +15,67 @@ use db_client::{
 };
 use credentials_provider::CredentialsProvider;
 use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, Task, TaskExt as _};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
 const CONNECTIONS_FILE: &str = "db_connections.json";
+
+/// On-disk shape of the connection tree: the folder set plus the connections.
+/// Older config files held a bare `[ConnectionConfig]` array; `load_tree_from_disk`
+/// migrates those into this form.
+#[derive(Default, Serialize, Deserialize)]
+struct StoredTree {
+    #[serde(default)]
+    folders: Vec<Folder>,
+    #[serde(default)]
+    connections: Vec<ConnectionConfig>,
+}
+
+/// Parses the connection file in either the current object form or the legacy
+/// bare-array form, migrating legacy flat `folder` names into `Folder` records
+/// and assigning each connection a stable `folder_id`.
+fn parse_stored_tree(bytes: &[u8]) -> Result<StoredTree> {
+    if let Ok(tree) = serde_json::from_slice::<StoredTree>(bytes) {
+        return Ok(tree);
+    }
+    let mut connections: Vec<ConnectionConfig> = serde_json::from_slice(bytes)?;
+    Ok(migrate_legacy_connections(&mut connections))
+}
+
+/// Converts legacy flat `folder` strings into top-level `Folder` records and
+/// points each connection at the matching `folder_id`. The legacy field is
+/// cleared so it is not written back.
+fn migrate_legacy_connections(connections: &mut [ConnectionConfig]) -> StoredTree {
+    let mut folders: Vec<Folder> = Vec::new();
+    for config in connections.iter_mut() {
+        let Some(name) = config.folder.take() else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let id = folders
+            .iter()
+            .find(|folder| folder.name == name && folder.parent_id.is_none())
+            .map(|folder| folder.id)
+            .unwrap_or_else(|| {
+                let order = folders.len() as i64;
+                let folder = Folder::new(name.to_string(), None, order);
+                let id = folder.id;
+                folders.push(folder);
+                id
+            });
+        config.folder_id = Some(id);
+    }
+    StoredTree {
+        folders,
+        connections: connections.to_vec(),
+    }
+}
 
 /// Keychain key for a connection's password. The connection id keeps the entry
 /// stable across label/host edits.
@@ -111,6 +167,7 @@ pub enum DatabaseStoreEvent {
 
 pub struct DatabaseStore {
     pub connections: Vec<ActiveConnection>,
+    pub folders: Vec<Folder>,
     pub query_history: Vec<String>,
     pub active_connection_id: Option<ConnectionId>,
     ssh_tunnels: HashMap<ConnectionId, SshTunnel>,
@@ -125,9 +182,13 @@ impl DatabaseStore {
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
-                    .spawn(async { load_connections_from_disk() })
+                    .spawn(async { load_tree_from_disk() })
                     .await;
-                if let Ok(mut configs) = result {
+                if let Ok(StoredTree {
+                    folders,
+                    connections: mut configs,
+                }) = result
+                {
                     // Passwords are stored in the OS keychain, not the JSON. Read
                     // each one back before auto-connecting. A config that still
                     // carries a non-empty password is a legacy plaintext entry;
@@ -152,10 +213,11 @@ impl DatabaseStore {
                         .collect();
 
                     this.update(cx, |store, cx| {
+                        store.folders = folders;
                         for config in configs {
                             store.connections.push(ActiveConnection::new(config));
                         }
-                        if !store.connections.is_empty() {
+                        if !store.connections.is_empty() || !store.folders.is_empty() {
                             cx.emit(DatabaseStoreEvent::ConnectionsChanged);
                             cx.notify();
                         }
@@ -171,6 +233,7 @@ impl DatabaseStore {
 
         Self {
             connections: Vec::new(),
+            folders: Vec::new(),
             query_history: Vec::new(),
             active_connection_id: None,
             ssh_tunnels: HashMap::new(),
@@ -219,16 +282,21 @@ impl DatabaseStore {
         cx.notify();
     }
 
-    pub fn add_connection(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+    pub fn add_connection(&mut self, mut config: ConnectionConfig, cx: &mut Context<Self>) {
+        config.order = self.next_order_in(config.folder_id);
         self.connections.push(ActiveConnection::new(config));
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         self.persist_connections(cx);
     }
 
-    pub fn update_connection(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+    pub fn update_connection(&mut self, mut config: ConnectionConfig, cx: &mut Context<Self>) {
         let config_id = config.id;
         if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == config_id) {
+            // The edit form does not manage tree placement; keep the existing
+            // folder and order so editing a connection never moves it.
+            config.folder_id = conn.config.folder_id;
+            config.order = conn.config.order;
             *conn = ActiveConnection::new(config);
         } else {
             return;
@@ -267,8 +335,13 @@ impl DatabaseStore {
     }
 
     fn persist_connections(&self, cx: &mut Context<Self>) {
+        // Tests never touch the real config dir or OS keychain global.
+        if cfg!(test) {
+            return;
+        }
         let configs: Vec<ConnectionConfig> =
             self.connections.iter().map(|c| c.config.clone()).collect();
+        let folders = self.folders.clone();
         // Credentials I/O runs on the foreground (the keychain provider returns
         // non-Send futures); the JSON write is moved to a background thread.
         cx.spawn(async move |_this, cx| {
@@ -283,11 +356,246 @@ impl DatabaseStore {
             let redacted: Vec<ConnectionConfig> = configs.iter().map(redact_password).collect();
             cx.background_executor()
                 .spawn(async move {
-                    save_connections_to_disk(redacted).log_err();
+                    save_tree_to_disk(StoredTree {
+                        folders,
+                        connections: redacted,
+                    })
+                    .log_err();
                 })
                 .await;
         })
         .detach();
+    }
+
+    /// Depth of `folder_id` in the tree, where a top-level folder is depth 1.
+    /// Walks parents with a visited guard so a cycle in stored data cannot loop
+    /// forever. Returns 0 for an unknown id.
+    pub fn folder_depth(&self, folder_id: FolderId) -> usize {
+        let mut depth = 0;
+        let mut current = Some(folder_id);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                break;
+            }
+            let Some(folder) = self.folders.iter().find(|f| f.id == id) else {
+                break;
+            };
+            depth += 1;
+            current = folder.parent_id;
+        }
+        depth
+    }
+
+    /// Greatest depth contained within `folder_id`, counting the folder itself
+    /// as 1. Used to keep a moved subtree within `MAX_FOLDER_DEPTH`.
+    fn subtree_height(&self, folder_id: FolderId) -> usize {
+        let children: Vec<FolderId> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == Some(folder_id))
+            .map(|f| f.id)
+            .collect();
+        1 + children
+            .into_iter()
+            .map(|child| self.subtree_height(child))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// True when `folder_id` is `ancestor` or sits below it. Prevents moving a
+    /// folder into its own subtree (which would orphan the cycle).
+    fn is_descendant_of(&self, folder_id: FolderId, ancestor: FolderId) -> bool {
+        let mut current = Some(folder_id);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            if !visited.insert(id) {
+                break;
+            }
+            current = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent_id);
+        }
+        false
+    }
+
+    fn next_order_in(&self, parent_id: Option<FolderId>) -> i64 {
+        let max_folder = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == parent_id)
+            .map(|f| f.order)
+            .max();
+        let max_connection = self
+            .connections
+            .iter()
+            .filter(|c| c.config.folder_id == parent_id)
+            .map(|c| c.config.order)
+            .max();
+        max_folder.max(max_connection).map_or(0, |order| order + 1)
+    }
+
+    pub fn folders(&self) -> &[Folder] {
+        &self.folders
+    }
+
+    /// Creates a folder under `parent_id` and returns its id, or `None` when the
+    /// new folder would exceed `MAX_FOLDER_DEPTH`.
+    pub fn add_folder(
+        &mut self,
+        name: String,
+        parent_id: Option<FolderId>,
+        cx: &mut Context<Self>,
+    ) -> Option<FolderId> {
+        if let Some(parent) = parent_id {
+            if self.folder_depth(parent) >= MAX_FOLDER_DEPTH {
+                return None;
+            }
+        }
+        let order = self.next_order_in(parent_id);
+        let folder = Folder::new(name, parent_id, order);
+        let id = folder.id;
+        self.folders.push(folder);
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+        Some(id)
+    }
+
+    pub fn rename_folder(&mut self, id: FolderId, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) else {
+            return;
+        };
+        folder.name = trimmed.to_string();
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
+    /// Moves `id` under `new_parent`, rejecting the move when it would create a
+    /// cycle or push the subtree past `MAX_FOLDER_DEPTH`. Returns whether it ran.
+    pub fn move_folder(
+        &mut self,
+        id: FolderId,
+        new_parent: Option<FolderId>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if Some(id) == new_parent {
+            return false;
+        }
+        if let Some(parent) = new_parent {
+            if self.is_descendant_of(parent, id) {
+                return false;
+            }
+            if self.folder_depth(parent) + self.subtree_height(id) > MAX_FOLDER_DEPTH {
+                return false;
+            }
+        } else if self.subtree_height(id) > MAX_FOLDER_DEPTH {
+            return false;
+        }
+        let order = self.next_order_in(new_parent);
+        let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) else {
+            return false;
+        };
+        folder.parent_id = new_parent;
+        folder.order = order;
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+        true
+    }
+
+    /// Removes a folder, lifting its direct children and connections to the
+    /// folder's own parent rather than deleting them. Connections are never
+    /// destroyed by a folder delete.
+    pub fn remove_folder(&mut self, id: FolderId, cx: &mut Context<Self>) {
+        let Some(parent_id) = self.folders.iter().find(|f| f.id == id).map(|f| f.parent_id) else {
+            return;
+        };
+        for folder in self.folders.iter_mut() {
+            if folder.parent_id == Some(id) {
+                folder.parent_id = parent_id;
+            }
+        }
+        for conn in self.connections.iter_mut() {
+            if conn.config.folder_id == Some(id) {
+                conn.config.folder_id = parent_id;
+            }
+        }
+        self.folders.retain(|f| f.id != id);
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
+    pub fn move_connection_to_folder(
+        &mut self,
+        connection_id: ConnectionId,
+        folder_id: Option<FolderId>,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.next_order_in(folder_id);
+        let Some(conn) = self
+            .connections
+            .iter_mut()
+            .find(|c| c.config.id == connection_id)
+        else {
+            return;
+        };
+        conn.config.folder_id = folder_id;
+        conn.config.order = order;
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
+    /// Reorders `connection_id` within its current parent by swapping order with
+    /// the neighbor in `direction` (-1 up, +1 down). No-op at the boundary.
+    pub fn reorder_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        direction: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self
+            .connections
+            .iter()
+            .find(|c| c.config.id == connection_id)
+            .map(|c| (c.config.folder_id, c.config.order))
+        else {
+            return;
+        };
+        let (parent, order) = current;
+        let mut siblings: Vec<(ConnectionId, i64)> = self
+            .connections
+            .iter()
+            .filter(|c| c.config.folder_id == parent)
+            .map(|c| (c.config.id, c.config.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings.iter().position(|(id, _)| *id == connection_id) else {
+            return;
+        };
+        let target = position as i64 + direction;
+        if target < 0 || target as usize >= siblings.len() {
+            return;
+        }
+        let (neighbor_id, neighbor_order) = siblings[target as usize];
+        for conn in self.connections.iter_mut() {
+            if conn.config.id == connection_id {
+                conn.config.order = neighbor_order;
+            } else if conn.config.id == neighbor_id {
+                conn.config.order = order;
+            }
+        }
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
     }
 
     pub fn connect(&mut self, id: ConnectionId, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -710,13 +1018,13 @@ fn connections_file_path() -> std::path::PathBuf {
     paths::config_dir().join(CONNECTIONS_FILE)
 }
 
-fn load_connections_from_disk() -> Result<Vec<ConnectionConfig>> {
+fn load_tree_from_disk() -> Result<StoredTree> {
     let bytes = std::fs::read(connections_file_path())?;
-    Ok(serde_json::from_slice(&bytes)?)
+    parse_stored_tree(&bytes)
 }
 
-fn save_connections_to_disk(configs: Vec<ConnectionConfig>) -> Result<()> {
-    let json = serde_json::to_vec_pretty(&configs)?;
+fn save_tree_to_disk(tree: StoredTree) -> Result<()> {
+    let json = serde_json::to_vec_pretty(&tree)?;
     std::fs::write(connections_file_path(), json)?;
     Ok(())
 }
@@ -778,6 +1086,126 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    fn config_in(folder_id: Option<FolderId>, order: i64) -> ConnectionConfig {
+        ConnectionConfig {
+            folder_id,
+            order,
+            ..ConnectionConfig::default()
+        }
+    }
+
+    #[test]
+    fn migrates_legacy_flat_folders_into_folder_records() {
+        let mut a = ConnectionConfig::default();
+        a.folder = Some("Work".to_string());
+        let mut b = ConnectionConfig::default();
+        b.folder = Some("Work".to_string());
+        let mut c = ConnectionConfig::default();
+        c.folder = Some("  ".to_string());
+        let mut connections = vec![a, b, c];
+
+        let tree = migrate_legacy_connections(&mut connections);
+
+        // Two connections share one "Work" folder; the blank folder is dropped.
+        assert_eq!(tree.folders.len(), 1);
+        assert_eq!(tree.folders[0].name, "Work");
+        assert!(tree.folders[0].parent_id.is_none());
+        let folder_id = tree.folders[0].id;
+        assert_eq!(tree.connections[0].folder_id, Some(folder_id));
+        assert_eq!(tree.connections[1].folder_id, Some(folder_id));
+        assert_eq!(tree.connections[2].folder_id, None);
+        // The legacy field is cleared so it is not written back.
+        assert!(tree.connections[0].folder.is_none());
+    }
+
+    #[test]
+    fn parses_both_legacy_array_and_object_forms() {
+        let legacy = br#"[{"id":"00000000-0000-0000-0000-000000000001","label":"x","driver":"MySQL","host":"h","port":3306,"username":"u","password":"","folder":"F"}]"#;
+        let tree = parse_stored_tree(legacy).expect("legacy parse");
+        assert_eq!(tree.connections.len(), 1);
+        assert_eq!(tree.folders.len(), 1);
+
+        let object = br#"{"folders":[],"connections":[]}"#;
+        let tree = parse_stored_tree(object).expect("object parse");
+        assert!(tree.connections.is_empty());
+        assert!(tree.folders.is_empty());
+    }
+
+    #[gpui::test]
+    fn folder_depth_and_guards(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let root = store.add_folder("root".into(), None, cx).expect("root");
+            let level2 = store.add_folder("l2".into(), Some(root), cx).expect("l2");
+            let level3 = store.add_folder("l3".into(), Some(level2), cx).expect("l3");
+            let level4 = store.add_folder("l4".into(), Some(level3), cx).expect("l4");
+            let level5 = store.add_folder("l5".into(), Some(level4), cx).expect("l5");
+            assert_eq!(store.folder_depth(level5), 5);
+            // A sixth level exceeds MAX_FOLDER_DEPTH and is rejected.
+            assert!(store.add_folder("l6".into(), Some(level5), cx).is_none());
+            // Moving an ancestor into its own descendant is rejected (cycle).
+            assert!(!store.move_folder(root, Some(level3), cx));
+            // Moving a leaf to the top level is allowed.
+            assert!(store.move_folder(level5, None, cx));
+            assert_eq!(store.folder_depth(level5), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn move_and_reorder_connections(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let folder = store.add_folder("f".into(), None, cx).expect("folder");
+            let first = config_in(None, 0);
+            let second = config_in(None, 1);
+            let first_id = first.id;
+            let second_id = second.id;
+            store.connections.push(ActiveConnection::new(first));
+            store.connections.push(ActiveConnection::new(second));
+
+            store.move_connection_to_folder(first_id, Some(folder), cx);
+            let moved = store
+                .connections
+                .iter()
+                .find(|c| c.config.id == first_id)
+                .expect("conn");
+            assert_eq!(moved.config.folder_id, Some(folder));
+
+            // second is now alone at top level; reordering up is a no-op.
+            store.reorder_connection(second_id, -1, cx);
+            let order = store
+                .connections
+                .iter()
+                .find(|c| c.config.id == second_id)
+                .expect("conn")
+                .config
+                .order;
+            assert_eq!(order, 1);
+        });
+    }
+
+    #[gpui::test]
+    fn remove_folder_lifts_children_to_parent(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let parent = store.add_folder("parent".into(), None, cx).expect("parent");
+            let child = store.add_folder("child".into(), Some(parent), cx).expect("child");
+            let conn = config_in(Some(child), 0);
+            let conn_id = conn.id;
+            store.connections.push(ActiveConnection::new(conn));
+
+            store.remove_folder(child, cx);
+            // The connection is preserved and lifted to the child's parent.
+            let lifted = store
+                .connections
+                .iter()
+                .find(|c| c.config.id == conn_id)
+                .expect("conn");
+            assert_eq!(lifted.config.folder_id, Some(parent));
+            assert!(store.folders.iter().all(|f| f.id != child));
+        });
     }
 
     #[test]
