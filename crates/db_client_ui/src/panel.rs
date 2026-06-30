@@ -7308,6 +7308,61 @@ mod tests {
         );
     }
 
+    // Regression guard for Ctrl+click on table names: the SQL console editor must
+    // actually carry the `DbSemanticsProvider` after `install_db_editor_features`
+    // runs, otherwise the editor's go-to-definition path never calls
+    // `definitions()` and the click does nothing. The earlier test only exercised
+    // a hand-built provider; this one drives the real install entry point.
+    #[gpui::test]
+    async fn install_db_editor_features_sets_semantics_provider(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("SELECT * FROM instruments.splits", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            })
+        });
+
+        assert!(
+            editor.read_with(cx, |editor, _| editor.semantics_provider().is_none()),
+            "no DB semantics provider before install"
+        );
+
+        cx.update(|_window, cx| {
+            install_db_editor_features(editor.clone(), store.downgrade(), workspace.downgrade(), cx);
+        });
+
+        assert!(
+            editor.read_with(cx, |editor, _| editor.semantics_provider().is_some()),
+            "console editor must carry the DbSemanticsProvider so Ctrl+click resolves DDL"
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
