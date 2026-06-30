@@ -1639,6 +1639,7 @@ impl DatabasePanel {
     ) -> anyhow::Result<Entity<Self>> {
         let result = workspace.update_in(&mut cx, |workspace, window, cx| {
             let store = cx.new(|cx| DatabaseStore::new(cx));
+            cx.set_global(crate::store::GlobalDatabaseStore(store.clone()));
             let focus_handle = cx.focus_handle();
             let workspace_entity = cx.entity();
             let workspace_handle = workspace.weak_handle();

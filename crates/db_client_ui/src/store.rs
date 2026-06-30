@@ -14,7 +14,7 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
-use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, Task, TaskExt as _};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Task, TaskExt as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -173,6 +173,22 @@ pub struct DatabaseStore {
     ssh_tunnels: HashMap<ConnectionId, SshTunnel>,
 }
 
+/// App-global handle to the single workspace `DatabaseStore`, set when the
+/// Database Explorer panel initializes. Lets non-UI callers (CLI, agent tools)
+/// reach the live connections.
+pub struct GlobalDatabaseStore(pub Entity<DatabaseStore>);
+
+impl Global for GlobalDatabaseStore {}
+
+/// Plain query result handed to non-UI callers (CLI, agent tools), free of any
+/// `db_client` types so the consuming crates need not depend on it.
+pub struct CliQueryOutput {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub rows_affected: u64,
+    pub execution_time_ms: u64,
+}
+
 impl DatabaseStore {
     pub fn new(cx: &mut Context<Self>) -> Self {
         // Skip disk load under test: it would read the user's real config dir
@@ -246,6 +262,71 @@ impl DatabaseStore {
 
     pub fn active_connection_id(&self) -> Option<ConnectionId> {
         self.active_connection_id
+    }
+
+    /// Returns the app-global store handle if the Database Explorer panel has
+    /// been initialized. External callers (CLI handler, agent tools) reach the
+    /// store through here rather than the workspace-scoped panel.
+    pub fn global(cx: &App) -> Option<Entity<DatabaseStore>> {
+        cx.try_global::<GlobalDatabaseStore>().map(|g| g.0.clone())
+    }
+
+    /// Saved connections as `(id, label, driver)` tuples, without credentials.
+    /// Used by the CLI/agent surfaces that must never expose passwords.
+    pub fn connection_summaries(&self) -> Vec<(String, String, String)> {
+        self.connections
+            .iter()
+            .map(|c| {
+                (
+                    c.config.id.to_string(),
+                    c.config.label.clone(),
+                    c.config.driver.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Resolves `connection` (a connection id or its label), connects if the
+    /// provider is not live yet, then runs `sql`. Used by the CLI handler and
+    /// agent tools so they share one execution path with the panel.
+    pub fn run_query_for_cli(
+        &mut self,
+        connection: String,
+        database: Option<String>,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CliQueryOutput>> {
+        let Some(conn) = self
+            .connections
+            .iter()
+            .find(|c| c.config.id.to_string() == connection || c.config.label == connection)
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "No database connection matching '{connection}'"
+            )));
+        };
+        let id = conn.config.id;
+        let already_connected = conn.provider.is_some();
+        let database = database
+            .filter(|database| !database.is_empty())
+            .or_else(|| conn.config.database.clone())
+            .unwrap_or_default();
+
+        cx.spawn(async move |this, cx| {
+            if !already_connected {
+                let connect_task = this.update(cx, |store, cx| store.connect(id, cx))?;
+                connect_task.await?;
+            }
+            let query_task =
+                this.update(cx, |store, cx| store.execute_query(id, database, sql, cx))?;
+            let result = query_task.await?;
+            Ok(CliQueryOutput {
+                columns: result.columns,
+                rows: result.rows,
+                rows_affected: result.rows_affected,
+                execution_time_ms: result.execution_time_ms,
+            })
+        })
     }
 
     pub fn active_connection(&self) -> Option<&ActiveConnection> {
@@ -1568,5 +1649,76 @@ mod tests {
             assert!(conn.expanded_databases.is_empty());
             assert!(conn.expanded_tables.is_empty());
         });
+    }
+
+    struct CliMockProvider;
+
+    #[async_trait::async_trait]
+    impl DbProvider for CliMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: vec!["n".into()],
+                rows: vec![vec![Some("1".into())]],
+                rows_affected: 0,
+                execution_time_ms: 7,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[gpui::test]
+    fn global_store_is_set_and_retrievable(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        cx.update(|cx| assert!(DatabaseStore::global(cx).is_none()));
+        cx.update(|cx| cx.set_global(GlobalDatabaseStore(store.clone())));
+        cx.update(|cx| {
+            assert_eq!(
+                DatabaseStore::global(cx).map(|s| s.entity_id()),
+                Some(store.entity_id())
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn run_query_for_cli_resolves_by_id_and_label(cx: &mut gpui::TestAppContext) {
+        let mut config = ConnectionConfig::default();
+        config.label = "primary".into();
+        let id = config.id;
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(CliMockProvider), cx);
+            let summaries = store.connection_summaries();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].0, id.to_string());
+            assert_eq!(summaries[0].1, "primary");
+        });
+
+        for connection in [id.to_string(), "primary".to_string()] {
+            let task = store.update(cx, |store, cx| {
+                store.run_query_for_cli(connection, None, "SELECT 1".into(), cx)
+            });
+            let output = task.await.expect("query runs through the cli path");
+            assert_eq!(output.columns, vec!["n".to_string()]);
+            assert_eq!(output.rows, vec![vec![Some("1".to_string())]]);
+            assert_eq!(output.execution_time_ms, 7);
+        }
     }
 }

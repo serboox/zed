@@ -13,7 +13,7 @@ use crate::completions::Shell;
 
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory, Parser};
-use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
+use cli::{CliRequest, CliResponse, DbConnectionSummary, IpcHandshake, ipc::IpcOneShotServer};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -420,6 +420,45 @@ mod tests {
         .unwrap();
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_db_query_args_parse() {
+        let args = DbArgs::try_parse_from(["query", "-c", "primary", "SELECT 1"]).unwrap();
+        match args.command {
+            DbCommand::Query {
+                connection,
+                database,
+                json,
+                sql,
+            } => {
+                assert_eq!(connection, "primary");
+                assert_eq!(database, None);
+                assert!(!json);
+                assert_eq!(sql, "SELECT 1");
+            }
+            _ => panic!("expected query"),
+        }
+
+        let args =
+            DbArgs::try_parse_from(["query", "-c", "p", "-d", "shop", "--json", "SELECT 1"])
+                .unwrap();
+        match args.command {
+            DbCommand::Query { database, json, .. } => {
+                assert_eq!(database.as_deref(), Some("shop"));
+                assert!(json);
+            }
+            _ => panic!("expected query"),
+        }
+
+        let args = DbArgs::try_parse_from(["list-connections"]).unwrap();
+        assert!(matches!(args.command, DbCommand::ListConnections));
+    }
+
+    #[test]
+    fn test_cell_display_renders_null() {
+        assert_eq!(cell_display(&Some("x".to_string())), "x");
+        assert_eq!(cell_display(&None), "NULL");
+    }
 }
 
 fn parse_path_in_wsl(source: &str, wsl: &str) -> Result<String> {
@@ -501,6 +540,16 @@ fn run() -> Result<()> {
     if let Ok(socket) = std::env::var("ZED_ASKPASS_SOCKET") {
         askpass::main_from_args(&socket, std::env::args().skip(1));
         return Ok(());
+    }
+
+    // `zed db ...` runs a SQL query against a saved connection by RPC-ing into
+    // the running Zed instance. Intercepted before the main arg parser, whose
+    // trailing-var-arg `paths` would otherwise swallow the subcommand.
+    {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if raw_args.get(1).map(String::as_str) == Some("db") {
+            return run_db_command(&raw_args[2..]);
+        }
     }
 
     let args = Args::parse();
@@ -740,6 +789,7 @@ fn run() -> Result<()> {
                                 .unwrap_or(cli::CliBehaviorSetting::ExistingWindow);
                             tx.send(CliRequest::SetOpenBehavior { behavior })?;
                         }
+                        CliResponse::QueryResult { .. } | CliResponse::Connections { .. } => {}
                     }
                 }
 
@@ -789,6 +839,217 @@ fn run() -> Result<()> {
         std::process::exit(exit_status);
     }
     Ok(())
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "zed db", no_binary_name = true, about = "Query saved database connections")]
+struct DbArgs {
+    #[command(subcommand)]
+    command: DbCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum DbCommand {
+    /// Run a SQL query against a saved connection and print the result.
+    Query {
+        /// Connection id or label.
+        #[arg(short, long)]
+        connection: String,
+        /// Database/schema to run against (defaults to the connection's own).
+        #[arg(short, long)]
+        database: Option<String>,
+        /// Print rows as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// The SQL statement to run.
+        sql: String,
+    },
+    /// List the saved database connections.
+    ListConnections,
+}
+
+/// Handles `zed db …` by RPC-ing the request into a running Zed instance and
+/// printing the response. Requires the Database Explorer panel to have been
+/// opened in that instance (that is where the connections live).
+fn run_db_command(args: &[String]) -> Result<()> {
+    let db_args = DbArgs::try_parse_from(args)?;
+    let json = matches!(
+        db_args.command,
+        DbCommand::Query { json: true, .. }
+    );
+    let request = match db_args.command {
+        DbCommand::Query {
+            connection,
+            database,
+            sql,
+            ..
+        } => CliRequest::ExecuteQuery {
+            connection,
+            database,
+            sql,
+        },
+        DbCommand::ListConnections => CliRequest::ListConnections,
+    };
+
+    let app = Detect::detect(None).context("Bundle detection")?;
+    let (server, server_name) =
+        IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zed spawn")?;
+    let url = format!("zed-cli://{server_name}");
+
+    let exit_status = Arc::new(Mutex::new(None));
+    let sender: JoinHandle<anyhow::Result<()>> = thread::Builder::new()
+        .name("CliDbReceiver".to_string())
+        .spawn({
+            let exit_status = exit_status.clone();
+            move || {
+                let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
+                let (tx, rx) = (handshake.requests, handshake.responses);
+                tx.send(request)?;
+
+                while let Ok(response) = rx.recv() {
+                    match response {
+                        CliResponse::Ping | CliResponse::PromptOpenBehavior => {}
+                        CliResponse::Stdout { message } => println!("{message}"),
+                        CliResponse::Stderr { message } => eprintln!("{message}"),
+                        CliResponse::Exit { status } => {
+                            exit_status.lock().replace(status);
+                            return Ok(());
+                        }
+                        CliResponse::QueryResult {
+                            columns,
+                            rows,
+                            rows_affected,
+                            execution_time_ms,
+                        } => {
+                            if json {
+                                print_query_json(&columns, &rows)?;
+                            } else {
+                                print_query_result(
+                                    &columns,
+                                    &rows,
+                                    rows_affected,
+                                    execution_time_ms,
+                                );
+                            }
+                        }
+                        CliResponse::Connections { items } => print_connections(&items),
+                    }
+                }
+
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    app.launch(url, None)?;
+    sender.join().unwrap()?;
+
+    if let Some(status) = exit_status.lock().take() {
+        std::process::exit(status);
+    }
+    Ok(())
+}
+
+fn cell_display(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("NULL")
+}
+
+fn print_query_result(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    rows_affected: u64,
+    execution_time_ms: u64,
+) {
+    if columns.is_empty() {
+        println!("{rows_affected} row(s) affected in {execution_time_ms} ms");
+        return;
+    }
+
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell_display(cell).chars().count());
+            }
+        }
+    }
+
+    let separator = |widths: &[usize]| {
+        let parts: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
+        format!("+{}+", parts.join("+"))
+    };
+    let format_row = |cells: Vec<String>| {
+        let parts: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| format!(" {:width$} ", cell, width = widths[index]))
+            .collect();
+        format!("|{}|", parts.join("|"))
+    };
+
+    println!("{}", separator(&widths));
+    println!("{}", format_row(columns.to_vec()));
+    println!("{}", separator(&widths));
+    for row in rows {
+        let cells: Vec<String> = (0..columns.len())
+            .map(|index| {
+                cell_display(row.get(index).unwrap_or(&None)).to_string()
+            })
+            .collect();
+        println!("{}", format_row(cells));
+    }
+    println!("{}", separator(&widths));
+    println!("{} row(s) in {execution_time_ms} ms", rows.len());
+}
+
+fn print_query_json(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<()> {
+    let objects: Vec<serde_json::Map<String, serde_json::Value>> = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let value = match row.get(index).and_then(|cell| cell.as_ref()) {
+                        Some(text) => serde_json::Value::String(text.clone()),
+                        None => serde_json::Value::Null,
+                    };
+                    (column.clone(), value)
+                })
+                .collect()
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&objects)?);
+    Ok(())
+}
+
+fn print_connections(items: &[DbConnectionSummary]) {
+    if items.is_empty() {
+        println!("No saved connections.");
+        return;
+    }
+    let id_width = items
+        .iter()
+        .map(|item| item.id.chars().count())
+        .chain(std::iter::once("ID".len()))
+        .max()
+        .unwrap_or(0);
+    let label_width = items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .chain(std::iter::once("LABEL".len()))
+        .max()
+        .unwrap_or(0);
+    println!(
+        "{:id_width$}  {:label_width$}  {}",
+        "ID", "LABEL", "DRIVER"
+    );
+    for item in items {
+        println!(
+            "{:id_width$}  {:label_width$}  {}",
+            item.id, item.label, item.driver
+        );
+    }
 }
 
 fn anonymous_fd(path: &str) -> Option<fs::File> {

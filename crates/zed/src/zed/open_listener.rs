@@ -2,7 +2,7 @@ use crate::handle_open_request;
 use crate::restore_or_create_workspace;
 use agent_ui::ExternalSourcePrompt;
 use anyhow::{Context as _, Result, anyhow};
-use cli::{CliRequest, CliResponse, CliResponseSink};
+use cli::{CliRequest, CliResponse, CliResponseSink, DbConnectionSummary};
 use cli::{IpcHandshake, ipc};
 use client::{ZedLink, parse_zed_link};
 use db::kvp::KeyValueStore;
@@ -643,8 +643,90 @@ pub async fn handle_cli_connection(
                 // resolve_open_behavior
                 debug_panic!("unexpected SetOpenBehavior message");
             }
+            CliRequest::ExecuteQuery {
+                connection,
+                database,
+                sql,
+            } => {
+                handle_execute_query(connection, database, sql, responses.as_ref(), cx).await;
+            }
+            CliRequest::ListConnections => {
+                handle_list_connections(responses.as_ref(), cx).await;
+            }
         }
     }
+}
+
+const DB_NOT_READY: &str =
+    "Database Explorer is not initialized. Open the Database Explorer panel in Zed first.";
+
+async fn handle_execute_query(
+    connection: String,
+    database: Option<String>,
+    sql: String,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let Some(store) = cx.update(|cx| db_client_ui::DatabaseStore::global(cx)) else {
+        responses
+            .send(CliResponse::Stderr {
+                message: DB_NOT_READY.to_string(),
+            })
+            .log_err();
+        responses.send(CliResponse::Exit { status: 1 }).log_err();
+        return;
+    };
+
+    let task = store.update(cx, |store, cx| {
+        store.run_query_for_cli(connection, database, sql, cx)
+    });
+    let result = task.await;
+
+    match result {
+        Ok(output) => {
+            responses
+                .send(CliResponse::QueryResult {
+                    columns: output.columns,
+                    rows: output.rows,
+                    rows_affected: output.rows_affected,
+                    execution_time_ms: output.execution_time_ms,
+                })
+                .log_err();
+            responses.send(CliResponse::Exit { status: 0 }).log_err();
+        }
+        Err(error) => {
+            responses
+                .send(CliResponse::Stderr {
+                    message: format!("{error}"),
+                })
+                .log_err();
+            responses.send(CliResponse::Exit { status: 1 }).log_err();
+        }
+    }
+}
+
+async fn handle_list_connections(responses: &dyn CliResponseSink, cx: &mut AsyncApp) {
+    let summaries = cx.update(|cx| {
+        db_client_ui::DatabaseStore::global(cx).map(|store| store.read(cx).connection_summaries())
+    });
+    let Some(summaries) = summaries else {
+        responses
+            .send(CliResponse::Stderr {
+                message: DB_NOT_READY.to_string(),
+            })
+            .log_err();
+        responses.send(CliResponse::Exit { status: 1 }).log_err();
+        return;
+    };
+
+    let items = summaries
+        .into_iter()
+        .map(|(id, label, driver)| DbConnectionSummary { id, label, driver })
+        .collect();
+    responses
+        .send(CliResponse::Connections { items })
+        .log_err();
+    responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
 /// Resolves the CLI open behavior when no explicit flag (`-n`, `-e`, `--reuse`)
@@ -2396,6 +2478,7 @@ mod tests {
                             .unbounded_send(CliRequest::SetOpenBehavior { behavior })
                             .map_err(|error| anyhow::anyhow!("{error}"))?;
                     }
+                    CliResponse::QueryResult { .. } | CliResponse::Connections { .. } => {}
                 }
             }
 

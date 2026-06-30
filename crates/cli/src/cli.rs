@@ -73,6 +73,23 @@ pub enum CliRequest {
     SetOpenBehavior {
         behavior: CliBehaviorSetting,
     },
+    /// Runs a SQL query against a saved database connection and returns the
+    /// result. `connection` is matched against a connection id or its label.
+    ExecuteQuery {
+        connection: String,
+        database: Option<String>,
+        sql: String,
+    },
+    /// Lists the saved database connections (no credentials).
+    ListConnections,
+}
+
+/// A saved database connection, without any credentials.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DbConnectionSummary {
+    pub id: String,
+    pub label: String,
+    pub driver: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +99,15 @@ pub enum CliResponse {
     Stderr { message: String },
     Exit { status: i32 },
     PromptOpenBehavior,
+    QueryResult {
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+        rows_affected: u64,
+        execution_time_ms: u64,
+    },
+    Connections {
+        items: Vec<DbConnectionSummary>,
+    },
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),
