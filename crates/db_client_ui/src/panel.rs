@@ -5,8 +5,7 @@ use crate::ddl_source::DdlSourceView;
 use crate::driver_icon::brand_icon;
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
-    ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
-    plan_text_from_result,
+    ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree, plan_text_from_result,
 };
 use crate::modify_table::ModifyTableView;
 use crate::native_dump::{
@@ -49,7 +48,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    Event as WorkspaceEvent, ItemHandle, OpenOptions, OpenVisible, Pane, Toast, Workspace,
+    Event as WorkspaceEvent, ItemHandle, ModalView, OpenOptions, OpenVisible, Pane, Toast,
+    Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::NotificationId,
 };
@@ -1517,8 +1517,6 @@ pub struct DatabasePanel {
     server_objects_expanded: HashSet<ConnectionId>,
     server_users: HashMap<ConnectionId, Vec<(String, String)>>,
     table_filter_is_regex: bool,
-    quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
-    explain_view: Option<Entity<ExplainPlanView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     selected_tree_node: Option<SelectedTreeNode>,
@@ -1631,6 +1629,86 @@ struct QueryParamsPrompt {
     inputs: Vec<(String, Entity<Editor>)>,
 }
 
+struct QuickDocView {
+    focus_handle: FocusHandle,
+    title: SharedString,
+    columns: Vec<ColumnInfo>,
+}
+
+impl QuickDocView {
+    fn new(
+        title: SharedString,
+        columns: Vec<ColumnInfo>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            title,
+            columns,
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for QuickDocView {}
+
+impl ModalView for QuickDocView {}
+
+impl Focusable for QuickDocView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for QuickDocView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = self
+            .columns
+            .iter()
+            .map(|col| {
+                let overlays = DatabasePanel::column_overlay_icons(col, false);
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .py_0p5()
+                    .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(col.data_type.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(
+                        overlays
+                            .into_iter()
+                            .map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
+                    )
+            })
+            .collect();
+        v_flex()
+            .key_context("QuickDoc")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(px(360.))
+            .max_h(px(480.))
+            .overflow_hidden()
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(crate::widgets::dialog_header(
+                self.title.clone(),
+                "quick-doc-close",
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+            ))
+            .child(
+                div()
+                    .id("quick-doc-body")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .py_1()
+                    .child(v_flex().children(rows)),
+            )
+    }
+}
+
 impl DatabasePanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -1703,8 +1781,6 @@ impl DatabasePanel {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    quick_doc: None,
-                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -2197,11 +2273,11 @@ impl DatabasePanel {
         }
     }
 
-    fn quick_doc_for_selection(&mut self, cx: &mut Context<Self>) {
+    fn quick_doc_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(node) = self.selected_tree_node.clone()
             && let Some(table) = node.table
         {
-            self.open_quick_doc(node.connection_id, node.database, table, cx);
+            self.open_quick_doc(node.connection_id, node.database, table, window, cx);
         }
     }
 
@@ -2275,19 +2351,23 @@ impl DatabasePanel {
         id: ConnectionId,
         database: String,
         table: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let title = SharedString::from(format!("{database}.{table}"));
         let task = self.store.update(cx, |store, cx| {
             store.describe_table(id, database, table, cx)
         });
-        cx.spawn(async move |this, cx| {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
             let columns = task.await.unwrap_or_default();
-            this.update(cx, |this, cx| {
-                this.quick_doc = Some((title, columns));
-                cx.notify();
-            })
-            .log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        QuickDocView::new(title.clone(), columns.clone(), window, cx)
+                    });
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -2538,7 +2618,8 @@ impl DatabasePanel {
     ) {
         let explain_sql = explain_sql_for_driver(driver, &sql);
         let store = self.store.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
             let connect = store.update(cx, |store, cx| store.connect(id, cx));
             connect.await.log_err();
             let task = store.update(cx, |store, cx| {
@@ -2552,19 +2633,12 @@ impl DatabasePanel {
                     children: Vec::new(),
                 }],
             };
-            this.update_in(cx, |panel, window, cx| {
-                let view = cx.new(|cx| ExplainPlanView::new(roots, window, cx));
-                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
-                    ExplainPlanEvent::Dismissed => {
-                        panel.explain_view = None;
-                        cx.notify();
-                    }
-                });
-                panel._subscriptions.push(subscription);
-                panel.explain_view = Some(view);
-                cx.notify();
-            })
-            .log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let view = cx.new(|cx| ExplainPlanView::new(roots, window, cx));
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -2911,66 +2985,6 @@ impl DatabasePanel {
                             })),
                     ),
             )
-    }
-
-    fn render_quick_doc_popup(
-        &self,
-        title: SharedString,
-        columns: &[ColumnInfo],
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let rows: Vec<_> =
-            columns
-                .iter()
-                .map(|col| {
-                    let is_fk = false;
-                    let overlays = Self::column_overlay_icons(col, is_fk);
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .py_0p5()
-                        .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
-                        .child(
-                            Label::new(col.data_type.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .children(overlays.into_iter().map(|(icon, color)| {
-                            Icon::new(icon).size(IconSize::XSmall).color(color)
-                        }))
-                })
-                .collect();
-        crate::widgets::popup_surface(cx)
-            .absolute()
-            .top_8()
-            .right_2()
-            .w(px(320.))
-            .max_h(px(420.))
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(Label::new(title).size(LabelSize::Small))
-                    .child(
-                        IconButton::new("quick-doc-close", IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Close"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.quick_doc = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(div().flex().flex_col().px_2().py_1().children(rows))
     }
 
     /// Decides whether a table name passes the explorer filter and, if so,
@@ -4123,9 +4137,9 @@ impl DatabasePanel {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
                                                         let tbl = tbl.clone();
-                                                        move |_window, cx| {
+                                                        move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
-                                                                panel.open_quick_doc(id, db.clone(), tbl.clone(), cx);
+                                                                panel.open_quick_doc(id, db.clone(), tbl.clone(), window, cx);
                                                             });
                                                         }
                                                     })
@@ -5203,8 +5217,8 @@ impl Render for DatabasePanel {
             .on_action(cx.listener(|this, _: &GoToDdl, window, cx| {
                 this.go_to_ddl_for_selection(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &QuickDocumentation, _, cx| {
-                this.quick_doc_for_selection(cx);
+            .on_action(cx.listener(|this, _: &QuickDocumentation, window, cx| {
+                this.quick_doc_for_selection(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowDiagram, window, cx| {
                 this.show_diagram_for_selection(window, cx);
@@ -5218,9 +5232,6 @@ impl Render for DatabasePanel {
                     this.deploy_panel_context_menu(event.position, window, cx);
                 }),
             ))
-            .when_some(self.quick_doc.clone(), |el, (title, columns)| {
-                el.child(self.render_quick_doc_popup(title, &columns, cx))
-            })
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -5268,20 +5279,6 @@ impl Render for DatabasePanel {
                         .justify_center()
                         .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
                         .child(self.render_query_params_popup(cx)),
-                )
-            })
-            .when_some(self.explain_view.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .p_8()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
                 )
             })
             .when(self.compare_pick.is_some(), |el| {
@@ -6088,8 +6085,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    quick_doc: None,
-                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6247,8 +6242,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    quick_doc: None,
-                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6398,8 +6391,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    quick_doc: None,
-                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6617,8 +6608,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6636,23 +6625,22 @@ mod tests {
         });
         cx.run_until_parked();
 
-        panel.update(cx, |panel, cx| {
+        panel.update_in(cx, |panel, window, cx| {
             panel.selected_tree_node = Some(SelectedTreeNode {
                 connection_id,
                 database: "public".to_string(),
                 table: Some("users".to_string()),
             });
-            panel.quick_doc_for_selection(cx);
+            panel.quick_doc_for_selection(window, cx);
         });
         cx.run_until_parked();
 
-        let title = panel.read_with(cx, |panel, _| {
-            panel.quick_doc.as_ref().map(|(title, _)| title.to_string())
+        let has_modal = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<QuickDocView>(cx).is_some()
         });
-        assert_eq!(
-            title.as_deref(),
-            Some("public.users"),
-            "Quick Documentation must act on the selected tree node"
+        assert!(
+            has_modal,
+            "Quick Documentation must open as a workspace modal for the selected tree node"
         );
     }
 
@@ -6697,8 +6685,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6814,8 +6800,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6893,8 +6877,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6999,8 +6981,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -7107,8 +7087,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                quick_doc: None,
-                explain_view: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -7526,8 +7504,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    quick_doc: None,
-                    explain_view: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -7727,19 +7703,28 @@ mod tests {
         };
         let connection_id = config.id;
         let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
 
-        panel.update(&mut cx, |panel, cx| {
-            panel.open_quick_doc(connection_id, "public".to_string(), "users".to_string(), cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_quick_doc(
+                connection_id,
+                "public".to_string(),
+                "users".to_string(),
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
-        panel.read_with(&cx, |panel, _| {
-            let (title, _columns) = panel
-                .quick_doc
-                .as_ref()
-                .expect("quick doc state must be set after opening it");
-            assert_eq!(title.as_ref(), "public.users");
+        let has_modal = workspace.read_with(&cx, |workspace, cx| {
+            workspace.active_modal::<QuickDocView>(cx).is_some()
         });
+        assert!(
+            has_modal,
+            "Quick Documentation must open as a workspace modal"
+        );
     }
 
     #[gpui::test]

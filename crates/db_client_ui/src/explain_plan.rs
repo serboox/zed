@@ -1,8 +1,9 @@
 use db_client::{DatabaseDriver, QueryResult};
-use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Window, div, px};
+use gpui::{App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Window, div, px};
 use std::collections::HashSet;
 use ui::prelude::*;
-use ui::{IconButton, IconName, IconSize, Label, LabelSize, h_flex, v_flex};
+use ui::{Icon, IconButton, IconName, IconSize, Label, LabelSize, h_flex, v_flex};
+use workspace::{Item, item::ItemEvent};
 
 /// One node of a query plan tree. `children` are the sub-operations nested under
 /// this node in the engine's EXPLAIN output.
@@ -188,6 +189,24 @@ impl ExplainPlanView {
 }
 
 impl EventEmitter<ExplainPlanEvent> for ExplainPlanView {}
+
+impl EventEmitter<DismissEvent> for ExplainPlanView {}
+
+impl Item for ExplainPlanView {
+    type Event = DismissEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Query Plan".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::ListTree))
+    }
+
+    fn to_item_events(_event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(ItemEvent::CloseItem);
+    }
+}
 
 impl Focusable for ExplainPlanView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
