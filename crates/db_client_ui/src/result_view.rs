@@ -2860,6 +2860,194 @@ impl ResultView {
         self.buffer_loaded_cell_value(abs_idx, col_idx, value, cx);
     }
 
+    // Writes a value into a single cell, routing to the added-row buffer or the
+    // loaded-row pending buffer. Shared by paste, cut, and range fills.
+    fn write_cell_value(
+        &mut self,
+        abs_idx: usize,
+        col_idx: usize,
+        value: CellValue,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded_count = self.loaded_row_count();
+        if abs_idx >= loaded_count {
+            let added_idx = abs_idx - loaded_count;
+            if let Some(cell) = self
+                .added_rows
+                .get_mut(added_idx)
+                .and_then(|row| row.get_mut(col_idx))
+            {
+                *cell = value;
+            }
+            return;
+        }
+        self.buffer_loaded_cell_value(abs_idx, col_idx, value, cx);
+    }
+
+    // Extends the selection from the active cell (the anchor) by moving the far
+    // corner, mirroring `move_active_cell`'s clamp model. The active cell stays
+    // put; Shift+Arrow grows/shrinks the rectangle (Excel range select).
+    fn extend_selection(&mut self, delta_col: i64, delta_row: i64, cx: &mut Context<Self>) {
+        let row_count = self.result.as_ref().map_or(0, |r| r.rows.len());
+        let vis_cols = self.visible_columns.clone();
+        if row_count == 0 || vis_cols.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.selected_cell else {
+            self.selected_cell = Some((0, vis_cols[0]));
+            cx.notify();
+            return;
+        };
+        let (end_abs, end_col) = self
+            .selected_cell_range
+            .map(|(_, end)| end)
+            .unwrap_or(anchor);
+        let new_abs = (end_abs as i64 + delta_row).clamp(0, row_count as i64 - 1) as usize;
+        let cur_vis = vis_cols.iter().position(|&c| c == end_col).unwrap_or(0);
+        let new_vis = (cur_vis as i64 + delta_col).clamp(0, vis_cols.len() as i64 - 1) as usize;
+        let new_end = (new_abs, vis_cols[new_vis]);
+        self.selected_cell_range = (new_end != anchor).then_some((anchor, new_end));
+        self.selected_rows.clear();
+        if let Some(display_idx) = self.display_idx_of(new_abs) {
+            self.scroll_handle
+                .scroll_to_item(display_idx, gpui::ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    // Selects every loaded cell (all display rows x all visible columns). The
+    // active cell becomes the top-left. Added rows are not included.
+    fn select_all_cells(&mut self, cx: &mut Context<Self>) {
+        let vis_cols = self.visible_columns.clone();
+        if vis_cols.is_empty() || self.filtered_display_order.is_empty() {
+            return;
+        }
+        let last_display = self.filtered_display_order.len() - 1;
+        let (Some(first_abs), Some(last_abs)) = (
+            self.abs_idx_at_display_idx(0),
+            self.abs_idx_at_display_idx(last_display),
+        ) else {
+            return;
+        };
+        let first_col = vis_cols[0];
+        let last_col = vis_cols[vis_cols.len() - 1];
+        self.selected_cell = Some((first_abs, first_col));
+        self.selected_cell_range = Some(((first_abs, first_col), (last_abs, last_col)));
+        self.selected_rows.clear();
+        cx.notify();
+    }
+
+    // Pastes clipboard text (TSV) starting at the active cell, filling right and
+    // down within the grid bounds. A single clipboard cell fills the whole
+    // current selection (Excel behaviour). No SQL runs; edits go to the buffer.
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.table_name.is_none() {
+            self.status_message = Some("Paste needs a table-backed result.".to_string());
+            cx.notify();
+            return;
+        }
+        let Some((anchor_abs, anchor_col)) = self.selected_cell else {
+            self.status_message = Some("Select a cell to paste into.".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let grid = Self::parse_tsv_grid(&text);
+        if grid.is_empty() {
+            return;
+        }
+        let vis_cols = self.visible_columns.clone();
+        let Some(anchor_vis) = vis_cols.iter().position(|&c| c == anchor_col) else {
+            return;
+        };
+        let col_count = self.result.as_ref().map_or(0, |r| r.columns.len());
+
+        // A single copied value fills the whole current selection.
+        if grid.len() == 1 && grid[0].len() == 1 && self.selected_cell_range.is_some() {
+            let value = grid[0][0].clone();
+            let rows = self.selected_display_rows_for_copy();
+            let cols: Vec<usize> = match self.selected_cell_range {
+                Some(((_, a), (_, b))) => {
+                    (a.min(b)..=a.max(b)).filter(|c| *c < col_count).collect()
+                }
+                None => vec![anchor_col],
+            };
+            for abs_idx in rows {
+                for &col in &cols {
+                    self.write_cell_value(abs_idx, col, CellValue::from_text(value.clone()), cx);
+                }
+            }
+            self.status_message = None;
+            cx.notify();
+            return;
+        }
+
+        let Some(anchor_display) = self.display_idx_of(anchor_abs) else {
+            return;
+        };
+        for (row_offset, row) in grid.iter().enumerate() {
+            let Some(target_abs) = self.abs_idx_at_display_idx(anchor_display + row_offset) else {
+                continue;
+            };
+            for (col_offset, value) in row.iter().enumerate() {
+                let Some(&col) = vis_cols.get(anchor_vis + col_offset) else {
+                    continue;
+                };
+                self.write_cell_value(target_abs, col, CellValue::from_text(value.clone()), cx);
+            }
+        }
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Copies the selection (like Ctrl+C) then clears those cells to empty.
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if self.table_name.is_none() {
+            self.status_message = Some("Cut needs a table-backed result.".to_string());
+            cx.notify();
+            return;
+        }
+        self.copy_selected_to_clipboard(cx);
+        let rows = self.selected_display_rows_for_copy();
+        let col_count = self.result.as_ref().map_or(0, |r| r.columns.len());
+        let cols: Vec<usize> = if !self.selected_rows.is_empty() {
+            (0..col_count).collect()
+        } else if let Some(((_, a), (_, b))) = self.selected_cell_range {
+            (a.min(b)..=a.max(b)).filter(|c| *c < col_count).collect()
+        } else if let Some((_, col)) = self.selected_cell {
+            vec![col]
+        } else {
+            Vec::new()
+        };
+        for abs_idx in rows {
+            for &col in &cols {
+                self.write_cell_value(abs_idx, col, CellValue::from_text(String::new()), cx);
+            }
+        }
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Parses clipboard TSV into a row-major grid. Splits on newlines then tabs;
+    // embedded tabs/newlines inside Excel-style quoted cells are not unquoted.
+    fn parse_tsv_grid(text: &str) -> Vec<Vec<String>> {
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        if body.is_empty() {
+            return Vec::new();
+        }
+        body.split('\n')
+            .map(|line| {
+                line.strip_suffix('\r')
+                    .unwrap_or(line)
+                    .split('\t')
+                    .map(|cell| cell.to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
     // True for a table-backed result that can receive row operations. INSERT
     // needs only the table; DELETE additionally needs a usable primary key,
     // which the submit-time guard enforces per row.
@@ -4713,6 +4901,7 @@ impl ResultView {
             return div().into_any_element();
         };
         let selection_bg = cx.theme().colors().element_selected;
+        let active_cell_border = cx.theme().colors().border_focused;
         let search_match_bg = cx.theme().colors().search_match_background;
         let active_line_bg = cx.theme().colors().editor_active_line_background;
         let row_selected_bg = cx.theme().colors().editor_highlighted_line_background;
@@ -4853,6 +5042,9 @@ impl ResultView {
                 })
                 .when(is_selected, |this| this.bg(selection_bg))
                 .when(is_deleted, |this| this.bg(deleted_bg))
+                .when(self.selected_cell == Some((abs_idx, cell_idx)), |this| {
+                    this.border_1().border_color(active_cell_border)
+                })
                 .when(
                     !is_selected && !is_find_match && !is_modified && !is_deleted,
                     |this| this.hover(move |style| style.bg(cell_hover_bg)),
@@ -5153,6 +5345,7 @@ impl ResultView {
         };
         let abs_idx = self.loaded_row_count() + added_idx;
         let selection_bg = cx.theme().colors().element_selected;
+        let active_cell_border = cx.theme().colors().border_focused;
         let column_count = self
             .result
             .as_ref()
@@ -5253,6 +5446,9 @@ impl ResultView {
                     .border_color(grid_border)
                     .overflow_hidden()
                     .when(is_selected, |this| this.bg(selection_bg))
+                    .when(self.selected_cell == Some((abs_idx, cell_idx)), |this| {
+                        this.border_1().border_color(active_cell_border)
+                    })
                     .when(!is_selected, |this| {
                         this.hover(move |style| style.bg(cell_hover_bg))
                     })
@@ -8929,7 +9125,47 @@ impl Render for ResultView {
                 let plain = !modifiers.modified();
                 let only_shift =
                     modifiers.shift && !modifiers.control && !modifiers.platform && !modifiers.alt;
+                // Primary shortcut modifier: Ctrl on Linux/Windows, Cmd on macOS.
+                let primary = (modifiers.control || modifiers.platform)
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && !modifiers.function;
                 match keystroke.key.as_str() {
+                    "up" if only_shift => {
+                        this.extend_selection(0, -1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "down" if only_shift => {
+                        this.extend_selection(0, 1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "left" if only_shift => {
+                        this.extend_selection(-1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "right" if only_shift => {
+                        this.extend_selection(1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "a" if primary => {
+                        this.select_all_cells(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "v" if primary => {
+                        this.paste_from_clipboard(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "x" if primary => {
+                        this.cut_selection(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     "f2" if plain => {
                         this.begin_edit_active_cell(CellEditEntry::CursorEnd, window, cx);
                         cx.stop_propagation();
@@ -10751,6 +10987,166 @@ mod tests {
                     .map(|edit| edit.editor.read(cx).text(cx)),
                 Some("9".to_string()),
                 "type-to-replace must overwrite the cell with the typed text"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_tsv_grid_splits_rows_and_columns() {
+        assert_eq!(
+            ResultView::parse_tsv_grid("a\tb\nc\td"),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()],
+            ]
+        );
+        // A trailing newline is dropped, not turned into an empty row.
+        assert_eq!(
+            ResultView::parse_tsv_grid("a\tb\n"),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+        // CRLF line endings (Excel on Windows) parse the same as LF.
+        assert_eq!(
+            ResultView::parse_tsv_grid("a\tb\r\nc\td"),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()],
+            ]
+        );
+        assert!(ResultView::parse_tsv_grid("").is_empty());
+    }
+
+    #[gpui::test]
+    fn keyboard_shift_arrow_extends_selection(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("shift-right");
+        cx.simulate_keystrokes("shift-down");
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((0, 0)),
+                "the active cell stays put while Shift+Arrow grows the range"
+            );
+            assert_eq!(view.selected_cell_range, Some(((0, 0), (1, 1))));
+        });
+
+        // Shrinking back onto the anchor collapses the range.
+        cx.simulate_keystrokes("shift-up");
+        cx.simulate_keystrokes("shift-left");
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 0)));
+            assert_eq!(
+                view.selected_cell_range, None,
+                "collapsing onto the anchor clears the range"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn select_all_cells_covers_whole_grid(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.select_all_cells(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((0, 0)),
+                "select-all anchors the active cell at the top-left"
+            );
+            assert_eq!(view.selected_cell_range, Some(((0, 0), (2, 1))));
+        });
+    }
+
+    #[gpui::test]
+    fn paste_single_value_fills_selection(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let last_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        cx.simulate_click(last_cell, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("Z".to_string())));
+        view.update(&mut cx, |view, cx| view.paste_from_clipboard(cx));
+
+        view.update(&mut cx, |view, _| {
+            for &(row, col) in &[(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                assert_eq!(
+                    view.pending_cell_value(row, col),
+                    Some(&CellValue::Text("Z".to_string())),
+                    "a single copied value must fill every selected cell ({row},{col})"
+                );
+            }
+            assert_eq!(
+                view.pending_cell_value(2, 0),
+                None,
+                "cells outside the selection must stay untouched"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn paste_grid_fills_right_and_down(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("X\tY\nZ\tW".to_string()))
+        });
+        view.update(&mut cx, |view, cx| view.paste_from_clipboard(cx));
+
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 0),
+                Some(&CellValue::Text("X".to_string()))
+            );
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Y".to_string()))
+            );
+            assert_eq!(
+                view.pending_cell_value(1, 0),
+                Some(&CellValue::Text("Z".to_string()))
+            );
+            assert_eq!(
+                view.pending_cell_value(1, 1),
+                Some(&CellValue::Text("W".to_string()))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cut_selection_copies_then_clears(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.cut_selection(cx));
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("cut should write the cut value to the clipboard");
+        assert!(
+            copied.contains("Alice"),
+            "cut must copy the value before clearing it, got {copied:?}"
+        );
+
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text(String::new())),
+                "cut must clear the cut cell to an empty value"
             );
         });
     }
