@@ -2,7 +2,7 @@ use crate::store::DatabaseStore;
 use db_client::schema::TableKind;
 use db_client::{ConnectionId, DatabaseDriver};
 use editor::{CompletionContext, CompletionProvider, Editor};
-use gpui::{App, Context, Entity, Task, WeakEntity, Window};
+use gpui::{App, Context, Entity, Hsla, Task, WeakEntity, Window};
 use language::{Anchor, Buffer, CodeLabel, ToOffset};
 use project::lsp_store::CompletionDocumentation;
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
@@ -10,6 +10,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use theme::ActiveTheme as _;
+use ui::IconName;
 use util::ResultExt as _;
 
 const CORE_KEYWORDS: &[&str] = &[
@@ -134,6 +136,7 @@ enum ContextKind {
 struct TableRef {
     name: String,
     alias: Option<String>,
+    schema: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +144,7 @@ struct ParsedContext {
     qualifier: Option<String>,
     kind: ContextKind,
     tables_in_scope: Vec<TableRef>,
+    cte_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,14 +288,15 @@ fn parse_table_refs(statement: &str) -> Vec<TableRef> {
             if stop.contains(&upper.as_str()) || upper == "JOIN" || upper == "FROM" {
                 break;
             }
-            let name = strip_qualifier(raw);
+            let (schema, name) = split_qualified(raw);
             if name.is_empty() {
                 index += 1;
                 continue;
             }
             let mut table_ref = TableRef {
-                name: name.to_string(),
+                name,
                 alias: None,
+                schema,
             };
             // Optional alias: `table alias` or `table AS alias`.
             let mut look = index + 1;
@@ -321,36 +326,113 @@ fn parse_table_refs(statement: &str) -> Vec<TableRef> {
     refs
 }
 
-/// Drops a `schema.` prefix from a qualified name, keeping the final segment.
-fn strip_qualifier(raw: &str) -> &str {
-    raw.rsplit('.')
-        .next()
-        .unwrap_or(raw)
-        .trim_matches(|c: char| c == '`' || c == '"' || c == '(' || c == ')')
+/// Splits a possibly-qualified name into its schema (the segment before the
+/// last dot, if any) and the final name segment, trimming quotes and parens.
+fn split_qualified(raw: &str) -> (Option<String>, String) {
+    let trim = |s: &str| {
+        s.trim_matches(|c: char| c == '`' || c == '"' || c == '(' || c == ')')
+            .to_string()
+    };
+    match raw.rsplit_once('.') {
+        Some((schema, name)) => {
+            let schema = trim(schema);
+            (
+                if schema.is_empty() { None } else { Some(schema) },
+                trim(name),
+            )
+        }
+        None => (None, trim(raw)),
+    }
+}
+
+/// Byte index just after the innermost unmatched `(` before the cursor, so
+/// FROM/JOIN scoping prefers a subquery's tables over the outer query. Zero
+/// when the cursor is not inside an open parenthesis.
+fn innermost_scope_start(statement_before: &str) -> usize {
+    let mut open_stack: Vec<usize> = Vec::new();
+    for (index, ch) in statement_before.char_indices() {
+        if ch == '(' {
+            open_stack.push(index + ch.len_utf8());
+        } else if ch == ')' {
+            open_stack.pop();
+        }
+    }
+    open_stack.last().copied().unwrap_or(0)
+}
+
+/// Splits a statement into identifier tokens plus standalone `(` / `)` tokens.
+fn tokens_with_parens(statement: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in statement.chars() {
+        if is_identifier_char(ch) {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            if ch == '(' || ch == ')' {
+                tokens.push(ch.to_string());
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Names of common table expressions defined by a leading `WITH a AS (...), b
+/// AS (...)`, matched as an identifier directly followed by `AS (`.
+fn parse_cte_names(statement: &str) -> Vec<String> {
+    if !statement.trim_start().to_uppercase().starts_with("WITH") {
+        return Vec::new();
+    }
+    let tokens = tokens_with_parens(statement);
+    let mut names = Vec::new();
+    for window in tokens.windows(3) {
+        let [name, as_word, paren] = window else {
+            continue;
+        };
+        if as_word.eq_ignore_ascii_case("AS")
+            && paren == "("
+            && name.chars().all(is_identifier_char)
+            && !name.is_empty()
+            && !name.eq_ignore_ascii_case("WITH")
+            && !name.eq_ignore_ascii_case("RECURSIVE")
+        {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 fn parse_context(text_before: &str) -> ParsedContext {
     let statement = current_statement(text_before);
+    let scope = &statement[innermost_scope_start(statement)..];
     ParsedContext {
         qualifier: extract_qualifier(text_before),
         kind: clause_kind(statement),
-        tables_in_scope: parse_table_refs(statement),
+        tables_in_scope: parse_table_refs(scope),
+        cte_names: parse_cte_names(statement),
     }
 }
 
-/// Resolves a qualifier to a table name: an alias maps to its table, otherwise
-/// a direct table-name match maps to itself.
-fn resolve_table(qualifier: &str, tables: &[TableRef]) -> Option<String> {
-    if let Some(found) = tables
-        .iter()
-        .find(|t| t.alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(qualifier)))
-    {
-        return Some(found.name.clone());
-    }
+/// Resolves a qualifier to the referenced table: an alias maps to its table,
+/// otherwise a direct table-name match maps to itself.
+fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> Option<&'a TableRef> {
     tables
         .iter()
-        .find(|t| t.name.eq_ignore_ascii_case(qualifier))
-        .map(|t| t.name.clone())
+        .find(|t| {
+            t.alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
+        })
+        .or_else(|| tables.iter().find(|t| t.name.eq_ignore_ascii_case(qualifier)))
+}
+
+fn resolve_table(qualifier: &str, tables: &[TableRef]) -> Option<String> {
+    resolve_table_ref(qualifier, tables).map(|t| t.name.clone())
 }
 
 /// Pure candidate builder: turns a schema snapshot + parsed context + dialect
@@ -415,6 +497,13 @@ fn build_candidates(
                 items.push(CandidateItem {
                     text: name.clone(),
                     kind: if *is_view { ItemKind::View } else { ItemKind::Table },
+                    detail: None,
+                });
+            }
+            for cte in &context.cte_names {
+                items.push(CandidateItem {
+                    text: cte.clone(),
+                    kind: ItemKind::Table,
                     detail: None,
                 });
             }
@@ -494,7 +583,41 @@ impl SqlCompletionProvider {
     }
 }
 
-fn make_completion(item: &CandidateItem, replace_range: Range<Anchor>) -> Completion {
+#[derive(Clone, Copy)]
+struct IconColors {
+    accent: Hsla,
+    muted: Hsla,
+    default: Hsla,
+}
+
+/// Type icon for a suggestion. Keywords stay icon-less so they read as plain
+/// language tokens rather than schema objects.
+fn icon_for(kind: ItemKind) -> Option<IconName> {
+    match kind {
+        ItemKind::Schema => Some(IconName::DatabaseZap),
+        ItemKind::Table => Some(IconName::ListTree),
+        ItemKind::View => Some(IconName::Eye),
+        ItemKind::Column => Some(IconName::SquareDot),
+        ItemKind::Trigger => Some(IconName::BoltFilled),
+        ItemKind::Function => Some(IconName::Code),
+        ItemKind::Keyword => None,
+    }
+}
+
+fn icon_color_for(kind: ItemKind, colors: &IconColors) -> Option<Hsla> {
+    match kind {
+        ItemKind::Schema | ItemKind::Table | ItemKind::View => Some(colors.accent),
+        ItemKind::Column => Some(colors.muted),
+        ItemKind::Trigger | ItemKind::Function => Some(colors.default),
+        ItemKind::Keyword => None,
+    }
+}
+
+fn make_completion(
+    item: &CandidateItem,
+    replace_range: Range<Anchor>,
+    colors: &IconColors,
+) -> Completion {
     let detail = match (&item.detail, item.kind) {
         (Some(data_type), ItemKind::Column) => format!("column · {data_type}"),
         _ => item.kind.label().to_string(),
@@ -505,8 +628,8 @@ fn make_completion(item: &CandidateItem, replace_range: Range<Anchor>) -> Comple
         label: CodeLabel::plain(item.text.clone(), None),
         documentation: Some(CompletionDocumentation::SingleLine(detail.into())),
         source: CompletionSource::Custom,
-        icon_path: None,
-        icon_color: None,
+        icon_path: icon_for(item.kind).map(|icon| icon.path().into()),
+        icon_color: icon_color_for(item.kind, colors),
         match_start: None,
         snippet_deduplication_key: None,
         insert_text_mode: None,
@@ -627,6 +750,15 @@ impl CompletionProvider for SqlCompletionProvider {
             return Task::ready(Ok(vec![]));
         };
 
+        let icon_colors = {
+            let colors = cx.theme().colors();
+            IconColors {
+                accent: colors.text_accent,
+                muted: colors.text_muted,
+                default: colors.text,
+            }
+        };
+
         let store = store.downgrade();
         cx.spawn(async move |_editor, cx| {
             ensure(&store, cx, connection_id, |store, cx| {
@@ -653,27 +785,35 @@ impl CompletionProvider for SqlCompletionProvider {
             };
 
             // Tables whose columns we may need: the qualifier target plus every
-            // table in scope when completing columns.
-            let mut tables_to_load: Vec<String> = Vec::new();
+            // table in scope when completing columns. Each carries the database
+            // to read it from — a table's own `schema.` qualifier wins over the
+            // connection's default database.
+            let mut tables_to_load: Vec<(String, String)> = Vec::new();
             if let Some(qualifier) = &context.qualifier {
                 if qualifier_is_schema {
-                    ensure(&store, cx, connection_id, |store, cx| {
-                        store.ensure_schema_for_completion(connection_id, qualifier.clone(), cx)
+                    let schema = qualifier.clone();
+                    ensure(&store, cx, connection_id, move |store, cx| {
+                        store.ensure_schema_for_completion(connection_id, schema, cx)
                     })
                     .await;
+                } else if let Some(table_ref) =
+                    resolve_table_ref(qualifier, &context.tables_in_scope)
+                {
+                    let table_database = table_ref.schema.clone().unwrap_or_else(|| database.clone());
+                    tables_to_load.push((table_database, table_ref.name.clone()));
                 } else {
-                    tables_to_load.push(
-                        resolve_table(qualifier, &context.tables_in_scope)
-                            .unwrap_or_else(|| qualifier.clone()),
-                    );
+                    tables_to_load.push((database.clone(), qualifier.clone()));
                 }
             } else if context.kind == ContextKind::Columns {
-                tables_to_load.extend(context.tables_in_scope.iter().map(|t| t.name.clone()));
+                for table_ref in &context.tables_in_scope {
+                    let table_database =
+                        table_ref.schema.clone().unwrap_or_else(|| database.clone());
+                    tables_to_load.push((table_database, table_ref.name.clone()));
+                }
             }
-            for table in tables_to_load {
-                let database = database.clone();
+            for (table_database, table) in tables_to_load {
                 ensure(&store, cx, connection_id, move |store, cx| {
-                    store.ensure_columns_for_completion(connection_id, database, table, cx)
+                    store.ensure_columns_for_completion(connection_id, table_database, table, cx)
                 })
                 .await;
             }
@@ -691,7 +831,7 @@ impl CompletionProvider for SqlCompletionProvider {
 
             let completions = build_candidates(&context, &snapshot, driver)
                 .iter()
-                .map(|item| make_completion(item, replace_range.clone()))
+                .map(|item| make_completion(item, replace_range.clone(), &icon_colors))
                 .collect();
 
             Ok(vec![CompletionResponse {
@@ -830,24 +970,27 @@ mod tests {
             vec![
                 TableRef {
                     name: "users".to_string(),
-                    alias: Some("u".to_string())
+                    alias: Some("u".to_string()),
+                    schema: None,
                 },
                 TableRef {
                     name: "orders".to_string(),
-                    alias: Some("o".to_string())
+                    alias: Some("o".to_string()),
+                    schema: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn parse_table_refs_strips_schema_and_handles_no_alias() {
+    fn parse_table_refs_keeps_schema_and_handles_no_alias() {
         let refs = parse_table_refs("SELECT * FROM instruments.splits");
         assert_eq!(
             refs,
             vec![TableRef {
                 name: "splits".to_string(),
-                alias: None
+                alias: None,
+                schema: Some("instruments".to_string()),
             }]
         );
     }
@@ -857,6 +1000,7 @@ mod tests {
         let refs = vec![TableRef {
             name: "users".to_string(),
             alias: Some("u".to_string()),
+            schema: None,
         }];
         assert_eq!(resolve_table("u", &refs).as_deref(), Some("users"));
         assert_eq!(resolve_table("users", &refs).as_deref(), Some("users"));
@@ -934,9 +1078,77 @@ mod tests {
             qualifier: None,
             kind: ContextKind::Columns,
             tables_in_scope: context.tables_in_scope,
+            cte_names: Vec::new(),
         };
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
         assert!(items.iter().any(|i| i.text == "id" && i.kind == ItemKind::Column));
         assert!(items.iter().any(|i| i.kind == ItemKind::Function));
+    }
+
+    #[test]
+    fn cte_names_are_parsed_and_offered_as_tables() {
+        let context = ctx("WITH recent AS (SELECT 1), totals AS (SELECT 2) SELECT * FROM ");
+        assert_eq!(context.cte_names, vec!["recent".to_string(), "totals".to_string()]);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        assert!(items.iter().any(|i| i.text == "recent" && i.kind == ItemKind::Table));
+        assert!(items.iter().any(|i| i.text == "totals" && i.kind == ItemKind::Table));
+    }
+
+    #[test]
+    fn subquery_scope_prefers_inner_tables() {
+        let context = ctx("SELECT * FROM outer_tbl o WHERE o.id IN (SELECT id FROM inner_tbl x WHERE x.");
+        // The innermost open paren scopes to the subquery's tables.
+        assert_eq!(
+            context.tables_in_scope,
+            vec![TableRef {
+                name: "inner_tbl".to_string(),
+                alias: Some("x".to_string()),
+                schema: None,
+            }]
+        );
+        assert_eq!(resolve_table("x", &context.tables_in_scope).as_deref(), Some("inner_tbl"));
+    }
+
+    #[test]
+    fn where_columns_use_table_schema_qualifier() {
+        // The table's own `schema.` qualifier is kept so columns load from the
+        // right database, not the connection default.
+        let context = ctx("SELECT * FROM instruments.splits AS s WHERE ");
+        assert_eq!(context.kind, ContextKind::Columns);
+        let table_ref = &context.tables_in_scope[0];
+        assert_eq!(table_ref.name, "splits");
+        assert_eq!(table_ref.schema.as_deref(), Some("instruments"));
+        assert_eq!(table_ref.alias.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn empty_prefix_in_where_still_yields_columns() {
+        // No identifier typed after WHERE: candidates must still include the
+        // in-scope table's columns (the editor filters interactively).
+        let mut schema = sample_schema();
+        schema
+            .columns_by_table
+            .insert("splits".to_string(), vec![("ratio".to_string(), "double".to_string())]);
+        let context = ParsedContext {
+            qualifier: None,
+            kind: ContextKind::Columns,
+            tables_in_scope: vec![TableRef {
+                name: "splits".to_string(),
+                alias: None,
+                schema: Some("instruments".to_string()),
+            }],
+            cte_names: Vec::new(),
+        };
+        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
+        assert!(items.iter().any(|i| i.text == "ratio" && i.kind == ItemKind::Column));
+    }
+
+    #[test]
+    fn type_icons_cover_objects_but_not_keywords() {
+        assert!(icon_for(ItemKind::Table).is_some());
+        assert!(icon_for(ItemKind::Column).is_some());
+        assert!(icon_for(ItemKind::View).is_some());
+        assert!(icon_for(ItemKind::Schema).is_some());
+        assert!(icon_for(ItemKind::Keyword).is_none());
     }
 }
