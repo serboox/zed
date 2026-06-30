@@ -498,6 +498,68 @@ enum ChartKind {
     Line,
 }
 
+// Results that read better as formatted text than as a one-cell grid: DDL from
+// `SHOW CREATE …` and query plans from `EXPLAIN …`. Detected from the query and
+// the result's column names; shown as the default view (the user can still flip
+// back to the table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialResult {
+    None,
+    Ddl,
+    ExplainPlan,
+}
+
+// Skips leading whitespace and SQL comments so the first keyword can be matched.
+fn sql_effective_start(sql: &str) -> &str {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            match after.find('\n') {
+                Some(newline) => rest = after[newline + 1..].trim_start(),
+                None => return "",
+            }
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            match after.find("*/") {
+                Some(close) => rest = after[close + 2..].trim_start(),
+                None => return "",
+            }
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn detect_special_result(sql: Option<&str>, columns: &[String]) -> SpecialResult {
+    if let Some(sql) = sql {
+        let upper = sql_effective_start(sql).to_ascii_uppercase();
+        if upper.starts_with("EXPLAIN") {
+            return SpecialResult::ExplainPlan;
+        }
+        if upper.starts_with("SHOW CREATE") {
+            return SpecialResult::Ddl;
+        }
+    }
+    if columns
+        .iter()
+        .any(|column| column.trim().to_ascii_lowercase().starts_with("create "))
+    {
+        return SpecialResult::Ddl;
+    }
+    SpecialResult::None
+}
+
+// Pulls the DDL string out of a `SHOW CREATE …` result: the "Create …" column of
+// the first row, falling back to that row's last column.
+fn ddl_text_from_result(result: &QueryResult) -> Option<String> {
+    let row = result.rows.first()?;
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.trim().to_ascii_lowercase().starts_with("create "))
+        .or_else(|| row.len().checked_sub(1))?;
+    row.get(index)?.clone()
+}
+
 // An open enum/set dropdown popup waiting for the user to pick a value.
 struct EnumPopup {
     abs_idx: usize,
@@ -691,6 +753,17 @@ pub struct ResultView {
     // Optional result column index used for bar/point labels (X axis); None uses
     // the row number.
     chart_label_column: Option<usize>,
+    // When true, a DDL/EXPLAIN result is shown as the raw grid because the user
+    // asked for the table view instead of the formatted default.
+    special_table_override: bool,
+    // Lazily-built read-only editor showing a DDL result as formatted SQL.
+    ddl_view: Option<Entity<Editor>>,
+    // Lazily-built tree view for an EXPLAIN result.
+    explain_view: Option<Entity<crate::explain_plan::ExplainPlanView>>,
+    // Bumped on each new query so cached special views rebuild for fresh output.
+    result_generation: u64,
+    // The generation the cached special view was built for.
+    special_built_for: Option<u64>,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -881,6 +954,11 @@ impl ResultView {
             chart_kind: ChartKind::Bar,
             chart_value_column: None,
             chart_label_column: None,
+            special_table_override: false,
+            ddl_view: None,
+            explain_view: None,
+            result_generation: 0,
+            special_built_for: None,
         }
     }
 
@@ -1700,6 +1778,7 @@ impl ResultView {
 
     pub fn set_result(&mut self, result: QueryResult, cx: &mut Context<Self>) {
         self.result = Some(result);
+        self.reset_special_view();
         self.error = None;
         self.cell_edit = None;
         self.status_message = None;
@@ -1726,6 +1805,132 @@ impl ResultView {
         self.recompute_layout();
         cx.emit(ResultViewEvent::ResultChanged);
         cx.notify();
+    }
+
+    fn reset_special_view(&mut self) {
+        self.result_generation = self.result_generation.wrapping_add(1);
+        self.special_table_override = false;
+        self.ddl_view = None;
+        self.explain_view = None;
+        self.special_built_for = None;
+    }
+
+    // The formatted view to show for the current result, or None to fall back to
+    // the grid (no result, not a DDL/EXPLAIN result, or the user chose Table).
+    fn active_special(&self) -> SpecialResult {
+        if self.special_table_override {
+            return SpecialResult::None;
+        }
+        match self.result.as_ref() {
+            Some(result) => detect_special_result(self.base_sql.as_deref(), &result.columns),
+            None => SpecialResult::None,
+        }
+    }
+
+    // Builds (once per result) the read-only editor or plan tree backing the
+    // formatted view. Runs in render(), where a Window is available.
+    fn sync_special_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let special = self.active_special();
+        if special == SpecialResult::None || self.special_built_for == Some(self.result_generation) {
+            return;
+        }
+        let Some(result) = self.result.clone() else {
+            return;
+        };
+        match special {
+            SpecialResult::Ddl => {
+                let text = ddl_text_from_result(&result).unwrap_or_default();
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::multi_line(window, cx);
+                    editor.set_show_gutter(false, cx);
+                    editor.disable_expand_excerpt_buttons(cx);
+                    editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                    editor.set_show_indent_guides(false, cx);
+                    editor.disable_mouse_wheel_zoom();
+                    editor.set_text(text, window, cx);
+                    editor.set_read_only(true);
+                    editor
+                });
+                self.ddl_view = Some(editor);
+                self.explain_view = None;
+            }
+            SpecialResult::ExplainPlan => {
+                let plan_text = crate::explain_plan::plan_text_from_result(&result);
+                let roots = crate::explain_plan::parse_plan_tree(&plan_text);
+                let view = cx.new(|cx| crate::explain_plan::ExplainPlanView::new(roots, window, cx));
+                self.explain_view = Some(view);
+                self.ddl_view = None;
+            }
+            SpecialResult::None => {}
+        }
+        self.special_built_for = Some(self.result_generation);
+    }
+
+    fn render_special_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let special = self.active_special();
+        let (title, body) = match special {
+            SpecialResult::Ddl => {
+                let body = self.ddl_view.clone().map(|editor| {
+                    div()
+                        .id("ddl-result-view")
+                        .debug_selector(|| "DDL_RESULT_VIEW".to_string())
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .p_2()
+                        .child(editor)
+                        .into_any_element()
+                });
+                ("DDL", body)
+            }
+            SpecialResult::ExplainPlan => {
+                let body = self.explain_view.clone().map(|view| {
+                    div()
+                        .id("explain-plan-view")
+                        .debug_selector(|| "EXPLAIN_PLAN_VIEW".to_string())
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_scroll()
+                        .p_2()
+                        .child(view)
+                        .into_any_element()
+                });
+                ("Query plan", body)
+            }
+            SpecialResult::None => return self.render_result(cx),
+        };
+        let body = body.unwrap_or_else(|| div().flex_1().into_any_element());
+
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("special-show-as-table", "Show as Table")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.special_table_override = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(body)
+            .into_any_element()
     }
 
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -1815,6 +2020,7 @@ impl ResultView {
         let pageable = db_client::is_pageable_query(&base_sql);
 
         self.result = None;
+        self.reset_special_view();
         self.error = None;
         self.loaded_rows = 0;
         self.is_loading = true;
@@ -8553,6 +8759,7 @@ impl Render for ResultView {
             }
         }
         self.sync_value_editor(window, cx);
+        self.sync_special_view(window, cx);
         let filter_bar = self.render_filter_bar(cx);
         let content = if self.is_loading {
             div()
@@ -8568,9 +8775,14 @@ impl Render for ResultView {
         } else if let Some(error) = self.error.clone() {
             self.render_error(&error).into_any_element()
         } else if self.result.is_some() {
-            // Borrow the result (do NOT clone it): cloning the whole result set
-            // on every scroll frame is a large per-frame cost on big results.
-            self.render_result(cx).into_any_element()
+            if self.active_special() != SpecialResult::None {
+                self.render_special_view(cx).into_any_element()
+            } else {
+                // Borrow the result (do NOT clone it): cloning the whole result
+                // set on every scroll frame is a large per-frame cost on big
+                // results.
+                self.render_result(cx).into_any_element()
+            }
         } else {
             self.render_empty_state().into_any_element()
         };
@@ -9912,6 +10124,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detect_special_result_classifies_ddl_and_explain() {
+        use super::{SpecialResult, detect_special_result};
+        let create_columns = vec!["Table".to_string(), "Create Table".to_string()];
+        assert_eq!(
+            detect_special_result(Some("SHOW CREATE TABLE t"), &[]),
+            SpecialResult::Ddl
+        );
+        assert_eq!(
+            detect_special_result(Some("  show create database d"), &[]),
+            SpecialResult::Ddl
+        );
+        assert_eq!(
+            detect_special_result(Some("EXPLAIN SELECT 1"), &[]),
+            SpecialResult::ExplainPlan
+        );
+        assert_eq!(
+            detect_special_result(Some("EXPLAIN ANALYZE SELECT 1"), &[]),
+            SpecialResult::ExplainPlan
+        );
+        assert_eq!(
+            detect_special_result(Some("EXPLAIN FORMAT=TREE SELECT 1"), &[]),
+            SpecialResult::ExplainPlan
+        );
+        assert_eq!(
+            detect_special_result(Some("EXPLAIN QUERY PLAN SELECT 1"), &[]),
+            SpecialResult::ExplainPlan
+        );
+        assert_eq!(
+            detect_special_result(Some("-- a comment\nEXPLAIN SELECT 1"), &[]),
+            SpecialResult::ExplainPlan
+        );
+        assert_eq!(
+            detect_special_result(Some("SELECT * FROM t"), &["id".to_string()]),
+            SpecialResult::None
+        );
+        // Column-based detection when the originating query is unknown.
+        assert_eq!(
+            detect_special_result(None, &create_columns),
+            SpecialResult::Ddl
+        );
+    }
+
+    #[test]
+    fn ddl_text_from_result_picks_create_column_then_last() {
+        use super::ddl_text_from_result;
+        let with_create = QueryResult {
+            columns: vec!["Table".to_string(), "Create Table".to_string()],
+            rows: vec![vec![
+                Some("t".to_string()),
+                Some("CREATE TABLE t (id INT)".to_string()),
+            ]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        assert_eq!(
+            ddl_text_from_result(&with_create).as_deref(),
+            Some("CREATE TABLE t (id INT)")
+        );
+        let without_create = QueryResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![vec![Some("x".to_string()), Some("y".to_string())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        assert_eq!(ddl_text_from_result(&without_create).as_deref(), Some("y"));
+    }
+
+    #[gpui::test]
+    fn ddl_result_renders_formatted_view(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["Table".to_string(), "Create Table".to_string()],
+            rows: vec![vec![
+                Some("t".to_string()),
+                Some("CREATE TABLE t (\n  id INT\n)".to_string()),
+            ]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (_window, _view, mut cx) = plain_result_window(cx, result);
+        assert!(
+            cx.debug_bounds("DDL_RESULT_VIEW").is_some(),
+            "a SHOW CREATE result must render the formatted DDL view by default"
+        );
+    }
+
+    #[gpui::test]
+    fn explain_result_renders_plan_tree(cx: &mut gpui::TestAppContext) {
+        init_result_view_test(cx);
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("query", cx);
+            view.base_sql = Some("EXPLAIN SELECT * FROM t".to_string());
+            let result = QueryResult {
+                columns: vec!["QUERY PLAN".to_string()],
+                rows: vec![
+                    vec![Some("Seq Scan on t".to_string())],
+                    vec![Some("  Filter: (id > 1)".to_string())],
+                ],
+                rows_affected: 0,
+                execution_time_ms: 0,
+            };
+            view.set_result(result, cx);
+            view
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("EXPLAIN_PLAN_VIEW").is_some(),
+            "an EXPLAIN result must render the plan tree by default"
+        );
+    }
+
+    #[gpui::test]
+    fn plain_result_has_no_special_view(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = plain_result_window(cx, sample_table_result());
+        assert!(cx.debug_bounds("DDL_RESULT_VIEW").is_none());
+        assert!(cx.debug_bounds("EXPLAIN_PLAN_VIEW").is_none());
+    }
+
     #[gpui::test]
     fn visual_double_click_cell_starts_editing(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);
@@ -9976,9 +10307,9 @@ mod tests {
 
     #[gpui::test]
     fn visual_multiline_cell_click_opens_value_editor_popup(cx: &mut gpui::TestAppContext) {
-        let ddl = "CREATE TABLE `splits` (\n  `split_id` int NOT NULL,\n  PRIMARY KEY (`split_id`)\n) ENGINE=InnoDB";
+        let ddl = "line one\n  nested line two\n  nested line three\nfinal line";
         let result = QueryResult {
-            columns: vec!["Create Table".to_string()],
+            columns: vec!["definition".to_string()],
             rows: vec![vec![Some(ddl.to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
@@ -10001,15 +10332,15 @@ mod tests {
                 .as_ref()
                 .map(|editor| editor.read(cx).text(cx))
                 .unwrap_or_default();
-            assert!(text.contains("CREATE TABLE `splits`"));
+            assert!(text.contains("line one"));
         });
     }
 
     #[gpui::test]
     fn visual_value_editor_popup_loads_selected_cell_text(cx: &mut gpui::TestAppContext) {
-        let ddl = "CREATE TABLE `splits` (\n  `split_id` int NOT NULL,\n  PRIMARY KEY (`split_id`)\n) ENGINE=InnoDB";
+        let ddl = "line one\n  nested line two\n  nested line three\nfinal line";
         let result = QueryResult {
-            columns: vec!["Create Table".to_string()],
+            columns: vec!["definition".to_string()],
             rows: vec![vec![Some(ddl.to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
@@ -10034,8 +10365,8 @@ mod tests {
                 .as_ref()
                 .map(|editor| editor.read(cx).text(cx))
                 .unwrap_or_default();
-            assert!(text.contains("CREATE TABLE `splits`"));
-            assert!(text.contains("\n  `split_id` int NOT NULL"));
+            assert!(text.contains("line one"));
+            assert!(text.contains("\n  nested line two"));
         });
     }
 
