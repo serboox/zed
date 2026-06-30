@@ -74,11 +74,40 @@ fn parse_env_color(s: &str) -> Option<gpui::Rgba> {
     })
 }
 
-pub(crate) fn init(_cx: &mut App) {
+pub(crate) fn init(cx: &mut App) {
     // Workspace action handlers (ToggleFocus, NewQuery, RunQuery) are registered
     // in zed::register_actions, which runs reliably for every workspace. An
     // observe_new here did not fire for the app's workspaces, so RunQuery had no
     // reachable handler and Ctrl+Enter fell through to the inline assistant.
+
+    // A console restored from a saved session is reopened by the workspace, not
+    // through `open_new_sql_query`, so it has no addon, semantics provider, or
+    // completion provider until reopened. Re-install the console features for any
+    // editor whose file is one of our console paths. The work is deferred because
+    // `install_db_editor_features` updates the editor we are observing, which is
+    // still leased inside this callback.
+    cx.observe_new(|editor: &mut Editor, _window, cx: &mut Context<Editor>| {
+        if editor.addon::<DbQueryEditorAddon>().is_some() {
+            return;
+        }
+        let editor = cx.entity();
+        cx.defer(move |cx| {
+            let Some(store) = DatabaseStore::global(cx) else {
+                return;
+            };
+            if editor.read(cx).addon::<DbQueryEditorAddon>().is_some() {
+                return;
+            }
+            if console_connection_for_editor(&editor, &store, cx).is_none() {
+                return;
+            }
+            let Some(workspace) = editor.read(cx).workspace() else {
+                return;
+            };
+            install_db_editor_features(editor, store.downgrade(), workspace.downgrade(), cx);
+        });
+    })
+    .detach();
 }
 
 // Carries the connection a SQL console editor is bound to, so Ctrl+Enter runs
@@ -7361,6 +7390,61 @@ mod tests {
         assert!(
             editor.read_with(cx, |editor, _| editor.semantics_provider().is_some()),
             "console editor must carry the DbSemanticsProvider so Ctrl+click resolves DDL"
+        );
+    }
+
+    // A console restored from a session has no addon, so the reinstall hook must
+    // recognise it by its file path. This guards that path detection round-trips.
+    #[test]
+    fn console_path_round_trips_to_connection_id() {
+        let id = db_client::ConnectionConfig::default().id;
+        let path = super::connection_query_path(id, "My Conn!!");
+        assert_eq!(
+            super::connection_id_from_console_path(&path, &[id]),
+            Some(id)
+        );
+        let unrelated = std::path::Path::new("/tmp/not-a-console.sql");
+        assert_eq!(super::connection_id_from_console_path(unrelated, &[id]), None);
+    }
+
+    // The reinstall hook runs for every new editor; it must leave editors that are
+    // not DB consoles untouched (never attach the console addon to a plain editor).
+    #[gpui::test]
+    async fn console_feature_hook_skips_non_console_editors(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                db_client::ConnectionConfig::default(),
+                std::sync::Arc::new(MockProvider),
+                cx,
+            );
+        });
+        cx.update(|_window, cx| cx.set_global(crate::store::GlobalDatabaseStore(store.clone())));
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("SELECT 1", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| Editor::for_multibuffer(multi, None, window, cx))
+        });
+        cx.run_until_parked();
+
+        assert!(
+            editor.read_with(cx, |editor, _| editor
+                .addon::<DbQueryEditorAddon>()
+                .is_none()),
+            "the reinstall hook must not attach the console addon to a non-console editor"
         );
     }
 
