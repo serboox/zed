@@ -286,6 +286,36 @@ impl DbProvider for ClickHouseProvider {
         Ok(ddl.trim().to_string())
     }
 
+    async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        let sql = format!("SHOW CREATE DATABASE `{}`", database.replace('`', "\\`"));
+        let url = format!(
+            "{}/?database={}&default_format=TabSeparatedRaw",
+            self.base_url,
+            urlencoding::encode(database)
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("X-ClickHouse-User", &self.username)
+            .header("X-ClickHouse-Key", &self.password)
+            .body(sql)
+            .send()
+            .await
+            .context("Failed to get database DDL")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("ClickHouse error ({}): {}", status, body);
+        }
+
+        let ddl = response
+            .text()
+            .await
+            .context("Failed to read database DDL response")?;
+        Ok(ddl.trim().to_string())
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let db_opt = if database.is_empty() {

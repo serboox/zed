@@ -97,6 +97,12 @@ impl DbProvider for RuntimeProvider {
         on_runtime(async move { inner.get_table_ddl(&database, &table).await }).await
     }
 
+    async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        let inner = self.inner.clone();
+        let database = database.to_owned();
+        on_runtime(async move { inner.get_database_ddl(&database).await }).await
+    }
+
     async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
         let inner = self.inner.clone();
         let database = database.to_owned();

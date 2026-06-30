@@ -161,6 +161,28 @@ impl DbProvider for PostgresProvider {
         Ok(ddl)
     }
 
+    async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        let owner = sqlx::query_as::<_, (Option<String>,)>(
+            "-- name: GetSchemaOwner :one
+             SELECT schema_owner FROM information_schema.schemata
+             WHERE schema_name = $1",
+        )
+        .bind(database)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query schema metadata")?;
+
+        let escaped = database.replace('"', "\"\"");
+        match owner {
+            Some((Some(owner),)) => Ok(format!(
+                "CREATE SCHEMA \"{}\" AUTHORIZATION \"{}\";\n",
+                escaped,
+                owner.replace('"', "\"\"")
+            )),
+            _ => Ok(format!("CREATE SCHEMA \"{}\";\n", escaped)),
+        }
+    }
+
     async fn execute_query(&self, schema: &str, sql: &str) -> Result<QueryResult> {
         if !schema.is_empty() {
             let set_path = format!("SET search_path = \"{}\"", schema.replace('"', "\"\""));
