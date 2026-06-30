@@ -4434,7 +4434,59 @@ impl DatabasePanel {
         let entity = cx.entity();
         let is_top_level_target = self.drag_target == Some(DropTarget::TopLevel);
         let show_empty_state = tree_elements.is_empty();
-        let background = v_flex()
+        // The blank-area menu lives on a filler below the rows (and fills the whole
+        // panel when there are no rows). Keeping it off the rows means each row's own
+        // right-click menu is never shadowed: `right_click_menu` registers a global
+        // bubble-phase handler, so a parent menu wrapping the rows would intercept
+        // their right-clicks before the row menus could open.
+        let background_menu = right_click_menu(ElementId::from("db-tree-background-menu"))
+            .trigger(move |_, _, _| {
+                v_flex()
+                    .id("db-tree-filler")
+                    .size_full()
+                    .min_h(px(48.))
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .when(show_empty_state, |el| {
+                        el.p_4()
+                            .child(
+                                Icon::new(IconName::DatabaseZap)
+                                    .size(IconSize::Medium)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new("No connections")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new("Right-click to add a folder or connection")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                    })
+            })
+            .menu(move |window, cx| {
+                let entity = entity.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("New Folder", None, {
+                        let entity = entity.clone();
+                        move |window, cx| {
+                            entity.update(cx, |panel, cx| {
+                                panel.start_new_folder(None, window, cx);
+                            });
+                        }
+                    })
+                    .entry("New Connection", None, move |window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.new_connection_in_folder(None, window, cx);
+                        });
+                    })
+                })
+            });
+
+        v_flex()
             .id("db-tree-background")
             .size_full()
             .min_h_full()
@@ -4455,52 +4507,7 @@ impl DatabasePanel {
                 this.handle_drop(*item, DropTarget::TopLevel, cx);
             }))
             .children(tree_elements)
-            .when(show_empty_state, |el| {
-                el.child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .p_4()
-                        .child(
-                            Icon::new(IconName::DatabaseZap)
-                                .size(IconSize::Medium)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("No connections")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("Right-click to add a folder or connection")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                )
-            });
-
-        right_click_menu(ElementId::from("db-tree-background-menu"))
-            .trigger(move |_, _, _| background)
-            .menu(move |window, cx| {
-                let entity = entity.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.entry("New Folder", None, {
-                        let entity = entity.clone();
-                        move |window, cx| {
-                            entity.update(cx, |panel, cx| {
-                                panel.start_new_folder(None, window, cx);
-                            });
-                        }
-                    })
-                    .entry("New Connection", None, move |window, cx| {
-                        entity.update(cx, |panel, cx| {
-                            panel.new_connection_in_folder(None, window, cx);
-                        });
-                    })
-                })
-            })
+            .child(div().flex_1().w_full().child(background_menu))
             .into_any_element()
     }
 }
@@ -6040,6 +6047,15 @@ mod tests {
         panel.update(cx, |panel, cx| panel.toggle_folder_collapsed(folder_id, cx));
         panel.read_with(cx, |panel, _| {
             assert!(!panel.collapsed_folders.contains(&folder_id));
+        });
+
+        // Deleting an empty folder removes it from the store.
+        panel.update(cx, |panel, cx| panel.delete_folder(folder_id, cx));
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.folders().is_empty(),
+                "an empty folder must be deletable"
+            );
         });
     }
 
