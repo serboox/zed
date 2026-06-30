@@ -1,5 +1,9 @@
-use gpui::{Context, FocusHandle, Focusable, Hsla, Window, canvas, point, prelude::*, px};
+use gpui::{
+    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Window, canvas, point,
+    prelude::*, px,
+};
 use ui::{Tooltip, prelude::*};
+use workspace::{Item, item::ItemEvent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErdColumn {
@@ -162,6 +166,7 @@ struct PlacedTable {
 
 pub struct ErdView {
     focus_handle: FocusHandle,
+    title: SharedString,
     placed: Vec<PlacedTable>,
     relationships: Vec<ErdRelationship>,
     mermaid: String,
@@ -174,6 +179,7 @@ impl ErdView {
     pub fn new(
         tables: Vec<ErdTable>,
         relationships: Vec<ErdRelationship>,
+        title: impl Into<SharedString>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -195,6 +201,7 @@ impl ErdView {
         }
         Self {
             focus_handle: cx.focus_handle(),
+            title: title.into(),
             placed,
             relationships,
             mermaid,
@@ -308,6 +315,24 @@ impl Focusable for ErdView {
     }
 }
 
+impl EventEmitter<DismissEvent> for ErdView {}
+
+impl Item for ErdView {
+    type Event = DismissEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::ListTree))
+    }
+
+    fn to_item_events(_event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(ItemEvent::CloseItem);
+    }
+}
+
 impl Render for ErdView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -367,7 +392,7 @@ impl Render for ErdView {
                     .gap_2()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(Label::new("Diagram").size(LabelSize::Small))
+                    .child(Label::new(self.title.clone()).size(LabelSize::Small))
                     .child(div().flex_1())
                     .child(
                         Button::new("erd-copy-mermaid", "Copy Mermaid")
@@ -516,7 +541,8 @@ mod tests {
         });
 
         let (tables, relationships) = sample();
-        let view = cx.add_window(|window, cx| ErdView::new(tables, relationships, window, cx));
+        let view =
+            cx.add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
         view.update(cx, |view, _, _| {
             assert_eq!(view.placed.len(), 2);
             assert_eq!(view.relationships.len(), 1);

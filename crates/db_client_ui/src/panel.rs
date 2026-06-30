@@ -28,8 +28,7 @@ use gpui::{
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, ScrollHandle,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
-    anchored, deferred,
-    div, px,
+    anchored, deferred, div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -1520,7 +1519,6 @@ pub struct DatabasePanel {
     table_filter_is_regex: bool,
     quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
     modify_table: Option<Entity<ModifyTableView>>,
-    erd_view: Option<Entity<ErdView>>,
     compare_view: Option<Entity<CompareDataView>>,
     explain_view: Option<Entity<ExplainPlanView>>,
     data_import: Option<Entity<ImportDataView>>,
@@ -1711,7 +1709,6 @@ impl DatabasePanel {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    erd_view: None,
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
@@ -2599,7 +2596,9 @@ impl DatabasePanel {
             .find(|connection| connection.config.id == id)
             .and_then(|connection| connection.provider.clone());
         let Some(provider) = provider else { return };
-        cx.spawn_in(window, async move |this, cx| {
+        let workspace = self.workspace.clone();
+        let title: SharedString = format!("Diagram: {database}").into();
+        cx.spawn_in(window, async move |_this, cx| {
             let tables = provider
                 .list_tables(&database)
                 .await
@@ -2645,12 +2644,13 @@ impl DatabasePanel {
                         .collect(),
                 });
             }
-            this.update_in(cx, |panel, window, cx| {
-                let view = cx.new(|cx| ErdView::new(erd_tables, relationships, window, cx));
-                panel.erd_view = Some(view);
-                cx.notify();
-            })
-            .log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let view =
+                        cx.new(|cx| ErdView::new(erd_tables, relationships, title, window, cx));
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -5150,28 +5150,6 @@ impl Render for DatabasePanel {
                         .child(self.render_query_params_popup(cx)),
                 )
             })
-            .when_some(self.erd_view.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .flex_col()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(
-                            h_flex().w_full().justify_end().p_1().child(
-                                IconButton::new("close-erd", IconName::Close)
-                                    .tooltip(Tooltip::text("Close diagram"))
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.erd_view = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                        )
-                        .child(div().flex_1().child(view)),
-                )
-            })
             .when_some(self.compare_view.clone(), |el, view| {
                 el.child(
                     div()
@@ -6031,7 +6009,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    erd_view: None,
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
@@ -6195,7 +6172,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    erd_view: None,
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
@@ -6351,7 +6327,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    erd_view: None,
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
@@ -6575,7 +6550,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                erd_view: None,
                 compare_view: None,
                 explain_view: None,
                 data_import: None,
@@ -6585,7 +6559,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6614,6 +6588,88 @@ mod tests {
             title.as_deref(),
             Some("public.users"),
             "Quick Documentation must act on the selected tree node"
+        );
+    }
+
+    #[gpui::test]
+    async fn show_diagram_opens_erd_as_workspace_tab(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "erd".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                dump: DumpUiState::default(),
+                context_menu: None,
+                tree_scroll_handle: ScrollHandle::new(),
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_erd_diagram(connection_id, "public".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let erd_tabs = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ErdView>()
+                .count()
+        });
+        assert_eq!(
+            erd_tabs, 1,
+            "Show Diagram must open the ERD as a tab in the active pane"
         );
     }
 
@@ -6661,7 +6717,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                erd_view: None,
                 compare_view: None,
                 explain_view: None,
                 data_import: None,
@@ -6671,7 +6726,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6745,7 +6800,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                erd_view: None,
                 compare_view: None,
                 explain_view: None,
                 data_import: None,
@@ -6755,7 +6809,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6856,7 +6910,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                erd_view: None,
                 compare_view: None,
                 explain_view: None,
                 data_import: None,
@@ -6866,7 +6919,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6969,7 +7022,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                erd_view: None,
                 compare_view: None,
                 explain_view: None,
                 data_import: None,
@@ -6979,7 +7031,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -7393,7 +7445,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    erd_view: None,
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
