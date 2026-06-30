@@ -775,7 +775,7 @@ impl Render for ConnectionView {
                                         Some(("Testing…".to_string(), Color::Muted))
                                     }
                                     TestState::Success => {
-                                        Some(("Connection OK".to_string(), Color::Success))
+                                        Some(("Connected".to_string(), Color::Success))
                                     }
                                     TestState::Failure(message) => {
                                         Some((message.clone(), Color::Error))
