@@ -3,7 +3,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*, px,
 };
 use ui::prelude::*;
-use ui::{Button, Divider, Icon, IconButton, IconName, Label};
+use ui::{Button, Divider, Label};
 use util::ResultExt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,27 +324,18 @@ impl Render for DdlSourceView {
             .max_h(px(560.0))
             .p_4()
             .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Icon::new(IconName::FileCode).color(Color::Accent))
-                            .child(Label::new("SQL schema source")),
-                    )
-                    .child(
-                        IconButton::new("close-ddl", IconName::Close).on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(DdlSourceEvent::Dismissed)),
-                        ),
-                    ),
-            )
+            .child(crate::widgets::dialog_header(
+                "SQL schema source",
+                "close-ddl",
+                cx.listener(|_, _, _, cx| cx.emit(DdlSourceEvent::Dismissed)),
+            ))
             .child(
                 h_flex()
                     .gap_2()
                     .child(div().flex_1().child(self.path_editor.clone()))
                     .child(
                         Button::new("load-ddl", "Load")
+                            .style(ButtonStyle::Filled)
                             .on_click(cx.listener(|view, _, window, cx| view.load(window, cx))),
                     ),
             )

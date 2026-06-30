@@ -470,7 +470,11 @@ impl Render for ModifyTableView {
             .max_h(px(560.))
             .p_3()
             .gap_2()
-            .child(Label::new(title).size(LabelSize::Large))
+            .child(crate::widgets::dialog_header(
+                title,
+                "close-modify",
+                cx.listener(|_, _, _, cx| cx.emit(ModifyTableEvent::Dismissed)),
+            ))
             .child(Divider::horizontal())
             .child(
                 v_flex()

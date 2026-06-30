@@ -1,7 +1,7 @@
 use db_client::schema::QueryResult;
 use gpui::{Context, EventEmitter, FocusHandle, Focusable, Window, prelude::*};
 use std::collections::{HashMap, VecDeque};
-use ui::{Divider, prelude::*};
+use ui::{Divider, Tooltip, prelude::*};
 
 const RENDERED_ROW_LIMIT: usize = 1000;
 
@@ -403,8 +403,21 @@ impl Render for CompareDataView {
                 h_flex()
                     .w_full()
                     .justify_between()
-                    .child(Label::new("Compare Data").size(LabelSize::Large))
-                    .child(header),
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(Label::new("Compare Data").size(LabelSize::Large))
+                            .child(header),
+                    )
+                    .child(
+                        IconButton::new("close-compare", IconName::Close)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(CompareDataEvent::Dismissed)),
+                            ),
+                    ),
             )
             .when(!self.diff.columns_aligned, |column| {
                 column.child(
@@ -433,16 +446,6 @@ impl Render for CompareDataView {
                     .color(Color::Muted),
                 )
             })
-            .child(Divider::horizontal())
-            .child(
-                h_flex().w_full().justify_end().child(
-                    ui::Button::new("close-compare", "Close").on_click(cx.listener(
-                        |_, _, _, cx| {
-                            cx.emit(CompareDataEvent::Dismissed);
-                        },
-                    )),
-                ),
-            )
     }
 }
 

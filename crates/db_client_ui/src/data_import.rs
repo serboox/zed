@@ -3,7 +3,7 @@ use editor::Editor;
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*, px};
 use ui::prelude::*;
 use ui::{
-    Button, ButtonStyle, Checkbox, ContextMenu, Divider, IconButton, IconName, Label, PopoverMenu,
+    Button, ButtonStyle, Checkbox, ContextMenu, Divider, Label, PopoverMenu,
 };
 use util::ResultExt;
 
@@ -422,16 +422,11 @@ impl Render for ImportDataView {
             .max_h(px(560.0))
             .p_4()
             .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(Label::new(format!("Import data into {}", self.table)))
-                    .child(
-                        IconButton::new("close-import", IconName::Close).on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(DataImportEvent::Dismissed)),
-                        ),
-                    ),
-            )
+            .child(crate::widgets::dialog_header(
+                format!("Import data into {}", self.table),
+                "close-import",
+                cx.listener(|_, _, _, cx| cx.emit(DataImportEvent::Dismissed)),
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -498,6 +493,7 @@ impl Render for ImportDataView {
                     )
                     .child(
                         ui::Button::new("run-import", "Import")
+                            .style(ButtonStyle::Filled)
                             .disabled(importing)
                             .on_click(cx.listener(|view, _, window, cx| view.run_import(window, cx))),
                     ),

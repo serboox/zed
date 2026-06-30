@@ -2,7 +2,7 @@ use db_client::{DatabaseDriver, QueryResult};
 use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Window, div, px};
 use std::collections::HashSet;
 use ui::prelude::*;
-use ui::{Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, h_flex, v_flex};
+use ui::{IconButton, IconName, IconSize, Label, LabelSize, h_flex, v_flex};
 
 /// One node of a query plan tree. `children` are the sub-operations nested under
 /// this node in the engine's EXPLAIN output.
@@ -237,20 +237,11 @@ impl Render for ExplainPlanView {
             .size_full()
             .p_3()
             .gap_2()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Icon::new(IconName::ListTree).color(Color::Accent))
-                            .child(Label::new("Query Plan")),
-                    )
-                    .child(
-                        IconButton::new("close-explain", IconName::Close)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ExplainPlanEvent::Dismissed))),
-                    ),
-            )
+            .child(crate::widgets::dialog_header(
+                "Query Plan",
+                "close-explain",
+                cx.listener(|_, _, _, cx| cx.emit(ExplainPlanEvent::Dismissed)),
+            ))
             .child(div().id("plan-scroll").flex_1().overflow_y_scroll().child(body))
     }
 }
