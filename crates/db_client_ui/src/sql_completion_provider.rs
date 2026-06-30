@@ -558,14 +558,6 @@ impl SqlCompletionProvider {
         }
     }
 
-    fn is_sql_buffer(buffer: &Entity<Buffer>, cx: &App) -> bool {
-        buffer
-            .read(cx)
-            .language()
-            .map(|lang| lang.name().as_ref().to_lowercase() == "sql")
-            .unwrap_or(false)
-    }
-
     fn text_before(buffer: &Entity<Buffer>, position: Anchor, cx: &App) -> String {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
@@ -732,9 +724,6 @@ impl CompletionProvider for SqlCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        if !Self::is_sql_buffer(buffer, cx) {
-            return Task::ready(Ok(vec![]));
-        }
         let Some(store) = self.store.upgrade() else {
             return Task::ready(Ok(vec![]));
         };
@@ -807,15 +796,12 @@ impl CompletionProvider for SqlCompletionProvider {
 
     fn is_completion_trigger(
         &self,
-        buffer: &Entity<Buffer>,
+        _buffer: &Entity<Buffer>,
         _position: language::Anchor,
         text: &str,
         trigger_in_words: bool,
-        cx: &mut Context<Editor>,
+        _cx: &mut Context<Editor>,
     ) -> bool {
-        if !Self::is_sql_buffer(buffer, cx) {
-            return false;
-        }
         text == "." || trigger_in_words
     }
 
@@ -855,15 +841,9 @@ pub fn install_on_editor(
     connection_id: Option<ConnectionId>,
     cx: &mut App,
 ) {
-    editor.update(cx, |editor, cx| {
-        let is_sql = editor
-            .language_at(language::Point::new(0, 0), cx)
-            .map(|lang| lang.name().as_ref().to_lowercase() == "sql")
-            .unwrap_or(false);
-        if is_sql {
-            let provider = Rc::new(SqlCompletionProvider::new(store, connection_id));
-            editor.set_completion_provider(Some(provider));
-        }
+    editor.update(cx, |editor, _cx| {
+        let provider = Rc::new(SqlCompletionProvider::new(store, connection_id));
+        editor.set_completion_provider(Some(provider));
     });
 }
 
