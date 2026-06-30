@@ -42,7 +42,7 @@ use workspace::{
     Event as WorkspaceEvent, ItemHandle, OpenOptions, OpenVisible, Pane, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::database_panel::ToggleFocus;
+use zed_actions::database_panel::{GoToDdl, QuickDocumentation, ShowDiagram, ToggleFocus};
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
 const ERD_TABLE_LIMIT: usize = 50;
@@ -1357,7 +1357,18 @@ pub struct DatabasePanel {
     ddl_source: Option<Entity<DdlSourceView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
+    selected_tree_node: Option<SelectedTreeNode>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The tree node the keyboard acts on. A node is a database (table = None) or a
+/// table within it, so Go to DDL / Quick Documentation / Show Diagram know their
+/// target without a pointer event.
+#[derive(Clone)]
+struct SelectedTreeNode {
+    connection_id: ConnectionId,
+    database: String,
+    table: Option<String>,
 }
 
 /// Pending second-table selection for the Compare Data flow: the user picked a
@@ -1452,6 +1463,7 @@ impl DatabasePanel {
                     ddl_source: None,
                     compare_pick: None,
                     query_params: None,
+                    selected_tree_node: None,
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -1639,6 +1651,28 @@ impl DatabasePanel {
             icons.push((IconName::SquareDot, Color::Muted));
         }
         icons
+    }
+
+    fn go_to_ddl_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(node) = self.selected_tree_node.clone()
+            && let Some(table) = node.table
+        {
+            self.open_table_ddl(node.connection_id, node.database, table, window, cx);
+        }
+    }
+
+    fn quick_doc_for_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(node) = self.selected_tree_node.clone()
+            && let Some(table) = node.table
+        {
+            self.open_quick_doc(node.connection_id, node.database, table, cx);
+        }
+    }
+
+    fn show_diagram_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(node) = self.selected_tree_node.clone() {
+            self.open_erd_diagram(node.connection_id, node.database, window, cx);
+        }
     }
 
     fn open_table_ddl(
@@ -2846,6 +2880,11 @@ impl DatabasePanel {
                         .on_click(cx.listener({
                             let db_name = db_name_for_click;
                             move |this, _, _, cx| {
+                                this.selected_tree_node = Some(SelectedTreeNode {
+                                    connection_id: id,
+                                    database: db_name.clone(),
+                                    table: None,
+                                });
                                 this.store.update(cx, |store, cx| {
                                     store
                                         .toggle_database_expanded(id, db_name.clone(), cx)
@@ -3053,6 +3092,11 @@ impl DatabasePanel {
                                             let tbl = table_name.clone();
                                             let workspace = self.workspace.clone();
                                             move |this, event: &ClickEvent, window, cx| {
+                                                this.selected_tree_node = Some(SelectedTreeNode {
+                                                    connection_id: id,
+                                                    database: db.clone(),
+                                                    table: Some(tbl.clone()),
+                                                });
                                                 if event.modifiers().control && event.click_count() == 1 {
                                                     let ddl_task = this.store.update(cx, |store, cx| {
                                                         store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
@@ -4049,6 +4093,15 @@ impl Render for DatabasePanel {
         v_flex()
             .key_context("DatabasePanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &GoToDdl, window, cx| {
+                this.go_to_ddl_for_selection(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickDocumentation, _, cx| {
+                this.quick_doc_for_selection(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowDiagram, window, cx| {
+                this.show_diagram_for_selection(window, cx);
+            }))
             .size_full()
             .relative()
             .overflow_hidden()
@@ -4929,6 +4982,7 @@ mod tests {
                     ddl_source: None,
                     compare_pick: None,
                     query_params: None,
+                    selected_tree_node: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -5086,6 +5140,7 @@ mod tests {
                     ddl_source: None,
                     compare_pick: None,
                     query_params: None,
+                    selected_tree_node: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -5235,6 +5290,7 @@ mod tests {
                     ddl_source: None,
                     compare_pick: None,
                     query_params: None,
+                    selected_tree_node: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -5402,6 +5458,85 @@ mod tests {
         assert_eq!(
             tab_count, 2,
             "two connections must produce exactly two result tabs"
+        );
+    }
+
+    #[gpui::test]
+    async fn quick_documentation_action_uses_selected_tree_node(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "doc".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                erd_view: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.selected_tree_node = Some(SelectedTreeNode {
+                connection_id,
+                database: "public".to_string(),
+                table: Some("users".to_string()),
+            });
+            panel.quick_doc_for_selection(cx);
+        });
+        cx.run_until_parked();
+
+        let title = panel.read_with(cx, |panel, _| {
+            panel.quick_doc.as_ref().map(|(title, _)| title.to_string())
+        });
+        assert_eq!(
+            title.as_deref(),
+            Some("public.users"),
+            "Quick Documentation must act on the selected tree node"
         );
     }
 
@@ -5712,6 +5847,7 @@ mod tests {
                     ddl_source: None,
                     compare_pick: None,
                     query_params: None,
+                    selected_tree_node: None,
                     _subscriptions: vec![sub],
                 }
             });

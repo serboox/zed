@@ -784,6 +784,12 @@ pub mod database_panel {
             NewQuery,
             /// Toggles focus on the database query results panel.
             ToggleResultsFocus,
+            /// Opens the DDL of the selected tree object in a new query tab.
+            GoToDdl,
+            /// Shows quick documentation for the selected tree object.
+            QuickDocumentation,
+            /// Shows an entity-relationship diagram for the selected database.
+            ShowDiagram,
         ]
     );
 }

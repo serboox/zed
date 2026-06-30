@@ -728,6 +728,15 @@
     },
   },
   {
+    "context": "DatabasePanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-b": "database_panel::GoToDdl",
+      "ctrl-q": "database_panel::QuickDocumentation",
+      "ctrl-alt-shift-u": "database_panel::ShowDiagram"
+    }
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {
