@@ -1,7 +1,11 @@
 use db_client::schema::QueryResult;
-use gpui::{Context, EventEmitter, FocusHandle, Focusable, Window, prelude::*};
+use gpui::{
+    App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, SharedString, Window,
+    prelude::*,
+};
 use std::collections::{HashMap, VecDeque};
-use ui::{Divider, Tooltip, prelude::*};
+use ui::{Divider, Icon, Tooltip, prelude::*};
+use workspace::{Item, item::ItemEvent};
 
 const RENDERED_ROW_LIMIT: usize = 1000;
 
@@ -251,12 +255,9 @@ pub fn compute_diff(
     }
 }
 
-pub enum CompareDataEvent {
-    Dismissed,
-}
-
 pub struct CompareDataView {
     focus_handle: FocusHandle,
+    title: SharedString,
     left: QueryResult,
     right: QueryResult,
     diff: DiffResult,
@@ -267,12 +268,14 @@ impl CompareDataView {
         left: QueryResult,
         right: QueryResult,
         key_columns: Option<Vec<usize>>,
+        title: SharedString,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let diff = compute_diff(&left, &right, key_columns.as_deref(), None);
         Self {
             focus_handle: cx.focus_handle(),
+            title,
             left,
             right,
             diff,
@@ -304,11 +307,27 @@ impl CompareDataView {
     }
 }
 
-impl EventEmitter<CompareDataEvent> for CompareDataView {}
+impl EventEmitter<DismissEvent> for CompareDataView {}
 
 impl Focusable for CompareDataView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl Item for CompareDataView {
+    type Event = DismissEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Copy))
+    }
+
+    fn to_item_events(_event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(ItemEvent::CloseItem);
     }
 }
 
@@ -394,9 +413,8 @@ impl Render for CompareDataView {
         v_flex()
             .key_context("CompareData")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(760.))
-            .max_h(px(560.))
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
             .p_3()
             .gap_2()
             .child(
@@ -415,7 +433,7 @@ impl Render for CompareDataView {
                         IconButton::new("close-compare", IconName::Close)
                             .tooltip(Tooltip::text("Close"))
                             .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(CompareDataEvent::Dismissed)),
+                                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
                             ),
                     ),
             )

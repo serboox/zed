@@ -1,4 +1,4 @@
-use crate::compare_data::{CompareDataEvent, CompareDataView};
+use crate::compare_data::CompareDataView;
 use crate::connection_view::ConnectionView;
 use crate::data_import::{DataImportEvent, ImportDataView};
 use crate::ddl_source::{DdlSourceEvent, DdlSourceView};
@@ -1519,7 +1519,6 @@ pub struct DatabasePanel {
     table_filter_is_regex: bool,
     quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
     modify_table: Option<Entity<ModifyTableView>>,
-    compare_view: Option<Entity<CompareDataView>>,
     explain_view: Option<Entity<ExplainPlanView>>,
     data_import: Option<Entity<ImportDataView>>,
     ddl_source: Option<Entity<DdlSourceView>>,
@@ -1709,7 +1708,6 @@ impl DatabasePanel {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    compare_view: None,
                     explain_view: None,
                     data_import: None,
                     ddl_source: None,
@@ -2729,7 +2727,9 @@ impl DatabasePanel {
             .find(|connection| connection.config.id == id)
             .and_then(|connection| connection.provider.clone());
         let Some(provider) = provider else { return };
-        cx.spawn_in(window, async move |this, cx| {
+        let workspace = self.workspace.clone();
+        let title: SharedString = format!("Compare: {left_table} vs {right_table}").into();
+        cx.spawn_in(window, async move |_this, cx| {
             let left = provider
                 .execute_query(&database, &format!("SELECT * FROM {left_table}"))
                 .await;
@@ -2754,19 +2754,13 @@ impl DatabasePanel {
             let (Ok(left), Ok(right)) = (left, right) else {
                 return anyhow::Ok(());
             };
-            this.update_in(cx, |panel, window, cx| {
-                let view = cx.new(|cx| CompareDataView::new(left, right, key_columns, window, cx));
-                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
-                    CompareDataEvent::Dismissed => {
-                        panel.compare_view = None;
-                        cx.notify();
-                    }
-                });
-                panel._subscriptions.push(subscription);
-                panel.compare_view = Some(view);
-                cx.notify();
-            })
-            .log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let view = cx
+                        .new(|cx| CompareDataView::new(left, right, key_columns, title, window, cx));
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -5312,19 +5306,6 @@ impl Render for DatabasePanel {
                         .child(self.render_query_params_popup(cx)),
                 )
             })
-            .when_some(self.compare_view.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
-                )
-            })
             .when_some(self.explain_view.clone(), |el, view| {
                 el.child(
                     div()
@@ -6171,7 +6152,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    compare_view: None,
                     explain_view: None,
                     data_import: None,
                     ddl_source: None,
@@ -6334,7 +6314,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    compare_view: None,
                     explain_view: None,
                     data_import: None,
                     ddl_source: None,
@@ -6489,7 +6468,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    compare_view: None,
                     explain_view: None,
                     data_import: None,
                     ddl_source: None,
@@ -6712,7 +6690,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -6796,7 +6773,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -6832,6 +6808,44 @@ mod tests {
         assert_eq!(
             erd_tabs, 1,
             "Show Diagram must open the ERD as a tab in the active pane"
+        );
+    }
+
+    #[gpui::test]
+    async fn compare_data_opens_as_workspace_tab(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "compare".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_compare(
+                connection_id,
+                "public".to_string(),
+                "left".to_string(),
+                "right".to_string(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let compare_tabs = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<CompareDataView>()
+                .count()
+        });
+        assert_eq!(
+            compare_tabs, 1,
+            "Compare Data must open as a tab in the active pane"
         );
     }
 
@@ -6879,7 +6893,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -6962,7 +6975,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -7072,7 +7084,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -7184,7 +7195,6 @@ mod tests {
                 table_filter_is_regex: false,
                 quick_doc: None,
                 modify_table: None,
-                compare_view: None,
                 explain_view: None,
                 data_import: None,
                 ddl_source: None,
@@ -7607,7 +7617,6 @@ mod tests {
                     table_filter_is_regex: false,
                     quick_doc: None,
                     modify_table: None,
-                    compare_view: None,
                     explain_view: None,
                     data_import: None,
                     ddl_source: None,
