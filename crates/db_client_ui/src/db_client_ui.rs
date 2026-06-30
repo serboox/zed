@@ -6,6 +6,7 @@ mod driver_icon;
 mod erd_diagram;
 mod explain_plan;
 mod modify_table;
+pub mod native_dump;
 mod panel;
 mod result_view;
 mod sql_completion_provider;
