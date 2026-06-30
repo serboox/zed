@@ -22,6 +22,17 @@ use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
 const CONNECTIONS_FILE: &str = "db_connections.json";
+const DDL_CACHE_FILE: &str = "db_ddl_cache.json";
+
+/// Cached DDL for one connection so `Go to DDL` works while disconnected.
+/// `tables` is keyed database -> table -> DDL to keep JSON map keys as strings.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct DdlCache {
+    #[serde(default)]
+    databases: HashMap<String, String>,
+    #[serde(default)]
+    tables: HashMap<String, HashMap<String, String>>,
+}
 
 /// On-disk shape of the connection tree: the folder set plus the connections.
 /// Older config files held a bare `[ConnectionConfig]` array; `load_tree_from_disk`
@@ -171,6 +182,7 @@ pub struct DatabaseStore {
     pub query_history: Vec<String>,
     pub active_connection_id: Option<ConnectionId>,
     ssh_tunnels: HashMap<ConnectionId, SshTunnel>,
+    ddl_cache: HashMap<ConnectionId, DdlCache>,
 }
 
 /// App-global handle to the single workspace `DatabaseStore`, set when the
@@ -247,13 +259,34 @@ impl DatabaseStore {
             .detach();
         }
 
+        if !cfg!(test) {
+            cx.spawn(async move |this, cx| {
+                let cache = cx
+                    .background_executor()
+                    .spawn(async { load_ddl_cache_from_disk() })
+                    .await;
+                if !cache.is_empty() {
+                    this.update(cx, |store, _| store.ddl_cache = cache).ok();
+                }
+            })
+            .detach();
+        }
+
         Self {
             connections: Vec::new(),
             folders: Vec::new(),
             query_history: Vec::new(),
             active_connection_id: None,
             ssh_tunnels: HashMap::new(),
+            ddl_cache: HashMap::new(),
         }
+    }
+
+    fn persist_ddl_cache(&self, cx: &mut Context<Self>) {
+        let cache = self.ddl_cache.clone();
+        cx.background_executor()
+            .spawn(async move { save_ddl_cache_to_disk(&cache).log_err() })
+            .detach();
     }
 
     pub fn connections(&self) -> &[ActiveConnection] {
@@ -987,6 +1020,9 @@ impl DatabaseStore {
             cx.emit(DatabaseStoreEvent::SchemaChanged);
             cx.notify();
         }
+        if self.ddl_cache.remove(&id).is_some() {
+            self.persist_ddl_cache(cx);
+        }
         self.refresh_databases(id, cx)
     }
 
@@ -1087,9 +1123,38 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
         let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
+            return match self.cached_table_ddl(id, &database, &table) {
+                Some(ddl) => Task::ready(Ok(ddl)),
+                None => Task::ready(Err(anyhow::anyhow!(
+                    "DDL not cached yet — connect to fetch it"
+                ))),
+            };
         };
-        cx.background_spawn(async move { provider.get_table_ddl(&database, &table).await })
+        cx.spawn(async move |this, cx| {
+            let ddl = provider.get_table_ddl(&database, &table).await?;
+            this.update(cx, |store, cx| {
+                store
+                    .ddl_cache
+                    .entry(id)
+                    .or_default()
+                    .tables
+                    .entry(database)
+                    .or_default()
+                    .insert(table, ddl.clone());
+                store.persist_ddl_cache(cx);
+            })
+            .ok();
+            Ok(ddl)
+        })
+    }
+
+    fn cached_table_ddl(&self, id: ConnectionId, database: &str, table: &str) -> Option<String> {
+        self.ddl_cache
+            .get(&id)?
+            .tables
+            .get(database)?
+            .get(table)
+            .cloned()
     }
 
     pub fn get_database_ddl(
@@ -1102,9 +1167,31 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
         let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
+            return match self
+                .ddl_cache
+                .get(&id)
+                .and_then(|c| c.databases.get(&database).cloned())
+            {
+                Some(ddl) => Task::ready(Ok(ddl)),
+                None => Task::ready(Err(anyhow::anyhow!(
+                    "DDL not cached yet — connect to fetch it"
+                ))),
+            };
         };
-        cx.background_spawn(async move { provider.get_database_ddl(&database).await })
+        cx.spawn(async move |this, cx| {
+            let ddl = provider.get_database_ddl(&database).await?;
+            this.update(cx, |store, cx| {
+                store
+                    .ddl_cache
+                    .entry(id)
+                    .or_default()
+                    .databases
+                    .insert(database, ddl.clone());
+                store.persist_ddl_cache(cx);
+            })
+            .ok();
+            Ok(ddl)
+        })
     }
 
     pub fn list_indexes(
@@ -1300,6 +1387,25 @@ fn load_tree_from_disk() -> Result<StoredTree> {
 fn save_tree_to_disk(tree: StoredTree) -> Result<()> {
     let json = serde_json::to_vec_pretty(&tree)?;
     std::fs::write(connections_file_path(), json)?;
+    Ok(())
+}
+
+fn ddl_cache_file_path() -> std::path::PathBuf {
+    paths::config_dir().join(DDL_CACHE_FILE)
+}
+
+/// Loads the DDL cache, returning an empty map when the file is missing or
+/// unreadable so a corrupt cache never blocks startup.
+fn load_ddl_cache_from_disk() -> HashMap<ConnectionId, DdlCache> {
+    let Ok(bytes) = std::fs::read(ddl_cache_file_path()) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_ddl_cache_to_disk(cache: &HashMap<ConnectionId, DdlCache>) -> Result<()> {
+    let json = serde_json::to_vec_pretty(cache)?;
+    std::fs::write(ddl_cache_file_path(), json)?;
     Ok(())
 }
 
@@ -1591,6 +1697,149 @@ mod tests {
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
             Ok(String::new())
         }
+    }
+
+    struct DdlMockProvider;
+
+    #[async_trait::async_trait]
+    impl DbProvider for DdlMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, table: &str) -> Result<String> {
+            Ok(format!("CREATE TABLE `{table}` (id INT)"))
+        }
+        async fn get_database_ddl(&self, database: &str) -> Result<String> {
+            Ok(format!("CREATE DATABASE `{database}`"))
+        }
+    }
+
+    #[gpui::test]
+    async fn ddl_cache_serves_offline_after_fetch(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(DdlMockProvider), cx);
+        });
+
+        let table_fetch = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        assert_eq!(
+            table_fetch.await.expect("connected fetch"),
+            "CREATE TABLE `users` (id INT)"
+        );
+        let db_fetch = store.update(cx, |store, cx| store.get_database_ddl(id, "shop".into(), cx));
+        assert_eq!(
+            db_fetch.await.expect("connected fetch"),
+            "CREATE DATABASE `shop`"
+        );
+
+        store.update(cx, |store, cx| store.disconnect(id, cx));
+
+        let table_cached = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        assert_eq!(
+            table_cached.await.expect("cached while offline"),
+            "CREATE TABLE `users` (id INT)"
+        );
+        let db_cached = store.update(cx, |store, cx| store.get_database_ddl(id, "shop".into(), cx));
+        assert_eq!(
+            db_cached.await.expect("cached while offline"),
+            "CREATE DATABASE `shop`"
+        );
+    }
+
+    #[gpui::test]
+    async fn ddl_uncached_offline_errors(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(DdlMockProvider), cx);
+            store.disconnect(id, cx);
+        });
+
+        let result = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        assert!(result.await.is_err());
+    }
+
+    #[gpui::test]
+    async fn refresh_clears_ddl_cache(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(DdlMockProvider), cx);
+        });
+        let fetch = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        fetch.await.expect("connected fetch");
+
+        store.update(cx, |store, cx| {
+            store.refresh_schema_cache(id, cx).detach();
+            store.disconnect(id, cx);
+        });
+        let result = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        assert!(result.await.is_err());
+    }
+
+    #[test]
+    fn ddl_cache_round_trips() {
+        let id = ConnectionConfig::default().id;
+        let mut cache: HashMap<ConnectionId, DdlCache> = HashMap::new();
+        let entry = cache.entry(id).or_default();
+        entry
+            .tables
+            .entry("shop".into())
+            .or_default()
+            .insert("users".into(), "CREATE TABLE users".into());
+        entry
+            .databases
+            .insert("shop".into(), "CREATE DATABASE shop".into());
+
+        let bytes = serde_json::to_vec(&cache).expect("serialize");
+        let restored: HashMap<ConnectionId, DdlCache> =
+            serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(
+            restored
+                .get(&id)
+                .and_then(|c| c.tables.get("shop"))
+                .and_then(|t| t.get("users")),
+            Some(&"CREATE TABLE users".to_string())
+        );
+        assert_eq!(
+            restored.get(&id).and_then(|c| c.databases.get("shop")),
+            Some(&"CREATE DATABASE shop".to_string())
+        );
     }
 
     #[gpui::test]
