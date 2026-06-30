@@ -3,6 +3,7 @@ use crate::driver_icon::brand_icon;
 use crate::compare_data::{CompareDataEvent, CompareDataView};
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::data_import::{DataImportEvent, ImportDataView};
+use crate::ddl_source::{DdlSourceEvent, DdlSourceView};
 use crate::explain_plan::{
     ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
     plan_text_from_result,
@@ -1353,6 +1354,7 @@ pub struct DatabasePanel {
     compare_view: Option<Entity<CompareDataView>>,
     explain_view: Option<Entity<ExplainPlanView>>,
     data_import: Option<Entity<ImportDataView>>,
+    ddl_source: Option<Entity<DdlSourceView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     _subscriptions: Vec<Subscription>,
@@ -1447,6 +1449,7 @@ impl DatabasePanel {
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
+                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![
@@ -1741,6 +1744,19 @@ impl DatabasePanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn open_ddl_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| DdlSourceView::new(window, cx));
+        let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
+            DdlSourceEvent::Dismissed => {
+                panel.ddl_source = None;
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(subscription);
+        self.ddl_source = Some(view);
+        cx.notify();
     }
 
     fn open_data_import(
@@ -2487,12 +2503,24 @@ impl DatabasePanel {
                     .py_1()
                     .child(Label::new("Database").size(LabelSize::Small))
                     .child(
-                        IconButton::new("add-connection", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Add Connection"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_add_connection_modal(window, cx);
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                IconButton::new("open-ddl-source", IconName::FileCode)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Open SQL schema file"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_ddl_source(window, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("add-connection", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Add Connection"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_add_connection_modal(window, cx);
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -4157,6 +4185,19 @@ impl Render for DatabasePanel {
                         .child(view),
                 )
             })
+            .when_some(self.ddl_source.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
+            })
             .when(self.compare_pick.is_some(), |el| {
                 el.child(
                     div()
@@ -4885,6 +4926,7 @@ mod tests {
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
+                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5041,6 +5083,7 @@ mod tests {
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
+                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5189,6 +5232,7 @@ mod tests {
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
+                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
@@ -5665,6 +5709,7 @@ mod tests {
                     compare_view: None,
                     explain_view: None,
                     data_import: None,
+                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     _subscriptions: vec![sub],
