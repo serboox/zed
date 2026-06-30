@@ -1779,8 +1779,22 @@ impl DatabasePanel {
     }
 
     fn toggle_connection_collapsed(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
-        if !self.collapsed_connections.remove(&id) {
+        let now_expanding = self.collapsed_connections.remove(&id);
+        if !now_expanding {
             self.collapsed_connections.insert(id);
+        } else {
+            let needs_databases = self
+                .store
+                .read(cx)
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .is_some_and(|c| c.databases.is_none());
+            if needs_databases {
+                self.store
+                    .update(cx, |store, cx| store.refresh_databases(id, cx))
+                    .detach_and_log_err(cx);
+            }
         }
         cx.notify();
     }

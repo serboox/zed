@@ -760,6 +760,35 @@ impl DatabaseStore {
         })
     }
 
+    /// Returns the connection's live provider, establishing the connection first
+    /// if it is not connected yet. This is how every provider-backed operation
+    /// gets its provider, so a missing connection never blocks an action — it is
+    /// opened on demand.
+    pub fn ensure_connected(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Arc<dyn DbProvider>>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if let Some(provider) = conn.provider.clone() {
+            return Task::ready(Ok(provider));
+        }
+        cx.spawn(async move |this, cx| {
+            let connect_task = this.update(cx, |store, cx| store.connect(id, cx))?;
+            connect_task.await?;
+            this.read_with(cx, |store, _| {
+                store
+                    .connections
+                    .iter()
+                    .find(|c| c.config.id == id)
+                    .and_then(|c| c.provider.clone())
+            })?
+            .ok_or_else(|| anyhow::anyhow!("Failed to connect"))
+        })
+    }
+
     pub fn disconnect(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
             return;
@@ -795,13 +824,13 @@ impl DatabaseStore {
             cx.notify();
             return Task::ready(Ok(()));
         }
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
         conn.expanded_database_set.insert(database.clone());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
             let tables = provider.list_tables(&database).await?;
             let views = provider.list_views(&database).await.unwrap_or_default();
             this.update(cx, |this, cx| {
@@ -839,13 +868,13 @@ impl DatabaseStore {
             cx.notify();
             return Task::ready(Ok(()));
         }
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
         conn.expanded_table_set.insert(key.clone());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
             let columns = provider.describe_table(&database, &table).await?;
             let indexes = provider
                 .list_indexes(&database, &table)
@@ -881,14 +910,14 @@ impl DatabaseStore {
         id: ConnectionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
+        }
 
         cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
             let databases = provider.list_databases().await?;
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
@@ -1084,16 +1113,18 @@ impl DatabaseStore {
         sql: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<db_client::schema::QueryResult>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
+        }
 
         self.record_query_history(sql.clone(), cx);
 
-        cx.background_spawn(async move { provider.execute_query(&database, &sql).await })
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.execute_query(&database, &sql).await
+        })
     }
 
     pub fn describe_table(
@@ -1103,13 +1134,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<ColumnInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.describe_table(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.describe_table(&database, &table).await
+        })
     }
 
     pub fn get_table_ddl(
@@ -1122,15 +1155,15 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
-        let Some(provider) = conn.provider.clone() else {
-            return match self.cached_table_ddl(id, &database, &table) {
-                Some(ddl) => Task::ready(Ok(ddl)),
-                None => Task::ready(Err(anyhow::anyhow!(
-                    "DDL not cached yet — connect to fetch it"
-                ))),
-            };
-        };
+        if conn.provider.is_none()
+            && let Some(ddl) = self.cached_table_ddl(id, &database, &table)
+        {
+            return Task::ready(Ok(ddl));
+        }
         cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
             let ddl = provider.get_table_ddl(&database, &table).await?;
             this.update(cx, |store, cx| {
                 store
@@ -1166,19 +1199,18 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
-        let Some(provider) = conn.provider.clone() else {
-            return match self
+        if conn.provider.is_none()
+            && let Some(ddl) = self
                 .ddl_cache
                 .get(&id)
                 .and_then(|c| c.databases.get(&database).cloned())
-            {
-                Some(ddl) => Task::ready(Ok(ddl)),
-                None => Task::ready(Err(anyhow::anyhow!(
-                    "DDL not cached yet — connect to fetch it"
-                ))),
-            };
-        };
+        {
+            return Task::ready(Ok(ddl));
+        }
         cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
             let ddl = provider.get_database_ddl(&database).await?;
             this.update(cx, |store, cx| {
                 store
@@ -1201,13 +1233,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<IndexInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.list_indexes(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_indexes(&database, &table).await
+        })
     }
 
     pub fn list_foreign_keys(
@@ -1217,13 +1251,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<FkInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.list_foreign_keys(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_foreign_keys(&database, &table).await
+        })
     }
 
     pub fn list_procedures(
@@ -1232,13 +1268,15 @@ impl DatabaseStore {
         database: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<ProcedureInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.list_procedures(&database).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_procedures(&database).await
+        })
     }
 
     pub fn list_triggers(
@@ -1248,13 +1286,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<TriggerInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.list_triggers(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_triggers(&database, &table).await
+        })
     }
 
     pub fn list_users(
@@ -1262,13 +1302,15 @@ impl DatabaseStore {
         id: ConnectionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<UserInfo>>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.list_users().await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_users().await
+        })
     }
 
     pub fn truncate_table(
@@ -1278,13 +1320,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.truncate_table(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.truncate_table(&database, &table).await
+        })
     }
 
     pub fn drop_table(
@@ -1294,13 +1338,15 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        let Some(provider) = conn.provider.clone() else {
-            return Task::ready(Err(anyhow::anyhow!("Not connected")));
-        };
-        cx.background_spawn(async move { provider.drop_table(&database, &table).await })
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.drop_table(&database, &table).await
+        })
     }
 
     fn record_query_history(&mut self, sql: String, cx: &mut Context<Self>) {
@@ -1774,19 +1820,19 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn ddl_uncached_offline_errors(cx: &mut gpui::TestAppContext) {
+    async fn ensure_connected_returns_existing_provider(cx: &mut gpui::TestAppContext) {
         let store = cx.new(DatabaseStore::new);
         let config = ConnectionConfig::default();
         let id = config.id;
         store.update(cx, |store, cx| {
             store.add_connected_for_test(config, Arc::new(DdlMockProvider), cx);
-            store.disconnect(id, cx);
         });
 
-        let result = store.update(cx, |store, cx| {
-            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
-        });
-        assert!(result.await.is_err());
+        // An already-connected connection resolves to its live provider without
+        // attempting a fresh connect (the None -> connect path hits a real
+        // network and is covered by integration/manual testing instead).
+        let provider = store.update(cx, |store, cx| store.ensure_connected(id, cx));
+        assert!(provider.await.is_ok());
     }
 
     #[gpui::test]
@@ -1801,15 +1847,15 @@ mod tests {
             store.get_table_ddl(id, "shop".into(), "users".into(), cx)
         });
         fetch.await.expect("connected fetch");
+        store.read_with(cx, |store, _| {
+            assert!(store.cached_table_ddl(id, "shop", "users").is_some());
+        });
 
-        store.update(cx, |store, cx| {
-            store.refresh_schema_cache(id, cx).detach();
-            store.disconnect(id, cx);
+        let refresh = store.update(cx, |store, cx| store.refresh_schema_cache(id, cx));
+        refresh.await.ok();
+        store.read_with(cx, |store, _| {
+            assert!(store.cached_table_ddl(id, "shop", "users").is_none());
         });
-        let result = store.update(cx, |store, cx| {
-            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
-        });
-        assert!(result.await.is_err());
     }
 
     #[test]
