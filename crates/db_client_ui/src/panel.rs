@@ -26,8 +26,9 @@ use futures::future::Shared;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, DragMoveEvent,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
+    anchored, deferred,
     div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
@@ -44,7 +45,8 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use ui::{
     CommonAnimationExt, ContextMenu, Divider, HighlightedLabel, Icon, IconButton, IconName,
-    IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu,
+    IconSize, Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -1528,6 +1530,7 @@ pub struct DatabasePanel {
     selected_tree_node: Option<SelectedTreeNode>,
     dump: DumpUiState,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    tree_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1718,6 +1721,7 @@ impl DatabasePanel {
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -5054,7 +5058,7 @@ fn new_items_context_menu(
 }
 
 impl Render for DatabasePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connections: Vec<ActiveConnection> =
             self.store.read(cx).connections().iter().cloned().collect();
         let folders: Vec<Folder> = self.store.read(cx).folders().to_vec();
@@ -5090,9 +5094,16 @@ impl Render for DatabasePanel {
             .child(
                 div()
                     .id("db-panel-scroll")
+                    .debug_selector(|| "DB-TREE-SCROLL".into())
                     .flex_1()
-                    .overflow_y_scroll()
-                    .child(tree_background),
+                    .overflow_scroll()
+                    .child(tree_background)
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Both)
+                            .tracked_scroll_handle(&self.tree_scroll_handle),
+                        window,
+                        cx,
+                    ),
             )
             .when(!self.store.read(cx).query_history().is_empty(), |el| {
                 el.child(self.render_history(cx))
@@ -6030,6 +6041,7 @@ mod tests {
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -6193,6 +6205,7 @@ mod tests {
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -6348,6 +6361,7 @@ mod tests {
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -6571,6 +6585,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6656,6 +6671,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6739,6 +6755,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6849,6 +6866,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6961,6 +6979,7 @@ mod tests {
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -7384,6 +7403,7 @@ mod tests {
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
