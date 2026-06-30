@@ -1,6 +1,6 @@
 use gpui::{
-    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, ScrollHandle, Window,
-    canvas, point, prelude::*, px,
+    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, Window, canvas, point, prelude::*, px,
 };
 use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use workspace::{Item, item::ItemEvent};
@@ -41,6 +41,9 @@ const MAX_DISPLAY_COLUMNS: usize = 10;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 3.0;
 const ZOOM_STEP: f32 = 0.25;
+// Line-based wheel deltas carry small magnitudes; scale them up to feel like pixel scrolls.
+const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
+const WHEEL_ZOOM_SENSITIVITY: f32 = 0.005;
 
 fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
@@ -236,6 +239,22 @@ impl ErdView {
     fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.zoom = 1.0;
         cx.notify();
+    }
+
+    // Returns true when the wheel event was consumed as a zoom, so the caller can
+    // suppress the container's own scroll. Zoom only applies with Ctrl (Linux/Windows)
+    // or Cmd (macOS) held; a plain wheel falls through to normal scrolling.
+    fn apply_wheel_zoom(&mut self, delta_y: f32, modifiers: &Modifiers) -> bool {
+        if !(modifiers.control || modifiers.platform) || delta_y == 0.0 {
+            return false;
+        }
+        let factor = if delta_y > 0.0 {
+            1.0 + delta_y.abs() * WHEEL_ZOOM_SENSITIVITY
+        } else {
+            1.0 / (1.0 + delta_y.abs() * WHEEL_ZOOM_SENSITIVITY)
+        };
+        self.zoom = clamp_zoom(self.zoom * factor);
+        true
     }
 
     fn table_center(&self, table_name: &str) -> Option<(f32, f32)> {
@@ -476,6 +495,16 @@ impl Render for ErdView {
                     .min_h_0()
                     .overflow_scroll()
                     .track_scroll(&self.scroll_handle)
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                        let delta_y: f32 = match event.delta {
+                            ScrollDelta::Pixels(pixels) => pixels.y.into(),
+                            ScrollDelta::Lines(lines) => lines.y * SCROLL_LINE_MULTIPLIER,
+                        };
+                        if this.apply_wheel_zoom(delta_y, &event.modifiers) {
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
                     .child(surface)
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Both)
@@ -643,6 +672,44 @@ mod tests {
             assert_eq!(view.zoom, MIN_ZOOM);
             view.reset_zoom(cx);
             assert_eq!(view.zoom, 1.0);
+        })
+        .expect("window should build");
+    }
+
+    #[gpui::test]
+    fn wheel_zoom_needs_modifier_and_clamps(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (tables, relationships) = sample();
+        let view = cx
+            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        view.update(cx, |view, _window, _cx| {
+            assert_eq!(view.zoom, 1.0);
+
+            // Plain wheel does not zoom.
+            assert!(!view.apply_wheel_zoom(50.0, &Modifiers::none()));
+            assert_eq!(view.zoom, 1.0);
+
+            // Ctrl + wheel up zooms in, down zooms out.
+            assert!(view.apply_wheel_zoom(50.0, &Modifiers::control()));
+            assert!(view.zoom > 1.0);
+            let zoomed_in = view.zoom;
+            assert!(view.apply_wheel_zoom(-50.0, &Modifiers::control()));
+            assert!(view.zoom < zoomed_in);
+
+            // Stays within bounds under repeated zooming.
+            for _ in 0..200 {
+                view.apply_wheel_zoom(100.0, &Modifiers::control());
+            }
+            assert_eq!(view.zoom, MAX_ZOOM);
+            for _ in 0..200 {
+                view.apply_wheel_zoom(-100.0, &Modifiers::control());
+            }
+            assert_eq!(view.zoom, MIN_ZOOM);
         })
         .expect("window should build");
     }
