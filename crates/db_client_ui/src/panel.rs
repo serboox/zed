@@ -4433,6 +4433,7 @@ impl DatabasePanel {
     ) -> AnyElement {
         let entity = cx.entity();
         let is_top_level_target = self.drag_target == Some(DropTarget::TopLevel);
+        let show_empty_state = tree_elements.is_empty();
         let background = v_flex()
             .id("db-tree-background")
             .size_full()
@@ -4453,7 +4454,32 @@ impl DatabasePanel {
             .on_drop(cx.listener(|this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::TopLevel, cx);
             }))
-            .children(tree_elements);
+            .children(tree_elements)
+            .when(show_empty_state, |el| {
+                el.child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_4()
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::Medium)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("No connections")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("Right-click to add a folder or connection")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            });
 
         right_click_menu(ElementId::from("db-tree-background-menu"))
             .trigger(move |_, _, _| background)
@@ -4487,7 +4513,6 @@ impl Render for DatabasePanel {
         let nodes = build_folder_tree(&folders, &connections, None, 1);
         let tree_elements = self.render_tree_nodes(nodes, &connections, 0, cx);
         let tree_background = self.render_tree_background(tree_elements, cx);
-        let is_empty = connections.is_empty() && folders.is_empty();
 
         v_flex()
             .key_context("DatabasePanel")
@@ -4515,33 +4540,6 @@ impl Render for DatabasePanel {
                     .overflow_y_scroll()
                     .child(tree_background),
             )
-            .when(is_empty, |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .gap_2()
-                        .p_4()
-                        .child(
-                            Icon::new(IconName::DatabaseZap)
-                                .size(IconSize::Medium)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("No connections")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("Right-click to add a folder or connection")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                )
-            })
             .when(!self.store.read(cx).query_history().is_empty(), |el| {
                 el.child(self.render_history(cx))
             })
@@ -6042,6 +6040,90 @@ mod tests {
         panel.update(cx, |panel, cx| panel.toggle_folder_collapsed(folder_id, cx));
         panel.read_with(cx, |panel, _| {
             assert!(!panel.collapsed_folders.contains(&folder_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_panel_background_menu_creates_folder_and_connection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                erd_view: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        // An empty store means the tree renders the right-clickable empty state.
+        store.read_with(cx, |store, _| {
+            assert!(store.connections().is_empty());
+            assert!(store.folders().is_empty());
+        });
+
+        // The background menu's "New Connection" opens a connection form.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_connection_in_folder(None, window, cx);
+        });
+        let connection_forms = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ConnectionView>()
+                .count()
+        });
+        assert_eq!(connection_forms, 1, "New Connection opens a connection form");
+
+        // The background menu's "New Folder" creates a top-level folder.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_new_folder(None, window, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.folders().len(),
+                1,
+                "New Folder creates a top-level folder"
+            );
+            assert!(store.folders()[0].parent_id.is_none());
         });
     }
 
