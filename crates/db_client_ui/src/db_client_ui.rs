@@ -1,6 +1,7 @@
 mod compare_data;
 mod connection_view;
 mod data_import;
+mod db_agent_tools;
 mod ddl_source;
 mod driver_icon;
 mod erd_diagram;
@@ -23,4 +24,5 @@ use gpui::App;
 
 pub fn init(cx: &mut App) {
     panel::init(cx);
+    db_agent_tools::init();
 }

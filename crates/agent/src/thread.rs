@@ -2175,6 +2175,11 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
+
+        for factory in EXTRA_TOOLS.lock().iter() {
+            let tool = factory();
+            self.tools.entry(tool.name()).or_insert(tool);
+        }
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -4851,6 +4856,22 @@ impl ToolInputSender {
             .unbounded_send(ToolInputPayload::InvalidJson { error_message })
             .ok();
     }
+}
+
+type ExtraToolFactory = Box<dyn Fn() -> Arc<dyn AnyAgentTool> + Send + Sync>;
+
+static EXTRA_TOOLS: parking_lot::Mutex<Vec<ExtraToolFactory>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Registers a tool contributed by a crate that `agent` does not depend on
+/// (e.g. database query tools defined in `db_client_ui`). Each registered
+/// factory runs when a thread assembles its default tools, so the tool reaches
+/// the model without `agent` taking a dependency on the contributing crate.
+pub fn register_extra_tool<F>(factory: F)
+where
+    F: Fn() -> Arc<dyn AnyAgentTool> + Send + Sync + 'static,
+{
+    EXTRA_TOOLS.lock().push(Box::new(factory));
 }
 
 pub trait AgentTool

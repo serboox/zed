@@ -4953,6 +4953,8 @@ dependencies = [
 name = "db_client_ui"
 version = "0.1.0"
 dependencies = [
+ "agent",
+ "agent-client-protocol",
  "anyhow",
  "async-trait",
  "clock",
