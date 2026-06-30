@@ -2,6 +2,7 @@ mod compare_data;
 mod connection_view;
 mod data_import;
 mod db_agent_tools;
+mod db_migration;
 mod ddl_source;
 mod driver_icon;
 mod erd_diagram;

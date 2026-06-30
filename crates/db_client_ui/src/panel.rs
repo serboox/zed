@@ -1,6 +1,9 @@
 use crate::compare_data::CompareDataView;
 use crate::connection_view::ConnectionView;
 use crate::data_import::ImportDataView;
+use crate::db_migration::{
+    BUNDLE_VERSION, ConsoleFile, EncryptedSecrets, ExportBundle, decrypt_secrets, encrypt_secrets,
+};
 use crate::ddl_source::DdlSourceView;
 use crate::driver_icon::brand_icon;
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
@@ -871,6 +874,42 @@ fn connection_query_path(connection_id: ConnectionId, label: &str) -> std::path:
         .join(format!("{sanitized}-{short}.sql"))
 }
 
+/// Serializes an export bundle and writes it to `path` off the main thread.
+fn write_export_bundle(
+    path: std::path::PathBuf,
+    folders: Vec<Folder>,
+    connections: Vec<ConnectionConfig>,
+    consoles: Vec<ConsoleFile>,
+    secrets: Option<EncryptedSecrets>,
+    cx: &mut App,
+) {
+    let bundle = ExportBundle {
+        version: BUNDLE_VERSION,
+        folders,
+        connections,
+        consoles,
+        secrets,
+    };
+    cx.background_spawn(async move {
+        if let Some(json) = serde_json::to_vec_pretty(&bundle).log_err() {
+            std::fs::write(&path, json).log_err();
+        }
+    })
+    .detach();
+}
+
+fn show_db_toast<C: gpui::AppContext>(
+    workspace: &WeakEntity<Workspace>,
+    id: &'static str,
+    message: &str,
+    cx: &mut C,
+) {
+    let toast = Toast::new(NotificationId::named(id.into()), message.to_string());
+    workspace
+        .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+        .log_err();
+}
+
 /// Resolves which connection a focused editor's SQL console belongs to, without
 /// depending on the editor addon. A file-backed console editor may not carry the
 /// addon (the addon can be lost when the editor is reopened or restored from a
@@ -1641,6 +1680,117 @@ impl Render for DraggedDbItemPreview {
 
 /// Workspace modal that collects values for a parameterized query, then hands the
 /// final SQL to `on_run` (the panel opens it in a console tab).
+type MasterPasswordCallback = Arc<dyn Fn(Option<String>, &mut Window, &mut App)>;
+
+/// A workspace modal that collects a master password used to encrypt (on export)
+/// or decrypt (on import) the connection passwords carried in a portable bundle.
+/// The callback gets `Some(password)` on confirm, or `None` when the user skips.
+struct MasterPasswordView {
+    focus_handle: FocusHandle,
+    title: SharedString,
+    subtitle: SharedString,
+    confirm_label: SharedString,
+    allow_skip: bool,
+    editor: Entity<Editor>,
+    on_result: MasterPasswordCallback,
+}
+
+impl MasterPasswordView {
+    fn new(
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        confirm_label: impl Into<SharedString>,
+        allow_skip: bool,
+        on_result: MasterPasswordCallback,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Master password", window, cx);
+            editor
+        });
+        Self {
+            focus_handle: cx.focus_handle(),
+            title: title.into(),
+            subtitle: subtitle.into(),
+            confirm_label: confirm_label.into(),
+            allow_skip,
+            editor,
+            on_result,
+        }
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = self.editor.read(cx).text(cx);
+        if password.is_empty() {
+            return;
+        }
+        (self.on_result.clone())(Some(password), window, cx);
+        cx.emit(DismissEvent);
+    }
+
+    fn skip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        (self.on_result.clone())(None, window, cx);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for MasterPasswordView {}
+
+impl ModalView for MasterPasswordView {}
+
+impl Focusable for MasterPasswordView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for MasterPasswordView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("MasterPassword")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(px(440.))
+            .p_3()
+            .gap_2()
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
+            .child(crate::widgets::dialog_header(
+                self.title.clone(),
+                "master-password-close",
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+            ))
+            .child(
+                Label::new(self.subtitle.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().child(self.editor.clone()))
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .when(self.allow_skip, |row| {
+                        row.child(Button::new("master-password-skip", "Skip passwords").on_click(
+                            cx.listener(|this, _, window, cx| this.skip(window, cx)),
+                        ))
+                    })
+                    .child(
+                        Button::new("master-password-cancel", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("master-password-confirm", self.confirm_label.clone())
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
+                    ),
+            )
+    }
+}
+
 type QueryRunCallback = Arc<dyn Fn(String, &mut Window, &mut App)>;
 
 struct QueryParamsView {
@@ -2773,6 +2923,226 @@ impl DatabasePanel {
                 workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
             })
             .log_err();
+    }
+
+    /// Exports the whole Database Explorer (folder tree, all connection
+    /// settings, the SQL console files, and optionally master-password-encrypted
+    /// passwords) to one portable file the user picks.
+    fn export_database_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let folders = store.read(cx).folders().to_vec();
+        let connections: Vec<ConnectionConfig> = store
+            .read(cx)
+            .connections()
+            .iter()
+            .map(|connection| {
+                let mut config = connection.config.clone();
+                config.password = String::new();
+                config
+            })
+            .collect();
+        let console_specs: Vec<(ConnectionId, std::path::PathBuf)> = connections
+            .iter()
+            .map(|config| (config.id, connection_query_path(config.id, &config.label)))
+            .collect();
+        let passwords_task = store.update(cx, |store, cx| store.read_all_passwords(cx));
+        let workspace = self.workspace.clone();
+        let path_rx =
+            cx.prompt_for_new_path(paths::home_dir(), Some("database-explorer.zdbexport.json"));
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let Some(path) = path_rx
+                .await
+                .log_err()
+                .and_then(|result| result.log_err())
+                .flatten()
+            else {
+                return;
+            };
+            let consoles = cx
+                .background_executor()
+                .spawn(async move {
+                    console_specs
+                        .into_iter()
+                        .filter_map(|(connection_id, file_path)| {
+                            let content = std::fs::read_to_string(&file_path).ok()?;
+                            let filename = file_path.file_name()?.to_string_lossy().into_owned();
+                            Some(ConsoleFile {
+                                connection_id,
+                                filename,
+                                content,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let passwords = passwords_task.await.unwrap_or_default();
+
+            if passwords.is_empty() {
+                workspace
+                    .update_in(cx, |_workspace, _window, cx| {
+                        write_export_bundle(path, folders, connections, consoles, None, cx);
+                    })
+                    .log_err();
+                return;
+            }
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let on_result: MasterPasswordCallback = Arc::new(move |password, _window, cx| {
+                        let secrets = password
+                            .and_then(|master| encrypt_secrets(&passwords, &master).log_err());
+                        write_export_bundle(
+                            path.clone(),
+                            folders.clone(),
+                            connections.clone(),
+                            consoles.clone(),
+                            secrets,
+                            cx,
+                        );
+                    });
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        MasterPasswordView::new(
+                            "Export with a master password",
+                            "Set a master password to encrypt the saved connection passwords; \
+                             you will enter it when importing. Or skip to export without passwords.",
+                            "Encrypt & export",
+                            true,
+                            on_result,
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// Imports a bundle written by `export_database_explorer`. Restores the tree,
+    /// connections and console files immediately; if the bundle carries encrypted
+    /// passwords, asks once for the master password to decrypt them into the
+    /// keychain. A wrong/skipped master password still leaves everything else
+    /// restored — connecting later prompts for the password.
+    fn import_database_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        let path_rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let Some(path) = path_rx
+                .await
+                .log_err()
+                .and_then(|result| result.log_err())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next())
+            else {
+                return;
+            };
+            let read_path = path.clone();
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&read_path) })
+                .await;
+            let Some(bytes) = bytes.log_err() else {
+                show_db_toast(&workspace, "db-import-read", "Could not read the export file.", cx);
+                return;
+            };
+            let Some(bundle) = serde_json::from_slice::<ExportBundle>(&bytes).log_err() else {
+                show_db_toast(
+                    &workspace,
+                    "db-import-parse",
+                    "That file is not a valid Database Explorer export.",
+                    cx,
+                );
+                return;
+            };
+
+            let folders = bundle.folders.clone();
+            let connections = bundle.connections.clone();
+            store.update(cx, |store, cx| store.restore_tree(folders, connections, cx));
+
+            let labels: HashMap<ConnectionId, String> = bundle
+                .connections
+                .iter()
+                .map(|config| (config.id, config.label.clone()))
+                .collect();
+            let console_writes: Vec<(std::path::PathBuf, String)> = bundle
+                .consoles
+                .iter()
+                .filter_map(|console| {
+                    let label = labels.get(&console.connection_id)?;
+                    Some((
+                        connection_query_path(console.connection_id, label),
+                        console.content.clone(),
+                    ))
+                })
+                .collect();
+            cx.background_executor()
+                .spawn(async move {
+                    for (file_path, content) in console_writes {
+                        if let Some(parent) = file_path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::write(&file_path, content).log_err();
+                    }
+                })
+                .await;
+
+            let Some(secrets) = bundle.secrets.clone() else {
+                show_db_toast(
+                    &workspace,
+                    "db-import-done",
+                    "Database Explorer restored.",
+                    cx,
+                );
+                return;
+            };
+
+            let store_for_modal = store.clone();
+            let workspace_for_modal = workspace.clone();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let on_result: MasterPasswordCallback = Arc::new(move |password, _window, cx| {
+                        let Some(master) = password else {
+                            return;
+                        };
+                        match decrypt_secrets(&secrets, &master) {
+                            Ok(passwords) => {
+                                store_for_modal
+                                    .update(cx, |store, cx| store.restore_passwords(passwords, cx))
+                                    .detach();
+                            }
+                            Err(_) => show_db_toast(
+                                &workspace_for_modal,
+                                "db-import-decrypt",
+                                "Could not decrypt passwords; everything else was restored. \
+                                 Connecting will ask for the password.",
+                                cx,
+                            ),
+                        }
+                    });
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        MasterPasswordView::new(
+                            "Restore saved passwords",
+                            "Enter the master password used when exporting to decrypt the saved \
+                             connection passwords. Cancel to restore without them.",
+                            "Decrypt",
+                            false,
+                            on_result,
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .log_err();
+        })
+        .detach();
     }
 
     fn open_data_import(
@@ -5293,10 +5663,23 @@ fn new_items_context_menu(
                 panel.update(cx, |panel, cx| panel.start_new_folder(None, window, cx));
             }
         })
-        .entry("New Connection", None, move |window, cx| {
-            panel.update(cx, |panel, cx| {
-                panel.new_connection_in_folder(None, window, cx)
-            });
+        .entry("New Connection", None, {
+            let panel = panel.clone();
+            move |window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.new_connection_in_folder(None, window, cx)
+                });
+            }
+        })
+        .separator()
+        .entry("Export Database Explorer…", None, {
+            let panel = panel.clone();
+            move |window, cx| {
+                panel.update(cx, |panel, cx| panel.export_database_explorer(window, cx));
+            }
+        })
+        .entry("Import Database Explorer…", None, move |window, cx| {
+            panel.update(cx, |panel, cx| panel.import_database_explorer(window, cx));
         })
     })
 }

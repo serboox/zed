@@ -16,7 +16,7 @@ use db_client::{
 };
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Task, TaskExt as _};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use util::ResultExt;
 
@@ -709,6 +709,88 @@ impl DatabaseStore {
                 .await;
         })
         .detach();
+    }
+
+    /// Reads every connection's password from the keychain, for an export
+    /// bundle. Connections with no stored password are skipped.
+    pub fn read_all_passwords(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<BTreeMap<ConnectionId, String>>> {
+        let ids: Vec<ConnectionId> = self.connections.iter().map(|c| c.config.id).collect();
+        cx.spawn(async move |_this, cx| {
+            let provider = cx.update(|cx| zed_credentials_provider::global(cx));
+            let mut passwords = BTreeMap::new();
+            for id in ids {
+                if let Some(password) = read_connection_password(&provider, id, cx).await? {
+                    if !password.is_empty() {
+                        passwords.insert(id, password);
+                    }
+                }
+            }
+            Ok(passwords)
+        })
+    }
+
+    /// Restores a folder tree and connections from an import bundle. Upserts by
+    /// id: an existing folder/connection is updated in place, a new one is added,
+    /// and nothing already present is dropped.
+    pub fn restore_tree(
+        &mut self,
+        folders: Vec<Folder>,
+        connections: Vec<ConnectionConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        for folder in folders {
+            if let Some(existing) = self.folders.iter_mut().find(|f| f.id == folder.id) {
+                *existing = folder;
+            } else {
+                self.folders.push(folder);
+            }
+        }
+        for config in connections {
+            if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == config.id) {
+                conn.config = config;
+            } else {
+                self.connections.push(ActiveConnection::new(config));
+            }
+        }
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
+    /// Writes decrypted passwords back to the keychain and into the in-memory
+    /// configs, so an imported connection can connect without a reload. Unknown
+    /// connection ids are ignored.
+    pub fn restore_passwords(
+        &mut self,
+        passwords: BTreeMap<ConnectionId, String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let mut entries = Vec::new();
+        for (id, password) in passwords {
+            if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) {
+                conn.config.password = password.clone();
+                entries.push((id, conn.config.username.clone(), password));
+            }
+        }
+        cx.notify();
+        cx.spawn(async move |_this, cx| {
+            let provider = cx.update(|cx| zed_credentials_provider::global(cx));
+            for (id, username, password) in entries {
+                provider
+                    .write_credentials(
+                        &connection_credentials_url(id),
+                        &username,
+                        password.as_bytes(),
+                        cx,
+                    )
+                    .await
+                    .log_err();
+            }
+            Ok(())
+        })
     }
 
     /// Depth of `folder_id` in the tree, where a top-level folder is depth 1.
@@ -1806,6 +1888,46 @@ mod tests {
         let tree = parse_stored_tree(object).expect("object parse");
         assert!(tree.connections.is_empty());
         assert!(tree.folders.is_empty());
+    }
+
+    #[gpui::test]
+    fn restore_tree_upserts_folders_and_connections(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let folder = Folder::new("Imported".to_string(), None, 0);
+        let folder_id = folder.id;
+        let mut connection = ConnectionConfig::default();
+        connection.label = "Imported DB".to_string();
+        let connection_id = connection.id;
+
+        store.update(cx, |store, cx| {
+            store.restore_tree(vec![folder.clone()], vec![connection.clone()], cx);
+            assert_eq!(store.folders().len(), 1);
+            assert_eq!(store.connections().len(), 1);
+
+            // Re-importing the same ids updates in place instead of duplicating.
+            let mut updated_folder = folder.clone();
+            updated_folder.name = "Renamed".to_string();
+            let mut updated_connection = connection.clone();
+            updated_connection.label = "Renamed DB".to_string();
+            store.restore_tree(vec![updated_folder], vec![updated_connection], cx);
+
+            assert_eq!(store.folders().len(), 1);
+            assert_eq!(store.connections().len(), 1);
+            assert_eq!(
+                store.folders().iter().find(|f| f.id == folder_id).unwrap().name,
+                "Renamed"
+            );
+            assert_eq!(
+                store
+                    .connections()
+                    .iter()
+                    .find(|c| c.config.id == connection_id)
+                    .unwrap()
+                    .config
+                    .label,
+                "Renamed DB"
+            );
+        });
     }
 
     #[gpui::test]
