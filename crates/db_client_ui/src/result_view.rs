@@ -775,6 +775,17 @@ enum CellEditTarget {
     Added(usize),
 }
 
+// How an edit was started, which decides the initial selection. Excel keeps the
+// value and puts the caret at the end when you open a cell with double-click/F2,
+// and only selects-all (so the first keystroke replaces) when you start by typing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellEditEntry {
+    // Double-click / F2 / move-to-next-cell: keep the value, caret at the end.
+    CursorEnd,
+    // Type-to-replace: select the value so the first keystroke overwrites it.
+    Replace,
+}
+
 // An in-progress inline cell edit: a single-line editor overlaid on the cell,
 // prefilled with the cell's full value. The subscription cancels the edit when
 // the editor loses focus.
@@ -783,6 +794,10 @@ struct CellEdit {
     col_idx: usize,
     target: CellEditTarget,
     editor: Entity<Editor>,
+    // Becomes true once the editor has actually gained focus. A blur is only
+    // treated as a commit after this, so the spurious blur that can fire while
+    // focus is still settling on open never commits an empty/half value.
+    commit_armed: bool,
     _subscription: Subscription,
 }
 
@@ -1517,7 +1532,7 @@ impl ResultView {
         if (click_count >= 2 || repeated_selected_cell_click)
             && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
         {
-            self.begin_cell_edit(abs_idx, cell_idx, window, cx);
+            self.begin_cell_edit(abs_idx, cell_idx, CellEditEntry::CursorEnd, window, cx);
         } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
             self.toggle_boolean_cell_loaded(abs_idx, cell_idx, cx);
         } else if let Some(value) = self
@@ -1556,7 +1571,14 @@ impl ResultView {
         if (click_count >= 2 || repeated_selected_cell_click)
             && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
         {
-            self.begin_added_cell_edit(abs_idx, cell_idx, added_idx, window, cx);
+            self.begin_added_cell_edit(
+                abs_idx,
+                cell_idx,
+                added_idx,
+                CellEditEntry::CursorEnd,
+                window,
+                cx,
+            );
         } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
             self.toggle_boolean_cell_added(cell_idx, added_idx, cx);
         } else if let Some(CellValue::Text(value)) = self
@@ -2150,6 +2172,7 @@ impl ResultView {
         &mut self,
         abs_idx: usize,
         col_idx: usize,
+        entry: CellEditEntry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2192,6 +2215,7 @@ impl ResultView {
             col_idx,
             CellEditTarget::Loaded,
             initial,
+            entry,
             window,
             cx,
         );
@@ -2204,6 +2228,7 @@ impl ResultView {
         abs_idx: usize,
         col_idx: usize,
         added_idx: usize,
+        entry: CellEditEntry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2243,6 +2268,7 @@ impl ResultView {
             col_idx,
             CellEditTarget::Added(added_idx),
             initial,
+            entry,
             window,
             cx,
         );
@@ -2282,7 +2308,7 @@ impl ResultView {
         if let Some(display_idx) = self.display_idx_of(abs_idx) {
             self.select_cell_from_click(abs_idx, display_idx, col_idx, false, false);
         }
-        self.begin_added_cell_edit(abs_idx, col_idx, added_idx, window, cx);
+        self.begin_added_cell_edit(abs_idx, col_idx, added_idx, CellEditEntry::CursorEnd, window, cx);
     }
 
     fn render_cell_editor(editor: Entity<Editor>, kind: CellEditorKind) -> AnyElement {
@@ -2337,6 +2363,7 @@ impl ResultView {
         col_idx: usize,
         target: CellEditTarget,
         initial: String,
+        entry: CellEditEntry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2352,16 +2379,36 @@ impl ResultView {
                 ed.set_placeholder_text(placeholder, window, cx);
             }
             ed.set_text(initial, window, cx);
-            ed.select_all(&Default::default(), window, cx);
+            // CursorEnd (double-click / F2 / move) leaves the caret at the end so
+            // the existing value is kept and editable. Only Replace selects all,
+            // so a type-to-replace entry overwrites on the first keystroke.
+            if entry == CellEditEntry::Replace {
+                ed.select_all(&Default::default(), window, cx);
+            }
             ed
         });
         let subscription = cx.subscribe_in(&editor, window, |this, _editor, event, window, cx| {
-            if matches!(event, EditorEvent::Blurred) {
-                this.commit_cell_edit(window, cx);
+            match event {
+                EditorEvent::Focused => {
+                    if let Some(edit) = this.cell_edit.as_mut() {
+                        edit.commit_armed = true;
+                    }
+                }
+                EditorEvent::Blurred => {
+                    // Ignore the blur that can fire while focus is still settling
+                    // on open; only commit once the editor has actually focused.
+                    if this.cell_edit.as_ref().is_some_and(|edit| edit.commit_armed) {
+                        this.commit_cell_edit(window, cx);
+                    }
+                }
+                _ => {}
             }
         });
 
         self.status_message = None;
+        // An inline edit owns the keyboard; close any value-editor popup that a
+        // click may have auto-opened so the two don't fight over focus.
+        self.value_editor_open = false;
         self.selected_cell = Some((abs_idx, col_idx));
         if let Some(disp) = self.display_idx_of(abs_idx) {
             self.record_view_row = Some(disp);
@@ -2371,13 +2418,16 @@ impl ResultView {
             col_idx,
             target,
             editor: editor.clone(),
+            commit_armed: false,
             _subscription: subscription,
         });
-        cx.notify();
+        // Focus before notify so the caret and keyboard land in the editor on the
+        // first click rather than a frame later.
         editor.update(cx, |editor, cx| {
             let handle = editor.focus_handle(cx);
             window.focus(&handle, cx);
         });
+        cx.notify();
     }
 
     // Loads the table's primary-key column names and FK metadata once and caches
@@ -2481,7 +2531,7 @@ impl ResultView {
         } else {
             col_idx
         };
-        self.begin_cell_edit(new_abs, new_col, window, cx);
+        self.begin_cell_edit(new_abs, new_col, CellEditEntry::CursorEnd, window, cx);
     }
 
     // Commits the inline edit into the local buffer (no SQL runs here). The grid
@@ -4647,6 +4697,9 @@ impl ResultView {
                     // Enter → commit + next row; Tab/Shift-Tab → commit + next/prev column.
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         match event.keystroke.key.as_str() {
+                            "enter" if event.keystroke.modifiers.shift => {
+                                this.commit_and_move(0, -1, window, cx);
+                            }
                             "enter" if !event.keystroke.modifiers.modified() => {
                                 this.commit_and_move(0, 1, window, cx);
                             }
@@ -4820,7 +4873,13 @@ impl ResultView {
                                 wt_edit
                                     .update(cx, |this, cx| {
                                         this.selected_cell = Some((abs_idx, cell_idx));
-                                        this.begin_cell_edit(abs_idx, cell_idx, window, cx);
+                                        this.begin_cell_edit(
+                                            abs_idx,
+                                            cell_idx,
+                                            CellEditEntry::CursorEnd,
+                                            window,
+                                            cx,
+                                        );
                                     })
                                     .ok();
                             })
@@ -5075,6 +5134,9 @@ impl ResultView {
                 div()
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         match event.keystroke.key.as_str() {
+                            "enter" if event.keystroke.modifiers.shift => {
+                                this.commit_and_move(0, -1, window, cx);
+                            }
                             "enter" if !event.keystroke.modifiers.modified() => {
                                 this.commit_and_move(0, 1, window, cx);
                             }
@@ -10270,6 +10332,43 @@ mod tests {
                     .as_ref()
                     .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
                 "double-click should open the inline cell editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_keeps_cell_text_with_caret_at_end(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx))
+                .unwrap_or_default();
+            assert_eq!(
+                text, "Alice",
+                "double-click must keep the cell's value, not wipe it"
+            );
+            assert!(
+                !view.value_editor_open,
+                "starting an inline edit must close any auto-opened value editor popup"
             );
         });
     }
