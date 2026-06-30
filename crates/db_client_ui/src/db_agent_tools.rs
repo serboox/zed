@@ -1,5 +1,5 @@
 use crate::store::{CliQueryOutput, DatabaseStore};
-use agent::{AgentTool, ToolCallEventStream, ToolInput};
+use agent::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, SharedString, Task};
 use schemars::JsonSchema;
@@ -114,6 +114,12 @@ fn is_read_only_sql(sql: &str) -> bool {
         .any(|token| WRITE_KEYWORDS.contains(&token.as_str()))
 }
 
+/// A statement that is not read-only changes data or schema, so the agent must
+/// ask the user to confirm before running it.
+fn requires_confirmation(sql: &str) -> bool {
+    !is_read_only_sql(sql)
+}
+
 fn format_connections(summaries: &[(String, String, String)]) -> String {
     if summaries.is_empty() {
         return "No database connections are saved.".to_string();
@@ -202,10 +208,11 @@ impl AgentTool for DbListConnectionsTool {
     }
 }
 
-/// Runs a read-only SQL query against a saved database connection and returns
-/// the rows. Only read statements are allowed (SELECT, WITH, SHOW, DESCRIBE,
-/// EXPLAIN); statements that change data or schema are rejected. The connection
-/// is opened automatically if it is not connected yet.
+/// Runs a SQL query against a saved database connection and returns the rows.
+/// Read statements (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN) run directly;
+/// statements that change data or schema (INSERT, UPDATE, DELETE, DDL, ...) run
+/// only after the user confirms. The connection is opened automatically if it
+/// is not connected yet.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DbRunQueryInput {
     /// Connection id or label (see `db_list_connections`).
@@ -213,7 +220,7 @@ pub struct DbRunQueryInput {
     /// Database/schema to run against. Defaults to the connection's database.
     #[serde(default)]
     pub database: Option<String>,
-    /// The read-only SQL statement to run.
+    /// The SQL statement to run. Writes and DDL require user confirmation.
     pub sql: String,
 }
 
@@ -243,7 +250,7 @@ impl AgentTool for DbRunQueryTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         let store = match store(cx) {
@@ -252,8 +259,13 @@ impl AgentTool for DbRunQueryTool {
         };
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| error.to_string())?;
-            if !is_read_only_sql(&input.sql) {
-                return Err("This statement changes data or schema. The database agent is read-only; run writes and DDL from the Database Explorer panel instead.".to_string());
+            if requires_confirmation(&input.sql) {
+                let title = format!("Run write query on {}", input.connection);
+                let context = ToolPermissionContext::new(Self::NAME, vec![input.sql.clone()]);
+                let authorize = cx.update(|cx| event_stream.authorize(title, context, cx));
+                if let Err(error) = authorize.await {
+                    return Err(format!("The write query was not run: {error}"));
+                }
             }
             let query = store.update(cx, |store, cx| {
                 store.run_query_for_cli(input.connection, input.database, input.sql, cx)
@@ -327,6 +339,22 @@ mod tests {
         // Unrecognized leading keyword is rejected (safe default).
         assert!(!is_read_only_sql("VACUUM"));
         assert!(!is_read_only_sql("PRAGMA writable_schema = 1"));
+    }
+
+    #[test]
+    fn requires_confirmation_only_for_writes() {
+        // Read-only statements run without confirmation.
+        assert!(!requires_confirmation("SELECT * FROM t"));
+        assert!(!requires_confirmation("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!requires_confirmation("SHOW TABLES"));
+        // Writes, DDL, data-modifying CTEs, and chained writes need confirmation.
+        assert!(requires_confirmation("INSERT INTO t VALUES (1)"));
+        assert!(requires_confirmation("UPDATE t SET a = 1"));
+        assert!(requires_confirmation("DROP TABLE t"));
+        assert!(requires_confirmation(
+            "WITH t AS (DELETE FROM a RETURNING id) SELECT * FROM t"
+        ));
+        assert!(requires_confirmation("SELECT * FROM t; DROP TABLE x"));
     }
 
     #[test]
