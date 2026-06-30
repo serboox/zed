@@ -3391,6 +3391,13 @@ impl DatabasePanel {
                         };
                         this.handle_drop(*item, target, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.deploy_connection_context_menu(id, event.position, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(
                         div()
                             .id(ElementId::from(SharedString::from(format!(
@@ -5039,6 +5046,145 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) {
         let menu = new_items_context_menu(cx.entity(), window, cx);
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn deploy_connection_context_menu(
+        &mut self,
+        id: ConnectionId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.read(cx);
+        let Some(connection) = store
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+        else {
+            return;
+        };
+        let config = connection.config.clone();
+        let is_connected = matches!(connection.status, ConnectionStatus::Connected);
+        let driver = config.driver;
+        let label = config.label.clone();
+        let default_database = config.database.clone();
+        let panel = cx.entity();
+        let workspace = self.workspace.clone();
+
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.when(is_connected, |menu| {
+                menu.entry("Disconnect", None, {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| store.disconnect(id, cx));
+                        });
+                    }
+                })
+            })
+            .when(!is_connected, |menu| {
+                menu.entry("Connect", None, {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.connect(id, cx).detach_and_log_err(cx);
+                            });
+                        });
+                    }
+                })
+            })
+            .entry("New Query", None, {
+                let panel = panel.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        Self::open_sql_query_with_text(
+                            workspace.clone(),
+                            panel.store.downgrade(),
+                            id,
+                            String::new(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .entry("Refresh", None, {
+                let panel = panel.clone();
+                move |_, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.store.update(cx, |store, cx| {
+                            store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
+                        });
+                    });
+                }
+            })
+            .separator()
+            .entry("Edit Connection…", None, {
+                let panel = panel.clone();
+                let config = config.clone();
+                move |window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.open_edit_connection_modal(config.clone(), window, cx);
+                    });
+                }
+            })
+            .entry("Duplicate", None, {
+                let panel = panel.clone();
+                move |_, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel
+                            .store
+                            .update(cx, |store, cx| store.duplicate_connection(id, cx));
+                    });
+                }
+            })
+            .when_some(dump_menu_label(driver), |menu, dump_label| {
+                menu.entry(dump_label, None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_dump_dialog(id, Vec::new(), Vec::new(), window, cx);
+                        });
+                    }
+                })
+            })
+            .when_some(default_database.clone(), |menu, database| {
+                menu.entry("Show Diagram", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_erd_diagram(id, database.clone(), window, cx);
+                        });
+                    }
+                })
+            })
+            .entry("Copy Name", None, {
+                let label = label.clone();
+                move |_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(label.clone()));
+                }
+            })
+            .separator()
+            .entry("Remove", None, {
+                let panel = panel.clone();
+                move |_, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel
+                            .store
+                            .update(cx, |store, cx| store.remove_connection(id, cx));
+                    });
+                }
+            })
+        });
         window.focus(&menu.focus_handle(cx), cx);
         let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.context_menu.take();
@@ -7712,6 +7858,40 @@ mod tests {
             assert!(
                 !panel.server_objects_expanded.contains(&connection_id),
                 "toggling again must collapse the Server Objects node"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn connection_right_click_opens_connection_menu(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "ctx-conn".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.context_menu.is_none(),
+                "no context menu is open before right-clicking"
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.deploy_connection_context_menu(
+                connection_id,
+                gpui::Point::default(),
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.context_menu.is_some(),
+                "right-clicking a connection opens its actions menu"
             );
         });
     }
