@@ -1,10 +1,12 @@
 use editor::Editor;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*, px,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Window,
+    prelude::*, px,
 };
 use ui::prelude::*;
-use ui::{Button, Divider, Label};
+use ui::{Button, Divider, Icon, Label};
 use util::ResultExt;
+use workspace::{Item, item::ItemEvent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DdlColumn {
@@ -188,10 +190,6 @@ pub fn parse_ddl_schema(sql: &str) -> Vec<DdlTable> {
     tables
 }
 
-pub enum DdlSourceEvent {
-    Dismissed,
-}
-
 pub struct DdlSourceView {
     focus_handle: FocusHandle,
     path_editor: Entity<Editor>,
@@ -248,7 +246,23 @@ impl DdlSourceView {
     }
 }
 
-impl EventEmitter<DdlSourceEvent> for DdlSourceView {}
+impl EventEmitter<DismissEvent> for DdlSourceView {}
+
+impl Item for DdlSourceView {
+    type Event = DismissEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "DDL Source".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::FileCode))
+    }
+
+    fn to_item_events(_event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(ItemEvent::CloseItem);
+    }
+}
 
 impl Focusable for DdlSourceView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -319,15 +333,13 @@ impl Render for DdlSourceView {
         v_flex()
             .key_context("DdlSource")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(720.0))
-            .max_h(px(560.0))
+            .size_full()
             .p_4()
             .gap_3()
             .child(crate::widgets::dialog_header(
                 "SQL schema source",
                 "close-ddl",
-                cx.listener(|_, _, _, cx| cx.emit(DdlSourceEvent::Dismissed)),
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
             ))
             .child(
                 h_flex()

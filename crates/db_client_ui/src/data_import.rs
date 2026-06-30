@@ -1,7 +1,11 @@
 use db_client::connection::{ConnectionId, DatabaseDriver};
 use editor::Editor;
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*, px};
+use gpui::{
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*,
+    px,
+};
 use ui::prelude::*;
+use workspace::ModalView;
 use ui::{
     Button, ButtonStyle, Checkbox, ContextMenu, Divider, Label, PopoverMenu,
 };
@@ -174,9 +178,6 @@ fn default_mapping(target_columns: &[String], headers: &[String]) -> Vec<Option<
         .collect()
 }
 
-pub enum DataImportEvent {
-    Dismissed,
-}
 
 const IMPORT_BATCH_SIZE: usize = 200;
 const PREVIEW_ROW_LIMIT: usize = 20;
@@ -395,7 +396,9 @@ impl ImportDataView {
     }
 }
 
-impl EventEmitter<DataImportEvent> for ImportDataView {}
+impl EventEmitter<DismissEvent> for ImportDataView {}
+
+impl ModalView for ImportDataView {}
 
 impl Focusable for ImportDataView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -425,7 +428,7 @@ impl Render for ImportDataView {
             .child(crate::widgets::dialog_header(
                 format!("Import data into {}", self.table),
                 "close-import",
-                cx.listener(|_, _, _, cx| cx.emit(DataImportEvent::Dismissed)),
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
             ))
             .child(
                 h_flex()
@@ -488,7 +491,7 @@ impl Render for ImportDataView {
                     .gap_2()
                     .child(
                         ui::Button::new("cancel-import", "Cancel").on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(DataImportEvent::Dismissed)),
+                            cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
                         ),
                     )
                     .child(

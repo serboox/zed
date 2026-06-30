@@ -1,14 +1,14 @@
 use crate::compare_data::CompareDataView;
 use crate::connection_view::ConnectionView;
-use crate::data_import::{DataImportEvent, ImportDataView};
-use crate::ddl_source::{DdlSourceEvent, DdlSourceView};
+use crate::data_import::ImportDataView;
+use crate::ddl_source::DdlSourceView;
 use crate::driver_icon::brand_icon;
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
     ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
     plan_text_from_result,
 };
-use crate::modify_table::{ModifyTableEvent, ModifyTableView};
+use crate::modify_table::ModifyTableView;
 use crate::native_dump::{
     DumpRequest, DumpStatus, DumpTask, NativeDumpDialog, NativeDumpEvent, apply_substitutions,
     render_dump_status_row, spawn_dump,
@@ -1518,10 +1518,7 @@ pub struct DatabasePanel {
     server_users: HashMap<ConnectionId, Vec<(String, String)>>,
     table_filter_is_regex: bool,
     quick_doc: Option<(SharedString, Vec<ColumnInfo>)>,
-    modify_table: Option<Entity<ModifyTableView>>,
     explain_view: Option<Entity<ExplainPlanView>>,
-    data_import: Option<Entity<ImportDataView>>,
-    ddl_source: Option<Entity<DdlSourceView>>,
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     selected_tree_node: Option<SelectedTreeNode>,
@@ -1707,10 +1704,7 @@ impl DatabasePanel {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
-                    modify_table: None,
                     explain_view: None,
-                    data_import: None,
-                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -2319,32 +2313,25 @@ impl DatabasePanel {
             store.describe_table(id, database.clone(), table.clone(), cx)
         });
         let store = self.store.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
             let columns = describe.await.unwrap_or_default();
-            this.update_in(cx, |panel, window, cx| {
-                let view = cx.new(|cx| {
-                    ModifyTableView::new(
-                        store.clone(),
-                        id,
-                        driver,
-                        database.clone(),
-                        table.clone(),
-                        &columns,
-                        window,
-                        cx,
-                    )
-                });
-                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
-                    ModifyTableEvent::Dismissed => {
-                        panel.modify_table = None;
-                        cx.notify();
-                    }
-                });
-                panel._subscriptions.push(subscription);
-                panel.modify_table = Some(view);
-                cx.notify();
-            })
-            .log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        ModifyTableView::new(
+                            store.clone(),
+                            id,
+                            driver,
+                            database.clone(),
+                            table.clone(),
+                            &columns,
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -2486,16 +2473,12 @@ impl DatabasePanel {
     }
 
     fn open_ddl_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| DdlSourceView::new(window, cx));
-        let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
-            DdlSourceEvent::Dismissed => {
-                panel.ddl_source = None;
-                cx.notify();
-            }
-        });
-        self._subscriptions.push(subscription);
-        self.ddl_source = Some(view);
-        cx.notify();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let view = cx.new(|cx| DdlSourceView::new(window, cx));
+                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+            })
+            .log_err();
     }
 
     fn open_data_import(
@@ -2518,33 +2501,27 @@ impl DatabasePanel {
             store.describe_table(id, database.clone(), table.clone(), cx)
         });
         let store = self.store.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
             let columns = describe.await.unwrap_or_default();
-            let target_columns = columns.into_iter().map(|column| column.name).collect();
-            this.update_in(cx, |panel, window, cx| {
-                let view = cx.new(|cx| {
-                    ImportDataView::new(
-                        store.clone(),
-                        id,
-                        database.clone(),
-                        table.clone(),
-                        driver,
-                        target_columns,
-                        window,
-                        cx,
-                    )
-                });
-                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
-                    DataImportEvent::Dismissed => {
-                        panel.data_import = None;
-                        cx.notify();
-                    }
-                });
-                panel._subscriptions.push(subscription);
-                panel.data_import = Some(view);
-                cx.notify();
-            })
-            .log_err();
+            let target_columns: Vec<String> =
+                columns.into_iter().map(|column| column.name).collect();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        ImportDataView::new(
+                            store.clone(),
+                            id,
+                            database.clone(),
+                            table.clone(),
+                            driver,
+                            target_columns.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -5280,19 +5257,6 @@ impl Render for DatabasePanel {
                         .child(view),
                 )
             })
-            .when_some(self.modify_table.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
-                )
-            })
             .when(self.query_params.is_some(), |el| {
                 el.child(
                     div()
@@ -5313,32 +5277,6 @@ impl Render for DatabasePanel {
                         .absolute()
                         .inset_0()
                         .p_8()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
-                )
-            })
-            .when_some(self.data_import.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
-                )
-            })
-            .when_some(self.ddl_source.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -6151,10 +6089,7 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
-                    modify_table: None,
                     explain_view: None,
-                    data_import: None,
-                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6313,10 +6248,7 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
-                    modify_table: None,
                     explain_view: None,
-                    data_import: None,
-                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6467,10 +6399,7 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
-                    modify_table: None,
                     explain_view: None,
-                    data_import: None,
-                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -6689,10 +6618,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6772,10 +6698,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6892,10 +6815,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -6974,10 +6894,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -7083,10 +7000,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -7194,10 +7108,7 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 quick_doc: None,
-                modify_table: None,
                 explain_view: None,
-                data_import: None,
-                ddl_source: None,
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
@@ -7616,10 +7527,7 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     quick_doc: None,
-                    modify_table: None,
                     explain_view: None,
-                    data_import: None,
-                    ddl_source: None,
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
@@ -7954,7 +7862,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn open_modify_table_populates_overlay(cx: &mut TestAppContext) {
+    async fn open_modify_table_opens_workspace_modal(cx: &mut TestAppContext) {
         let config = db_client::ConnectionConfig {
             label: "modify".to_string(),
             auto_connect: false,
@@ -7962,6 +7870,9 @@ mod tests {
         };
         let connection_id = config.id;
         let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.open_modify_table(
@@ -7974,12 +7885,73 @@ mod tests {
         });
         cx.run_until_parked();
 
-        panel.read_with(&cx, |panel, _| {
-            assert!(
-                panel.modify_table.is_some(),
-                "modify table overlay must be set after opening it"
+        let has_modal = workspace.read_with(&cx, |workspace, cx| {
+            workspace.active_modal::<ModifyTableView>(cx).is_some()
+        });
+        assert!(
+            has_modal,
+            "Modify Table must open as a workspace modal, not an in-panel overlay"
+        );
+    }
+
+    #[gpui::test]
+    async fn open_data_import_opens_workspace_modal(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "import".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_data_import(
+                connection_id,
+                "public".to_string(),
+                "users".to_string(),
+                window,
+                cx,
             );
         });
+        cx.run_until_parked();
+
+        let has_modal = workspace.read_with(&cx, |workspace, cx| {
+            workspace.active_modal::<ImportDataView>(cx).is_some()
+        });
+        assert!(
+            has_modal,
+            "Import Data must open as a workspace modal, not an in-panel overlay"
+        );
+    }
+
+    #[gpui::test]
+    async fn open_ddl_source_opens_workspace_tab(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "ddl".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_ddl_source(window, cx);
+        });
+        cx.run_until_parked();
+
+        let tabs = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<DdlSourceView>()
+                .count()
+        });
+        assert_eq!(tabs, 1, "DDL Source must open as a tab in the active pane");
     }
 
     #[gpui::test]

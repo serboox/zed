@@ -1,9 +1,12 @@
 use db_client::connection::{ConnectionId, DatabaseDriver};
 use db_client::schema::ColumnInfo;
 use editor::Editor;
-use gpui::{Context, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*};
+use gpui::{
+    Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*,
+};
 use ui::{Checkbox, Divider, Tooltip, prelude::*};
 use util::ResultExt;
+use workspace::ModalView;
 
 use crate::store::DatabaseStore;
 
@@ -244,9 +247,6 @@ fn fold_mysql_rename_modify(
     statements
 }
 
-pub enum ModifyTableEvent {
-    Dismissed,
-}
 
 pub struct ModifyTableView {
     focus_handle: FocusHandle,
@@ -389,7 +389,7 @@ impl ModifyTableView {
             }
             this.update(cx, |this, cx| {
                 this.busy = false;
-                cx.emit(ModifyTableEvent::Dismissed);
+                cx.emit(DismissEvent);
             })
             .log_err();
             anyhow::Ok(())
@@ -437,7 +437,9 @@ impl ModifyTableView {
     }
 }
 
-impl EventEmitter<ModifyTableEvent> for ModifyTableView {}
+impl EventEmitter<DismissEvent> for ModifyTableView {}
+
+impl ModalView for ModifyTableView {}
 
 impl Focusable for ModifyTableView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -473,7 +475,7 @@ impl Render for ModifyTableView {
             .child(crate::widgets::dialog_header(
                 title,
                 "close-modify",
-                cx.listener(|_, _, _, cx| cx.emit(ModifyTableEvent::Dismissed)),
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
             ))
             .child(Divider::horizontal())
             .child(
@@ -512,7 +514,7 @@ impl Render for ModifyTableView {
                     .gap_2()
                     .child(
                         Button::new("cancel", "Cancel").on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(ModifyTableEvent::Dismissed);
+                            cx.emit(DismissEvent);
                         })),
                     )
                     .child(
