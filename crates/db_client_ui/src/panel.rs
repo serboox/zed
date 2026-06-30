@@ -24,10 +24,11 @@ use db_client::{
 use editor::{Editor, EditorEvent, GotoDefinitionKind, SemanticsProvider, ToOffset};
 use futures::future::Shared;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    WeakEntity, Window, div, px,
+    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, DragMoveEvent,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -1526,6 +1527,7 @@ pub struct DatabasePanel {
     query_params: Option<QueryParamsPrompt>,
     selected_tree_node: Option<SelectedTreeNode>,
     dump: DumpUiState,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1715,6 +1717,7 @@ impl DatabasePanel {
                     query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    context_menu: None,
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -2403,8 +2406,7 @@ impl DatabasePanel {
             let result = dump.await;
             panel
                 .update(cx, |panel, cx| {
-                    if let Some(task) =
-                        panel.dump.tasks.iter_mut().find(|task| task.id == task_id)
+                    if let Some(task) = panel.dump.tasks.iter_mut().find(|task| task.id == task_id)
                     {
                         task.status = match result {
                             Ok(output_path) => DumpStatus::Done { output_path },
@@ -2426,7 +2428,9 @@ impl DatabasePanel {
 
     fn dismiss_dump_task(&mut self, task_id: usize, cx: &mut Context<Self>) {
         // Dropping the runner handle cancels a dump that is still running.
-        self.dump.runners.retain(|(running_id, _)| *running_id != task_id);
+        self.dump
+            .runners
+            .retain(|(running_id, _)| *running_id != task_id);
         self.dump.tasks.retain(|task| task.id != task_id);
         cx.notify();
     }
@@ -4981,24 +4985,7 @@ impl DatabasePanel {
                             )
                     })
             })
-            .menu(move |window, cx| {
-                let entity = entity.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.entry("New Folder", None, {
-                        let entity = entity.clone();
-                        move |window, cx| {
-                            entity.update(cx, |panel, cx| {
-                                panel.start_new_folder(None, window, cx);
-                            });
-                        }
-                    })
-                    .entry("New Connection", None, move |window, cx| {
-                        entity.update(cx, |panel, cx| {
-                            panel.new_connection_in_folder(None, window, cx);
-                        });
-                    })
-                })
-            });
+            .menu(move |window, cx| new_items_context_menu(entity.clone(), window, cx));
 
         v_flex()
             .id("db-tree-background")
@@ -5024,6 +5011,46 @@ impl DatabasePanel {
             .child(div().flex_1().w_full().child(background_menu))
             .into_any_element()
     }
+
+    /// Opens the New Folder / New Connection menu at `position`. Driven by a
+    /// right-click on the panel background that reaches no row with its own menu.
+    fn deploy_panel_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = new_items_context_menu(cx.entity(), window, cx);
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+}
+
+/// Builds the panel's "create" menu (New Folder / New Connection at the top
+/// level). Shared by the tree's blank-area menu and the whole-panel right-click.
+fn new_items_context_menu(
+    panel: Entity<DatabasePanel>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |menu, _, _| {
+        menu.entry("New Folder", None, {
+            let panel = panel.clone();
+            move |window, cx| {
+                panel.update(cx, |panel, cx| panel.start_new_folder(None, window, cx));
+            }
+        })
+        .entry("New Connection", None, move |window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.new_connection_in_folder(None, window, cx)
+            });
+        })
+    })
 }
 
 impl Render for DatabasePanel {
@@ -5050,6 +5077,12 @@ impl Render for DatabasePanel {
             .size_full()
             .relative()
             .overflow_hidden()
+            .child(div().absolute().inset_0().on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_panel_context_menu(event.position, window, cx);
+                }),
+            ))
             .when_some(self.quick_doc.clone(), |el, (title, columns)| {
                 el.child(self.render_quick_doc_popup(title, &columns, cx))
             })
@@ -5194,6 +5227,15 @@ impl Render for DatabasePanel {
                         .child(self.render_compare_picker(cx)),
                 )
             })
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
     }
 }
 
@@ -5987,6 +6029,7 @@ mod tests {
                     query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    context_menu: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -6149,6 +6192,7 @@ mod tests {
                     query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    context_menu: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -6303,6 +6347,7 @@ mod tests {
                     query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    context_menu: None,
                     _subscriptions: vec![sub],
                 }
             });
@@ -6525,6 +6570,7 @@ mod tests {
                 query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                context_menu: None,
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6609,6 +6655,7 @@ mod tests {
                 query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                context_menu: None,
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6691,6 +6738,7 @@ mod tests {
                 query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                context_menu: None,
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6800,6 +6848,7 @@ mod tests {
                 query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                context_menu: None,
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6911,6 +6960,7 @@ mod tests {
                 query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                context_menu: None,
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -7333,6 +7383,7 @@ mod tests {
                     query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    context_menu: None,
                     _subscriptions: vec![sub],
                 }
             });
