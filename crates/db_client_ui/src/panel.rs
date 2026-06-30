@@ -4993,7 +4993,7 @@ impl DatabasePanel {
 
         v_flex()
             .id("db-tree-background")
-            .size_full()
+            .min_w_full()
             .min_h_full()
             .when(is_top_level_target, |el| {
                 el.bg(cx.theme().colors().drop_target_background)
@@ -5096,7 +5096,9 @@ impl Render for DatabasePanel {
                     .id("db-panel-scroll")
                     .debug_selector(|| "DB-TREE-SCROLL".into())
                     .flex_1()
+                    .min_h_0()
                     .overflow_scroll()
+                    .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Both)
