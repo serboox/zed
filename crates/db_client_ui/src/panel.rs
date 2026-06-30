@@ -930,9 +930,7 @@ pub fn open_new_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let store = workspace
-        .panel::<DatabasePanel>(cx)
-        .map(|panel| panel.read(cx).store.downgrade());
+    let store = DatabaseStore::global(cx).map(|store| store.downgrade());
     let workspace_handle = workspace.weak_handle();
     let path = connection_query_path(connection_id, &connection_label);
     cx.spawn_in(window, async move |workspace, cx| {
