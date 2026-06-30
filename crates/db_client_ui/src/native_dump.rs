@@ -1,17 +1,23 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use db_client::connection::{ConnectionConfig, DatabaseDriver};
 use editor::Editor;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task, Window,
-    prelude::*,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
+    Window, prelude::*,
 };
 use ui::{Button, ButtonStyle, Checkbox, Divider, Icon, IconName, Label, LabelSize, prelude::*};
+use workspace::ModalView;
 
 use crate::widgets::{dialog_header, popup_surface};
+
+/// Invoked when the dump dialog is confirmed, so the owning panel can spawn the
+/// run without this dialog depending on the panel type.
+pub type DumpRunCallback = Arc<dyn Fn(DumpRequest, &mut Window, &mut App)>;
 
 /// One toggle in the dump dialog. Each option maps to a driver-specific command
 /// flag; `None` means the flag has no equivalent for that driver and is skipped.
@@ -403,6 +409,7 @@ pub struct NativeDumpDialog {
     databases_editor: Entity<Editor>,
     tables_editor: Entity<Editor>,
     option_enabled: Vec<bool>,
+    on_run: Option<DumpRunCallback>,
 }
 
 impl NativeDumpDialog {
@@ -453,7 +460,13 @@ impl NativeDumpDialog {
             databases_editor,
             tables_editor,
             option_enabled: DUMP_OPTIONS.iter().map(|option| option.default_on).collect(),
+            on_run: None,
         }
+    }
+
+    pub fn on_run(mut self, callback: DumpRunCallback) -> Self {
+        self.on_run = Some(callback);
+        self
     }
 
     fn enabled_flags(&self) -> Vec<String> {
@@ -523,6 +536,10 @@ impl NativeDumpDialog {
 
 impl EventEmitter<NativeDumpEvent> for NativeDumpDialog {}
 
+impl EventEmitter<DismissEvent> for NativeDumpDialog {}
+
+impl ModalView for NativeDumpDialog {}
+
 impl Focusable for NativeDumpDialog {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -570,7 +587,10 @@ impl Render for NativeDumpDialog {
             .child(dialog_header(
                 title,
                 "dump-close",
-                cx.listener(|_, _, _, cx| cx.emit(NativeDumpEvent::Dismissed)),
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(NativeDumpEvent::Dismissed);
+                    cx.emit(DismissEvent);
+                }),
             ))
             .child(self.field_row("Path to executable:", &self.executable_editor.clone(), cx))
             .child(self.field_row("Output result to:", &self.output_editor.clone(), cx))
@@ -605,15 +625,20 @@ impl Render for NativeDumpDialog {
                     .child(
                         Button::new("dump-run", "Run")
                             .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, _window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 let request = this.build_request(cx);
+                                if let Some(callback) = this.on_run.clone() {
+                                    callback(request.clone(), window, cx);
+                                }
                                 cx.emit(NativeDumpEvent::Run(request));
+                                cx.emit(DismissEvent);
                             })),
                     )
                     .child(
-                        Button::new("dump-cancel", "Cancel").on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(NativeDumpEvent::Dismissed)),
-                        ),
+                        Button::new("dump-cancel", "Cancel").on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(NativeDumpEvent::Dismissed);
+                            cx.emit(DismissEvent);
+                        })),
                     ),
             )
     }

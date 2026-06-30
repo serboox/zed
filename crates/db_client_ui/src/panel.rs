@@ -9,7 +9,7 @@ use crate::explain_plan::{
 };
 use crate::modify_table::ModifyTableView;
 use crate::native_dump::{
-    DumpRequest, DumpStatus, DumpTask, NativeDumpDialog, NativeDumpEvent, apply_substitutions,
+    DumpRequest, DumpRunCallback, DumpStatus, DumpTask, NativeDumpDialog, apply_substitutions,
     render_dump_status_row, spawn_dump,
 };
 use crate::result_view::ResultView;
@@ -42,7 +42,7 @@ use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
 use ui::{
-    CommonAnimationExt, ContextMenu, Divider, HighlightedLabel, Icon, IconButton, IconName,
+    CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName,
     IconSize, Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*, right_click_menu,
 };
@@ -1517,8 +1517,6 @@ pub struct DatabasePanel {
     server_objects_expanded: HashSet<ConnectionId>,
     server_users: HashMap<ConnectionId, Vec<(String, String)>>,
     table_filter_is_regex: bool,
-    compare_pick: Option<ComparePick>,
-    query_params: Option<QueryParamsPrompt>,
     selected_tree_node: Option<SelectedTreeNode>,
     dump: DumpUiState,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
@@ -1526,12 +1524,12 @@ pub struct DatabasePanel {
     _subscriptions: Vec<Subscription>,
 }
 
-/// Background native-dump state owned by the panel: the open dialog, the visible
-/// task list for the status strip, and the spawned task handles (kept alive so a
-/// dump keeps running, and droppable to cancel one). `next_id` labels each task.
+/// Background native-dump state owned by the panel: the visible task list for the
+/// status strip and the spawned task handles (kept alive so a dump keeps running,
+/// and droppable to cancel one). `next_id` labels each task. The settings dialog
+/// itself is a workspace modal, not held here.
 #[derive(Default)]
 struct DumpUiState {
-    dialog: Option<Entity<NativeDumpDialog>>,
     tasks: Vec<DumpTask>,
     runners: Vec<(usize, Task<()>)>,
     next_id: usize,
@@ -1614,19 +1612,212 @@ impl Render for DraggedDbItemPreview {
     }
 }
 
-/// Pending second-table selection for the Compare Data flow: the user picked a
-/// source table and now chooses what to compare it against.
-struct ComparePick {
-    connection_id: ConnectionId,
-    database: String,
-    left_table: String,
-    candidates: Vec<String>,
-}
+/// Workspace modal that collects values for a parameterized query, then hands the
+/// final SQL to `on_run` (the panel opens it in a console tab).
+type QueryRunCallback = Arc<dyn Fn(String, &mut Window, &mut App)>;
 
-struct QueryParamsPrompt {
-    connection_id: ConnectionId,
+struct QueryParamsView {
+    focus_handle: FocusHandle,
     sql: String,
     inputs: Vec<(String, Entity<Editor>)>,
+    on_run: QueryRunCallback,
+}
+
+impl QueryParamsView {
+    fn new(
+        sql: String,
+        on_run: QueryRunCallback,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inputs = extract_query_parameters(&sql)
+            .into_iter()
+            .map(|name| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("value", window, cx);
+                    editor
+                });
+                (name, editor)
+            })
+            .collect();
+        Self {
+            focus_handle: cx.focus_handle(),
+            sql,
+            inputs,
+            on_run,
+        }
+    }
+
+    fn run(&mut self, strip: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let final_sql = if strip {
+            self.sql.clone()
+        } else {
+            let values: HashMap<String, String> = self
+                .inputs
+                .iter()
+                .map(|(name, editor)| (name.clone(), editor.read(cx).text(cx)))
+                .collect();
+            substitute_query_parameters(&self.sql, &values)
+        };
+        (self.on_run.clone())(final_sql, window, cx);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for QueryParamsView {}
+
+impl ModalView for QueryParamsView {}
+
+impl Focusable for QueryParamsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for QueryParamsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = self
+            .inputs
+            .iter()
+            .map(|(name, editor)| {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .child(Label::new(name.clone()).size(LabelSize::Small)),
+                    )
+                    .child(div().flex_1().child(editor.clone()))
+            })
+            .collect();
+        v_flex()
+            .key_context("QueryParams")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(px(420.))
+            .p_3()
+            .gap_2()
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(crate::widgets::dialog_header(
+                "Query Parameters",
+                "query-params-close",
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+            ))
+            .child(v_flex().gap_1().children(rows))
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("params-cancel", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("params-strip", "Run as-is").on_click(
+                            cx.listener(|this, _, window, cx| this.run(true, window, cx)),
+                        ),
+                    )
+                    .child(
+                        Button::new("params-run", "Run")
+                            .style(ButtonStyle::Filled)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run(false, window, cx)),
+                            ),
+                    ),
+            )
+    }
+}
+
+/// Workspace modal that picks the second table for the Compare Data flow, then
+/// hands the chosen table to `on_pick` (the panel runs the comparison).
+type ComparePickCallback = Arc<dyn Fn(String, &mut Window, &mut App)>;
+
+struct ComparePickerView {
+    focus_handle: FocusHandle,
+    left_table: String,
+    candidates: Vec<String>,
+    on_pick: ComparePickCallback,
+}
+
+impl ComparePickerView {
+    fn new(
+        left_table: String,
+        candidates: Vec<String>,
+        on_pick: ComparePickCallback,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            left_table,
+            candidates,
+            on_pick,
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for ComparePickerView {}
+
+impl ModalView for ComparePickerView {}
+
+impl Focusable for ComparePickerView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ComparePickerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = self
+            .candidates
+            .iter()
+            .cloned()
+            .map(|candidate| {
+                Button::new(
+                    SharedString::from(format!("cmp-{candidate}")),
+                    candidate.clone(),
+                )
+                .style(ButtonStyle::Subtle)
+                .full_width()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    (this.on_pick.clone())(candidate.clone(), window, cx);
+                    cx.emit(DismissEvent);
+                }))
+            })
+            .collect();
+        v_flex()
+            .key_context("ComparePicker")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(px(420.))
+            .max_h(px(480.))
+            .p_3()
+            .gap_2()
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(crate::widgets::dialog_header(
+                SharedString::from(format!("Compare {} with", self.left_table)),
+                "compare-pick-close",
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+            ))
+            .when(rows.is_empty(), |column| {
+                column.child(
+                    Label::new("No other tables to compare")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                v_flex()
+                    .id("compare-candidates")
+                    .gap_0p5()
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+    }
 }
 
 struct QuickDocView {
@@ -1781,8 +1972,6 @@ impl DatabasePanel {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    compare_pick: None,
-                    query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
@@ -2434,21 +2623,20 @@ impl DatabasePanel {
             .map(|connection| connection.config.clone());
         let Some(config) = config else { return };
         let driver = config.driver;
-        let view = cx.new(|cx| {
-            NativeDumpDialog::new(driver, config, preset_databases, preset_tables, window, cx)
+        let panel = cx.entity().downgrade();
+        let on_run: DumpRunCallback = Arc::new(move |request, _window, cx: &mut App| {
+            panel
+                .update(cx, |panel, cx| panel.start_dump(id, request, cx))
+                .ok();
         });
-        let subscription = cx.subscribe(&view, move |panel, _view, event, cx| match event {
-            NativeDumpEvent::Dismissed => {
-                panel.dump.dialog = None;
-                cx.notify();
-            }
-            NativeDumpEvent::Run(request) => {
-                panel.start_dump(id, request.clone(), cx);
-            }
-        });
-        self._subscriptions.push(subscription);
-        self.dump.dialog = Some(view);
-        cx.notify();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    NativeDumpDialog::new(driver, config, preset_databases, preset_tables, window, cx)
+                        .on_run(on_run)
+                });
+            })
+            .log_err();
     }
 
     fn start_dump(&mut self, id: ConnectionId, request: DumpRequest, cx: &mut Context<Self>) {
@@ -2502,7 +2690,6 @@ impl DatabasePanel {
                 .ok();
         });
         self.dump.runners.push((task_id, handle));
-        self.dump.dialog = None;
         cx.notify();
     }
 
@@ -2724,6 +2911,7 @@ impl DatabasePanel {
         id: ConnectionId,
         database: String,
         left_table: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let provider = self
@@ -2735,7 +2923,7 @@ impl DatabasePanel {
             .and_then(|connection| connection.provider.clone());
         let Some(provider) = provider else { return };
         let left_for_filter = left_table.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let candidates: Vec<String> = provider
                 .list_tables(&database)
                 .await
@@ -2745,14 +2933,31 @@ impl DatabasePanel {
                 .map(|table| table.name)
                 .filter(|name| name != &left_for_filter)
                 .collect();
-            this.update(cx, |panel, cx| {
-                panel.compare_pick = Some(ComparePick {
-                    connection_id: id,
-                    database,
-                    left_table,
-                    candidates,
+            this.update_in(cx, |panel, window, cx| {
+                let weak = cx.entity().downgrade();
+                let title = left_table.clone();
+                let database = database.clone();
+                let on_pick: ComparePickCallback = Arc::new(move |right_table, window, cx| {
+                    weak.update(cx, |panel, cx| {
+                        panel.start_compare(
+                            id,
+                            database.clone(),
+                            left_table.clone(),
+                            right_table,
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
                 });
-                cx.notify();
+                panel
+                    .workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |_window, cx| {
+                            ComparePickerView::new(title.clone(), candidates.clone(), on_pick, cx)
+                        });
+                    })
+                    .log_err();
             })
             .log_err();
             anyhow::Ok(())
@@ -2769,7 +2974,6 @@ impl DatabasePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.compare_pick = None;
         let provider = self
             .store
             .read(cx)
@@ -2824,167 +3028,28 @@ impl DatabasePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let inputs = extract_query_parameters(&sql)
-            .into_iter()
-            .map(|name| {
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::single_line(window, cx);
-                    editor.set_placeholder_text("value", window, cx);
-                    editor
-                });
-                (name, editor)
-            })
-            .collect();
-        self.query_params = Some(QueryParamsPrompt {
-            connection_id,
-            sql,
-            inputs,
-        });
-        cx.notify();
-    }
-
-    fn run_query_params(&mut self, strip: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.query_params.take() else {
-            return;
-        };
-        let final_sql = if strip {
-            prompt.sql.clone()
-        } else {
-            let values: HashMap<String, String> = prompt
-                .inputs
-                .iter()
-                .map(|(name, editor)| (name.clone(), editor.read(cx).text(cx)))
-                .collect();
-            substitute_query_parameters(&prompt.sql, &values)
-        };
-        let workspace = self.workspace.clone();
-        let store = self.store.downgrade();
-        Self::open_sql_query_with_text(
-            workspace,
-            store,
-            prompt.connection_id,
-            final_sql,
-            window,
-            cx,
-        );
-        cx.notify();
-    }
-
-    fn render_compare_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(pick) = self.compare_pick.as_ref() else {
-            return div();
-        };
-        let id = pick.connection_id;
-        let database = pick.database.clone();
-        let left_table = pick.left_table.clone();
-        let rows: Vec<_> = pick
-            .candidates
-            .iter()
-            .cloned()
-            .map(|candidate| {
-                let database = database.clone();
-                let left_table = left_table.clone();
-                Button::new(
-                    SharedString::from(format!("cmp-{candidate}")),
-                    candidate.clone(),
-                )
-                .style(ButtonStyle::Subtle)
-                .full_width()
-                .on_click(cx.listener(move |panel, _, window, cx| {
-                    panel.start_compare(
-                        id,
-                        database.clone(),
-                        left_table.clone(),
-                        candidate.clone(),
+        let panel = cx.entity().downgrade();
+        let on_run: QueryRunCallback = Arc::new(move |final_sql, window, cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    Self::open_sql_query_with_text(
+                        panel.workspace.clone(),
+                        panel.store.downgrade(),
+                        connection_id,
+                        final_sql,
                         window,
                         cx,
                     );
-                }))
-            })
-            .collect();
-        div().child(
-            v_flex()
-                .elevation_3(cx)
-                .w(px(420.))
-                .max_h(px(480.))
-                .p_3()
-                .gap_2()
-                .child(Label::new(format!("Compare {left_table} with")).size(LabelSize::Large))
-                .child(Divider::horizontal())
-                .when(rows.is_empty(), |column| {
-                    column.child(
-                        Label::new("No other tables to compare")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
                 })
-                .child(
-                    v_flex()
-                        .id("compare-candidates")
-                        .gap_0p5()
-                        .max_h(px(360.))
-                        .overflow_y_scroll()
-                        .children(rows),
-                )
-                .child(h_flex().w_full().justify_end().child(
-                    Button::new("compare-cancel", "Cancel").on_click(cx.listener(
-                        |panel, _, _, cx| {
-                            panel.compare_pick = None;
-                            cx.notify();
-                        },
-                    )),
-                )),
-        )
-    }
-
-    fn render_query_params_popup(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
-            .query_params
-            .iter()
-            .flat_map(|prompt| prompt.inputs.iter())
-            .map(|(name, editor)| {
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(120.))
-                            .child(Label::new(name.clone()).size(LabelSize::Small)),
-                    )
-                    .child(div().flex_1().child(editor.clone()))
+                .ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    QueryParamsView::new(sql, on_run, window, cx)
+                });
             })
-            .collect();
-        v_flex()
-            .elevation_3(cx)
-            .w(px(420.))
-            .p_3()
-            .gap_2()
-            .child(Label::new("Query Parameters").size(LabelSize::Large))
-            .child(Divider::horizontal())
-            .child(v_flex().gap_1().children(rows))
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
-                    .child(Button::new("params-cancel", "Cancel").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.query_params = None;
-                            cx.notify();
-                        },
-                    )))
-                    .child(Button::new("params-strip", "Run as-is").on_click(
-                        cx.listener(|this, _, window, cx| this.run_query_params(true, window, cx)),
-                    ))
-                    .child(
-                        Button::new("params-run", "Run")
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_query_params(false, window, cx)
-                            })),
-                    ),
-            )
+            .log_err();
     }
 
     /// Decides whether a table name passes the explorer filter and, if so,
@@ -4167,9 +4232,15 @@ impl DatabasePanel {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
                                                         let tbl = tbl.clone();
-                                                        move |_window, cx| {
+                                                        move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
-                                                                panel.open_compare_picker(id, db.clone(), tbl.clone(), cx);
+                                                                panel.open_compare_picker(
+                                                                    id,
+                                                                    db.clone(),
+                                                                    tbl.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
                                                             });
                                                         }
                                                     })
@@ -5255,45 +5326,6 @@ impl Render for DatabasePanel {
             .when(!self.dump.tasks.is_empty(), |el| {
                 el.child(self.render_dump_status(cx))
             })
-            .when_some(self.dump.dialog.clone(), |el, view| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(view),
-                )
-            })
-            .when(self.query_params.is_some(), |el| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(self.render_query_params_popup(cx)),
-                )
-            })
-            .when(self.compare_pick.is_some(), |el| {
-                el.child(
-                    div()
-                        .occlude()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
-                        .child(self.render_compare_picker(cx)),
-                )
-            })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
@@ -6085,8 +6117,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    compare_pick: None,
-                    query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
@@ -6242,8 +6272,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    compare_pick: None,
-                    query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
@@ -6391,8 +6419,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    compare_pick: None,
-                    query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
@@ -6608,8 +6634,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -6685,8 +6709,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -6800,8 +6822,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -6821,8 +6841,10 @@ mod tests {
             panel.open_dump_dialog(connection_id, Vec::new(), Vec::new(), window, cx);
         });
         assert!(
-            panel.read_with(cx, |panel, _| panel.dump.dialog.is_some()),
-            "Export entry must open the native dump dialog"
+            workspace.update(cx, |workspace, cx| workspace
+                .active_modal::<NativeDumpDialog>(cx)
+                .is_some()),
+            "Export entry must open the native dump dialog as a workspace modal"
         );
 
         panel.update(cx, |panel, _cx| {
@@ -6877,8 +6899,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -6981,8 +7001,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -7087,8 +7105,6 @@ mod tests {
                 server_objects_expanded: HashSet::default(),
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
-                compare_pick: None,
-                query_params: None,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
                 context_menu: None,
@@ -7504,8 +7520,6 @@ mod tests {
                     server_objects_expanded: HashSet::default(),
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
-                    compare_pick: None,
-                    query_params: None,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
                     context_menu: None,
@@ -7958,13 +7972,20 @@ mod tests {
             );
         });
 
-        panel.read_with(&cx, |panel, _| {
-            let prompt = panel
-                .query_params
-                .as_ref()
-                .expect("params prompt must be set");
-            let names: Vec<_> = prompt.inputs.iter().map(|(name, _)| name.clone()).collect();
-            assert_eq!(names, vec!["id".to_string(), "name".to_string()]);
-        });
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.clone());
+        workspace
+            .update(&mut cx, |workspace, cx| {
+                let view = workspace
+                    .active_modal::<QueryParamsView>(cx)
+                    .expect("params prompt must open as a workspace modal");
+                let names: Vec<_> = view
+                    .read(cx)
+                    .inputs
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                assert_eq!(names, vec!["id".to_string(), "name".to_string()]);
+            })
+            .unwrap();
     }
 }
