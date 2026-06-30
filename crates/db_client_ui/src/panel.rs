@@ -1,9 +1,9 @@
-use crate::connection_view::ConnectionView;
-use crate::driver_icon::brand_icon;
 use crate::compare_data::{CompareDataEvent, CompareDataView};
-use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
+use crate::connection_view::ConnectionView;
 use crate::data_import::{DataImportEvent, ImportDataView};
 use crate::ddl_source::{DdlSourceEvent, DdlSourceView};
+use crate::driver_icon::brand_icon;
+use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
     ExplainPlanEvent, ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree,
     plan_text_from_result,
@@ -752,8 +752,13 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
 /// connections; a connection node carries the index into the `connections`
 /// slice so the caller renders the original `ActiveConnection` without cloning.
 enum TreeNode {
-    Folder { folder: Folder, children: Vec<TreeNode> },
-    Connection { index: usize },
+    Folder {
+        folder: Folder,
+        children: Vec<TreeNode>,
+    },
+    Connection {
+        index: usize,
+    },
 }
 
 // Builds the nested tree under `parent_id`: child folders first (sorted by
@@ -771,8 +776,10 @@ fn build_folder_tree(
     }
     let mut nodes: Vec<TreeNode> = Vec::new();
 
-    let mut child_folders: Vec<&Folder> =
-        folders.iter().filter(|f| f.parent_id == parent_id).collect();
+    let mut child_folders: Vec<&Folder> = folders
+        .iter()
+        .filter(|f| f.parent_id == parent_id)
+        .collect();
     child_folders.sort_by(|a, b| {
         a.order
             .cmp(&b.order)
@@ -1022,13 +1029,10 @@ fn show_result_in_pane(
 ) -> Entity<ResultView> {
     // Reuse this connection's tab only if it is not pinned. A pinned tab is left
     // untouched, so the query lands in a fresh, numbered tab instead.
-    let existing = pane
-        .read(cx)
-        .items_of_type::<ResultView>()
-        .find(|view| {
-            let view = view.read(cx);
-            view.connection_id() == Some(connection_id) && !view.is_pinned()
-        });
+    let existing = pane.read(cx).items_of_type::<ResultView>().find(|view| {
+        let view = view.read(cx);
+        view.connection_id() == Some(connection_id) && !view.is_pinned()
+    });
 
     if let Some(view) = existing {
         let index = pane
@@ -1495,6 +1499,7 @@ pub struct DatabasePanel {
     history_expanded: bool,
     table_filter_editor: Entity<Editor>,
     collapsed_folders: HashSet<FolderId>,
+    collapsed_connections: HashSet<ConnectionId>,
     editing_folder: Option<EditingFolder>,
     drag_target: Option<DropTarget>,
     views_expanded: HashSet<(ConnectionId, String)>,
@@ -1568,7 +1573,11 @@ impl Render for DraggedDbItemPreview {
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)
-            .child(Icon::new(self.icon).size(IconSize::Small).color(Color::Muted))
+            .child(
+                Icon::new(self.icon)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
             .child(Label::new(self.label.clone()).size(LabelSize::Small))
     }
 }
@@ -1649,6 +1658,7 @@ impl DatabasePanel {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
@@ -1727,6 +1737,49 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    fn toggle_connection_collapsed(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if !self.collapsed_connections.remove(&id) {
+            self.collapsed_connections.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Collapses the whole tree: every folder and connection is folded and all
+    /// cached schema expansion is cleared. Cheap — touches only local state.
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let folder_ids: HashSet<FolderId> =
+            self.store.read(cx).folders().iter().map(|f| f.id).collect();
+        let connection_ids: HashSet<ConnectionId> = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .map(|c| c.config.id)
+            .collect();
+        self.collapsed_folders = folder_ids;
+        self.collapsed_connections = connection_ids;
+        self.views_expanded.clear();
+        self.table_indexes_expanded.clear();
+        self.table_fks_expanded.clear();
+        self.table_triggers_expanded.clear();
+        self.server_objects_expanded.clear();
+        self.store
+            .update(cx, |store, cx| store.collapse_all_schema(cx));
+        cx.notify();
+    }
+
+    /// Expands the structural tree: folders, connections, and the databases of
+    /// connected connections (their tables load lazily). Tables and columns are
+    /// not force-expanded to avoid a burst of metadata queries.
+    fn expand_all(&mut self, cx: &mut Context<Self>) {
+        self.collapsed_folders.clear();
+        self.collapsed_connections.clear();
+        self.store
+            .update(cx, |store, cx| store.expand_all_databases(cx))
+            .detach_and_log_err(cx);
+        cx.notify();
+    }
+
     /// Creates a folder under `parent` and immediately opens its inline editor so
     /// the name is typed in place (like creating a file in the project panel).
     /// Silently rejected when nesting would exceed the depth limit.
@@ -1739,9 +1792,9 @@ impl DatabasePanel {
         if let Some(parent) = parent {
             self.collapsed_folders.remove(&parent);
         }
-        let new_id = self
-            .store
-            .update(cx, |store, cx| store.add_folder("New Folder".into(), parent, cx));
+        let new_id = self.store.update(cx, |store, cx| {
+            store.add_folder("New Folder".into(), parent, cx)
+        });
         if let Some(id) = new_id {
             self.begin_folder_rename(id, "New Folder", window, cx);
         }
@@ -1941,16 +1994,16 @@ impl DatabasePanel {
                 let name = name.clone();
                 move |_, _, _, cx| Self::drag_preview(name.clone().into(), IconName::Folder, cx)
             })
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
                     if event.bounds.contains(&event.event.position)
                         && this.drag_target != Some(DropTarget::Folder(folder_id))
                     {
                         this.drag_target = Some(DropTarget::Folder(folder_id));
                         cx.notify();
                     }
-                },
-            ))
+                }),
+            )
             .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::Folder(folder_id), cx);
             }))
@@ -2228,13 +2281,12 @@ impl DatabasePanel {
                         cx,
                     )
                 });
-                let subscription =
-                    cx.subscribe(&view, |panel, _view, event, cx| match event {
-                        ModifyTableEvent::Dismissed => {
-                            panel.modify_table = None;
-                            cx.notify();
-                        }
-                    });
+                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
+                    ModifyTableEvent::Dismissed => {
+                        panel.modify_table = None;
+                        cx.notify();
+                    }
+                });
                 panel._subscriptions.push(subscription);
                 panel.modify_table = Some(view);
                 cx.notify();
@@ -2415,8 +2467,7 @@ impl DatabasePanel {
                 });
             }
             this.update_in(cx, |panel, window, cx| {
-                let view =
-                    cx.new(|cx| ErdView::new(erd_tables, relationships, window, cx));
+                let view = cx.new(|cx| ErdView::new(erd_tables, relationships, window, cx));
                 panel.erd_view = Some(view);
                 cx.notify();
             })
@@ -2511,15 +2562,13 @@ impl DatabasePanel {
                 return anyhow::Ok(());
             };
             this.update_in(cx, |panel, window, cx| {
-                let view = cx
-                    .new(|cx| CompareDataView::new(left, right, key_columns, window, cx));
-                let subscription =
-                    cx.subscribe(&view, |panel, _view, event, cx| match event {
-                        CompareDataEvent::Dismissed => {
-                            panel.compare_view = None;
-                            cx.notify();
-                        }
-                    });
+                let view = cx.new(|cx| CompareDataView::new(left, right, key_columns, window, cx));
+                let subscription = cx.subscribe(&view, |panel, _view, event, cx| match event {
+                    CompareDataEvent::Dismissed => {
+                        panel.compare_view = None;
+                        cx.notify();
+                    }
+                });
                 panel._subscriptions.push(subscription);
                 panel.compare_view = Some(view);
                 cx.notify();
@@ -2597,19 +2646,22 @@ impl DatabasePanel {
             .map(|candidate| {
                 let database = database.clone();
                 let left_table = left_table.clone();
-                Button::new(SharedString::from(format!("cmp-{candidate}")), candidate.clone())
-                    .style(ButtonStyle::Subtle)
-                    .full_width()
-                    .on_click(cx.listener(move |panel, _, window, cx| {
-                        panel.start_compare(
-                            id,
-                            database.clone(),
-                            left_table.clone(),
-                            candidate.clone(),
-                            window,
-                            cx,
-                        );
-                    }))
+                Button::new(
+                    SharedString::from(format!("cmp-{candidate}")),
+                    candidate.clone(),
+                )
+                .style(ButtonStyle::Subtle)
+                .full_width()
+                .on_click(cx.listener(move |panel, _, window, cx| {
+                    panel.start_compare(
+                        id,
+                        database.clone(),
+                        left_table.clone(),
+                        candidate.clone(),
+                        window,
+                        cx,
+                    );
+                }))
             })
             .collect();
         div().child(
@@ -2619,10 +2671,7 @@ impl DatabasePanel {
                 .max_h(px(480.))
                 .p_3()
                 .gap_2()
-                .child(
-                    Label::new(format!("Compare {left_table} with"))
-                        .size(LabelSize::Large),
-                )
+                .child(Label::new(format!("Compare {left_table} with")).size(LabelSize::Large))
                 .child(Divider::horizontal())
                 .when(rows.is_empty(), |column| {
                     column.child(
@@ -2639,16 +2688,14 @@ impl DatabasePanel {
                         .overflow_y_scroll()
                         .children(rows),
                 )
-                .child(
-                    h_flex().w_full().justify_end().child(
-                        Button::new("compare-cancel", "Cancel").on_click(cx.listener(
-                            |panel, _, _, cx| {
-                                panel.compare_pick = None;
-                                cx.notify();
-                            },
-                        )),
-                    ),
-                ),
+                .child(h_flex().w_full().justify_end().child(
+                    Button::new("compare-cancel", "Cancel").on_click(cx.listener(
+                        |panel, _, _, cx| {
+                            panel.compare_pick = None;
+                            cx.notify();
+                        },
+                    )),
+                )),
         )
     }
 
@@ -2689,9 +2736,9 @@ impl DatabasePanel {
                             cx.notify();
                         },
                     )))
-                    .child(Button::new("params-strip", "Run as-is").on_click(cx.listener(
-                        |this, _, window, cx| this.run_query_params(true, window, cx),
-                    )))
+                    .child(Button::new("params-strip", "Run as-is").on_click(
+                        cx.listener(|this, _, window, cx| this.run_query_params(true, window, cx)),
+                    ))
                     .child(
                         Button::new("params-run", "Run")
                             .style(ButtonStyle::Filled)
@@ -2996,10 +3043,26 @@ impl DatabasePanel {
                     .items_center()
                     .px_2()
                     .py_1()
-                    .child(Label::new("Database").size(LabelSize::Small))
+                    .child(Label::new("Database Explorer").size(LabelSize::Small))
                     .child(
                         h_flex()
                             .gap_1()
+                            .child(
+                                IconButton::new("expand-all", IconName::ChevronUpDown)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Expand all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.expand_all(cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("collapse-all", IconName::ChevronDownUp)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Collapse all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.collapse_all(cx);
+                                    })),
+                            )
                             .child(
                                 IconButton::new("open-ddl-source", IconName::FileCode)
                                     .icon_size(IconSize::Small)
@@ -3053,6 +3116,7 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = conn.config.id;
+        let is_collapsed = self.collapsed_connections.contains(&id);
         let indent = px(8. + depth as f32 * 12.);
         let connection_folder = conn.config.folder_id;
         let drag_label: SharedString = conn.config.label.clone().into();
@@ -3134,6 +3198,29 @@ impl DatabasePanel {
                         };
                         this.handle_drop(*item, target, cx);
                     }))
+                    .child(
+                        div()
+                            .id(ElementId::from(SharedString::from(format!(
+                                "conn-chevron-{}",
+                                id
+                            ))))
+                            .debug_selector(move || format!("CONN-CHEVRON-{id}"))
+                            .flex_none()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(if is_collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_connection_collapsed(id, cx);
+                                cx.stop_propagation();
+                            })),
+                    )
                     .child(
                         h_flex()
                             .gap_1()
@@ -3283,7 +3370,7 @@ impl DatabasePanel {
                         .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error)),
                 )
             })
-            .when(is_connected, |el| {
+            .when(is_connected && !is_collapsed, |el| {
                 el.child(
                     div()
                         .flex()
@@ -3356,7 +3443,7 @@ impl DatabasePanel {
                         }),
                 )
             })
-            .when_some(databases, |el, dbs| {
+            .when(!is_collapsed, |el| el.when_some(databases, |el, dbs| {
                 el.children(dbs.into_iter().map(|db| {
                     let db_name = db.name;
                     let is_db_expanded = expanded_database_set.contains(&db_name);
@@ -4479,7 +4566,7 @@ impl DatabasePanel {
                             })
                         })
                 }))
-            })
+            }))
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -4699,16 +4786,16 @@ impl DatabasePanel {
             .when(is_top_level_target, |el| {
                 el.bg(cx.theme().colors().drop_target_background)
             })
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
                     if event.bounds.contains(&event.event.position)
                         && this.drag_target != Some(DropTarget::TopLevel)
                     {
                         this.drag_target = Some(DropTarget::TopLevel);
                         cx.notify();
                     }
-                },
-            ))
+                }),
+            )
             .on_drop(cx.listener(|this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::TopLevel, cx);
             }))
@@ -4792,18 +4879,14 @@ impl Render for DatabasePanel {
                         .flex_col()
                         .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
                         .child(
-                            h_flex()
-                                .w_full()
-                                .justify_end()
-                                .p_1()
-                                .child(
-                                    IconButton::new("close-erd", IconName::Close)
-                                        .tooltip(Tooltip::text("Close diagram"))
-                                        .on_click(cx.listener(|panel, _, _, cx| {
-                                            panel.erd_view = None;
-                                            cx.notify();
-                                        })),
-                                ),
+                            h_flex().w_full().justify_end().p_1().child(
+                                IconButton::new("close-erd", IconName::Close)
+                                    .tooltip(Tooltip::text("Close diagram"))
+                                    .on_click(cx.listener(|panel, _, _, cx| {
+                                        panel.erd_view = None;
+                                        cx.notify();
+                                    })),
+                            ),
                         )
                         .child(div().flex_1().child(view)),
                 )
@@ -4919,7 +5002,7 @@ impl Panel for DatabasePanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Database Panel")
+        Some("Database Explorer")
     }
 
     fn toggle_action(&self) -> Box<dyn gpui::Action> {
@@ -5266,11 +5349,7 @@ mod tests {
         );
     }
 
-    fn connection_in(
-        label: &str,
-        folder_id: Option<FolderId>,
-        order: i64,
-    ) -> ActiveConnection {
+    fn connection_in(label: &str, folder_id: Option<FolderId>, order: i64) -> ActiveConnection {
         let config = db_client::ConnectionConfig {
             label: label.to_string(),
             folder_id,
@@ -5650,6 +5729,7 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
@@ -5810,6 +5890,7 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
@@ -5962,6 +6043,7 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
@@ -6182,6 +6264,7 @@ mod tests {
                 history_expanded: false,
                 table_filter_editor,
                 collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
@@ -6256,6 +6339,7 @@ mod tests {
                 history_expanded: false,
                 table_filter_editor,
                 collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
@@ -6333,9 +6417,14 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn empty_panel_background_menu_creates_folder_and_connection(
-        cx: &mut TestAppContext,
-    ) {
+    async fn expand_all_collapse_all_and_connection_chevron_toggle(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "tree".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs.clone(), [], cx).await;
@@ -6358,6 +6447,117 @@ mod tests {
                 history_expanded: false,
                 table_filter_editor,
                 collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                erd_view: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let folder_id = store
+            .update(cx, |store, cx| store.add_folder("Prod".into(), None, cx))
+            .expect("folder must be created");
+
+        // Collapse All folds every folder and connection and clears schema expansion.
+        panel.update(cx, |panel, cx| panel.collapse_all(cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.collapsed_folders.contains(&folder_id),
+                "collapse all folds folders"
+            );
+            assert!(
+                panel.collapsed_connections.contains(&connection_id),
+                "collapse all folds connections"
+            );
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                store
+                    .connections()
+                    .iter()
+                    .all(|c| c.expanded_database_set.is_empty()),
+                "collapse all clears schema expansion"
+            );
+        });
+
+        // Expand All unfolds folders and connections.
+        panel.update(cx, |panel, cx| panel.expand_all(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.collapsed_folders.is_empty(),
+                "expand all unfolds folders"
+            );
+            assert!(
+                panel.collapsed_connections.is_empty(),
+                "expand all unfolds connections"
+            );
+        });
+
+        // The connection disclosure chevron folds a single connection in place.
+        panel.update(cx, |panel, cx| {
+            panel.toggle_connection_collapsed(connection_id, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.collapsed_connections.contains(&connection_id));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.toggle_connection_collapsed(connection_id, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.collapsed_connections.contains(&connection_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_panel_background_menu_creates_folder_and_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
@@ -6400,7 +6600,10 @@ mod tests {
                 .items_of_type::<ConnectionView>()
                 .count()
         });
-        assert_eq!(connection_forms, 1, "New Connection opens a connection form");
+        assert_eq!(
+            connection_forms, 1,
+            "New Connection opens a connection form"
+        );
 
         // The background menu's "New Folder" creates a top-level folder.
         panel.update_in(cx, |panel, window, cx| {
@@ -6514,8 +6717,8 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> Option<String> {
         let anchor = buffer.read_with(cx, |buffer, _| buffer.snapshot().anchor_before(offset));
-        let task =
-            cx.update(|_, cx| provider.definitions(buffer, anchor, GotoDefinitionKind::Symbol, cx))?;
+        let task = cx
+            .update(|_, cx| provider.definitions(buffer, anchor, GotoDefinitionKind::Symbol, cx))?;
         let links = task.await.ok()??;
         let target = links.first()?.target.buffer.clone();
         Some(target.read_with(cx, |buffer, _| buffer.text()))
@@ -6775,6 +6978,7 @@ mod tests {
                     history_expanded: false,
                     table_filter_editor,
                     collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),

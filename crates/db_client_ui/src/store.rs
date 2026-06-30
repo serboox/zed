@@ -1,4 +1,5 @@
 use anyhow::Result;
+use credentials_provider::CredentialsProvider;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
     RuntimeProvider, SshTunnel,
@@ -13,7 +14,6 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
-use credentials_provider::CredentialsProvider;
 use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, Task, TaskExt as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -292,7 +292,11 @@ impl DatabaseStore {
 
     pub fn update_connection(&mut self, mut config: ConnectionConfig, cx: &mut Context<Self>) {
         let config_id = config.id;
-        if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == config_id) {
+        if let Some(conn) = self
+            .connections
+            .iter_mut()
+            .find(|c| c.config.id == config_id)
+        {
             // The edit form does not manage tree placement; keep the existing
             // folder and order so editing a connection never moves it.
             config.folder_id = conn.config.folder_id;
@@ -415,7 +419,11 @@ impl DatabaseStore {
             if !visited.insert(id) {
                 break;
             }
-            current = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent_id);
+            current = self
+                .folders
+                .iter()
+                .find(|f| f.id == id)
+                .and_then(|f| f.parent_id);
         }
         false
     }
@@ -901,6 +909,57 @@ impl DatabaseStore {
         self.refresh_databases(id, cx)
     }
 
+    /// Folds every connection's schema by clearing the expanded database/table
+    /// sets. The cached metadata is kept so re-expanding is instant.
+    pub fn collapse_all_schema(&mut self, cx: &mut Context<Self>) {
+        for conn in &mut self.connections {
+            conn.expanded_database_set.clear();
+            conn.expanded_table_set.clear();
+        }
+        cx.notify();
+    }
+
+    /// Marks every known database of every connected connection as expanded,
+    /// fetching the table/view lists that are not cached yet. Tables themselves
+    /// are not expanded, so this stays bounded by the number of databases.
+    pub fn expand_all_databases(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let mut to_fetch: Vec<(ConnectionId, String, Arc<dyn DbProvider>)> = Vec::new();
+        for conn in &mut self.connections {
+            let Some(databases) = conn.databases.clone() else {
+                continue;
+            };
+            let provider = conn.provider.clone();
+            for db in databases {
+                conn.expanded_database_set.insert(db.name.clone());
+                if !conn.expanded_databases.contains_key(&db.name)
+                    && let Some(provider) = provider.clone()
+                {
+                    to_fetch.push((conn.config.id, db.name.clone(), provider));
+                }
+            }
+        }
+        cx.notify();
+        if to_fetch.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        cx.spawn(async move |this, cx| {
+            for (id, database, provider) in to_fetch {
+                let tables = provider.list_tables(&database).await.unwrap_or_default();
+                let views = provider.list_views(&database).await.unwrap_or_default();
+                this.update(cx, |this, cx| {
+                    if let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) {
+                        conn.expanded_databases.insert(database.clone(), tables);
+                        conn.db_views.insert(database, views);
+                        cx.emit(DatabaseStoreEvent::SchemaChanged);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            Ok(())
+        })
+    }
+
     pub fn execute_query(
         &mut self,
         id: ConnectionId,
@@ -1325,7 +1384,9 @@ mod tests {
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
             let parent = store.add_folder("parent".into(), None, cx).expect("parent");
-            let child = store.add_folder("child".into(), Some(parent), cx).expect("child");
+            let child = store
+                .add_folder("child".into(), Some(parent), cx)
+                .expect("child");
             let conn = config_in(Some(child), 0);
             let conn_id = conn.id;
             store.connections.push(ActiveConnection::new(conn));
@@ -1465,9 +1526,16 @@ mod tests {
         cx.run_until_parked();
 
         store.update(cx, |store, cx| {
-            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
             assert!(conn.databases.is_some(), "databases cached");
-            assert_eq!(conn.expanded_databases.get("shop").map(|t| t.len()), Some(1));
+            assert_eq!(
+                conn.expanded_databases.get("shop").map(|t| t.len()),
+                Some(1)
+            );
             // Loading the schema for completion must not expand the tree.
             assert!(conn.expanded_database_set.is_empty());
 
@@ -1478,7 +1546,11 @@ mod tests {
         cx.run_until_parked();
 
         store.update(cx, |store, cx| {
-            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
             assert!(
                 conn.expanded_tables
                     .contains_key(&("shop".to_string(), "users".to_string())),
@@ -1487,7 +1559,11 @@ mod tests {
             assert!(conn.expanded_table_set.is_empty());
 
             store.refresh_schema_cache(id, cx).detach();
-            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
             assert!(conn.databases.is_none(), "cache cleared on refresh");
             assert!(conn.expanded_databases.is_empty());
             assert!(conn.expanded_tables.is_empty());
