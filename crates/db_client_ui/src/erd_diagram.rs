@@ -1,8 +1,8 @@
 use gpui::{
-    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Window, canvas, point,
-    prelude::*, px,
+    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, ScrollHandle, Window,
+    canvas, point, prelude::*, px,
 };
-use ui::{Tooltip, prelude::*};
+use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use workspace::{Item, item::ItemEvent};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +37,14 @@ const DEFAULT_COLUMNS_PER_ROW: usize = 3;
 // Cap the rows drawn per table so every box fits one uniform grid slot; this
 // keeps box positions (and therefore the relationship lines) deterministic.
 const MAX_DISPLAY_COLUMNS: usize = 10;
+
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 3.0;
+const ZOOM_STEP: f32 = 0.25;
+
+fn clamp_zoom(zoom: f32) -> f32 {
+    zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
 
 /// Grid coordinate (row, column) for each table index, wrapping after
 /// `columns_per_row`. Pure so the layout can be unit-tested without a window.
@@ -173,6 +181,8 @@ pub struct ErdView {
     dot: String,
     total_width: f32,
     total_height: f32,
+    scroll_handle: ScrollHandle,
+    zoom: f32,
 }
 
 impl ErdView {
@@ -208,7 +218,24 @@ impl ErdView {
             dot,
             total_width: total_width.max(1.0),
             total_height: total_height.max(1.0),
+            scroll_handle: ScrollHandle::new(),
+            zoom: 1.0,
         }
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.zoom = clamp_zoom(self.zoom + ZOOM_STEP);
+        cx.notify();
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.zoom = clamp_zoom(self.zoom - ZOOM_STEP);
+        cx.notify();
+    }
+
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.zoom = 1.0;
+        cx.notify();
     }
 
     fn table_center(&self, table_name: &str) -> Option<(f32, f32)> {
@@ -225,15 +252,20 @@ impl ErdView {
         })
     }
 
-    fn render_table_box(&self, placed: &PlacedTable, cx: &Context<Self>) -> impl IntoElement {
+    fn render_table_box(
+        &self,
+        placed: &PlacedTable,
+        zoom: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors();
         let visible = displayed_column_count(placed.table.columns.len());
         let hidden = placed.table.columns.len().saturating_sub(visible);
         let mut box_element = v_flex()
             .absolute()
-            .left(px(placed.origin_x))
-            .top(px(placed.origin_y))
-            .w(px(BOX_WIDTH))
+            .left(px(placed.origin_x * zoom))
+            .top(px(placed.origin_y * zoom))
+            .w(px(BOX_WIDTH * zoom))
             .border_1()
             .border_color(colors.border)
             .rounded_md()
@@ -241,7 +273,7 @@ impl ErdView {
             .overflow_hidden()
             .child(
                 h_flex()
-                    .h(px(HEADER_HEIGHT))
+                    .h(px(HEADER_HEIGHT * zoom))
                     .w_full()
                     .px_2()
                     .items_center()
@@ -265,7 +297,7 @@ impl ErdView {
             };
             box_element = box_element.child(
                 h_flex()
-                    .h(px(ROW_HEIGHT))
+                    .h(px(ROW_HEIGHT * zoom))
                     .w_full()
                     .px_2()
                     .gap_1()
@@ -298,7 +330,7 @@ impl ErdView {
         }
         if hidden > 0 {
             box_element = box_element.child(
-                h_flex().h(px(ROW_HEIGHT)).w_full().px_2().items_center().child(
+                h_flex().h(px(ROW_HEIGHT * zoom)).w_full().px_2().items_center().child(
                     Label::new(format!("+{hidden} more"))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
@@ -334,9 +366,10 @@ impl Item for ErdView {
 }
 
 impl Render for ErdView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let line_color: Hsla = colors.border_variant;
+        let zoom = self.zoom;
 
         let mut segments: Vec<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)> = Vec::new();
         for relationship in &self.relationships {
@@ -345,8 +378,8 @@ impl Render for ErdView {
                 self.table_center(&relationship.to_table),
             ) {
                 segments.push((
-                    point(px(from.0), px(from.1)),
-                    point(px(to.0), px(to.1)),
+                    point(px(from.0 * zoom), px(from.1 * zoom)),
+                    point(px(to.0 * zoom), px(to.1 * zoom)),
                 ));
             }
         }
@@ -356,8 +389,8 @@ impl Render for ErdView {
 
         let mut surface = div()
             .relative()
-            .w(px(self.total_width))
-            .h(px(self.total_height))
+            .w(px(self.total_width * zoom))
+            .h(px(self.total_height * zoom))
             .child(
                 canvas(
                     move |_, _, _| {},
@@ -376,7 +409,7 @@ impl Render for ErdView {
                 .size_full(),
             );
         for placed in &self.placed {
-            surface = surface.child(self.render_table_box(placed, cx));
+            surface = surface.child(self.render_table_box(placed, zoom, cx));
         }
 
         v_flex()
@@ -394,6 +427,25 @@ impl Render for ErdView {
                     .border_color(colors.border)
                     .child(Label::new(self.title.clone()).size(LabelSize::Small))
                     .child(div().flex_1())
+                    .child(
+                        IconButton::new("erd-zoom-out", IconName::Dash)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Zoom out"))
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
+                    )
+                    .child(
+                        Button::new("erd-zoom-reset", format!("{}%", (zoom * 100.0).round() as i32))
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("Reset zoom to 100%"))
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
+                    )
+                    .child(
+                        IconButton::new("erd-zoom-in", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Zoom in"))
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
+                    )
                     .child(
                         Button::new("erd-copy-mermaid", "Copy Mermaid")
                             .style(ButtonStyle::Subtle)
@@ -418,10 +470,19 @@ impl Render for ErdView {
             .child(
                 div()
                     .id("erd-scroll")
+                    .debug_selector(|| "ERD_SCROLL".into())
                     .flex_1()
                     .w_full()
+                    .min_h_0()
                     .overflow_scroll()
-                    .child(surface),
+                    .track_scroll(&self.scroll_handle)
+                    .child(surface)
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Both)
+                            .tracked_scroll_handle(&self.scroll_handle),
+                        window,
+                        cx,
+                    ),
             )
     }
 }
@@ -548,6 +609,40 @@ mod tests {
             assert_eq!(view.relationships.len(), 1);
             assert!(view.table_center("users").is_some());
             assert!(view.table_center("missing").is_none());
+        })
+        .expect("window should build");
+    }
+
+    #[test]
+    fn clamp_zoom_stays_within_bounds() {
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(MIN_ZOOM - 1.0), MIN_ZOOM);
+        assert_eq!(clamp_zoom(MAX_ZOOM + 1.0), MAX_ZOOM);
+    }
+
+    #[gpui::test]
+    fn zoom_in_out_and_reset_clamp(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (tables, relationships) = sample();
+        let view = cx
+            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        view.update(cx, |view, _window, cx| {
+            assert_eq!(view.zoom, 1.0);
+            for _ in 0..20 {
+                view.zoom_in(cx);
+            }
+            assert_eq!(view.zoom, MAX_ZOOM);
+            for _ in 0..20 {
+                view.zoom_out(cx);
+            }
+            assert_eq!(view.zoom, MIN_ZOOM);
+            view.reset_zoom(cx);
+            assert_eq!(view.zoom, 1.0);
         })
         .expect("window should build");
     }
