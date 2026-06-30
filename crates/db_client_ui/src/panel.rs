@@ -9,6 +9,10 @@ use crate::explain_plan::{
     plan_text_from_result,
 };
 use crate::modify_table::{ModifyTableEvent, ModifyTableView};
+use crate::native_dump::{
+    DumpRequest, DumpStatus, DumpTask, NativeDumpDialog, NativeDumpEvent, apply_substitutions,
+    render_dump_status_row, spawn_dump,
+};
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent};
@@ -35,6 +39,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
+use time::OffsetDateTime;
+use time::macros::format_description;
 use ui::{
     CommonAnimationExt, ContextMenu, Divider, HighlightedLabel, Icon, IconButton, IconName,
     IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*, right_click_menu,
@@ -1519,7 +1525,36 @@ pub struct DatabasePanel {
     compare_pick: Option<ComparePick>,
     query_params: Option<QueryParamsPrompt>,
     selected_tree_node: Option<SelectedTreeNode>,
+    dump: DumpUiState,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Background native-dump state owned by the panel: the open dialog, the visible
+/// task list for the status strip, and the spawned task handles (kept alive so a
+/// dump keeps running, and droppable to cancel one). `next_id` labels each task.
+#[derive(Default)]
+struct DumpUiState {
+    dialog: Option<Entity<NativeDumpDialog>>,
+    tasks: Vec<DumpTask>,
+    runners: Vec<(usize, Task<()>)>,
+    next_id: usize,
+}
+
+/// A compact local timestamp for dump output filenames. Falls back to UTC when
+/// the local offset can't be resolved (e.g. a sandboxed environment).
+fn dump_timestamp() -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let format = format_description!("[year][month][day]-[hour][minute][second]");
+    now.format(&format).unwrap_or_default()
+}
+
+/// The native dump tool is driver specific; only MySQL and PostgreSQL have one.
+fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
+    match driver {
+        DatabaseDriver::MySQL => Some("Export with mysqldump…"),
+        DatabaseDriver::PostgreSQL => Some("Export with pg_dump…"),
+        _ => None,
+    }
 }
 
 /// The tree node the keyboard acts on. A node is a database (table = None) or a
@@ -1678,6 +1713,7 @@ impl DatabasePanel {
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
+                    dump: DumpUiState::default(),
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -2295,6 +2331,140 @@ impl DatabasePanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn open_dump_dialog(
+        &mut self,
+        id: ConnectionId,
+        preset_databases: Vec<String>,
+        preset_tables: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .map(|connection| connection.config.clone());
+        let Some(config) = config else { return };
+        let driver = config.driver;
+        let view = cx.new(|cx| {
+            NativeDumpDialog::new(driver, config, preset_databases, preset_tables, window, cx)
+        });
+        let subscription = cx.subscribe(&view, move |panel, _view, event, cx| match event {
+            NativeDumpEvent::Dismissed => {
+                panel.dump.dialog = None;
+                cx.notify();
+            }
+            NativeDumpEvent::Run(request) => {
+                panel.start_dump(id, request.clone(), cx);
+            }
+        });
+        self._subscriptions.push(subscription);
+        self.dump.dialog = Some(view);
+        cx.notify();
+    }
+
+    fn start_dump(&mut self, id: ConnectionId, request: DumpRequest, cx: &mut Context<Self>) {
+        let password = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .map(|connection| connection.config.password.clone())
+            .filter(|password| !password.is_empty());
+        let timestamp = dump_timestamp();
+        let database = request
+            .databases
+            .first()
+            .or(request.database.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let resolved_output = apply_substitutions(
+            &request.output_path,
+            &request.data_source,
+            &database,
+            &timestamp,
+        );
+        let task_id = self.dump.next_id;
+        self.dump.next_id += 1;
+        let label: SharedString = request.data_source.clone().into();
+        self.dump.tasks.push(DumpTask {
+            id: task_id,
+            label,
+            status: DumpStatus::Running,
+        });
+        let dump = spawn_dump(request, password, resolved_output, cx);
+        let handle = cx.spawn(async move |panel, cx| {
+            let result = dump.await;
+            panel
+                .update(cx, |panel, cx| {
+                    if let Some(task) =
+                        panel.dump.tasks.iter_mut().find(|task| task.id == task_id)
+                    {
+                        task.status = match result {
+                            Ok(output_path) => DumpStatus::Done { output_path },
+                            Err(message) => DumpStatus::Failed { message },
+                        };
+                    }
+                    panel
+                        .dump
+                        .runners
+                        .retain(|(running_id, _)| *running_id != task_id);
+                    cx.notify();
+                })
+                .ok();
+        });
+        self.dump.runners.push((task_id, handle));
+        self.dump.dialog = None;
+        cx.notify();
+    }
+
+    fn dismiss_dump_task(&mut self, task_id: usize, cx: &mut Context<Self>) {
+        // Dropping the runner handle cancels a dump that is still running.
+        self.dump.runners.retain(|(running_id, _)| *running_id != task_id);
+        self.dump.tasks.retain(|task| task.id != task_id);
+        cx.notify();
+    }
+
+    fn render_dump_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .dump
+            .tasks
+            .iter()
+            .map(|task| {
+                let task_id = task.id;
+                let is_running = matches!(task.status, DumpStatus::Running);
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_1().child(render_dump_status_row(task, cx)))
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("dump-task-dismiss-{task_id}")),
+                            if is_running {
+                                IconName::XCircle
+                            } else {
+                                IconName::Close
+                            },
+                        )
+                        .tooltip(Tooltip::text(if is_running { "Cancel" } else { "Dismiss" }))
+                        .on_click(cx.listener(move |panel, _, _, cx| {
+                            panel.dismiss_dump_task(task_id, cx);
+                        })),
+                    )
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .flex_none()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .children(rows)
     }
 
     fn open_ddl_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3341,6 +3511,21 @@ impl DatabasePanel {
                                 }
                             })),
                     )
+                    .when(dump_menu_label(driver).is_some(), |row| {
+                        row.child(
+                            IconButton::new(
+                                SharedString::from(format!("dump-conn-{}", id)),
+                                IconName::Download,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text(
+                                dump_menu_label(driver).unwrap_or("Export with dump tool"),
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_dump_dialog(id, Vec::new(), Vec::new(), window, cx);
+                            })),
+                        )
+                    })
                     .child(
                         IconButton::new(SharedString::from(format!("dup-conn-{}", id)), IconName::Copy)
                             .icon_size(IconSize::XSmall)
@@ -3536,6 +3721,23 @@ impl DatabasePanel {
                                                 });
                                             });
                                         }
+                                    })
+                                    .when_some(dump_menu_label(driver), |menu, label| {
+                                        menu.entry(label, None, {
+                                            let entity = entity.clone();
+                                            let db = db.clone();
+                                            move |window, cx| {
+                                                entity.update(cx, |panel, cx| {
+                                                    panel.open_dump_dialog(
+                                                        id,
+                                                        vec![db.clone()],
+                                                        Vec::new(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        })
                                     })
                                     .separator()
                                     .entry("View Procedures", None, {
@@ -3955,6 +4157,24 @@ impl DatabasePanel {
                                                                 panel.open_compare_picker(id, db.clone(), tbl.clone(), cx);
                                                             });
                                                         }
+                                                    })
+                                                    .when_some(dump_menu_label(driver), |menu, label| {
+                                                        menu.entry(label, None, {
+                                                            let entity = entity.clone();
+                                                            let db = db.clone();
+                                                            let tbl = tbl.clone();
+                                                            move |window, cx| {
+                                                                entity.update(cx, |panel, cx| {
+                                                                    panel.open_dump_dialog(
+                                                                        id,
+                                                                        vec![db.clone()],
+                                                                        vec![tbl.clone()],
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
+                                                        })
                                                     })
                                                     .entry("Script as CREATE", None, {
                                                         let entity = entity.clone();
@@ -4842,6 +5062,22 @@ impl Render for DatabasePanel {
             )
             .when(!self.store.read(cx).query_history().is_empty(), |el| {
                 el.child(self.render_history(cx))
+            })
+            .when(!self.dump.tasks.is_empty(), |el| {
+                el.child(self.render_dump_status(cx))
+            })
+            .when_some(self.dump.dialog.clone(), |el, view| {
+                el.child(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().colors().elevated_surface_background.opacity(0.6))
+                        .child(view),
+                )
             })
             .when_some(self.modify_table.clone(), |el, view| {
                 el.child(
@@ -5749,6 +5985,7 @@ mod tests {
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
+                    dump: DumpUiState::default(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -5910,6 +6147,7 @@ mod tests {
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
+                    dump: DumpUiState::default(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -6063,6 +6301,7 @@ mod tests {
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
+                    dump: DumpUiState::default(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -6284,6 +6523,7 @@ mod tests {
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
+                dump: DumpUiState::default(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6312,6 +6552,96 @@ mod tests {
             title.as_deref(),
             Some("public.users"),
             "Quick Documentation must act on the selected tree node"
+        );
+    }
+
+    #[gpui::test]
+    async fn dump_dialog_opens_and_task_dismisses(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "qa".to_string(),
+            driver: db_client::DatabaseDriver::MySQL,
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                quick_doc: None,
+                modify_table: None,
+                erd_view: None,
+                compare_view: None,
+                explain_view: None,
+                data_import: None,
+                ddl_source: None,
+                compare_pick: None,
+                query_params: None,
+                selected_tree_node: None,
+                dump: DumpUiState::default(),
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_dump_dialog(connection_id, Vec::new(), Vec::new(), window, cx);
+        });
+        assert!(
+            panel.read_with(cx, |panel, _| panel.dump.dialog.is_some()),
+            "Export entry must open the native dump dialog"
+        );
+
+        panel.update(cx, |panel, _cx| {
+            panel.dump.tasks.push(DumpTask {
+                id: 42,
+                label: "qa".into(),
+                status: DumpStatus::Done {
+                    output_path: "/tmp/qa-dump.sql".to_string(),
+                },
+            });
+        });
+        assert_eq!(panel.read_with(cx, |panel, _| panel.dump.tasks.len()), 1);
+
+        panel.update(cx, |panel, cx| panel.dismiss_dump_task(42, cx));
+        assert!(
+            panel.read_with(cx, |panel, _| panel.dump.tasks.is_empty()),
+            "Dismiss must remove a finished dump task from the status strip"
         );
     }
 
@@ -6359,6 +6689,7 @@ mod tests {
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
+                dump: DumpUiState::default(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6467,6 +6798,7 @@ mod tests {
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
+                dump: DumpUiState::default(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6577,6 +6909,7 @@ mod tests {
                 compare_pick: None,
                 query_params: None,
                 selected_tree_node: None,
+                dump: DumpUiState::default(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -6998,6 +7331,7 @@ mod tests {
                     compare_pick: None,
                     query_params: None,
                     selected_tree_node: None,
+                    dump: DumpUiState::default(),
                     _subscriptions: vec![sub],
                 }
             });
