@@ -372,6 +372,105 @@ fn statement_table_reference_at_offset(text: &str, offset: usize) -> Option<SqlT
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlDatabaseReference {
+    database: String,
+    start: usize,
+    end: usize,
+}
+
+// `SHOW CREATE DATABASE <name>` / `SHOW CREATE SCHEMA <name>` — returns the span
+// of the database identifier so Ctrl+click on it can open the database DDL.
+fn show_create_database_reference(sql: &str) -> Option<SqlDatabaseReference> {
+    let bytes = sql.as_bytes();
+    let mut index = skip_sql_whitespace(bytes, 0);
+    if !keyword_at(bytes, index, b"show") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"show".len());
+    if !keyword_at(bytes, index, b"create") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"create".len());
+    let keyword: &[u8] = if keyword_at(bytes, index, b"database") {
+        b"database"
+    } else if keyword_at(bytes, index, b"schema") {
+        b"schema"
+    } else {
+        return None;
+    };
+    let start = skip_sql_whitespace(bytes, index + keyword.len());
+    let mut end = start;
+    while end < bytes.len() && is_sql_word_byte(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(SqlDatabaseReference {
+        database: sql[start..end].to_string(),
+        start,
+        end,
+    })
+}
+
+// Resolves a database reference at the cursor: either the `<name>` of a
+// `SHOW CREATE DATABASE <name>` statement, or the database part of a qualified
+// `database.table` reference (cursor before the dot). Returns None when the
+// cursor is on the table part, so the table path keeps its existing behavior.
+fn database_reference_at_offset(text: &str, offset: usize) -> Option<SqlDatabaseReference> {
+    let cursor = offset.min(text.len());
+    let statement_start = text[..cursor]
+        .rfind(';')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let statement_end = text[cursor..]
+        .find(';')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len());
+    let statement = &text[statement_start..statement_end];
+
+    if let Some(mut reference) = show_create_database_reference(statement) {
+        reference.start += statement_start;
+        reference.end += statement_start;
+        if offset >= reference.start && offset <= reference.end {
+            return Some(reference);
+        }
+    }
+
+    let bytes = text.as_bytes();
+    let mut word_start = offset.min(bytes.len());
+    while word_start > 0 && is_sql_reference_byte(bytes[word_start - 1]) {
+        word_start -= 1;
+    }
+    let mut word_end = offset.min(bytes.len());
+    while word_end < bytes.len() && is_sql_reference_byte(bytes[word_end]) {
+        word_end += 1;
+    }
+    if word_start == word_end {
+        return None;
+    }
+    let word = &text[word_start..word_end];
+    let dot = word.find('.')?;
+    let dot_offset = word_start + dot;
+    if offset > dot_offset {
+        return None;
+    }
+    let database = &word[..dot];
+    if database.is_empty() {
+        return None;
+    }
+    let table_reference = statement_table_reference_at_offset(text, dot_offset + 1)?;
+    if table_reference.database.as_deref() != Some(database) {
+        return None;
+    }
+    Some(SqlDatabaseReference {
+        database: database.to_string(),
+        start: word_start,
+        end: dot_offset,
+    })
+}
+
 impl SemanticsProvider for DbSemanticsProvider {
     fn hover(
         &self,
@@ -449,65 +548,55 @@ impl SemanticsProvider for DbSemanticsProvider {
         let snapshot = buffer.read(cx).snapshot();
         let offset = snapshot.offset_for_anchor(&position);
         let text = snapshot.text();
-        let table_reference = statement_table_reference_at_offset(&text, offset)
-            .or_else(|| table_reference_at_offset(&text, offset))?;
-        let database_opt = table_reference.database;
-        let table_name = table_reference.table;
 
-        let (database, table) = self
-            .store
-            .read_with(cx, |store, _| {
-                let conn = store
-                    .connections
-                    .iter()
-                    .find(|c| c.config.id == self.connection_id)?;
-                let db = database_opt.clone().or_else(|| {
-                    conn.config
-                        .database
-                        .clone()
-                        .or_else(|| conn.expanded_databases.keys().next().cloned())
-                })?;
-                Some((db, table_name.clone()))
-            })
-            .ok()
-            .flatten()?;
-        let word_start = snapshot.anchor_before(table_reference.start);
-        let word_end = snapshot.anchor_after(table_reference.end);
-        let source_buffer = buffer.clone();
-        let store = self.store.clone();
-        let workspace = self.workspace.clone();
-        let connection_id = self.connection_id;
+        if let Some(table_reference) = statement_table_reference_at_offset(&text, offset)
+            .or_else(|| table_reference_at_offset(&text, offset))
+        {
+            let database_opt = table_reference.database;
+            let table_name = table_reference.table;
 
-        Some(cx.spawn(async move |cx| {
-            let ddl_task = store.update(cx, |store, cx| {
-                store.get_table_ddl(connection_id, database, table.clone(), cx)
-            })?;
-            let ddl = ddl_task.await?;
-
-            let language_task = workspace.read_with(cx, |ws, _| {
-                ws.app_state().languages.language_for_name("SQL")
-            })?;
-            let language = language_task.await.ok();
-
-            let ddl_buffer = workspace.update(cx, |ws, cx| {
-                ws.project().update(cx, |project, cx| {
-                    project.create_local_buffer(&ddl, language, false, cx)
+            let (database, table) = self
+                .store
+                .read_with(cx, |store, _| {
+                    let conn = store
+                        .connections
+                        .iter()
+                        .find(|c| c.config.id == self.connection_id)?;
+                    let db = database_opt.clone().or_else(|| {
+                        conn.config
+                            .database
+                            .clone()
+                            .or_else(|| conn.expanded_databases.keys().next().cloned())
+                    })?;
+                    Some((db, table_name.clone()))
                 })
-            })?;
+                .ok()
+                .flatten()?;
+            let word_start = snapshot.anchor_before(table_reference.start);
+            let word_end = snapshot.anchor_after(table_reference.end);
+            let connection_id = self.connection_id;
+            return Some(self.spawn_ddl_navigation(
+                buffer.clone(),
+                word_start..word_end,
+                cx,
+                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+            ));
+        }
 
-            let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(0));
+        if let Some(database_reference) = database_reference_at_offset(&text, offset) {
+            let database = database_reference.database;
+            let word_start = snapshot.anchor_before(database_reference.start);
+            let word_end = snapshot.anchor_after(database_reference.end);
+            let connection_id = self.connection_id;
+            return Some(self.spawn_ddl_navigation(
+                buffer.clone(),
+                word_start..word_end,
+                cx,
+                move |store, cx| store.get_database_ddl(connection_id, database, cx),
+            ));
+        }
 
-            Ok(Some(vec![LocationLink {
-                origin: Some(Location {
-                    buffer: source_buffer,
-                    range: word_start..word_end,
-                }),
-                target: Location {
-                    buffer: ddl_buffer,
-                    range: target_anchor..target_anchor,
-                },
-            }]))
-        }))
+        None
     }
 
     fn range_for_rename(
@@ -527,6 +616,51 @@ impl SemanticsProvider for DbSemanticsProvider {
         _cx: &mut App,
     ) -> Option<Task<anyhow::Result<ProjectTransaction>>> {
         None
+    }
+}
+
+impl DbSemanticsProvider {
+    fn spawn_ddl_navigation(
+        &self,
+        source_buffer: Entity<Buffer>,
+        origin_range: std::ops::Range<Anchor>,
+        cx: &mut App,
+        make_ddl_task: impl FnOnce(
+            &mut DatabaseStore,
+            &mut Context<DatabaseStore>,
+        ) -> Task<anyhow::Result<String>>
+        + 'static,
+    ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |cx| {
+            let ddl_task = store.update(cx, |store, cx| make_ddl_task(store, cx))?;
+            let ddl = ddl_task.await?;
+
+            let language_task = workspace.read_with(cx, |ws, _| {
+                ws.app_state().languages.language_for_name("SQL")
+            })?;
+            let language = language_task.await.ok();
+
+            let ddl_buffer = workspace.update(cx, |ws, cx| {
+                ws.project().update(cx, |project, cx| {
+                    project.create_local_buffer(&ddl, language, false, cx)
+                })
+            })?;
+
+            let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(0));
+
+            Ok(Some(vec![LocationLink {
+                origin: Some(Location {
+                    buffer: source_buffer,
+                    range: origin_range,
+                }),
+                target: Location {
+                    buffer: ddl_buffer,
+                    range: target_anchor..target_anchor,
+                },
+            }]))
+        })
     }
 }
 
@@ -4922,6 +5056,70 @@ mod tests {
     }
 
     #[test]
+    fn database_reference_at_offset_resolves_qualified_database_part() {
+        let text = "SELECT * FROM instruments.splits;";
+        let database_start = text.find("instruments").expect("database in sql");
+        let offset = database_start + 2;
+
+        assert_eq!(
+            super::database_reference_at_offset(text, offset),
+            Some(super::SqlDatabaseReference {
+                database: "instruments".to_string(),
+                start: database_start,
+                end: database_start + "instruments".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn database_reference_at_offset_rejects_table_part() {
+        let text = "SELECT * FROM instruments.splits;";
+        let offset = text.find("splits").expect("table in sql") + 1;
+
+        assert_eq!(super::database_reference_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn database_reference_at_offset_resolves_show_create_database() {
+        let text = "SHOW CREATE DATABASE instruments;";
+        let database_start = text.find("instruments").expect("database in sql");
+        let offset = database_start + 3;
+
+        assert_eq!(
+            super::database_reference_at_offset(text, offset),
+            Some(super::SqlDatabaseReference {
+                database: "instruments".to_string(),
+                start: database_start,
+                end: database_start + "instruments".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn database_reference_at_offset_resolves_show_create_schema() {
+        let text = "SHOW CREATE SCHEMA public;";
+        let database_start = text.find("public").expect("schema in sql");
+        let offset = database_start + 1;
+
+        assert_eq!(
+            super::database_reference_at_offset(text, offset),
+            Some(super::SqlDatabaseReference {
+                database: "public".to_string(),
+                start: database_start,
+                end: database_start + "public".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn database_reference_at_offset_rejects_arbitrary_qualified_word() {
+        let text = "SET a.b = 1";
+        let offset = text.find("a.b").expect("qualified word in sql");
+
+        assert_eq!(super::database_reference_at_offset(text, offset), None);
+    }
+
+    #[test]
     fn table_reference_at_offset_resolves_unqualified_table() {
         let text = "SELECT * FROM users WHERE id = 1";
         let offset = text.find("users").expect("users in sql") + 1;
@@ -5275,7 +5473,10 @@ mod tests {
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
-            Ok(String::new())
+            Ok("TABLE_DDL".to_string())
+        }
+        async fn get_database_ddl(&self, _database: &str) -> anyhow::Result<String> {
+            Ok("DATABASE_DDL".to_string())
         }
     }
 
@@ -6304,6 +6505,74 @@ mod tests {
                 "the console ctrl-enter binding must resolve from its JSON action name"
             );
         });
+    }
+
+    async fn resolve_definition_ddl(
+        provider: &DbSemanticsProvider,
+        buffer: &Entity<Buffer>,
+        offset: usize,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        let anchor = buffer.read_with(cx, |buffer, _| buffer.snapshot().anchor_before(offset));
+        let task =
+            cx.update(|_, cx| provider.definitions(buffer, anchor, GotoDefinitionKind::Symbol, cx))?;
+        let links = task.await.ok()??;
+        let target = links.first()?.target.buffer.clone();
+        Some(target.read_with(cx, |buffer, _| buffer.text()))
+    }
+
+    // Regression guard: Ctrl+click (go-to-definition) on a table token must open
+    // the table DDL, and on the database token the database DDL. Exercises the
+    // semantics provider end to end so "table click stopped working" is caught.
+    #[gpui::test]
+    async fn semantics_provider_routes_table_and_database_ddl(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "ddl".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let provider = DbSemanticsProvider {
+            connection_id,
+            store: store.downgrade(),
+            workspace: workspace.downgrade(),
+        };
+
+        let sql = "SELECT * FROM instruments.splits;";
+        let buffer = cx.new(|cx| Buffer::local(sql, cx));
+
+        let table_offset = sql.find("splits").expect("table token") + 1;
+        let table_ddl = resolve_definition_ddl(&provider, &buffer, table_offset, cx).await;
+        assert_eq!(
+            table_ddl.as_deref(),
+            Some("TABLE_DDL"),
+            "Ctrl+click on a table token must resolve the table DDL"
+        );
+
+        let database_offset = sql.find("instruments").expect("database token") + 2;
+        let database_ddl = resolve_definition_ddl(&provider, &buffer, database_offset, cx).await;
+        assert_eq!(
+            database_ddl.as_deref(),
+            Some("DATABASE_DDL"),
+            "Ctrl+click on a database token must resolve the database DDL"
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) {
