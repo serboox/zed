@@ -2266,18 +2266,13 @@ impl DatabasePanel {
                         }))
                 })
                 .collect();
-        div()
+        crate::widgets::popup_surface(cx)
             .absolute()
             .top_8()
             .right_2()
             .w(px(320.))
             .max_h(px(420.))
             .overflow_hidden()
-            .bg(cx.theme().colors().elevated_surface_background)
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .rounded_md()
-            .shadow_md()
             .child(
                 div()
                     .flex()
@@ -2292,6 +2287,7 @@ impl DatabasePanel {
                     .child(
                         IconButton::new("quick-doc-close", IconName::Close)
                             .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.quick_doc = None;
                                 cx.notify();
