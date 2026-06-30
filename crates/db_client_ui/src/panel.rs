@@ -1750,7 +1750,7 @@ impl DatabasePanel {
             .w_full()
             .items_center()
             .gap_1()
-            .py_0p5()
+            .py_1()
             .pr_2()
             .pl(px(8. + depth as f32 * 12.))
             .rounded_sm()
@@ -1759,22 +1759,27 @@ impl DatabasePanel {
                 el.bg(cx.theme().colors().drop_target_background)
             })
             .child(
-                Icon::new(if is_collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
-                Icon::new(if is_collapsed {
-                    IconName::Folder
-                } else {
-                    IconName::FolderOpen
-                })
-                .size(IconSize::Small)
-                .color(Color::Muted),
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(if is_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(if is_collapsed {
+                            IconName::Folder
+                        } else {
+                            IconName::FolderOpen
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Default),
+                    ),
             );
 
         if let Some(editor) = editing {
