@@ -29,6 +29,9 @@ const SCHEMA_CACHE_FILE: &str = "db_schema_cache.json";
 /// not stall the worker or balloon memory. Beyond these the rest stays lazy.
 const MAX_PREFETCH_DATABASES: usize = 50;
 const MAX_PREFETCH_TABLES_PER_DATABASE: usize = 300;
+/// Total describe_table calls a single prefetch may spend loading columns across
+/// all databases, so a server with many large schemas stays responsive.
+const MAX_PREFETCH_COLUMN_TABLES_TOTAL: usize = 1000;
 
 /// Cached DDL for one connection so `Go to DDL` works while disconnected.
 /// `tables` is keyed database -> table -> DDL to keep JSON map keys as strings.
@@ -410,27 +413,6 @@ impl DatabaseStore {
                     let database = info.name.clone();
                     let tables = provider.list_tables(&database).await.unwrap_or_default();
                     let views = provider.list_views(&database).await.unwrap_or_default();
-                    if Some(&database) == primary.as_ref() {
-                        let total = tables.len();
-                        let mut columns = HashMap::new();
-                        for table in tables.iter().take(MAX_PREFETCH_TABLES_PER_DATABASE) {
-                            if let Some(cols) =
-                                provider.describe_table(&database, &table.name).await.log_err()
-                            {
-                                columns.insert(table.name.clone(), cols);
-                            }
-                        }
-                        if total > MAX_PREFETCH_TABLES_PER_DATABASE {
-                            log::info!(
-                                "db_client: schema prefetch loaded columns for {} of {} tables in {database}",
-                                MAX_PREFETCH_TABLES_PER_DATABASE,
-                                total
-                            );
-                        }
-                        if !columns.is_empty() {
-                            cache.columns.insert(database.clone(), columns);
-                        }
-                    }
                     cache.tables.insert(database.clone(), tables);
                     cache.views.insert(database, views);
                 }
@@ -439,6 +421,65 @@ impl DatabaseStore {
                         "db_client: schema prefetch capped at {} of {} databases",
                         MAX_PREFETCH_DATABASES,
                         databases.len()
+                    );
+                }
+
+                // Load columns primary-database-first, then the rest in listing
+                // order, spending a shared budget so many large schemas can't
+                // issue thousands of describe_table calls.
+                let mut column_order: Vec<String> = Vec::new();
+                if let Some(primary_database) = primary
+                    .clone()
+                    .filter(|database| cache.tables.contains_key(database))
+                {
+                    column_order.push(primary_database);
+                }
+                for info in databases.iter().take(MAX_PREFETCH_DATABASES) {
+                    if !column_order.contains(&info.name) {
+                        column_order.push(info.name.clone());
+                    }
+                }
+
+                let mut column_budget = MAX_PREFETCH_COLUMN_TABLES_TOTAL;
+                let mut budget_skipped: Vec<String> = Vec::new();
+                for database in &column_order {
+                    let Some(tables) = cache.tables.get(database) else {
+                        continue;
+                    };
+                    if column_budget == 0 {
+                        if !tables.is_empty() {
+                            budget_skipped.push(database.clone());
+                        }
+                        continue;
+                    }
+                    let total = tables.len();
+                    let per_database_limit = MAX_PREFETCH_TABLES_PER_DATABASE.min(column_budget);
+                    let mut columns = HashMap::new();
+                    for table in tables.iter().take(per_database_limit) {
+                        if let Some(cols) =
+                            provider.describe_table(database, &table.name).await.log_err()
+                        {
+                            columns.insert(table.name.clone(), cols);
+                        }
+                    }
+                    column_budget = column_budget.saturating_sub(total.min(per_database_limit));
+                    if total > per_database_limit {
+                        log::info!(
+                            "db_client: schema prefetch loaded columns for {} of {} tables in {database}",
+                            per_database_limit,
+                            total
+                        );
+                    }
+                    if !columns.is_empty() {
+                        cache.columns.insert(database.clone(), columns);
+                    }
+                }
+                if !budget_skipped.is_empty() {
+                    log::info!(
+                        "db_client: schema prefetch column budget of {} exhausted; columns not loaded for {} databases: {}",
+                        MAX_PREFETCH_COLUMN_TABLES_TOTAL,
+                        budget_skipped.len(),
+                        budget_skipped.join(", ")
                     );
                 }
 
@@ -1953,6 +1994,57 @@ mod tests {
         }
     }
 
+    struct MultiDbSchemaMockProvider;
+
+    #[async_trait::async_trait]
+    impl DbProvider for MultiDbSchemaMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(vec![
+                DatabaseInfo {
+                    name: "shop".into(),
+                },
+                DatabaseInfo {
+                    name: "analytics".into(),
+                },
+            ])
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
+            let name = if database == "shop" { "users" } else { "events" };
+            Ok(vec![TableInfo {
+                name: name.into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(vec![ColumnInfo {
+                name: "id".into(),
+                data_type: "int".into(),
+                is_nullable: false,
+                column_key: Some("PRI".into()),
+                default_value: None,
+                extra: String::new(),
+            }])
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
     struct DdlMockProvider;
 
     #[async_trait::async_trait]
@@ -2185,6 +2277,36 @@ mod tests {
             // Prefetch must not expand the tree.
             assert!(conn.expanded_database_set.is_empty());
             assert!(conn.expanded_table_set.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn prefetch_full_schema_indexes_columns_for_all_databases(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(MultiDbSchemaMockProvider), cx);
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
+            assert!(
+                conn.expanded_tables
+                    .contains_key(&("shop".to_string(), "users".to_string())),
+                "columns indexed for the primary database"
+            );
+            assert!(
+                conn.expanded_tables
+                    .contains_key(&("analytics".to_string(), "events".to_string())),
+                "columns indexed for non-primary databases within the budget"
+            );
         });
     }
 
