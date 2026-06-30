@@ -5721,8 +5721,6 @@ impl Render for DatabasePanel {
                     .debug_selector(|| "DB-TREE-SCROLL".into())
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Both)
