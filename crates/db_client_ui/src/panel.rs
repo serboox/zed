@@ -4451,10 +4451,34 @@ impl DatabasePanel {
             match node {
                 TreeNode::Folder { folder, children } => {
                     let is_collapsed = self.collapsed_folders.contains(&folder.id);
-                    elements.push(self.render_folder_row(&folder, depth, is_collapsed, cx));
-                    if !is_collapsed {
-                        elements.extend(
-                            self.render_tree_nodes(children, connections, depth + 1, cx),
+                    let row = self.render_folder_row(&folder, depth, is_collapsed, cx);
+                    if is_collapsed || children.is_empty() {
+                        elements.push(row);
+                    } else {
+                        let child_elements =
+                            self.render_tree_nodes(children, connections, depth + 1, cx);
+                        // A continuous guide line sits under the parent's chevron and runs
+                        // down the whole child block, so nesting reads at a glance.
+                        let guide_color = cx.theme().colors().border_variant;
+                        let guide_left = px(8. + depth as f32 * 12. + 6.);
+                        elements.push(
+                            v_flex()
+                                .child(row)
+                                .child(
+                                    div()
+                                        .relative()
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(guide_left)
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(1.))
+                                                .bg(guide_color),
+                                        )
+                                        .child(v_flex().children(child_elements)),
+                                )
+                                .into_any_element(),
                         );
                     }
                 }
