@@ -1524,6 +1524,7 @@ impl ResultView {
             cx.notify();
             return;
         }
+        window.focus(&self.focus_handle, cx);
         let repeated_selected_cell_click = !shift
             && !control
             && self.selected_cell == Some((abs_idx, cell_idx))
@@ -1563,6 +1564,7 @@ impl ResultView {
             cx.notify();
             return;
         }
+        window.focus(&self.focus_handle, cx);
         let repeated_selected_cell_click = !shift
             && !control
             && self.selected_cell == Some((abs_idx, cell_idx))
@@ -2532,6 +2534,70 @@ impl ResultView {
             col_idx
         };
         self.begin_cell_edit(new_abs, new_col, CellEditEntry::CursorEnd, window, cx);
+    }
+
+    // Moves the active cell in Ready mode (no edit in progress), clamping at the
+    // grid edges and scrolling the new row into view, like arrow keys in Excel.
+    fn move_active_cell(&mut self, delta_col: i64, delta_row: i64, cx: &mut Context<Self>) {
+        let row_count = self.result.as_ref().map_or(0, |r| r.rows.len());
+        let vis_cols = self.visible_columns.clone();
+        if row_count == 0 || vis_cols.is_empty() {
+            return;
+        }
+        let (new_abs, new_col) = match self.selected_cell {
+            Some((abs, col)) => {
+                let new_abs = (abs as i64 + delta_row).clamp(0, row_count as i64 - 1) as usize;
+                let cur_vis = vis_cols.iter().position(|&c| c == col).unwrap_or(0);
+                let new_vis =
+                    (cur_vis as i64 + delta_col).clamp(0, vis_cols.len() as i64 - 1) as usize;
+                (new_abs, vis_cols[new_vis])
+            }
+            None => (0, vis_cols[0]),
+        };
+        self.selected_cell = Some((new_abs, new_col));
+        self.selected_cell_range = None;
+        self.selected_rows.clear();
+        if let Some(display_idx) = self
+            .filtered_display_order
+            .iter()
+            .position(|&a| a == new_abs)
+        {
+            self.scroll_handle
+                .scroll_to_item(display_idx, gpui::ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    // Begins editing the active cell from the keyboard (F2 / type-to-replace).
+    // `begin_cell_edit` already no-ops on non-editable tables; boolean columns are
+    // toggled by click, not text-edited, so they are skipped here.
+    fn begin_edit_active_cell(
+        &mut self,
+        entry: CellEditEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((abs, col)) = self.selected_cell else {
+            return;
+        };
+        if matches!(self.column_kind_at(col), CellEditorKind::Boolean) {
+            return;
+        }
+        self.begin_cell_edit(abs, col, entry, window, cx);
+    }
+
+    // Starts an edit by typing on the active cell: the typed text replaces the
+    // current value (Excel type-to-replace).
+    fn type_to_replace_active_cell(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_edit_active_cell(CellEditEntry::Replace, window, cx);
+        if let Some(editor) = self.cell_edit.as_ref().map(|edit| edit.editor.clone()) {
+            editor.update(cx, |ed, cx| ed.set_text(text, window, cx));
+        }
     }
 
     // Commits the inline edit into the local buffer (no SQL runs here). The grid
@@ -8852,6 +8918,79 @@ impl Render for ResultView {
         v_flex()
             .key_context("DbResultView")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Ready-mode navigation/edit-entry. While an inline editor is open
+                // the editor's own key handler owns these keys.
+                if this.cell_edit.is_some() {
+                    return;
+                }
+                let keystroke = &event.keystroke;
+                let modifiers = keystroke.modifiers;
+                let plain = !modifiers.modified();
+                let only_shift =
+                    modifiers.shift && !modifiers.control && !modifiers.platform && !modifiers.alt;
+                match keystroke.key.as_str() {
+                    "f2" if plain => {
+                        this.begin_edit_active_cell(CellEditEntry::CursorEnd, window, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "up" if plain => {
+                        this.move_active_cell(0, -1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "down" if plain => {
+                        this.move_active_cell(0, 1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "left" if plain => {
+                        this.move_active_cell(-1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "right" if plain => {
+                        this.move_active_cell(1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "enter" if only_shift => {
+                        this.move_active_cell(0, -1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "enter" if plain => {
+                        this.move_active_cell(0, 1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" if only_shift => {
+                        this.move_active_cell(-1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" if plain => {
+                        this.move_active_cell(1, 0, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => {}
+                }
+                // Type-to-replace: a printable character starts an edit that
+                // overwrites the cell (shift for uppercase is allowed).
+                if !modifiers.control && !modifiers.platform && !modifiers.alt && !modifiers.function
+                {
+                    if let Some(text) = keystroke.key_char.as_ref() {
+                        if text.chars().count() == 1
+                            && text.chars().next().is_some_and(|c| !c.is_control())
+                        {
+                            this.type_to_replace_active_cell(text, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                }
+            }))
             .size_full()
             .when_some(self.env_accent, |el, color| {
                 // Ambient environment cue: a thin top stripe plus a faint wash so
@@ -10527,6 +10666,91 @@ mod tests {
                     .as_ref()
                     .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
                 "second click on an already-selected cell should open the inline editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn keyboard_arrows_move_active_cell_with_clamp(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("down");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 0))));
+        cx.simulate_keystrokes("right");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 1))));
+        cx.simulate_keystrokes("up");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 1))));
+        cx.simulate_keystrokes("left");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+        // Clamps at the top-left edge.
+        cx.simulate_keystrokes("up left");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+    }
+
+    #[gpui::test]
+    fn keyboard_enter_tab_navigate_in_ready_mode(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("enter");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 0))));
+        cx.simulate_keystrokes("tab");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 1))));
+        cx.simulate_keystrokes("shift-enter");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 1))));
+        cx.simulate_keystrokes("shift-tab");
+        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+    }
+
+    #[gpui::test]
+    fn keyboard_f2_opens_editor_keeping_value(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("f2");
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert!(
+                view.cell_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
+                "F2 should open the inline editor on the active cell"
+            );
+            assert!(
+                text.is_some_and(|t| !t.is_empty()),
+                "F2 must keep the existing cell value, not clear it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn type_to_replace_overwrites_active_cell(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.type_to_replace_active_cell("9", window, cx);
+        });
+        view.update(&mut cx, |view, cx| {
+            assert!(view.cell_edit.is_some(), "typing should start an edit");
+            assert_eq!(
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| edit.editor.read(cx).text(cx)),
+                Some("9".to_string()),
+                "type-to-replace must overwrite the cell with the typed text"
             );
         });
     }
