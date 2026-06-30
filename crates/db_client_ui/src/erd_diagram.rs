@@ -2,7 +2,7 @@ use gpui::{
     Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, Window, canvas, point, prelude::*, px,
 };
-use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
+use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*, rems_from_px};
 use workspace::{Item, item::ItemEvent};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,8 +45,37 @@ const ZOOM_STEP: f32 = 0.25;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.005;
 
+// Base (zoom = 1.0) pixel sizes for everything inside a box. Zoom multiplies
+// each of these by the same factor so the diagram scales like an image: text,
+// icons, padding, gaps and line strokes all grow and shrink together with the
+// box geometry, instead of the box growing while fixed-size text drifts.
+const HEADER_FONT: f32 = 13.0;
+const COLUMN_FONT: f32 = 11.0;
+const CELL_PADDING: f32 = 8.0;
+const ROW_GAP: f32 = 4.0;
+const ICON_PX: f32 = 12.0;
+const LINE_STROKE: f32 = 1.5;
+
 fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// Multiply a base pixel value by the zoom factor. Every dimension in the
+/// diagram goes through this so scaling stays uniform.
+fn scaled(value: f32, zoom: f32) -> f32 {
+    value * zoom
+}
+
+/// Scale a box's position and size by a single zoom factor. Position and size
+/// use the same multiplier so a box at (x, y, w, h) maps to (x*z, y*z, w*z, h*z)
+/// and never drifts relative to its neighbours.
+pub fn scaled_box(x: f32, y: f32, width: f32, height: f32, zoom: f32) -> (f32, f32, f32, f32) {
+    (
+        scaled(x, zoom),
+        scaled(y, zoom),
+        scaled(width, zoom),
+        scaled(height, zoom),
+    )
 }
 
 /// Grid coordinate (row, column) for each table index, wrapping after
@@ -280,11 +309,23 @@ impl ErdView {
         let colors = cx.theme().colors();
         let visible = displayed_column_count(placed.table.columns.len());
         let hidden = placed.table.columns.len().saturating_sub(visible);
+        let cell_padding = px(scaled(CELL_PADDING, zoom));
+        let row_gap = px(scaled(ROW_GAP, zoom));
+        let header_font = px(scaled(HEADER_FONT, zoom));
+        let column_font = px(scaled(COLUMN_FONT, zoom));
+        let icon_size = IconSize::Custom(rems_from_px(scaled(ICON_PX, zoom)));
+        let (box_x, box_y, box_w, _box_h) = scaled_box(
+            placed.origin_x,
+            placed.origin_y,
+            BOX_WIDTH,
+            box_height(placed.table.columns.len()),
+            zoom,
+        );
         let mut box_element = v_flex()
             .absolute()
-            .left(px(placed.origin_x * zoom))
-            .top(px(placed.origin_y * zoom))
-            .w(px(BOX_WIDTH * zoom))
+            .left(px(box_x))
+            .top(px(box_y))
+            .w(px(box_w))
             .border_1()
             .border_color(colors.border)
             .rounded_md()
@@ -292,18 +333,20 @@ impl ErdView {
             .overflow_hidden()
             .child(
                 h_flex()
-                    .h(px(HEADER_HEIGHT * zoom))
+                    .h(px(scaled(HEADER_HEIGHT, zoom)))
                     .w_full()
-                    .px_2()
+                    .px(cell_padding)
                     .items_center()
                     .bg(colors.element_background)
                     .border_b_1()
                     .border_color(colors.border)
                     .child(
-                        Label::new(placed.table.name.clone())
-                            .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::SEMIBOLD)
-                            .truncate(),
+                        div()
+                            .text_size(header_font)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(colors.text)
+                            .truncate()
+                            .child(placed.table.name.clone()),
                     ),
             );
         for column in placed.table.columns.iter().take(visible) {
@@ -316,10 +359,10 @@ impl ErdView {
             };
             box_element = box_element.child(
                 h_flex()
-                    .h(px(ROW_HEIGHT * zoom))
+                    .h(px(scaled(ROW_HEIGHT, zoom)))
                     .w_full()
-                    .px_2()
-                    .gap_1()
+                    .px(cell_padding)
+                    .gap(row_gap)
                     .items_center()
                     .when_some(key_color, |row, color| {
                         row.child(
@@ -328,32 +371,40 @@ impl ErdView {
                             } else {
                                 IconName::Link
                             })
-                            .size(IconSize::XSmall)
+                            .size(icon_size)
                             .color(Color::Custom(color)),
                         )
                     })
                     .child(
-                        Label::new(column.name.clone())
-                            .size(LabelSize::XSmall)
-                            .truncate(),
+                        div()
+                            .text_size(column_font)
+                            .text_color(colors.text)
+                            .truncate()
+                            .child(column.name.clone()),
                     )
                     .child(
-                        div().flex_1().child(
-                            Label::new(column.data_type.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
+                        div()
+                            .flex_1()
+                            .text_size(column_font)
+                            .text_color(colors.text_muted)
+                            .truncate()
+                            .child(column.data_type.clone()),
                     ),
             );
         }
         if hidden > 0 {
             box_element = box_element.child(
-                h_flex().h(px(ROW_HEIGHT * zoom)).w_full().px_2().items_center().child(
-                    Label::new(format!("+{hidden} more"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
+                h_flex()
+                    .h(px(scaled(ROW_HEIGHT, zoom)))
+                    .w_full()
+                    .px(cell_padding)
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(column_font)
+                            .text_color(colors.text_muted)
+                            .child(format!("+{hidden} more")),
+                    ),
             );
         }
         box_element
@@ -405,17 +456,18 @@ impl Render for ErdView {
 
         let mermaid = self.mermaid.clone();
         let dot = self.dot.clone();
+        let stroke_width = px(scaled(LINE_STROKE, zoom));
 
         let mut surface = div()
             .relative()
-            .w(px(self.total_width * zoom))
-            .h(px(self.total_height * zoom))
+            .w(px(scaled(self.total_width, zoom)))
+            .h(px(scaled(self.total_height, zoom)))
             .child(
                 canvas(
                     move |_, _, _| {},
                     move |_bounds, _, window, _| {
                         for (from, to) in &segments {
-                            let mut builder = gpui::PathBuilder::stroke(px(1.5));
+                            let mut builder = gpui::PathBuilder::stroke(stroke_width);
                             builder.move_to(*from);
                             builder.line_to(*to);
                             if let Ok(path) = builder.build() {
@@ -647,6 +699,28 @@ mod tests {
         assert_eq!(clamp_zoom(1.0), 1.0);
         assert_eq!(clamp_zoom(MIN_ZOOM - 1.0), MIN_ZOOM);
         assert_eq!(clamp_zoom(MAX_ZOOM + 1.0), MAX_ZOOM);
+    }
+
+    #[test]
+    fn scaled_box_scales_position_and_size_uniformly() {
+        let (x, y, w, h) = scaled_box(10.0, 20.0, 220.0, 80.0, 2.0);
+        assert_eq!((x, y, w, h), (20.0, 40.0, 440.0, 160.0));
+        let (x, y, w, h) = scaled_box(10.0, 20.0, 220.0, 80.0, 0.5);
+        assert_eq!((x, y, w, h), (5.0, 10.0, 110.0, 40.0));
+    }
+
+    #[test]
+    fn fonts_and_geometry_share_one_zoom_factor() {
+        assert_eq!(scaled(HEADER_FONT, 2.0), HEADER_FONT * 2.0);
+        assert_eq!(scaled(COLUMN_FONT, 0.5), COLUMN_FONT * 0.5);
+        assert_eq!(scaled(ICON_PX, 2.0), ICON_PX * 2.0);
+        // Box width and font grow by the same ratio, so text stays in proportion
+        // to the box at any zoom (image-like scaling, no drift).
+        let zoom = 1.75;
+        assert_eq!(
+            scaled(BOX_WIDTH, zoom) / BOX_WIDTH,
+            scaled(HEADER_FONT, zoom) / HEADER_FONT
+        );
     }
 
     #[gpui::test]
