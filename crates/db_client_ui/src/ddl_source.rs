@@ -132,11 +132,10 @@ pub fn parse_ddl_schema(sql: &str) -> Vec<DdlTable> {
         let header = &sql[start..open];
         let name = header
             .split_whitespace()
-            .filter(|token| {
+            .rfind(|token| {
                 let upper = token.to_uppercase();
                 !matches!(upper.as_str(), "CREATE" | "TABLE" | "IF" | "NOT" | "EXISTS")
             })
-            .next_back()
             .map(unquote_identifier)
             .unwrap_or_default();
 

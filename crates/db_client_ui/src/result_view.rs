@@ -1232,12 +1232,9 @@ impl ResultView {
         entries: &mut Vec<ResultDisplayRow>,
         placed: &mut [bool],
     ) {
-        loop {
-            let Some(added_idx) = self.added_rows.iter().enumerate().position(|(idx, _)| {
-                !placed.get(idx).copied().unwrap_or(true) && self.added_row_anchor(idx) == anchor
-            }) else {
-                break;
-            };
+        while let Some(added_idx) = self.added_rows.iter().enumerate().position(|(idx, _)| {
+            !placed.get(idx).copied().unwrap_or(true) && self.added_row_anchor(idx) == anchor
+        }) {
             if let Some(placed) = placed.get_mut(added_idx) {
                 *placed = true;
             }
@@ -4080,7 +4077,7 @@ impl ResultView {
                 } else {
                     preview
                 };
-                let sql_owned = sql.clone();
+                let sql_owned = sql;
                 div()
                     .id(("history-item", i))
                     .px_2()
@@ -5575,7 +5572,7 @@ impl ResultView {
                 let filter_dot_color = cx.theme().colors().text_accent;
                 let local_filters = self.local_filters.clone();
                 let display_rows_for_body = display_rows.clone();
-                let display_rows_for_gutter = display_rows.clone();
+                let display_rows_for_gutter = display_rows;
 
                 // Horizontal viewport window, shared by header and rows, so only
                 // on-screen columns are built per frame.
@@ -6706,14 +6703,9 @@ impl ResultView {
                             IconButton::new("value-editor-copy", IconName::Copy)
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Copy full value"))
-                                .on_click({
-                                    let value = value.clone();
-                                    cx.listener(move |_, _, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            value.clone(),
-                                        ));
-                                    })
-                                }),
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+                                })),
                         )
                         .child(
                             IconButton::new("value-editor-close", IconName::Close)

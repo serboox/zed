@@ -113,10 +113,8 @@ pub fn explain_sql_for_driver(driver: DatabaseDriver, sql: &str) -> String {
 pub fn plan_text_from_result(result: &QueryResult) -> String {
     let mut lines = Vec::new();
     for row in &result.rows {
-        for cell in row {
-            if let Some(value) = cell {
-                lines.push(value.clone());
-            }
+        for value in row.iter().flatten() {
+            lines.push(value.clone());
         }
     }
     lines.join("\n")
