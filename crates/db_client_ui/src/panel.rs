@@ -41,8 +41,9 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    Event as WorkspaceEvent, ItemHandle, OpenOptions, OpenVisible, Pane, Workspace,
+    Event as WorkspaceEvent, ItemHandle, OpenOptions, OpenVisible, Pane, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotificationId,
 };
 use zed_actions::database_panel::{GoToDdl, QuickDocumentation, ShowDiagram, ToggleFocus};
 
@@ -1658,6 +1659,26 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    fn delete_folder(&mut self, folder_id: FolderId, cx: &mut Context<Self>) {
+        let removed = self
+            .store
+            .update(cx, |store, cx| store.remove_folder(folder_id, cx));
+        if removed {
+            return;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::named("db-folder-not-empty".into()),
+                        "Can't delete a folder that isn't empty. Move or delete its contents first.",
+                    ),
+                    cx,
+                );
+            })
+            .ok();
+    }
+
     fn new_connection_in_folder(
         &self,
         folder: Option<FolderId>,
@@ -1831,9 +1852,7 @@ impl DatabasePanel {
                 })
                 .entry("Delete Folder", None, move |_, cx| {
                     entity.update(cx, |panel, cx| {
-                        panel
-                            .store
-                            .update(cx, |store, cx| store.remove_folder(folder_id, cx));
+                        panel.delete_folder(folder_id, cx);
                     });
                 })
             })

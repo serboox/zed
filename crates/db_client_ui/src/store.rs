@@ -510,27 +510,26 @@ impl DatabaseStore {
         true
     }
 
-    /// Removes a folder, lifting its direct children and connections to the
-    /// folder's own parent rather than deleting them. Connections are never
-    /// destroyed by a folder delete.
-    pub fn remove_folder(&mut self, id: FolderId, cx: &mut Context<Self>) {
-        let Some(parent_id) = self.folders.iter().find(|f| f.id == id).map(|f| f.parent_id) else {
-            return;
-        };
-        for folder in self.folders.iter_mut() {
-            if folder.parent_id == Some(id) {
-                folder.parent_id = parent_id;
-            }
-        }
-        for conn in self.connections.iter_mut() {
-            if conn.config.folder_id == Some(id) {
-                conn.config.folder_id = parent_id;
-            }
+    /// A folder is empty when it holds no child folders and no connections.
+    pub fn folder_is_empty(&self, id: FolderId) -> bool {
+        !self.folders.iter().any(|f| f.parent_id == Some(id))
+            && !self
+                .connections
+                .iter()
+                .any(|c| c.config.folder_id == Some(id))
+    }
+
+    /// Removes a folder only when it is empty. Returns false and changes nothing
+    /// for a missing or non-empty folder, so a delete never destroys connections.
+    pub fn remove_folder(&mut self, id: FolderId, cx: &mut Context<Self>) -> bool {
+        if !self.folders.iter().any(|f| f.id == id) || !self.folder_is_empty(id) {
+            return false;
         }
         self.folders.retain(|f| f.id != id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         self.persist_connections(cx);
+        true
     }
 
     pub fn move_connection_to_folder(
@@ -1187,7 +1186,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn remove_folder_lifts_children_to_parent(cx: &mut gpui::TestAppContext) {
+    fn remove_folder_only_deletes_empty(cx: &mut gpui::TestAppContext) {
         let store = cx.new(DatabaseStore::new);
         store.update(cx, |store, cx| {
             let parent = store.add_folder("parent".into(), None, cx).expect("parent");
@@ -1196,14 +1195,30 @@ mod tests {
             let conn_id = conn.id;
             store.connections.push(ActiveConnection::new(conn));
 
-            store.remove_folder(child, cx);
-            // The connection is preserved and lifted to the child's parent.
-            let lifted = store
-                .connections
-                .iter()
-                .find(|c| c.config.id == conn_id)
-                .expect("conn");
-            assert_eq!(lifted.config.folder_id, Some(parent));
+            // A folder with a connection is not empty and is not removed.
+            assert!(!store.folder_is_empty(child));
+            assert!(!store.remove_folder(child, cx));
+            assert!(store.folders.iter().any(|f| f.id == child));
+            assert_eq!(
+                store
+                    .connections
+                    .iter()
+                    .find(|c| c.config.id == conn_id)
+                    .expect("conn")
+                    .config
+                    .folder_id,
+                Some(child)
+            );
+
+            // A folder with a child folder is not empty either.
+            assert!(!store.folder_is_empty(parent));
+            assert!(!store.remove_folder(parent, cx));
+            assert!(store.folders.iter().any(|f| f.id == parent));
+
+            // Emptying the child lets it be deleted; the parent then becomes empty.
+            store.move_connection_to_folder(conn_id, Some(parent), cx);
+            assert!(store.folder_is_empty(child));
+            assert!(store.remove_folder(child, cx));
             assert!(store.folders.iter().all(|f| f.id != child));
         });
     }
