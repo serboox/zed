@@ -781,6 +781,126 @@ impl DatabaseStore {
         })
     }
 
+    /// Loads the database list and the given database's tables/views into the
+    /// schema cache for autocomplete, without marking any tree node expanded.
+    /// No-op when the data is already cached.
+    pub fn ensure_schema_for_completion(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Ok(()));
+        };
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Ok(()));
+        };
+        let need_databases = conn.databases.is_none();
+        let need_tables = !database.is_empty() && !conn.expanded_databases.contains_key(&database);
+        if !need_databases && !need_tables {
+            return Task::ready(Ok(()));
+        }
+
+        cx.spawn(async move |this, cx| {
+            let databases = if need_databases {
+                provider.list_databases().await.log_err()
+            } else {
+                None
+            };
+            let tables = if need_tables {
+                provider.list_tables(&database).await.log_err()
+            } else {
+                None
+            };
+            let views = if need_tables {
+                Some(provider.list_views(&database).await.unwrap_or_default())
+            } else {
+                None
+            };
+            this.update(cx, |this, cx| {
+                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                    return;
+                };
+                if let Some(databases) = databases {
+                    conn.databases = Some(databases);
+                }
+                if let Some(tables) = tables {
+                    conn.expanded_databases.insert(database.clone(), tables);
+                }
+                if let Some(views) = views {
+                    conn.db_views.insert(database, views);
+                }
+                cx.emit(DatabaseStoreEvent::SchemaChanged);
+                cx.notify();
+            })
+            .ok();
+            Ok(())
+        })
+    }
+
+    /// Loads a table's columns into the schema cache for autocomplete, without
+    /// marking the tree node expanded. No-op when already cached.
+    pub fn ensure_columns_for_completion(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let key = (database.clone(), table.clone());
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Ok(()));
+        };
+        if conn.expanded_tables.contains_key(&key) {
+            return Task::ready(Ok(()));
+        }
+        let Some(provider) = conn.provider.clone() else {
+            return Task::ready(Ok(()));
+        };
+
+        cx.spawn(async move |this, cx| {
+            let columns = provider.describe_table(&database, &table).await.log_err();
+            this.update(cx, |this, cx| {
+                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                    return;
+                };
+                if let Some(columns) = columns {
+                    conn.expanded_tables.insert((database, table), columns);
+                    cx.emit(DatabaseStoreEvent::SchemaChanged);
+                    cx.notify();
+                }
+            })
+            .ok();
+            Ok(())
+        })
+    }
+
+    /// Drops a connection's cached schema (databases, tables, views, columns,
+    /// indexes, foreign keys, triggers) and collapses its tree, then reloads the
+    /// database list so the next expand or completion sees the live schema. The
+    /// connection itself stays open. This is the user-facing "Refresh".
+    pub fn refresh_schema_cache(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) {
+            conn.databases = None;
+            conn.expanded_databases.clear();
+            conn.db_views.clear();
+            conn.expanded_tables.clear();
+            conn.table_indexes.clear();
+            conn.table_fks.clear();
+            conn.table_triggers.clear();
+            conn.expanded_database_set.clear();
+            conn.expanded_table_set.clear();
+            cx.emit(DatabaseStoreEvent::SchemaChanged);
+            cx.notify();
+        }
+        self.refresh_databases(id, cx)
+    }
+
     pub fn execute_query(
         &mut self,
         id: ConnectionId,
@@ -1284,5 +1404,93 @@ mod tests {
             .await
             .expect("read password");
         assert_eq!(after, None);
+    }
+
+    struct SchemaMockProvider;
+
+    #[async_trait::async_trait]
+    impl DbProvider for SchemaMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(vec![DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(vec![TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(vec![ColumnInfo {
+                name: "id".into(),
+                data_type: "int".into(),
+                is_nullable: false,
+                column_key: Some("PRI".into()),
+                default_value: None,
+                extra: String::new(),
+            }])
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[gpui::test]
+    fn completion_schema_cache_loads_and_refreshes(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(SchemaMockProvider), cx);
+            store
+                .ensure_schema_for_completion(id, "shop".into(), cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            assert!(conn.databases.is_some(), "databases cached");
+            assert_eq!(conn.expanded_databases.get("shop").map(|t| t.len()), Some(1));
+            // Loading the schema for completion must not expand the tree.
+            assert!(conn.expanded_database_set.is_empty());
+
+            store
+                .ensure_columns_for_completion(id, "shop".into(), "users".into(), cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            assert!(
+                conn.expanded_tables
+                    .contains_key(&("shop".to_string(), "users".to_string())),
+                "columns cached"
+            );
+            assert!(conn.expanded_table_set.is_empty());
+
+            store.refresh_schema_cache(id, cx).detach();
+            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            assert!(conn.databases.is_none(), "cache cleared on refresh");
+            assert!(conn.expanded_databases.is_empty());
+            assert!(conn.expanded_tables.is_empty());
+        });
     }
 }

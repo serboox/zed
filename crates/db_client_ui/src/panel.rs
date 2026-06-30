@@ -748,12 +748,12 @@ fn install_db_editor_features(
     workspace: WeakEntity<Workspace>,
     cx: &mut App,
 ) {
-    install_on_editor(editor.clone(), store.clone(), cx);
+    let connection_id = store
+        .upgrade()
+        .and_then(|store_entity| console_connection_for_editor(&editor, &store_entity, cx));
+    install_on_editor(editor.clone(), store.clone(), connection_id, cx);
 
-    let Some(store_entity) = store.upgrade() else {
-        return;
-    };
-    let Some(connection_id) = console_connection_for_editor(&editor, &store_entity, cx) else {
+    let Some(connection_id) = connection_id else {
         return;
     };
 
@@ -3069,7 +3069,7 @@ impl DatabasePanel {
                                 .tooltip(Tooltip::text("Refresh"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.store.update(cx, |store, cx| {
-                                        store.refresh_databases(id, cx).detach_and_log_err(cx);
+                                        store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
                                     });
                                 })),
                         )
@@ -3303,12 +3303,10 @@ impl DatabasePanel {
                                     })
                                     .entry("Refresh Tables", None, {
                                         let entity = entity.clone();
-                                        let db = db.clone();
                                         move |_, cx| {
                                             entity.update(cx, |panel, cx| {
                                                 panel.store.update(cx, |store, cx| {
-                                                    store.toggle_database_expanded(id, db.clone(), cx).detach_and_log_err(cx);
-                                                    store.toggle_database_expanded(id, db.clone(), cx).detach_and_log_err(cx);
+                                                    store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
                                                 });
                                             });
                                         }
@@ -3950,7 +3948,7 @@ impl DatabasePanel {
                                                                         });
                                                                         if drop_task.await.log_err().is_some() {
                                                                             store.update(cx, |store, cx| {
-                                                                                store.refresh_databases(id, cx).detach_and_log_err(cx);
+                                                                                store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
                                                                             });
                                                                         }
                                                                     }
