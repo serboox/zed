@@ -12,7 +12,6 @@ use std::ops::Range;
 use std::rc::Rc;
 use theme::ActiveTheme as _;
 use ui::IconName;
-use util::ResultExt as _;
 
 const CORE_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON",
@@ -759,87 +758,51 @@ impl CompletionProvider for SqlCompletionProvider {
             }
         };
 
-        let store = store.downgrade();
-        cx.spawn(async move |_editor, cx| {
-            ensure(&store, cx, connection_id, |store, cx| {
-                store.ensure_schema_for_completion(connection_id, database.clone(), cx)
-            })
-            .await;
-
-            // With the database list loaded, decide whether the qualifier names
-            // a schema (suggest its objects) or a table/alias (suggest columns).
-            let qualifier_is_schema = if let Some(qualifier) = &context.qualifier {
+        // Read the cached schema synchronously so completion is instant — no
+        // per-keystroke database round-trip. A full prefetch fills the index in
+        // the background on connect; if it has not landed for this connection
+        // yet, trigger it once here and answer with whatever is cached now.
+        let qualifier_is_schema = context
+            .qualifier
+            .as_ref()
+            .map(|qualifier| {
                 store
-                    .read_with(cx, |store, _| {
-                        store
-                            .connections()
-                            .iter()
-                            .find(|c| c.config.id == connection_id)
-                            .and_then(|c| c.databases.as_ref())
-                            .map(|dbs| dbs.iter().any(|d| d.name.eq_ignore_ascii_case(qualifier)))
-                            .unwrap_or(false)
-                    })
+                    .read(cx)
+                    .connections()
+                    .iter()
+                    .find(|c| c.config.id == connection_id)
+                    .and_then(|c| c.databases.as_ref())
+                    .map(|dbs| dbs.iter().any(|d| d.name.eq_ignore_ascii_case(qualifier)))
                     .unwrap_or(false)
-            } else {
-                false
-            };
+            })
+            .unwrap_or(false);
+        let qualifier_schema = if qualifier_is_schema {
+            context.qualifier.as_deref()
+        } else {
+            None
+        };
 
-            // Tables whose columns we may need: the qualifier target plus every
-            // table in scope when completing columns. Each carries the database
-            // to read it from — a table's own `schema.` qualifier wins over the
-            // connection's default database.
-            let mut tables_to_load: Vec<(String, String)> = Vec::new();
-            if let Some(qualifier) = &context.qualifier {
-                if qualifier_is_schema {
-                    let schema = qualifier.clone();
-                    ensure(&store, cx, connection_id, move |store, cx| {
-                        store.ensure_schema_for_completion(connection_id, schema, cx)
-                    })
-                    .await;
-                } else if let Some(table_ref) =
-                    resolve_table_ref(qualifier, &context.tables_in_scope)
-                {
-                    let table_database = table_ref.schema.clone().unwrap_or_else(|| database.clone());
-                    tables_to_load.push((table_database, table_ref.name.clone()));
-                } else {
-                    tables_to_load.push((database.clone(), qualifier.clone()));
-                }
-            } else if context.kind == ContextKind::Columns {
-                for table_ref in &context.tables_in_scope {
-                    let table_database =
-                        table_ref.schema.clone().unwrap_or_else(|| database.clone());
-                    tables_to_load.push((table_database, table_ref.name.clone()));
-                }
-            }
-            for (table_database, table) in tables_to_load {
-                ensure(&store, cx, connection_id, move |store, cx| {
-                    store.ensure_columns_for_completion(connection_id, table_database, table, cx)
-                })
-                .await;
-            }
+        let snapshot =
+            read_schema_snapshot(store.read(cx), connection_id, &database, qualifier_schema);
+        if snapshot.tables.is_empty()
+            && snapshot.databases.is_empty()
+            && snapshot.columns_by_table.is_empty()
+        {
+            store
+                .update(cx, |store, cx| store.prefetch_full_schema(connection_id, cx))
+                .detach();
+        }
 
-            let qualifier_schema = if qualifier_is_schema {
-                context.qualifier.as_deref()
-            } else {
-                None
-            };
-            let snapshot = store
-                .read_with(cx, |store, _| {
-                    read_schema_snapshot(store, connection_id, &database, qualifier_schema)
-                })
-                .unwrap_or_default();
+        let completions = build_candidates(&context, &snapshot, driver)
+            .iter()
+            .map(|item| make_completion(item, replace_range.clone(), &icon_colors))
+            .collect();
 
-            let completions = build_candidates(&context, &snapshot, driver)
-                .iter()
-                .map(|item| make_completion(item, replace_range.clone(), &icon_colors))
-                .collect();
-
-            Ok(vec![CompletionResponse {
-                completions,
-                display_options: CompletionDisplayOptions::default(),
-                is_incomplete: false,
-            }])
-        })
+        Task::ready(Ok(vec![CompletionResponse {
+            completions,
+            display_options: CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
     }
 
     fn is_completion_trigger(
@@ -872,21 +835,6 @@ impl CompletionProvider for SqlCompletionProvider {
 
     fn filter_completions(&self) -> bool {
         true
-    }
-}
-
-/// Runs a store schema-fetch task to completion, ignoring failures (completion
-/// must never surface an error; a missing connection just yields no fetch).
-async fn ensure<F>(
-    store: &WeakEntity<DatabaseStore>,
-    cx: &mut gpui::AsyncApp,
-    _connection_id: ConnectionId,
-    build: F,
-) where
-    F: FnOnce(&mut DatabaseStore, &mut Context<DatabaseStore>) -> Task<anyhow::Result<()>>,
-{
-    if let Ok(task) = store.update(cx, |store, cx| build(store, cx)) {
-        task.await.log_err();
     }
 }
 

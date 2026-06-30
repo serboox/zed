@@ -23,6 +23,12 @@ use util::ResultExt;
 const MAX_QUERY_HISTORY: usize = 100;
 const CONNECTIONS_FILE: &str = "db_connections.json";
 const DDL_CACHE_FILE: &str = "db_ddl_cache.json";
+const SCHEMA_CACHE_FILE: &str = "db_schema_cache.json";
+
+/// Upper bounds for the background full-schema prefetch so a huge server does
+/// not stall the worker or balloon memory. Beyond these the rest stays lazy.
+const MAX_PREFETCH_DATABASES: usize = 50;
+const MAX_PREFETCH_TABLES_PER_DATABASE: usize = 300;
 
 /// Cached DDL for one connection so `Go to DDL` works while disconnected.
 /// `tables` is keyed database -> table -> DDL to keep JSON map keys as strings.
@@ -32,6 +38,21 @@ struct DdlCache {
     databases: HashMap<String, String>,
     #[serde(default)]
     tables: HashMap<String, HashMap<String, String>>,
+}
+
+/// Persisted full-schema snapshot for one connection, the source the completion
+/// provider reads from so suggestions are instant and survive restarts/offline.
+/// Map keys stay strings (database, then table) for plain JSON.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct SchemaCache {
+    #[serde(default)]
+    databases: Vec<DatabaseInfo>,
+    #[serde(default)]
+    tables: HashMap<String, Vec<TableInfo>>,
+    #[serde(default)]
+    views: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    columns: HashMap<String, HashMap<String, Vec<ColumnInfo>>>,
 }
 
 /// On-disk shape of the connection tree: the folder set plus the connections.
@@ -183,6 +204,8 @@ pub struct DatabaseStore {
     pub active_connection_id: Option<ConnectionId>,
     ssh_tunnels: HashMap<ConnectionId, SshTunnel>,
     ddl_cache: HashMap<ConnectionId, DdlCache>,
+    schema_cache: HashMap<ConnectionId, SchemaCache>,
+    prefetching_schema: HashSet<ConnectionId>,
 }
 
 /// App-global handle to the single workspace `DatabaseStore`, set when the
@@ -245,6 +268,7 @@ impl DatabaseStore {
                         for config in configs {
                             store.connections.push(ActiveConnection::new(config));
                         }
+                        store.hydrate_schema_caches();
                         if !store.connections.is_empty() || !store.folders.is_empty() {
                             cx.emit(DatabaseStoreEvent::ConnectionsChanged);
                             cx.notify();
@@ -270,6 +294,24 @@ impl DatabaseStore {
                 }
             })
             .detach();
+
+            cx.spawn(async move |this, cx| {
+                let cache = cx
+                    .background_executor()
+                    .spawn(async { load_schema_cache_from_disk() })
+                    .await;
+                if !cache.is_empty() {
+                    this.update(cx, |store, cx| {
+                        store.schema_cache = cache;
+                        // Connections may already be loaded; fill their empty maps
+                        // so completion is rich before any connect happens.
+                        store.hydrate_schema_caches();
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
 
         Self {
@@ -279,6 +321,8 @@ impl DatabaseStore {
             active_connection_id: None,
             ssh_tunnels: HashMap::new(),
             ddl_cache: HashMap::new(),
+            schema_cache: HashMap::new(),
+            prefetching_schema: HashSet::new(),
         }
     }
 
@@ -287,6 +331,147 @@ impl DatabaseStore {
         cx.background_executor()
             .spawn(async move { save_ddl_cache_to_disk(&cache).log_err() })
             .detach();
+    }
+
+    fn persist_schema_cache(&self, cx: &mut Context<Self>) {
+        let cache = self.schema_cache.clone();
+        cx.background_executor()
+            .spawn(async move { save_schema_cache_to_disk(&cache).log_err() })
+            .detach();
+    }
+
+    /// Fills each connection's empty schema maps from the persisted snapshot so
+    /// completion has data offline and right after startup. Never overwrites
+    /// live data already fetched from the server.
+    fn hydrate_schema_caches(&mut self) {
+        let cache = std::mem::take(&mut self.schema_cache);
+        for conn in &mut self.connections {
+            let Some(snapshot) = cache.get(&conn.config.id) else {
+                continue;
+            };
+            if conn.databases.is_none() && !snapshot.databases.is_empty() {
+                conn.databases = Some(snapshot.databases.clone());
+            }
+            for (database, tables) in &snapshot.tables {
+                conn.expanded_databases
+                    .entry(database.clone())
+                    .or_insert_with(|| tables.clone());
+            }
+            for (database, views) in &snapshot.views {
+                conn.db_views
+                    .entry(database.clone())
+                    .or_insert_with(|| views.clone());
+            }
+            for (database, tables) in &snapshot.columns {
+                for (table, columns) in tables {
+                    conn.expanded_tables
+                        .entry((database.clone(), table.clone()))
+                        .or_insert_with(|| columns.clone());
+                }
+            }
+        }
+        self.schema_cache = cache;
+    }
+
+    /// Loads the full schema (every database, its tables/views, and the columns
+    /// of the primary database) into the in-memory maps in the background, then
+    /// persists it, so the completion provider answers instantly and offline.
+    /// Bounded by `MAX_PREFETCH_*` and idempotent per connection (a second call
+    /// while one is in flight is a no-op). Columns of non-primary databases stay
+    /// lazy to keep the round-trip count sane on large servers.
+    pub fn prefetch_full_schema(
+        &mut self,
+        id: ConnectionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Ok(()));
+        };
+        if !self.prefetching_schema.insert(id) {
+            return Task::ready(Ok(()));
+        }
+        let preferred_database = conn.config.database.clone().filter(|d| !d.is_empty());
+
+        cx.spawn(async move |this, cx| {
+            let outcome = async {
+                let provider = this
+                    .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                    .await?;
+                let databases = provider.list_databases().await?;
+                let primary = preferred_database
+                    .clone()
+                    .or_else(|| databases.first().map(|d| d.name.clone()));
+
+                let mut cache = SchemaCache {
+                    databases: databases.clone(),
+                    ..Default::default()
+                };
+                for info in databases.iter().take(MAX_PREFETCH_DATABASES) {
+                    let database = info.name.clone();
+                    let tables = provider.list_tables(&database).await.unwrap_or_default();
+                    let views = provider.list_views(&database).await.unwrap_or_default();
+                    if Some(&database) == primary.as_ref() {
+                        let total = tables.len();
+                        let mut columns = HashMap::new();
+                        for table in tables.iter().take(MAX_PREFETCH_TABLES_PER_DATABASE) {
+                            if let Some(cols) =
+                                provider.describe_table(&database, &table.name).await.log_err()
+                            {
+                                columns.insert(table.name.clone(), cols);
+                            }
+                        }
+                        if total > MAX_PREFETCH_TABLES_PER_DATABASE {
+                            log::info!(
+                                "db_client: schema prefetch loaded columns for {} of {} tables in {database}",
+                                MAX_PREFETCH_TABLES_PER_DATABASE,
+                                total
+                            );
+                        }
+                        if !columns.is_empty() {
+                            cache.columns.insert(database.clone(), columns);
+                        }
+                    }
+                    cache.tables.insert(database.clone(), tables);
+                    cache.views.insert(database, views);
+                }
+                if databases.len() > MAX_PREFETCH_DATABASES {
+                    log::info!(
+                        "db_client: schema prefetch capped at {} of {} databases",
+                        MAX_PREFETCH_DATABASES,
+                        databases.len()
+                    );
+                }
+
+                this.update(cx, |store, cx| {
+                    if let Some(conn) = store.connections.iter_mut().find(|c| c.config.id == id) {
+                        conn.databases = Some(cache.databases.clone());
+                        for (database, tables) in &cache.tables {
+                            conn.expanded_databases.insert(database.clone(), tables.clone());
+                        }
+                        for (database, views) in &cache.views {
+                            conn.db_views.insert(database.clone(), views.clone());
+                        }
+                        for (database, columns) in &cache.columns {
+                            for (table, cols) in columns {
+                                conn.expanded_tables
+                                    .insert((database.clone(), table.clone()), cols.clone());
+                            }
+                        }
+                    }
+                    store.schema_cache.insert(id, cache);
+                    store.persist_schema_cache(cx);
+                    cx.emit(DatabaseStoreEvent::SchemaChanged);
+                    cx.notify();
+                })?;
+                anyhow::Ok(())
+            }
+            .await;
+            this.update(cx, |store, _| {
+                store.prefetching_schema.remove(&id);
+            })
+            .ok();
+            outcome
+        })
     }
 
     pub fn connections(&self) -> &[ActiveConnection] {
@@ -753,6 +938,7 @@ impl DatabaseStore {
                 cx.notify();
                 if now_connected {
                     this.refresh_databases(id, cx).detach_and_log_err(cx);
+                    this.prefetch_full_schema(id, cx).detach_and_log_err(cx);
                 }
             })
             .ok();
@@ -1052,7 +1238,10 @@ impl DatabaseStore {
         if self.ddl_cache.remove(&id).is_some() {
             self.persist_ddl_cache(cx);
         }
-        self.refresh_databases(id, cx)
+        if self.schema_cache.remove(&id).is_some() {
+            self.persist_schema_cache(cx);
+        }
+        self.prefetch_full_schema(id, cx)
     }
 
     /// Folds every connection's schema by clearing the expanded database/table
@@ -1452,6 +1641,25 @@ fn load_ddl_cache_from_disk() -> HashMap<ConnectionId, DdlCache> {
 fn save_ddl_cache_to_disk(cache: &HashMap<ConnectionId, DdlCache>) -> Result<()> {
     let json = serde_json::to_vec_pretty(cache)?;
     std::fs::write(ddl_cache_file_path(), json)?;
+    Ok(())
+}
+
+fn schema_cache_file_path() -> std::path::PathBuf {
+    paths::config_dir().join(SCHEMA_CACHE_FILE)
+}
+
+/// Loads the persisted schema cache, returning an empty map when the file is
+/// missing or unreadable so a corrupt cache never blocks startup.
+fn load_schema_cache_from_disk() -> HashMap<ConnectionId, SchemaCache> {
+    let Ok(bytes) = std::fs::read(schema_cache_file_path()) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_schema_cache_to_disk(cache: &HashMap<ConnectionId, SchemaCache>) -> Result<()> {
+    let json = serde_json::to_vec_pretty(cache)?;
+    std::fs::write(schema_cache_file_path(), json)?;
     Ok(())
 }
 
@@ -1944,6 +2152,87 @@ mod tests {
             assert!(conn.expanded_databases.is_empty());
             assert!(conn.expanded_tables.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn prefetch_full_schema_populates_index(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(SchemaMockProvider), cx);
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
+            assert!(conn.databases.is_some(), "databases indexed");
+            assert_eq!(
+                conn.expanded_databases.get("shop").map(|t| t.len()),
+                Some(1),
+                "tables indexed for every database"
+            );
+            assert!(
+                conn.expanded_tables
+                    .contains_key(&("shop".to_string(), "users".to_string())),
+                "columns indexed for the primary database"
+            );
+            // Prefetch must not expand the tree.
+            assert!(conn.expanded_database_set.is_empty());
+            assert!(conn.expanded_table_set.is_empty());
+        });
+    }
+
+    #[test]
+    fn schema_cache_round_trips() {
+        let id = ConnectionConfig::default().id;
+        let mut cache: HashMap<ConnectionId, SchemaCache> = HashMap::new();
+        let entry = cache.entry(id).or_default();
+        entry.databases.push(DatabaseInfo {
+            name: "shop".into(),
+        });
+        entry.tables.insert(
+            "shop".into(),
+            vec![TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }],
+        );
+        entry.columns.entry("shop".into()).or_default().insert(
+            "users".into(),
+            vec![ColumnInfo {
+                name: "id".into(),
+                data_type: "int".into(),
+                is_nullable: false,
+                column_key: Some("PRI".into()),
+                default_value: None,
+                extra: String::new(),
+            }],
+        );
+
+        let bytes = serde_json::to_vec(&cache).expect("serialize");
+        let restored: HashMap<ConnectionId, SchemaCache> =
+            serde_json::from_slice(&bytes).expect("deserialize");
+        let snapshot = restored.get(&id).expect("connection entry");
+        assert_eq!(snapshot.databases.first().map(|d| d.name.as_str()), Some("shop"));
+        assert_eq!(
+            snapshot.tables.get("shop").and_then(|t| t.first()).map(|t| t.name.as_str()),
+            Some("users")
+        );
+        assert_eq!(
+            snapshot
+                .columns
+                .get("shop")
+                .and_then(|t| t.get("users"))
+                .and_then(|c| c.first())
+                .map(|c| c.name.as_str()),
+            Some("id")
+        );
     }
 
     struct CliMockProvider;

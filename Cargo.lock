@@ -4967,6 +4967,7 @@ dependencies = [
  "gpui",
  "icons",
  "language",
+ "log",
  "menu",
  "multi_buffer",
  "paths",
