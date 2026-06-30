@@ -2244,7 +2244,7 @@ impl DatabasePanel {
             .id(ElementId::from(SharedString::from(format!(
                 "folder-row-{folder_id}"
             ))))
-            .w_full()
+            .min_w_full()
             .items_center()
             .gap_1()
             .py_1()
@@ -3414,6 +3414,7 @@ impl DatabasePanel {
                     .id(ElementId::from(SharedString::from(format!("conn-header-{}", id))))
                     .flex()
                     .flex_row()
+                    .min_w_full()
                     .items_center()
                     .gap_1()
                     .pr_2()
@@ -3506,11 +3507,11 @@ impl DatabasePanel {
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
-                            .overflow_hidden()
+                            .flex_none()
                             .child(Label::new(label).size(LabelSize::Small))
                             .child(Label::new(driver_label).size(LabelSize::XSmall).color(Color::Muted)),
                     )
+                    .child(div().flex_1())
                     .child(
                         IconButton::new(SharedString::from(format!("new-query-{}", id)), IconName::File)
                             .icon_size(IconSize::XSmall)
