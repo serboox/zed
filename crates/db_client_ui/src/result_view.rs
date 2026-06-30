@@ -17,11 +17,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ui::{
-    Button, ButtonCommon, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Icon, IconButton,
-    IconName, IconSize, Label, LabelSize, PopoverMenu, ScrollableHandle, Tooltip, prelude::*,
-    right_click_menu,
+    Button, ButtonCommon, ButtonStyle, Checkbox, Color, CommonAnimationExt, ContextMenu, Divider,
+    Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu, ScrollableHandle, Tooltip,
+    prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
+
+use crate::widgets::popup_surface;
 use workspace::{Item, Workspace};
 
 /// Rows fetched per network round-trip while the result grid fills (chunked
@@ -4122,7 +4124,7 @@ impl ResultView {
         });
 
         Some(
-            div()
+            popup_surface(cx)
                 .id("query-history-popup")
                 .debug_selector(|| "QUERY_HISTORY_POPUP".to_string())
                 .absolute()
@@ -4130,11 +4132,6 @@ impl ResultView {
                 .left_0()
                 .flex()
                 .flex_col()
-                .bg(cx.theme().colors().surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .rounded_md()
-                .shadow_md()
                 .min_w(px(360.0))
                 .max_h(px(360.0))
                 .when_some(search_box, |el, box_| el.child(box_))
@@ -4328,25 +4325,43 @@ impl ResultView {
     }
 
     fn render_empty_state(&self) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
             .size_full()
             .items_center()
             .justify_center()
+            .gap_1()
             .child(
-                Label::new("No results")
+                Icon::new(IconName::DatabaseZap)
+                    .size(IconSize::Medium)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Run a query to see rows here")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
     }
 
     fn render_error(&self, error: &str) -> impl IntoElement {
-        div().p_4().child(
-            Label::new(error.to_string())
-                .size(LabelSize::Small)
-                .color(Color::Error),
-        )
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(Icon::new(IconName::Warning).color(Color::Error))
+            .child(
+                div()
+                    .id("query-error")
+                    .max_w(px(560.))
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .child(
+                        Label::new(error.to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    ),
+            )
     }
 
     // Builds ONE grid row (by absolute index), horizontally virtualized: only the
@@ -4366,6 +4381,7 @@ impl ResultView {
         has_table_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let modified_border = cx.theme().status().modified;
         // Bounds-check only; actual cell access goes through self.result inside closures.
         let Some(_row) = self
             .result
@@ -4508,7 +4524,7 @@ impl ResultView {
                 .when(is_modified && !is_selected && !is_find_match, |this| {
                     this.bg(modified_bg)
                         .border_l(px(2.))
-                        .border_color(gpui::rgb(0xD97706))
+                        .border_color(modified_border)
                 })
                 .when(is_selected, |this| this.bg(selection_bg))
                 .when(is_deleted, |this| this.bg(deleted_bg))
@@ -5241,7 +5257,7 @@ impl ResultView {
                             ),
                     )
                     .when(has_selected_cell, |el| {
-                        el.child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                        el.child(Divider::vertical())
                         .when(selected_col_nullable, |el| {
                             el.child(
                                 Button::new("set-null", "Set NULL")
@@ -5264,7 +5280,7 @@ impl ResultView {
                         })
                     })
                     .when(pending_count > 0, |el| {
-                        el.child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                        el.child(Divider::vertical())
                         .child(
                             Button::new("submit-edits", "Submit")
                                 .style(ButtonStyle::Filled)
@@ -5291,7 +5307,7 @@ impl ResultView {
                                 })),
                         )
                     })
-                    .child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                    .child(Divider::vertical())
                     .child(
                         Button::new("transaction-mode", transaction_mode.label())
                             .style(ButtonStyle::Subtle)
@@ -5324,7 +5340,7 @@ impl ResultView {
                                 })),
                         )
                     })
-                    .child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                    .child(Divider::vertical())
                     .child(
                         IconButton::new("toggle-local-filters", IconName::Filter)
                             .icon_size(IconSize::Small)
@@ -5343,7 +5359,7 @@ impl ResultView {
                                 this.toggle_column_list(cx);
                             })),
                     )
-                    .child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                    .child(Divider::vertical())
                     .child(
                         PopoverMenu::new("view-dropdown")
                             .menu(move |window, cx| {
@@ -5374,7 +5390,7 @@ impl ResultView {
                                 Tooltip::text("Panels and inspectors"),
                             ),
                     )
-                    .child(div().h(px(16.)).w(px(1.)).bg(cx.theme().colors().border_variant).flex_none())
+                    .child(Divider::vertical())
                     .child({
                         PopoverMenu::new("export-dropdown")
                             .menu(move |window, cx| {
@@ -6301,7 +6317,6 @@ impl ResultView {
             .into_any_element()
     }
 
-    // ---------- value editor panel -------------------------------------------
 
     fn selected_cell_full_value(&self) -> Option<String> {
         let (abs_idx, col_idx) = self.selected_cell?;
@@ -6654,10 +6669,8 @@ impl ResultView {
                 .top(px(top))
                 .w(px(popup_width))
                 .h(px(popup_height))
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().surface_background)
-                .shadow_md()
+                .elevation_2(cx)
+                .occlude()
                 .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
                     cx.stop_propagation();
                 }))
@@ -6690,7 +6703,7 @@ impl ResultView {
                         })
                         .when(editable, |row| {
                             row.child(
-                                Button::new("value-editor-save", "Save")
+                                Button::new("value-editor-save", "Submit")
                                     .style(ButtonStyle::Filled)
                                     .label_size(LabelSize::Small)
                                     .tooltip(Tooltip::text("Apply to pending edits (Ctrl+Enter)"))
@@ -6816,7 +6829,6 @@ impl ResultView {
         )
     }
 
-    // ---------- record view panel ---------------------------------------------
 
     fn record_view_display_idx(&self) -> Option<usize> {
         // Clamp to the filtered display order so changing filters never leaves
@@ -7072,7 +7084,6 @@ impl ResultView {
         cx.notify();
     }
 
-    // ---------- find-on-page --------------------------------------------------
 
     fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_editor.is_none() {
@@ -7356,18 +7367,13 @@ impl ResultView {
             .collect();
 
         Some(
-            div()
+            popup_surface(cx)
                 .id("pending-preview-popup")
                 .absolute()
                 .top_8()
                 .right_2()
                 .w(px(520.0))
                 .max_h(px(400.0))
-                .bg(cx.theme().colors().elevated_surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .rounded_md()
-                .shadow_md()
                 .child(
                     h_flex()
                         .px_2()
@@ -7419,7 +7425,6 @@ impl ResultView {
         )
     }
 
-    // ---------- per-column local filters ------------------------------------
 
     fn recompute_local_filter(&mut self, cx: &mut Context<Self>) {
         let num_cols = self.result.as_ref().map(|r| r.columns.len()).unwrap_or(0);
@@ -7519,7 +7524,6 @@ impl ResultView {
         )
     }
 
-    // ---------- column visibility -------------------------------------------
 
     fn toggle_column_list(&mut self, cx: &mut Context<Self>) {
         self.column_list_visible = !self.column_list_visible;
@@ -7548,49 +7552,28 @@ impl ResultView {
             let name = col_name.clone();
             items.push(
                 div()
-                    .id(ElementId::from(SharedString::from(format!(
-                        "col-vis-{col_idx}"
-                    ))))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
                     .px_2()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_column_visibility(col_idx, cx);
-                    }))
+                    .py_0p5()
                     .child(
-                        Icon::new(if is_visible {
-                            IconName::Check
-                        } else {
-                            IconName::Dash
-                        })
-                        .size(IconSize::Small)
-                        .color(if is_visible {
-                            Color::Accent
-                        } else {
-                            Color::Muted
-                        }),
+                        Checkbox::new(
+                            ElementId::from(SharedString::from(format!("col-vis-{col_idx}"))),
+                            is_visible.into(),
+                        )
+                        .label(name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_column_visibility(col_idx, cx);
+                        })),
                     )
-                    .child(Label::new(name).size(LabelSize::Small))
                     .into_any_element(),
             );
         }
 
         Some(
-            div()
+            popup_surface(cx)
                 .id("column-list-popup")
                 .absolute()
                 .top_8()
                 .right_0()
-                .bg(cx.theme().colors().surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .rounded_md()
-                .shadow_md()
                 .min_w(px(160.0))
                 .max_h(px(400.0))
                 .overflow_y_scroll()
@@ -7636,29 +7619,14 @@ impl ResultView {
         let headers_on = self.export_headers;
         let transpose_on = self.export_transpose;
 
-        let icon_for = |checked: bool| {
-            Icon::new(if checked {
-                IconName::Check
-            } else {
-                IconName::Dash
-            })
-            .size(IconSize::Small)
-            .color(if checked { Color::Accent } else { Color::Muted })
-        };
-
         Some(
-            div()
+            popup_surface(cx)
                 .id("export-dialog-popup")
                 .debug_selector(|| "EXPORT_DIALOG_POPUP".to_string())
                 .absolute()
                 .top_8()
                 .right_0()
                 .w(px(320.0))
-                .bg(cx.theme().colors().elevated_surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .rounded_md()
-                .shadow_md()
                 .p_3()
                 .child(
                     h_flex()
@@ -7686,68 +7654,33 @@ impl ResultView {
                         .gap_0p5()
                         .mb_2()
                         .child(
-                            h_flex()
-                                .id("export-opt-ddl")
-                                .gap_2()
-                                .items_center()
-                                .px_1()
-                                .py_0p5()
-                                .when(has_table, |row| {
-                                    row.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                                        this.export_add_ddl = !this.export_add_ddl;
-                                        if this.export_add_ddl {
-                                            this.fetch_export_ddl(cx);
-                                        }
-                                        cx.notify();
-                                    }))
-                                })
-                                .child(icon_for(add_ddl))
-                                .child(
-                                    Label::new("Add DDL (CREATE TABLE)")
-                                        .size(LabelSize::Small)
-                                        .color(if has_table {
-                                            Color::Default
-                                        } else {
-                                            Color::Muted
-                                        }),
-                                ),
+                            Checkbox::new("export-opt-ddl", add_ddl.into())
+                                .label("Add DDL (CREATE TABLE)")
+                                .disabled(!has_table)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_add_ddl = !this.export_add_ddl;
+                                    if this.export_add_ddl {
+                                        this.fetch_export_ddl(cx);
+                                    }
+                                    cx.notify();
+                                })),
                         )
                         .child(
-                            h_flex()
-                                .id("export-opt-headers")
-                                .gap_2()
-                                .items_center()
-                                .px_1()
-                                .py_0p5()
-                                .when(headers_enabled, |row| {
-                                    row.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                                        this.export_headers = !this.export_headers;
-                                        cx.notify();
-                                    }))
-                                })
-                                .child(icon_for(headers_on))
-                                .child(Label::new("Column headers").size(LabelSize::Small).color(
-                                    if headers_enabled {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    },
-                                )),
+                            Checkbox::new("export-opt-headers", headers_on.into())
+                                .label("Column headers")
+                                .disabled(!headers_enabled)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_headers = !this.export_headers;
+                                    cx.notify();
+                                })),
                         )
                         .child(
-                            h_flex()
-                                .id("export-opt-transpose")
-                                .gap_2()
-                                .items_center()
-                                .px_1()
-                                .py_0p5()
-                                .cursor_pointer()
+                            Checkbox::new("export-opt-transpose", transpose_on.into())
+                                .label("Transpose")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.export_transpose = !this.export_transpose;
                                     cx.notify();
-                                }))
-                                .child(icon_for(transpose_on))
-                                .child(Label::new("Transpose").size(LabelSize::Small)),
+                                })),
                         ),
                 )
                 .child(
@@ -7849,7 +7782,7 @@ impl ResultView {
         };
 
         Some(
-            div()
+            popup_surface(cx)
                 .id("chart-popup")
                 .debug_selector(|| "CHART_POPUP".to_string())
                 .absolute()
@@ -7857,11 +7790,6 @@ impl ResultView {
                 .left_0()
                 .right_0()
                 .bottom_8()
-                .bg(cx.theme().colors().elevated_surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .rounded_md()
-                .shadow_md()
                 .p_3()
                 .flex()
                 .flex_col()
@@ -8117,11 +8045,8 @@ impl ResultView {
                         .absolute()
                         .left(gpui::px(0.0))
                         .top(gpui::px(0.0))
-                        .bg(cx.theme().colors().surface_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_md()
-                        .shadow_md()
+                        .elevation_2(cx)
+                        .occlude()
                         .min_w(gpui::px(120.0))
                         .children(items),
                 )
