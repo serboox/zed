@@ -11102,6 +11102,69 @@ mod tests {
     }
 
     #[gpui::test]
+    fn single_click_leaves_cell_value_and_data_untouched(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((0, 1)));
+            assert!(
+                view.cell_edit.is_none(),
+                "a plain single click must not open the inline editor"
+            );
+            assert!(
+                !view.value_editor_open,
+                "a plain single click on a short value must not open the value editor popup"
+            );
+            assert_eq!(
+                view.result.as_ref().unwrap().rows[0][1].as_deref(),
+                Some("Alice"),
+                "the underlying cell data must be unchanged by a single click"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_keeps_cloned_row_cell_text(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            view.clone_row_after(0, 0, cx);
+        });
+        draw_result_view(window, &mut cx);
+        let cell_center = debug_center(&mut cx, "ADDED_CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx))
+                .unwrap_or_default();
+            assert_eq!(
+                text, "Alice",
+                "double-click on a cloned added-row cell must keep its value, not wipe it"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn visual_multiline_cell_click_opens_value_editor_popup(cx: &mut gpui::TestAppContext) {
         let ddl = "line one\n  nested line two\n  nested line three\nfinal line";
         let result = QueryResult {
