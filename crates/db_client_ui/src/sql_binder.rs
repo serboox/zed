@@ -161,12 +161,22 @@ enum TableBinding {
         database: Option<String>,
         table: String,
     },
-    /// A CTE or derived table: its own projected columns, mapped (lowercased
-    /// projected name) to the real source they resolve through to. A
-    /// computed projection (e.g. an aggregate) maps to the first real column
-    /// referenced inside it, mirroring the heuristic scanner's fallback.
+    /// A CTE or derived table.
     Derived {
+        /// Its own projected columns, mapped (lowercased projected name) to
+        /// the real source they resolve through to, for navigation's
+        /// pass-through. A computed projection (e.g. an aggregate) maps to
+        /// the first real column referenced inside it, mirroring the
+        /// heuristic scanner's fallback; a projection with no traceable
+        /// source at all (a bare unqualified identifier, a literal) is
+        /// absent here even though it may still be a real, referenceable
+        /// name -- see `names`.
         projections: HashMap<String, (Option<String>, String, String)>,
+        /// Every name this alias actually exposes -- what a real query can
+        /// reference through it -- regardless of whether navigation could
+        /// trace it to a real source. Completion needs this full list;
+        /// navigation only ever consults `projections`.
+        names: Vec<String>,
     },
 }
 
@@ -246,10 +256,10 @@ fn object_name_click(name: &ObjectName, target: Location) -> Option<ObjectNameHi
 fn bind_ctes(with: &With, ctx: &BindCtx) -> HashMap<String, TableBinding> {
     let mut ctes = HashMap::default();
     for cte in &with.cte_tables {
-        let projections = select_projections(&cte.query, &ctes, ctx);
+        let (projections, names) = select_projections(&cte.query, &ctes, ctx);
         ctes.insert(
             cte.alias.name.value.to_ascii_lowercase(),
-            TableBinding::Derived { projections },
+            TableBinding::Derived { projections, names },
         );
     }
     ctes
@@ -503,42 +513,39 @@ fn collect_table_binding(
         }
         TableFactor::Derived { subquery, alias, .. } => {
             let alias = alias.as_ref()?;
-            let projections = select_projections(subquery, ctes, ctx);
+            let (projections, names) = select_projections(subquery, ctes, ctx);
             Some((
                 alias.name.value.to_ascii_lowercase(),
-                TableBinding::Derived { projections },
+                TableBinding::Derived { projections, names },
             ))
         }
         _ => None,
     }
 }
 
-/// Maps each of `query`'s own projected columns (lowercased) to the real
-/// source it resolves through to, using only `query`'s own FROM/JOIN tables.
-/// A projection with no identifiable source column (a literal, `*`, or a
-/// pass-through of another derived table one level further down) is skipped
-/// rather than guessed, matching the heuristic scanner's own convention.
+/// Computes both views of `query`'s own SELECT list: a map from each
+/// projected column (lowercased) to the real source it resolves through to
+/// -- for navigation's pass-through, using only `query`'s own FROM/JOIN
+/// tables and skipping anything with no identifiable source column (a
+/// literal, `*`, or a pass-through of another derived table one level
+/// further down), matching the heuristic scanner's own convention -- and the
+/// full list of every name the projection actually exposes, for completion,
+/// which has no such requirement: a bare unqualified column or an aliased
+/// computed expression is still a real, referenceable name even though
+/// navigation has nothing to trace it to.
 fn select_projections(
     query: &Query,
     ctes: &HashMap<String, TableBinding>,
     ctx: &BindCtx,
-) -> HashMap<String, (Option<String>, String, String)> {
+) -> (HashMap<String, (Option<String>, String, String)>, Vec<String>) {
     let mut projections = HashMap::default();
+    let mut names = Vec::new();
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return projections;
+        return (projections, names);
     };
 
     let mut tables: HashMap<String, TableBinding> = HashMap::default();
-    for table_with_joins in &select.from {
-        if let Some((key, binding)) = collect_table_binding(&table_with_joins.relation, ctes, ctx) {
-            tables.insert(key, binding);
-        }
-        for join in &table_with_joins.joins {
-            if let Some((key, binding)) = collect_table_binding(&join.relation, ctes, ctx) {
-                tables.insert(key, binding);
-            }
-        }
-    }
+    collect_tables_into(&select.from, ctes, ctx, &mut tables);
 
     for item in &select.projection {
         let (expr, explicit_name) = match item {
@@ -547,6 +554,11 @@ fn select_projections(
             _ => (None, None),
         };
         let Some(expr) = expr else { continue };
+
+        if let Some(name) = explicit_name.clone().or_else(|| bare_identifier_name(expr)) {
+            names.push(name);
+        }
+
         let Some((qualifier, column)) = first_qualified_reference(expr) else {
             continue;
         };
@@ -561,7 +573,19 @@ fn select_projections(
             (database.clone(), table.clone(), column),
         );
     }
-    projections
+    (projections, names)
+}
+
+/// The referenceable name of a bare (unaliased) projection expression: the
+/// identifier itself for `a`, or the last segment for `t.a` -- a computed
+/// expression with no alias (`CONCAT(a, b)`) has no name an outer query could
+/// reference, so it yields `None`.
+fn bare_identifier_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        _ => None,
+    }
 }
 
 /// The first `qualifier.column` reference found anywhere inside `expr`. For a
@@ -709,7 +733,7 @@ fn resolve_column(
                     column: column.to_string(),
                     span,
                 }),
-                TableBinding::Derived { projections } => {
+                TableBinding::Derived { projections, .. } => {
                     let (database, table, real_column) =
                         projections.get(&column.to_ascii_lowercase())?;
                     Some(NavigationTarget::Column {
@@ -740,7 +764,7 @@ fn resolve_column(
                             }
                         }
                     }
-                    TableBinding::Derived { projections } => {
+                    TableBinding::Derived { projections, .. } => {
                         if let Some((database, table, real_column)) =
                             projections.get(&column.to_ascii_lowercase())
                         {
@@ -1001,6 +1025,303 @@ fn bind_delete(delete: &Delete, target: Location, ctx: &BindCtx) -> Option<Navig
         }
     }
     None
+}
+
+/// What a completion-time scope lookup exposes for one alias: either a real
+/// table (columns come from the schema cache, keyed by `table`) or a
+/// CTE/derived table (columns are exactly its own projected/aliased names --
+/// what a real query can actually reference through that alias -- unlike
+/// navigation's pass-through to the underlying real column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScopeBinding {
+    Real {
+        database: Option<String>,
+        table: String,
+    },
+    Derived {
+        columns: Vec<String>,
+    },
+}
+
+/// A [`SchemaLookup`] that answers every question with "no" -- scope
+/// collection (unlike navigation's bare-column disambiguation) never needs to
+/// check the schema cache, but the collection helpers it reuses require a
+/// [`BindCtx`] by signature.
+struct NoSchema;
+
+impl SchemaLookup for NoSchema {
+    fn table_has_column(&self, _database: &str, _table: &str, _column: &str) -> bool {
+        false
+    }
+}
+
+/// Parses the statement under `cursor_offset` and returns every table/alias
+/// binding visible at that position -- the innermost `SELECT`/`UPDATE`/
+/// `DELETE`/`INSERT...SELECT` scope containing the cursor, walking through
+/// CTEs and derived-table subqueries the same way navigation does. Returns
+/// `None` when the statement doesn't fully parse, signalling the caller to
+/// fall back to the heuristic scanner.
+pub(crate) fn scope_bindings_at(
+    text: &str,
+    driver: DatabaseDriver,
+    cursor_offset: usize,
+) -> Option<Vec<(String, ScopeBinding)>> {
+    let (statement, parsed_range) =
+        sql_ast::try_parse_statement_at_with_span(text, driver, cursor_offset)?;
+    let statement_text = text.get(parsed_range.clone())?;
+    let local_offset = cursor_offset
+        .saturating_sub(parsed_range.start)
+        .min(statement_text.len());
+    let target = location_for_offset(statement_text, local_offset);
+    let ctx = BindCtx {
+        schema: &NoSchema,
+        default_database: None,
+    };
+    let local_tables = scope_tables_in_statement(&statement, target, &ctx)?;
+    Some(
+        local_tables
+            .into_iter()
+            .map(|(alias, binding)| (alias, scope_binding_from(binding)))
+            .collect(),
+    )
+}
+
+fn scope_binding_from(binding: TableBinding) -> ScopeBinding {
+    match binding {
+        TableBinding::Real { database, table } => ScopeBinding::Real { database, table },
+        TableBinding::Derived { names, .. } => {
+            let mut columns = names;
+            columns.sort();
+            columns.dedup();
+            ScopeBinding::Derived { columns }
+        }
+    }
+}
+
+/// Collects every table/join relation in `tables` into `out`, without
+/// checking whether `target` lands on any of them -- the pure-collection
+/// counterpart to [`bind_tables`], which stops early on a click hit. Shared
+/// by [`select_projections`] and the scope-lookup functions below, both of
+/// which need "every table this clause makes visible" rather than a specific
+/// click resolution.
+fn collect_tables_into(
+    tables: &[TableWithJoins],
+    ctes: &HashMap<String, TableBinding>,
+    ctx: &BindCtx,
+    out: &mut HashMap<String, TableBinding>,
+) {
+    for table_with_joins in tables {
+        if let Some((key, binding)) = collect_table_binding(&table_with_joins.relation, ctes, ctx) {
+            out.insert(key, binding);
+        }
+        for join in &table_with_joins.joins {
+            if let Some((key, binding)) = collect_table_binding(&join.relation, ctes, ctx) {
+                out.insert(key, binding);
+            }
+        }
+    }
+}
+
+/// The innermost scope's table bindings for whichever statement shape
+/// contains `target`. `INSERT`'s own target-table/column-list scope isn't
+/// returned here (a fixed single table has no "completion scope" of its own
+/// beyond what the heuristic already offers); only its trailing `SELECT`
+/// body, when the cursor is inside it, is.
+fn scope_tables_in_statement(
+    statement: &Statement,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    match statement {
+        Statement::Query(query) => scope_tables_in_query(query, &HashMap::default(), target, ctx),
+        Statement::Insert(insert) => {
+            let source = insert.source.as_ref()?;
+            if span_contains(source.span(), target) {
+                scope_tables_in_query(source, &HashMap::default(), target, ctx)
+            } else {
+                None
+            }
+        }
+        Statement::Update(update) => {
+            let ctes = HashMap::default();
+            let mut local_tables = HashMap::default();
+            collect_tables_into(std::slice::from_ref(&update.table), &ctes, ctx, &mut local_tables);
+            if let Some(from) = &update.from {
+                let tables = match from {
+                    UpdateTableFromKind::BeforeSet(tables)
+                    | UpdateTableFromKind::AfterSet(tables) => tables,
+                };
+                collect_tables_into(tables, &ctes, ctx, &mut local_tables);
+            }
+            Some(local_tables)
+        }
+        Statement::Delete(delete) => {
+            let ctes = HashMap::default();
+            let mut local_tables = HashMap::default();
+            let from_tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            collect_tables_into(from_tables, &ctes, ctx, &mut local_tables);
+            if let Some(using) = &delete.using {
+                collect_tables_into(using, &ctes, ctx, &mut local_tables);
+            }
+            Some(local_tables)
+        }
+        _ => None,
+    }
+}
+
+fn scope_tables_in_query(
+    query: &Query,
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    let local_ctes = match &query.with {
+        Some(with) => {
+            let mut merged = ctes.clone();
+            merged.extend(bind_ctes(with, ctx));
+            for cte in &with.cte_tables {
+                if span_contains(cte.query.span(), target) {
+                    return scope_tables_in_query(&cte.query, &merged, target, ctx);
+                }
+            }
+            merged
+        }
+        None => ctes.clone(),
+    };
+    scope_tables_in_set_expr(&query.body, &local_ctes, target, ctx)
+}
+
+fn scope_tables_in_set_expr(
+    set_expr: &SetExpr,
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    match set_expr {
+        SetExpr::Select(select) => scope_tables_in_select(select, ctes, target, ctx),
+        SetExpr::Query(query) => scope_tables_in_query(query, ctes, target, ctx),
+        SetExpr::SetOperation { left, right, .. } => {
+            scope_tables_in_set_expr(left, ctes, target, ctx)
+                .or_else(|| scope_tables_in_set_expr(right, ctes, target, ctx))
+        }
+        _ => None,
+    }
+}
+
+/// The innermost scope containing `target`: a deeper `SELECT` embedded in a
+/// derived-table subquery or a `WHERE ... IN (subquery)`-style nested query
+/// wins over this level's own scope, mirroring the same "deepest match wins"
+/// rule navigation's [`resolve_expr_at`]/[`bind_table_factor`] already use.
+/// When no deeper scope contains `target`, this level's own `FROM`/`JOIN`
+/// tables are the answer -- this is what makes the function usable even when
+/// the cursor sits on a not-yet-existing token (an incomplete projection or a
+/// trailing `WHERE `), unlike navigation which requires an actual identifier
+/// to resolve.
+fn scope_tables_in_select(
+    select: &Select,
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    for table_with_joins in &select.from {
+        if let Some(deeper) = scope_tables_in_table_factor(&table_with_joins.relation, ctes, target, ctx)
+        {
+            return Some(deeper);
+        }
+        for join in &table_with_joins.joins {
+            if let Some(deeper) = scope_tables_in_table_factor(&join.relation, ctes, target, ctx) {
+                return Some(deeper);
+            }
+        }
+    }
+
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) => Some(expr),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            SelectItem::ExprWithAliases { expr, .. } => Some(expr),
+            _ => None,
+        };
+        if let Some(expr) = expr {
+            if let Some(deeper) = scope_tables_in_expr(expr, ctes, target, ctx) {
+                return Some(deeper);
+            }
+        }
+    }
+    if let Some(selection) = &select.selection {
+        if let Some(deeper) = scope_tables_in_expr(selection, ctes, target, ctx) {
+            return Some(deeper);
+        }
+    }
+    if let Some(having) = &select.having {
+        if let Some(deeper) = scope_tables_in_expr(having, ctes, target, ctx) {
+            return Some(deeper);
+        }
+    }
+    for table_with_joins in &select.from {
+        for join in &table_with_joins.joins {
+            if let Some(constraint_expr) = join_constraint_expr(&join.join_operator) {
+                if let Some(deeper) = scope_tables_in_expr(constraint_expr, ctes, target, ctx) {
+                    return Some(deeper);
+                }
+            }
+        }
+    }
+
+    let mut local_tables = HashMap::default();
+    collect_tables_into(&select.from, ctes, ctx, &mut local_tables);
+    Some(local_tables)
+}
+
+fn scope_tables_in_table_factor(
+    factor: &TableFactor,
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    match factor {
+        TableFactor::Derived { subquery, .. } => {
+            if span_contains(subquery.span(), target) {
+                scope_tables_in_query(subquery, ctes, target, ctx)
+            } else {
+                None
+            }
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            if let Some(deeper) =
+                scope_tables_in_table_factor(&table_with_joins.relation, ctes, target, ctx)
+            {
+                return Some(deeper);
+            }
+            for join in &table_with_joins.joins {
+                if let Some(deeper) = scope_tables_in_table_factor(&join.relation, ctes, target, ctx) {
+                    return Some(deeper);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn scope_tables_in_expr(
+    expr: &Expr,
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<HashMap<String, TableBinding>> {
+    let mut locator = ExprLocator {
+        target,
+        nested_query: None,
+        column_hit: None,
+    };
+    let _ = expr.visit(&mut locator);
+    let nested = locator.nested_query?;
+    scope_tables_in_query(&nested, ctes, target, ctx)
 }
 
 #[cfg(test)]
@@ -1536,6 +1857,109 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
             }
             other => panic!("expected a column target, got {other:?}"),
         }
+    }
+
+    fn scoped(text: &str, offset: usize) -> HashMap<String, ScopeBinding> {
+        scope_bindings_at(text, DatabaseDriver::MySQL, offset)
+            .expect("statement parses")
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn scope_bindings_returns_the_single_from_table() {
+        let text = "SELECT 1 FROM db.table t WHERE 1 = 1";
+        let offset = text.find("FROM").expect("marker present");
+        let bindings = scoped(text, offset);
+        assert_eq!(
+            bindings.get("t"),
+            Some(&ScopeBinding::Real {
+                database: Some("db".to_string()),
+                table: "table".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn scope_bindings_returns_both_sides_of_a_join() {
+        let text = "SELECT 1 FROM db.orders o JOIN db.customers c ON o.customer_id = c.id";
+        let offset = text.find("FROM").expect("marker present");
+        let bindings = scoped(text, offset);
+        assert_eq!(
+            bindings.get("o"),
+            Some(&ScopeBinding::Real {
+                database: Some("db".to_string()),
+                table: "orders".to_string(),
+            })
+        );
+        assert_eq!(
+            bindings.get("c"),
+            Some(&ScopeBinding::Real {
+                database: Some("db".to_string()),
+                table: "customers".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn scope_bindings_expose_a_derived_tables_own_projected_names_not_the_real_columns() {
+        // `q`'s own projection is `a` (a plain pass-through) and `c` (an
+        // alias for `b`) -- a completion offered through `q.` must be exactly
+        // these two names, never `real`'s raw column set.
+        let text = "SELECT q.a FROM (SELECT a, b AS c FROM real_table) q";
+        let offset = text.find("q.a").expect("marker present") + "q.".len();
+        let bindings = scoped(text, offset);
+        match bindings.get("q") {
+            Some(ScopeBinding::Derived { columns }) => {
+                assert_eq!(columns, &vec!["a".to_string(), "c".to_string()]);
+            }
+            other => panic!("expected a derived binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_bindings_prefer_the_innermost_subquery_scope() {
+        let text = "SELECT * FROM outer_tbl o WHERE o.id IN (SELECT 1 FROM inner_tbl x)";
+        let offset = text.rfind("FROM").expect("inner marker present");
+        let bindings = scoped(text, offset);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings.get("x"),
+            Some(&ScopeBinding::Real {
+                database: None,
+                table: "inner_tbl".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn scope_bindings_return_none_for_an_incomplete_statement() {
+        // A dangling qualifier dot is not yet valid SQL -- exactly the moment
+        // completion fires right after typing `alias.`. The caller is
+        // expected to fall back to the heuristic scanner in this case.
+        let text = "SELECT * FROM db.orders o WHERE o.";
+        assert!(scope_bindings_at(text, DatabaseDriver::MySQL, text.len()).is_none());
+    }
+
+    #[test]
+    fn scope_bindings_resolve_the_real_production_query_without_a_live_connection() {
+        // `scope_bindings_at` never takes a schema/connection argument at
+        // all -- there is no live-connection object to withhold, which is
+        // itself the proof this path can never require one.
+        let text = "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID) \
+             SELECT qpa.pair_id \
+             FROM (SELECT qca.currency_short_name FROM ec_fmedia.quotes_currency_attr qca) q1 \
+             JOIN ec_fmedia.quotes_pair_attr qpa ON q1.currency_ID = qpa.cur1";
+        let offset = text.find("qpa.pair_id").expect("marker present") + "qpa.".len();
+        let bindings = scoped(text, offset);
+        assert_eq!(
+            bindings.get("qpa"),
+            Some(&ScopeBinding::Real {
+                database: Some("ec_fmedia".to_string()),
+                table: "quotes_pair_attr".to_string(),
+            })
+        );
+        assert!(matches!(bindings.get("q1"), Some(ScopeBinding::Derived { .. })));
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::sql_binder::{self, ScopeBinding};
 use crate::store::DatabaseStore;
 use db_client::schema::TableKind;
 use db_client::{ConnectionId, DatabaseDriver};
@@ -417,6 +418,50 @@ fn parse_context(text_before: &str) -> ParsedContext {
     }
 }
 
+/// The AST binder's answer to "which tables/aliases are visible here" for the
+/// statement containing `cursor_offset`, converted to the same [`TableRef`]
+/// shape [`build_candidates`] already consumes -- so the existing
+/// ranking/filtering logic needs no changes, only where its input tables come
+/// from. A derived-table/CTE alias becomes a `TableRef` whose `name` equals
+/// the alias itself; `extra_columns` carries that alias's own projected
+/// column names, to be injected into the schema snapshot before completion
+/// runs, since there is no real table to look them up from.
+///
+/// Returns `None` when the statement under the cursor doesn't fully parse --
+/// most commonly because it is still being typed, since a dangling qualifier
+/// (`alias.`) with nothing typed after it is not yet valid SQL. The caller
+/// falls back to the heuristic scanner in that case, exactly as navigation
+/// does.
+fn ast_tables_in_scope(
+    full_text: &str,
+    driver: DatabaseDriver,
+    cursor_offset: usize,
+) -> Option<(Vec<TableRef>, HashMap<String, Vec<String>>)> {
+    let bindings = sql_binder::scope_bindings_at(full_text, driver, cursor_offset)?;
+    let mut table_refs = Vec::with_capacity(bindings.len());
+    let mut extra_columns = HashMap::new();
+    for (alias, binding) in bindings {
+        match binding {
+            ScopeBinding::Real { database, table } => {
+                table_refs.push(TableRef {
+                    name: table,
+                    alias: Some(alias),
+                    schema: database,
+                });
+            }
+            ScopeBinding::Derived { columns } => {
+                table_refs.push(TableRef {
+                    name: alias.clone(),
+                    alias: Some(alias.clone()),
+                    schema: None,
+                });
+                extra_columns.insert(alias, columns);
+            }
+        }
+    }
+    Some((table_refs, extra_columns))
+}
+
 /// Resolves a qualifier to the referenced table: an alias maps to its table,
 /// otherwise a direct table-name match maps to itself.
 pub(crate) fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> Option<&'a TableRef> {
@@ -730,13 +775,35 @@ impl CompletionProvider for SqlCompletionProvider {
 
         let text_before = Self::text_before(buffer, buffer_position, cx);
         let replace_range = Self::compute_replace_range(buffer, buffer_position, cx);
-        let context = parse_context(&text_before);
 
         let Some((connection_id, driver, database)) =
             resolve_connection(store.read(cx), self.connection_id)
         else {
             return Task::ready(Ok(vec![]));
         };
+
+        // Try the AST binder first: it scopes tables through subqueries,
+        // derived tables, and CTEs exactly like real SQL rather than by
+        // offset heuristics. It only succeeds when the whole statement fully
+        // parses, which a dangling `alias.` mid-keystroke never does — the
+        // heuristic context below is then what actually drives completion,
+        // not a fallback bolted on as an afterthought.
+        let full_text: String = buffer.read(cx).snapshot().text();
+        let cursor_offset = text_before.len();
+        let heuristic_context = parse_context(&text_before);
+        let (context, extra_columns) =
+            match ast_tables_in_scope(&full_text, driver, cursor_offset) {
+                Some((tables_in_scope, extra_columns)) => (
+                    ParsedContext {
+                        qualifier: heuristic_context.qualifier,
+                        kind: heuristic_context.kind,
+                        tables_in_scope,
+                        cte_names: heuristic_context.cte_names,
+                    },
+                    extra_columns,
+                ),
+                None => (heuristic_context, HashMap::new()),
+            };
 
         let icon_colors = {
             let colors = cx.theme().colors();
@@ -771,7 +838,7 @@ impl CompletionProvider for SqlCompletionProvider {
             None
         };
 
-        let snapshot =
+        let mut snapshot =
             read_schema_snapshot(store.read(cx), connection_id, &database, qualifier_schema);
         if snapshot.tables.is_empty()
             && snapshot.databases.is_empty()
@@ -780,6 +847,16 @@ impl CompletionProvider for SqlCompletionProvider {
             store
                 .update(cx, |store, cx| store.prefetch_full_schema(connection_id, cx))
                 .detach();
+        }
+        // A derived-table/CTE alias has no real table to look up columns
+        // from, so its own projected names are injected as a synthetic
+        // entry keyed by the alias — the data type is unknowable for a
+        // computed projection, so it is left blank rather than guessed.
+        for (alias, columns) in extra_columns {
+            snapshot.columns_by_table.insert(
+                alias.to_lowercase(),
+                columns.into_iter().map(|name| (name, String::new())).collect(),
+            );
         }
 
         let completions = build_candidates(&context, &snapshot, driver)
@@ -1078,5 +1155,93 @@ mod tests {
         assert!(icon_for(ItemKind::View).is_some());
         assert!(icon_for(ItemKind::Schema).is_some());
         assert!(icon_for(ItemKind::Keyword).is_none());
+    }
+
+    #[test]
+    fn ast_scope_resolves_a_real_table_through_a_join() {
+        let text = "SELECT o.id FROM db.orders o JOIN db.customers c ON o.customer_id = c.id";
+        let offset = text.rfind("o.customer_id").expect("marker present") + "o.".len();
+        let (tables, extra_columns) =
+            ast_tables_in_scope(text, DatabaseDriver::MySQL, offset).expect("statement parses");
+        assert!(tables.contains(&TableRef {
+            name: "orders".to_string(),
+            alias: Some("o".to_string()),
+            schema: Some("db".to_string()),
+        }));
+        assert!(tables.contains(&TableRef {
+            name: "customers".to_string(),
+            alias: Some("c".to_string()),
+            schema: Some("db".to_string()),
+        }));
+        assert!(extra_columns.is_empty());
+    }
+
+    #[test]
+    fn ast_scope_exposes_a_derived_tables_own_projected_names_as_a_virtual_table() {
+        let text = "SELECT q.a FROM (SELECT a, b AS c FROM real_table) q WHERE 1 = 1";
+        let offset = text.find("q.a").expect("marker present") + "q.".len();
+        let (tables, extra_columns) =
+            ast_tables_in_scope(text, DatabaseDriver::MySQL, offset).expect("statement parses");
+        assert!(tables.contains(&TableRef {
+            name: "q".to_string(),
+            alias: Some("q".to_string()),
+            schema: None,
+        }));
+        assert_eq!(extra_columns.get("q"), Some(&vec!["a".to_string(), "c".to_string()]));
+    }
+
+    #[test]
+    fn ast_scope_end_to_end_offers_a_derived_tables_columns_via_build_candidates() {
+        // Proves the whole pipeline a real completion request drives: AST
+        // scope resolution feeds `TableRef`s into the same `build_candidates`
+        // the heuristic path already uses, and the derived table's projected
+        // names are injected into the schema snapshot exactly like
+        // `completions()` does before calling it.
+        let text = "SELECT q.a FROM (SELECT a, b AS c FROM real_table) q";
+        let offset = text.find("q.a").expect("marker present") + "q.".len();
+        let (tables_in_scope, extra_columns) =
+            ast_tables_in_scope(text, DatabaseDriver::MySQL, offset).expect("statement parses");
+        let mut schema = sample_schema();
+        for (alias, columns) in extra_columns {
+            schema.columns_by_table.insert(
+                alias.to_lowercase(),
+                columns.into_iter().map(|name| (name, String::new())).collect(),
+            );
+        }
+        let context = ParsedContext {
+            qualifier: Some("q".to_string()),
+            kind: ContextKind::Columns,
+            tables_in_scope,
+            cte_names: Vec::new(),
+        };
+        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
+        assert!(items.iter().any(|i| i.text == "a" && i.kind == ItemKind::Column));
+        assert!(items.iter().any(|i| i.text == "c" && i.kind == ItemKind::Column));
+    }
+
+    #[test]
+    fn ast_scope_returns_none_for_a_statement_still_being_typed() {
+        // The exact moment completion fires after typing `alias.` -- nothing
+        // follows the dot yet, so the whole statement does not parse. The
+        // heuristic scanner (unchanged, exercised by every other test in this
+        // module) is the fallback for this case, not this function.
+        let text = "SELECT * FROM db.orders o WHERE o.";
+        assert!(ast_tables_in_scope(text, DatabaseDriver::MySQL, text.len()).is_none());
+        // The pre-existing heuristic path is completely unaffected: it still
+        // resolves the same in-scope table from the same (incomplete) text.
+        let context = parse_context(text);
+        assert_eq!(context.tables_in_scope[0].alias.as_deref(), Some("o"));
+    }
+
+    #[test]
+    fn ast_scope_lookup_never_takes_a_connection_or_store_argument() {
+        // `ast_tables_in_scope` takes only text/driver/offset -- there is no
+        // connection or store parameter to withhold, which is itself the
+        // proof this path can never require a live connection. Completion
+        // reads the already-cached schema snapshot separately, exactly as it
+        // already did before this change.
+        let text = "SELECT o.id FROM db.orders o";
+        let offset = text.find("o.id").expect("marker present") + "o.".len();
+        assert!(ast_tables_in_scope(text, DatabaseDriver::MySQL, offset).is_some());
     }
 }
