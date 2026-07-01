@@ -677,6 +677,15 @@ pub struct ResultView {
     // where they appear in the current display order.
     added_rows: Vec<Vec<CellValue>>,
     added_row_anchors: Vec<AddedRowAnchor>,
+    // Undo/redo stacks over the edit buffer (pending edits, deletes, added rows).
+    // Each entry is the full buffer state before an editing operation; this is
+    // independent of the database and is cleared on Submit/Revert.
+    edit_undo_stack: Vec<EditSnapshot>,
+    edit_redo_stack: Vec<EditSnapshot>,
+    // While true, per-cell writes skip recording their own undo entry. Set by a
+    // multi-cell operation (paste, cut, fill) that records a single entry up front
+    // so the whole operation undoes at once instead of one cell at a time.
+    suppress_edit_undo: bool,
     // Last-read filter text per data column index (empty = no filter).
     local_filters: Vec<String>,
     // Editor widget per column, created lazily when the filter row first opens.
@@ -854,9 +863,20 @@ impl CellValue {
 // One buffered cell change. `original` is the value loaded from the database
 // (so reverting a single cell back to it drops the entry); `new_value` is what
 // the grid shows and what Submit writes.
+#[derive(Clone)]
 struct PendingEdit {
     original: Option<String>,
     new_value: CellValue,
+}
+
+// A full copy of the edit buffer captured before an editing operation, so the
+// operation can be undone/redone without touching the database.
+#[derive(Clone)]
+struct EditSnapshot {
+    pending_edits: std::collections::HashMap<(usize, usize), PendingEdit>,
+    deleted_rows: std::collections::HashSet<usize>,
+    added_rows: Vec<Vec<CellValue>>,
+    added_row_anchors: Vec<AddedRowAnchor>,
 }
 
 // State of an in-progress scrollbar drag. The grab is relative: the content
@@ -935,6 +955,9 @@ impl ResultView {
             deleted_rows: std::collections::HashSet::new(),
             added_rows: Vec::new(),
             added_row_anchors: Vec::new(),
+            edit_undo_stack: Vec::new(),
+            edit_redo_stack: Vec::new(),
+            suppress_edit_undo: false,
             local_filters: Vec::new(),
             local_filter_editors: Vec::new(),
             filtered_display_order: Vec::new(),
@@ -1810,6 +1833,7 @@ impl ResultView {
         self.deleted_rows.clear();
         self.added_rows.clear();
         self.added_row_anchors.clear();
+        self.clear_edit_history();
         self.cell_drag_anchor = None;
         self.suppress_next_cell_click = false;
         self.selected_cell = None;
@@ -2650,13 +2674,8 @@ impl ResultView {
         // Added rows have no loaded value or key: the edit writes straight into
         // the added-row buffer and is submitted as part of the INSERT.
         if let CellEditTarget::Added(added_idx) = target {
-            if let Some(cell) = self
-                .added_rows
-                .get_mut(added_idx)
-                .and_then(|row| row.get_mut(col_idx))
-            {
-                *cell = new_value;
-            }
+            let abs = self.loaded_row_count() + added_idx;
+            self.write_cell_value(abs, col_idx, new_value, cx);
             cx.notify();
             return true;
         }
@@ -2694,6 +2713,7 @@ impl ResultView {
             cx.notify();
             return;
         }
+        self.maybe_record_edit_undo();
         if new_value == CellValue::from_loaded(&original) {
             self.pending_edits.remove(&(abs_idx, col_idx));
             cx.notify();
@@ -2796,13 +2816,8 @@ impl ResultView {
             return;
         };
         let new = toggle_bool_value(cell);
-        if let Some(cell) = self
-            .added_rows
-            .get_mut(added_idx)
-            .and_then(|row| row.get_mut(col_idx))
-        {
-            *cell = new;
-        }
+        let abs = self.loaded_row_count() + added_idx;
+        self.write_cell_value(abs, col_idx, new, cx);
         cx.notify();
     }
 
@@ -2812,13 +2827,8 @@ impl ResultView {
             return;
         };
         if let Some(added_idx) = popup.added_idx {
-            if let Some(cell) = self
-                .added_rows
-                .get_mut(added_idx)
-                .and_then(|row| row.get_mut(popup.col_idx))
-            {
-                *cell = value;
-            }
+            let abs = self.loaded_row_count() + added_idx;
+            self.write_cell_value(abs, popup.col_idx, value, cx);
         } else {
             self.buffer_loaded_cell_value(popup.abs_idx, popup.col_idx, value, cx);
         }
@@ -2845,14 +2855,7 @@ impl ResultView {
 
         let loaded_count = self.loaded_row_count();
         if abs_idx >= loaded_count {
-            let added_idx = abs_idx - loaded_count;
-            if let Some(cell) = self
-                .added_rows
-                .get_mut(added_idx)
-                .and_then(|row| row.get_mut(col_idx))
-            {
-                *cell = value;
-            }
+            self.write_cell_value(abs_idx, col_idx, value, cx);
             self.status_message = None;
             cx.notify();
             return;
@@ -2872,6 +2875,14 @@ impl ResultView {
         let loaded_count = self.loaded_row_count();
         if abs_idx >= loaded_count {
             let added_idx = abs_idx - loaded_count;
+            let changed = self
+                .added_rows
+                .get(added_idx)
+                .and_then(|row| row.get(col_idx))
+                .is_some_and(|cell| *cell != value);
+            if changed {
+                self.maybe_record_edit_undo();
+            }
             if let Some(cell) = self
                 .added_rows
                 .get_mut(added_idx)
@@ -2882,6 +2893,194 @@ impl ResultView {
             return;
         }
         self.buffer_loaded_cell_value(abs_idx, col_idx, value, cx);
+    }
+
+    // The current buffered value of a cell: the pending edit if present, else the
+    // loaded value, else the added-row value. Used as the source for fills.
+    fn current_cell_value(&self, abs_idx: usize, col_idx: usize) -> CellValue {
+        if let Some(value) = self.pending_cell_value(abs_idx, col_idx) {
+            return value.clone();
+        }
+        let loaded_count = self.loaded_row_count();
+        if abs_idx < loaded_count {
+            return CellValue::from_loaded(&self.loaded_cell_value(abs_idx, col_idx));
+        }
+        self.added_rows
+            .get(abs_idx - loaded_count)
+            .and_then(|row| row.get(col_idx))
+            .cloned()
+            .unwrap_or(CellValue::Null)
+    }
+
+    fn edit_snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            pending_edits: self.pending_edits.clone(),
+            deleted_rows: self.deleted_rows.clone(),
+            added_rows: self.added_rows.clone(),
+            added_row_anchors: self.added_row_anchors.clone(),
+        }
+    }
+
+    // Records the buffer state before a mutating edit so it can be undone. Any
+    // pending redo is invalidated, matching the usual undo/redo model.
+    fn record_edit_undo(&mut self) {
+        self.edit_undo_stack.push(self.edit_snapshot());
+        self.edit_redo_stack.clear();
+    }
+
+    // Per-cell undo recording for single-cell writes. A multi-cell operation sets
+    // `suppress_edit_undo` so its one up-front entry covers the whole batch.
+    fn maybe_record_edit_undo(&mut self) {
+        if !self.suppress_edit_undo {
+            self.record_edit_undo();
+        }
+    }
+
+    // Runs a multi-cell edit as one undo unit: records a single snapshot up front,
+    // then suppresses the per-cell recording the inner writes would otherwise do.
+    fn run_edit_batch(
+        &mut self,
+        cx: &mut Context<Self>,
+        body: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        self.record_edit_undo();
+        self.suppress_edit_undo = true;
+        body(self, cx);
+        self.suppress_edit_undo = false;
+    }
+
+    fn restore_edit_snapshot(&mut self, snapshot: EditSnapshot) {
+        self.pending_edits = snapshot.pending_edits;
+        self.deleted_rows = snapshot.deleted_rows;
+        self.added_rows = snapshot.added_rows;
+        self.added_row_anchors = snapshot.added_row_anchors;
+    }
+
+    // Undo/redo of buffered edits (Excel Ctrl+Z / Ctrl+Y). Operates on the local
+    // edit buffer only; nothing is sent to the database until Submit.
+    fn undo_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(previous) = self.edit_undo_stack.pop() else {
+            return;
+        };
+        self.edit_redo_stack.push(self.edit_snapshot());
+        self.restore_edit_snapshot(previous);
+        self.cell_edit = None;
+        self.status_message = None;
+        cx.notify();
+    }
+
+    fn redo_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = self.edit_redo_stack.pop() else {
+            return;
+        };
+        self.edit_undo_stack.push(self.edit_snapshot());
+        self.restore_edit_snapshot(next);
+        self.cell_edit = None;
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Drops the undo/redo history. Called whenever the edit buffer is reset to the
+    // database state (new result, Submit, Revert, Commit, Rollback), since the old
+    // snapshots no longer describe a reachable buffer state.
+    fn clear_edit_history(&mut self) {
+        self.edit_undo_stack.clear();
+        self.edit_redo_stack.clear();
+        self.suppress_edit_undo = false;
+    }
+
+    // Fill down (Ctrl+D): every column of the selection takes the value of its
+    // top cell and copies it down to the rows below. With no range, the active
+    // cell's value fills the cell directly below it.
+    fn fill_down(&mut self, cx: &mut Context<Self>) {
+        if self.table_name.is_none() {
+            self.status_message = Some("Fill needs a table-backed result.".to_string());
+            cx.notify();
+            return;
+        }
+        let (rows, cols) = self.fill_region(true);
+        if rows.len() < 2 || cols.is_empty() {
+            self.status_message = Some("Select a range, or a cell with a row below.".to_string());
+            cx.notify();
+            return;
+        }
+        let top = rows[0];
+        self.run_edit_batch(cx, |this, cx| {
+            for &col in &cols {
+                let value = this.current_cell_value(top, col);
+                for &abs_idx in &rows[1..] {
+                    this.write_cell_value(abs_idx, col, value.clone(), cx);
+                }
+            }
+        });
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Fill right (Ctrl+R): every row of the selection takes the value of its left
+    // cell and copies it across. With no range, the active cell's value fills the
+    // cell to its right.
+    fn fill_right(&mut self, cx: &mut Context<Self>) {
+        if self.table_name.is_none() {
+            self.status_message = Some("Fill needs a table-backed result.".to_string());
+            cx.notify();
+            return;
+        }
+        let (rows, cols) = self.fill_region(false);
+        if cols.len() < 2 || rows.is_empty() {
+            self.status_message =
+                Some("Select a range, or a cell with a column to the right.".to_string());
+            cx.notify();
+            return;
+        }
+        let left = cols[0];
+        self.run_edit_batch(cx, |this, cx| {
+            for &abs_idx in &rows {
+                let value = this.current_cell_value(abs_idx, left);
+                for &col in &cols[1..] {
+                    this.write_cell_value(abs_idx, col, value.clone(), cx);
+                }
+            }
+        });
+        self.status_message = None;
+        cx.notify();
+    }
+
+    // Computes the (display-ordered rows, columns) a fill should cover. A real
+    // selection is used as-is; a lone active cell is grown by one row (down) or
+    // one column (right) so a single Ctrl+D/Ctrl+R still fills the neighbour.
+    fn fill_region(&self, down: bool) -> (Vec<usize>, Vec<usize>) {
+        let Some(result) = self.result.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let has_selection = self.selected_cell_range.is_some() || !self.selected_rows.is_empty();
+        if has_selection {
+            return (
+                self.selected_display_rows_for_copy(),
+                self.selected_columns_for_copy(result),
+            );
+        }
+        let Some((abs_idx, col_idx)) = self.selected_cell else {
+            return (Vec::new(), Vec::new());
+        };
+        if down {
+            let mut rows = vec![abs_idx];
+            if let Some(display_idx) = self.display_idx_of(abs_idx) {
+                if let Some(below) = self.abs_idx_at_display_idx(display_idx + 1) {
+                    rows.push(below);
+                }
+            }
+            (rows, vec![col_idx])
+        } else {
+            let vis_cols = self.visible_columns.clone();
+            let mut cols = vec![col_idx];
+            if let Some(pos) = vis_cols.iter().position(|&c| c == col_idx) {
+                if let Some(&right) = vis_cols.get(pos + 1) {
+                    cols.push(right);
+                }
+            }
+            (vec![abs_idx], cols)
+        }
     }
 
     // Extends the selection from the active cell (the anchor) by moving the far
@@ -2965,39 +3164,54 @@ impl ResultView {
         let col_count = self.result.as_ref().map_or(0, |r| r.columns.len());
 
         // A single copied value fills the whole current selection.
-        if grid.len() == 1 && grid[0].len() == 1 && self.selected_cell_range.is_some() {
-            let value = grid[0][0].clone();
-            let rows = self.selected_display_rows_for_copy();
-            let cols: Vec<usize> = match self.selected_cell_range {
-                Some(((_, a), (_, b))) => {
-                    (a.min(b)..=a.max(b)).filter(|c| *c < col_count).collect()
-                }
-                None => vec![anchor_col],
-            };
-            for abs_idx in rows {
-                for &col in &cols {
-                    self.write_cell_value(abs_idx, col, CellValue::from_text(value.clone()), cx);
-                }
-            }
-            self.status_message = None;
-            cx.notify();
-            return;
-        }
+        let single_value_fill = grid.len() == 1
+            && grid[0].len() == 1
+            && self.selected_cell_range.is_some();
 
-        let Some(anchor_display) = self.display_idx_of(anchor_abs) else {
-            return;
-        };
-        for (row_offset, row) in grid.iter().enumerate() {
-            let Some(target_abs) = self.abs_idx_at_display_idx(anchor_display + row_offset) else {
-                continue;
+        self.run_edit_batch(cx, |this, cx| {
+            if single_value_fill {
+                let value = grid[0][0].clone();
+                let rows = this.selected_display_rows_for_copy();
+                let cols: Vec<usize> = match this.selected_cell_range {
+                    Some(((_, a), (_, b))) => {
+                        (a.min(b)..=a.max(b)).filter(|c| *c < col_count).collect()
+                    }
+                    None => vec![anchor_col],
+                };
+                for abs_idx in rows {
+                    for &col in &cols {
+                        this.write_cell_value(
+                            abs_idx,
+                            col,
+                            CellValue::from_text(value.clone()),
+                            cx,
+                        );
+                    }
+                }
+                return;
+            }
+
+            let Some(anchor_display) = this.display_idx_of(anchor_abs) else {
+                return;
             };
-            for (col_offset, value) in row.iter().enumerate() {
-                let Some(&col) = vis_cols.get(anchor_vis + col_offset) else {
+            for (row_offset, row) in grid.iter().enumerate() {
+                let Some(target_abs) = this.abs_idx_at_display_idx(anchor_display + row_offset)
+                else {
                     continue;
                 };
-                self.write_cell_value(target_abs, col, CellValue::from_text(value.clone()), cx);
+                for (col_offset, value) in row.iter().enumerate() {
+                    let Some(&col) = vis_cols.get(anchor_vis + col_offset) else {
+                        continue;
+                    };
+                    this.write_cell_value(
+                        target_abs,
+                        col,
+                        CellValue::from_text(value.clone()),
+                        cx,
+                    );
+                }
             }
-        }
+        });
         self.status_message = None;
         cx.notify();
     }
@@ -3021,11 +3235,16 @@ impl ResultView {
         } else {
             Vec::new()
         };
-        for abs_idx in rows {
-            for &col in &cols {
-                self.write_cell_value(abs_idx, col, CellValue::from_text(String::new()), cx);
-            }
+        if rows.is_empty() || cols.is_empty() {
+            return;
         }
+        self.run_edit_batch(cx, |this, cx| {
+            for abs_idx in rows {
+                for &col in &cols {
+                    this.write_cell_value(abs_idx, col, CellValue::from_text(String::new()), cx);
+                }
+            }
+        });
         self.status_message = None;
         cx.notify();
     }
@@ -3105,6 +3324,7 @@ impl ResultView {
             cx.notify();
             return;
         }
+        self.record_edit_undo();
         for abs_idx in loaded_rows {
             if !self.deleted_rows.remove(&abs_idx) {
                 self.deleted_rows.insert(abs_idx);
@@ -3153,6 +3373,7 @@ impl ResultView {
             cx.notify();
             return None;
         };
+        self.record_edit_undo();
         let added_idx = self.added_rows.len();
         self.added_rows.push(vec![CellValue::Null; col_count]);
         self.added_row_anchors.push(
@@ -3223,6 +3444,7 @@ impl ResultView {
             };
             row.clone()
         };
+        self.record_edit_undo();
         let added_idx = self.added_rows.len();
         self.added_rows.push(clone);
         self.added_row_anchors
@@ -3397,11 +3619,13 @@ impl ResultView {
                     this.deleted_rows.clear();
                     this.added_rows.clear();
                     this.added_row_anchors.clear();
+                    this.clear_edit_history();
                     this.status_message = None;
                     this.refresh_table_data(window, cx);
                 } else {
                     this.apply_pending_edits_to_result();
                     this.pending_edits.clear();
+                    this.clear_edit_history();
                     this.status_message = None;
                     this.recompute_layout();
                     cx.notify();
@@ -3450,6 +3674,7 @@ impl ResultView {
         self.deleted_rows.clear();
         self.added_rows.clear();
         self.added_row_anchors.clear();
+        self.clear_edit_history();
         self.status_message = None;
         cx.notify();
     }
@@ -3511,6 +3736,7 @@ impl ResultView {
                 this.deleted_rows.clear();
                 this.added_rows.clear();
                 this.added_row_anchors.clear();
+                this.clear_edit_history();
                 this.status_message = None;
                 this.refresh_table_data(window, cx);
             })
@@ -3534,6 +3760,7 @@ impl ResultView {
         self.deleted_rows.clear();
         self.added_rows.clear();
         self.added_row_anchors.clear();
+        self.clear_edit_history();
         self.status_message = None;
         cx.notify();
     }
@@ -9166,6 +9393,26 @@ impl Render for ResultView {
                         cx.stop_propagation();
                         return;
                     }
+                    "d" if primary => {
+                        this.fill_down(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "r" if primary => {
+                        this.fill_right(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "z" if primary => {
+                        this.undo_edit(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "y" if primary => {
+                        this.redo_edit(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     "f2" if plain => {
                         this.begin_edit_active_cell(CellEditEntry::CursorEnd, window, cx);
                         cx.stop_propagation();
@@ -11061,6 +11308,144 @@ mod tests {
                 "select-all anchors the active cell at the top-left"
             );
             assert_eq!(view.selected_cell_range, Some(((0, 0), (2, 1))));
+        });
+    }
+
+    #[gpui::test]
+    fn fill_down_copies_top_cell_value_down_a_range(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let top = debug_center(&mut cx, "CELL-0-1");
+        let bottom = debug_center(&mut cx, "CELL-2-1");
+        cx.simulate_click(top, gpui::Modifiers::none());
+        cx.simulate_click(bottom, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.fill_down(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(1, 1),
+                Some(&CellValue::Text("Alice".to_string())),
+                "fill down must copy the top cell value into the rows below"
+            );
+            assert_eq!(
+                view.pending_cell_value(2, 1),
+                Some(&CellValue::Text("Alice".to_string()))
+            );
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                None,
+                "the source (top) cell must stay untouched"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn fill_down_lone_active_cell_fills_the_cell_below(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.fill_down(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(1, 0),
+                Some(&CellValue::Text("1".to_string())),
+                "with no range, fill down still copies into the cell directly below"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn fill_right_copies_left_cell_value_across_a_range(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let left = debug_center(&mut cx, "CELL-0-0");
+        let right = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(left, gpui::Modifiers::none());
+        cx.simulate_click(right, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.fill_right(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("1".to_string())),
+                "fill right must copy the left cell value across the row"
+            );
+            assert_eq!(
+                view.pending_cell_value(0, 0),
+                None,
+                "the source (left) cell must stay untouched"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn edit_undo_then_redo_roundtrips_a_cell_write(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.write_cell_value(0, 1, CellValue::Text("Zed".to_string()), cx);
+        });
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string()))
+            );
+        });
+
+        view.update(&mut cx, |view, cx| view.undo_edit(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                None,
+                "undo must revert the buffered cell edit"
+            );
+            assert!(view.edit_undo_stack.is_empty());
+            assert_eq!(view.edit_redo_stack.len(), 1);
+        });
+
+        view.update(&mut cx, |view, cx| view.redo_edit(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "redo must re-apply the undone edit"
+            );
+            assert!(view.edit_redo_stack.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn fill_down_is_a_single_undo_unit(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let top = debug_center(&mut cx, "CELL-0-1");
+        let bottom = debug_center(&mut cx, "CELL-2-1");
+        cx.simulate_click(top, gpui::Modifiers::none());
+        cx.simulate_click(bottom, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| view.fill_down(cx));
+        view.update(&mut cx, |view, cx| view.undo_edit(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.pending_cell_value(1, 1), None);
+            assert_eq!(
+                view.pending_cell_value(2, 1),
+                None,
+                "one undo must clear the whole fill batch, not just one cell"
+            );
+        });
+
+        view.update(&mut cx, |view, cx| view.redo_edit(cx));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(1, 1),
+                Some(&CellValue::Text("Alice".to_string()))
+            );
+            assert_eq!(
+                view.pending_cell_value(2, 1),
+                Some(&CellValue::Text("Alice".to_string()))
+            );
         });
     }
 
