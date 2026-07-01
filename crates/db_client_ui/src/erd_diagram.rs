@@ -545,8 +545,6 @@ impl Render for ErdView {
                     .flex_1()
                     .w_full()
                     .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.scroll_handle)
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                         let delta_y: f32 = match event.delta {
                             ScrollDelta::Pixels(pixels) => pixels.y.into(),
