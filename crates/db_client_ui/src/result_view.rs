@@ -2438,7 +2438,12 @@ impl ResultView {
                     .min_w_0()
                     .overflow_hidden()
                     .when(align_right, |element| element.flex().justify_end())
-                    .child(body),
+                    // A flex item shrinks to fit by default, which wraps the
+                    // label's text onto multiple lines instead of clipping it.
+                    // flex_none keeps it at its natural single-line width so
+                    // justify_end only repositions it, matching how the
+                    // non-right-aligned (block layout) case already clips.
+                    .child(div().flex_none().child(body)),
             )
             .into_any_element()
     }
@@ -11377,6 +11382,43 @@ mod tests {
                     .map(|edit| edit.editor.read(cx).text(cx)),
                 Some("9".to_string()),
                 "type-to-replace must overwrite the cell with the typed text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn real_keystrokes_accumulate_in_the_live_editor_while_typing(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        // First keystroke goes through the real on_key_down dispatch (not a
+        // direct function call) and should start type-to-replace.
+        cx.simulate_keystrokes("h");
+        view.update(&mut cx, |view, cx| {
+            assert!(
+                view.cell_edit.is_some(),
+                "typing a printable character should start an edit"
+            );
+            assert_eq!(
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| edit.editor.read(cx).text(cx)),
+                Some("h".to_string())
+            );
+        });
+
+        // Second keystroke, while already editing, must reach the live editor
+        // and accumulate rather than being swallowed or restarting the edit.
+        cx.simulate_keystrokes("i");
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| edit.editor.read(cx).text(cx)),
+                Some("hi".to_string()),
+                "a second real keystroke must append to the live editor, not be lost"
             );
         });
     }
