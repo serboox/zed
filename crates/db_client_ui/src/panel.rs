@@ -511,6 +511,136 @@ fn database_reference_at_offset(text: &str, offset: usize) -> Option<SqlDatabase
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlColumnReference {
+    qualifier: Option<String>,
+    column: String,
+    start: usize,
+    end: usize,
+}
+
+// Resolves a column token at the cursor: `alias.col`, `table.col`, or a bare
+// `col`. Returns the column identifier plus its optional qualifier (the segment
+// right before the last dot). Returns None when the cursor sits on the
+// qualifier part, so `db.table` navigation keeps opening the table.
+fn column_reference_at_offset(text: &str, offset: usize) -> Option<SqlColumnReference> {
+    if offset > text.len() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut start = offset;
+    while start > 0 && is_sql_reference_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < bytes.len() && is_sql_reference_byte(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    let word = &text[start..end];
+    if word.starts_with('.') || word.ends_with('.') {
+        return None;
+    }
+
+    let (qualifier, column, column_start) = match word.rfind('.') {
+        Some(dot) => {
+            let column = &word[dot + 1..];
+            let left = &word[..dot];
+            let qualifier = left.rsplit('.').next().unwrap_or(left);
+            if column.is_empty() || qualifier.is_empty() {
+                return None;
+            }
+            (Some(qualifier.to_string()), column.to_string(), start + dot + 1)
+        }
+        None => (None, word.to_string(), start),
+    };
+
+    if offset < column_start {
+        return None;
+    }
+    let column_end = column_start + column.len();
+    Some(SqlColumnReference {
+        qualifier,
+        column,
+        start: column_start,
+        end: column_end,
+    })
+}
+
+const DDL_STRUCTURAL_KEYWORDS: &[&str] = &[
+    "primary",
+    "unique",
+    "key",
+    "index",
+    "constraint",
+    "foreign",
+    "fulltext",
+    "spatial",
+    "check",
+    "create",
+    "engine",
+];
+
+// True when a DDL body line declares `column`. Matches a quoted identifier
+// (`\`col\``, `"col"`, `[col]`) that opens the line, or a bare leading
+// identifier that is not a structural keyword (PRIMARY KEY, CONSTRAINT, ...).
+fn line_defines_column(content: &str, column: &str) -> bool {
+    let bytes = content.as_bytes();
+    let (opening, closing): (Option<u8>, Option<u8>) = match bytes.first() {
+        Some(b'`') => (Some(b'`'), Some(b'`')),
+        Some(b'"') => (Some(b'"'), Some(b'"')),
+        Some(b'[') => (Some(b'['), Some(b']')),
+        _ => (None, None),
+    };
+    let identifier_start = if opening.is_some() { 1 } else { 0 };
+    let mut identifier_end = identifier_start;
+    while identifier_end < bytes.len() && is_sql_word_byte(bytes[identifier_end]) {
+        identifier_end += 1;
+    }
+    if identifier_start == identifier_end {
+        return false;
+    }
+    let identifier = &content[identifier_start..identifier_end];
+    if !identifier.eq_ignore_ascii_case(column) {
+        return false;
+    }
+    if let Some(closing) = closing {
+        return bytes.get(identifier_end) == Some(&closing);
+    }
+    !DDL_STRUCTURAL_KEYWORDS
+        .iter()
+        .any(|keyword| identifier.eq_ignore_ascii_case(keyword))
+}
+
+// Byte offset of the line that declares `column` in a DDL string, so Ctrl+click
+// on a column can center that definition. The first matching line wins, which
+// picks the real column definition over any later `KEY`/index line naming it.
+fn find_column_definition_offset(ddl: &str, column: &str) -> Option<usize> {
+    let mut byte = 0usize;
+    for line in ddl.split_inclusive('\n') {
+        let leading = line.len() - line.trim_start().len();
+        if line_defines_column(line.trim_start(), column) {
+            return Some(byte + leading);
+        }
+        byte += line.len();
+    }
+    None
+}
+
+// Tables referenced by the `;`-delimited statement containing `offset`, used to
+// resolve a column's `alias`/`table` qualifier and to scope a bare column.
+fn from_tables_at_offset(text: &str, offset: usize) -> Vec<crate::sql_completion_provider::TableRef> {
+    let cursor = offset.min(text.len());
+    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_end = text[cursor..]
+        .find(';')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len());
+    crate::sql_completion_provider::parse_table_refs(&text[statement_start..statement_end])
+}
+
 impl SemanticsProvider for DbSemanticsProvider {
     fn hover(
         &self,
@@ -589,9 +719,7 @@ impl SemanticsProvider for DbSemanticsProvider {
         let offset = snapshot.offset_for_anchor(&position);
         let text = snapshot.text();
 
-        if let Some(table_reference) = statement_table_reference_at_offset(&text, offset)
-            .or_else(|| table_reference_at_offset(&text, offset))
-        {
+        if let Some(table_reference) = statement_table_reference_at_offset(&text, offset) {
             let database_opt = table_reference.database;
             let table_name = table_reference.table;
 
@@ -618,6 +746,7 @@ impl SemanticsProvider for DbSemanticsProvider {
             return Some(self.spawn_ddl_navigation(
                 buffer.clone(),
                 word_start..word_end,
+                None,
                 cx,
                 move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
             ));
@@ -631,8 +760,129 @@ impl SemanticsProvider for DbSemanticsProvider {
             return Some(self.spawn_ddl_navigation(
                 buffer.clone(),
                 word_start..word_end,
+                None,
                 cx,
                 move |store, cx| store.get_database_ddl(connection_id, database, cx),
+            ));
+        }
+
+        if let Some(column_reference) = column_reference_at_offset(&text, offset) {
+            let from_tables = from_tables_at_offset(&text, offset);
+            let candidates: Vec<(Option<String>, String)> = match &column_reference.qualifier {
+                Some(qualifier) => {
+                    match crate::sql_completion_provider::resolve_table_ref(qualifier, &from_tables)
+                    {
+                        Some(table_ref) => {
+                            vec![(table_ref.schema.clone(), table_ref.name.clone())]
+                        }
+                        None => vec![(None, qualifier.clone())],
+                    }
+                }
+                None => from_tables
+                    .iter()
+                    .map(|table_ref| (table_ref.schema.clone(), table_ref.name.clone()))
+                    .collect(),
+            };
+
+            let column = column_reference.column.clone();
+            let resolved = self
+                .store
+                .read_with(cx, |store, _| {
+                    let conn = store
+                        .connections
+                        .iter()
+                        .find(|c| c.config.id == self.connection_id)?;
+                    let default_database = conn
+                        .config
+                        .database
+                        .clone()
+                        .filter(|database| !database.is_empty())
+                        .or_else(|| conn.expanded_databases.keys().next().cloned());
+                    let resolve_database =
+                        |schema: Option<String>| schema.or_else(|| default_database.clone());
+
+                    let chosen = if candidates.len() <= 1 {
+                        candidates.into_iter().next()
+                    } else {
+                        // A bare column with several FROM tables: keep only the
+                        // table whose cached columns actually contain it, and
+                        // navigate only when that leaves a single owner.
+                        let mut owners = candidates
+                            .into_iter()
+                            .filter(|(schema, table)| {
+                                let Some(database) = resolve_database(schema.clone()) else {
+                                    return false;
+                                };
+                                conn.expanded_tables
+                                    .get(&(database, table.clone()))
+                                    .is_some_and(|columns| {
+                                        columns
+                                            .iter()
+                                            .any(|c| c.name.eq_ignore_ascii_case(&column))
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if owners.len() == 1 {
+                            owners.pop()
+                        } else {
+                            None
+                        }
+                    }?;
+
+                    let (schema, table) = chosen;
+                    let database = resolve_database(schema)?;
+                    Some((database, table))
+                })
+                .ok()
+                .flatten();
+
+            // Fall through to bare-table navigation when the token cannot be
+            // tied to a known column, since any word token reaches this branch.
+            if let Some((database, table)) = resolved {
+                let word_start = snapshot.anchor_before(column_reference.start);
+                let word_end = snapshot.anchor_after(column_reference.end);
+                let connection_id = self.connection_id;
+                let focus_column = column_reference.column;
+                return Some(self.spawn_ddl_navigation(
+                    buffer.clone(),
+                    word_start..word_end,
+                    Some(focus_column),
+                    cx,
+                    move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                ));
+            }
+        }
+
+        if let Some(table_reference) = table_reference_at_offset(&text, offset) {
+            let database_opt = table_reference.database;
+            let table_name = table_reference.table;
+
+            let (database, table) = self
+                .store
+                .read_with(cx, |store, _| {
+                    let conn = store
+                        .connections
+                        .iter()
+                        .find(|c| c.config.id == self.connection_id)?;
+                    let db = database_opt.clone().or_else(|| {
+                        conn.config
+                            .database
+                            .clone()
+                            .or_else(|| conn.expanded_databases.keys().next().cloned())
+                    })?;
+                    Some((db, table_name.clone()))
+                })
+                .ok()
+                .flatten()?;
+            let word_start = snapshot.anchor_before(table_reference.start);
+            let word_end = snapshot.anchor_after(table_reference.end);
+            let connection_id = self.connection_id;
+            return Some(self.spawn_ddl_navigation(
+                buffer.clone(),
+                word_start..word_end,
+                None,
+                cx,
+                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
             ));
         }
 
@@ -664,6 +914,7 @@ impl DbSemanticsProvider {
         &self,
         source_buffer: Entity<Buffer>,
         origin_range: std::ops::Range<Anchor>,
+        focus_column: Option<String>,
         cx: &mut App,
         make_ddl_task: impl FnOnce(
             &mut DatabaseStore,
@@ -682,13 +933,18 @@ impl DbSemanticsProvider {
             })?;
             let language = language_task.await.ok();
 
+            let target_offset = focus_column
+                .as_deref()
+                .and_then(|column| find_column_definition_offset(&ddl, column))
+                .unwrap_or(0);
+
             let ddl_buffer = workspace.update(cx, |ws, cx| {
                 ws.project().update(cx, |project, cx| {
                     project.create_local_buffer(&ddl, language, false, cx)
                 })
             })?;
 
-            let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(0));
+            let target_anchor = ddl_buffer.read_with(cx, |buf, _| buf.anchor_before(target_offset));
 
             Ok(Some(vec![LocationLink {
                 origin: Some(Location {
@@ -5987,6 +6243,90 @@ mod tests {
         let offset = text.find("a.b").expect("qualified word in sql");
 
         assert_eq!(super::database_reference_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn column_reference_at_offset_resolves_alias_qualified_column() {
+        let text = "SELECT * FROM instruments.splits AS s WHERE s.operation;";
+        let column_start = text.rfind("operation").expect("column in sql");
+        let offset = column_start + 3;
+
+        assert_eq!(
+            super::column_reference_at_offset(text, offset),
+            Some(super::SqlColumnReference {
+                qualifier: Some("s".to_string()),
+                column: "operation".to_string(),
+                start: column_start,
+                end: column_start + "operation".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn column_reference_at_offset_rejects_qualifier_part() {
+        let text = "SELECT s.operation FROM instruments.splits AS s;";
+        let offset = text.find("s.operation").expect("alias in sql");
+
+        assert_eq!(super::column_reference_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn column_reference_at_offset_resolves_bare_column() {
+        let text = "SELECT operation FROM splits;";
+        let column_start = text.find("operation").expect("column in sql");
+        let offset = column_start + 1;
+
+        assert_eq!(
+            super::column_reference_at_offset(text, offset),
+            Some(super::SqlColumnReference {
+                qualifier: None,
+                column: "operation".to_string(),
+                start: column_start,
+                end: column_start + "operation".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn from_tables_at_offset_resolves_alias_to_table() {
+        let text = "SELECT * FROM instruments.splits AS s WHERE s.operation;";
+        let offset = text.rfind("operation").expect("column in sql");
+        let tables = super::from_tables_at_offset(text, offset);
+
+        let resolved = crate::sql_completion_provider::resolve_table_ref("s", &tables)
+            .expect("alias resolves");
+        assert_eq!(resolved.name, "splits");
+        assert_eq!(resolved.schema.as_deref(), Some("instruments"));
+    }
+
+    #[test]
+    fn find_column_definition_offset_matches_backtick_quoted_column() {
+        let ddl = "CREATE TABLE `splits` (\n  `id` bigint NOT NULL,\n  `operation` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n)";
+        let offset = super::find_column_definition_offset(ddl, "operation").expect("column found");
+        let line_start = ddl[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        assert_eq!(&ddl[line_start..offset], "  ");
+        assert!(ddl[offset..].starts_with("`operation`"));
+    }
+
+    #[test]
+    fn find_column_definition_offset_matches_bare_column_case_insensitively() {
+        let ddl = "CREATE TABLE splits (\n  id bigint,\n  Operation varchar(255)\n)";
+        let offset = super::find_column_definition_offset(ddl, "operation").expect("column found");
+        assert!(ddl[offset..].starts_with("Operation"));
+    }
+
+    #[test]
+    fn find_column_definition_offset_prefers_definition_over_key_line() {
+        let ddl = "CREATE TABLE `t` (\n  `key` int NOT NULL,\n  KEY `key` (`key`)\n)";
+        let offset = super::find_column_definition_offset(ddl, "key").expect("column found");
+        assert!(ddl[offset..].starts_with("`key` int"));
+    }
+
+    #[test]
+    fn find_column_definition_offset_ignores_substring_columns() {
+        let ddl = "CREATE TABLE `t` (\n  `operation_id` int,\n  `operation` varchar(8)\n)";
+        let offset = super::find_column_definition_offset(ddl, "operation").expect("column found");
+        assert!(ddl[offset..].starts_with("`operation` varchar"));
     }
 
     #[test]

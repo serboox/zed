@@ -132,10 +132,10 @@ enum ContextKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TableRef {
-    name: String,
-    alias: Option<String>,
-    schema: Option<String>,
+pub(crate) struct TableRef {
+    pub(crate) name: String,
+    pub(crate) alias: Option<String>,
+    pub(crate) schema: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +262,7 @@ fn clause_kind(statement_before: &str) -> ContextKind {
 
 /// Tables (with optional aliases) referenced in the FROM/JOIN clauses of the
 /// current statement, used to resolve `alias.` and to scope column suggestions.
-fn parse_table_refs(statement: &str) -> Vec<TableRef> {
+pub(crate) fn parse_table_refs(statement: &str) -> Vec<TableRef> {
     let tokens: Vec<&str> = statement
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|t| !t.is_empty())
@@ -419,7 +419,7 @@ fn parse_context(text_before: &str) -> ParsedContext {
 
 /// Resolves a qualifier to the referenced table: an alias maps to its table,
 /// otherwise a direct table-name match maps to itself.
-fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> Option<&'a TableRef> {
+pub(crate) fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> Option<&'a TableRef> {
     tables
         .iter()
         .find(|t| {
