@@ -6700,13 +6700,20 @@ impl ResultView {
                     .when_some(self.render_local_filter_row(cx), |el, row| el.child(row))
                     .child(body);
 
+                // `overflow_x_scroll` (not `overflow_x_hidden`) is required here:
+                // GPUI's wheel-scroll listener only moves a tracked scroll
+                // handle's offset on an axis whose overflow is `Overflow::Scroll`
+                // (see `paint_scroll_listener` in gpui's div.rs) — `Hidden` still
+                // clips content but silently drops all wheel/trackpad deltas on
+                // that axis, leaving only the manual scrollbar-thumb drag able to
+                // move it.
                 let mut h_scroll_div = div()
                     .id("result-grid")
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
                     .h_full()
-                    .overflow_x_hidden()
+                    .overflow_x_scroll()
                     .track_scroll(&self.h_scroll)
                     .child(table);
                 h_scroll_div.style().restrict_scroll_to_axis = Some(true);
@@ -12747,6 +12754,122 @@ mod tests {
             } else {
                 Some(format!("pair-{idx:04}"))
             }
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_type_and_escape_on_a_numeric_column(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        // `column_kind_at` only returns `Numeric` when schema metadata is
+        // loaded (unlike `numeric_columns`, which is value-sampled and drives
+        // read-mode right-alignment independently) — set it directly so this
+        // test exercises the real `CellEditorKind::Numeric` editor path
+        // (icon + placeholder) that all prior investigations, which only used
+        // the "name" text column, never touched.
+        view.update(&mut cx, |view, _cx| {
+            view.column_infos = Some(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+                ColumnInfo {
+                    name: "name".to_string(),
+                    data_type: "varchar(255)".to_string(),
+                    is_nullable: true,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ]);
+        });
+        view.update(&mut cx, |view, _cx| {
+            assert!(matches!(view.column_kind_at(0), CellEditorKind::Numeric));
+        });
+
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("1".to_string()),
+                "double-clicking a numeric cell must open the editor pre-filled with its value, not blank"
+            );
+        });
+
+        cx.simulate_keystrokes("5");
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("15".to_string()),
+                "a real keystroke into a numeric cell's live editor must appear immediately"
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.cell_edit.is_none(),
+                "escape must cancel the in-progress edit"
+            );
+            let rendered = view.loaded_cell_value(0, 0).unwrap_or_default();
+            assert_eq!(
+                rendered, "1",
+                "after escape the cell must show only its original value, not the typed text or a concatenation of both"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_mouse_wheel_scrolls_the_grid(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, wide_table_result());
+        let position = debug_center(&mut cx, "CELL-0-0");
+
+        let offset_before = view.update(&mut cx, |view, _cx| f32::from(view.h_scroll.offset().x));
+        assert_eq!(offset_before, 0.0, "grid should start unscrolled");
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-120.), px(0.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            let offset_after = f32::from(view.h_scroll.offset().x);
+            assert!(
+                offset_after < offset_before,
+                "a horizontal mouse-wheel/trackpad gesture over the grid must move the \
+                 horizontal scroll offset, not just the drag-thumb; offset_before={offset_before}, \
+                 offset_after={offset_after}"
+            );
         });
     }
 }
