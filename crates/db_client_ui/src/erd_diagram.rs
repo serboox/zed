@@ -1,6 +1,7 @@
 use gpui::{
-    Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Window, canvas, point, prelude::*, px,
+    Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Window, canvas, point, prelude::*, px,
 };
 use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*, rems_from_px};
 use workspace::{Item, item::ItemEvent};
@@ -215,6 +216,9 @@ pub struct ErdView {
     total_height: f32,
     scroll_handle: ScrollHandle,
     zoom: f32,
+    // (mouse position, scroll offset) captured at the start of a click-drag pan;
+    // `None` means the canvas is idle (not currently being dragged).
+    pan_origin: Option<(Point<gpui::Pixels>, Point<gpui::Pixels>)>,
 }
 
 impl ErdView {
@@ -252,6 +256,7 @@ impl ErdView {
             total_height: total_height.max(1.0),
             scroll_handle: ScrollHandle::new(),
             zoom: 1.0,
+            pan_origin: None,
         }
     }
 
@@ -268,6 +273,28 @@ impl ErdView {
     fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.zoom = 1.0;
         cx.notify();
+    }
+
+    fn begin_pan(&mut self, mouse_position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.pan_origin = Some((mouse_position, self.scroll_handle.offset()));
+        cx.notify();
+    }
+
+    // Moves the content by exactly the mouse's own travel since `begin_pan`, so
+    // the point under the cursor stays pinned to the cursor (a real "grab").
+    fn update_pan(&mut self, mouse_position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some((start_mouse, start_offset)) = self.pan_origin else {
+            return;
+        };
+        let delta = mouse_position - start_mouse;
+        self.scroll_handle.set_offset(start_offset + delta);
+        cx.notify();
+    }
+
+    fn end_pan(&mut self, cx: &mut Context<Self>) {
+        if self.pan_origin.take().is_some() {
+            cx.notify();
+        }
     }
 
     // Returns true when the wheel event was consumed as a zoom, so the caller can
@@ -545,6 +572,13 @@ impl Render for ErdView {
                     .flex_1()
                     .w_full()
                     .min_h_0()
+                    .overflow_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .cursor(if self.pan_origin.is_some() {
+                        CursorStyle::ClosedHand
+                    } else {
+                        CursorStyle::OpenHand
+                    })
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                         let delta_y: f32 = match event.delta {
                             ScrollDelta::Pixels(pixels) => pixels.y.into(),
@@ -555,6 +589,23 @@ impl Render for ErdView {
                             cx.notify();
                         }
                     }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.begin_pan(event.position, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            this.update_pan(event.position, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.end_pan(cx);
+                        }),
+                    )
                     .child(surface)
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Both)
@@ -569,6 +620,20 @@ impl Render for ErdView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn many_tables(count: usize) -> Vec<ErdTable> {
+        (0..count)
+            .map(|index| ErdTable {
+                name: format!("table_{index}"),
+                columns: vec![ErdColumn {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    is_primary_key: true,
+                    is_foreign_key: false,
+                }],
+            })
+            .collect()
+    }
 
     fn sample() -> (Vec<ErdTable>, Vec<ErdRelationship>) {
         let tables = vec![
@@ -690,6 +755,151 @@ mod tests {
             assert!(view.table_center("missing").is_none());
         })
         .expect("window should build");
+    }
+
+    struct ErdViewFrame {
+        view: gpui::Entity<ErdView>,
+    }
+
+    impl Render for ErdViewFrame {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(400.)).h(px(300.)).child(self.view.clone())
+        }
+    }
+
+    fn draw_erd_frame(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // Renders a real ErdView inside a fixed 400x300 window and measures the
+    // scroll handle's actual `max_offset()` after a real paint pass -- this is
+    // the concrete, paint-derived proxy for "there is real scrollable range",
+    // as opposed to reasoning about the styling code in isolation. A diagram
+    // with many tables stacked vertically is far taller than the 300px frame,
+    // so a correctly wired scroll container must report a positive y max
+    // offset; if it reports zero, the content is being clipped/measured wrong
+    // and the scrollbar has nothing to scroll regardless of how it's painted.
+    #[gpui::test]
+    fn scroll_handle_reports_real_range_when_content_exceeds_the_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(30);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+
+        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let max_offset = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+
+        assert!(
+            max_offset.y > px(0.),
+            "expected positive vertical scroll range for 30 stacked tables in a 300px-tall \
+             viewport, got {max_offset:?} -- the diagram content is not exceeding the viewport \
+             so there is nothing for the scrollbar to scroll"
+        );
+    }
+
+    // Zooming in scales `total_width`/`total_height` (see `scaled_box`), so the
+    // real measured scroll range must grow with it too -- this proves the zoom
+    // factor actually reaches the painted layout the scrollbar measures against,
+    // not just the in-memory field.
+    #[gpui::test]
+    fn scroll_range_grows_when_zooming_in(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(6);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+
+        let max_offset_at_1x = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+
+        erd.update(&mut cx, |view, cx| {
+            view.zoom_in(cx);
+            view.zoom_in(cx);
+        });
+        draw_erd_frame(&mut cx);
+        let max_offset_at_1_5x = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+
+        assert!(
+            max_offset_at_1_5x.y > max_offset_at_1x.y,
+            "zooming in should increase the real measured scroll range: {max_offset_at_1x:?} \
+             at 1.0x vs {max_offset_at_1_5x:?} after zooming in"
+        );
+    }
+
+    // Drives a real mouse-down + mouse-move + mouse-up sequence over the canvas
+    // (not a direct call to `update_pan`) and checks the scroll handle's actual
+    // offset moved by the same delta as the cursor -- proving the gesture is
+    // really wired to mouse events, not just that the underlying math is right.
+    #[gpui::test]
+    fn drag_pans_the_canvas_by_the_cursor_travel(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(30);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+
+        let scroll_bounds = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should have painted bounds");
+        let start = scroll_bounds.center();
+        let end = point(start.x - px(15.), start.y - px(40.));
+
+        let offset_before = erd.read_with(&cx, |view, _| view.scroll_handle.offset());
+        assert!(
+            erd.read_with(&cx, |view, _| view.pan_origin.is_none()),
+            "canvas should not be mid-pan before any drag"
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        assert!(
+            erd.read_with(&cx, |view, _| view.pan_origin.is_some()),
+            "mouse-down on the canvas should arm panning"
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        assert!(
+            erd.read_with(&cx, |view, _| view.pan_origin.is_none()),
+            "mouse-up should disarm panning"
+        );
+
+        let offset_after = erd.read_with(&cx, |view, _| view.scroll_handle.offset());
+        let expected = offset_before + (end - start);
+        assert_eq!(
+            offset_after, expected,
+            "the content should move by exactly the cursor's own travel"
+        );
     }
 
     #[test]
