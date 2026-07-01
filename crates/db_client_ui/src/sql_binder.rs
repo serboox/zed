@@ -20,6 +20,18 @@ use crate::sql_ast;
 /// a small in-memory fixture instead.
 pub(crate) trait SchemaLookup {
     fn table_has_column(&self, database: &str, table: &str, column: &str) -> bool;
+    /// Whether `database`'s table list has actually been fetched into the
+    /// cache -- distinguishes a genuinely unknown table from a database the
+    /// cache simply hasn't looked at yet, so the validator never flags the
+    /// latter as an error.
+    fn has_schema_for_database(&self, database: &str) -> bool;
+    /// Whether `table` is a real, cached table of `database`. Only
+    /// meaningful when `has_schema_for_database` is true.
+    fn table_exists(&self, database: &str, table: &str) -> bool;
+    /// Whether `(database, table)`'s column list has actually been fetched
+    /// into the cache -- distinguishes a table that genuinely lacks a column
+    /// from one whose columns simply haven't been expanded yet.
+    fn has_columns_for_table(&self, database: &str, table: &str) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +135,7 @@ fn location_for_offset(text: &str, offset: usize) -> Location {
 /// The inverse of [`location_for_offset`]: the byte offset within `text` at
 /// the given 1-based line/column, or `None` when the location falls outside
 /// `text` (which would indicate a span from a different piece of text).
-fn offset_for_location(text: &str, location: Location) -> Option<usize> {
+pub(crate) fn offset_for_location(text: &str, location: Location) -> Option<usize> {
     if location.line == 0 {
         return None;
     }
@@ -192,7 +204,7 @@ fn object_name_parts(name: &ObjectName) -> Vec<String> {
 
 /// The last two dot-separated parts of `name` as (database, table); a single
 /// part is just the table, with no database qualifier.
-fn database_and_table(name: &ObjectName) -> (Option<String>, String) {
+pub(crate) fn database_and_table(name: &ObjectName) -> (Option<String>, String) {
     let parts = object_name_parts(name);
     match parts.len() {
         0 => (None, String::new()),
@@ -1053,6 +1065,18 @@ impl SchemaLookup for NoSchema {
     fn table_has_column(&self, _database: &str, _table: &str, _column: &str) -> bool {
         false
     }
+
+    fn has_schema_for_database(&self, _database: &str) -> bool {
+        false
+    }
+
+    fn table_exists(&self, _database: &str, _table: &str) -> bool {
+        false
+    }
+
+    fn has_columns_for_table(&self, _database: &str, _table: &str) -> bool {
+        false
+    }
 }
 
 /// Parses the statement under `cursor_offset` and returns every table/alias
@@ -1328,25 +1352,65 @@ fn scope_tables_in_expr(
 mod tests {
     use super::*;
 
+    /// Mirrors `ActiveConnection`'s two-tier cache: a database's table list
+    /// and a table's column list are each either "not fetched" (absent from
+    /// the map) or "fetched" (present, possibly empty) -- tests need this
+    /// distinction to prove the validator skips databases/tables it has no
+    /// data for at all, rather than treating that as an error.
     #[derive(Default)]
-    struct FakeSchema(HashMap<(String, String), Vec<String>>);
+    struct FakeSchema {
+        tables_by_database: HashMap<String, Vec<String>>,
+        columns_by_table: HashMap<(String, String), Vec<String>>,
+    }
 
     impl FakeSchema {
         fn with_table(database: &str, table: &str, columns: &[&str]) -> Self {
-            let mut schema = FakeSchema::default();
-            schema.0.insert(
+            FakeSchema::default().and_table(database, table, columns)
+        }
+
+        fn and_table(mut self, database: &str, table: &str, columns: &[&str]) -> Self {
+            self.tables_by_database
+                .entry(database.to_string())
+                .or_default()
+                .push(table.to_string());
+            self.columns_by_table.insert(
                 (database.to_string(), table.to_string()),
                 columns.iter().map(|c| c.to_string()).collect(),
             );
+            self
+        }
+
+        /// Registers `database` as fetched, with no tables in it -- distinct
+        /// from `FakeSchema::default()`, which has never fetched anything.
+        fn with_known_empty_database(database: &str) -> Self {
+            let mut schema = FakeSchema::default();
+            schema
+                .tables_by_database
+                .insert(database.to_string(), Vec::new());
             schema
         }
     }
 
     impl SchemaLookup for FakeSchema {
         fn table_has_column(&self, database: &str, table: &str, column: &str) -> bool {
-            self.0
+            self.columns_by_table
                 .get(&(database.to_string(), table.to_string()))
                 .is_some_and(|columns| columns.iter().any(|c| c.eq_ignore_ascii_case(column)))
+        }
+
+        fn has_schema_for_database(&self, database: &str) -> bool {
+            self.tables_by_database.contains_key(database)
+        }
+
+        fn table_exists(&self, database: &str, table: &str) -> bool {
+            self.tables_by_database
+                .get(database)
+                .is_some_and(|tables| tables.iter().any(|t| t.eq_ignore_ascii_case(table)))
+        }
+
+        fn has_columns_for_table(&self, database: &str, table: &str) -> bool {
+            self.columns_by_table
+                .contains_key(&(database.to_string(), table.to_string()))
         }
     }
 
@@ -1494,13 +1558,8 @@ mod tests {
     #[test]
     fn bare_column_stays_unresolved_when_ambiguous_across_from_tables() {
         let text = "SELECT flag FROM db.orders o, db.shipments s WHERE flag = 1";
-        let schema = {
-            let mut schema = FakeSchema::with_table("db", "orders", &["flag"]);
-            schema
-                .0
-                .insert(("db".to_string(), "shipments".to_string()), vec!["flag".to_string()]);
-            schema
-        };
+        let schema =
+            FakeSchema::with_table("db", "orders", &["flag"]).and_table("db", "shipments", &["flag"]);
         let offset = text.find("flag").expect("marker present");
         assert!(
             resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema).is_none(),

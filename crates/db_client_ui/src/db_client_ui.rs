@@ -14,6 +14,7 @@ mod result_view;
 mod sql_ast;
 mod sql_binder;
 mod sql_completion_provider;
+mod sql_validator;
 mod store;
 mod widgets;
 

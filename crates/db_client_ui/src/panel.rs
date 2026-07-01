@@ -26,11 +26,11 @@ use db_client::{
 use editor::{Editor, EditorEvent, GotoDefinitionKind, SemanticsProvider, ToOffset};
 use futures::future::Shared;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, DragMoveEvent,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
-    anchored, deferred, div, px,
+    AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
+    DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    WeakEntity, Window, anchored, deferred, div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -38,6 +38,7 @@ use project::{
     DocumentHighlight, InlayHint, InvalidationStrategy, Location, LocationLink, ProjectTransaction,
     lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
 };
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -230,6 +231,21 @@ impl crate::sql_binder::SchemaLookup for ActiveConnection {
         self.expanded_tables
             .get(&(database.to_string(), table.to_string()))
             .is_some_and(|columns| columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
+    }
+
+    fn has_schema_for_database(&self, database: &str) -> bool {
+        self.expanded_databases.contains_key(database)
+    }
+
+    fn table_exists(&self, database: &str, table: &str) -> bool {
+        self.expanded_databases
+            .get(database)
+            .is_some_and(|tables| tables.iter().any(|t| t.name.eq_ignore_ascii_case(table)))
+    }
+
+    fn has_columns_for_table(&self, database: &str, table: &str) -> bool {
+        self.expanded_tables
+            .contains_key(&(database.to_string(), table.to_string()))
     }
 }
 
@@ -2030,6 +2046,7 @@ fn install_db_editor_features(
         return;
     };
 
+    let validation_store = store.clone();
     editor.update(cx, |editor, cx| {
         if editor.addon::<DbQueryEditorAddon>().is_none() {
             editor.register_addon(DbQueryEditorAddon::new(connection_id));
@@ -2040,6 +2057,129 @@ fn install_db_editor_features(
             store,
             workspace,
         })));
+    });
+    install_sql_validation(editor, validation_store, connection_id, cx);
+}
+
+/// A stable synthetic language-server id for diagnostics produced by the SQL
+/// validator, which has no real language server behind it. Chosen far above
+/// any id a real running language server would be assigned, to avoid ever
+/// colliding with one.
+const SQL_VALIDATOR_SERVER_ID: language::LanguageServerId =
+    language::LanguageServerId(usize::MAX - 1000);
+
+/// Idle time after the last edit before a validation pass runs, so typing
+/// never triggers a parse+bind on every keystroke. `sql_validator::validate`
+/// took ~4ms on a debug build for a deeply nested real production query
+/// (three levels of subqueries, two derived tables, an `INSERT ... ON
+/// DUPLICATE KEY UPDATE`) -- trivial next to this window, and only ever
+/// matters once typing pauses.
+const SQL_VALIDATION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Revalidates `editor`'s buffer against the cached schema whenever it is
+/// edited, debounced so a validation pass never runs mid-keystroke. Reads
+/// only the in-memory schema cache (never a live connection), exactly like
+/// completion and Ctrl+click navigation.
+fn install_sql_validation(
+    editor: Entity<Editor>,
+    store: WeakEntity<DatabaseStore>,
+    connection_id: ConnectionId,
+    cx: &mut App,
+) {
+    let pending_validation: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
+    let trigger = {
+        let editor = editor.clone();
+        move |cx: &mut App| {
+            let editor = editor.clone();
+            let store = store.clone();
+            let task = cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(SQL_VALIDATION_DEBOUNCE)
+                    .await;
+                run_sql_validation(&editor, &store, connection_id, cx).await;
+            });
+            *pending_validation.borrow_mut() = Some(task);
+        }
+    };
+    trigger(cx);
+    cx.subscribe(&editor, move |_editor, event, cx| {
+        if matches!(event, EditorEvent::BufferEdited) {
+            trigger(cx);
+        }
+    })
+    .detach();
+}
+
+async fn run_sql_validation(
+    editor: &Entity<Editor>,
+    store: &WeakEntity<DatabaseStore>,
+    connection_id: ConnectionId,
+    cx: &mut AsyncApp,
+) {
+    let Some(buffer) =
+        editor.read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
+    else {
+        return;
+    };
+    let text = buffer.read_with(cx, |buffer, _| buffer.text());
+    // Reading the connection and validating happen inside one synchronous
+    // closure so the `&ActiveConnection` borrow never needs to outlive it --
+    // `validate` runs to completion and returns an owned `Vec` before the
+    // closure (and the borrow) ends.
+    let Ok(Some(diagnostics)) = store.read_with(cx, |store, _| {
+        let conn = store
+            .connections
+            .iter()
+            .find(|c| c.config.id == connection_id)?;
+        let default_database = conn
+            .config
+            .database
+            .clone()
+            .filter(|database| !database.is_empty())
+            .or_else(|| conn.expanded_databases.keys().next().cloned());
+        Some(crate::sql_validator::validate(
+            &text,
+            conn.config.driver,
+            default_database.as_deref(),
+            conn,
+        ))
+    }) else {
+        return;
+    };
+    apply_sql_diagnostics(&buffer, diagnostics, cx).await;
+}
+
+async fn apply_sql_diagnostics(
+    buffer: &Entity<Buffer>,
+    diagnostics: Vec<crate::sql_validator::SqlDiagnostic>,
+    cx: &mut AsyncApp,
+) {
+    buffer.update(cx, |buffer, cx| {
+        let snapshot = buffer.snapshot();
+        let entries: Vec<_> = diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                let start = snapshot.offset_to_point_utf16(diagnostic.range.start);
+                let end = snapshot.offset_to_point_utf16(diagnostic.range.end);
+                let severity = match diagnostic.level {
+                    crate::sql_validator::DiagnosticLevel::Warning => {
+                        language::DiagnosticSeverity::WARNING
+                    }
+                };
+                language::DiagnosticEntry {
+                    range: start..end,
+                    diagnostic: language::Diagnostic {
+                        source: Some("sql".to_string()),
+                        severity,
+                        message: diagnostic.message,
+                        source_kind: language::DiagnosticSourceKind::Other,
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+        let diagnostic_set = language::DiagnosticSet::new(entries, &snapshot);
+        buffer.update_diagnostics(SQL_VALIDATOR_SERVER_ID, diagnostic_set, cx);
     });
 }
 
@@ -9184,6 +9324,83 @@ mod tests {
         assert!(
             editor.read_with(cx, |editor, _| editor.semantics_provider().is_some()),
             "console editor must carry the DbSemanticsProvider so Ctrl+click resolves DDL"
+        );
+    }
+
+    // The validator runs debounced off buffer edits, never on the edit itself,
+    // and must actually reach the buffer's diagnostic set once it does run.
+    #[gpui::test]
+    async fn install_db_editor_features_debounces_sql_validation(cx: &mut TestAppContext) {
+        let mut config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            auto_connect: false,
+            database: Some("db".to_string()),
+            ..Default::default()
+        };
+        config.driver = db_client::DatabaseDriver::MySQL;
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+            let conn = store
+                .connections
+                .iter_mut()
+                .find(|c| c.config.id == connection_id)
+                .unwrap();
+            conn.expanded_databases.insert(
+                "db".to_string(),
+                vec![db_client::TableInfo {
+                    name: "orders".to_string(),
+                    kind: db_client::TableKind::Table,
+                }],
+            );
+        });
+        cx.run_until_parked();
+
+        let (buffer, editor) = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("SELECT * FROM db.missing_table", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            (buffer, editor)
+        });
+
+        cx.update(|_window, cx| {
+            install_db_editor_features(editor.clone(), store.downgrade(), workspace.downgrade(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            buffer
+                .read_with(cx, |buffer, _| buffer
+                    .buffer_diagnostics(Some(SQL_VALIDATOR_SERVER_ID))
+                    .is_empty()),
+            "the very first validation pass still has to wait out the debounce"
+        );
+
+        cx.executor().advance_clock(SQL_VALIDATION_DEBOUNCE);
+        cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer
+                .buffer_diagnostics(Some(SQL_VALIDATOR_SERVER_ID))
+                .len()),
+            1,
+            "an unknown table in a cached database must surface as a buffer diagnostic"
         );
     }
 
