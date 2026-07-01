@@ -14,7 +14,7 @@ use std::rc::Rc;
 use theme::ActiveTheme as _;
 use ui::IconName;
 
-const CORE_KEYWORDS: &[&str] = &[
+pub(crate) const CORE_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON",
     "USING", "AND", "OR", "NOT", "IN", "IS", "NULL", "AS", "DISTINCT", "ORDER", "GROUP", "BY",
     "HAVING", "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",

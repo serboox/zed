@@ -322,6 +322,18 @@ fn parse_table_reference(
         return None;
     }
 
+    // A bare (unqualified) reserved word like `SELECT` or `FROM` is never a
+    // real table name; without this check the lexical scanner above would
+    // happily treat any keyword under the cursor as a candidate table and
+    // make it Ctrl+click-navigable.
+    if database.is_none()
+        && crate::sql_completion_provider::CORE_KEYWORDS
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(&table))
+    {
+        return None;
+    }
+
     let table_end = table_start + table.len();
     if let Some(offset) = required_offset {
         if offset < table_start || offset > table_end {
@@ -6729,6 +6741,8 @@ impl Render for DatabasePanel {
                     .debug_selector(|| "DB-TREE-SCROLL".into())
                     .flex_1()
                     .min_h_0()
+                    .overflow_scroll()
+                    .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Both)
@@ -7273,6 +7287,22 @@ mod tests {
     fn table_reference_at_offset_rejects_incomplete_reference() {
         let text = "SELECT * FROM public.";
         assert_eq!(super::table_reference_at_offset(text, text.len()), None);
+    }
+
+    #[test]
+    fn table_reference_at_offset_rejects_bare_reserved_keywords() {
+        let text = "SELECT * FROM users WHERE id = 1";
+        let select_offset = text.find("SELECT").expect("SELECT in sql") + 1;
+        let from_offset = text.find("FROM").expect("FROM in sql") + 1;
+        let where_offset = text.find("WHERE").expect("WHERE in sql") + 1;
+
+        assert_eq!(super::table_reference_at_offset(text, select_offset), None);
+        assert_eq!(super::table_reference_at_offset(text, from_offset), None);
+        assert_eq!(super::table_reference_at_offset(text, where_offset), None);
+        // A real table name is unaffected by the keyword filter.
+        assert!(
+            super::table_reference_at_offset(text, text.find("users").unwrap() + 1).is_some()
+        );
     }
 
     #[test]
@@ -9393,6 +9423,117 @@ mod tests {
                 "DatabasePanel must be in left dock"
             );
         });
+    }
+
+    // Proves the tree can actually scroll: with far more connection rows than
+    // fit in the test window, a real layout+paint pass must leave the scroll
+    // handle with a nonzero max offset. `Scrollbars::tracked_scroll_handle`
+    // marks the handle as manually-added, which makes `custom_scrollbars`
+    // SKIP its own internal `.track_scroll()`/`.overflow_scroll()` wiring
+    // (see `ScrollbarState::handle_to_track`) -- the caller supplying its own
+    // handle is responsible for wiring the div itself. Without an explicit
+    // `.overflow_scroll().track_scroll(&handle)` call, the scroll handle's
+    // `scroll_offset` is never set, `clamp_scroll_position` never runs, and
+    // `max_offset`/`bounds` never update from their zero-initialized state --
+    // regardless of how much taller the actual content is.
+    #[gpui::test]
+    async fn database_explorer_tree_scrolls_when_content_overflows_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(|cx| DatabaseStore::new(cx));
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        store.update(cx, |store, cx| {
+            for i in 0..80 {
+                store.add_connection(
+                    db_client::ConnectionConfig {
+                        label: format!("connection-{i}"),
+                        auto_connect: false,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        // Force a real layout+paint pass so the scroll handle's bounds and
+        // content size reflect what was actually measured, not just default
+        // zero-initialized state.
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.left_dock().read(cx).panel::<DatabasePanel>()
+            })
+            .expect("DatabasePanel must be in the left dock");
+
+        let max_offset_y = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().y);
+        assert!(
+            max_offset_y > px(0.),
+            "tree has 80 connection rows, far more than fit in the test window, so the scroll \
+             handle must report a nonzero max scroll offset; got {max_offset_y:?}"
+        );
     }
 
     // Replicates what the real app does:
