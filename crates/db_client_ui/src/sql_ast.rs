@@ -126,17 +126,33 @@ pub(crate) fn try_parse_statement_at(
     driver: DatabaseDriver,
     cursor_offset: usize,
 ) -> Option<Statement> {
+    try_parse_statement_at_with_span(text, driver, cursor_offset).map(|(statement, _)| statement)
+}
+
+/// Same as [`try_parse_statement_at`], but also returns the exact byte range
+/// within `text` that was parsed (the statement's span with surrounding
+/// whitespace trimmed off) -- callers that need to map a location inside the
+/// returned AST back to an absolute offset in `text` need this trimmed range,
+/// since the AST's own spans are relative to it, not to the untrimmed span.
+pub(crate) fn try_parse_statement_at_with_span(
+    text: &str,
+    driver: DatabaseDriver,
+    cursor_offset: usize,
+) -> Option<(Statement, Range<usize>)> {
     let dialect = dialect_for_driver(driver)?;
     let span = statement_span_at(text, cursor_offset)?;
-    let statement_text = text.get(span)?.trim();
+    let raw = text.get(span.clone())?;
+    let leading = raw.len() - raw.trim_start().len();
+    let statement_text = raw.trim();
     if statement_text.is_empty() {
         return None;
     }
+    let trimmed_span = (span.start + leading)..(span.start + leading + statement_text.len());
     let mut statements = Parser::parse_sql(dialect.as_ref(), statement_text).ok()?;
     if statements.len() != 1 {
         return None;
     }
-    statements.pop()
+    statements.pop().map(|statement| (statement, trimmed_span))
 }
 
 #[cfg(test)]

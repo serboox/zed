@@ -225,6 +225,14 @@ struct DbSemanticsProvider {
     workspace: WeakEntity<Workspace>,
 }
 
+impl crate::sql_binder::SchemaLookup for ActiveConnection {
+    fn table_has_column(&self, database: &str, table: &str, column: &str) -> bool {
+        self.expanded_tables
+            .get(&(database.to_string(), table.to_string()))
+            .is_some_and(|columns| columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlTableReference {
     database: Option<String>,
@@ -1271,6 +1279,53 @@ impl SemanticsProvider for DbSemanticsProvider {
         let offset = snapshot.offset_for_anchor(&position);
         let text = snapshot.text();
 
+        // Try a real AST-based resolution first: it parses the statement
+        // under the cursor with `sqlparser` and walks a scope-stack binder,
+        // handling constructs (CTEs, derived tables, nested subqueries) the
+        // heuristic scanner below only partially covers. It returns `None`
+        // both when the statement doesn't fully parse (most commonly because
+        // it is still being typed) and when the token doesn't resolve to a
+        // concrete table/column -- either way, the heuristic scanner below
+        // remains the fallback and its behavior is unchanged.
+        if let Some((target, range)) = self.ast_definition_target(&text, offset, cx) {
+            let connection_id = self.connection_id;
+            let word_start = snapshot.anchor_before(range.start);
+            let word_end = snapshot.anchor_after(range.end);
+            match target {
+                AstDefinitionTarget::Table { database, table } => {
+                    return Some(self.spawn_ddl_navigation(
+                        buffer.clone(),
+                        word_start..word_end,
+                        None,
+                        cx,
+                        move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                    ));
+                }
+                AstDefinitionTarget::Database { database } => {
+                    return Some(self.spawn_ddl_navigation(
+                        buffer.clone(),
+                        word_start..word_end,
+                        None,
+                        cx,
+                        move |store, cx| store.get_database_ddl(connection_id, database, cx),
+                    ));
+                }
+                AstDefinitionTarget::Column {
+                    database,
+                    table,
+                    column,
+                } => {
+                    return Some(self.spawn_ddl_navigation(
+                        buffer.clone(),
+                        word_start..word_end,
+                        Some(column),
+                        cx,
+                        move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                    ));
+                }
+            }
+        }
+
         if let Some(table_reference) = statement_table_reference_at_offset(&text, offset) {
             let database_opt = table_reference.database;
             let table_name = table_reference.table;
@@ -1581,7 +1636,80 @@ impl SemanticsProvider for DbSemanticsProvider {
     }
 }
 
+enum AstDefinitionTarget {
+    Table {
+        database: String,
+        table: String,
+    },
+    Database {
+        database: String,
+    },
+    Column {
+        database: String,
+        table: String,
+        column: String,
+    },
+}
+
 impl DbSemanticsProvider {
+    /// Resolves the token at `offset` via the AST scope-stack binder
+    /// (`sql_binder`), reading only the connection's cached schema -- never a
+    /// live connection. Returns `None` when the statement doesn't fully parse,
+    /// the token doesn't resolve to a concrete table/column, or no database
+    /// can be determined (no explicit qualifier and no connection default);
+    /// each case is the caller's signal to fall back to the heuristic scanner.
+    fn ast_definition_target(
+        &self,
+        text: &str,
+        offset: usize,
+        cx: &App,
+    ) -> Option<(AstDefinitionTarget, std::ops::Range<usize>)> {
+        self.store
+            .read_with(cx, |store, _| {
+                let conn = store
+                    .connections
+                    .iter()
+                    .find(|c| c.config.id == self.connection_id)?;
+                let default_database = conn
+                    .config
+                    .database
+                    .clone()
+                    .filter(|database| !database.is_empty())
+                    .or_else(|| conn.expanded_databases.keys().next().cloned());
+                let (target, range) = crate::sql_binder::resolve_navigation_at(
+                    text,
+                    conn.config.driver,
+                    offset,
+                    default_database.as_deref(),
+                    conn,
+                )?;
+                let target = match target {
+                    crate::sql_binder::NavigationTarget::Table { database, table, .. } => {
+                        AstDefinitionTarget::Table {
+                            database: database.or(default_database)?,
+                            table,
+                        }
+                    }
+                    crate::sql_binder::NavigationTarget::Database { database, .. } => {
+                        AstDefinitionTarget::Database { database }
+                    }
+                    crate::sql_binder::NavigationTarget::Column {
+                        database,
+                        table,
+                        column,
+                        ..
+                    } => AstDefinitionTarget::Column {
+                        database: database.or(default_database)?,
+                        table,
+                        column,
+                    },
+                };
+                Some((target, range))
+            })
+            .ok()
+            .flatten()
+    }
+
     fn spawn_ddl_navigation(
         &self,
         source_buffer: Entity<Buffer>,
