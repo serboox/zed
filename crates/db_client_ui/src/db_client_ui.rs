@@ -11,6 +11,7 @@ mod modify_table;
 pub mod native_dump;
 mod panel;
 mod result_view;
+mod sql_ast;
 mod sql_completion_provider;
 mod store;
 mod widgets;

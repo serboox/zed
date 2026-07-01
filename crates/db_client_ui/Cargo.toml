@@ -44,6 +44,7 @@ serde_json.workspace = true
 settings.workspace = true
 sha2.workspace = true
 smol.workspace = true
+sqlparser = { version = "0.62", features = ["visitor"] }
 subtle = "2.6"
 terminal_view.workspace = true
 theme.workspace = true
