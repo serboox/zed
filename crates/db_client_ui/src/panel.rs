@@ -629,8 +629,33 @@ fn find_column_definition_offset(ddl: &str, column: &str) -> Option<usize> {
     None
 }
 
+// Byte index of the `)` matching the innermost open scope that starts at
+// `scope_start` (as returned by `innermost_scope_start`), or the end of `text`
+// when `scope_start` is 0 (the cursor is not inside a subquery).
+fn innermost_scope_end(text: &str, scope_start: usize) -> usize {
+    if scope_start == 0 {
+        return text.len();
+    }
+    let mut depth = 0i32;
+    for (index, ch) in text[scope_start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return scope_start + index;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
 // Tables referenced by the `;`-delimited statement containing `offset`, used to
-// resolve a column's `alias`/`table` qualifier and to scope a bare column.
+// resolve a column's `alias`/`table` qualifier and to scope a bare column. When
+// `offset` sits inside a subquery, only that subquery's own FROM/JOIN tables are
+// considered, so a reused alias in an outer query never shadows the inner one.
 fn from_tables_at_offset(text: &str, offset: usize) -> Vec<crate::sql_completion_provider::TableRef> {
     let cursor = offset.min(text.len());
     let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
@@ -638,7 +663,534 @@ fn from_tables_at_offset(text: &str, offset: usize) -> Vec<crate::sql_completion
         .find(';')
         .map(|index| cursor + index)
         .unwrap_or(text.len());
-    crate::sql_completion_provider::parse_table_refs(&text[statement_start..statement_end])
+    let statement = &text[statement_start..statement_end];
+    let relative_cursor = (cursor - statement_start).min(statement.len());
+    let scope_start = crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
+    let scope_end = innermost_scope_end(statement, scope_start);
+    crate::sql_completion_provider::parse_table_refs(&statement[scope_start..scope_end])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InsertColumnContext {
+    database: Option<String>,
+    table: String,
+    // Absolute byte span of the parenthesized `(col, col, ...)` list right
+    // after `INSERT INTO table`, when the statement has an explicit one.
+    column_list: Option<(usize, usize)>,
+    // Absolute byte offset where the body of a MySQL `ON DUPLICATE KEY
+    // UPDATE` clause starts, when the statement has one.
+    on_duplicate_key_update: Option<usize>,
+}
+
+// `INSERT [IGNORE] INTO <table>`, so column-list and `ON DUPLICATE KEY
+// UPDATE` navigation share the same target-table resolution as a plain
+// `INSERT INTO` table click.
+fn insert_into_target(sql: &str) -> Option<SqlTableReference> {
+    let bytes = sql.as_bytes();
+    let mut index = skip_sql_whitespace(bytes, 0);
+    if !keyword_at(bytes, index, b"insert") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"insert".len());
+    if keyword_at(bytes, index, b"ignore") {
+        index = skip_sql_whitespace(bytes, index + b"ignore".len());
+    }
+    if !keyword_at(bytes, index, b"into") {
+        return None;
+    }
+    table_reference_after(bytes, sql, index + b"into".len())
+}
+
+// Byte offset right after `ON DUPLICATE KEY UPDATE`, so callers can treat
+// everything from there to the end of the statement as column assignments
+// against the INSERT target table (MySQL-specific upsert clause).
+fn find_on_duplicate_key_update(statement: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if keyword_at(bytes, index, b"on") {
+            let mut probe = skip_sql_whitespace(bytes, index + b"on".len());
+            if keyword_at(bytes, probe, b"duplicate") {
+                probe = skip_sql_whitespace(bytes, probe + b"duplicate".len());
+                if keyword_at(bytes, probe, b"key") {
+                    probe = skip_sql_whitespace(bytes, probe + b"key".len());
+                    if keyword_at(bytes, probe, b"update") {
+                        return Some(skip_sql_whitespace(bytes, probe + b"update".len()));
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+// INSERT-target context for the `;`-delimited statement containing `offset`,
+// so a column in the `INSERT INTO table (col, col, ...)` list or in an `ON
+// DUPLICATE KEY UPDATE col = VALUES(col)` clause resolves against the INSERT
+// target table instead of the trailing SELECT's FROM tables.
+fn insert_column_context_at_offset(text: &str, offset: usize) -> Option<InsertColumnContext> {
+    let cursor = offset.min(text.len());
+    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_end = text[cursor..]
+        .find(';')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len());
+    let statement = &text[statement_start..statement_end];
+    let target = insert_into_target(statement)?;
+    let bytes = statement.as_bytes();
+    let after_table = skip_sql_whitespace(bytes, target.end);
+
+    let column_list = if bytes.get(after_table) == Some(&b'(') {
+        let mut depth = 0i32;
+        let mut span = None;
+        for (index, ch) in statement[after_table..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        span = Some((
+                            statement_start + after_table + 1,
+                            statement_start + after_table + index,
+                        ));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        span
+    } else {
+        None
+    };
+
+    let on_duplicate_key_update =
+        find_on_duplicate_key_update(statement).map(|local_offset| statement_start + local_offset);
+
+    Some(InsertColumnContext {
+        database: target.database,
+        table: target.table,
+        column_list,
+        on_duplicate_key_update,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivedTableRef {
+    alias: String,
+    // Lowercased projected column name -> resolved real (schema, table,
+    // column). A computed projection (e.g. an aggregate) maps to the first
+    // real column referenced inside its expression, since that is the
+    // closest useful navigation target when there is no single source column.
+    projections: HashMap<String, (Option<String>, String, String)>,
+}
+
+// Derived-table aliases (`FROM (SELECT ...) alias`) visible from `offset`,
+// scoped the same way as `from_tables_at_offset` so a click on `q1.col` in an
+// outer query resolves through the derived table to its real source column.
+fn derived_tables_at_offset(text: &str, offset: usize) -> Vec<DerivedTableRef> {
+    let cursor = offset.min(text.len());
+    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_end = text[cursor..]
+        .find(';')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len());
+    let statement = &text[statement_start..statement_end];
+    let relative_cursor = (cursor - statement_start).min(statement.len());
+    let scope_start = crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
+    let scope_end = innermost_scope_end(statement, scope_start);
+    derived_tables_in_scope(&statement[scope_start..scope_end])
+}
+
+// Scans `scope` for `(SELECT ...) [AS] alias` derived tables directly in its
+// own FROM/JOIN list (one nesting level: the subquery's own FROM tables must
+// be real tables, not further derived tables), skipping every other
+// parenthesized span (function calls, ON-clause groups, nested subqueries)
+// entirely so it never misreads their contents as a derived table.
+fn derived_tables_in_scope(scope: &str) -> Vec<DerivedTableRef> {
+    let bytes = scope.as_bytes();
+    let mut derived = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'(' {
+            index += 1;
+            continue;
+        }
+        let starts_derived_table = matches!(
+            word_before(scope, bytes, index).as_deref(),
+            Some("from") | Some("join")
+        );
+        if !starts_derived_table {
+            index += 1;
+            continue;
+        }
+
+        let inner_start = index + 1;
+        let mut depth = 1i32;
+        let mut inner_end = None;
+        for (relative, ch) in scope[inner_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        inner_end = Some(inner_start + relative);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(inner_end) = inner_end else {
+            break;
+        };
+
+        let subquery = &scope[inner_start..inner_end];
+        let mut alias_start = skip_sql_whitespace(bytes, inner_end + 1);
+        if keyword_at(bytes, alias_start, b"as") {
+            alias_start = skip_sql_whitespace(bytes, alias_start + b"as".len());
+        }
+        let mut alias_end = alias_start;
+        while alias_end < bytes.len() && is_sql_word_byte(bytes[alias_end]) {
+            alias_end += 1;
+        }
+        if alias_end > alias_start && subquery.trim_start().to_ascii_lowercase().starts_with("select") {
+            derived.push(DerivedTableRef {
+                alias: scope[alias_start..alias_end].to_string(),
+                projections: derived_table_projections(subquery),
+            });
+        }
+        index = inner_end + 1;
+    }
+    derived
+}
+
+// Byte range of `subquery`'s own SELECT list (before its top-level FROM),
+// respecting parenthesized function calls so a `FROM` inside one is ignored.
+fn extract_select_list(subquery: &str) -> Option<&str> {
+    let bytes = subquery.as_bytes();
+    let mut index = skip_sql_whitespace(bytes, 0);
+    if !keyword_at(bytes, index, b"select") {
+        return None;
+    }
+    index = skip_sql_whitespace(bytes, index + b"select".len());
+    if keyword_at(bytes, index, b"distinct") {
+        index = skip_sql_whitespace(bytes, index + b"distinct".len());
+    }
+    let list_start = index;
+    let mut depth = 0i32;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && keyword_at(bytes, index, b"from") => {
+                return Some(&subquery[list_start..index]);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(&subquery[list_start..])
+}
+
+// Splits a comma-separated list at top level only, so commas inside a
+// function call or nested subquery do not split its arguments apart.
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&text[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+// Splits a SELECT-list item into its expression and an explicit trailing `AS
+// alias`, matched only at top level so an `AS` inside a function call/subquery
+// is ignored.
+fn split_projection_alias(item: &str) -> (&str, Option<String>) {
+    let bytes = item.as_bytes();
+    let mut depth = 0i32;
+    let mut as_start = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && keyword_at(bytes, index, b"as") => {
+                as_start = Some(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if let Some(as_start) = as_start {
+        let expr = item[..as_start].trim_end();
+        let alias_start = skip_sql_whitespace(bytes, as_start + b"as".len());
+        let mut alias_end = alias_start;
+        while alias_end < bytes.len() && is_sql_word_byte(bytes[alias_end]) {
+            alias_end += 1;
+        }
+        if alias_end > alias_start {
+            return (expr, Some(item[alias_start..alias_end].to_string()));
+        }
+    }
+    (item.trim(), None)
+}
+
+// First `qualifier.column` reference found in `expr`, scanning left to right.
+// For a plain pass-through item (`qdt.col`) this is the item itself; for a
+// computed expression (`GROUP_CONCAT(qdt.col SEPARATOR ' ')`) it is the
+// closest known source column, used as the navigation fallback.
+fn first_qualified_reference(expr: &str) -> Option<(String, String)> {
+    let bytes = expr.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !is_sql_word_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let word_start = index;
+        while index < bytes.len() && is_sql_word_byte(bytes[index]) {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'.') {
+            let qualifier = expr[word_start..index].to_string();
+            let column_start = index + 1;
+            let mut column_end = column_start;
+            while column_end < bytes.len() && is_sql_word_byte(bytes[column_end]) {
+                column_end += 1;
+            }
+            if column_end > column_start {
+                return Some((qualifier, expr[column_start..column_end].to_string()));
+            }
+        }
+    }
+    None
+}
+
+// Maps each projected column of `subquery` (a derived table's own SELECT
+// list) to its resolved real (schema, table, column) source, using the
+// subquery's own FROM/JOIN tables. An item with no identifiable source column
+// (a literal, `*`, or a pure output alias) is skipped rather than guessed.
+fn derived_table_projections(subquery: &str) -> HashMap<String, (Option<String>, String, String)> {
+    let mut projections = HashMap::default();
+    let Some(select_list) = extract_select_list(subquery) else {
+        return projections;
+    };
+    let tables = crate::sql_completion_provider::parse_table_refs(subquery);
+    for item in split_top_level_commas(select_list) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (expr, explicit_alias) = split_projection_alias(item);
+        let Some((qualifier, column)) = first_qualified_reference(expr) else {
+            continue;
+        };
+        let Some(table_ref) = crate::sql_completion_provider::resolve_table_ref(&qualifier, &tables)
+        else {
+            continue;
+        };
+        let projected_name = explicit_alias.unwrap_or_else(|| column.clone());
+        projections.insert(
+            projected_name.to_ascii_lowercase(),
+            (table_ref.schema.clone(), table_ref.name.clone(), column),
+        );
+    }
+    projections
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlDocKeyword {
+    Select,
+    From,
+    Where,
+    Join,
+    GroupBy,
+    Having,
+    OrderBy,
+    Limit,
+    Insert,
+    Update,
+    Delete,
+    CreateTable,
+    AlterTable,
+    DropTable,
+    Union,
+    Distinct,
+}
+
+fn word_before(text: &str, bytes: &[u8], offset: usize) -> Option<String> {
+    let mut index = offset;
+    while index > 0 && bytes[index - 1].is_ascii_whitespace() {
+        index -= 1;
+    }
+    let word_end = index;
+    while index > 0 && is_sql_word_byte(bytes[index - 1]) {
+        index -= 1;
+    }
+    if index == word_end {
+        return None;
+    }
+    Some(text[index..word_end].to_ascii_lowercase())
+}
+
+fn word_after(text: &str, bytes: &[u8], offset: usize) -> Option<String> {
+    let start = skip_sql_whitespace(bytes, offset);
+    let mut end = start;
+    while end < bytes.len() && is_sql_word_byte(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(text[start..end].to_ascii_lowercase())
+}
+
+// Recognizes a reserved SQL keyword at `offset`, so Ctrl+click on it can open
+// the connected driver's documentation. Runs as the last resort in
+// `definitions()`, after table/database/column resolution already failed, so
+// a real identifier that happens to share a keyword's spelling is never
+// shadowed by this lookup.
+fn sql_doc_keyword_at_offset(text: &str, offset: usize) -> Option<SqlDocKeyword> {
+    let bytes = text.as_bytes();
+    let mut start = offset.min(bytes.len());
+    while start > 0 && is_sql_word_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = offset.min(bytes.len());
+    while end < bytes.len() && is_sql_word_byte(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    let word = text[start..end].to_ascii_lowercase();
+
+    match word.as_str() {
+        "select" => Some(SqlDocKeyword::Select),
+        "from" => Some(SqlDocKeyword::From),
+        "where" => Some(SqlDocKeyword::Where),
+        "join" | "inner" | "left" | "right" | "full" | "cross" => Some(SqlDocKeyword::Join),
+        "group" => Some(SqlDocKeyword::GroupBy),
+        "having" => Some(SqlDocKeyword::Having),
+        "order" => Some(SqlDocKeyword::OrderBy),
+        "by" => match word_before(text, bytes, start).as_deref() {
+            Some("group") => Some(SqlDocKeyword::GroupBy),
+            Some("order") => Some(SqlDocKeyword::OrderBy),
+            _ => None,
+        },
+        "limit" => Some(SqlDocKeyword::Limit),
+        "insert" => Some(SqlDocKeyword::Insert),
+        "update" => Some(SqlDocKeyword::Update),
+        "delete" => Some(SqlDocKeyword::Delete),
+        "union" => Some(SqlDocKeyword::Union),
+        "distinct" => Some(SqlDocKeyword::Distinct),
+        "create" if word_after(text, bytes, end).as_deref() == Some("table") => {
+            Some(SqlDocKeyword::CreateTable)
+        }
+        "alter" if word_after(text, bytes, end).as_deref() == Some("table") => {
+            Some(SqlDocKeyword::AlterTable)
+        }
+        "drop" if word_after(text, bytes, end).as_deref() == Some("table") => {
+            Some(SqlDocKeyword::DropTable)
+        }
+        "table" => match word_before(text, bytes, start).as_deref() {
+            Some("create") => Some(SqlDocKeyword::CreateTable),
+            Some("alter") => Some(SqlDocKeyword::AlterTable),
+            Some("drop") => Some(SqlDocKeyword::DropTable),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Official reference-manual URL for `keyword` under `driver`, verified against
+// each vendor's current docs site. MySQL/PostgreSQL/SQLite document most
+// SELECT-clause keywords on one shared statement page (no per-clause anchor);
+// ClickHouse publishes a dedicated subpage per clause. Redis has no SQL
+// grammar, so it never resolves.
+fn sql_doc_url_for(driver: DatabaseDriver, keyword: SqlDocKeyword) -> Option<String> {
+    use SqlDocKeyword::*;
+    let url = match driver {
+        DatabaseDriver::MySQL => {
+            const BASE: &str = "https://dev.mysql.com/doc/refman/8.4/en/";
+            match keyword {
+                Select | From | Where | GroupBy | Having | OrderBy | Limit | Distinct => {
+                    format!("{BASE}select.html")
+                }
+                Join => format!("{BASE}join.html"),
+                Insert => format!("{BASE}insert.html"),
+                Update => format!("{BASE}update.html"),
+                Delete => format!("{BASE}delete.html"),
+                CreateTable => format!("{BASE}create-table.html"),
+                AlterTable => format!("{BASE}alter-table.html"),
+                DropTable => format!("{BASE}drop-table.html"),
+                Union => format!("{BASE}union.html"),
+            }
+        }
+        DatabaseDriver::PostgreSQL => {
+            const BASE: &str = "https://www.postgresql.org/docs/current/";
+            match keyword {
+                Select | From | Where | Join | GroupBy | Having | OrderBy | Limit | Union
+                | Distinct => format!("{BASE}sql-select.html"),
+                Insert => format!("{BASE}sql-insert.html"),
+                Update => format!("{BASE}sql-update.html"),
+                Delete => format!("{BASE}sql-delete.html"),
+                CreateTable => format!("{BASE}sql-createtable.html"),
+                AlterTable => format!("{BASE}sql-altertable.html"),
+                DropTable => format!("{BASE}sql-droptable.html"),
+            }
+        }
+        DatabaseDriver::SQLite => {
+            const BASE: &str = "https://sqlite.org/";
+            match keyword {
+                Select | From | Where | Join | GroupBy | Having | OrderBy | Limit | Union
+                | Distinct => format!("{BASE}lang_select.html"),
+                Insert => format!("{BASE}lang_insert.html"),
+                Update => format!("{BASE}lang_update.html"),
+                Delete => format!("{BASE}lang_delete.html"),
+                CreateTable => format!("{BASE}lang_createtable.html"),
+                AlterTable => format!("{BASE}lang_altertable.html"),
+                DropTable => format!("{BASE}lang_droptable.html"),
+            }
+        }
+        DatabaseDriver::ClickHouse => {
+            const BASE: &str = "https://clickhouse.com/docs/sql-reference/statements/";
+            match keyword {
+                Select => format!("{BASE}select"),
+                From => format!("{BASE}select/from"),
+                Where => format!("{BASE}select/where"),
+                Join => format!("{BASE}select/join"),
+                GroupBy => format!("{BASE}select/group-by"),
+                Having => format!("{BASE}select/having"),
+                OrderBy => format!("{BASE}select/order-by"),
+                Limit => format!("{BASE}select/limit"),
+                Union => format!("{BASE}select/union"),
+                Distinct => format!("{BASE}select/distinct"),
+                Insert => format!("{BASE}insert-into"),
+                Update => format!("{BASE}update"),
+                Delete => format!("{BASE}delete"),
+                CreateTable => format!("{BASE}create/table"),
+                AlterTable => format!("{BASE}alter"),
+                DropTable => format!("{BASE}drop"),
+            }
+        }
+        DatabaseDriver::Redis => return None,
+    };
+    Some(url)
 }
 
 impl SemanticsProvider for DbSemanticsProvider {
@@ -766,7 +1318,103 @@ impl SemanticsProvider for DbSemanticsProvider {
             ));
         }
 
+        // An INSERT column list or `ON DUPLICATE KEY UPDATE`/`VALUES(...)`
+        // column always belongs to the INSERT target table, never to the
+        // trailing SELECT's FROM tables, so this runs ahead of the generic
+        // column resolution below.
+        if let Some(insert_context) = insert_column_context_at_offset(&text, offset) {
+            let in_column_list = insert_context
+                .column_list
+                .is_some_and(|(start, end)| offset >= start && offset <= end);
+            let in_on_duplicate_key_update = insert_context
+                .on_duplicate_key_update
+                .is_some_and(|start| offset >= start);
+            if in_column_list || in_on_duplicate_key_update {
+                if let Some(column_reference) = column_reference_at_offset(&text, offset) {
+                    if column_reference.qualifier.is_none()
+                        && !column_reference.column.eq_ignore_ascii_case("values")
+                    {
+                        let database = self
+                            .store
+                            .read_with(cx, |store, _| {
+                                let conn = store
+                                    .connections
+                                    .iter()
+                                    .find(|c| c.config.id == self.connection_id)?;
+                                insert_context.database.clone().or_else(|| {
+                                    conn.config
+                                        .database
+                                        .clone()
+                                        .filter(|database| !database.is_empty())
+                                        .or_else(|| conn.expanded_databases.keys().next().cloned())
+                                })
+                            })
+                            .ok()
+                            .flatten();
+                        if let Some(database) = database {
+                            let word_start = snapshot.anchor_before(column_reference.start);
+                            let word_end = snapshot.anchor_after(column_reference.end);
+                            let connection_id = self.connection_id;
+                            let table = insert_context.table;
+                            let focus_column = column_reference.column;
+                            return Some(self.spawn_ddl_navigation(
+                                buffer.clone(),
+                                word_start..word_end,
+                                Some(focus_column),
+                                cx,
+                                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(column_reference) = column_reference_at_offset(&text, offset) {
+            if let Some(qualifier) = &column_reference.qualifier {
+                let derived_tables = derived_tables_at_offset(&text, offset);
+                if let Some(derived) = derived_tables
+                    .iter()
+                    .find(|derived| derived.alias.eq_ignore_ascii_case(qualifier))
+                {
+                    if let Some((schema, table, real_column)) = derived
+                        .projections
+                        .get(&column_reference.column.to_ascii_lowercase())
+                        .cloned()
+                    {
+                        let database = self
+                            .store
+                            .read_with(cx, |store, _| {
+                                let conn = store
+                                    .connections
+                                    .iter()
+                                    .find(|c| c.config.id == self.connection_id)?;
+                                schema.clone().or_else(|| {
+                                    conn.config
+                                        .database
+                                        .clone()
+                                        .filter(|database| !database.is_empty())
+                                        .or_else(|| conn.expanded_databases.keys().next().cloned())
+                                })
+                            })
+                            .ok()
+                            .flatten();
+                        if let Some(database) = database {
+                            let word_start = snapshot.anchor_before(column_reference.start);
+                            let word_end = snapshot.anchor_after(column_reference.end);
+                            let connection_id = self.connection_id;
+                            return Some(self.spawn_ddl_navigation(
+                                buffer.clone(),
+                                word_start..word_end,
+                                Some(real_column),
+                                cx,
+                                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                            ));
+                        }
+                    }
+                }
+            }
+
             let from_tables = from_tables_at_offset(&text, offset);
             let candidates: Vec<(Option<String>, String)> = match &column_reference.qualifier {
                 Some(qualifier) => {
@@ -853,11 +1501,33 @@ impl SemanticsProvider for DbSemanticsProvider {
             }
         }
 
+        // Reserved keywords are never valid unquoted identifiers, so this check
+        // runs ahead of the bare-word table fallback below: a real table can
+        // never be literally named `select`/`join`/etc. without quoting, which
+        // this lexer would tokenize differently anyway.
+        if let Some(keyword) = sql_doc_keyword_at_offset(&text, offset) {
+            let driver = self
+                .store
+                .read_with(cx, |store, _| {
+                    store
+                        .connections
+                        .iter()
+                        .find(|c| c.config.id == self.connection_id)
+                        .map(|c| c.config.driver)
+                })
+                .ok()
+                .flatten();
+            if let Some(url) = driver.and_then(|driver| sql_doc_url_for(driver, keyword)) {
+                cx.open_url(&url);
+            }
+            return Some(Task::ready(Ok(None)));
+        }
+
         if let Some(table_reference) = table_reference_at_offset(&text, offset) {
             let database_opt = table_reference.database;
             let table_name = table_reference.table;
 
-            let (database, table) = self
+            let resolved = self
                 .store
                 .read_with(cx, |store, _| {
                     let conn = store
@@ -873,17 +1543,19 @@ impl SemanticsProvider for DbSemanticsProvider {
                     Some((db, table_name.clone()))
                 })
                 .ok()
-                .flatten()?;
-            let word_start = snapshot.anchor_before(table_reference.start);
-            let word_end = snapshot.anchor_after(table_reference.end);
-            let connection_id = self.connection_id;
-            return Some(self.spawn_ddl_navigation(
-                buffer.clone(),
-                word_start..word_end,
-                None,
-                cx,
-                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
-            ));
+                .flatten();
+            if let Some((database, table)) = resolved {
+                let word_start = snapshot.anchor_before(table_reference.start);
+                let word_end = snapshot.anchor_after(table_reference.end);
+                let connection_id = self.connection_id;
+                return Some(self.spawn_ddl_navigation(
+                    buffer.clone(),
+                    word_start..word_end,
+                    None,
+                    cx,
+                    move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                ));
+            }
         }
 
         None
@@ -6300,6 +6972,162 @@ mod tests {
     }
 
     #[test]
+    fn from_tables_at_offset_resolves_alias_before_from_in_select_list() {
+        let text = "SELECT s.opera FROM instruments.splits AS s WHERE s.operation;";
+        let offset = text.find("opera").expect("column in sql");
+        let tables = super::from_tables_at_offset(text, offset);
+
+        let resolved = crate::sql_completion_provider::resolve_table_ref("s", &tables)
+            .expect("alias resolves from a SELECT-list offset before FROM is parsed");
+        assert_eq!(resolved.name, "splits");
+        assert_eq!(resolved.schema.as_deref(), Some("instruments"));
+    }
+
+    #[test]
+    fn from_tables_at_offset_scopes_a_reused_alias_to_its_own_subquery() {
+        let text = "SELECT outer_s.name FROM accounts AS outer_s WHERE outer_s.id IN \
+            (SELECT inner_s.id FROM instruments.splits AS inner_s WHERE inner_s.operation = 1)";
+        let inner_offset = text.rfind("inner_s.operation").expect("inner column in sql");
+        let inner_tables = super::from_tables_at_offset(text, inner_offset);
+        let inner_resolved = crate::sql_completion_provider::resolve_table_ref("inner_s", &inner_tables)
+            .expect("subquery alias resolves");
+        assert_eq!(inner_resolved.name, "splits");
+        assert!(
+            crate::sql_completion_provider::resolve_table_ref("outer_s", &inner_tables).is_none(),
+            "the outer query's alias must not leak into the subquery's scope"
+        );
+
+        let outer_offset = text.find("outer_s.name").expect("outer column in sql");
+        let outer_tables = super::from_tables_at_offset(text, outer_offset);
+        let outer_resolved = crate::sql_completion_provider::resolve_table_ref("outer_s", &outer_tables)
+            .expect("outer alias resolves");
+        assert_eq!(outer_resolved.name, "accounts");
+    }
+
+    #[test]
+    fn from_tables_at_offset_resolves_real_table_three_levels_deep_in_nested_where_in() {
+        let text = "SELECT 1 FROM t1 WHERE t1.id IN \
+            (SELECT id FROM t2 WHERE id IN \
+            (SELECT id FROM t3 WHERE t3.flag = 1))";
+        let offset = text.rfind("t3.flag").expect("column in sql");
+        let tables = super::from_tables_at_offset(text, offset);
+
+        let resolved = crate::sql_completion_provider::resolve_table_ref("t3", &tables)
+            .expect("innermost table resolves three levels deep");
+        assert_eq!(resolved.name, "t3");
+        assert!(
+            crate::sql_completion_provider::resolve_table_ref("t1", &tables).is_none(),
+            "the outermost scope must not leak into the innermost subquery"
+        );
+    }
+
+    #[test]
+    fn insert_column_context_resolves_column_list_to_target_table() {
+        let text =
+            "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname) SELECT 1, 2, 3;";
+        let offset = text.find("shortname").expect("column in sql") + 2;
+        let context = super::insert_column_context_at_offset(text, offset).expect("insert context");
+        assert_eq!(context.database.as_deref(), Some("ec_fmedia"));
+        assert_eq!(context.table, "quotes_pair_translate");
+        let (start, end) = context.column_list.expect("column list span");
+        assert!(offset >= start && offset <= end);
+        assert_eq!(&text[start..end], "pair_ID, lang_id, shortname");
+    }
+
+    #[test]
+    fn insert_column_context_finds_on_duplicate_key_update_span() {
+        let text =
+            "INSERT INTO t (a, b) SELECT 1, 2 ON DUPLICATE KEY UPDATE a = VALUES(a), b = VALUES(b);";
+        let context = super::insert_column_context_at_offset(text, 0).expect("insert context");
+        assert_eq!(context.table, "t");
+        let clause_start = context.on_duplicate_key_update.expect("clause span");
+        assert_eq!(&text[clause_start..clause_start + 1], "a");
+
+        let values_a_offset = text.find("VALUES(a)").expect("VALUES call") + "VALUES(".len();
+        assert!(values_a_offset >= clause_start);
+    }
+
+    #[test]
+    fn derived_table_projections_resolve_simple_passthrough_and_computed_columns() {
+        let subquery = "SELECT qdt.currency_ID, qca.currency_short_name, qdt.lang_id, \
+            GROUP_CONCAT(qdt.fullname SEPARATOR ' ') AS fullname \
+            FROM ec_fmedia.quotes_currency_attr qca \
+            LEFT JOIN ec_fmedia.quotes_currency_dat_trans qdt ON qca.currency_ID = qdt.currency_ID \
+            GROUP BY qdt.lang_id, qdt.currency_ID";
+        let projections = super::derived_table_projections(subquery);
+
+        assert_eq!(
+            projections.get("currency_id"),
+            Some(&(
+                Some("ec_fmedia".to_string()),
+                "quotes_currency_dat_trans".to_string(),
+                "currency_ID".to_string()
+            ))
+        );
+        assert_eq!(
+            projections.get("currency_short_name"),
+            Some(&(
+                Some("ec_fmedia".to_string()),
+                "quotes_currency_attr".to_string(),
+                "currency_short_name".to_string()
+            ))
+        );
+        assert_eq!(
+            projections.get("lang_id"),
+            Some(&(
+                Some("ec_fmedia".to_string()),
+                "quotes_currency_dat_trans".to_string(),
+                "lang_id".to_string()
+            ))
+        );
+        assert_eq!(
+            projections.get("fullname"),
+            Some(&(
+                Some("ec_fmedia".to_string()),
+                "quotes_currency_dat_trans".to_string(),
+                "fullname".to_string()
+            )),
+            "a computed aggregate falls back to the table of its first referenced column"
+        );
+    }
+
+    #[test]
+    fn derived_tables_at_offset_resolves_alias_from_outer_select_list() {
+        let text = "SELECT q1.lang_id, q1.currency_ID \
+            FROM (SELECT qdt.currency_ID, qdt.lang_id FROM ec_fmedia.quotes_currency_dat_trans qdt) q1 \
+            JOIN (SELECT qdt.currency_ID FROM ec_fmedia.quotes_currency_dat_trans qdt) q2 \
+            ON q1.lang_id = q2.currency_ID;";
+        let offset = text.find("q1.lang_id").expect("outer column reference");
+        let derived_tables = super::derived_tables_at_offset(text, offset);
+
+        let q1 = derived_tables
+            .iter()
+            .find(|derived| derived.alias == "q1")
+            .expect("q1 recognized as a derived table");
+        assert_eq!(
+            q1.projections.get("lang_id"),
+            Some(&(
+                Some("ec_fmedia".to_string()),
+                "quotes_currency_dat_trans".to_string(),
+                "lang_id".to_string()
+            ))
+        );
+        assert!(
+            derived_tables.iter().any(|derived| derived.alias == "q2"),
+            "q2 recognized as a derived table alongside q1"
+        );
+    }
+
+    #[test]
+    fn column_reference_at_offset_treats_output_only_select_alias_as_unqualified() {
+        let text = "SELECT CONCAT(a.x, b.y) AS pair_shortname FROM a, b;";
+        let offset = text.find("pair_shortname").expect("alias in sql") + 3;
+        let reference = super::column_reference_at_offset(text, offset).expect("column reference");
+        assert_eq!(reference.qualifier, None);
+        assert_eq!(reference.column, "pair_shortname");
+    }
+
+    #[test]
     fn find_column_definition_offset_matches_backtick_quoted_column() {
         let ddl = "CREATE TABLE `splits` (\n  `id` bigint NOT NULL,\n  `operation` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n)";
         let offset = super::find_column_definition_offset(ddl, "operation").expect("column found");
@@ -6327,6 +7155,123 @@ mod tests {
         let ddl = "CREATE TABLE `t` (\n  `operation_id` int,\n  `operation` varchar(8)\n)";
         let offset = super::find_column_definition_offset(ddl, "operation").expect("column found");
         assert!(ddl[offset..].starts_with("`operation` varchar"));
+    }
+
+    #[test]
+    fn sql_doc_keyword_at_offset_resolves_select_and_where() {
+        let text = "SELECT s.operation FROM instruments.splits AS s WHERE s.operation = 1;";
+        let select_offset = text.find("SELECT").unwrap() + 2;
+        let where_offset = text.find("WHERE").unwrap() + 2;
+
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, select_offset),
+            Some(super::SqlDocKeyword::Select)
+        );
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, where_offset),
+            Some(super::SqlDocKeyword::Where)
+        );
+    }
+
+    #[test]
+    fn sql_doc_keyword_at_offset_resolves_group_by_and_order_by_from_either_word() {
+        let text = "SELECT * FROM t GROUP BY a ORDER BY b";
+        let group_offset = text.find("GROUP").unwrap() + 1;
+        let by_after_group_offset = text.find("BY a").unwrap() + 1;
+        let order_offset = text.find("ORDER").unwrap() + 1;
+        let by_after_order_offset = text.rfind("BY b").unwrap() + 1;
+
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, group_offset),
+            Some(super::SqlDocKeyword::GroupBy)
+        );
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, by_after_group_offset),
+            Some(super::SqlDocKeyword::GroupBy)
+        );
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, order_offset),
+            Some(super::SqlDocKeyword::OrderBy)
+        );
+        assert_eq!(
+            super::sql_doc_keyword_at_offset(text, by_after_order_offset),
+            Some(super::SqlDocKeyword::OrderBy)
+        );
+    }
+
+    #[test]
+    fn sql_doc_keyword_at_offset_resolves_create_alter_drop_table_from_either_word() {
+        for (text, expected) in [
+            ("CREATE TABLE t (id int)", super::SqlDocKeyword::CreateTable),
+            ("ALTER TABLE t ADD COLUMN x int", super::SqlDocKeyword::AlterTable),
+            ("DROP TABLE t", super::SqlDocKeyword::DropTable),
+        ] {
+            let verb_offset = 1;
+            let table_offset = text.find("TABLE").unwrap() + 1;
+            assert_eq!(super::sql_doc_keyword_at_offset(text, verb_offset), Some(expected));
+            assert_eq!(super::sql_doc_keyword_at_offset(text, table_offset), Some(expected));
+        }
+    }
+
+    #[test]
+    fn sql_doc_keyword_at_offset_rejects_create_without_table() {
+        let text = "CREATE DATABASE db";
+        let offset = 1;
+        assert_eq!(super::sql_doc_keyword_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn sql_doc_keyword_at_offset_rejects_non_keyword_identifier() {
+        let text = "SELECT customer_id FROM orders";
+        let offset = text.find("customer_id").unwrap() + 1;
+        assert_eq!(super::sql_doc_keyword_at_offset(text, offset), None);
+    }
+
+    #[test]
+    fn sql_doc_url_for_covers_every_keyword_for_each_sql_driver() {
+        use super::{DatabaseDriver, SqlDocKeyword::*};
+
+        let all_keywords = [
+            Select, From, Where, Join, GroupBy, Having, OrderBy, Limit, Insert, Update, Delete,
+            CreateTable, AlterTable, DropTable, Union, Distinct,
+        ];
+        for driver in [
+            DatabaseDriver::MySQL,
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::SQLite,
+            DatabaseDriver::ClickHouse,
+        ] {
+            for keyword in all_keywords {
+                let url = super::sql_doc_url_for(driver, keyword)
+                    .unwrap_or_else(|| panic!("{driver:?} should document {keyword:?}"));
+                assert!(url.starts_with("https://"), "{driver:?}/{keyword:?} -> {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn sql_doc_url_for_mysql_matches_verified_reference_manual_urls() {
+        use super::{DatabaseDriver::MySQL, SqlDocKeyword::*};
+
+        assert_eq!(
+            super::sql_doc_url_for(MySQL, Select).as_deref(),
+            Some("https://dev.mysql.com/doc/refman/8.4/en/select.html")
+        );
+        assert_eq!(
+            super::sql_doc_url_for(MySQL, Join).as_deref(),
+            Some("https://dev.mysql.com/doc/refman/8.4/en/join.html")
+        );
+        assert_eq!(
+            super::sql_doc_url_for(MySQL, CreateTable).as_deref(),
+            Some("https://dev.mysql.com/doc/refman/8.4/en/create-table.html")
+        );
+    }
+
+    #[test]
+    fn sql_doc_url_for_redis_never_resolves() {
+        use super::{DatabaseDriver::Redis, SqlDocKeyword::Select};
+
+        assert_eq!(super::sql_doc_url_for(Redis, Select), None);
     }
 
     #[test]

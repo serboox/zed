@@ -347,7 +347,7 @@ fn split_qualified(raw: &str) -> (Option<String>, String) {
 /// Byte index just after the innermost unmatched `(` before the cursor, so
 /// FROM/JOIN scoping prefers a subquery's tables over the outer query. Zero
 /// when the cursor is not inside an open parenthesis.
-fn innermost_scope_start(statement_before: &str) -> usize {
+pub(crate) fn innermost_scope_start(statement_before: &str) -> usize {
     let mut open_stack: Vec<usize> = Vec::new();
     for (index, ch) in statement_before.char_indices() {
         if ch == '(' {
