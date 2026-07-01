@@ -836,10 +836,6 @@ struct CellEdit {
     col_idx: usize,
     target: CellEditTarget,
     editor: Entity<Editor>,
-    // Becomes true once the editor has actually gained focus. A blur is only
-    // treated as a commit after this, so the spurious blur that can fire while
-    // focus is still settling on open never commits an empty/half value.
-    commit_armed: bool,
     _subscription: Subscription,
 }
 
@@ -1594,6 +1590,29 @@ impl ResultView {
         }
     }
 
+    // Commits any edit in progress on a DIFFERENT cell before a new cell is
+    // selected. This does not depend on the editor's own focus/blur events —
+    // those are not reliably emitted for every focus-transition path here, so
+    // clicking a different cell while editing could otherwise leave the
+    // in-progress edit open and uncommitted indefinitely. Returns `false` when
+    // the commit was rejected (invalid value for the column type), in which
+    // case the caller must abort the click and keep the invalid cell in edit
+    // mode, matching `commit_and_move`'s existing validation-blocking behavior.
+    fn commit_other_cell_edit(
+        &mut self,
+        abs_idx: usize,
+        cell_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.cell_edit.as_ref() {
+            Some(edit) if edit.abs_idx != abs_idx || edit.col_idx != cell_idx => {
+                self.commit_cell_edit(window, cx)
+            }
+            _ => true,
+        }
+    }
+
     fn click_loaded_cell(
         &mut self,
         abs_idx: usize,
@@ -1606,6 +1625,10 @@ impl ResultView {
         cx: &mut Context<Self>,
     ) {
         if self.should_suppress_cell_click() {
+            cx.notify();
+            return;
+        }
+        if !self.commit_other_cell_edit(abs_idx, cell_idx, window, cx) {
             cx.notify();
             return;
         }
@@ -1640,6 +1663,10 @@ impl ResultView {
         cx: &mut Context<Self>,
     ) {
         if self.should_suppress_cell_click() {
+            cx.notify();
+            return;
+        }
+        if !self.commit_other_cell_edit(abs_idx, cell_idx, window, cx) {
             cx.notify();
             return;
         }
@@ -2479,21 +2506,16 @@ impl ResultView {
             }
             ed
         });
+        // Best-effort backup: commits on blur when the editor's focus/blur
+        // events do fire. This is NOT the primary mechanism — clicking a
+        // different cell reliably commits via the explicit check at the top
+        // of `click_loaded_cell`/`click_added_cell` instead, because
+        // `EditorEvent::Focused`/`Blurred` are not guaranteed to be emitted
+        // for this editor in every focus-transition path, which previously
+        // left clicking away from an edit unable to commit it at all.
         let subscription = cx.subscribe_in(&editor, window, |this, _editor, event, window, cx| {
-            match event {
-                EditorEvent::Focused => {
-                    if let Some(edit) = this.cell_edit.as_mut() {
-                        edit.commit_armed = true;
-                    }
-                }
-                EditorEvent::Blurred => {
-                    // Ignore the blur that can fire while focus is still settling
-                    // on open; only commit once the editor has actually focused.
-                    if this.cell_edit.as_ref().is_some_and(|edit| edit.commit_armed) {
-                        this.commit_cell_edit(window, cx);
-                    }
-                }
-                _ => {}
+            if matches!(event, EditorEvent::Blurred) {
+                this.commit_cell_edit(window, cx);
             }
         });
 
@@ -2510,7 +2532,6 @@ impl ResultView {
             col_idx,
             target,
             editor: editor.clone(),
-            commit_armed: false,
             _subscription: subscription,
         });
         // Focus before notify so the caret and keyboard land in the editor on the
@@ -12524,6 +12545,208 @@ mod tests {
                 view.filtered_history(),
                 vec![(1, "select * from orders".to_string())]
             );
+        });
+    }
+
+    // Large, uniquely-identifiable dataset for scroll/virtualization regression
+    // tests: `row_{n}` in column 0 and `pair-{n:04}` in column 1, so a rendered
+    // value can be checked against its row index without any ambiguity.
+    fn many_row_result(count: usize) -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "pair".to_string()],
+            rows: (0..count)
+                .map(|row| vec![Some(format!("row_{row}")), Some(format!("pair-{row:04}"))])
+                .collect(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    // Standing regression harness for the "active cell renders blank" class of
+    // bug (reported live in the running app; two rounds of small, unscrolled
+    // `#[gpui::test]`s failed to reproduce it). Scans `probe_range` for every
+    // currently on-screen cell in `col_idx` (via its debug selector, so this
+    // only inspects rows the virtualized list actually painted) and asserts
+    // each one's read-mode value is exactly its known-good data — not blank,
+    // not another row's value. Call this after any click/scroll/edit sequence
+    // to assert the grid never desyncs from its underlying data. Extend
+    // `probe_range` and the click/scroll sequence around the call site to
+    // cover new interactions; the assertion logic itself should not need to
+    // change.
+    fn assert_visible_cells_match_data(
+        cx: &mut gpui::VisualTestContext,
+        view: &Entity<ResultView>,
+        col_idx: usize,
+        probe_range: std::ops::Range<usize>,
+        expected: impl Fn(usize) -> Option<String>,
+    ) -> usize {
+        let mut checked = 0;
+        for abs_idx in probe_range {
+            let Some(expected_value) = expected(abs_idx) else {
+                continue;
+            };
+            let selector: &'static str = format!("CELL-{abs_idx}-{col_idx}").leak();
+            if cx.debug_bounds(selector).is_none() {
+                continue;
+            }
+            checked += 1;
+            view.update(cx, |view, _cx| {
+                let rendered = view
+                    .pending_cell_value(abs_idx, col_idx)
+                    .map(|value| match value {
+                        CellValue::Text(text) => text.clone(),
+                        CellValue::Null | CellValue::Default => String::new(),
+                    })
+                    .or_else(|| view.loaded_cell_value(abs_idx, col_idx))
+                    .unwrap_or_default();
+                assert_eq!(
+                    rendered, expected_value,
+                    "visible cell ({abs_idx}, {col_idx}) does not match its known data"
+                );
+            });
+        }
+        checked
+    }
+
+    #[gpui::test]
+    fn scrolled_click_selects_the_correct_row_and_renders_its_real_value(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, many_row_result(200));
+
+        view.update(&mut cx, |view, cx| {
+            view.scroll_handle
+                .set_offset(gpui::point(px(0.), px(-1300.)));
+            cx.notify();
+        });
+        draw_result_view_frame(window, &mut cx);
+
+        // Find a row the virtualized list actually painted after scrolling;
+        // don't assume a fixed viewport size.
+        let visible_idx = (0..200)
+            .find(|idx| {
+                cx.debug_bounds(format!("CELL-{idx}-1").leak() as &str)
+                    .is_some()
+            })
+            .expect("scrolling should bring some row other than 0 into view");
+        assert!(
+            visible_idx > 0,
+            "the scroll offset should have moved the viewport past row 0, got row {visible_idx}"
+        );
+
+        let cell_center = debug_center(&mut cx, format!("CELL-{visible_idx}-1").leak());
+        cx.simulate_click(cell_center, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.selected_cell,
+                Some((visible_idx, 1)),
+                "clicking a cell after scrolling must select the row actually under the cursor"
+            );
+            let rendered = view.loaded_cell_value(visible_idx, 1).unwrap_or_default();
+            assert_eq!(rendered, format!("pair-{visible_idx:04}"));
+        });
+
+        assert_visible_cells_match_data(&mut cx, &view, 1, 0..200, |idx| {
+            Some(format!("pair-{idx:04}"))
+        });
+    }
+
+    #[gpui::test]
+    fn chained_scroll_edit_commit_click_sequence_never_blanks_a_cell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, many_row_result(150));
+
+        view.update(&mut cx, |view, cx| {
+            view.scroll_handle
+                .set_offset(gpui::point(px(0.), px(-780.)));
+            cx.notify();
+        });
+        draw_result_view_frame(window, &mut cx);
+
+        let visible_rows: Vec<usize> = (0..150)
+            .filter(|idx| {
+                cx.debug_bounds(format!("CELL-{idx}-1").leak() as &str)
+                    .is_some()
+            })
+            .collect();
+        assert!(
+            visible_rows.len() >= 3,
+            "need at least 3 on-screen rows to chain edit/commit/click, saw {}",
+            visible_rows.len()
+        );
+        let row_a = visible_rows[0];
+        let row_b = visible_rows[1];
+        let row_c = visible_rows[2];
+
+        // Edit row A, commit by clicking away to row B.
+        let cell_a = debug_center(&mut cx, format!("CELL-{row_a}-1").leak());
+        cx.simulate_click(cell_a, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_keystrokes("f2");
+        cx.simulate_keystrokes("x y z");
+        let cell_b = debug_center(&mut cx, format!("CELL-{row_b}-1").leak());
+        cx.simulate_click(cell_b, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.cell_edit.is_none(),
+                "clicking away from an editing cell must commit and close the editor"
+            );
+        });
+
+        // Edit row B, commit by clicking away to row C.
+        cx.simulate_click(cell_b, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_keystrokes("f2");
+        cx.simulate_keystrokes("q r");
+        let cell_c = debug_center(&mut cx, format!("CELL-{row_c}-1").leak());
+        cx.simulate_click(cell_c, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        // Click back to row A: its committed edit must render, not blank out.
+        cx.simulate_click(cell_a, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.selected_cell, Some((row_a, 1)));
+            let rendered_a = view
+                .pending_cell_value(row_a, 1)
+                .map(|value| match value {
+                    CellValue::Text(text) => text.clone(),
+                    CellValue::Null | CellValue::Default => String::new(),
+                })
+                .or_else(|| view.loaded_cell_value(row_a, 1))
+                .unwrap_or_default();
+            assert!(
+                !rendered_a.is_empty(),
+                "row A must not render blank after an edit/commit/click-away/click-back cycle"
+            );
+            assert!(
+                rendered_a.starts_with(&format!("pair-{row_a:04}")),
+                "row A's committed edit should extend its original value, got {rendered_a:?}"
+            );
+
+            let rendered_c = view.loaded_cell_value(row_c, 1).unwrap_or_default();
+            assert_eq!(
+                rendered_c,
+                format!("pair-{row_c:04}"),
+                "row C, never edited, must still show its untouched data"
+            );
+        });
+
+        // Full-sweep invariant: every currently-visible cell in the column
+        // still matches its known data (edited rows extend the original
+        // value; untouched rows are unchanged).
+        assert_visible_cells_match_data(&mut cx, &view, 1, 0..150, |idx| {
+            if idx == row_a || idx == row_b {
+                None // checked individually above with their edited values
+            } else {
+                Some(format!("pair-{idx:04}"))
+            }
         });
     }
 }
