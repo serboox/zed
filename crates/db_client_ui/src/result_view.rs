@@ -330,6 +330,36 @@ fn is_valid_numeric(text: &str) -> bool {
     text.is_empty() || text.parse::<f64>().is_ok()
 }
 
+// Decides whether a column is numeric for display (right-alignment). A known SQL
+// type is authoritative; without type metadata the loaded values decide — every
+// non-empty value must parse as a number and at least one value must be present.
+fn column_is_numeric<'a>(
+    data_type: Option<&str>,
+    values: impl Iterator<Item = Option<&'a str>>,
+) -> bool {
+    if let Some(data_type) = data_type {
+        return matches!(column_editor_kind(data_type), CellEditorKind::Numeric);
+    }
+    column_values_look_numeric(values)
+}
+
+fn column_values_look_numeric<'a>(values: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut saw_value = false;
+    for value in values {
+        match value {
+            None => {}
+            Some("") => {}
+            Some(text) => {
+                if text.parse::<f64>().is_err() {
+                    return false;
+                }
+                saw_value = true;
+            }
+        }
+    }
+    saw_value
+}
+
 fn is_valid_date(text: &str) -> bool {
     if text.is_empty() {
         return true;
@@ -615,6 +645,9 @@ pub struct ResultView {
     col_widths: Vec<gpui::Pixels>,
     column_edges: Vec<f32>,
     total_width: f32,
+    // Per data-column flag: true for numeric columns, which render right-aligned
+    // like a spreadsheet. Indexed by result column index, recomputed with layout.
+    numeric_columns: Vec<bool>,
     // Currently selected cell as (absolute row index, column index), highlighted
     // like a spreadsheet/grid selection.
     selected_cell: Option<(usize, usize)>,
@@ -928,6 +961,7 @@ impl ResultView {
             col_widths: Vec::new(),
             column_edges: Vec::new(),
             total_width: 0.0,
+            numeric_columns: Vec::new(),
             selected_cell: None,
             selected_cell_range: None,
             cell_drag_anchor: None,
@@ -1151,6 +1185,7 @@ impl ResultView {
             self.order.clear();
             self.col_widths.clear();
             self.column_edges.clear();
+            self.numeric_columns.clear();
             self.visible_columns.clear();
             self.filtered_display_order.clear();
             return;
@@ -1230,6 +1265,25 @@ impl ResultView {
                     .max(col.chars().count())
                     .max(3);
                 px((widest as f32 * 7.5 + 28.0).clamp(80.0, 360.0))
+            })
+            .collect();
+
+        // Numeric flag per data column (for right-alignment), from type metadata
+        // when available, otherwise inferred from the sampled values.
+        let column_infos = self.column_infos.as_ref();
+        self.numeric_columns = (0..total_cols)
+            .map(|data_col| {
+                let data_type = column_infos.and_then(|infos| {
+                    let col_name = result.columns.get(data_col)?;
+                    infos
+                        .iter()
+                        .find(|info| &info.name == col_name)
+                        .map(|info| info.data_type.as_str())
+                });
+                let values = result.rows[..sample]
+                    .iter()
+                    .map(move |row| row.get(data_col).and_then(|cell| cell.as_deref()));
+                column_is_numeric(data_type, values)
             })
             .collect();
 
@@ -1427,6 +1481,14 @@ impl ResultView {
         self.result
             .as_ref()
             .and_then(|result| result.columns.len().checked_sub(1))
+    }
+
+    fn active_cell_row(&self) -> Option<usize> {
+        self.selected_cell.map(|(row, _)| row)
+    }
+
+    fn active_cell_column(&self) -> Option<usize> {
+        self.selected_cell.map(|(_, col)| col)
     }
 
     fn select_entire_row(&mut self, abs_idx: usize, display_idx: usize) {
@@ -2364,7 +2426,11 @@ impl ResultView {
         }
     }
 
-    fn render_typed_cell_body(body: AnyElement, kind: CellEditorKind) -> AnyElement {
+    fn render_typed_cell_body(
+        body: AnyElement,
+        kind: CellEditorKind,
+        align_right: bool,
+    ) -> AnyElement {
         h_flex()
             .size_full()
             .gap_1()
@@ -2378,7 +2444,14 @@ impl ResultView {
                     ),
                 )
             })
-            .child(div().flex_1().min_w_0().overflow_hidden().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(align_right, |element| element.flex().justify_end())
+                    .child(body),
+            )
             .into_any_element()
     }
 
@@ -5228,7 +5301,8 @@ impl ResultView {
                     )
                     .when(is_deleted, |label| label.strikethrough())
                     .into_any_element();
-                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx))
+                let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
+                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx), align_right)
             };
             let is_find_match = self.find_query.as_ref().is_some_and(|q| !q.is_empty())
                 && self.find_matches.contains(&(abs_idx, cell_idx));
@@ -5654,7 +5728,8 @@ impl ResultView {
                     .size(LabelSize::Small)
                     .color(color)
                     .into_any_element();
-                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx))
+                let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
+                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx), align_right)
             };
             let cell_display_idx = display_idx;
             cells.push(
@@ -6319,6 +6394,11 @@ impl ResultView {
                     .blend(cx.theme().colors().text.opacity(0.035));
                 let header_hover_bg = header_bg.blend(cx.theme().colors().element_hover);
                 let sorted_header_bg = header_bg.blend(cx.theme().colors().element_selected);
+                // Accent tint marking the active cell's column header (spreadsheet
+                // cross-highlight). Distinct from the sorted-column shade.
+                let active_header_bg =
+                    header_bg.blend(cx.theme().colors().text_accent.opacity(0.18));
+                let active_col = self.active_cell_column();
                 let gutter_bg = cx
                     .theme()
                     .colors()
@@ -6410,6 +6490,7 @@ impl ResultView {
                         None => String::new(),
                     };
                     let is_sorted = sort_pos.is_some();
+                    let is_active_col = active_col == Some(col_idx);
                     let header_cell_hover_bg = if is_sorted {
                         sorted_header_bg.blend(header_hover_bg)
                     } else {
@@ -6434,6 +6515,7 @@ impl ResultView {
                             .font_weight(gpui::FontWeight::BOLD)
                             .hover(move |style| style.bg(header_cell_hover_bg))
                             .when(is_sorted, move |this| this.bg(sorted_header_bg))
+                            .when(is_active_col, move |this| this.bg(active_header_bg))
                             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 let shift = if let gpui::ClickEvent::Mouse(m) = event {
                                     m.down.modifiers.shift
@@ -6722,6 +6804,7 @@ impl ResultView {
                 let gutter_row_bg = gutter_bg;
                 let gutter_row_hover_bg = gutter_hover_bg;
                 let gutter_selected_bg = cx.theme().colors().element_selected;
+                let gutter_active_bg = gutter_bg.blend(cx.theme().colors().element_selected.opacity(0.5));
                 let gutter_deleted_bg = deleted_bg;
                 let gutter_selected_bar = cx.theme().colors().text_accent;
                 let gutter_unselected_bar = cx.theme().colors().border_transparent;
@@ -6737,6 +6820,7 @@ impl ResultView {
                             let abs_idx = display_row.abs_idx(loaded_count);
                             let is_selected = this.selected_rows.contains(&abs_idx);
                             let is_deleted = this.deleted_rows.contains(&abs_idx);
+                            let is_active_row = this.active_cell_row() == Some(abs_idx);
                             let row_num: SharedString = match display_row {
                                 ResultDisplayRow::Loaded(loaded_abs_idx) => this
                                     .filtered_display_order
@@ -6763,6 +6847,9 @@ impl ResultView {
                                 .cursor_pointer()
                                 .when(!is_deleted, move |el| {
                                     el.hover(move |style| style.bg(gutter_row_hover_bg))
+                                })
+                                .when(is_active_row && !is_selected, move |el| {
+                                    el.bg(gutter_active_bg)
                                 })
                                 .when(is_selected, move |el| el.bg(gutter_selected_bg))
                                 .when(is_deleted, move |el| el.bg(gutter_deleted_bg))
@@ -11446,6 +11533,69 @@ mod tests {
                 view.pending_cell_value(2, 1),
                 Some(&CellValue::Text("Alice".to_string()))
             );
+        });
+    }
+
+    #[test]
+    fn column_values_look_numeric_requires_all_values_numeric() {
+        let all_numbers = [Some("1"), Some("2.5"), Some("-3")];
+        assert!(column_values_look_numeric(all_numbers.into_iter()));
+
+        let mixed = [Some("1"), Some("two"), Some("3")];
+        assert!(!column_values_look_numeric(mixed.into_iter()));
+
+        // Nulls and empties are skipped, but at least one real number is needed.
+        let with_nulls = [None, Some(""), Some("42")];
+        assert!(column_values_look_numeric(with_nulls.into_iter()));
+
+        let only_nulls = [None, Some("")];
+        assert!(!column_values_look_numeric(only_nulls.into_iter()));
+
+        let empty: [Option<&str>; 0] = [];
+        assert!(!column_values_look_numeric(empty.into_iter()));
+    }
+
+    #[test]
+    fn column_is_numeric_prefers_type_over_values() {
+        // A known numeric type is numeric even before any values are seen.
+        let no_values: [Option<&str>; 0] = [];
+        assert!(column_is_numeric(Some("int"), no_values.into_iter()));
+        assert!(column_is_numeric(Some("decimal(10,2)"), no_values.into_iter()));
+
+        // A known text type is not numeric even when its values look like numbers.
+        let numeric_looking = [Some("1"), Some("2")];
+        assert!(!column_is_numeric(
+            Some("varchar(255)"),
+            numeric_looking.into_iter()
+        ));
+
+        // With no type metadata, the values decide.
+        assert!(column_is_numeric(None, [Some("1"), Some("2")].into_iter()));
+        assert!(!column_is_numeric(
+            None,
+            [Some("1"), Some("x")].into_iter()
+        ));
+    }
+
+    #[gpui::test]
+    fn recompute_layout_flags_numeric_columns_by_value(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _| {
+            // sample_table_result: column 0 (id) is all numbers, column 1 (name) is text.
+            assert_eq!(view.numeric_columns, vec![true, false]);
+        });
+    }
+
+    #[gpui::test]
+    fn active_cell_row_and_column_track_the_selected_cell(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.active_cell_row(), None);
+            assert_eq!(view.active_cell_column(), None);
+
+            view.selected_cell = Some((2, 1));
+            assert_eq!(view.active_cell_row(), Some(2));
+            assert_eq!(view.active_cell_column(), Some(1));
         });
     }
 
