@@ -1610,14 +1610,8 @@ impl ResultView {
             return;
         }
         window.focus(&self.focus_handle, cx);
-        let repeated_selected_cell_click = !shift
-            && !control
-            && self.selected_cell == Some((abs_idx, cell_idx))
-            && self.selected_cell_range.is_none();
         self.select_cell_from_click(abs_idx, display_idx, cell_idx, shift, control);
-        if (click_count >= 2 || repeated_selected_cell_click)
-            && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
-        {
+        if click_count >= 2 && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
             self.begin_cell_edit(abs_idx, cell_idx, CellEditEntry::CursorEnd, window, cx);
         } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
             self.toggle_boolean_cell_loaded(abs_idx, cell_idx, cx);
@@ -1650,14 +1644,8 @@ impl ResultView {
             return;
         }
         window.focus(&self.focus_handle, cx);
-        let repeated_selected_cell_click = !shift
-            && !control
-            && self.selected_cell == Some((abs_idx, cell_idx))
-            && self.selected_cell_range.is_none();
         self.select_cell_from_click(abs_idx, display_idx, cell_idx, shift, control);
-        if (click_count >= 2 || repeated_selected_cell_click)
-            && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean)
-        {
+        if click_count >= 2 && !matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
             self.begin_added_cell_edit(
                 abs_idx,
                 cell_idx,
@@ -11220,7 +11208,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn visual_second_click_selected_cell_starts_editing(cx: &mut gpui::TestAppContext) {
+    fn visual_second_single_click_on_selected_cell_does_not_start_editing(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (window, view, mut cx) = table_backed_result_window(cx);
         let cell_center = debug_center(&mut cx, "CELL-0-1");
 
@@ -11232,10 +11222,13 @@ mod tests {
         view.update(&mut cx, |view, _cx| {
             assert_eq!(view.selected_cell, Some((0, 1)));
             assert!(
-                view.cell_edit
-                    .as_ref()
-                    .is_some_and(|edit| edit.abs_idx == 0 && edit.col_idx == 1),
-                "second click on an already-selected cell should open the inline editor"
+                view.cell_edit.is_none(),
+                "a second single click on an already-selected cell must only select it, like Excel — only a double-click or F2 should start editing"
+            );
+            let text = view.loaded_cell_value(0, 1).unwrap_or_default();
+            assert_eq!(
+                text, "Alice",
+                "the cell's value must stay visible in read mode after repeated single clicks"
             );
         });
     }
