@@ -5,9 +5,10 @@ use std::ops::{ControlFlow, Range};
 use collections::HashMap;
 use db_client::DatabaseDriver;
 use sqlparser::ast::{
-    Expr, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, Select,
-    SelectItem, SetExpr, Spanned, Statement, TableFactor, TableObject, TableWithJoins, Visit,
-    Visitor, With, visit_expressions,
+    Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Insert, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, OnInsert, Query, Select, SelectItem, SetExpr,
+    Spanned, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
+    Visit, Visitor, With, visit_expressions,
 };
 use sqlparser::tokenizer::{Location, Span};
 
@@ -89,6 +90,8 @@ pub(crate) fn resolve_navigation(
     match statement {
         Statement::Query(query) => bind_query(query, &HashMap::default(), target, ctx),
         Statement::Insert(insert) => bind_insert(insert, target, ctx),
+        Statement::Update(update) => bind_update(update, target, ctx),
+        Statement::Delete(delete) => bind_delete(delete, target, ctx),
         _ => None,
     }
 }
@@ -295,6 +298,27 @@ fn bind_set_expr(
     }
 }
 
+/// Binds every `TableWithJoins` in `tables` into `local_tables`, returning
+/// early the moment `target` lands on one of them (a table name or alias) --
+/// shared by `SELECT`'s `FROM`, `UPDATE`'s target/`FROM`, and `DELETE`'s
+/// `FROM`/`USING`, which all scope columns the same way once their tables are
+/// known.
+fn bind_tables(
+    tables: &[TableWithJoins],
+    ctes: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+    local_tables: &mut HashMap<String, TableBinding>,
+) -> Option<NavigationTarget> {
+    for table_with_joins in tables {
+        if let Some(hit) = bind_table_with_joins(table_with_joins, ctes, target, ctx, local_tables)
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 fn bind_select(
     select: &Select,
     ctes: &HashMap<String, TableBinding>,
@@ -302,12 +326,8 @@ fn bind_select(
     ctx: &BindCtx,
 ) -> Option<NavigationTarget> {
     let mut local_tables: HashMap<String, TableBinding> = HashMap::default();
-    for table_with_joins in &select.from {
-        if let Some(hit) =
-            bind_table_with_joins(table_with_joins, ctes, target, ctx, &mut local_tables)
-        {
-            return Some(hit);
-        }
+    if let Some(hit) = bind_tables(&select.from, ctes, target, ctx, &mut local_tables) {
+        return Some(hit);
     }
 
     for item in &select.projection {
@@ -739,12 +759,12 @@ fn resolve_column(
     }
 }
 
-/// Resolves the INSERT target table name and, when `target` instead falls
-/// inside the `SELECT` that supplies the inserted rows, binds that as an
-/// ordinary query. The INSERT's own column list and `ON DUPLICATE KEY
-/// UPDATE`/`VALUES(...)` scoping needed for full DML parity is Wave 2's job,
-/// so a click there returns `None` here and falls back to the heuristic
-/// scanner, which already handles it.
+/// Resolves the INSERT target table name, a column in its explicit
+/// `(col, col, ...)` list, the `SELECT`/`VALUES` body that supplies the
+/// inserted rows, and a MySQL `ON DUPLICATE KEY UPDATE` clause -- the column
+/// list and `ON DUPLICATE KEY UPDATE` always resolve against the INSERT
+/// target table, never the trailing `SELECT`'s own `FROM` tables, matching
+/// the heuristic scanner's existing convention.
 fn bind_insert(insert: &Insert, target: Location, ctx: &BindCtx) -> Option<NavigationTarget> {
     if let TableObject::TableName(name) = &insert.table {
         if let Some(hit) = object_name_click(name, target) {
@@ -764,9 +784,221 @@ fn bind_insert(insert: &Insert, target: Location, ctx: &BindCtx) -> Option<Navig
             });
         }
     }
-    let source = insert.source.as_ref()?;
-    if span_contains(source.span(), target) {
-        return bind_query(source, &HashMap::default(), target, ctx);
+    let (insert_database, insert_table) = match &insert.table {
+        TableObject::TableName(name) => database_and_table(name),
+        TableObject::TableFunction(_) | TableObject::TableQuery(_) => (None, String::new()),
+    };
+
+    for column in &insert.columns {
+        if let Some((column_name, span)) = flat_object_name_click(column, target) {
+            if insert_table.is_empty() {
+                return None;
+            }
+            return Some(NavigationTarget::Column {
+                database: insert_database,
+                table: insert_table,
+                column: column_name,
+                span,
+            });
+        }
+    }
+
+    if let Some(source) = &insert.source {
+        if span_contains(source.span(), target) {
+            return bind_query(source, &HashMap::default(), target, ctx);
+        }
+    }
+
+    if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on {
+        if !insert_table.is_empty() {
+            return bind_on_duplicate_key_update(
+                assignments,
+                target,
+                insert_database.as_deref(),
+                &insert_table,
+            );
+        }
+    }
+    None
+}
+
+/// The last identifier segment of a plain (unqualified) name reference, such
+/// as an entry in an `INSERT INTO table (col, col, ...)` list -- unlike
+/// [`object_name_click`], this never distinguishes a table vs. database
+/// segment, since a column-list entry is always resolved against one already
+/// -known table.
+fn flat_object_name_click(name: &ObjectName, target: Location) -> Option<(String, Span)> {
+    let idents: Vec<&Ident> = name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => ident,
+            ObjectNamePart::Function(function) => &function.name,
+        })
+        .collect();
+    let last = *idents.last()?;
+    span_contains(last.span, target).then(|| (last.value.clone(), last.span))
+}
+
+/// A bare (unqualified) `Expr::Identifier` inside an expression -- used for
+/// `ON DUPLICATE KEY UPDATE`'s `VALUES(col)` argument, which MySQL resolves
+/// against the INSERT target table's column, never a `FROM`-clause table.
+/// The `VALUES` function name itself is never visited here: it lives in
+/// `Function.name` (an [`ObjectName`]), not as an `Expr` node, so only its
+/// argument -- the actual column reference -- can ever match.
+struct BareIdentLocator {
+    target: Location,
+    hit: Option<(String, Span)>,
+}
+
+impl Visitor for BareIdentLocator {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Identifier(ident) = expr {
+            if span_contains(ident.span, self.target) {
+                self.hit = Some((ident.value.clone(), ident.span));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Resolves a click inside a MySQL `ON DUPLICATE KEY UPDATE col = VALUES(col)`
+/// clause against the fixed INSERT target table: both the assignment's own
+/// target column and a bare column referenced in its value (including inside
+/// a `VALUES(...)` call) resolve there, matching the heuristic scanner's
+/// existing "any unqualified identifier in this clause" convention -- a
+/// qualified reference is not valid MySQL syntax in this position and is
+/// left unresolved, same as today.
+fn bind_on_duplicate_key_update(
+    assignments: &[Assignment],
+    target: Location,
+    database: Option<&str>,
+    table: &str,
+) -> Option<NavigationTarget> {
+    for assignment in assignments {
+        if let AssignmentTarget::ColumnName(name) = &assignment.target {
+            if let Some((column, span)) = flat_object_name_click(name, target) {
+                return Some(NavigationTarget::Column {
+                    database: database.map(str::to_string),
+                    table: table.to_string(),
+                    column,
+                    span,
+                });
+            }
+        }
+        let mut locator = BareIdentLocator { target, hit: None };
+        let _ = assignment.value.visit(&mut locator);
+        if let Some((column, span)) = locator.hit {
+            return Some(NavigationTarget::Column {
+                database: database.map(str::to_string),
+                table: table.to_string(),
+                column,
+                span,
+            });
+        }
+    }
+    None
+}
+
+/// Resolves a click on an `ObjectName` used as a column reference (an
+/// `UPDATE` assignment's target, which may be qualified with a table alias
+/// like `t.col` or bare) the same way a `CompoundIdentifier`/`Identifier`
+/// expression already resolves.
+fn resolve_object_name_column(
+    name: &ObjectName,
+    local_tables: &HashMap<String, TableBinding>,
+    target: Location,
+    ctx: &BindCtx,
+) -> Option<NavigationTarget> {
+    let idents: Vec<&Ident> = name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => ident,
+            ObjectNamePart::Function(function) => &function.name,
+        })
+        .collect();
+    let last = *idents.last()?;
+    if !span_contains(last.span, target) {
+        return None;
+    }
+    let qualifier = idents
+        .len()
+        .checked_sub(2)
+        .and_then(|index| idents.get(index))
+        .map(|ident| ident.value.as_str());
+    resolve_column(qualifier, &last.value, last.span, local_tables, ctx)
+}
+
+/// Binds `UPDATE`'s target table (and, when present, its `FROM`/`USING`-style
+/// source tables), then resolves a click on an assignment's target/value or
+/// the `WHERE` clause through that scope -- the same scope-stack machinery
+/// `SELECT` already uses, since an `UPDATE` target is just another table.
+fn bind_update(update: &Update, target: Location, ctx: &BindCtx) -> Option<NavigationTarget> {
+    let ctes = HashMap::default();
+    let mut local_tables: HashMap<String, TableBinding> = HashMap::default();
+
+    if let Some(hit) = bind_tables(
+        std::slice::from_ref(&update.table),
+        &ctes,
+        target,
+        ctx,
+        &mut local_tables,
+    ) {
+        return Some(hit);
+    }
+    if let Some(from) = &update.from {
+        let tables = match from {
+            UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => {
+                tables
+            }
+        };
+        if let Some(hit) = bind_tables(tables, &ctes, target, ctx, &mut local_tables) {
+            return Some(hit);
+        }
+    }
+
+    for assignment in &update.assignments {
+        if let AssignmentTarget::ColumnName(name) = &assignment.target {
+            if let Some(hit) = resolve_object_name_column(name, &local_tables, target, ctx) {
+                return Some(hit);
+            }
+        }
+        if let Some(hit) = resolve_expr_at(&assignment.value, &ctes, &local_tables, target, ctx) {
+            return Some(hit);
+        }
+    }
+    if let Some(selection) = &update.selection {
+        if let Some(hit) = resolve_expr_at(selection, &ctes, &local_tables, target, ctx) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Binds `DELETE`'s `FROM`/`USING` tables, then resolves a click on the
+/// `WHERE` clause through that scope.
+fn bind_delete(delete: &Delete, target: Location, ctx: &BindCtx) -> Option<NavigationTarget> {
+    let ctes = HashMap::default();
+    let mut local_tables: HashMap<String, TableBinding> = HashMap::default();
+
+    let from_tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if let Some(hit) = bind_tables(from_tables, &ctes, target, ctx, &mut local_tables) {
+        return Some(hit);
+    }
+    if let Some(using) = &delete.using {
+        if let Some(hit) = bind_tables(using, &ctes, target, ctx, &mut local_tables) {
+            return Some(hit);
+        }
+    }
+    if let Some(selection) = &delete.selection {
+        if let Some(hit) = resolve_expr_at(selection, &ctes, &local_tables, target, ctx) {
+            return Some(hit);
+        }
     }
     None
 }
@@ -1030,7 +1262,7 @@ mod tests {
         assert!(resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema).is_some());
     }
 
-    /// Sergei's real production query: `INSERT ... SELECT` with two derived
+    /// A real production-shaped query: `INSERT ... SELECT` with two derived
     /// tables (`q1`/`q2`, each with a computed `GROUP_CONCAT` column), three
     /// levels of nested `WHERE ... IN (...)`, and an `ON DUPLICATE KEY
     /// UPDATE` clause. Only the derived-table pass-through click is asserted
@@ -1097,4 +1329,215 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
             other => panic!("expected a column target, got {other:?}"),
         }
     }
+
+    #[test]
+    fn insert_column_list_entry_resolves_to_the_target_table() {
+        let text = "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname) \
+            SELECT 1, 2, 3";
+        let schema = FakeSchema::default();
+        let offset = text.find("shortname").expect("marker present") + 2;
+        let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
+            .expect("insert column list entry resolves");
+        match target {
+            NavigationTarget::Column {
+                database,
+                table,
+                column,
+                ..
+            } => {
+                assert_eq!(database.as_deref(), Some("ec_fmedia"));
+                assert_eq!(table, "quotes_pair_translate");
+                assert_eq!(column, "shortname");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_duplicate_key_update_target_column_resolves_to_the_insert_table() {
+        let text = "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE a = VALUES(a)";
+        let schema = FakeSchema::default();
+        let offset = text.rfind("a = VALUES").expect("marker present");
+        let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
+            .expect("assignment target resolves");
+        match target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "t");
+                assert_eq!(column, "a");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
+
+    /// `VALUES(col)` must resolve to the INSERT target table's column even
+    /// when a `FROM`-clause table in the same statement happens to have a
+    /// same-named column -- MySQL's `VALUES(col)` always refers to the row
+    /// being inserted, never a `FROM`-clause table, no matter how the two
+    /// happen to overlap by name.
+
+    #[test]
+    fn values_function_argument_resolves_to_the_insert_target_not_a_same_named_from_column() {
+        let text =
+            "INSERT INTO shipments (status) SELECT s.status FROM staging s \
+             ON DUPLICATE KEY UPDATE status = VALUES(status)";
+        let schema = FakeSchema::with_table("db", "staging", &["status"]);
+        let offset = text.rfind("VALUES(status)").expect("marker present") + "VALUES(".len();
+        let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
+            .expect("VALUES(col) argument resolves");
+        match target {
+            NavigationTarget::Column { database, table, column, .. } => {
+                assert_eq!(database, None);
+                assert_eq!(table, "shipments");
+                assert_eq!(column, "status");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_assignment_and_where_columns_resolve_through_the_target_table() {
+        let text = "UPDATE db.orders t SET t.status = 'x' WHERE t.id = 1";
+        let schema = FakeSchema::default();
+
+        let status_offset = text.find("t.status").expect("marker present") + "t.".len();
+        let (status_target, _) =
+            resolve_navigation_at(text, DatabaseDriver::MySQL, status_offset, None, &schema)
+                .expect("assignment target resolves");
+        match status_target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "orders");
+                assert_eq!(column, "status");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+
+        let id_offset = text.rfind("t.id").expect("marker present") + "t.".len();
+        let (id_target, _) =
+            resolve_navigation_at(text, DatabaseDriver::MySQL, id_offset, None, &schema)
+                .expect("where column resolves");
+        match id_target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "orders");
+                assert_eq!(column, "id");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_where_column_resolves_through_the_from_table() {
+        let text = "DELETE FROM db.orders t WHERE t.status = 1";
+        let schema = FakeSchema::default();
+        let offset = text.rfind("t.status").expect("marker present") + "t.".len();
+        let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
+            .expect("where column resolves");
+        match target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "orders");
+                assert_eq!(column, "status");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
+
+    /// End-to-end proof that a real production-shaped query resolves several
+    /// distinct DML-specific entities via the AST binder (not the heuristic
+    /// fallback): the INSERT column list, the `ON DUPLICATE KEY UPDATE`
+    /// target column, and its `VALUES(...)` argument -- alongside the
+    /// derived-table/nested-subquery resolution Wave 1 already covered for
+    /// this same query.
+    #[test]
+    fn resolves_insert_and_on_duplicate_key_update_columns_in_the_real_production_query() {
+        let text = "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname, pair_name_export_trans, name, nickname, synonym, pair_name_autonews)
+SELECT qpa.pair_id,
+       q1.lang_id,
+       CONCAT(q1.currency_short_name, '/', q2.currency_short_name) AS pair_shortname,
+       CONCAT(q1.fullname, ' ', q2.fullname)                       AS pair_fullname,
+       CONCAT(q1.fullname, ' ', q2.fullname)                       AS pair_fullname,
+       '',
+       '',
+       ''
+FROM (SELECT qdt.currency_ID, qca.currency_short_name, qdt.lang_id, GROUP_CONCAT(qdt.fullname SEPARATOR ' ') AS fullname
+      FROM ec_fmedia.quotes_currency_attr qca
+               LEFT JOIN ec_fmedia.quotes_currency_dat_trans qdt ON qca.currency_ID = qdt.currency_ID
+      WHERE qca.currency_ID IN (SELECT cur1
+                                FROM ec_fmedia.quotes_pair_attr
+                                WHERE pair_id IN
+                                      (SELECT pair_id FROM ec_fmedia.quotes_pair_attr WHERE pair_type IN ('currency')))
+      GROUP BY qdt.lang_id, qdt.currency_ID) q1
+         JOIN (SELECT qdt.currency_ID,
+                      qca.currency_short_name,
+                      qdt.lang_id,
+                      GROUP_CONCAT(qdt.fullname SEPARATOR ' ') AS fullname
+               FROM ec_fmedia.quotes_currency_attr qca
+                        LEFT JOIN ec_fmedia.quotes_currency_dat_trans qdt ON qca.currency_ID = qdt.currency_ID
+               WHERE qca.currency_ID IN (SELECT cur2
+                                         FROM ec_fmedia.quotes_pair_attr
+                                         WHERE pair_id IN
+                                               (SELECT pair_id
+                                                FROM ec_fmedia.quotes_pair_attr
+                                                WHERE pair_type IN ('currency')))
+               GROUP BY qdt.lang_id, qdt.currency_ID) q2
+              ON q1.lang_id = q2.lang_id
+         JOIN ec_fmedia.quotes_pair_attr qpa
+              ON q1.currency_ID = qpa.cur1 AND q2.currency_ID = qpa.cur2
+WHERE qpa.pair_id IN (SELECT pair_id FROM ec_fmedia.quotes_pair_attr WHERE pair_type IN ('currency'))
+ORDER BY pair_ID, lang_ID
+ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
+                        pair_name_export_trans = VALUES(pair_name_export_trans),
+                        name                   = VALUES(pair_name_export_trans);";
+        let schema = FakeSchema::default();
+
+        let column_list_offset =
+            text.find("pair_ID, lang_id, shortname").expect("marker present") + 2;
+        let (column_list_target, _) = resolve_navigation_at(
+            text,
+            DatabaseDriver::MySQL,
+            column_list_offset,
+            None,
+            &schema,
+        )
+        .expect("insert column list entry resolves");
+        match column_list_target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "quotes_pair_translate");
+                assert_eq!(column, "pair_ID");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+
+        let assignment_offset =
+            text.rfind("shortname              =").expect("marker present");
+        let (assignment_target, _) = resolve_navigation_at(
+            text,
+            DatabaseDriver::MySQL,
+            assignment_offset,
+            None,
+            &schema,
+        )
+        .expect("on duplicate key update target resolves");
+        match assignment_target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "quotes_pair_translate");
+                assert_eq!(column, "shortname");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+
+        let values_offset = text.rfind("VALUES(shortname)").expect("marker present")
+            + "VALUES(".len();
+        let (values_target, _) =
+            resolve_navigation_at(text, DatabaseDriver::MySQL, values_offset, None, &schema)
+                .expect("VALUES(col) argument resolves");
+        match values_target {
+            NavigationTarget::Column { table, column, .. } => {
+                assert_eq!(table, "quotes_pair_translate");
+                assert_eq!(column, "shortname");
+            }
+            other => panic!("expected a column target, got {other:?}"),
+        }
+    }
 }
+
+
+
