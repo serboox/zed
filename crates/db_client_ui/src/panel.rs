@@ -45,13 +45,10 @@ use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
-use editor::EditorSettings;
-use settings::Settings as _;
 use ui::{
     CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName,
-    IconSize, Indicator, Label, LabelSize, Scrollbars, Tooltip, WithScrollbar,
+    IconSize, Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*, right_click_menu,
-    scrollbars::{ScrollbarVisibility, ShowScrollbar},
 };
 use util::ResultExt as _;
 use workspace::{
@@ -2587,15 +2584,6 @@ fn run_sql_from_editor(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
-}
-
-#[derive(Default)]
-struct DatabasePanelScrollbarProxy;
-
-impl ScrollbarVisibility for DatabasePanelScrollbarProxy {
-    fn visibility(&self, cx: &App) -> ShowScrollbar {
-        EditorSettings::get_global(cx).scrollbar.show
-    }
 }
 
 pub struct DatabasePanel {
@@ -6752,7 +6740,7 @@ impl Render for DatabasePanel {
                     .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
-                        Scrollbars::for_settings::<DatabasePanelScrollbarProxy>()
+                        Scrollbars::always_visible(ScrollAxes::Both)
                             .tracked_scroll_handle(&self.tree_scroll_handle),
                         window,
                         cx,
@@ -9659,49 +9647,6 @@ mod tests {
             "tree has 80 connection rows, far more than fit in the test window, so the scroll \
              handle must report a nonzero max scroll offset; got {max_offset_y:?}"
         );
-    }
-
-    // The tree previously wired its scrollbar with `Scrollbars::new(...)`,
-    // which hardcodes `ShowScrollbar::default()` (Auto) and never consults
-    // the user's actual `scrollbar.show` setting -- unlike `project_panel`
-    // and `outline_panel`, which use `Scrollbars::for_settings::<Proxy>()` to
-    // read it. Under `Auto`, the scrollbar only flashes in transiently on
-    // scroll/hover, which reads as "no scrollbar at all" to a user who has
-    // explicitly set `scrollbar.show: always` and expects it to stay visible.
-    // This proves `DatabasePanelScrollbarProxy` actually reads the live
-    // setting instead of ignoring it.
-    #[gpui::test]
-    fn database_panel_scrollbar_proxy_reflects_the_editor_scrollbar_setting(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            EditorSettings::register(cx);
-
-            let default_visibility = DatabasePanelScrollbarProxy.visibility(cx);
-            assert_eq!(
-                default_visibility,
-                EditorSettings::get_global(cx).scrollbar.show,
-                "with no override, the proxy must reflect whatever the editor's real default is"
-            );
-
-            let mut always_shown = EditorSettings::get_global(cx).clone();
-            always_shown.scrollbar.show = ShowScrollbar::Always;
-            EditorSettings::override_global(always_shown, cx);
-            assert_eq!(
-                DatabasePanelScrollbarProxy.visibility(cx),
-                ShowScrollbar::Always,
-                "the tree's scrollbar proxy must respect an explicit `scrollbar.show: always`, \
-                 not silently stay on Auto"
-            );
-
-            let mut never_shown = EditorSettings::get_global(cx).clone();
-            never_shown.scrollbar.show = ShowScrollbar::Never;
-            EditorSettings::override_global(never_shown, cx);
-            assert_eq!(
-                DatabasePanelScrollbarProxy.visibility(cx),
-                ShowScrollbar::Never,
-                "the tree's scrollbar proxy must also respect `scrollbar.show: never`"
-            );
-        });
     }
 
     // Replicates what the real app does:
