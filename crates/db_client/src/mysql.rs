@@ -293,7 +293,8 @@ impl DbProvider for MySqlProvider {
             || trimmed_upper.starts_with("SHOW")
             || trimmed_upper.starts_with("DESCRIBE")
             || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESC");
+            || trimmed_upper.starts_with("DESC")
+            || trimmed_upper.starts_with("WITH");
         let prefixed = format!(
             "{}{}",
             crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
@@ -801,5 +802,27 @@ mod integration_tests {
                 .expect("query via runtime");
             assert!(!result.columns.is_empty());
         });
+    }
+
+    // Regression test: `is_read_query` must recognize a CTE (`WITH ...
+    // SELECT`) as a read query, matching db_client::is_read_only_query and
+    // the Postgres provider's identical check — otherwise the query falls
+    // into the non-streaming `.execute()` path and the grid silently shows
+    // zero columns and zero rows even though the query succeeded.
+    #[tokio::test]
+    #[ignore]
+    async fn test_with_cte_returns_rows() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let result = provider
+            .execute_query("", "WITH one AS (SELECT 1 AS n) SELECT n FROM one")
+            .await
+            .expect("Failed to execute query");
+
+        assert_eq!(result.columns, vec!["n".to_string()]);
+        assert_eq!(result.rows.len(), 1);
     }
 }
