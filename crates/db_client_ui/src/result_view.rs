@@ -521,7 +521,7 @@ fn is_valid_datetime(text: &str) -> bool {
     ok_h && ok_m && ok_s
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SortColumn {
     col_idx: usize,
     ascending: bool,
@@ -1656,7 +1656,11 @@ impl ResultView {
         display_idx: usize,
         cell_idx: usize,
         shift: bool,
-        control: bool,
+        // Ctrl/Cmd-click on a cell (as opposed to the row gutter, which does
+        // support additive multi-row selection) has no dedicated behavior:
+        // the selection model only tracks a single contiguous cell range, not
+        // a discontiguous set, so it falls back to a plain single-cell select.
+        _control: bool,
     ) {
         if shift {
             if let Some(anchor) = self.selected_cell {
@@ -1666,10 +1670,6 @@ impl ResultView {
                 let anchor_display_idx = self.last_selected_row.unwrap_or(display_idx);
                 self.select_row_range(anchor_display_idx, display_idx);
             }
-        } else if control {
-            self.selected_rows.clear();
-            self.last_selected_row = Some(display_idx);
-            self.selected_cell_range = None;
         } else {
             self.selected_rows.clear();
             self.last_selected_row = Some(display_idx);
@@ -9568,9 +9568,15 @@ impl Render for ResultView {
             .key_context("DbResultView")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // Ready-mode navigation/edit-entry. While an inline editor is open
-                // the editor's own key handler owns these keys.
-                if this.cell_edit.is_some() {
+                // Ready-mode navigation/edit-entry. Bubbled key events still reach
+                // this handler while a cell editor, the find box, or any other
+                // inline editor owns focus -- checking only `cell_edit.is_some()`
+                // let a printable keystroke fall through to type-to-replace even
+                // while the find editor was focused, silently starting a cell edit
+                // instead of typing the find query. Requiring this view's own
+                // focus handle to be exactly focused covers every inline editor,
+                // not just the cell editor.
+                if !this.focus_handle.is_focused(window) {
                     return;
                 }
                 let keystroke = &event.keystroke;
@@ -10755,26 +10761,28 @@ mod tests {
 
     #[gpui::test]
     fn toggle_chart_opens_and_picks_numeric_column(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            let settings = settings::SettingsStore::test(cx);
-            cx.set_global(settings);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        // Drives the real ToggleChart action (the "Show Chart" view-menu entry
+        // dispatches this same action) instead of calling toggle_chart directly,
+        // so this also proves the .on_action(ToggleChart) wiring in render().
+        let (window, view, mut cx) = plain_result_window(cx, export_fixture());
+        view.update(&mut cx, |view, _cx| assert!(!view.chart_open));
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.dispatch_action(ToggleChart);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.chart_open,
+                "a real ToggleChart action dispatch must open the chart"
+            );
+            assert_eq!(view.chart_value_column, Some(0));
         });
-        let window = cx.add_window(|_window, cx| {
-            let mut view = ResultView::new("test", cx);
-            view.set_result(export_fixture(), cx);
-            view
-        });
-        window
-            .update(cx, |view, _window, cx| {
-                assert!(!view.chart_open);
-                view.toggle_chart(cx);
-                assert!(view.chart_open);
-                assert_eq!(view.chart_value_column, Some(0));
-                view.toggle_chart(cx);
-                assert!(!view.chart_open);
-            })
-            .unwrap();
+
+        cx.dispatch_action(ToggleChart);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| assert!(!view.chart_open));
     }
 
     #[gpui::test]
@@ -11500,13 +11508,25 @@ mod tests {
     // both NULL and leaving the cell untouched.
     #[gpui::test]
     fn set_empty_value_action_stores_a_real_empty_string(cx: &mut gpui::TestAppContext) {
-        let (_window, view, mut cx) =
+        // Real ctrl-alt-e keystroke through the production binding
+        // (assets/keymaps/default-linux.json: "DbResultView" -> SetEmptyValue)
+        // instead of calling set_selected_cell_value directly.
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-alt-e",
+                SetEmptyValue,
+                Some("DbResultView"),
+            )]);
+        });
+        let (window, view, mut cx) =
             table_backed_result_window_with(cx, table_result_with_null_cell());
 
-        view.update(&mut cx, |view, cx| {
-            view.selected_cell = Some((0, 1));
-            view.set_selected_cell_value(CellValue::Text(String::new()), cx);
-        });
+        let cell = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-alt-e");
+        draw_result_view(window, &mut cx);
 
         view.update(&mut cx, |view, _cx| {
             let edit = view
@@ -11739,6 +11759,28 @@ mod tests {
             assert_eq!(
                 text, "Alice",
                 "the cell's value must stay visible in read mode after repeated single clicks"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_click_on_a_cell_selects_it_like_a_plain_click(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let other_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        // The cell selection model only tracks one contiguous range, not a
+        // discontiguous set, so Ctrl-click on a cell is not additive: it must
+        // behave exactly like a plain click, replacing the selection.
+        cx.simulate_click(other_cell, gpui::Modifiers::control());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 1)));
+            assert_eq!(
+                view.selected_cell_range, None,
+                "ctrl-click must not create or extend a multi-cell range"
             );
         });
     }
@@ -12076,6 +12118,89 @@ mod tests {
         });
     }
 
+    // edit_undo_then_redo_roundtrips_a_cell_write and fill_down_is_a_single_undo_unit
+    // above each undo/redo a single kind of edit. This proves the undo/redo stack
+    // is shared across DIFFERENT edit types (a cell write, then a real row
+    // delete through the gutter context menu) and unwinds/replays them in the
+    // correct LIFO order, using real ctrl-z/ctrl-y keystrokes (already proven to
+    // reach undo_edit/redo_edit in real_keymap_editor_bindings_...) rather than
+    // calling undo_edit/redo_edit directly.
+    #[gpui::test]
+    fn undo_redo_unwinds_a_mixed_sequence_of_cell_edit_and_row_delete(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.write_cell_value(0, 1, CellValue::Text("Zed".to_string()), cx);
+        });
+        draw_result_view(window, &mut cx);
+
+        open_gutter_menu_and_click(window, &mut cx, "GUTTER-2", "MENU_ITEM-Delete Row");
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "the earlier cell write must still be buffered after the row delete"
+            );
+            assert!(
+                view.deleted_rows.contains(&2),
+                "Delete Row from the gutter menu must mark the row"
+            );
+        });
+
+        // The gutter's right-click menu does not itself focus the grid's own
+        // focus handle, so a real click is needed first -- otherwise the
+        // ctrl-z/ctrl-y keystrokes below would not even reach on_key_down.
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-z");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert!(
+                !view.deleted_rows.contains(&2),
+                "the first undo must revert the most recent op (the delete), LIFO"
+            );
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "the older cell write must survive undoing the newer delete"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                None,
+                "the second undo must revert the cell write too"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-y");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "the first redo must replay the cell write, in the original order"
+            );
+            assert!(!view.deleted_rows.contains(&2));
+        });
+
+        cx.simulate_keystrokes("ctrl-y");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.deleted_rows.contains(&2),
+                "the second redo must replay the row delete"
+            );
+        });
+    }
+
     #[test]
     fn column_values_look_numeric_requires_all_values_numeric() {
         let all_numbers = [Some("1"), Some("2.5"), Some("-3")];
@@ -12192,6 +12317,115 @@ mod tests {
                 view.order,
                 vec![2, 0, 1, 3],
                 "a second click on the same header should reverse to descending"
+            );
+        });
+    }
+
+    // header_click_sorts_a_numeric_column_ascending_then_descending (above) only
+    // proves single-column sort. Shift-click adds a secondary sort key (the
+    // header on_click handler branches on modifiers.shift) -- this had no
+    // coverage at all, so nothing would catch a broken tie-breaker.
+    #[gpui::test]
+    fn shift_click_header_adds_a_secondary_sort_column(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["team".to_string(), "score".to_string()],
+            rows: vec![
+                vec![Some("b".to_string()), Some("2".to_string())],
+                vec![Some("a".to_string()), Some("1".to_string())],
+                vec![Some("a".to_string()), Some("3".to_string())],
+                vec![Some("b".to_string()), Some("1".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+
+        let team_header = debug_center(&mut cx, "COL_HEADER-0");
+        cx.simulate_click(team_header, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.sort_columns,
+                vec![SortColumn { col_idx: 0, ascending: true }]
+            );
+        });
+
+        let score_header = debug_center(&mut cx, "COL_HEADER-1");
+        cx.simulate_click(score_header, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.sort_columns,
+                vec![
+                    SortColumn { col_idx: 0, ascending: true },
+                    SortColumn { col_idx: 1, ascending: true },
+                ],
+                "shift-click must add a secondary sort key, not replace the primary one"
+            );
+            // team ascending (a, a, b, b), tie-broken by score ascending within
+            // each team: rows 1 (a,1), 2 (a,3), 3 (b,1), 0 (b,2).
+            assert_eq!(
+                view.order,
+                vec![1, 2, 3, 0],
+                "rows must sort by team first, then by score within each team"
+            );
+        });
+
+        // Shift-clicking the already-secondary column again toggles its direction
+        // in place instead of adding a third entry or moving it to primary.
+        cx.simulate_click(score_header, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.sort_columns,
+                vec![
+                    SortColumn { col_idx: 0, ascending: true },
+                    SortColumn { col_idx: 1, ascending: false },
+                ],
+                "shift-clicking an existing secondary sort column must toggle its direction"
+            );
+            assert_eq!(view.order, vec![2, 1, 0, 3]);
+        });
+    }
+
+    // export_tsv/compute_column_aggregates already treat a NULL cell distinctly
+    // from a real value, but recompute_layout's sort comparator had no coverage
+    // at all for how it orders NULLs -- it maps a NULL cell to "" before
+    // comparing, so this locks in the resulting (undocumented) behavior:
+    // NULLs sort first ascending, last descending, exactly like an empty string
+    // would.
+    #[gpui::test]
+    fn sort_orders_null_cells_like_an_empty_string(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "note".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("b".to_string())],
+                vec![Some("2".to_string()), None],
+                vec![Some("3".to_string()), Some("a".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+
+        let header_center = debug_center(&mut cx, "COL_HEADER-1");
+        cx.simulate_click(header_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.order,
+                vec![1, 2, 0],
+                "ascending sort must place the NULL row first"
+            );
+        });
+
+        cx.simulate_click(header_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.order,
+                vec![0, 2, 1],
+                "descending sort must place the NULL row last"
             );
         });
     }
@@ -12750,6 +12984,52 @@ mod tests {
         });
     }
 
+    // find_filter_rows_hides_non_matching_rows/quick_filter_by_cell_narrows_visible_rows
+    // (below) set `find_query`/call `recompute_local_filter_inner` directly --
+    // they never prove a real user can actually type into the find box and see
+    // rows filter. open_find focuses `find_editor`, so a real keystroke typed
+    // right after ctrl-f should reach it and drive the same
+    // EditorEvent::BufferEdited -> update_find_matches pipeline.
+    #[gpui::test]
+    fn typing_into_the_find_editor_after_ctrl_f_filters_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-f",
+                ToggleFind,
+                Some("DbResultView"),
+            )]);
+        });
+
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            view.find_filter_rows = true;
+        });
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-f");
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("b");
+        cx.simulate_keystrokes("o");
+        cx.simulate_keystrokes("b");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.find_query.as_deref(),
+                Some("bob"),
+                "real keystrokes typed after ctrl-f must reach the focused find editor"
+            );
+            assert_eq!(
+                view.filtered_display_order,
+                vec![1],
+                "typing a query with row filtering on must actually filter the visible rows, \
+                 through the real editor -> BufferEdited -> update_find_matches pipeline"
+            );
+        });
+    }
+
     // visual_copy_selection_uses_selected_copy_format (below) and
     // copy_selection_uses_insert_copy_format call copy_selected_to_clipboard
     // directly -- they never prove a real ctrl-c keystroke reaches it. The
@@ -12787,6 +13067,43 @@ mod tests {
             .expect("a real ctrl-c keystroke must write the selection to the clipboard through \
                      the production keymap binding and action dispatch");
         assert_eq!(copied, "id,name\n2,Bob\n");
+    }
+
+    // TSV is `copy_format`'s default (never overridden here, unlike the sibling
+    // tests above) and the one Excel/Sheets round-trips through paste -- yet it
+    // had no coverage: nothing exercised export_tsv at all. This selects a 2x2
+    // CELL RANGE (not a full-row selection, which the sibling tests already
+    // cover), so it also proves selected_columns_for_copy/export_tsv only emit
+    // the selected columns' header, not every column in the result.
+    #[gpui::test]
+    fn real_ctrl_c_keystroke_copies_a_cell_range_as_tsv_by_default(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-c",
+                CopySelection,
+                Some("DbResultView"),
+            )]);
+        });
+
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let last_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        cx.simulate_click(last_cell, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(view.copy_format, CopyFormat::Tsv);
+        });
+
+        cx.simulate_keystrokes("ctrl-c");
+        draw_result_view(window, &mut cx);
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("a real ctrl-c keystroke must write the selected range to the clipboard \
+                     as TSV by default");
+        assert_eq!(copied, "id\tname\n1\tAlice\n2\tBob\n");
     }
 
     #[gpui::test]
@@ -13101,12 +13418,24 @@ mod tests {
 
     #[gpui::test]
     fn copy_aggregation_writes_column_summary_to_clipboard(cx: &mut gpui::TestAppContext) {
-        let (window, view, mut cx) = table_backed_result_window(cx);
-        draw_result_view(window, &mut cx);
-        view.update(&mut cx, |view, cx| {
-            view.selected_cell = Some((0, 0));
-            view.copy_aggregation_to_clipboard(cx);
+        // Real ctrl-shift-c keystroke through the production binding
+        // (assets/keymaps/default-linux.json: "DbResultView" -> CopyAggregation)
+        // instead of calling copy_aggregation_to_clipboard directly.
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-shift-c",
+                CopyAggregation,
+                Some("DbResultView"),
+            )]);
         });
+        let (window, _view, mut cx) = table_backed_result_window(cx);
+        let cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-shift-c");
+        draw_result_view(window, &mut cx);
+
         let copied = cx
             .read_from_clipboard()
             .and_then(|clipboard| clipboard.text())
@@ -13211,13 +13540,18 @@ mod tests {
 
     #[gpui::test]
     fn toggle_transpose_switches_view(cx: &mut gpui::TestAppContext) {
+        // Drives the real ToggleTranspose action (the "Transpose" view-menu
+        // entry dispatches this same action) instead of calling
+        // toggle_transpose directly, proving the .on_action wiring.
         let (window, view, mut cx) = table_backed_result_window(cx);
-        view.update(&mut cx, |view, cx| {
-            assert!(!view.transposed);
-            view.toggle_transpose(cx);
-            assert!(view.transposed);
-        });
+        view.update(&mut cx, |view, _cx| assert!(!view.transposed));
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
         draw_result_view(window, &mut cx);
+
+        cx.dispatch_action(ToggleTranspose);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| assert!(view.transposed));
         assert!(
             cx.debug_bounds("TRANSPOSE_VIEW").is_some(),
             "transposed view should render"
@@ -13973,6 +14307,23 @@ mod tests {
                  competing editor::SelectNext keymap binding, when no cell editor is focused"
             );
             assert_eq!(view.pending_cell_value(2, 1), Some(&CellValue::Text("Zed".to_string())));
+        });
+
+        let left_cell = debug_center(&mut cx, "CELL-0-0");
+        let right_cell = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(left_cell, gpui::Modifiers::none());
+        cx.simulate_click(right_cell, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-r");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("1".to_string())),
+                "a real ctrl-r keystroke must reach the grid's own fill-right handler when no \
+                 cell editor is focused"
+            );
         });
 
         // A plain single click also copies the clicked cell's own value to the
