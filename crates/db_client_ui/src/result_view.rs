@@ -70,6 +70,8 @@ actions!(
         SetNull,
         /// Sets the selected cell to the column DEFAULT.
         SetDefault,
+        /// Sets the selected cell to an explicit empty string.
+        SetEmptyValue,
         /// Opens or closes the value editor panel (full-content view of the selected cell).
         ToggleValueEditor,
         /// Opens or closes the find-in-results bar.
@@ -2715,6 +2717,17 @@ impl ResultView {
 
         let raw_text = editor.read(cx).text(cx);
 
+        // An editor left empty at commit time never overwrites the cell: this
+        // matches leaving the edit unchanged (or typing something and erasing
+        // it back to nothing) with cancelling the edit, so a NULL (or any
+        // other) original value is never silently coerced into an empty
+        // string. Set Empty Value is the only way to store a real "".
+        if raw_text.is_empty() {
+            self.cell_edit.take();
+            cx.notify();
+            return true;
+        }
+
         // Reject non-numeric input for numeric columns; keep the editor open.
         if matches!(self.column_kind_at(col_idx), CellEditorKind::Numeric) {
             if !is_valid_numeric(&raw_text) {
@@ -5298,6 +5311,7 @@ impl ResultView {
                         let wt_val = wt.clone();
                         let wt_null = wt.clone();
                         let wt_default = wt.clone();
+                        let wt_empty = wt.clone();
                         let wt_revert = wt.clone();
                         let wt_add = wt.clone();
                         let wt_del = wt.clone();
@@ -5412,6 +5426,17 @@ impl ResultView {
                                     .update(cx, |this, cx| {
                                         this.selected_cell = Some((abs_idx, cell_idx));
                                         this.set_selected_cell_value(CellValue::Default, cx);
+                                    })
+                                    .ok();
+                            })
+                            .entry("Set Empty Value", None, move |_, cx| {
+                                wt_empty
+                                    .update(cx, |this, cx| {
+                                        this.selected_cell = Some((abs_idx, cell_idx));
+                                        this.set_selected_cell_value(
+                                            CellValue::Text(String::new()),
+                                            cx,
+                                        );
                                     })
                                     .ok();
                             })
@@ -6011,6 +6036,14 @@ impl ResultView {
                                     })),
                             )
                         })
+                        .child(
+                            Button::new("set-empty-value", "Set Empty Value")
+                                .style(ButtonStyle::Subtle)
+                                .tooltip(Tooltip::text("Set the selected cell to an explicit empty string (Ctrl+Alt+E / Cmd+Alt+E)"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_selected_cell_value(CellValue::Text(String::new()), cx);
+                                })),
+                        )
                     })
                     .when(pending_count > 0, |el| {
                         el.child(Divider::vertical())
@@ -7148,6 +7181,12 @@ impl ResultView {
             return;
         };
         let raw_text = editor.read(cx).text(cx);
+        if raw_text.is_empty() {
+            self.value_editor_open = false;
+            self.value_editor_resize_drag = None;
+            cx.notify();
+            return;
+        }
         let new_value = CellValue::from_text(raw_text);
 
         let added_idx = self
@@ -9507,6 +9546,9 @@ impl Render for ResultView {
             .on_action(cx.listener(|this, _: &SetDefault, _window, cx| {
                 this.set_selected_cell_value(CellValue::Default, cx);
             }))
+            .on_action(cx.listener(|this, _: &SetEmptyValue, _window, cx| {
+                this.set_selected_cell_value(CellValue::Text(String::new()), cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleValueEditor, _window, cx| {
                 this.value_editor_open = !this.value_editor_open;
                 if !this.value_editor_open {
@@ -10741,6 +10783,17 @@ mod tests {
         Entity<ResultView>,
         gpui::VisualTestContext,
     ) {
+        table_backed_result_window_with(cx, sample_table_result())
+    }
+
+    fn table_backed_result_window_with(
+        cx: &mut gpui::TestAppContext,
+        result: QueryResult,
+    ) -> (
+        gpui::WindowHandle<ResultView>,
+        Entity<ResultView>,
+        gpui::VisualTestContext,
+    ) {
         init_result_view_test(cx);
         let store = cx.update(|cx| cx.new(DatabaseStore::new));
         let connection_id = uuid::Uuid::new_v4();
@@ -10755,7 +10808,7 @@ mod tests {
                     window,
                     cx,
                 );
-                view.set_result(sample_table_result(), cx);
+                view.set_result(result, cx);
                 view
             }
         });
@@ -10763,6 +10816,22 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_result_view(window, &mut cx);
         (window, view, cx)
+    }
+
+    // Same shape as `sample_table_result`, but row 0's "name" cell is SQL
+    // NULL instead of a loaded string, for testing that clearing/leaving a
+    // cell empty never coerces a NULL original into an empty string.
+    fn table_result_with_null_cell() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), None],
+                vec![Some("2".to_string()), Some("Bob".to_string())],
+                vec![Some("3".to_string()), Some("Claire".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
     }
 
     fn framed_plain_result_window(
@@ -11067,6 +11136,195 @@ mod tests {
              element tree: got {:?}",
             bounds.size
         );
+    }
+
+    // Real double-click + real click-away, matching the reported bug exactly:
+    // opening a NULL cell's editor and leaving it untouched must never turn
+    // the cell into an empty string.
+    #[gpui::test]
+    fn committing_an_empty_editor_on_a_null_cell_keeps_it_null(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_null_cell());
+        let null_cell = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: null_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: null_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| edit.editor.read(cx).text(cx)),
+                Some(String::new()),
+                "a NULL cell's editor should start empty"
+            );
+        });
+
+        let other_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                !view.pending_edits.contains_key(&(0, 1)),
+                "leaving a NULL cell's editor empty must not buffer an edit that turns it into \
+                 an empty string"
+            );
+        });
+    }
+
+    // Same as above, but the user actually types something first and then
+    // erases it back to nothing before clicking away — the net effect at
+    // commit time is still "empty", so the original NULL must be kept.
+    #[gpui::test]
+    fn typing_then_clearing_a_null_cell_before_commit_keeps_it_null(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_null_cell());
+        let null_cell = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: null_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: null_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        // Real typing, then a real delete action (mirrors how the Escape fix
+        // test above dispatches `editor::actions::Cancel` directly: this test
+        // harness loads no production keymap, so a raw "backspace" keystroke
+        // never resolves to the Editor's delete-backward action; dispatching
+        // the action itself still exercises the real deletion path).
+        cx.simulate_keystrokes("x");
+        cx.dispatch_action(editor::actions::Backspace);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| edit.editor.read(cx).text(cx)),
+                Some(String::new()),
+                "typing then erasing back to nothing should leave the editor empty"
+            );
+        });
+
+        let other_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                !view.pending_edits.contains_key(&(0, 1)),
+                "typing then clearing a NULL cell before committing must not turn it into an \
+                 empty string"
+            );
+        });
+    }
+
+    // Regression proof that the empty-commit no-op does not swallow a real
+    // edit: replacing a non-empty value with a different non-empty value must
+    // still buffer normally.
+    #[gpui::test]
+    fn committing_a_new_nonempty_value_still_buffers_the_edit(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_null_cell());
+        let bob_cell = debug_center(&mut cx, "CELL-1-1");
+
+        // A single click selects the cell (no edit yet); typing on a selected,
+        // non-editing cell replaces its value (type-to-replace), giving a
+        // clean, unambiguous new value to assert on.
+        cx.simulate_click(bob_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        cx.simulate_input("bydan");
+
+        let other_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: other_cell,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            let edit = view
+                .pending_edits
+                .get(&(1, 1))
+                .expect("a real, non-empty edit must still be buffered");
+            assert!(matches!(&edit.new_value, CellValue::Text(t) if t == "bydan"));
+        });
+    }
+
+    // The only way to deliberately store a real empty string: distinct from
+    // both NULL and leaving the cell untouched.
+    #[gpui::test]
+    fn set_empty_value_action_stores_a_real_empty_string(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_null_cell());
+
+        view.update(&mut cx, |view, cx| {
+            view.selected_cell = Some((0, 1));
+            view.set_selected_cell_value(CellValue::Text(String::new()), cx);
+        });
+
+        view.update(&mut cx, |view, _cx| {
+            let edit = view
+                .pending_edits
+                .get(&(0, 1))
+                .expect("Set Empty Value must buffer a real change from NULL");
+            assert_eq!(edit.new_value, CellValue::Text(String::new()));
+        });
     }
 
     #[gpui::test]

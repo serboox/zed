@@ -1722,6 +1722,7 @@
       "cmd-shift-d": "db_result_view::CloneRow",
       "cmd-alt-n": "db_result_view::SetNull",
       "cmd-alt-d": "db_result_view::SetDefault",
+      "cmd-alt-e": "db_result_view::SetEmptyValue",
       "cmd-f": "db_result_view::ToggleFind",
       "cmd-g": "db_result_view::FindNext",
       "shift-cmd-g": "db_result_view::FindPrevious",

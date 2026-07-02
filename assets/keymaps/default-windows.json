@@ -1637,6 +1637,7 @@
       "ctrl-shift-d": "db_result_view::CloneRow",
       "ctrl-alt-n": "db_result_view::SetNull",
       "ctrl-alt-d": "db_result_view::SetDefault",
+      "ctrl-alt-e": "db_result_view::SetEmptyValue",
       "ctrl-f": "db_result_view::ToggleFind",
       "ctrl-g": "db_result_view::FindNext",
       "shift-ctrl-g": "db_result_view::FindPrevious",
