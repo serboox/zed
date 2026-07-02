@@ -29,9 +29,9 @@ const READ_ONLY_STARTERS: [&str; 7] = [
     "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "USE",
 ];
 
-const WRITE_KEYWORDS: [&str; 17] = [
+const WRITE_KEYWORDS: [&str; 19] = [
     "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "TRUNCATE", "DROP", "ALTER", "CREATE",
-    "RENAME", "GRANT", "REVOKE", "SET", "CALL", "LOAD", "IMPORT", "COPY",
+    "RENAME", "GRANT", "REVOKE", "SET", "CALL", "LOAD", "IMPORT", "COPY", "OUTFILE", "DUMPFILE",
 ];
 
 /// Splits SQL into uppercased word tokens, skipping line/block comments and the
@@ -355,6 +355,17 @@ mod tests {
             "WITH t AS (DELETE FROM a RETURNING id) SELECT * FROM t"
         ));
         assert!(requires_confirmation("SELECT * FROM t; DROP TABLE x"));
+        // `SELECT ... INTO OUTFILE/DUMPFILE` writes a file on the database
+        // server and must not slip through as read-only just because it
+        // starts with SELECT.
+        assert!(requires_confirmation(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x.csv'"
+        ));
+        assert!(requires_confirmation(
+            "SELECT * FROM t INTO DUMPFILE '/tmp/x.bin'"
+        ));
+        // The common case without INTO OUTFILE/DUMPFILE stays read-only.
+        assert!(!requires_confirmation("SELECT * FROM t"));
     }
 
     #[test]
