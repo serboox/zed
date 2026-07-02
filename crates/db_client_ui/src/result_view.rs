@@ -2441,24 +2441,11 @@ impl ResultView {
         }
     }
 
-    fn render_typed_cell_body(
-        body: AnyElement,
-        kind: CellEditorKind,
-        align_right: bool,
-    ) -> AnyElement {
+    fn render_typed_cell_body(body: AnyElement, align_right: bool) -> AnyElement {
         h_flex()
             .size_full()
             .gap_1()
             .items_center()
-            .when_some(Self::cell_kind_icon(&kind), |element, (icon_name, _)| {
-                element.child(
-                    div().flex_none().child(
-                        Icon::new(icon_name)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
             .child(
                 div()
                     .flex_1()
@@ -5196,7 +5183,7 @@ impl ResultView {
                     .when(is_deleted, |label| label.strikethrough())
                     .into_any_element();
                 let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
-                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx), align_right)
+                Self::render_typed_cell_body(label, align_right)
             };
             let is_find_match = self.find_query.as_ref().is_some_and(|q| !q.is_empty())
                 && self.find_matches.contains(&(abs_idx, cell_idx));
@@ -5643,7 +5630,7 @@ impl ResultView {
                     .color(color)
                     .into_any_element();
                 let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
-                Self::render_typed_cell_body(label, self.column_kind_at(cell_idx), align_right)
+                Self::render_typed_cell_body(label, align_right)
             };
             let cell_display_idx = display_idx;
             cells.push(
