@@ -1559,3 +1559,104 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{TestAppContext, point, size};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct MockHandle(Rc<RefCell<MockHandleState>>);
+
+    struct MockHandleState {
+        offset: Point<Pixels>,
+        max_offset: Point<Pixels>,
+        viewport: Bounds<Pixels>,
+    }
+
+    impl MockHandle {
+        fn new(viewport_size: Size<Pixels>, content_size: Size<Pixels>) -> Self {
+            let max_offset = Point::new(
+                (content_size.width - viewport_size.width).max(Pixels::ZERO),
+                (content_size.height - viewport_size.height).max(Pixels::ZERO),
+            );
+            Self(Rc::new(RefCell::new(MockHandleState {
+                offset: Point::default(),
+                max_offset,
+                viewport: Bounds::new(Point::default(), viewport_size),
+            })))
+        }
+    }
+
+    impl ScrollableHandle for MockHandle {
+        fn max_offset(&self) -> Point<Pixels> {
+            self.0.borrow().max_offset
+        }
+
+        fn set_offset(&self, point: Point<Pixels>) {
+            self.0.borrow_mut().offset = point;
+        }
+
+        fn offset(&self) -> Point<Pixels> {
+            self.0.borrow().offset
+        }
+
+        fn viewport(&self) -> Bounds<Pixels> {
+            self.0.borrow().viewport
+        }
+    }
+
+    #[gpui::test]
+    fn always_visible_thumb_survives_a_scroll(cx: &mut TestAppContext) {
+        let handle = MockHandle::new(size(px(300.), px(250.)), size(px(300.), px(1000.)));
+        let cx = cx.add_empty_window();
+
+        let state = cx.update(|_window, cx| {
+            cx.new(|cx| {
+                let parent_id = cx.entity_id();
+                ScrollbarState::new_from_config(
+                    Scrollbars::always_visible(ScrollAxes::Both).tracked_scroll_handle(&handle),
+                    parent_id,
+                    cx,
+                )
+            })
+        });
+
+        state.update(cx, |state, _cx| {
+            assert_eq!(
+                state.thumb_ranges().count(),
+                1,
+                "vertical thumb should exist before scroll"
+            );
+            assert!(
+                state.show_state.is_visible(),
+                "should be visible before scroll (at rest)"
+            );
+        });
+
+        // Simulate a scroll the same way a real mouse-wheel event does: only
+        // the handle's offset changes.
+        handle.set_offset(point(px(0.), px(-400.)));
+
+        // Mirror what `prepaint` does on every render when the computed thumb
+        // geometry changes, which a scroll always causes: re-arm visibility.
+        state.update_in(cx, |state, window, cx| {
+            state.show_scrollbars(window, cx);
+        });
+
+        state.update(cx, |state, _cx| {
+            assert_eq!(
+                state.thumb_ranges().count(),
+                1,
+                "vertical thumb must still exist after a scroll for an always-visible scrollbar"
+            );
+            assert!(
+                state.show_state.is_visible(),
+                "an always-visible scrollbar must remain visible after a scroll, not just at rest"
+            );
+        });
+    }
+}
