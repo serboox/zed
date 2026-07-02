@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::{Column as _, Row as _};
+use sqlx::{Column as _, Row as _, ValueRef as _};
 use std::path::Path;
 use std::time::Instant;
 
@@ -252,6 +252,18 @@ impl DbProvider for SqliteProvider {
                 }
                 let decoded: Vec<Option<String>> = (0..columns.len())
                     .map(|index| {
+                        // SQLite's manifest typing means a NULL column still
+                        // satisfies a typed try_get (e.g. i64) as 0 instead of
+                        // erroring, so nullness must be checked before any
+                        // typed decode is attempted, not inferred from decode
+                        // failure.
+                        if row
+                            .try_get_raw(index)
+                            .map(|v| v.is_null())
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
                         row.try_get::<Option<String>, _>(index)
                             .ok()
                             .flatten()
@@ -290,5 +302,50 @@ impl DbProvider for SqliteProvider {
                 execution_time_ms: start.elapsed().as_millis() as u64,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Gates the "NULL decodes as 0" hypothesis from the grid UX audit: writes
+    // a genuine SQL NULL into a TEXT and an INTEGER column and decodes it
+    // through the exact same execute_query path production queries use.
+    #[tokio::test]
+    async fn null_cells_decode_as_none_not_as_zero_or_empty_string() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory sqlite pool");
+        let provider = SqliteProvider {
+            pool,
+            db_name: "test".to_string(),
+        };
+
+        sqlx::query("CREATE TABLE t (name TEXT, amount INTEGER)")
+            .execute(&provider.pool)
+            .await
+            .expect("failed to create table");
+        sqlx::query("INSERT INTO t (name, amount) VALUES (NULL, NULL)")
+            .execute(&provider.pool)
+            .await
+            .expect("failed to insert null row");
+
+        let result = provider
+            .execute_query("test", "SELECT name, amount FROM t")
+            .await
+            .expect("failed to execute select");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0], None,
+            "a NULL TEXT column must decode to None, not Some(\"0\")/Some(\"\")"
+        );
+        assert_eq!(
+            result.rows[0][1], None,
+            "a NULL INTEGER column must decode to None, not Some(\"0\")"
+        );
     }
 }

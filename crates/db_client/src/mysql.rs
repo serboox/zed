@@ -825,4 +825,31 @@ mod integration_tests {
         assert_eq!(result.columns, vec!["n".to_string()]);
         assert_eq!(result.rows.len(), 1);
     }
+
+    // Gates the "NULL decodes as 0" hypothesis from the grid UX audit for
+    // MySQL specifically -- do not assume the fix SQLite needed applies here
+    // without empirical proof, per that audit's own correction.
+    #[tokio::test]
+    #[ignore]
+    async fn test_null_cells_decode_as_none() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let result = provider
+            .execute_query("", "SELECT CAST(NULL AS CHAR) AS text_col, CAST(NULL AS SIGNED) AS int_col")
+            .await
+            .expect("Failed to execute query");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0], None,
+            "a NULL text column must decode to None, not Some(\"0\")/Some(\"\")"
+        );
+        assert_eq!(
+            result.rows[0][1], None,
+            "a NULL integer column must decode to None, not Some(\"0\")"
+        );
+    }
 }

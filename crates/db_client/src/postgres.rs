@@ -410,3 +410,74 @@ impl DbProvider for PostgresProvider {
         Ok(())
     }
 }
+
+/// Integration tests against a real Postgres server.
+///
+/// Set POSTGRES_TEST_URL=postgres://user:password@host:port/dbname before
+/// running, then use `cargo test -p db_client -- --include-ignored` to
+/// execute. Mirrors the MySQL provider's integration_tests convention.
+#[cfg(test)]
+mod integration_tests {
+    use super::PostgresProvider;
+    use crate::provider::DbProvider;
+    use crate::{ConnectionConfig, DatabaseDriver};
+    use uuid::Uuid;
+
+    fn test_config_from_env() -> Option<ConnectionConfig> {
+        let url = std::env::var("POSTGRES_TEST_URL").ok()?;
+        let url = url.strip_prefix("postgres://")?;
+        let (userinfo, hostpart) = url.split_once('@')?;
+        let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+        let (hostport, database) = hostpart.split_once('/').unwrap_or((hostpart, ""));
+        let (host, port_str) = hostport.split_once(':').unwrap_or((hostport, "5432"));
+        let port: u16 = port_str.parse().unwrap_or(5432);
+
+        Some(ConnectionConfig {
+            id: Uuid::new_v4(),
+            label: "test".to_string(),
+            driver: DatabaseDriver::PostgreSQL,
+            host: host.to_string(),
+            port,
+            username: username.to_string(),
+            password: password.to_string(),
+            database: if database.is_empty() {
+                None
+            } else {
+                Some(database.to_string())
+            },
+            auto_connect: false,
+            ..ConnectionConfig::default()
+        })
+    }
+
+    // Gates the "NULL decodes as 0" hypothesis from the grid UX audit for
+    // Postgres specifically -- SQLite's manifest typing made the hypothesis
+    // true there, but Postgres's strongly-typed driver may already behave
+    // correctly; this test must not be skipped in favor of assuming so.
+    #[tokio::test]
+    #[ignore]
+    async fn test_null_cells_decode_as_none() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let result = provider
+            .execute_query(
+                "public",
+                "SELECT NULL::text AS text_col, NULL::bigint AS int_col",
+            )
+            .await
+            .expect("Failed to execute query");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0], None,
+            "a NULL text column must decode to None, not Some(\"0\")/Some(\"\")"
+        );
+        assert_eq!(
+            result.rows[0][1], None,
+            "a NULL integer column must decode to None, not Some(\"0\")"
+        );
+    }
+}
