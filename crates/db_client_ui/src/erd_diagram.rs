@@ -608,7 +608,7 @@ impl Render for ErdView {
                     )
                     .child(surface)
                     .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Both)
+                        Scrollbars::always_visible(ScrollAxes::Both)
                             .tracked_scroll_handle(&self.scroll_handle),
                         window,
                         cx,
