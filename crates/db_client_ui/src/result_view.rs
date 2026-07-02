@@ -362,6 +362,36 @@ fn column_values_look_numeric<'a>(values: impl Iterator<Item = Option<&'a str>>)
     saw_value
 }
 
+// Decides whether a column looks boolean before real type metadata has loaded. A
+// known SQL type is authoritative (mirrors column_is_numeric); without it, every
+// non-empty sampled value must look like a boolean literal.
+fn column_is_boolean<'a>(
+    data_type: Option<&str>,
+    values: impl Iterator<Item = Option<&'a str>>,
+) -> bool {
+    if let Some(data_type) = data_type {
+        return matches!(column_editor_kind(data_type), CellEditorKind::Boolean);
+    }
+    column_values_look_boolean(values)
+}
+
+fn column_values_look_boolean<'a>(values: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut saw_value = false;
+    for value in values {
+        match value {
+            None => {}
+            Some("") => {}
+            Some(text) => {
+                if !matches!(text.to_lowercase().as_str(), "0" | "1" | "true" | "false") {
+                    return false;
+                }
+                saw_value = true;
+            }
+        }
+    }
+    saw_value
+}
+
 fn is_valid_date(text: &str) -> bool {
     if text.is_empty() {
         return true;
@@ -650,6 +680,12 @@ pub struct ResultView {
     // Per data-column flag: true for numeric columns, which render right-aligned
     // like a spreadsheet. Indexed by result column index, recomputed with layout.
     numeric_columns: Vec<bool>,
+    // Per data-column flag: true for boolean-looking columns, used only as a
+    // provisional hint before real column type metadata (describe_table) has
+    // loaded -- column_kind_at always prefers the real type once known. Without
+    // this, a boolean column renders raw "1"/"0" text and then visibly flips to
+    // the check/dash icon once metadata arrives.
+    boolean_columns: Vec<bool>,
     // Currently selected cell as (absolute row index, column index), highlighted
     // like a spreadsheet/grid selection.
     selected_cell: Option<(usize, usize)>,
@@ -956,6 +992,7 @@ impl ResultView {
             column_edges: Vec::new(),
             total_width: 0.0,
             numeric_columns: Vec::new(),
+            boolean_columns: Vec::new(),
             selected_cell: None,
             selected_cell_range: None,
             cell_drag_anchor: None,
@@ -1270,6 +1307,25 @@ impl ResultView {
                     .iter()
                     .map(move |row| row.get(data_col).and_then(|cell| cell.as_deref()));
                 column_is_numeric(data_type, values)
+            })
+            .collect();
+
+        // Provisional boolean flag per data column, same type-first/sample-fallback
+        // shape as numeric_columns above -- lets column_kind_at render the check/dash
+        // icon immediately instead of flashing raw "1"/"0" until describe_table loads.
+        self.boolean_columns = (0..total_cols)
+            .map(|data_col| {
+                let data_type = column_infos.and_then(|infos| {
+                    let col_name = result.columns.get(data_col)?;
+                    infos
+                        .iter()
+                        .find(|info| &info.name == col_name)
+                        .map(|info| info.data_type.as_str())
+                });
+                let values = result.rows[..sample]
+                    .iter()
+                    .map(move |row| row.get(data_col).and_then(|cell| cell.as_deref()));
+                column_is_boolean(data_type, values)
             })
             .collect();
 
@@ -1704,6 +1760,24 @@ impl ResultView {
         let col_lo = anchor_col_idx.min(end_col_idx);
         let col_hi = anchor_col_idx.max(end_col_idx);
         display_idx >= row_lo && display_idx <= row_hi && cell_idx >= col_lo && cell_idx <= col_hi
+    }
+
+    // Whether a cell should paint the range-selection tint: any selected cell
+    // (lone active cell or part of a multi-cell range) EXCEPT the active cell
+    // itself, which stays background-colored -- its own border is enough to mark
+    // it (the range fills, the active corner does not). Shared by both grid
+    // render paths so a test can exercise the exact same decision the renderer
+    // makes, not a re-derived copy of the formula.
+    fn cell_receives_selection_tint(
+        &self,
+        abs_idx: usize,
+        display_idx: usize,
+        cell_idx: usize,
+    ) -> bool {
+        let is_active = self.selected_cell == Some((abs_idx, cell_idx));
+        let is_selected =
+            is_active || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
+        is_selected && !is_active
     }
 
     pub fn with_workspace(mut self, workspace: WeakEntity<Workspace>) -> Self {
@@ -2413,7 +2487,7 @@ impl ResultView {
             .into_any_element()
     }
 
-    fn render_typed_cell_body(body: AnyElement, align_right: bool) -> AnyElement {
+    fn render_typed_cell_body(body: AnyElement, align_right: bool, text_debug_id: String) -> AnyElement {
         h_flex()
             .size_full()
             .gap_1()
@@ -2429,7 +2503,12 @@ impl ResultView {
                     // flex_none keeps it at its natural single-line width so
                     // justify_end only repositions it, matching how the
                     // non-right-aligned (block layout) case already clips.
-                    .child(div().flex_none().child(body)),
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector(move || text_debug_id)
+                            .child(body),
+                    ),
             )
             .into_any_element()
     }
@@ -2817,12 +2896,23 @@ impl ResultView {
     // The editor kind for a column, resolved from cached column metadata.
     // Falls back to Text when no metadata has been loaded yet.
     fn column_kind_at(&self, col_idx: usize) -> CellEditorKind {
+        // Provisional fallback while describe_table metadata hasn't loaded yet: a
+        // sampled-boolean-looking column renders as Boolean from the first paint
+        // instead of flashing raw "1"/"0" text. Real type metadata below always
+        // takes priority once it arrives, exactly like numeric_columns' fallback.
+        let provisional = || {
+            if self.boolean_columns.get(col_idx).copied().unwrap_or(false) {
+                CellEditorKind::Boolean
+            } else {
+                CellEditorKind::Text
+            }
+        };
         let col_name = self.result.as_ref().and_then(|r| r.columns.get(col_idx));
         let (Some(col_name), Some(infos)) = (col_name, self.column_infos.as_ref()) else {
-            return CellEditorKind::Text;
+            return provisional();
         };
         let Some(info) = infos.iter().find(|ci| &ci.name == col_name) else {
-            return CellEditorKind::Text;
+            return provisional();
         };
         column_editor_kind(&info.data_type)
     }
@@ -5027,7 +5117,15 @@ impl ResultView {
         else {
             return div().into_any_element();
         };
-        let selection_bg = cx.theme().colors().element_selected;
+        // A flat `element_selected` fill reads as invisible against the grid's own
+        // background here; blending a visible tint into the grid's base color,
+        // mirroring the header cross-highlight's `text_accent.opacity` pattern,
+        // keeps contrast in both light and dark themes.
+        let selection_bg = cx
+            .theme()
+            .colors()
+            .editor_background
+            .blend(cx.theme().colors().text_accent.opacity(0.14));
         let active_cell_border = cx.theme().colors().border_focused;
         let search_match_bg = cx.theme().colors().search_match_background;
         let active_line_bg = cx.theme().colors().editor_active_line_background;
@@ -5064,8 +5162,9 @@ impl ResultView {
                 }
                 continue;
             }
-            let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
-                || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
+            let is_active = self.selected_cell == Some((abs_idx, cell_idx));
+            let is_selected =
+                is_active || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
             let is_modified = self.pending_edits.contains_key(&(abs_idx, cell_idx));
             let editing = self
                 .cell_edit
@@ -5149,6 +5248,7 @@ impl ResultView {
                 let label = Label::new(display.clone())
                     .size(LabelSize::Small)
                     .color(color)
+                    .single_line()
                     .when(
                         display == NULL_MARKER || display == DEFAULT_MARKER,
                         |label| label.italic(),
@@ -5156,7 +5256,11 @@ impl ResultView {
                     .when(is_deleted, |label| label.strikethrough())
                     .into_any_element();
                 let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
-                Self::render_typed_cell_body(label, align_right)
+                Self::render_typed_cell_body(
+                    label,
+                    align_right,
+                    format!("CELL_TEXT-{abs_idx}-{cell_idx}"),
+                )
             };
             let is_find_match = self.find_query.as_ref().is_some_and(|q| !q.is_empty())
                 && self.find_matches.contains(&(abs_idx, cell_idx));
@@ -5195,9 +5299,12 @@ impl ResultView {
                         .border_l(px(2.))
                         .border_color(modified_border)
                 })
-                .when(is_selected, |this| this.bg(selection_bg))
+                .when(
+                    self.cell_receives_selection_tint(abs_idx, display_idx, cell_idx),
+                    |this| this.bg(selection_bg),
+                )
                 .when(is_deleted, |this| this.bg(deleted_bg))
-                .when(self.selected_cell == Some((abs_idx, cell_idx)), |this| {
+                .when(is_active, |this| {
                     this.border_1().border_color(active_cell_border)
                 })
                 .when(
@@ -5511,7 +5618,13 @@ impl ResultView {
             return div().into_any_element();
         };
         let abs_idx = self.loaded_row_count() + added_idx;
-        let selection_bg = cx.theme().colors().element_selected;
+        // See render_grid_row's identical comment: a flat element_selected fill is
+        // invisible here, so blend a visible tint into the grid's base color instead.
+        let selection_bg = cx
+            .theme()
+            .colors()
+            .editor_background
+            .blend(cx.theme().colors().text_accent.opacity(0.14));
         let active_cell_border = cx.theme().colors().border_focused;
         let column_count = self
             .result
@@ -5548,8 +5661,9 @@ impl ResultView {
                 }
                 continue;
             }
-            let is_selected = self.selected_cell == Some((abs_idx, cell_idx))
-                || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
+            let is_active = self.selected_cell == Some((abs_idx, cell_idx));
+            let is_selected =
+                is_active || self.selected_cell_range_contains(abs_idx, display_idx, cell_idx);
             let editing = self
                 .cell_edit
                 .as_ref()
@@ -5612,9 +5726,14 @@ impl ResultView {
                 let label = Label::new(display)
                     .size(LabelSize::Small)
                     .color(color)
+                    .single_line()
                     .into_any_element();
                 let align_right = self.numeric_columns.get(cell_idx).copied().unwrap_or(false);
-                Self::render_typed_cell_body(label, align_right)
+                Self::render_typed_cell_body(
+                    label,
+                    align_right,
+                    format!("ADDED_CELL_TEXT-{added_idx}-{cell_idx}"),
+                )
             };
             let cell_display_idx = display_idx;
             cells.push(
@@ -5632,8 +5751,11 @@ impl ResultView {
                     .border_r_1()
                     .border_color(grid_border)
                     .overflow_hidden()
-                    .when(is_selected, |this| this.bg(selection_bg))
-                    .when(self.selected_cell == Some((abs_idx, cell_idx)), |this| {
+                    .when(
+                        self.cell_receives_selection_tint(abs_idx, display_idx, cell_idx),
+                        |this| this.bg(selection_bg),
+                    )
+                    .when(is_active, |this| {
                         this.border_1().border_color(active_cell_border)
                     })
                     .when(!is_selected, |this| {
@@ -6373,6 +6495,10 @@ impl ResultView {
                     };
                     let is_sorted = sort_pos.is_some();
                     let is_active_col = active_col == Some(col_idx);
+                    // Numeric columns render their data right-aligned; right-aligning
+                    // the header too keeps it visually anchored over its column
+                    // instead of floating at the opposite edge on wide columns.
+                    let is_numeric_header = self.numeric_columns.get(col_idx).copied().unwrap_or(false);
                     let header_cell_hover_bg = if is_sorted {
                         sorted_header_bg.blend(header_hover_bg)
                     } else {
@@ -6434,13 +6560,23 @@ impl ResultView {
                                 col_type_tooltips.get(col_idx).and_then(|t| t.clone()),
                                 |el, tip| el.tooltip(Tooltip::text(tip)),
                             )
+                            .when(is_numeric_header, |el| el.justify_end())
                             .child(
                                 h_flex()
+                                    .debug_selector(move || format!("COL_HEADER_CONTENT-{col_idx}"))
                                     .gap_1()
                                     .items_center()
+                                    // flex_none keeps this at its natural width when the
+                                    // parent switches to justify_end above -- without it,
+                                    // a flex child is shrinkable and long header names
+                                    // wrap onto two lines instead of just moving right
+                                    // (the same class of bug fixed for numeric cells in
+                                    // commit d0084bff98).
+                                    .when(is_numeric_header, |el| el.flex_none())
                                     .child(
                                         Label::new(format!("{}{}", col, sort_label))
                                             .size(LabelSize::Small)
+                                            .single_line()
                                             .color(if is_sorted {
                                                 Color::Accent
                                             } else {
@@ -11958,6 +12094,163 @@ mod tests {
             // sample_table_result: column 0 (id) is all numbers, column 1 (name) is text.
             assert_eq!(view.numeric_columns, vec![true, false]);
         });
+    }
+
+    // Grid-audit item 4: a long value must clip on one line, not wrap and grow the
+    // row past its fixed height.
+    #[gpui::test]
+    fn long_cell_text_never_wraps_onto_a_second_line(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "notes".to_string()],
+            rows: vec![vec![
+                // Not 0/1 so it stays unambiguously numeric-text, not the boolean fallback.
+                Some("42".to_string()),
+                Some(
+                    "a very long note value that would wrap onto a second collided line inside \
+                     the fixed-height row if the label were allowed to wrap"
+                        .to_string(),
+                ),
+            ]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (_window, _view, mut cx) = table_backed_result_window_with(cx, result);
+        // The outer CELL bounds are pinned to GRID_ROW_H and clip overflow, so they
+        // stay fixed-height even if the text wraps underneath. Measure the inner
+        // text wrapper instead -- that is what actually grows taller when the label
+        // wraps onto a second line.
+        let text_bounds = cx
+            .debug_bounds("CELL_TEXT-0-1")
+            .expect("expected the long-text cell's text wrapper to be measurable");
+        let single_line_bounds = cx
+            .debug_bounds("CELL_TEXT-0-0")
+            .expect("expected the short id cell's text wrapper to be measurable");
+        assert!(
+            text_bounds.size.height <= single_line_bounds.size.height + px(1.),
+            "a long cell value must render on a single line: expected height close to a \
+             single line's height ({:?}), got {:?}",
+            single_line_bounds.size.height,
+            text_bounds.size.height
+        );
+    }
+
+    // Grid-audit item 5: shift-click a 2x2 range and confirm the tint decision the
+    // renderer actually uses (`cell_receives_selection_tint`) excludes only the
+    // last-clicked corner (the real active cell after a shift-click, per
+    // `select_cell_from_click`), tinting the other three cells.
+    #[gpui::test]
+    fn range_selection_tints_every_cell_except_the_active_corner(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        let last_cell = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        cx.simulate_click(last_cell, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _| {
+            // A shift-click moves the active cell to the newly-clicked corner (real
+            // spreadsheet behavior), not the original anchor.
+            assert_eq!(view.selected_cell, Some((1, 1)));
+            for &(abs_idx, display_idx, cell_idx) in
+                &[(0usize, 0usize, 0usize), (0, 0, 1), (1, 1, 0)]
+            {
+                assert!(
+                    view.cell_receives_selection_tint(abs_idx, display_idx, cell_idx),
+                    "cell ({abs_idx},{cell_idx}) is part of the range and must be tinted"
+                );
+            }
+            assert!(
+                !view.cell_receives_selection_tint(1, 1, 1),
+                "the active corner (1,1) must not be tinted -- its own border marks it"
+            );
+        });
+    }
+
+    // Grid-audit item 7, pure logic half (mirrors column_is_numeric_prefers_type_over_values).
+    #[test]
+    fn column_is_boolean_prefers_type_over_values() {
+        let no_values: [Option<&str>; 0] = [];
+        assert!(column_is_boolean(Some("boolean"), no_values.into_iter()));
+        assert!(column_is_boolean(Some("tinyint(1)"), no_values.into_iter()));
+
+        // A known non-boolean type is not boolean even when its values look boolean.
+        let boolean_looking = [Some("0"), Some("1")];
+        assert!(!column_is_boolean(
+            Some("varchar(255)"),
+            boolean_looking.into_iter()
+        ));
+
+        // With no type metadata, the sampled values decide.
+        assert!(column_is_boolean(None, [Some("0"), Some("1")].into_iter()));
+        assert!(column_is_boolean(
+            None,
+            [Some("true"), Some("false")].into_iter()
+        ));
+        assert!(!column_is_boolean(None, [Some("0"), Some("2")].into_iter()));
+    }
+
+    // Grid-audit item 7, rendering half: a boolean-looking column must classify as
+    // Boolean (and therefore render its icon, not raw "1"/"0" text) on the very
+    // first layout pass, before any describe_table metadata has loaded.
+    #[gpui::test]
+    fn boolean_looking_column_classifies_as_boolean_before_metadata_loads(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "is_active".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("1".to_string())],
+                vec![Some("2".to_string()), Some("0".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (_window, view, mut cx) = table_backed_result_window_with(cx, result);
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.column_infos.is_none(),
+                "this test only proves the pre-metadata fallback; describe_table must not \
+                 have loaded yet"
+            );
+            assert!(matches!(view.column_kind_at(1), CellEditorKind::Boolean));
+        });
+    }
+
+    // Grid-audit item 8: a numeric column's header label sits near the right edge
+    // of its header cell (matching its right-aligned data below it); a text
+    // column's header label sits near the left edge (unchanged layout).
+    #[gpui::test]
+    fn numeric_column_headers_hug_the_right_edge(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = table_backed_result_window(cx);
+        // sample_table_result: column 0 (id) is numeric, column 1 (name) is text.
+        let numeric_header = cx
+            .debug_bounds("COL_HEADER-0")
+            .expect("expected the numeric column's header to be measurable");
+        let numeric_content = cx
+            .debug_bounds("COL_HEADER_CONTENT-0")
+            .expect("expected the numeric column's header label to be measurable");
+        let text_header = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("expected the text column's header to be measurable");
+        let text_content = cx
+            .debug_bounds("COL_HEADER_CONTENT-1")
+            .expect("expected the text column's header label to be measurable");
+
+        let numeric_right_gap = numeric_header.right() - numeric_content.right();
+        let numeric_left_gap = numeric_content.left() - numeric_header.left();
+        assert!(
+            numeric_right_gap < numeric_left_gap,
+            "numeric column header must hug the right edge: right gap {numeric_right_gap:?} \
+             should be smaller than left gap {numeric_left_gap:?}"
+        );
+
+        let text_left_gap = text_content.left() - text_header.left();
+        let text_right_gap = text_header.right() - text_content.right();
+        assert!(
+            text_left_gap < text_right_gap,
+            "text column header must stay left-aligned: left gap {text_left_gap:?} should be \
+             smaller than right gap {text_right_gap:?}"
+        );
     }
 
     #[gpui::test]
