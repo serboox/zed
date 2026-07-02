@@ -3,7 +3,7 @@ use db_client::{
     ConnectionId, DatabaseDriver,
     schema::{ColumnInfo, FkInfo, QueryResult},
 };
-use editor::{Editor, EditorEvent, MinimapVisibility};
+use editor::{CompletionContext, CompletionProvider, Editor, EditorEvent, MinimapVisibility};
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton, MouseDownEvent,
@@ -12,7 +12,10 @@ use gpui::{
     actions, uniform_list,
 };
 use language::language_settings::SoftWrap;
+use language::{Buffer, CodeLabel, ToOffset};
+use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 use std::io::Write;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -301,6 +304,87 @@ fn parse_enum_values(data_type: &str) -> Vec<String> {
         }
     }
     values
+}
+
+// Distinct, already-loaded values of one column, offered as completions while
+// editing a cell of that column. Built entirely from `result.rows` already in
+// memory (no query), case-sensitive, capped so a large result set can't turn
+// every keystroke into an unbounded scan.
+fn distinct_column_values(result: &QueryResult, col_idx: usize) -> Vec<String> {
+    const MAX_VALUES: usize = 50;
+    let mut seen = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    for row in &result.rows {
+        let Some(text) = row.get(col_idx).and_then(|cell| cell.as_deref()) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if seen.insert(text.to_string()) {
+            values.push(text.to_string());
+            if values.len() >= MAX_VALUES {
+                break;
+            }
+        }
+    }
+    values.sort();
+    values
+}
+
+struct CellValueCompletionProvider {
+    values: Vec<String>,
+}
+
+impl CompletionProvider for CellValueCompletionProvider {
+    fn completions(
+        &self,
+        buffer: &Entity<Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: CompletionContext,
+        _window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = buffer_position.to_offset(&snapshot);
+        let query: String = snapshot.text_for_range(0..offset).collect::<String>().to_lowercase();
+        let replace_range = snapshot.anchor_before(0)..snapshot.anchor_after(offset);
+        let completions = self
+            .values
+            .iter()
+            .filter(|value| value.to_lowercase().starts_with(&query))
+            .map(|value| Completion {
+                replace_range: replace_range.clone(),
+                new_text: value.clone(),
+                label: CodeLabel::plain(value.clone(), None),
+                documentation: None,
+                source: CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect();
+        Task::ready(Ok(vec![CompletionResponse {
+            completions,
+            display_options: CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: language::Anchor,
+        _text: &str,
+        _trigger_in_words: bool,
+        _cx: &mut Context<Editor>,
+    ) -> bool {
+        true
+    }
 }
 
 fn is_truthy_bool(s: &str) -> bool {
@@ -2524,12 +2608,20 @@ impl ResultView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let placeholder = match self.column_kind_at(col_idx) {
+        let column_kind = self.column_kind_at(col_idx);
+        let placeholder = match column_kind {
             CellEditorKind::Numeric => Some("number"),
             CellEditorKind::Date => Some("YYYY-MM-DD"),
             CellEditorKind::DateTime => Some("YYYY-MM-DD HH:MM:SS"),
             _ => None,
         };
+        // Value completion only makes sense for free-text columns; Boolean/Enum
+        // never reach this function (begin_cell_edit routes them to a dedicated
+        // toggle/popup before an inline editor is ever spawned).
+        let completion_values = matches!(column_kind, CellEditorKind::Text)
+            .then(|| self.result.as_ref().map(|result| distinct_column_values(result, col_idx)))
+            .flatten()
+            .filter(|values| !values.is_empty());
         let editor = cx.new(|cx| {
             let mut ed = Editor::single_line(window, cx);
             if let Some(placeholder) = placeholder {
@@ -2541,6 +2633,13 @@ impl ResultView {
             // so a type-to-replace entry overwrites on the first keystroke.
             if entry == CellEditEntry::Replace {
                 ed.select_all(&Default::default(), window, cx);
+            }
+            if let Some(values) = completion_values {
+                ed.set_completion_provider(Some(Rc::new(CellValueCompletionProvider { values })));
+                // This curated, always-short list of the column's own loaded
+                // values should show up regardless of the user's global "show
+                // completions on input" code-editor preference.
+                ed.set_show_completions_on_input(Some(true));
             }
             ed
         });
@@ -7153,13 +7252,19 @@ impl ResultView {
                             ),
                     )
                     .children((0..record_count).map(|record_idx| {
-                        let (display, color) = render_loaded_value(
-                            result
-                                .rows
-                                .get(record_idx)
-                                .and_then(|row| row.get(col_idx))
-                                .and_then(|cell| cell.as_deref()),
-                        );
+                        // Mirror the normal grid's resolution order (pending
+                        // edit wins over the loaded value) so toggling
+                        // Transpose never hides an in-progress edit.
+                        let (display, color) = match self.pending_cell_value(record_idx, col_idx) {
+                            Some(value) => render_cell_value(value),
+                            None => render_loaded_value(
+                                result
+                                    .rows
+                                    .get(record_idx)
+                                    .and_then(|row| row.get(col_idx))
+                                    .and_then(|cell| cell.as_deref()),
+                            ),
+                        };
                         div()
                             .flex_none()
                             .w(px(180.0))
@@ -7170,6 +7275,10 @@ impl ResultView {
                             .border_r_1()
                             .border_color(grid_border)
                             .overflow_hidden()
+                            .debug_selector({
+                                let display = display.clone();
+                                move || format!("TCELL-{record_idx}-{col_idx}-{display}")
+                            })
                             .child(Label::new(display).size(LabelSize::Small).color(color))
                             .into_any_element()
                     }))
@@ -13115,6 +13224,31 @@ mod tests {
         );
     }
 
+    // The normal grid and the transposed view are two independent rendering
+    // paths over the same `result`/`pending_edits` state (see .rules on twin
+    // render paths). The normal grid always shows a pending edit over the
+    // loaded value; this proves the transposed view does too, instead of
+    // silently falling back to the stale loaded row once a fix regresses.
+    #[gpui::test]
+    fn transposed_view_shows_pending_edit_not_stale_loaded_value(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, cx| {
+            view.write_cell_value(0, 1, CellValue::Text("Edited".to_string()), cx);
+            view.toggle_transpose(cx);
+        });
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("TCELL-0-1-Edited").is_some(),
+            "the transposed view must show the pending edit (\"Edited\"), not the stale \
+             loaded value (\"Alice\"), for a cell that was edited before switching views"
+        );
+        assert!(
+            cx.debug_bounds("TCELL-0-1-Alice").is_none(),
+            "the transposed view must not still be rendering the pre-edit loaded value"
+        );
+    }
+
     #[gpui::test]
     fn move_column_reorders_visible_columns(cx: &mut gpui::TestAppContext) {
         let (_window, view, mut cx) = table_backed_result_window(cx);
@@ -13524,6 +13658,213 @@ mod tests {
         });
     }
 
+    fn table_result_with_status_column() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "status".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("red".to_string())],
+                vec![Some("2".to_string()), Some("green".to_string())],
+                vec![Some("3".to_string()), Some("red".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    // Registers the same "enter"/"shift-enter" -> ConfirmCompletion/ConfirmCompletionReplace
+    // bindings the production keymap uses in the "Editor && showing_completions"
+    // context (assets/keymaps/default-linux.json), since this crate's test
+    // keymap has none of the editor completion bindings by default (see the
+    // comment above escape_action_cancels_edit_even_when_the_editor_claims_it_first
+    // for why that gap matters and how prior tests worked around it).
+    fn bind_editor_completion_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new(
+                    "enter",
+                    editor::actions::ConfirmCompletion::default(),
+                    Some("Editor && showing_completions"),
+                ),
+                gpui::KeyBinding::new(
+                    "shift-enter",
+                    editor::actions::ConfirmCompletionReplace,
+                    Some("Editor && showing_completions"),
+                ),
+            ]);
+        });
+    }
+
+    #[gpui::test]
+    fn cell_editor_offers_completions_from_the_loaded_column_values(cx: &mut gpui::TestAppContext) {
+        bind_editor_completion_keys(cx);
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_status_column());
+
+        // Row 1's "status" cell is "green"; double-click opens the editor with
+        // the caret at the end of that text (CellEditEntry::CursorEnd).
+        let cell_center = debug_center(&mut cx, "CELL-1-1");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(text, Some("green".to_string()));
+        });
+
+        // Clear "green" with the real delete-backward action (this test
+        // harness loads no production keymap, so a raw "backspace" keystroke
+        // never resolves to it -- see the identical note on
+        // typing_then_clearing_a_null_cell_before_commit_keeps_it_null above),
+        // then type "r" as a real keystroke into the focused editor,
+        // exercising its normal input/completion pipeline (not a direct
+        // model mutation).
+        for _ in 0.."green".len() {
+            cx.dispatch_action(editor::actions::Backspace);
+        }
+        cx.simulate_keystrokes("r");
+        draw_result_view(window, &mut cx);
+
+        let editor = view.update(&mut cx, |view, _cx| {
+            view.cell_edit
+                .as_ref()
+                .expect("cell editor should still be open")
+                .editor
+                .clone()
+        });
+        editor.update(&mut cx, |editor, _cx| {
+            let labels: Vec<String> = editor
+                .current_completions()
+                .expect("typing 'r' should open a completion menu")
+                .iter()
+                .map(|completion| completion.label.text.clone())
+                .collect();
+            assert_eq!(
+                labels,
+                vec!["red".to_string()],
+                "only the loaded column value starting with 'r' should be offered"
+            );
+        });
+
+        // First Enter: the production keymap resolves "enter" to
+        // editor::ConfirmCompletion while the menu is open, so it must accept
+        // the completion, not commit the cell edit.
+        cx.simulate_keystrokes("enter");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            assert!(
+                view.cell_edit.is_some(),
+                "accepting a completion must not itself commit and close the cell edit"
+            );
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("red".to_string()),
+                "accepting the completion should fill in the full matched value"
+            );
+        });
+        editor.update(&mut cx, |editor, _cx| {
+            assert!(
+                editor.current_completions().is_none(),
+                "the completion menu must close once a completion is accepted"
+            );
+        });
+
+        // Second Enter: no completion menu is showing anymore, so "enter" now
+        // falls through to this view's own raw key handler, which commits the
+        // edit and moves to the next cell (Excel-style commit-and-move) --
+        // it must not still be editing the just-accepted (1, 1) cell.
+        cx.simulate_keystrokes("enter");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_ne!(
+                view.cell_edit.as_ref().map(|edit| (edit.abs_idx, edit.col_idx)),
+                Some((1, 1)),
+                "the second enter must commit the accepted completion and move off the cell"
+            );
+            let rendered = view
+                .pending_cell_value(1, 1)
+                .map(|value| match value {
+                    CellValue::Text(text) => text.clone(),
+                    other => panic!("expected a text edit, got {other:?}"),
+                });
+            assert_eq!(rendered, Some("red".to_string()));
+        });
+    }
+
+    #[gpui::test]
+    fn cell_editor_does_not_offer_value_completion_on_numeric_columns(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            view.column_infos = Some(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+                ColumnInfo {
+                    name: "name".to_string(),
+                    data_type: "varchar(255)".to_string(),
+                    is_nullable: true,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ]);
+        });
+
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        let editor = view.update(&mut cx, |view, _cx| {
+            view.cell_edit
+                .as_ref()
+                .expect("double-click should open the numeric cell editor")
+                .editor
+                .clone()
+        });
+        editor.update(&mut cx, |editor, _cx| {
+            assert!(
+                editor.completion_provider().is_none(),
+                "numeric columns must not get value-completion (doc: TEXT-kind only)"
+            );
+        });
+    }
+
     // The Escape bug (escape_action_cancels_edit_even_when_the_editor_claims_it_first
     // above) existed because a real focused `Editor` entity let the production
     // keymap's "Editor"-context binding claim the key before this view's own raw
@@ -13541,10 +13882,24 @@ mod tests {
     fn real_keymap_editor_bindings_do_not_shadow_grid_shortcuts_when_no_editor_is_focused(
         cx: &mut gpui::TestAppContext,
     ) {
+        // Mirrors the real Linux/Windows default keymap's "Editor"-context
+        // bindings for the same keys (assets/keymaps/default-linux.json:
+        // ctrl-d -> editor::SelectNext, ctrl-y -> editor::Redo) plus the two
+        // most collision-prone letters (ctrl-v paste, ctrl-x cut), so every
+        // raw "<letter> if primary" branch in this view's key handler gets the
+        // same real-keymap proof ctrl-a/ctrl-z already had.
         cx.update(|cx| {
             cx.bind_keys([
                 gpui::KeyBinding::new("ctrl-a", editor::actions::SelectAll, Some("Editor")),
                 gpui::KeyBinding::new("ctrl-z", editor::actions::Undo, Some("Editor")),
+                gpui::KeyBinding::new("ctrl-y", editor::actions::Redo, Some("Editor")),
+                gpui::KeyBinding::new(
+                    "ctrl-d",
+                    editor::actions::SelectNext::default(),
+                    Some("Editor"),
+                ),
+                gpui::KeyBinding::new("ctrl-v", editor::actions::Paste, Some("Editor")),
+                gpui::KeyBinding::new("ctrl-x", editor::actions::Cut, Some("Editor")),
             ]);
         });
 
@@ -13588,6 +13943,70 @@ mod tests {
                 None,
                 "a real ctrl-z keystroke must reach the grid's own undo handler, not the \
                  competing editor::Undo keymap binding, when no cell editor is focused"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-y");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "a real ctrl-y keystroke must reach the grid's own redo handler, not the \
+                 competing editor::Redo keymap binding, when no cell editor is focused"
+            );
+        });
+
+        let top_cell = debug_center(&mut cx, "CELL-0-1");
+        let bottom_cell = debug_center(&mut cx, "CELL-2-1");
+        cx.simulate_click(top_cell, gpui::Modifiers::none());
+        cx.simulate_click(bottom_cell, gpui::Modifiers::shift());
+        draw_result_view(window, &mut cx);
+
+        cx.simulate_keystrokes("ctrl-d");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(1, 1),
+                Some(&CellValue::Text("Zed".to_string())),
+                "a real ctrl-d keystroke must reach the grid's own fill-down handler, not the \
+                 competing editor::SelectNext keymap binding, when no cell editor is focused"
+            );
+            assert_eq!(view.pending_cell_value(2, 1), Some(&CellValue::Text("Zed".to_string())));
+        });
+
+        // A plain single click also copies the clicked cell's own value to the
+        // clipboard (see single_click_leaves_cell_value_and_data_untouched),
+        // so the paste payload must be written *after* selecting the target
+        // cell, not before, or the click silently clobbers it.
+        let single_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(single_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("Pasted".to_string())));
+        cx.simulate_keystrokes("ctrl-v");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 0),
+                Some(&CellValue::Text("Pasted".to_string())),
+                "a real ctrl-v keystroke must reach the grid's own paste handler, not the \
+                 competing editor::Paste keymap binding, when no cell editor is focused"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-x");
+        draw_result_view(window, &mut cx);
+        let cut = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("a real ctrl-x keystroke must reach the grid's own cut handler and write to \
+                     the clipboard, not the competing editor::Cut keymap binding");
+        assert!(cut.contains("Pasted"));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 0),
+                Some(&CellValue::Text(String::new())),
+                "cut must clear the cell after copying it"
             );
         });
     }
