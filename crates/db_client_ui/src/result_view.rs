@@ -662,10 +662,6 @@ pub struct ResultView {
     selected_rows: std::collections::HashSet<usize>,
     // The row that anchors range selection (shift-click extends from here).
     last_selected_row: Option<usize>,
-    // Timestamps of recent render frames (within the last second), used to show a
-    // live FPS readout above the grid so scroll performance is measurable.
-    frame_instants: std::collections::VecDeque<std::time::Instant>,
-    fps: usize,
     // Active scrollbar drag, if the user grabbed a thumb. While set, a window
     // overlay captures mouse moves so the drag keeps tracking even when the
     // cursor leaves the narrow gutter.
@@ -966,8 +962,6 @@ impl ResultView {
             suppress_next_cell_click: false,
             selected_rows: std::collections::HashSet::new(),
             last_selected_row: None,
-            frame_instants: std::collections::VecDeque::new(),
-            fps: 0,
             scroll_drag: None,
             cell_edit: None,
             status_message: None,
@@ -1160,21 +1154,6 @@ impl ResultView {
         self.visible_columns.get(display_pos).copied()
     }
 
-    // Records this frame and updates the rolling 1-second FPS, so the watermark
-    // reflects the real render rate while scrolling.
-    fn tick_fps(&mut self) {
-        let now = std::time::Instant::now();
-        self.frame_instants.push_back(now);
-        while let Some(&front) = self.frame_instants.front() {
-            if now.duration_since(front) > Duration::from_secs(1) {
-                self.frame_instants.pop_front();
-            } else {
-                break;
-            }
-        }
-        self.fps = self.frame_instants.len();
-    }
-
     // Recomputes the cached row order (with sort applied) and per-column widths.
     // Called only when the result or sort changes — never per scroll frame — so
     // scrolling stays cheap.
@@ -1206,7 +1185,16 @@ impl ResultView {
                         .get(sc.col_idx)
                         .and_then(|v| v.as_deref())
                         .unwrap_or("");
-                    let ord = a_val.cmp(b_val);
+                    // Numeric-aware comparison: if both sides parse as a number, compare
+                    // numerically ("9" < "10"); otherwise fall back to string comparison
+                    // (mixed/non-numeric columns), matching how aggregates already treat
+                    // numeric values in `compute_column_aggregates`.
+                    let ord = match (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                        (Ok(a_num), Ok(b_num)) => {
+                            a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        _ => a_val.cmp(b_val),
+                    };
                     let ord = if sc.ascending { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -4735,10 +4723,10 @@ impl ResultView {
     ) -> String {
         let mut count = 0usize;
         let mut null_count = 0usize;
-        let mut min_str: Option<String> = None;
-        let mut max_str: Option<String> = None;
         let mut numeric_sum = 0.0f64;
         let mut numeric_count = 0usize;
+        let mut numeric_min: Option<f64> = None;
+        let mut numeric_max: Option<f64> = None;
 
         for &abs_idx in display_order {
             let cell = result.rows.get(abs_idx).and_then(|row| row.get(col_idx));
@@ -4746,41 +4734,32 @@ impl ResultView {
                 None => null_count += 1,
                 Some(val) => {
                     count += 1;
-                    min_str = Some(match min_str.take() {
-                        None => val.to_string(),
-                        Some(m) => {
-                            if val < m.as_str() {
-                                val.to_string()
-                            } else {
-                                m
-                            }
-                        }
-                    });
-                    max_str = Some(match max_str.take() {
-                        None => val.to_string(),
-                        Some(m) => {
-                            if val > m.as_str() {
-                                val.to_string()
-                            } else {
-                                m
-                            }
-                        }
-                    });
                     if let Ok(n) = val.parse::<f64>() {
                         numeric_sum += n;
                         numeric_count += 1;
+                        numeric_min = Some(numeric_min.map_or(n, |m| m.min(n)));
+                        numeric_max = Some(numeric_max.map_or(n, |m| m.max(n)));
                     }
                 }
             }
         }
 
         if numeric_count == count && count > 0 {
-            let min_s = min_str.as_deref().unwrap_or("—");
-            let max_s = max_str.as_deref().unwrap_or("—");
-            let mut out = format!("COUNT {count} | NULLS {null_count} | MIN {min_s} | MAX {max_s}");
+            // Every non-null value in this column parsed as a number, so MIN/MAX/SUM/AVG
+            // are numerically meaningful; format whole numbers without a trailing ".00".
+            let format_numeric = |n: f64| {
+                if n.fract() == 0.0 {
+                    format!("{n:.0}")
+                } else {
+                    format!("{n:.2}")
+                }
+            };
+            let min_s = numeric_min.map(format_numeric).unwrap_or_else(|| "—".to_string());
+            let max_s = numeric_max.map(format_numeric).unwrap_or_else(|| "—".to_string());
             let avg = numeric_sum / count as f64;
-            out.push_str(&format!(" | SUM {numeric_sum} | AVG {avg:.2}"));
-            out
+            format!(
+                "COUNT {count} | NULLS {null_count} | MIN {min_s} | MAX {max_s} | SUM {numeric_sum} | AVG {avg:.2}"
+            )
         } else {
             format!("COUNT {count} | NULLS {null_count}")
         }
@@ -5854,19 +5833,6 @@ impl ResultView {
                                     .size(LabelSize::Small)
                                     .color(Color::Modified),
                                 )
-                            }),
-                    )
-                    .child(
-                        // Live FPS watermark — updates each render, so it reflects
-                        // the real frame rate while scrolling the grid.
-                        Label::new(format!("{} FPS", self.fps))
-                            .size(LabelSize::Small)
-                            .color(if self.fps >= 50 {
-                                Color::Success
-                            } else if self.fps >= 25 {
-                                Color::Warning
-                            } else {
-                                Color::Error
                             }),
                     )
                     // Row-limit control: text input + presets dropdown.
@@ -9294,7 +9260,6 @@ impl Focusable for ResultView {
 
 impl Render for ResultView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.tick_fps();
         // One-time lazy init of the limit editor (requires window, so can't live in new()).
         if self.limit_editor.is_none() {
             let initial = if self.fetch_target == usize::MAX {
@@ -11905,6 +11870,85 @@ mod tests {
             None,
             [Some("1"), Some("x")].into_iter()
         ));
+    }
+
+    #[test]
+    fn compute_column_aggregates_compares_numerics_numerically_not_lexicographically() {
+        // "959" > "5110" lexicographically but 5110 is the real numeric maximum; a
+        // NULL is present and must be counted, not treated as a value.
+        let result = QueryResult {
+            columns: vec!["balance".to_string()],
+            rows: vec![
+                vec![Some("959".to_string())],
+                vec![Some("5110".to_string())],
+                vec![Some("40".to_string())],
+                vec![None],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let display_order = [0, 1, 2, 3];
+        let summary = ResultView::compute_column_aggregates(&result, 0, &display_order);
+        assert!(
+            summary.contains("MIN 40"),
+            "expected numeric MIN 40, got: {summary}"
+        );
+        assert!(
+            summary.contains("MAX 5110"),
+            "expected numeric MAX 5110 (not lexicographic 959), got: {summary}"
+        );
+        assert!(
+            summary.contains("NULLS 1"),
+            "expected the NULL row to be counted, got: {summary}"
+        );
+    }
+
+    // Verifies the EXISTING column-header sort (sort_columns + recompute_layout +
+    // header on_click) actually works end to end via a real click, and that the
+    // comparator is numeric-aware (a lexicographic-only comparator would order
+    // "9" after "10"). A plain (non-table-backed) view is required so the click
+    // takes the local `recompute_layout` path instead of `refresh_table_data`
+    // (which would need a live connection).
+    #[gpui::test]
+    fn header_click_sorts_a_numeric_column_ascending_then_descending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "balance".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("959".to_string())],
+                vec![Some("2".to_string()), Some("40".to_string())],
+                vec![Some("3".to_string()), Some("5110".to_string())],
+                vec![Some("4".to_string()), Some("9".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (window, view, mut cx) = plain_result_window(cx, result);
+        view.update(&mut cx, |view, _| assert!(view.sort_columns.is_empty()));
+
+        let header_center = debug_center(&mut cx, "COL_HEADER-1");
+        cx.simulate_click(header_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            // Numeric-aware ascending: 9 < 40 < 959 < 5110. A lexicographic
+            // comparator would instead put "40" before "5110" before "9" before "959".
+            assert_eq!(
+                view.order,
+                vec![3, 1, 0, 2],
+                "ascending sort is not numeric-aware (or sorting did not run)"
+            );
+        });
+
+        cx.simulate_click(header_center, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.order,
+                vec![2, 0, 1, 3],
+                "a second click on the same header should reverse to descending"
+            );
+        });
     }
 
     #[gpui::test]
