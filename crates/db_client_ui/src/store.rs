@@ -1037,6 +1037,7 @@ impl DatabaseStore {
 
         cx.spawn(async move |this, cx| {
             let result = build_provider(&config).await;
+            let connect_error = result.as_ref().err().map(|err| err.to_string());
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
@@ -1065,7 +1066,7 @@ impl DatabaseStore {
                 }
             })
             .ok();
-            Ok(())
+            connect_task_result(connect_error)
         })
     }
 
@@ -1140,8 +1141,10 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let tables = provider.list_tables(&database).await?;
-            let views = provider.list_views(&database).await.unwrap_or_default();
+            let (tables, views) =
+                futures::join!(provider.list_tables(&database), provider.list_views(&database));
+            let tables = tables?;
+            let views = views.unwrap_or_default();
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
@@ -1184,19 +1187,16 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let columns = provider.describe_table(&database, &table).await?;
-            let indexes = provider
-                .list_indexes(&database, &table)
-                .await
-                .unwrap_or_default();
-            let fks = provider
-                .list_foreign_keys(&database, &table)
-                .await
-                .unwrap_or_default();
-            let triggers = provider
-                .list_triggers(&database, &table)
-                .await
-                .unwrap_or_default();
+            let (columns, indexes, fks, triggers) = futures::join!(
+                provider.describe_table(&database, &table),
+                provider.list_indexes(&database, &table),
+                provider.list_foreign_keys(&database, &table),
+                provider.list_triggers(&database, &table)
+            );
+            let columns = columns?;
+            let indexes = indexes.unwrap_or_default();
+            let fks = fks.unwrap_or_default();
+            let triggers = triggers.unwrap_or_default();
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
@@ -1682,6 +1682,18 @@ pub fn test_connection(config: ConnectionConfig, cx: &App) -> Task<Result<()>> {
         let (provider, _tunnel) = build_provider(&config).await?;
         provider.ping().await
     })
+}
+
+/// Maps `connect()`'s captured `build_provider` failure (if any) to the
+/// `Task<Result<()>>` it returns to callers. Kept separate from `connect()`
+/// itself so this mapping -- the exact thing that must reflect a real
+/// connection failure instead of always resolving `Ok(())` -- is directly
+/// unit-testable without needing a real provider connection attempt.
+fn connect_task_result(connect_error: Option<String>) -> Result<()> {
+    match connect_error {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
+    }
 }
 
 async fn build_provider(
@@ -2239,6 +2251,23 @@ mod tests {
             db_cached.await.expect("cached while offline"),
             "CREATE DATABASE `shop`"
         );
+    }
+
+    // A real end-to-end #[gpui::test] driving connect() through an actual
+    // (even locally-failing) provider connection attempt hits GPUI's
+    // deterministic test scheduler's "parking forbidden" guard, since the
+    // real connection attempt needs genuine async I/O to resolve -- exactly
+    // why connect()'s network path is otherwise left to integration/manual
+    // testing (see the comment on `ensure_connected_returns_existing_provider`
+    // below). `connect_task_result` isolates the exact logic that was buggy
+    // (the mapping from a captured failure to the Task's Ok/Err) so it can be
+    // tested directly without any real connection attempt.
+    #[test]
+    fn connect_task_result_reports_failure_instead_of_always_ok() {
+        assert!(connect_task_result(None).is_ok());
+        let err = connect_task_result(Some("boom".to_string()))
+            .expect_err("a captured connect error must not resolve to Ok(())");
+        assert_eq!(err.to_string(), "boom");
     }
 
     #[gpui::test]
