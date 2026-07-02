@@ -902,9 +902,16 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
 
 impl<T: ScrollableHandle> Render for ScrollbarState<T> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // This scrollbar is a normal child of the div it decorates (see
+        // `render_scrollbar`), so GPUI's own `overflow_scroll` paint-time
+        // offset shifts it exactly like any other child of that scrollable
+        // content. Counter that shift so the thumb stays pinned to the
+        // viewport regardless of scroll position on either axis -- the same
+        // compensation `UniformListDecoration::compute` already applies for
+        // list-based scrollbars, which sit outside the normal child flow.
         ScrollbarElement {
             state: cx.entity(),
-            origin: Default::default(),
+            origin: -self.scroll_handle().offset(),
         }
     }
 }
@@ -1564,7 +1571,7 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use gpui::{TestAppContext, point, size};
+    use gpui::{TestAppContext, div, point, size};
 
     use super::*;
 
@@ -1607,6 +1614,122 @@ mod tests {
         fn viewport(&self) -> Bounds<Pixels> {
             self.0.borrow().viewport
         }
+    }
+
+    // A real div using `.custom_scrollbars(...)` (the generic, non-uniform-list
+    // path used by e.g. the ERD diagram), with a fixed-size inner child much
+    // larger than the frame so both axes genuinely overflow. Uses a real
+    // `gpui::ScrollHandle` (not the local `MockHandle`, which cannot drive
+    // GPUI's own `track_scroll`/`overflow_scroll` machinery) so this exercises
+    // the actual Taffy layout/paint path, not a reimplementation, while
+    // keeping a handle to the `ScrollbarState` entity for inspecting its real,
+    // painted thumb geometry.
+    struct GenericScrollbarFrame {
+        handle: ScrollHandle,
+        state: Option<Entity<ScrollbarState<ScrollHandle>>>,
+    }
+
+    impl Render for GenericScrollbarFrame {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let parent_id = cx.entity_id();
+            let state = self.state.get_or_insert_with(|| {
+                cx.new(|cx| {
+                    ScrollbarState::new_from_config(
+                        Scrollbars::always_visible(ScrollAxes::Both)
+                            .tracked_scroll_handle(&self.handle),
+                        parent_id,
+                        cx,
+                    )
+                })
+            });
+            let wrapper = cx.new(|_| ScrollbarStateWrapper(state.clone()));
+
+            div().id("frame").w(px(400.)).h(px(300.)).child(
+                render_scrollbar(
+                    wrapper,
+                    div().id("content").size_full().child(div().w(px(2000.)).h(px(2000.))),
+                    cx,
+                )
+                .overflow_scroll()
+                .track_scroll(&self.handle),
+            )
+        }
+    }
+
+    // Reproduces the two real E2E findings for the generic (non-uniform-list)
+    // `custom_scrollbars` path: scrolling one axis must not move or resize the
+    // OTHER axis's thumb, and must not move the SAME axis's thumb along its
+    // cross-axis (perpendicular) coordinate -- only its along-axis position
+    // should track the scroll.
+    #[gpui::test]
+    fn generic_scrollbar_cross_axis_position_is_unaffected_by_scroll(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let handle = ScrollHandle::new();
+        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame { handle: handle.clone(), state: None });
+        let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let (h_before, v_before) = view
+            .update(cx, |frame, _window, cx| {
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    (
+                        state.thumb_for_axis(ScrollbarAxis::Horizontal).map(|t| t.thumb_bounds),
+                        state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds),
+                    )
+                })
+            })
+            .unwrap();
+        let h_before = h_before.expect("horizontal thumb should exist before scroll");
+        let v_before = v_before.expect("vertical thumb should exist before scroll");
+
+        // Scroll ONLY the vertical axis -- the horizontal thumb's entire
+        // geometry (both axes of its bounds) must stay identical, since
+        // nothing about the viewport width or horizontal content changed.
+        handle.set_offset(point(px(0.), px(-500.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let (h_after, v_after) = view
+            .update(cx, |frame, _window, cx| {
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    (
+                        state.thumb_for_axis(ScrollbarAxis::Horizontal).map(|t| t.thumb_bounds),
+                        state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds),
+                    )
+                })
+            })
+            .unwrap();
+        let h_after = h_after.expect("horizontal thumb should still exist after a vertical scroll");
+        let v_after = v_after.expect("vertical thumb should still exist after a vertical scroll");
+
+        assert_eq!(
+            h_before, h_after,
+            "scrolling vertically must not move or resize the horizontal thumb: before {:?}, after {:?}",
+            h_before, h_after
+        );
+        assert_eq!(
+            v_before.origin.x, v_after.origin.x,
+            "the vertical thumb's cross-axis (horizontal) position must stay fixed across a \
+             vertical scroll: before {:?}, after {:?}",
+            v_before, v_after
+        );
+        assert_eq!(
+            v_before.size.width, v_after.size.width,
+            "the vertical thumb's width must stay fixed across a vertical scroll"
+        );
+        assert_ne!(
+            v_before.origin.y, v_after.origin.y,
+            "the vertical thumb's along-axis (vertical) position MUST move when scrolling \
+             vertically -- this is the regression-proof half of the fix"
+        );
     }
 
     #[gpui::test]
