@@ -2416,31 +2416,13 @@ impl ResultView {
         self.begin_added_cell_edit(abs_idx, col_idx, added_idx, CellEditEntry::CursorEnd, window, cx);
     }
 
-    fn render_cell_editor(editor: Entity<Editor>, kind: CellEditorKind) -> AnyElement {
+    fn render_cell_editor(editor: Entity<Editor>) -> AnyElement {
         h_flex()
             .size_full()
             .gap_1()
             .items_center()
-            .when_some(Self::cell_kind_icon(&kind), |element, (icon_name, _)| {
-                element.child(
-                    div().flex_none().child(
-                        Icon::new(icon_name)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
             .child(div().flex_1().min_w_0().child(editor))
             .into_any_element()
-    }
-
-    fn cell_kind_icon(kind: &CellEditorKind) -> Option<(IconName, &'static str)> {
-        match kind {
-            CellEditorKind::Numeric => Some((IconName::Binary, "Number")),
-            CellEditorKind::Date => Some((IconName::CountdownTimer, "Date: YYYY-MM-DD")),
-            CellEditorKind::DateTime => Some((IconName::Clock, "Date-time: YYYY-MM-DD HH:MM:SS")),
-            _ => None,
-        }
     }
 
     fn render_typed_cell_body(body: AnyElement, align_right: bool) -> AnyElement {
@@ -5112,7 +5094,6 @@ impl ResultView {
                 .filter(|edit| edit.abs_idx == abs_idx && edit.col_idx == cell_idx);
             let cell_body: AnyElement = if let Some(edit) = editing {
                 let editor = edit.editor.clone();
-                let editor_kind = self.column_kind_at(cell_idx);
                 div()
                     // Unlike the read-mode branch (an h_flex with size_full at
                     // its top level), this wraps render_cell_editor in an extra
@@ -5162,7 +5143,7 @@ impl ResultView {
                             cx.stop_propagation();
                         },
                     ))
-                    .child(Self::render_cell_editor(editor, editor_kind))
+                    .child(Self::render_cell_editor(editor))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
                 let cell_val = match self.pending_cell_value(abs_idx, cell_idx) {
@@ -5596,7 +5577,6 @@ impl ResultView {
                 .filter(|edit| edit.abs_idx == abs_idx && edit.col_idx == cell_idx);
             let cell_body: AnyElement = if let Some(edit) = editing {
                 let editor = edit.editor.clone();
-                let editor_kind = self.column_kind_at(cell_idx);
                 div()
                     // See the equivalent branch in the non-transposed grid:
                     // without size_full here, this wrapper doesn't establish a
@@ -5636,7 +5616,7 @@ impl ResultView {
                             cx.stop_propagation();
                         },
                     ))
-                    .child(Self::render_cell_editor(editor, editor_kind))
+                    .child(Self::render_cell_editor(editor))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
                 let cell_val = row.get(cell_idx).cloned().unwrap_or(CellValue::Null);
