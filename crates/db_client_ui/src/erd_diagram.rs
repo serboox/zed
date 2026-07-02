@@ -902,6 +902,97 @@ mod tests {
         );
     }
 
+    // Reproduces "the horizontal scrollbar moves up and down / the vertical
+    // scrollbar strangely changes size" (a real bug report, not a synthetic
+    // one): captures the scroll container's own painted bounds and both axes'
+    // `max_offset` at three points -- initial, after a diagonal scroll, and
+    // after an idle re-render with no state change -- and asserts they never
+    // move/shrink for a reason a scroll on the OTHER axis or a no-op render
+    // should not cause.
+    #[gpui::test]
+    fn scroll_container_geometry_stays_stable_across_a_scroll_and_an_idle_render(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        // 6 tables at 3 columns/row and 220px/box comfortably overflow a
+        // 400x300 window on both axes at once.
+        let tables = many_tables(6);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+
+        let bounds_initial = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should have painted bounds");
+        let max_offset_initial = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+        assert!(
+            max_offset_initial.x > px(0.) && max_offset_initial.y > px(0.),
+            "expected both axes to overflow a 400x300 viewport with 6 tables at 3/row, got \
+             {max_offset_initial:?}"
+        );
+
+        // Scroll the VERTICAL axis only (a real horizontal wheel gesture would
+        // go through the container's own scroll handling; setting the offset
+        // directly isolates the geometry question from input plumbing, which
+        // `drag_pans_the_canvas_by_the_cursor_travel` already covers).
+        erd.update(&mut cx, |view, cx| {
+            let vertical_only = point(px(0.), -max_offset_initial.y / 2.0);
+            view.scroll_handle.set_offset(vertical_only);
+            cx.notify();
+        });
+        draw_erd_frame(&mut cx);
+
+        let bounds_after_v_scroll = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should still have painted bounds after a scroll");
+        let max_offset_after_v_scroll =
+            erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+
+        assert_eq!(
+            bounds_after_v_scroll.origin, bounds_initial.origin,
+            "the scroll container's own on-screen position must not move because its CONTENT \
+             scrolled -- a vertical scroll must never shift the container's origin"
+        );
+        assert_eq!(
+            bounds_after_v_scroll.size, bounds_initial.size,
+            "the scroll container's own on-screen size must not change because its content \
+             scrolled -- the viewport is fixed by the window, not by scroll position"
+        );
+        assert_eq!(
+            max_offset_after_v_scroll, max_offset_initial,
+            "max_offset (the content-vs-viewport overflow) must not change just because the \
+             CURRENT scroll position changed -- it depends on content size and viewport size, \
+             neither of which a scroll (as opposed to a zoom or resize) touches"
+        );
+
+        // An idle re-render with no state change at all must be a complete
+        // no-op for geometry -- if a value here drifts, something is being
+        // recomputed non-deterministically (e.g. from a fresh, un-cached
+        // layout pass) rather than read from stable state.
+        draw_erd_frame(&mut cx);
+        let bounds_idle = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should still have painted bounds after an idle render");
+        let max_offset_idle = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+        assert_eq!(
+            bounds_idle, bounds_after_v_scroll,
+            "an idle re-render (no state change) must not move or resize the scroll container"
+        );
+        assert_eq!(
+            max_offset_idle, max_offset_after_v_scroll,
+            "an idle re-render (no state change) must not change either axis's max_offset"
+        );
+    }
+
     #[test]
     fn clamp_zoom_stays_within_bounds() {
         assert_eq!(clamp_zoom(1.0), 1.0);
