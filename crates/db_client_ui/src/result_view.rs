@@ -12603,6 +12603,83 @@ mod tests {
         });
     }
 
+    // find_matches_locate_substring_across_cells (above) re-implements the match
+    // logic inline as a pure function -- it never dispatches the real
+    // db_result_view::ToggleFind action, so it would not catch a broken
+    // ctrl-f-to-open-find wiring. This test binds the real keymap entry
+    // (assets/keymaps/default-linux.json: "ctrl-f": "db_result_view::ToggleFind",
+    // context "DbResultView", matching this view's own key_context) and dispatches
+    // a genuine ctrl-f keystroke through it.
+    #[gpui::test]
+    fn real_ctrl_f_keystroke_opens_find_through_the_production_keymap_binding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-f",
+                ToggleFind,
+                Some("DbResultView"),
+            )]);
+        });
+
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert!(view.find_query.is_none(), "find must start closed");
+        });
+
+        cx.simulate_keystrokes("ctrl-f");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.find_query.is_some(),
+                "a real ctrl-f keystroke must open find through the actual production keymap \
+                 binding and action dispatch, not just by calling toggle_find directly"
+            );
+        });
+    }
+
+    // visual_copy_selection_uses_selected_copy_format (below) and
+    // copy_selection_uses_insert_copy_format call copy_selected_to_clipboard
+    // directly -- they never prove a real ctrl-c keystroke reaches it. The
+    // production keymap binds ctrl-c to THREE different actions across contexts
+    // (menu::Cancel, editor::Copy in context "Editor", db_result_view::CopySelection
+    // in context "DbResultView") -- this test binds the real db_result_view entry
+    // and confirms a genuine keystroke, with no cell being edited (no "Editor"
+    // context in the focus chain), resolves to the grid's own copy action.
+    #[gpui::test]
+    fn real_ctrl_c_keystroke_copies_the_selection_through_the_production_keymap_binding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-c",
+                CopySelection,
+                Some("DbResultView"),
+            )]);
+        });
+
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let row_number = debug_center(&mut cx, "GUTTER-1");
+        cx.simulate_click(row_number, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            view.copy_format = CopyFormat::Csv;
+        });
+
+        cx.simulate_keystrokes("ctrl-c");
+        draw_result_view(window, &mut cx);
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .expect("a real ctrl-c keystroke must write the selection to the clipboard through \
+                     the production keymap binding and action dispatch");
+        assert_eq!(copied, "id,name\n2,Bob\n");
+    }
+
     #[gpui::test]
     fn visual_copy_selection_uses_selected_copy_format(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);
@@ -13443,6 +13520,74 @@ mod tests {
             assert_eq!(
                 rendered, "Alice",
                 "after cancelling, the cell must show only its original value, not the typed text"
+            );
+        });
+    }
+
+    // The Escape bug (escape_action_cancels_edit_even_when_the_editor_claims_it_first
+    // above) existed because a real focused `Editor` entity let the production
+    // keymap's "Editor"-context binding claim the key before this view's own raw
+    // handler ever saw it. The grid's select-all/undo/fill/paste/cut shortcuts are
+    // matched the same raw way (see the "a"/"z"/"d"/"r" branches in this view's
+    // key handler) and the production keymap binds several of those same letters
+    // to "Editor"-context actions (ctrl-a -> editor::SelectAll, ctrl-z ->
+    // editor::Undo, per assets/keymaps/default-linux.json) -- so the same failure
+    // mode is structurally possible here too, and deserves the same real-keymap
+    // proof rather than an internal-function-call test. This view's own root
+    // declares key_context("DbResultView"), never "Editor", and no cell is being
+    // edited (no focused Editor entity exists) in this scenario, so this test
+    // proves the raw handler correctly wins when nothing else is focused.
+    #[gpui::test]
+    fn real_keymap_editor_bindings_do_not_shadow_grid_shortcuts_when_no_editor_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("ctrl-a", editor::actions::SelectAll, Some("Editor")),
+                gpui::KeyBinding::new("ctrl-z", editor::actions::Undo, Some("Editor")),
+            ]);
+        });
+
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.cell_edit.is_none(),
+                "selecting (not editing) a cell must not open the inline editor"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-a");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell_range,
+                Some(((0, 0), (2, 1))),
+                "a real ctrl-a keystroke must reach the grid's own select-all handler, not the \
+                 competing editor::SelectAll keymap binding, when no cell editor is focused"
+            );
+        });
+
+        view.update(&mut cx, |view, cx| {
+            view.write_cell_value(0, 1, CellValue::Text("Zed".to_string()), cx);
+        });
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("Zed".to_string()))
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                None,
+                "a real ctrl-z keystroke must reach the grid's own undo handler, not the \
+                 competing editor::Undo keymap binding, when no cell editor is focused"
             );
         });
     }
