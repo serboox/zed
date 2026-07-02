@@ -8905,8 +8905,8 @@ fn thumb_range(origin: f32, viewport_len: f32, content_len: f32, offset: f32) ->
         return (origin, origin + viewport_len);
     }
     let max_offset = content_len - viewport_len;
-    let thumb_len =
-        ((viewport_len * viewport_len) / content_len).clamp(SCROLLBAR_THUMB_MIN, viewport_len);
+    let thumb_len = ((viewport_len * viewport_len) / content_len)
+        .clamp(SCROLLBAR_THUMB_MIN.min(viewport_len), viewport_len);
     let travel = (viewport_len - thumb_len).max(0.0);
     let pos_frac = (-offset / max_offset).clamp(0.0, 1.0);
     let start = origin + pos_frac * travel;
@@ -8928,8 +8928,8 @@ fn drag_scroll_offset(
         return None;
     }
     let delta = current_pos - grab_pos;
-    let thumb_len =
-        ((viewport_len * viewport_len) / content_len).clamp(SCROLLBAR_THUMB_MIN, viewport_len);
+    let thumb_len = ((viewport_len * viewport_len) / content_len)
+        .clamp(SCROLLBAR_THUMB_MIN.min(viewport_len), viewport_len);
     let travel = (viewport_len - thumb_len).max(1.0);
     let new_offset = grab_offset - delta * (max_offset / travel);
     Some(new_offset.clamp(-max_offset, 0.0))
@@ -10097,6 +10097,44 @@ mod tests {
         // The origin offsets the whole range into window coordinates.
         let (start, _) = thumb_range(10.0, 100.0, 300.0, 0.0);
         assert!((start - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn thumb_range_does_not_panic_when_viewport_is_smaller_than_the_minimum_thumb_size() {
+        // Reconstructs a real crash: `f32::clamp` panics if `min > max`, which
+        // happened when `viewport_len` (5.0) was smaller than
+        // `SCROLLBAR_THUMB_MIN` (36.0). With no room to enforce a minimum
+        // thumb size, the thumb must just fill the whole tiny viewport.
+        let (start, end) = thumb_range(0.0, 5.0, 1000.0, 0.0);
+        assert!(start.is_finite() && end.is_finite());
+        assert!(start >= 0.0);
+        assert!(end - start <= 5.0 + 1e-3);
+    }
+
+    #[test]
+    fn drag_scroll_offset_does_not_panic_when_viewport_is_smaller_than_the_minimum_thumb_size() {
+        let result = drag_scroll_offset(0.0, 0.0, 1.0, 5.0, 1000.0);
+        assert!(result.is_some_and(|offset| offset.is_finite()));
+    }
+
+    #[test]
+    fn thumb_range_at_the_minimum_thumb_size_boundary_is_unchanged() {
+        // viewport_len == SCROLLBAR_THUMB_MIN exactly: the clamp's lower bound
+        // still equals SCROLLBAR_THUMB_MIN, so behavior must be identical to
+        // before the fix -- the thumb fills the whole (tiny) viewport.
+        let (start, end) = thumb_range(0.0, SCROLLBAR_THUMB_MIN, 1000.0, 0.0);
+        assert!((end - start - SCROLLBAR_THUMB_MIN).abs() < 1e-3);
+        assert!((start - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn thumb_range_above_the_minimum_thumb_size_is_unaffected_by_the_fix() {
+        // viewport_len well above SCROLLBAR_THUMB_MIN: the fix is a no-op here,
+        // so this must produce the same thumb_len as before the change.
+        let (start, end) = thumb_range(0.0, 200.0, 1000.0, 0.0);
+        let expected_thumb_len = (200.0f32 * 200.0 / 1000.0).max(SCROLLBAR_THUMB_MIN);
+        assert!((end - start - expected_thumb_len).abs() < 1e-2);
+        assert!((start - 0.0).abs() < 1e-3);
     }
 
     // Autonomous perf guard: a large result must virtualize — only the visible
