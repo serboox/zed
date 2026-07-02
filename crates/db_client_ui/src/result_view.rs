@@ -7,7 +7,7 @@ use editor::{Editor, EditorEvent, MinimapVisibility};
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PromptLevel, Render, ScrollWheelEvent, SharedString,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     actions, uniform_list,
 };
@@ -4502,7 +4502,7 @@ impl ResultView {
         out
     }
 
-    fn export_xlsx(result: &QueryResult) -> Vec<u8> {
+    fn export_xlsx(result: &QueryResult) -> anyhow::Result<Vec<u8>> {
         let buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(buf);
         let opts =
@@ -4614,20 +4614,20 @@ impl ResultView {
         }
         sheet.push_str("</sheetData></worksheet>");
 
-        let _ = zip.start_file("[Content_Types].xml", opts);
-        let _ = zip.write_all(content_types.as_bytes());
-        let _ = zip.start_file("_rels/.rels", opts);
-        let _ = zip.write_all(rels.as_bytes());
-        let _ = zip.start_file("xl/workbook.xml", opts);
-        let _ = zip.write_all(workbook.as_bytes());
-        let _ = zip.start_file("xl/_rels/workbook.xml.rels", opts);
-        let _ = zip.write_all(workbook_rels.as_bytes());
-        let _ = zip.start_file("xl/styles.xml", opts);
-        let _ = zip.write_all(styles.as_bytes());
-        let _ = zip.start_file("xl/worksheets/sheet1.xml", opts);
-        let _ = zip.write_all(sheet.as_bytes());
+        zip.start_file("[Content_Types].xml", opts)?;
+        zip.write_all(content_types.as_bytes())?;
+        zip.start_file("_rels/.rels", opts)?;
+        zip.write_all(rels.as_bytes())?;
+        zip.start_file("xl/workbook.xml", opts)?;
+        zip.write_all(workbook.as_bytes())?;
+        zip.start_file("xl/_rels/workbook.xml.rels", opts)?;
+        zip.write_all(workbook_rels.as_bytes())?;
+        zip.start_file("xl/styles.xml", opts)?;
+        zip.write_all(styles.as_bytes())?;
+        zip.start_file("xl/worksheets/sheet1.xml", opts)?;
+        zip.write_all(sheet.as_bytes())?;
 
-        zip.finish().map(|c| c.into_inner()).unwrap_or_default()
+        Ok(zip.finish()?.into_inner())
     }
 
     // Parses `text` as CSV or TSV (auto-detected by the first line) and returns
@@ -4970,154 +4970,6 @@ impl ResultView {
         )
     }
 
-    #[allow(dead_code)]
-    fn generate_update_sql(table: &str, columns: &[String], row: &[Option<String>]) -> String {
-        if columns.is_empty() {
-            return format!("UPDATE {} SET  WHERE ;", table);
-        }
-        let set_clauses: Vec<String> = columns
-            .iter()
-            .zip(row.iter())
-            .map(|(col, val)| match val {
-                Some(v) => format!("{} = '{}'", col, v.replace('\'', "''")),
-                None => format!("{} = NULL", col),
-            })
-            .collect();
-        let where_clause = columns
-            .first()
-            .zip(row.first())
-            .map(|(col, val)| match val {
-                Some(v) => format!("{} = '{}'", col, v.replace('\'', "''")),
-                None => format!("{} IS NULL", col),
-            })
-            .unwrap_or_else(|| "1 = 1".to_string());
-        format!(
-            "UPDATE {} SET {} WHERE {};",
-            table,
-            set_clauses.join(", "),
-            where_clause
-        )
-    }
-
-    #[allow(dead_code)]
-    fn generate_delete_sql(table: &str, columns: &[String], row: &[Option<String>]) -> String {
-        let where_clause = columns
-            .first()
-            .zip(row.first())
-            .map(|(col, val)| match val {
-                Some(v) => format!("{} = '{}'", col, v.replace('\'', "''")),
-                None => format!("{} IS NULL", col),
-            })
-            .unwrap_or_else(|| "1 = 1".to_string());
-        format!("DELETE FROM {} WHERE {};", table, where_clause)
-    }
-
-    #[allow(dead_code)]
-    fn edit_row_as_sql(
-        &self,
-        row: &[Option<String>],
-        columns: &[String],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.workspace.clone() else {
-            return;
-        };
-        let table = self.table_name.clone().unwrap_or_default();
-        let sql = Self::generate_update_sql(&table, columns, row);
-        Self::open_sql_in_workspace(workspace, sql, window, cx);
-    }
-
-    #[allow(dead_code)]
-    fn open_sql_in_workspace(
-        workspace: WeakEntity<Workspace>,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let languages = workspace
-            .update(cx, |ws, _cx| ws.app_state().languages.clone())
-            .log_err();
-        let Some(languages) = languages else { return };
-        let language_task = languages.language_for_name("SQL");
-        cx.spawn_in(window, async move |_, cx| {
-            let language = language_task.await.log_err();
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    let project = workspace.project().clone();
-                    let buffer_task = project.update(cx, move |project, cx| {
-                        project.create_buffer(language, false, cx)
-                    });
-                    cx.spawn_in(window, async move |workspace, cx| {
-                        let buffer = buffer_task.await?;
-                        let multi = cx.new(|cx| {
-                            multi_buffer::MultiBuffer::singleton(buffer, cx)
-                                .with_title("query.sql".into())
-                        });
-                        workspace.update_in(cx, |workspace, window, cx| {
-                            let editor = cx.new(|cx| {
-                                let mut ed = Editor::for_multibuffer(multi, None, window, cx);
-                                ed.set_text(text.clone(), window, cx);
-                                ed
-                            });
-                            workspace.add_item_to_active_pane(
-                                Box::new(editor),
-                                None,
-                                true,
-                                window,
-                                cx,
-                            );
-                        })?;
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                })
-                .log_err();
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    #[allow(dead_code)]
-    fn delete_row(
-        &mut self,
-        row: Vec<Option<String>>,
-        columns: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (store, conn_id, db, table) = match (
-            self.store.clone(),
-            self.connection_id,
-            self.database.clone(),
-            self.table_name.clone(),
-        ) {
-            (Some(s), Some(id), Some(db), Some(tbl)) => (s, id, db, tbl),
-            _ => return,
-        };
-        let sql = Self::generate_delete_sql(&table, &columns, &row);
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Delete this row from '{}'?", table),
-            Some(&sql),
-            &["Delete", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await.ok() == Some(0) {
-                let task =
-                    store.update(cx, |store, cx| store.execute_query(conn_id, db, sql, cx))?;
-                task.await.log_err();
-                this.update_in(cx, |this, window, cx| {
-                    this.refresh_table_data(window, cx);
-                })
-                .log_err();
-            }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
     fn render_filter_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let editor = self.filter_editor.clone()?;
         let is_loading = self.is_loading;
@@ -5286,10 +5138,30 @@ impl ResultView {
                             "tab" if event.keystroke.modifiers.shift => {
                                 this.commit_and_move(-1, 0, window, cx);
                             }
+                            // Raw fallback: only reached when nothing resolved
+                            // "escape" to a bound action first (e.g. no keymap
+                            // loaded). The real app's keymap binds "escape" to
+                            // the `editor::Cancel` action instead, which is why
+                            // `capture_action` below also handles it.
                             "escape" => this.cancel_cell_edit(window, cx),
                             _ => {}
                         }
                     }))
+                    // When the real app's keymap resolves "escape" to the
+                    // `editor::Cancel` action instead of a raw keystroke, it
+                    // never reaches the raw fallback above: the inner Editor's
+                    // own Cancel handler claims the action first and
+                    // re-propagates it (finding nothing internal to dismiss),
+                    // but with no listener catching that re-propagated action,
+                    // nothing ever cancelled the cell edit. Intercepting during
+                    // the action capture phase (before the Editor's own handler
+                    // runs) and stopping propagation is what actually cancels it.
+                    .capture_action(cx.listener(
+                        |this, _: &editor::actions::Cancel, window, cx| {
+                            this.cancel_cell_edit(window, cx);
+                            cx.stop_propagation();
+                        },
+                    ))
                     .child(Self::render_cell_editor(editor, editor_kind))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
@@ -5734,10 +5606,24 @@ impl ResultView {
                             "tab" if event.keystroke.modifiers.shift => {
                                 this.commit_and_move(-1, 0, window, cx);
                             }
+                            // Raw fallback: only reached when nothing resolved
+                            // "escape" to a bound action first (e.g. no keymap
+                            // loaded). The real app's keymap binds "escape" to
+                            // the `editor::Cancel` action instead, which is why
+                            // `capture_action` below also handles it.
                             "escape" => this.cancel_cell_edit(window, cx),
                             _ => {}
                         }
                     }))
+                    // See the equivalent branch in the non-transposed grid: Escape
+                    // resolves to the `editor::Cancel` action, not a raw keystroke,
+                    // so it must be intercepted during the action capture phase.
+                    .capture_action(cx.listener(
+                        |this, _: &editor::actions::Cancel, window, cx| {
+                            this.cancel_cell_edit(window, cx);
+                            cx.stop_propagation();
+                        },
+                    ))
                     .child(Self::render_cell_editor(editor, editor_kind))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
@@ -6387,7 +6273,9 @@ impl ResultView {
                                                     let path_rx = cx.prompt_for_new_path(&home, Some("result.xlsx"));
                                                     cx.background_spawn(async move {
                                                         if let Some(path) = path_rx.await.log_err().and_then(|r| r.log_err()).flatten() {
-                                                            std::fs::write(path, ResultView::export_xlsx(&result)).log_err();
+                                                            if let Some(bytes) = ResultView::export_xlsx(&result).log_err() {
+                                                                std::fs::write(path, bytes).log_err();
+                                                            }
                                                         }
                                                     }).detach();
                                                 }
@@ -12895,6 +12783,197 @@ mod tests {
             assert_eq!(
                 rendered, "1",
                 "after escape the cell must show only its original value, not the typed text or a concatenation of both"
+            );
+        });
+    }
+
+    // The test above passes even against the pre-fix code, because this
+    // crate's test keymap has no binding for "escape" at all, so the
+    // keystroke falls straight through to the raw key capture/bubble path --
+    // it does not exercise what actually happens once "escape" resolves to
+    // the `editor::Cancel` action (its real, production keymap binding in the
+    // focused Editor's own "Editor" context; see
+    // assets/keymaps/default-linux.json). Dispatching that resolved action
+    // directly to the focused node (bypassing keystroke-to-action resolution
+    // entirely, exactly like `Window::dispatch_action` does once a keymap
+    // match is found) reproduces the real gap: the Editor's own `cancel()`
+    // handler finds nothing internal to dismiss for a plain single-line cell
+    // editor and calls `cx.propagate()`, and without a listener on our
+    // wrapper the action is never seen again by anything that would cancel
+    // the cell edit.
+    #[gpui::test]
+    fn escape_action_cancels_edit_even_when_the_editor_claims_it_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.cell_edit.is_some(),
+                "double-click must open the inline editor before escape is tested"
+            );
+        });
+
+        cx.simulate_keystrokes("x");
+        cx.dispatch_action(editor::actions::Cancel);
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.cell_edit.is_none(),
+                "the editor::Cancel action must cancel the cell edit even though the focused \
+                 Editor's own cancel handler claims (and then re-propagates) it first"
+            );
+            let rendered = view.loaded_cell_value(0, 1).unwrap_or_default();
+            assert_eq!(
+                rendered, "Alice",
+                "after cancelling, the cell must show only its original value, not the typed text"
+            );
+        });
+    }
+
+    // Investigates a report of a numeric cell showing a doubled-looking value
+    // ("1010" for an underlying "10") "out of nowhere". The two structural
+    // hypotheses -- (a) the read-mode label and the live editor both painting
+    // at once, (b) a second numeric-alignment render path missing the
+    // `flex_none` wrapping fix -- do not hold up against the source: the
+    // read-mode/edit-mode branches are a mutually exclusive if/else-if/else
+    // chain (only one AnyElement is ever built per cell per render), and both
+    // numeric-alignment call sites (`recompute_layout`'s data-column labels
+    // and the added-row labels) funnel through the same fixed
+    // `render_typed_cell_body`. This test walks a "10"-valued numeric cell
+    // through select -> edit -> type -> commit-via-click-elsewhere and
+    // asserts the rendered value is never anything but "10" or "105" (the
+    // deliberately-typed result), never a concatenation/doubling -- it passes
+    // cleanly, so the symptom was not reproduced through this path.
+    #[gpui::test]
+    fn numeric_cell_never_renders_a_doubled_value_across_select_edit_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        view.update(&mut cx, |view, _cx| {
+            view.column_infos = Some(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+                ColumnInfo {
+                    name: "name".to_string(),
+                    data_type: "varchar(255)".to_string(),
+                    is_nullable: true,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ]);
+            if let Some(result) = view.result.as_mut() {
+                result.rows[0][0] = Some("10".to_string());
+            }
+            view.recompute_layout();
+        });
+
+        let cell_center = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.loaded_cell_value(0, 0).as_deref(),
+                Some("10"),
+                "a plain single click must show the value as-is, never doubled"
+            );
+        });
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("10".to_string()),
+                "double-clicking must pre-fill the editor with the exact value, not doubled"
+            );
+        });
+
+        cx.simulate_keystrokes("5");
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("105".to_string()),
+                "typing must append to the real value, never duplicate it"
+            );
+        });
+
+        let other_cell_center = debug_center(&mut cx, "CELL-1-0");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: other_cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: other_cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.pending_cell_value(0, 0).map(|v| render_cell_value(v).0),
+                Some("105".to_string()),
+                "the committed value must be exactly what was typed, never doubled or concatenated \
+                 with the original"
             );
         });
     }
