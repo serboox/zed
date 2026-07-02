@@ -5262,6 +5262,14 @@ impl ResultView {
                 let editor = edit.editor.clone();
                 let editor_kind = self.column_kind_at(cell_idx);
                 div()
+                    // Unlike the read-mode branch (an h_flex with size_full at
+                    // its top level), this wraps render_cell_editor in an extra
+                    // div for key capture. Without an explicit size here, that
+                    // wrapper doesn't establish a definite size for its child's
+                    // size_full to fill, so the live editor paints with zero
+                    // effective area even though its text is set correctly.
+                    .size_full()
+                    .debug_selector(|| "CELL_EDITOR_BODY".into())
                     // Capture phase: intercept before the editor processes them.
                     // Enter → commit + next row; Tab/Shift-Tab → commit + next/prev column.
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -5706,6 +5714,12 @@ impl ResultView {
                 let editor = edit.editor.clone();
                 let editor_kind = self.column_kind_at(cell_idx);
                 div()
+                    // See the equivalent branch in the non-transposed grid:
+                    // without size_full here, this wrapper doesn't establish a
+                    // definite size for the editor's own size_full to fill, so
+                    // it paints with zero effective area despite having the
+                    // correct text set.
+                    .size_full()
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         match event.keystroke.key.as_str() {
                             "enter" if event.keystroke.modifiers.shift => {
@@ -11101,6 +11115,45 @@ mod tests {
                 "starting an inline edit must close any auto-opened value editor popup"
             );
         });
+    }
+
+    // Regression test for a bug that survived direct-function-call and
+    // element-tree/text-content assertions (like the two tests above) across
+    // four investigation rounds, and only reproduced under a real compiled
+    // build driven by genuine OS-level input: the cell editor's wrapping div
+    // had no size directive, so during layout its size_full child editor
+    // resolved to a zero-area box and painted nothing, even though the
+    // editor's own text content was always correct. Checking real computed
+    // bounds (not just model state) is what would have caught this.
+    #[gpui::test]
+    fn cell_editor_body_has_nonzero_bounds_while_editing(cx: &mut gpui::TestAppContext) {
+        let (window, _view, mut cx) = table_backed_result_window(cx);
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        let bounds = cx
+            .debug_bounds("CELL_EDITOR_BODY")
+            .expect("the cell editor body should be present and measurable while editing");
+        assert!(
+            bounds.size.width > px(0.) && bounds.size.height > px(0.),
+            "the live cell editor must occupy real, non-zero screen area, not just exist in the \
+             element tree: got {:?}",
+            bounds.size
+        );
     }
 
     #[gpui::test]
