@@ -3517,7 +3517,7 @@ impl DatabasePanel {
             .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::Folder(folder_id), cx);
             }))
-            .child(Label::new(name.clone()).size(LabelSize::Small));
+            .child(Label::new(name.clone()).size(LabelSize::Small).single_line());
 
         right_click_menu(ElementId::from(SharedString::from(format!(
             "folder-menu-{folder_id}"
@@ -4922,7 +4922,7 @@ impl DatabasePanel {
                             .flex()
                             .flex_col()
                             .flex_none()
-                            .child(Label::new(label).size(LabelSize::Small))
+                            .child(Label::new(label).size(LabelSize::Small).single_line())
                             .child(Label::new(driver_label).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .child(div().flex_1())
@@ -5110,11 +5110,12 @@ impl DatabasePanel {
                                         .pl(px(48.))
                                         .pr_2()
                                         .py_1()
-                                        .child(Label::new(name).size(LabelSize::XSmall))
+                                        .child(Label::new(name).size(LabelSize::XSmall).single_line())
                                         .child(
                                             Label::new(format!("@{host}"))
                                                 .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
+                                                .color(Color::Muted)
+                                                .single_line(),
                                         )
                                 }))
                             })
@@ -5428,7 +5429,7 @@ impl DatabasePanel {
                                         .child(
                                             div()
                                                 .id(ElementId::from(SharedString::from(format!("tbl-label-{}-{}-{}", id, db_for_table, table_name))))
-                                                .child(HighlightedLabel::new(table_name.clone(), highlight_indices).size(LabelSize::Small))
+                                                .child(HighlightedLabel::new(table_name.clone(), highlight_indices).size(LabelSize::Small).single_line())
                                                 .tooltip(Tooltip::text("Ctrl+click to view DDL")),
                                         )
                                         .child(
@@ -6181,7 +6182,7 @@ impl DatabasePanel {
                                                     .pr_2()
                                                     .py_1()
                                                     .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Muted))
-                                                    .child(Label::new(view_name.clone()).size(LabelSize::Small));
+                                                    .child(Label::new(view_name.clone()).size(LabelSize::Small).single_line());
 
                                                 let view_ctx_menu = {
                                                     let entity = entity.clone();
@@ -9646,6 +9647,124 @@ mod tests {
             max_offset_y > px(0.),
             "tree has 80 connection rows, far more than fit in the test window, so the scroll \
              handle must report a nonzero max scroll offset; got {max_offset_y:?}"
+        );
+
+        let max_offset_x = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().x);
+        assert_eq!(
+            max_offset_x,
+            px(0.),
+            "no row's label is wider than the test window, so there is genuinely nothing to \
+             scroll horizontally yet; got {max_offset_x:?}"
+        );
+    }
+
+    // A connection label far wider than the test window's panel must produce a
+    // nonzero horizontal scroll range -- this is the counterpart to the
+    // vertical-overflow test above, checking the `x` axis instead of `y`.
+    //
+    // Currently ignored: this reproduces a real, unfixed bug. `content_size()`
+    // and `viewport()` both measure at exactly the same width regardless of
+    // how long the label is (confirmed via direct measurement: both report
+    // 259px even for a ~90-character label with `.single_line()` applied to
+    // prevent wrapping). Neither `.single_line()` on the label nor
+    // `.self_start()` on the row or on `db-tree-background` (to opt the row
+    // out of the column's default cross-axis stretch) changed this. The true
+    // constraint is somewhere else in this layout chain and needs further
+    // investigation before this can pass.
+    #[gpui::test]
+    #[ignore = "known bug: tree rows never report a wider-than-viewport content size, so horizontal scroll never activates regardless of label length"]
+    async fn database_explorer_tree_scrolls_horizontally_when_a_label_overflows_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(|cx| DatabaseStore::new(cx));
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connection(
+                db_client::ConnectionConfig {
+                    label: "a-connection-name-so-long-it-must-overflow-any-reasonable-panel-width-and-then-some-more"
+                        .to_string(),
+                    auto_connect: false,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.left_dock().read(cx).panel::<DatabasePanel>()
+            })
+            .expect("DatabasePanel must be in the left dock");
+
+        let max_offset_x = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().x);
+        assert!(
+            max_offset_x > px(0.),
+            "the connection label is far wider than the panel, so the scroll handle must report \
+             a nonzero horizontal max offset; got {max_offset_x:?}"
         );
     }
 
