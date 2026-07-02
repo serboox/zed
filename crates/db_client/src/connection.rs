@@ -67,6 +67,17 @@ impl DatabaseDriver {
     pub fn is_file_based(self) -> bool {
         matches!(self, DatabaseDriver::SQLite)
     }
+
+    /// Quotes an identifier (table/column/database name) for use in a
+    /// generated SQL statement, escaping any embedded quote character by
+    /// doubling it. MySQL uses backticks; every other SQL driver here uses
+    /// ANSI double quotes.
+    pub fn quote_identifier(self, name: &str) -> String {
+        match self {
+            DatabaseDriver::MySQL => format!("`{}`", name.replace('`', "``")),
+            _ => format!("\"{}\"", name.replace('"', "\"\"")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +151,39 @@ impl Default for ConnectionConfig {
             folder_id: None,
             order: 0,
             env_color: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_identifier_uses_backticks_for_mysql_and_escapes_embedded_backticks() {
+        assert_eq!(
+            DatabaseDriver::MySQL.quote_identifier("orders"),
+            "`orders`"
+        );
+        assert_eq!(
+            DatabaseDriver::MySQL.quote_identifier("weird`name"),
+            "`weird``name`"
+        );
+    }
+
+    #[test]
+    fn quote_identifier_uses_double_quotes_for_non_mysql_drivers_and_escapes_embedded_quotes() {
+        for driver in [
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::SQLite,
+            DatabaseDriver::ClickHouse,
+            DatabaseDriver::Redis,
+        ] {
+            assert_eq!(driver.quote_identifier("orders"), "\"orders\"");
+            assert_eq!(
+                driver.quote_identifier("weird\"name"),
+                "\"weird\"\"name\""
+            );
         }
     }
 }

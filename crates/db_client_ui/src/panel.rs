@@ -45,10 +45,13 @@ use std::sync::Arc;
 use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
+use editor::EditorSettings;
+use settings::Settings as _;
 use ui::{
     CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName,
-    IconSize, Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    IconSize, Indicator, Label, LabelSize, Scrollbars, Tooltip, WithScrollbar,
     prelude::*, right_click_menu,
+    scrollbars::{ScrollbarVisibility, ShowScrollbar},
 };
 use util::ResultExt as _;
 use workspace::{
@@ -2586,6 +2589,15 @@ fn run_sql_from_editor(
     .detach_and_log_err(cx);
 }
 
+#[derive(Default)]
+struct DatabasePanelScrollbarProxy;
+
+impl ScrollbarVisibility for DatabasePanelScrollbarProxy {
+    fn visibility(&self, cx: &App) -> ShowScrollbar {
+        EditorSettings::get_global(cx).scrollbar.show
+    }
+}
+
 pub struct DatabasePanel {
     focus_handle: FocusHandle,
     store: Entity<DatabaseStore>,
@@ -3443,6 +3455,7 @@ impl DatabasePanel {
             .id(ElementId::from(SharedString::from(format!(
                 "folder-row-{folder_id}"
             ))))
+            .debug_selector(|| format!("folder-row-{folder_id}"))
             .min_w_full()
             .items_center()
             .gap_1()
@@ -3617,13 +3630,6 @@ impl DatabasePanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-    }
-
-    fn quote_ident(name: &str, driver: DatabaseDriver) -> String {
-        match driver {
-            DatabaseDriver::MySQL => format!("`{}`", name.replace('`', "``")),
-            _ => format!("\"{}\"", name.replace('"', "\"\"")),
-        }
     }
 
     /// Stacked tree overlays for a column: gold star = primary key,
@@ -4526,13 +4532,13 @@ impl DatabasePanel {
         driver: DatabaseDriver,
         columns: &[ColumnInfo],
     ) -> String {
-        let qt = Self::quote_ident(table, driver);
+        let qt = driver.quote_identifier(table);
         if columns.is_empty() {
             return format!("INSERT INTO {} () VALUES ();", qt);
         }
         let cols: Vec<String> = columns
             .iter()
-            .map(|c| Self::quote_ident(&c.name, driver))
+            .map(|c| driver.quote_identifier(&c.name))
             .collect();
         let placeholders: Vec<String> = columns.iter().map(|c| format!("'{}'", c.name)).collect();
         format!(
@@ -4548,7 +4554,7 @@ impl DatabasePanel {
         driver: DatabaseDriver,
         columns: &[ColumnInfo],
     ) -> String {
-        let qt = Self::quote_ident(table, driver);
+        let qt = driver.quote_identifier(table);
         if columns.is_empty() {
             return format!("UPDATE {} SET  WHERE ;", qt);
         }
@@ -4561,12 +4567,12 @@ impl DatabasePanel {
             .collect();
         let set_clause: Vec<String> = non_pk_cols
             .iter()
-            .map(|c| format!("{} = '{}'", Self::quote_ident(&c.name, driver), c.name))
+            .map(|c| format!("{} = '{}'", driver.quote_identifier(&c.name), c.name))
             .collect();
         let where_clause = if let Some(pk_col) = pk {
             format!(
                 "{} = '{}'",
-                Self::quote_ident(&pk_col.name, driver),
+                driver.quote_identifier(&pk_col.name),
                 pk_col.name
             )
         } else {
@@ -4640,7 +4646,7 @@ impl DatabasePanel {
         columns: &[ColumnInfo],
         count: usize,
     ) -> String {
-        let qt = Self::quote_ident(table, driver);
+        let qt = driver.quote_identifier(table);
         let insertable_cols: Vec<&ColumnInfo> = columns
             .iter()
             .filter(|c| c.extra != "auto_increment" && c.extra != "GENERATED ALWAYS")
@@ -4652,7 +4658,7 @@ impl DatabasePanel {
 
         let col_list: Vec<String> = insertable_cols
             .iter()
-            .map(|c| Self::quote_ident(&c.name, driver))
+            .map(|c| driver.quote_identifier(&c.name))
             .collect();
 
         (1..=count)
@@ -4677,14 +4683,14 @@ impl DatabasePanel {
         driver: DatabaseDriver,
         columns: &[ColumnInfo],
     ) -> String {
-        let qt = Self::quote_ident(table, driver);
+        let qt = driver.quote_identifier(table);
         let pk = columns
             .iter()
             .find(|c| c.column_key.as_deref() == Some("PRI"));
         let where_clause = if let Some(pk_col) = pk {
             format!(
                 "{} = '{}'",
-                Self::quote_ident(&pk_col.name, driver),
+                driver.quote_identifier(&pk_col.name),
                 pk_col.name
             )
         } else {
@@ -4831,6 +4837,7 @@ impl DatabasePanel {
             .child(
                 div()
                     .id(ElementId::from(SharedString::from(format!("conn-header-{}", id))))
+                    .debug_selector(|| format!("conn-header-{}", id))
                     .flex()
                     .flex_row()
                     .min_w_full()
@@ -5449,7 +5456,7 @@ impl DatabasePanel {
                                                 move |this, _, window, cx| {
                                                     let sql = format!(
                                                         "SELECT * FROM {} LIMIT 500",
-                                                        Self::quote_ident(&tbl, driver)
+                                                        driver.quote_identifier(&tbl)
                                                     );
                                                     let store_weak = this.store.downgrade();
                                                     let task = this.store.update(cx, |store, cx| {
@@ -5552,7 +5559,7 @@ impl DatabasePanel {
                                                             entity.update(cx, |panel, cx| {
                                                                 let sql = format!(
                                                                     "SELECT * FROM {} LIMIT 500",
-                                                                    Self::quote_ident(&tbl, driver)
+                                                                    driver.quote_identifier(&tbl)
                                                                 );
                                                                 let store_weak = panel.store.downgrade();
                                                                 let task = panel.store.update(cx, |store, cx| {
@@ -5591,14 +5598,14 @@ impl DatabasePanel {
                                                                 "*".to_string()
                                                             } else {
                                                                 cols.iter()
-                                                                    .map(|c| Self::quote_ident(&c.name, driver))
+                                                                    .map(|c| driver.quote_identifier(&c.name))
                                                                     .collect::<Vec<_>>()
                                                                     .join(", ")
                                                             };
                                                             let sql = format!(
                                                                 "SELECT {}\nFROM {};",
                                                                 col_list,
-                                                                Self::quote_ident(&tbl, driver)
+                                                                driver.quote_identifier(&tbl)
                                                             );
                                                             entity.update(cx, |panel, cx| {
                                                                 Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
@@ -5849,8 +5856,8 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             let sql = format!(
                                                                 "ALTER TABLE {} RENAME TO {};",
-                                                                Self::quote_ident(&tbl, driver),
-                                                                Self::quote_ident(&format!("{}_renamed", tbl), driver),
+                                                                driver.quote_identifier(&tbl),
+                                                                driver.quote_identifier(&format!("{}_renamed", tbl)),
                                                             );
                                                             entity.update(cx, |panel, cx| {
                                                                 Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
@@ -6745,7 +6752,7 @@ impl Render for DatabasePanel {
                     .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Both)
+                        Scrollbars::for_settings::<DatabasePanelScrollbarProxy>()
                             .tracked_scroll_handle(&self.tree_scroll_handle),
                         window,
                         cx,
@@ -8758,6 +8765,118 @@ mod tests {
         });
     }
 
+    // `handle_drop` had zero test coverage of any kind -- not even a direct
+    // function call -- despite being the whole mechanism behind drag-and-drop
+    // reparenting in the tree. Per this session's own lesson (a test calling
+    // a handler directly can pass while the real event-driven path is
+    // broken), this drives the real GPUI drag gesture: mouse-down on the
+    // connection row, mouse-move onto the folder row (which is what actually
+    // arms `on_drag`/`on_drag_move` and flips `drag_target`), then mouse-up
+    // to fire `on_drop`.
+    #[gpui::test]
+    async fn dragging_a_connection_row_onto_a_folder_row_reparents_it(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "tree".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, _panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                selected_tree_node: None,
+                dump: DumpUiState::default(),
+                context_menu: None,
+                tree_scroll_handle: ScrollHandle::new(),
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        let folder_id = store
+            .update(cx, |store, cx| store.add_folder("Prod".into(), None, cx))
+            .expect("folder must be created");
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let connection_source = debug_center(cx, format!("conn-header-{connection_id}").leak());
+        let folder_target = debug_center(cx, format!("folder-row-{folder_id}").leak());
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .connections()
+                    .iter()
+                    .find(|c| c.config.id == connection_id)
+                    .and_then(|c| c.config.folder_id),
+                None,
+                "the connection must start outside any folder"
+            );
+        });
+
+        cx.simulate_mouse_down(connection_source, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(folder_target, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_move(folder_target, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(folder_target, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .connections()
+                    .iter()
+                    .find(|c| c.config.id == connection_id)
+                    .and_then(|c| c.config.folder_id),
+                Some(folder_id),
+                "dropping the connection row onto the folder row must reparent it via the real \
+                 on_drag/on_drop path, not merely by calling handle_drop directly"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn empty_panel_background_menu_creates_folder_and_connection(cx: &mut TestAppContext) {
         init_test(cx);
@@ -9193,6 +9312,12 @@ mod tests {
         });
     }
 
+    fn debug_center(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Point<Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
+            .center()
+    }
+
     // Autonomously verifies the Ctrl+Enter precedence without a live database,
     // mirroring production exactly: the inline-assistant binding sits on
     // `!AcpThread > Editor && mode == full`, the console binding on
@@ -9534,6 +9659,49 @@ mod tests {
             "tree has 80 connection rows, far more than fit in the test window, so the scroll \
              handle must report a nonzero max scroll offset; got {max_offset_y:?}"
         );
+    }
+
+    // The tree previously wired its scrollbar with `Scrollbars::new(...)`,
+    // which hardcodes `ShowScrollbar::default()` (Auto) and never consults
+    // the user's actual `scrollbar.show` setting -- unlike `project_panel`
+    // and `outline_panel`, which use `Scrollbars::for_settings::<Proxy>()` to
+    // read it. Under `Auto`, the scrollbar only flashes in transiently on
+    // scroll/hover, which reads as "no scrollbar at all" to a user who has
+    // explicitly set `scrollbar.show: always` and expects it to stay visible.
+    // This proves `DatabasePanelScrollbarProxy` actually reads the live
+    // setting instead of ignoring it.
+    #[gpui::test]
+    fn database_panel_scrollbar_proxy_reflects_the_editor_scrollbar_setting(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            EditorSettings::register(cx);
+
+            let default_visibility = DatabasePanelScrollbarProxy.visibility(cx);
+            assert_eq!(
+                default_visibility,
+                EditorSettings::get_global(cx).scrollbar.show,
+                "with no override, the proxy must reflect whatever the editor's real default is"
+            );
+
+            let mut always_shown = EditorSettings::get_global(cx).clone();
+            always_shown.scrollbar.show = ShowScrollbar::Always;
+            EditorSettings::override_global(always_shown, cx);
+            assert_eq!(
+                DatabasePanelScrollbarProxy.visibility(cx),
+                ShowScrollbar::Always,
+                "the tree's scrollbar proxy must respect an explicit `scrollbar.show: always`, \
+                 not silently stay on Auto"
+            );
+
+            let mut never_shown = EditorSettings::get_global(cx).clone();
+            never_shown.scrollbar.show = ShowScrollbar::Never;
+            EditorSettings::override_global(never_shown, cx);
+            assert_eq!(
+                DatabasePanelScrollbarProxy.visibility(cx),
+                ShowScrollbar::Never,
+                "the tree's scrollbar proxy must also respect `scrollbar.show: never`"
+            );
+        });
     }
 
     // Replicates what the real app does:

@@ -13,13 +13,6 @@ use util::ResultExt;
 
 use crate::store::DatabaseStore;
 
-fn quote_ident(name: &str, driver: DatabaseDriver) -> String {
-    match driver {
-        DatabaseDriver::MySQL => format!("`{}`", name.replace('`', "``")),
-        _ => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
-}
-
 fn quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -131,10 +124,10 @@ pub fn build_insert_statements(
     let batch_size = batch_size.max(1);
     let columns_sql = included
         .iter()
-        .map(|&index| quote_ident(&target_columns[index], driver))
+        .map(|&index| driver.quote_identifier(&target_columns[index]))
         .collect::<Vec<_>>()
         .join(", ");
-    let table_sql = quote_ident(table, driver);
+    let table_sql = driver.quote_identifier(table);
 
     let mut statements = Vec::new();
     for chunk in rows.chunks(batch_size) {

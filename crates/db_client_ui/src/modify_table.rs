@@ -10,13 +10,6 @@ use workspace::ModalView;
 
 use crate::store::DatabaseStore;
 
-fn quote_ident(name: &str, driver: DatabaseDriver) -> String {
-    match driver {
-        DatabaseDriver::MySQL => format!("`{}`", name.replace('`', "``")),
-        _ => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
-}
-
 #[derive(Clone)]
 struct ColumnDraft {
     original: Option<ColumnInfo>,
@@ -113,7 +106,7 @@ pub fn generate_alter_statements(
     driver: DatabaseDriver,
     changes: &[ColumnChange],
 ) -> Vec<String> {
-    let table_ident = quote_ident(table, driver);
+    let table_ident = driver.quote_identifier(table);
     let null_clause = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
     let mut statements = Vec::new();
     for change in changes {
@@ -125,7 +118,7 @@ pub fn generate_alter_statements(
             } => {
                 statements.push(format!(
                     "ALTER TABLE {table_ident} ADD COLUMN {} {} {};",
-                    quote_ident(name, driver),
+                    driver.quote_identifier(name),
                     data_type,
                     null_clause(*nullable)
                 ));
@@ -133,15 +126,15 @@ pub fn generate_alter_statements(
             ColumnChange::Drop { name } => {
                 statements.push(format!(
                     "ALTER TABLE {table_ident} DROP COLUMN {};",
-                    quote_ident(name, driver)
+                    driver.quote_identifier(name)
                 ));
             }
             ColumnChange::Rename { from, to } => {
                 if driver != DatabaseDriver::MySQL {
                     statements.push(format!(
                         "ALTER TABLE {table_ident} RENAME COLUMN {} TO {};",
-                        quote_ident(from, driver),
-                        quote_ident(to, driver)
+                        driver.quote_identifier(from),
+                        driver.quote_identifier(to)
                     ));
                 }
             }
@@ -152,20 +145,20 @@ pub fn generate_alter_statements(
             } => match driver {
                 DatabaseDriver::MySQL => statements.push(format!(
                     "ALTER TABLE {table_ident} MODIFY COLUMN {} {} {};",
-                    quote_ident(name, driver),
+                    driver.quote_identifier(name),
                     data_type,
                     null_clause(*nullable)
                 )),
                 _ => {
                     statements.push(format!(
                         "ALTER TABLE {table_ident} ALTER COLUMN {} TYPE {};",
-                        quote_ident(name, driver),
+                        driver.quote_identifier(name),
                         data_type
                     ));
                     let null_op = if *nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
                     statements.push(format!(
                         "ALTER TABLE {table_ident} ALTER COLUMN {} {null_op};",
-                        quote_ident(name, driver)
+                        driver.quote_identifier(name)
                     ));
                 }
             },
@@ -201,16 +194,16 @@ fn fold_mysql_rename_modify(
                 handled_modify_for.push(to.clone());
                 statements.push(format!(
                     "ALTER TABLE {table_ident} CHANGE COLUMN {} {} {} {};",
-                    quote_ident(from, driver),
-                    quote_ident(to, driver),
+                    driver.quote_identifier(from),
+                    driver.quote_identifier(to),
                     data_type,
                     null_clause(nullable)
                 ));
             } else {
                 statements.push(format!(
                     "ALTER TABLE {table_ident} RENAME COLUMN {} TO {};",
-                    quote_ident(from, driver),
-                    quote_ident(to, driver)
+                    driver.quote_identifier(from),
+                    driver.quote_identifier(to)
                 ));
             }
         }
@@ -223,13 +216,13 @@ fn fold_mysql_rename_modify(
                 nullable,
             } => statements.push(format!(
                 "ALTER TABLE {table_ident} ADD COLUMN {} {} {};",
-                quote_ident(name, driver),
+                driver.quote_identifier(name),
                 data_type,
                 null_clause(*nullable)
             )),
             ColumnChange::Drop { name } => statements.push(format!(
                 "ALTER TABLE {table_ident} DROP COLUMN {};",
-                quote_ident(name, driver)
+                driver.quote_identifier(name)
             )),
             ColumnChange::Modify {
                 name,
@@ -237,7 +230,7 @@ fn fold_mysql_rename_modify(
                 nullable,
             } if !handled_modify_for.contains(name) => statements.push(format!(
                 "ALTER TABLE {table_ident} MODIFY COLUMN {} {} {};",
-                quote_ident(name, driver),
+                driver.quote_identifier(name),
                 data_type,
                 null_clause(*nullable)
             )),
