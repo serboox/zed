@@ -25,8 +25,13 @@ impl PostgresProvider {
             .username(&config.username)
             .password(&config.password)
             .database(config.database.as_deref().unwrap_or("postgres"));
+        // Single connection: `execute_query` relies on `SET search_path`
+        // staying applied for the query that follows it, which only holds
+        // when both run on the same physical connection. The metadata
+        // queries are fully qualified, so serializing them through one
+        // connection is acceptable for a single-user GUI client.
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect_with(opts)
             .await
             .context("Failed to connect to PostgreSQL")?;
