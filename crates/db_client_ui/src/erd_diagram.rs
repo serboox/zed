@@ -56,6 +56,7 @@ const CELL_PADDING: f32 = 8.0;
 const ROW_GAP: f32 = 4.0;
 const ICON_PX: f32 = 12.0;
 const LINE_STROKE: f32 = 1.5;
+const ARROW_SIZE: f32 = 8.0;
 
 fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
@@ -112,6 +113,73 @@ pub fn box_origin(row: usize, column: usize) -> (f32, f32) {
     let x = OUTER_PADDING + column as f32 * (BOX_WIDTH + HORIZONTAL_GAP);
     let y = OUTER_PADDING + row as f32 * slot_height();
     (x, y)
+}
+
+/// Point on a box's perimeter (one of its four edge midpoints) that faces
+/// `toward`, so a relationship line anchors to the box's border instead of
+/// passing through its center and the table contents drawn inside it.
+pub fn edge_anchor(box_rect: (f32, f32, f32, f32), toward: (f32, f32)) -> (f32, f32) {
+    let (x, y, w, h) = box_rect;
+    let center = (x + w / 2.0, y + h / 2.0);
+    let dx = toward.0 - center.0;
+    let dy = toward.1 - center.1;
+    if dx.abs() >= dy.abs() {
+        if dx >= 0.0 {
+            (x + w, center.1)
+        } else {
+            (x, center.1)
+        }
+    } else if dy >= 0.0 {
+        (center.0, y + h)
+    } else {
+        (center.0, y)
+    }
+}
+
+/// Right-angle ("elbow") waypoints connecting two boxes' facing edges instead
+/// of a straight center-to-center diagonal that would cut through both boxes'
+/// contents. Bends at the horizontal midpoint between the two edge anchors;
+/// this collapses to a single straight segment when the anchors already
+/// share an axis (e.g. two boxes in the same grid row), which is the correct
+/// degenerate case, not a bug.
+pub fn elbow_route(
+    from_box: (f32, f32, f32, f32),
+    to_box: (f32, f32, f32, f32),
+) -> Vec<(f32, f32)> {
+    let from_center = (from_box.0 + from_box.2 / 2.0, from_box.1 + from_box.3 / 2.0);
+    let to_center = (to_box.0 + to_box.2 / 2.0, to_box.1 + to_box.3 / 2.0);
+    let anchor_from = edge_anchor(from_box, to_center);
+    let anchor_to = edge_anchor(to_box, from_center);
+    let mid_x = (anchor_from.0 + anchor_to.0) / 2.0;
+    vec![
+        anchor_from,
+        (mid_x, anchor_from.1),
+        (mid_x, anchor_to.1),
+        anchor_to,
+    ]
+}
+
+/// Triangle points for an arrowhead whose tip sits at `to`, pointing along
+/// the direction from `from` to `to`. Coincident points (a zero-length final
+/// segment) degenerate to a zero-size triangle at `to` rather than dividing
+/// by zero, since a relationship route should never realistically produce
+/// this but a defensive caller still deserves a valid (if invisible) result.
+pub fn arrowhead_triangle(from: (f32, f32), to: (f32, f32), size: f32) -> [(f32, f32); 3] {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < f32::EPSILON {
+        return [to, to, to];
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let perp_x = -uy;
+    let perp_y = ux;
+    let back = (to.0 - ux * size, to.1 - uy * size);
+    let half = size * 0.5;
+    let left = (back.0 + perp_x * half, back.1 + perp_y * half);
+    let right = (back.0 - perp_x * half, back.1 - perp_y * half);
+    [to, left, right]
 }
 
 fn escape_mermaid_type(data_type: &str) -> String {
@@ -313,18 +381,40 @@ impl ErdView {
         true
     }
 
-    fn table_center(&self, table_name: &str) -> Option<(f32, f32)> {
+    /// Unscaled (zoom = 1.0) bounding rect (x, y, width, height) of a placed
+    /// table box, for edge-anchored relationship routing.
+    fn table_box(&self, table_name: &str) -> Option<(f32, f32, f32, f32)> {
         self.placed.iter().find_map(|placed| {
             if placed.table.name == table_name {
-                let height = box_height(placed.table.columns.len());
                 Some((
-                    placed.origin_x + BOX_WIDTH / 2.0,
-                    placed.origin_y + height / 2.0,
+                    placed.origin_x,
+                    placed.origin_y,
+                    BOX_WIDTH,
+                    box_height(placed.table.columns.len()),
                 ))
             } else {
                 None
             }
         })
+    }
+
+    /// Unscaled elbow-routed waypoints and arrowhead triangle for every
+    /// relationship whose both endpoints are placed tables. Kept as its own
+    /// method (rather than inlined in `render`) so it is directly callable
+    /// and assertable from tests without a full paint pass.
+    fn relationship_paths(&self) -> Vec<(Vec<(f32, f32)>, [(f32, f32); 3])> {
+        self.relationships
+            .iter()
+            .filter_map(|relationship| {
+                let from_box = self.table_box(&relationship.from_table)?;
+                let to_box = self.table_box(&relationship.to_table)?;
+                let waypoints = elbow_route(from_box, to_box);
+                let tail = *waypoints.get(waypoints.len().checked_sub(2)?)?;
+                let tip = *waypoints.last()?;
+                let arrow = arrowhead_triangle(tail, tip, ARROW_SIZE);
+                Some((waypoints, arrow))
+            })
+            .collect()
     }
 
     fn render_table_box(
@@ -468,17 +558,16 @@ impl Render for ErdView {
         let line_color: Hsla = colors.border_variant;
         let zoom = self.zoom;
 
-        let mut segments: Vec<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)> = Vec::new();
-        for relationship in &self.relationships {
-            if let (Some(from), Some(to)) = (
-                self.table_center(&relationship.from_table),
-                self.table_center(&relationship.to_table),
-            ) {
-                segments.push((
-                    point(px(from.0 * zoom), px(from.1 * zoom)),
-                    point(px(to.0 * zoom), px(to.1 * zoom)),
-                ));
-            }
+        let mut routes: Vec<Vec<gpui::Point<gpui::Pixels>>> = Vec::new();
+        let mut arrowheads: Vec<[gpui::Point<gpui::Pixels>; 3]> = Vec::new();
+        for (waypoints, arrow) in self.relationship_paths() {
+            routes.push(
+                waypoints
+                    .iter()
+                    .map(|(x, y)| point(px(scaled(*x, zoom)), px(scaled(*y, zoom))))
+                    .collect(),
+            );
+            arrowheads.push(arrow.map(|(x, y)| point(px(scaled(x, zoom)), px(scaled(y, zoom)))));
         }
 
         let mermaid = self.mermaid.clone();
@@ -493,10 +582,25 @@ impl Render for ErdView {
                 canvas(
                     move |_, _, _| {},
                     move |_bounds, _, window, _| {
-                        for (from, to) in &segments {
+                        for route in &routes {
+                            let Some((first, rest)) = route.split_first() else {
+                                continue;
+                            };
                             let mut builder = gpui::PathBuilder::stroke(stroke_width);
-                            builder.move_to(*from);
-                            builder.line_to(*to);
+                            builder.move_to(*first);
+                            for point in rest {
+                                builder.line_to(*point);
+                            }
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, line_color);
+                            }
+                        }
+                        for triangle in &arrowheads {
+                            let mut builder = gpui::PathBuilder::fill();
+                            builder.move_to(triangle[0]);
+                            builder.line_to(triangle[1]);
+                            builder.line_to(triangle[2]);
+                            builder.close();
                             if let Ok(path) = builder.build() {
                                 window.paint_path(path, line_color);
                             }
@@ -751,8 +855,8 @@ mod tests {
         view.update(cx, |view, _, _| {
             assert_eq!(view.placed.len(), 2);
             assert_eq!(view.relationships.len(), 1);
-            assert!(view.table_center("users").is_some());
-            assert!(view.table_center("missing").is_none());
+            assert!(view.table_box("users").is_some());
+            assert!(view.table_box("missing").is_none());
         })
         .expect("window should build");
     }
@@ -991,6 +1095,109 @@ mod tests {
             max_offset_idle, max_offset_after_v_scroll,
             "an idle re-render (no state change) must not change either axis's max_offset"
         );
+    }
+
+    #[test]
+    fn edge_anchor_picks_the_facing_side_not_the_center() {
+        let box_rect = (0.0, 0.0, 100.0, 40.0);
+        // Something to the right and roughly level -> right edge, vertically centered.
+        assert_eq!(edge_anchor(box_rect, (500.0, 20.0)), (100.0, 20.0));
+        // Something to the left -> left edge.
+        assert_eq!(edge_anchor(box_rect, (-500.0, 20.0)), (0.0, 20.0));
+        // Something below -> bottom edge, horizontally centered.
+        assert_eq!(edge_anchor(box_rect, (50.0, 500.0)), (50.0, 40.0));
+        // Something above -> top edge.
+        assert_eq!(edge_anchor(box_rect, (50.0, -500.0)), (50.0, 0.0));
+    }
+
+    #[test]
+    fn elbow_route_bends_between_boxes_offset_in_both_axes() {
+        let from_box = (0.0, 0.0, 100.0, 40.0);
+        let to_box = (300.0, 200.0, 100.0, 40.0);
+        let waypoints = elbow_route(from_box, to_box);
+        assert_eq!(waypoints.len(), 4, "route must be anchor, two bends, anchor");
+        let (start, bend1, bend2, end) = (waypoints[0], waypoints[1], waypoints[2], waypoints[3]);
+        // Start and end anchor to box edges, not centers (50,20)/(350,220).
+        assert_ne!(start, (50.0, 20.0));
+        assert_ne!(end, (350.0, 220.0));
+        // The route actually bends: the middle waypoints share one axis each
+        // with an anchor, and the two bends share an x (the elbow's vertical
+        // run), which is not true of a straight two-point diagonal.
+        assert_eq!(bend1.1, start.1, "first bend keeps the source anchor's y");
+        assert_eq!(bend2.1, end.1, "second bend takes on the target anchor's y");
+        assert_eq!(bend1.0, bend2.0, "the two bends share an x (the vertical run)");
+    }
+
+    #[test]
+    fn elbow_route_collapses_to_a_straight_run_when_boxes_share_a_row() {
+        let from_box = (0.0, 0.0, 100.0, 40.0);
+        let to_box = (300.0, 0.0, 100.0, 40.0);
+        let waypoints = elbow_route(from_box, to_box);
+        // Same row -> anchors already share a y, so both bends collapse onto
+        // that same y: the whole route is a single horizontal run.
+        assert!(waypoints.iter().all(|point| point.1 == waypoints[0].1));
+    }
+
+    #[test]
+    fn arrowhead_triangle_points_back_from_the_tip_along_the_line_direction() {
+        let triangle = arrowhead_triangle((0.0, 0.0), (10.0, 0.0), 6.0);
+        assert_eq!(triangle[0], (10.0, 0.0), "tip sits exactly at the target point");
+        assert_eq!(triangle[1], (4.0, 3.0));
+        assert_eq!(triangle[2], (4.0, -3.0));
+    }
+
+    #[test]
+    fn arrowhead_triangle_handles_coincident_points_without_panicking() {
+        let triangle = arrowhead_triangle((5.0, 5.0), (5.0, 5.0), 6.0);
+        assert_eq!(triangle, [(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)]);
+    }
+
+    // Real end-to-end proof that relationship lines route around box edges
+    // with a trailing arrowhead, not a straight center-to-center diagonal
+    // through both tables' contents -- calls the exact method `render` uses
+    // to build what it paints, the closest achievable proxy since individual
+    // painted path segments have no `debug_selector` to assert on directly.
+    #[gpui::test]
+    fn relationship_paths_route_around_box_edges_with_an_arrowhead_at_the_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (tables, relationships) = sample();
+        let view = cx
+            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        view.update(cx, |view, _, _| {
+            let paths = view.relationship_paths();
+            assert_eq!(paths.len(), 1, "expected exactly one relationship path");
+            let (waypoints, arrow) = &paths[0];
+
+            let from_box = view.table_box("orders").expect("orders should be placed");
+            let to_box = view.table_box("users").expect("users should be placed");
+            let from_center = (from_box.0 + from_box.2 / 2.0, from_box.1 + from_box.3 / 2.0);
+            let to_center = (to_box.0 + to_box.2 / 2.0, to_box.1 + to_box.3 / 2.0);
+            let expected_start = edge_anchor(from_box, to_center);
+            let expected_end = edge_anchor(to_box, from_center);
+
+            assert_eq!(
+                waypoints[0], expected_start,
+                "route must start at the source box's edge, not its center"
+            );
+            assert_eq!(
+                *waypoints.last().unwrap(),
+                expected_end,
+                "route must end at the target box's edge, not its center"
+            );
+            assert_eq!(
+                arrow[0],
+                *waypoints.last().unwrap(),
+                "arrowhead tip must sit exactly at the route's target anchor"
+            );
+        })
+        .expect("window should build");
     }
 
     #[test]
