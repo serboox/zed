@@ -10643,6 +10643,70 @@ mod tests {
         assert!(sql.contains("UPDATE users SET name = 'bob', val = 42 WHERE id = 2;"));
     }
 
+    #[test]
+    fn export_sql_multi_insert_uses_one_insert_with_all_value_tuples() {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), None],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let sql = ResultView::export_sql_multi_insert(&result, "users", '`');
+        assert_eq!(
+            sql,
+            "INSERT INTO `users` (`id`, `name`) VALUES\n  ('1', 'Alice'),\n  ('2', NULL);\n"
+        );
+    }
+
+    #[test]
+    fn export_xlsx_produces_a_valid_workbook_with_header_and_cell_values() {
+        use std::io::Read;
+
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Alice".to_string())],
+                vec![Some("2".to_string()), None],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let bytes = ResultView::export_xlsx(&result).expect("xlsx export should succeed");
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("output must be a valid zip");
+        let mut sheet_xml = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .expect("the worksheet part must exist in the workbook")
+            .read_to_string(&mut sheet_xml)
+            .expect("the worksheet part must be valid UTF-8 XML");
+
+        assert!(
+            sheet_xml.contains("<is><t>id</t></is>"),
+            "header row must include the id column: {sheet_xml}"
+        );
+        assert!(
+            sheet_xml.contains("<is><t>name</t></is>"),
+            "header row must include the name column: {sheet_xml}"
+        );
+        assert!(
+            sheet_xml.contains("<v>1</v>"),
+            "a numeric-looking cell must be written as a numeric xlsx cell: {sheet_xml}"
+        );
+        assert!(
+            sheet_xml.contains("<is><t>Alice</t></is>"),
+            "a text cell must carry its value: {sheet_xml}"
+        );
+        assert!(
+            sheet_xml.contains("<is><t></t></is>"),
+            "a NULL cell must be written as an empty inline string, not dropped: {sheet_xml}"
+        );
+    }
+
     fn export_fixture() -> QueryResult {
         QueryResult {
             columns: vec!["id".to_string(), "name".to_string()],
