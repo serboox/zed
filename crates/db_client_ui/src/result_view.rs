@@ -117,6 +117,8 @@ actions!(
         ToggleFindFilterRows,
         /// Toggles the transposed view (columns become rows, records become columns).
         ToggleTranspose,
+        /// Toggles heatmap tinting of numeric cells by their value's position in the column's range.
+        ToggleHeatmap,
         /// Resets column order, hidden columns, sort, filters, and transpose to defaults.
         ResetView,
         /// Opens the Export Data dialog (format, headers, DDL, transpose, destination).
@@ -444,6 +446,16 @@ fn column_values_look_numeric<'a>(values: impl Iterator<Item = Option<&'a str>>)
         }
     }
     saw_value
+}
+
+// Maps a value's position within [min, max] to 0.0-1.0 for heatmap tinting.
+// When the column has no spread (min == max), every cell gets the same neutral
+// mid-ramp tint rather than dividing by zero.
+fn heatmap_ratio(value: f64, min: f64, max: f64) -> f32 {
+    if max <= min {
+        return 0.5;
+    }
+    (((value - min) / (max - min)) as f32).clamp(0.0, 1.0)
 }
 
 // Decides whether a column looks boolean before real type metadata has loaded. A
@@ -888,6 +900,12 @@ pub struct ResultView {
     // When true, the grid is shown transposed: original columns become rows and
     // each record becomes a column.
     transposed: bool,
+    // When true, numeric cells paint a background tint scaled by their value's
+    // position in the column's min/max range (spreadsheet-style heatmap).
+    heatmap_enabled: bool,
+    // Per data-column (min, max) over every loaded row, for numeric columns only
+    // (None for non-numeric columns). Recomputed with layout, like numeric_columns.
+    heatmap_ranges: Vec<Option<(f64, f64)>>,
     // Data column indices in the user's chosen display order. Drives
     // `visible_columns` (which also drops hidden columns). Identity by default.
     column_order: Vec<usize>,
@@ -1126,6 +1144,8 @@ impl ResultView {
             find_filter_rows: false,
             value_editor_cell: None,
             transposed: false,
+            heatmap_enabled: false,
+            heatmap_ranges: Vec::new(),
             column_order: Vec::new(),
             history_search: String::new(),
             history_search_editor: None,
@@ -1284,6 +1304,7 @@ impl ResultView {
             self.col_widths.clear();
             self.column_edges.clear();
             self.numeric_columns.clear();
+            self.heatmap_ranges.clear();
             self.visible_columns.clear();
             self.filtered_display_order.clear();
             return;
@@ -1391,6 +1412,28 @@ impl ResultView {
                     .iter()
                     .map(move |row| row.get(data_col).and_then(|cell| cell.as_deref()));
                 column_is_numeric(data_type, values)
+            })
+            .collect();
+
+        // Min/max over every loaded row for numeric columns, driving the heatmap
+        // tint. Scanned in full (not just the width-sampling window above) so the
+        // range reflects every row the grid can paint, not just the first sample.
+        self.heatmap_ranges = (0..total_cols)
+            .map(|data_col| {
+                if !self.numeric_columns.get(data_col).copied().unwrap_or(false) {
+                    return None;
+                }
+                result.rows.iter().fold(None, |range: Option<(f64, f64)>, row| {
+                    let value = row
+                        .get(data_col)
+                        .and_then(|cell| cell.as_deref())
+                        .and_then(|text| text.parse::<f64>().ok());
+                    match (range, value) {
+                        (None, Some(v)) => Some((v, v)),
+                        (Some((lo, hi)), Some(v)) => Some((lo.min(v), hi.max(v))),
+                        (range, None) => range,
+                    }
+                })
             })
             .collect();
 
@@ -5229,6 +5272,8 @@ impl ResultView {
         let search_match_bg = cx.theme().colors().search_match_background;
         let active_line_bg = cx.theme().colors().editor_active_line_background;
         let row_selected_bg = cx.theme().colors().editor_highlighted_line_background;
+        let heatmap_base = cx.theme().colors().editor_background;
+        let heatmap_tint = cx.theme().colors().text_accent;
         let is_deleted = self.deleted_rows.contains(&abs_idx);
         let is_row_selected = self.selected_rows.contains(&abs_idx);
         let weak_this = cx.weak_entity();
@@ -5366,6 +5411,21 @@ impl ResultView {
             let is_current_find = is_find_match
                 && self.find_matches.get(self.find_current) == Some(&(abs_idx, cell_idx));
             let cell_display_idx = display_idx;
+            let heatmap_bg = self.heatmap_cell_bg(
+                cell_idx,
+                match self.pending_cell_value(abs_idx, cell_idx) {
+                    Some(CellValue::Text(text)) => Some(text.as_str()),
+                    Some(CellValue::Null) | Some(CellValue::Default) => None,
+                    None => self
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.rows.get(abs_idx))
+                        .and_then(|row| row.get(cell_idx))
+                        .and_then(|cell| cell.as_deref()),
+                },
+                heatmap_base,
+                heatmap_tint,
+            );
 
             let cell_div = div()
                 .id(ElementId::from(SharedString::from(format!(
@@ -5381,6 +5441,9 @@ impl ResultView {
                 .border_r_1()
                 .border_color(grid_border)
                 .overflow_hidden()
+                // Lowest priority: the heatmap tint is a base data indicator, so any
+                // higher-priority highlight below overwrites it by being applied later.
+                .when_some(heatmap_bg, move |this, bg| this.bg(bg))
                 // Priority (high→low): selection, find, row-selected, modified.
                 .when(
                     is_row_selected && !is_selected && !is_find_match,
@@ -5725,6 +5788,8 @@ impl ResultView {
             .editor_background
             .blend(cx.theme().colors().text_accent.opacity(0.14));
         let active_cell_border = cx.theme().colors().border_focused;
+        let heatmap_base = cx.theme().colors().editor_background;
+        let heatmap_tint = cx.theme().colors().text_accent;
         let column_count = self
             .result
             .as_ref()
@@ -5835,6 +5900,15 @@ impl ResultView {
                 )
             };
             let cell_display_idx = display_idx;
+            let heatmap_bg = self.heatmap_cell_bg(
+                cell_idx,
+                row.get(cell_idx).and_then(|value| match value {
+                    CellValue::Text(text) => Some(text.as_str()),
+                    CellValue::Null | CellValue::Default => None,
+                }),
+                heatmap_base,
+                heatmap_tint,
+            );
             cells.push(
                 div()
                     .id(ElementId::from(SharedString::from(format!(
@@ -5850,6 +5924,7 @@ impl ResultView {
                     .border_r_1()
                     .border_color(grid_border)
                     .overflow_hidden()
+                    .when_some(heatmap_bg, move |this, bg| this.bg(bg))
                     .when(
                         self.cell_receives_selection_tint(abs_idx, display_idx, cell_idx),
                         |this| this.bg(selection_bg),
@@ -5998,6 +6073,7 @@ impl ResultView {
         let history_open = self.history_open;
         let transposed = self.transposed;
         let chart_open = self.chart_open;
+        let heatmap_enabled = self.heatmap_enabled;
         let pinned = self.pinned;
         let limit_editor = self.limit_editor.clone();
         let copy_format = self.copy_format;
@@ -6302,6 +6378,7 @@ impl ResultView {
                                         .action_checked("Record View", Box::new(ToggleRecordView), record_view_open)
                                         .action_checked("Transpose", Box::new(ToggleTranspose), transposed)
                                         .action_checked("Show Chart", Box::new(ToggleChart), chart_open)
+                                        .action_checked("Heatmap", Box::new(ToggleHeatmap), heatmap_enabled)
                                         .action_checked("Column Info", Box::new(QuickDoc), quick_doc_open)
                                         .separator()
                                         .action_checked("Query History", Box::new(OpenQueryHistory), history_open)
@@ -7180,6 +7257,8 @@ impl ResultView {
         let grid_border = cx.theme().colors().border.opacity(0.46);
         let header_bg = cx.theme().colors().editor_subheader_background;
         let name_bg = cx.theme().colors().editor_gutter_background;
+        let heatmap_base = cx.theme().colors().editor_background;
+        let heatmap_tint = cx.theme().colors().text_accent;
 
         const MAX_RECORDS: usize = 500;
         let record_count = result.rows.len().min(MAX_RECORDS);
@@ -7265,6 +7344,20 @@ impl ResultView {
                                     .and_then(|cell| cell.as_deref()),
                             ),
                         };
+                        let heatmap_bg = self.heatmap_cell_bg(
+                            col_idx,
+                            match self.pending_cell_value(record_idx, col_idx) {
+                                Some(CellValue::Text(text)) => Some(text.as_str()),
+                                Some(CellValue::Null) | Some(CellValue::Default) => None,
+                                None => result
+                                    .rows
+                                    .get(record_idx)
+                                    .and_then(|row| row.get(col_idx))
+                                    .and_then(|cell| cell.as_deref()),
+                            },
+                            heatmap_base,
+                            heatmap_tint,
+                        );
                         div()
                             .flex_none()
                             .w(px(180.0))
@@ -7275,6 +7368,7 @@ impl ResultView {
                             .border_r_1()
                             .border_color(grid_border)
                             .overflow_hidden()
+                            .when_some(heatmap_bg, move |this, bg| this.bg(bg))
                             .debug_selector({
                                 let display = display.clone();
                                 move || format!("TCELL-{record_idx}-{col_idx}-{display}")
@@ -7460,6 +7554,7 @@ impl ResultView {
         self.local_filters.clear();
         self.local_filter_editors.clear();
         self.transposed = false;
+        self.heatmap_enabled = false;
         if let Some(result) = self.result.as_ref() {
             self.column_order = (0..result.columns.len()).collect();
         } else {
@@ -7472,6 +7567,33 @@ impl ResultView {
     fn toggle_transpose(&mut self, cx: &mut Context<Self>) {
         self.transposed = !self.transposed;
         cx.notify();
+    }
+
+    fn toggle_heatmap(&mut self, cx: &mut Context<Self>) {
+        self.heatmap_enabled = !self.heatmap_enabled;
+        cx.notify();
+    }
+
+    // The tint a heatmapped numeric cell should paint, or None when heatmap mode
+    // is off, the column has no known range, or the cell's own value doesn't
+    // parse as a number (e.g. NULL). Takes the base/tint colors already resolved
+    // from the theme by the caller so this stays callable from inside the nested
+    // per-row/per-column closures that build the grid, without threading `cx`
+    // (and its borrow-checker friction) through every closure layer.
+    fn heatmap_cell_bg(
+        &self,
+        col_idx: usize,
+        value: Option<&str>,
+        base: gpui::Hsla,
+        tint: gpui::Hsla,
+    ) -> Option<gpui::Hsla> {
+        if !self.heatmap_enabled {
+            return None;
+        }
+        let (min, max) = (*self.heatmap_ranges.get(col_idx)?)?;
+        let value: f64 = value?.parse().ok()?;
+        let ratio = heatmap_ratio(value, min, max);
+        Some(base.blend(tint.opacity(0.05 + ratio * 0.25)))
     }
 
     fn open_export_dialog(&mut self, cx: &mut Context<Self>) {
@@ -9818,6 +9940,9 @@ impl Render for ResultView {
             .on_action(cx.listener(|this, _: &ToggleTranspose, _window, cx| {
                 this.toggle_transpose(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleHeatmap, _window, cx| {
+                this.toggle_heatmap(cx);
+            }))
             .on_action(cx.listener(|this, _: &ResetView, window, cx| {
                 this.reset_view(cx);
                 if this.table_name.is_some() {
@@ -10823,6 +10948,20 @@ mod tests {
         assert_eq!(ResultView::first_numeric_column(&result), Some(0));
     }
 
+    #[test]
+    fn heatmap_ratio_maps_value_position_in_range() {
+        assert_eq!(heatmap_ratio(0.0, 0.0, 10.0), 0.0);
+        assert_eq!(heatmap_ratio(10.0, 0.0, 10.0), 1.0);
+        assert_eq!(heatmap_ratio(5.0, 0.0, 10.0), 0.5);
+        // A column with no spread (every value equal) must not divide by zero
+        // and must render every cell with the same neutral tint.
+        assert_eq!(heatmap_ratio(5.0, 5.0, 5.0), 0.5);
+        // Values outside [min, max] (shouldn't normally happen, since min/max are
+        // derived from the same data) still clamp instead of over/undershooting.
+        assert_eq!(heatmap_ratio(-5.0, 0.0, 10.0), 0.0);
+        assert_eq!(heatmap_ratio(15.0, 0.0, 10.0), 1.0);
+    }
+
     #[gpui::test]
     fn toggle_chart_opens_and_picks_numeric_column(cx: &mut gpui::TestAppContext) {
         // Drives the real ToggleChart action (the "Show Chart" view-menu entry
@@ -10847,6 +10986,55 @@ mod tests {
         cx.dispatch_action(ToggleChart);
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, _cx| assert!(!view.chart_open));
+    }
+
+    #[gpui::test]
+    fn toggle_heatmap_action_tints_numeric_cells_by_value(cx: &mut gpui::TestAppContext) {
+        // Drives the real ToggleHeatmap action (the "Heatmap" view-menu entry
+        // dispatches this same action) instead of flipping the field directly,
+        // proving the .on_action(ToggleHeatmap) wiring in render().
+        let (window, view, mut cx) = plain_result_window(cx, export_fixture());
+        let (base, tint) = view.update(&mut cx, |view, cx| {
+            let base = cx.theme().colors().editor_background;
+            let tint = cx.theme().colors().text_accent;
+            assert!(!view.heatmap_enabled);
+            // id column (0) ranges 1..=2 (export_fixture's two rows) once loaded.
+            assert_eq!(view.heatmap_ranges.get(0).copied().flatten(), Some((1.0, 2.0)));
+            // With heatmap mode off, the renderer's own decision function must
+            // never tint a cell, regardless of the column's range.
+            assert_eq!(view.heatmap_cell_bg(0, Some("1"), base, tint), None);
+            (base, tint)
+        });
+        let first_cell = debug_center(&mut cx, "CELL-0-0");
+        cx.simulate_click(first_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        cx.dispatch_action(ToggleHeatmap);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(
+                view.heatmap_enabled,
+                "a real ToggleHeatmap action dispatch must turn heatmap mode on"
+            );
+            let min_bg = view.heatmap_cell_bg(0, Some("1"), base, tint);
+            let max_bg = view.heatmap_cell_bg(0, Some("2"), base, tint);
+            assert_ne!(
+                min_bg, max_bg,
+                "the low and high end of a column's range must get visibly different tints"
+            );
+            assert!(min_bg.is_some() && max_bg.is_some());
+            // A non-numeric column (name, index 1) must never be tinted.
+            assert_eq!(view.heatmap_cell_bg(1, Some("Alice"), base, tint), None);
+            // A NULL cell in a numeric column must never be tinted either.
+            assert_eq!(view.heatmap_cell_bg(0, None, base, tint), None);
+        });
+
+        cx.dispatch_action(ToggleHeatmap);
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert!(!view.heatmap_enabled);
+            assert_eq!(view.heatmap_cell_bg(0, Some("1"), base, tint), None);
+        });
     }
 
     #[gpui::test]
