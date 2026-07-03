@@ -20,6 +20,7 @@ mod sql_binder;
 mod sql_completion_provider;
 mod sql_validator;
 mod store;
+mod table_copy;
 mod widgets;
 
 pub use panel::{

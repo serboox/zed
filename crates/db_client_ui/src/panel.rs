@@ -4353,6 +4353,153 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    /// Opens a picker over every OTHER connection as the copy target. Reuses
+    /// `ComparePickerView`'s generic label-list-plus-callback picker (built
+    /// for choosing a second table to diff) since choosing a second
+    /// connection to copy into is the same shape of UI.
+    fn open_copy_table_picker(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let candidates: Vec<String> = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .filter(|connection| connection.config.id != id)
+            .map(|connection| connection.config.label.clone())
+            .collect();
+        let weak = cx.entity().downgrade();
+        let title = table.clone();
+        let on_pick: ComparePickCallback = Arc::new(move |target_label, window, cx| {
+            weak.update(cx, |panel, cx| {
+                panel.start_table_copy(
+                    id,
+                    database.clone(),
+                    table.clone(),
+                    target_label,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_window, cx| {
+                    ComparePickerView::new(title, candidates, on_pick, cx)
+                });
+            })
+            .log_err();
+    }
+
+    /// Copies every row of `source_table` into a same-named table on the
+    /// connection labeled `target_label`, creating it first (type-mapped from
+    /// the source driver) unless a compatible table already exists there.
+    fn start_table_copy(
+        &mut self,
+        source_id: ConnectionId,
+        source_database: String,
+        source_table: String,
+        target_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store_ref = self.store.read(cx);
+        let Some(source) = store_ref
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == source_id)
+        else {
+            return;
+        };
+        let Some(source_provider) = source.provider.clone() else {
+            return;
+        };
+        let source_driver = source.config.driver;
+        let Some(target) = store_ref
+            .connections()
+            .iter()
+            .find(|connection| connection.config.label == target_label)
+        else {
+            return;
+        };
+        let Some(target_provider) = target.provider.clone() else {
+            return;
+        };
+        let target_driver = target.config.driver;
+        let target_database = target.config.database.clone().unwrap_or_default();
+
+        let task_id = self.export.next_id;
+        self.export.next_id += 1;
+        self.export.tasks.push(DumpTask {
+            id: task_id,
+            label: format!("Copy Table: {source_table} → {target_label}").into(),
+            status: DumpStatus::Running,
+        });
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_for_task = cancelled.clone();
+        let source_table_for_task = source_table;
+        let handle = cx.spawn_in(window, async move |panel, cx| {
+            let cancelled = cancelled_for_task;
+            let source_columns = source_provider
+                .describe_table(&source_database, &source_table_for_task)
+                .await
+                .unwrap_or_default();
+            let existing_target_columns = target_provider
+                .describe_table(&target_database, &source_table_for_task)
+                .await
+                .ok()
+                .filter(|columns| !columns.is_empty());
+            let copy = cx.update(|_window, cx| {
+                crate::table_copy::spawn_table_copy(
+                    source_provider,
+                    source_database,
+                    source_table_for_task.clone(),
+                    source_driver,
+                    source_columns,
+                    target_provider,
+                    target_database,
+                    source_table_for_task,
+                    target_driver,
+                    existing_target_columns,
+                    cancelled.clone(),
+                    cx,
+                )
+            });
+            let Ok(copy) = copy else { return };
+            let result = copy.await;
+            panel
+                .update(cx, |panel, cx| {
+                    if let Some(task) = panel
+                        .export
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.id == task_id)
+                    {
+                        task.status = match result {
+                            Ok(rows) => DumpStatus::Done {
+                                output_path: format!("{rows} row(s) copied"),
+                            },
+                            Err(message) => DumpStatus::Failed { message },
+                        };
+                    }
+                    panel
+                        .export
+                        .runners
+                        .retain(|(running_id, ..)| *running_id != task_id);
+                    cx.notify();
+                })
+                .ok();
+        });
+        self.export.runners.push((task_id, handle, cancelled));
+        cx.notify();
+    }
+
     fn render_export_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self
             .export
@@ -6411,6 +6558,22 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
                                                                 panel.open_schema_compare_picker(
+                                                                    id,
+                                                                    db.clone(),
+                                                                    tbl.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    })
+                                                    .entry("Copy Table to…", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_copy_table_picker(
                                                                     id,
                                                                     db.clone(),
                                                                     tbl.clone(),
