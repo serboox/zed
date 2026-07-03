@@ -9,8 +9,8 @@ use crate::connection::{ConnectionConfig, SslMode};
 use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
-    ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult, TableInfo,
-    TableKind, TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
+    ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
 pub struct PostgresProvider {
@@ -311,6 +311,66 @@ impl DbProvider for PostgresProvider {
                 unique,
                 index_type,
             })
+            .collect())
+    }
+
+    async fn list_foreign_keys(&self, database: &str, table: &str) -> Result<Vec<FkInfo>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String)>(
+            "-- name: ListForeignKeys :many
+             SELECT tc.constraint_name, kcu.column_name, ccu.table_name, ccu.column_name
+             FROM information_schema.table_constraints tc
+             JOIN information_schema.key_column_usage kcu
+               ON kcu.constraint_schema = tc.constraint_schema
+              AND kcu.constraint_name = tc.constraint_name
+             JOIN information_schema.constraint_column_usage ccu
+               ON ccu.constraint_schema = tc.constraint_schema
+              AND ccu.constraint_name = tc.constraint_name
+             WHERE tc.constraint_type = 'FOREIGN KEY'
+               AND tc.table_schema = $1 AND tc.table_name = $2
+             ORDER BY tc.constraint_name, kcu.ordinal_position",
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list foreign keys")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, from_column, to_table, to_column)| FkInfo {
+                name,
+                from_column,
+                to_table,
+                to_column,
+            })
+            .collect())
+    }
+
+    async fn list_check_constraints(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<CheckConstraintInfo>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "-- name: ListCheckConstraints :many
+             SELECT tc.constraint_name, cc.check_clause
+             FROM information_schema.table_constraints tc
+             JOIN information_schema.check_constraints cc
+               ON cc.constraint_schema = tc.constraint_schema
+              AND cc.constraint_name = tc.constraint_name
+             WHERE tc.constraint_type = 'CHECK'
+               AND tc.table_schema = $1 AND tc.table_name = $2
+             ORDER BY tc.constraint_name",
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list check constraints")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, expression)| CheckConstraintInfo { name, expression })
             .collect())
     }
 

@@ -44,6 +44,12 @@ pub struct IndexInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckConstraintInfo {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcedureInfo {
     pub name: String,
     pub kind: ProcedureKind,

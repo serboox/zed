@@ -16,8 +16,8 @@ pub use connection::{
 pub use provider::DbProvider;
 pub use runtime::{RuntimeProvider, on_runtime};
 pub use schema::{
-    ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult,
-    TableInfo, TableKind, TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
+    ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 pub use ssh_tunnel::{SshAuth, SshTunnel};
 

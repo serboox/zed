@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::schema::{
-    ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, QueryResult, TableInfo,
-    TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, QueryResult,
+    TableInfo, TriggerInfo, UserInfo,
 };
 
 #[async_trait]
@@ -28,6 +28,14 @@ pub trait DbProvider: Send + Sync {
     }
 
     async fn list_foreign_keys(&self, _database: &str, _table: &str) -> Result<Vec<FkInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_check_constraints(
+        &self,
+        _database: &str,
+        _table: &str,
+    ) -> Result<Vec<CheckConstraintInfo>> {
         Ok(Vec::new())
     }
 

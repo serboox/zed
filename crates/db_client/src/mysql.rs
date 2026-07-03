@@ -11,8 +11,8 @@ use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
 use crate::schema::{
-    ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult,
-    TableInfo, TableKind, TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
+    ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
 pub struct MySqlProvider {
@@ -238,6 +238,36 @@ impl DbProvider for MySqlProvider {
                 from_column: bytes_to_string(from_col),
                 to_table: bytes_to_string(to_table),
                 to_column: bytes_to_string(to_col),
+            })
+            .collect())
+    }
+
+    async fn list_check_constraints(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<CheckConstraintInfo>> {
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+            "-- name: ListCheckConstraints :many
+             SELECT cc.CONSTRAINT_NAME, cc.CHECK_CLAUSE
+             FROM information_schema.CHECK_CONSTRAINTS cc
+             JOIN information_schema.TABLE_CONSTRAINTS tc
+               ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA
+              AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
+             WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? AND tc.CONSTRAINT_TYPE = 'CHECK'
+             ORDER BY cc.CONSTRAINT_NAME",
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list check constraints")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, expression)| CheckConstraintInfo {
+                name: bytes_to_string(name),
+                expression: bytes_to_string(expression),
             })
             .collect())
     }

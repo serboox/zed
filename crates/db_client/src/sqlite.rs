@@ -10,7 +10,8 @@ use crate::connection::ConnectionConfig;
 use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
-    ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind, TriggerInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
+    TriggerInfo,
 };
 
 pub struct SqliteProvider {
@@ -156,6 +157,31 @@ impl DbProvider for SqliteProvider {
             });
         }
         Ok(indexes)
+    }
+
+    // SQLite exposes no system view for CHECK constraints, so this scans the
+    // table's own stored CREATE TABLE text for `CHECK (...)` clauses. It is a
+    // best-effort text scan, not a SQL parser: it can be fooled by a `CHECK`
+    // substring appearing inside a string literal or comment. Good enough for
+    // a first version; a real parser would be needed for full correctness.
+    async fn list_check_constraints(
+        &self,
+        _database: &str,
+        table: &str,
+    ) -> Result<Vec<CheckConstraintInfo>> {
+        let row = sqlx::query_as::<_, (Option<String>,)>(
+            "-- name: GetTableDDLForCheckConstraints :one
+             SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query sqlite_master for check constraints")?;
+
+        match row {
+            Some((Some(ddl),)) => Ok(extract_check_constraints(&ddl)),
+            _ => Ok(Vec::new()),
+        }
     }
 
     async fn list_triggers(&self, _database: &str, table: &str) -> Result<Vec<TriggerInfo>> {
@@ -305,6 +331,81 @@ impl DbProvider for SqliteProvider {
     }
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (offset, &b) in bytes[open..].iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// Looks for `CONSTRAINT <name>` immediately before a `CHECK` keyword, so an
+// explicitly named constraint keeps its name instead of getting a synthetic
+// one.
+fn explicit_constraint_name(sql: &str, check_keyword_start: usize) -> Option<String> {
+    let prefix = sql[..check_keyword_start].trim_end();
+    let name_start = prefix.rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+    let name = &prefix[name_start..];
+    if name.is_empty() {
+        return None;
+    }
+    let before_name = prefix[..name_start].trim_end();
+    if before_name.to_uppercase().ends_with("CONSTRAINT") {
+        Some(name.trim_matches(|c| c == '"' || c == '`' || c == '\'').to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_check_constraints(create_table_sql: &str) -> Vec<CheckConstraintInfo> {
+    let bytes = create_table_sql.as_bytes();
+    let upper = create_table_sql.to_uppercase();
+    let mut constraints = Vec::new();
+    let mut search_start = 0;
+    let mut anon_index = 1;
+    while let Some(rel_pos) = upper[search_start..].find("CHECK") {
+        let keyword_start = search_start + rel_pos;
+        let keyword_end = keyword_start + "CHECK".len();
+        let word_boundary_before =
+            keyword_start == 0 || !is_ident_byte(bytes[keyword_start - 1]);
+        let word_boundary_after =
+            keyword_end >= bytes.len() || !is_ident_byte(bytes[keyword_end]);
+        let mut cursor = keyword_end;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if word_boundary_before && word_boundary_after && bytes.get(cursor) == Some(&b'(') {
+            if let Some(close) = matching_paren(bytes, cursor) {
+                let expression = create_table_sql[cursor + 1..close].trim().to_string();
+                let name = explicit_constraint_name(create_table_sql, keyword_start)
+                    .unwrap_or_else(|| {
+                        let generated = format!("check_{anon_index}");
+                        anon_index += 1;
+                        generated
+                    });
+                constraints.push(CheckConstraintInfo { name, expression });
+                search_start = close + 1;
+                continue;
+            }
+        }
+        search_start = keyword_end;
+    }
+    constraints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +448,49 @@ mod tests {
             result.rows[0][1], None,
             "a NULL INTEGER column must decode to None, not Some(\"0\")"
         );
+    }
+
+    #[test]
+    fn extract_check_constraints_finds_an_unnamed_check() {
+        let ddl = "CREATE TABLE t (age INTEGER, CHECK (age >= 0))";
+        let checks = extract_check_constraints(ddl);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "check_1");
+        assert_eq!(checks[0].expression, "age >= 0");
+    }
+
+    #[test]
+    fn extract_check_constraints_uses_the_explicit_constraint_name() {
+        let ddl = "CREATE TABLE t (age INTEGER, CONSTRAINT age_non_negative CHECK (age >= 0))";
+        let checks = extract_check_constraints(ddl);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "age_non_negative");
+        assert_eq!(checks[0].expression, "age >= 0");
+    }
+
+    #[test]
+    fn extract_check_constraints_handles_nested_parens_and_multiple_checks() {
+        let ddl = "CREATE TABLE t (\
+            age INTEGER CHECK (age BETWEEN 0 AND (100 + 1)), \
+            status TEXT CONSTRAINT status_valid CHECK (status IN ('a', 'b'))\
+        )";
+        let checks = extract_check_constraints(ddl);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "check_1");
+        assert_eq!(checks[0].expression, "age BETWEEN 0 AND (100 + 1)");
+        assert_eq!(checks[1].name, "status_valid");
+        assert_eq!(checks[1].expression, "status IN ('a', 'b')");
+    }
+
+    #[test]
+    fn extract_check_constraints_ignores_a_column_named_check_like() {
+        let ddl = "CREATE TABLE t (checksum TEXT, id INTEGER)";
+        assert!(extract_check_constraints(ddl).is_empty());
+    }
+
+    #[test]
+    fn extract_check_constraints_returns_empty_for_a_table_without_checks() {
+        let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        assert!(extract_check_constraints(ddl).is_empty());
     }
 }
