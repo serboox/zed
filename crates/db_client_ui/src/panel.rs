@@ -4322,7 +4322,14 @@ impl DatabasePanel {
             };
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let view = cx.new(|cx| ExplainPlanView::new(roots, window, cx));
+                    let context = crate::explain_plan::ExplainQueryContext {
+                        store,
+                        connection_id: id,
+                        database,
+                        driver,
+                        sql,
+                    };
+                    let view = cx.new(|cx| ExplainPlanView::new(roots, Some(context), window, cx));
                     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
                 })
                 .log_err();

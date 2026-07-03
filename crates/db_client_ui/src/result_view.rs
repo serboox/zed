@@ -2211,7 +2211,29 @@ impl ResultView {
             SpecialResult::ExplainPlan => {
                 let plan_text = crate::explain_plan::plan_text_from_result(&result);
                 let roots = crate::explain_plan::parse_plan_tree(&plan_text);
-                let view = cx.new(|cx| crate::explain_plan::ExplainPlanView::new(roots, window, cx));
+                let query_context = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.upgrade())
+                    .zip(self.connection_id)
+                    .map(|(store, connection_id)| {
+                        let driver = store
+                            .read(cx)
+                            .connections()
+                            .iter()
+                            .find(|c| c.config.id == connection_id)
+                            .map(|c| c.config.driver)
+                            .unwrap_or(DatabaseDriver::MySQL);
+                        crate::explain_plan::ExplainQueryContext {
+                            store,
+                            connection_id,
+                            database: self.database.clone().unwrap_or_default(),
+                            driver,
+                            sql: self.base_sql.clone().unwrap_or_default(),
+                        }
+                    });
+                let view =
+                    cx.new(|cx| crate::explain_plan::ExplainPlanView::new(roots, query_context, window, cx));
                 self.explain_view = Some(view);
                 self.ddl_view = None;
             }
