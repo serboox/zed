@@ -1,3 +1,4 @@
+use crate::db_migration::ConnectionSecrets;
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use db_client::{
@@ -971,24 +972,35 @@ impl DatabaseStore {
         .detach();
     }
 
-    /// Reads every connection's password from the keychain, for an export
-    /// bundle. Connections with no stored password are skipped.
-    pub fn read_all_passwords(
+    /// Reads every connection's DB password and SSH tunnel password from the
+    /// keychain, for an export bundle. A connection with neither secret set is
+    /// skipped entirely.
+    pub fn read_all_secrets(
         &self,
         cx: &mut Context<Self>,
-    ) -> Task<Result<BTreeMap<ConnectionId, String>>> {
+    ) -> Task<Result<BTreeMap<ConnectionId, ConnectionSecrets>>> {
         let ids: Vec<ConnectionId> = self.connections.iter().map(|c| c.config.id).collect();
         cx.spawn(async move |_this, cx| {
             let provider = cx.update(|cx| zed_credentials_provider::global(cx));
-            let mut passwords = BTreeMap::new();
+            let mut secrets = BTreeMap::new();
             for id in ids {
-                if let Some(password) = read_connection_password(&provider, id, cx).await? {
-                    if !password.is_empty() {
-                        passwords.insert(id, password);
-                    }
+                let password = read_connection_password(&provider, id, cx)
+                    .await?
+                    .unwrap_or_default();
+                let ssh_password = read_connection_ssh_password(&provider, id, cx)
+                    .await?
+                    .unwrap_or_default();
+                if !password.is_empty() || !ssh_password.is_empty() {
+                    secrets.insert(
+                        id,
+                        ConnectionSecrets {
+                            password,
+                            ssh_password,
+                        },
+                    );
                 }
             }
-            Ok(passwords)
+            Ok(secrets)
         })
     }
 
@@ -1020,30 +1032,52 @@ impl DatabaseStore {
         self.persist_connections(cx);
     }
 
-    /// Writes decrypted passwords back to the keychain and into the in-memory
-    /// configs, so an imported connection can connect without a reload. Unknown
-    /// connection ids are ignored.
-    pub fn restore_passwords(
+    /// Writes decrypted DB and SSH tunnel passwords back to the keychain and
+    /// into the in-memory configs, so an imported connection can connect (and
+    /// tunnel) without a reload. Unknown connection ids are ignored.
+    pub fn restore_secrets(
         &mut self,
-        passwords: BTreeMap<ConnectionId, String>,
+        secrets: BTreeMap<ConnectionId, ConnectionSecrets>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let mut entries = Vec::new();
-        for (id, password) in passwords {
+        let mut db_entries = Vec::new();
+        let mut ssh_entries = Vec::new();
+        for (id, secrets) in secrets {
             if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) {
-                conn.config.password = password.clone();
-                entries.push((id, conn.config.username.clone(), password));
+                if !secrets.password.is_empty() {
+                    conn.config.password = secrets.password.clone();
+                    db_entries.push((id, conn.config.username.clone(), secrets.password));
+                }
+                if !secrets.ssh_password.is_empty() {
+                    conn.config.ssh_password = secrets.ssh_password.clone();
+                    ssh_entries.push((
+                        id,
+                        conn.config.ssh_username.clone().unwrap_or_default(),
+                        secrets.ssh_password,
+                    ));
+                }
             }
         }
         cx.notify();
         cx.spawn(async move |_this, cx| {
             let provider = cx.update(|cx| zed_credentials_provider::global(cx));
-            for (id, username, password) in entries {
+            for (id, username, password) in db_entries {
                 provider
                     .write_credentials(
                         &connection_credentials_url(id),
                         &username,
                         password.as_bytes(),
+                        cx,
+                    )
+                    .await
+                    .log_err();
+            }
+            for (id, username, ssh_password) in ssh_entries {
+                provider
+                    .write_credentials(
+                        &ssh_connection_credentials_url(id),
+                        &username,
+                        ssh_password.as_bytes(),
                         cx,
                     )
                     .await

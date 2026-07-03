@@ -4846,7 +4846,7 @@ impl DatabasePanel {
             .iter()
             .map(|config| (config.id, connection_query_path(config.id, &config.label)))
             .collect();
-        let passwords_task = store.update(cx, |store, cx| store.read_all_passwords(cx));
+        let secrets_task = store.update(cx, |store, cx| store.read_all_secrets(cx));
         let workspace = self.workspace.clone();
         let path_rx =
             cx.prompt_for_new_path(paths::home_dir(), Some("database-explorer.zdbexport.json"));
@@ -4877,9 +4877,9 @@ impl DatabasePanel {
                         .collect::<Vec<_>>()
                 })
                 .await;
-            let passwords = passwords_task.await.unwrap_or_default();
+            let secrets_map = secrets_task.await.unwrap_or_default();
 
-            if passwords.is_empty() {
+            if secrets_map.is_empty() {
                 workspace
                     .update_in(cx, |_workspace, _window, cx| {
                         write_export_bundle(path, folders, connections, consoles, None, cx);
@@ -4892,7 +4892,7 @@ impl DatabasePanel {
                 .update_in(cx, |workspace, window, cx| {
                     let on_result: MasterPasswordCallback = Arc::new(move |password, _window, cx| {
                         let secrets = password
-                            .and_then(|master| encrypt_secrets(&passwords, &master).log_err());
+                            .and_then(|master| encrypt_secrets(&secrets_map, &master).log_err());
                         write_export_bundle(
                             path.clone(),
                             folders.clone(),
@@ -5014,9 +5014,9 @@ impl DatabasePanel {
                             return;
                         };
                         match decrypt_secrets(&secrets, &master) {
-                            Ok(passwords) => {
+                            Ok(secrets) => {
                                 store_for_modal
-                                    .update(cx, |store, cx| store.restore_passwords(passwords, cx))
+                                    .update(cx, |store, cx| store.restore_secrets(secrets, cx))
                                     .detach();
                             }
                             Err(_) => show_db_toast(

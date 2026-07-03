@@ -49,6 +49,17 @@ pub struct EncryptedSecrets {
     pub mac: String,
 }
 
+/// Both secrets a connection may hold: its own DB password and, independently,
+/// its SSH tunnel password. Empty string means "not set", matching how
+/// `ConnectionConfig` itself represents an absent password.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConnectionSecrets {
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub ssh_password: String,
+}
+
 /// The whole Database Explorer state in one portable file: the folder tree, all
 /// connection settings (passwords redacted here — they live in `secrets`), the
 /// SQL console files, and optionally the encrypted passwords.
@@ -81,10 +92,10 @@ fn mac_tag(mac_key: &[u8], salt: &[u8], iterations: u32, iv: &[u8], ciphertext: 
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-/// Encrypts the connection-password map under `master_password`. The map is
+/// Encrypts the per-connection secrets map under `master_password`. The map is
 /// serialized to JSON, padded, AES-256-CBC encrypted, then MAC'd.
 pub fn encrypt_secrets(
-    passwords: &BTreeMap<ConnectionId, String>,
+    connection_secrets: &BTreeMap<ConnectionId, ConnectionSecrets>,
     master_password: &str,
 ) -> Result<EncryptedSecrets> {
     let mut salt = [0u8; SALT_LEN];
@@ -95,7 +106,7 @@ pub fn encrypt_secrets(
     let mut material = derive_key_material(master_password, &salt, PBKDF2_ITERATIONS);
     let (enc_key, mac_key) = material.split_at(32);
 
-    let mut plaintext = serde_json::to_vec(passwords).context("serializing passwords")?;
+    let mut plaintext = serde_json::to_vec(connection_secrets).context("serializing secrets")?;
     let ciphertext = Aes256CbcEnc::new_from_slices(enc_key, &iv)
         .map_err(|_| anyhow!("invalid key/iv length"))?
         .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
@@ -113,12 +124,13 @@ pub fn encrypt_secrets(
     })
 }
 
-/// Decrypts the password map. Returns an error (never garbage) when the master
-/// password is wrong or the data was tampered with — the HMAC check fails first.
+/// Decrypts the per-connection secrets map. Returns an error (never garbage)
+/// when the master password is wrong or the data was tampered with — the HMAC
+/// check fails first.
 pub fn decrypt_secrets(
     secrets: &EncryptedSecrets,
     master_password: &str,
-) -> Result<BTreeMap<ConnectionId, String>> {
+) -> Result<BTreeMap<ConnectionId, ConnectionSecrets>> {
     let salt = BASE64.decode(&secrets.kdf_salt).context("decoding salt")?;
     let iv = BASE64.decode(&secrets.iv).context("decoding IV")?;
     let ciphertext = BASE64
@@ -147,9 +159,9 @@ pub fn decrypt_secrets(
         .map_err(|_| anyhow!("invalid master password or corrupted export"))?;
     material.zeroize();
 
-    let passwords =
-        serde_json::from_slice(&plaintext).context("deserializing decrypted passwords")?;
-    Ok(passwords)
+    let secrets =
+        serde_json::from_slice(&plaintext).context("deserializing decrypted secrets")?;
+    Ok(secrets)
 }
 
 #[cfg(test)]
@@ -157,10 +169,22 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    fn sample_map() -> BTreeMap<ConnectionId, String> {
+    fn sample_map() -> BTreeMap<ConnectionId, ConnectionSecrets> {
         let mut map = BTreeMap::new();
-        map.insert(Uuid::new_v4(), "p@ss w0rd:1".to_string());
-        map.insert(Uuid::new_v4(), "second-secret".to_string());
+        map.insert(
+            Uuid::new_v4(),
+            ConnectionSecrets {
+                password: "p@ss w0rd:1".to_string(),
+                ssh_password: String::new(),
+            },
+        );
+        map.insert(
+            Uuid::new_v4(),
+            ConnectionSecrets {
+                password: "second-secret".to_string(),
+                ssh_password: "tunnel-secret".to_string(),
+            },
+        );
         map
     }
 
@@ -170,6 +194,18 @@ mod tests {
         let encrypted = encrypt_secrets(&map, "master").unwrap();
         let decrypted = decrypt_secrets(&encrypted, "master").unwrap();
         assert_eq!(map, decrypted);
+    }
+
+    #[test]
+    fn secrets_round_trip_preserves_the_ssh_password_independently_of_the_db_password() {
+        let map = sample_map();
+        let encrypted = encrypt_secrets(&map, "master").unwrap();
+        let decrypted = decrypt_secrets(&encrypted, "master").unwrap();
+        for (id, secrets) in &map {
+            let restored = &decrypted[id];
+            assert_eq!(restored.password, secrets.password);
+            assert_eq!(restored.ssh_password, secrets.ssh_password);
+        }
     }
 
     #[test]
