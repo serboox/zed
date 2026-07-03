@@ -19,7 +19,9 @@ use crate::native_dump::{
 };
 use crate::result_view::ResultView;
 use crate::sql_completion_provider::install_on_editor;
-use crate::store::{ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent};
+use crate::store::{
+    ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RunConfiguration,
+};
 use collections::{HashMap, HashSet};
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
@@ -2332,6 +2334,270 @@ pub fn format_current_sql_query(
     });
 }
 
+/// Streams the current console statement's full result straight to a CSV
+/// file, bypassing the results grid entirely -- unlike `run_current_sql_query`,
+/// the row count here is not capped by `MAX_RESULT_ROWS`. Only the single
+/// statement at the cursor (or the current selection) runs; named parameters
+/// are not supported yet (the params-prompt flow `run_sql_from_editor` uses
+/// is UI-heavy and out of scope for a first version -- a parameterized
+/// statement is reported as an error instead of silently running unsubstituted).
+pub fn execute_current_sql_query_to_file(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
+        cx.propagate();
+        return;
+    };
+    let store = panel.read(cx).store.clone();
+    let active_item = workspace.active_item(cx);
+    let editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
+    let Some(editor) = editor else {
+        cx.propagate();
+        return;
+    };
+    let Some(bound_connection_id) = console_connection_for_editor(&editor, &store, cx) else {
+        cx.propagate();
+        return;
+    };
+
+    let sql = editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let start = selection.start.to_offset(&snapshot).0;
+        let end = selection.end.to_offset(&snapshot).0;
+        let full = editor.text(cx);
+        if start != end {
+            let (lo, hi) = (start.min(end), start.max(end));
+            full.get(lo..hi).map(str::to_string)
+        } else {
+            let cursor = selection.head().to_offset(&snapshot).0;
+            statement_range_at_cursor(&full, cursor).map(|range| full[range].to_string())
+        }
+    });
+    let Some(sql) = sql else { return };
+    let sql = sql.trim().trim_end_matches(';').trim().to_string();
+    if sql.is_empty() {
+        return;
+    }
+    if !extract_query_parameters(&sql).is_empty() {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::named("db-execute-to-file-params".into()),
+                "Execute to File does not support named parameters yet -- run the query \
+                 normally first to substitute them, or remove the placeholders.",
+            ),
+            cx,
+        );
+        return;
+    }
+
+    let connection = {
+        let store_ref = store.read(cx);
+        store_ref
+            .connections()
+            .iter()
+            .find(|c| c.config.id == bound_connection_id)
+            .or_else(|| store_ref.active_connection())
+            .and_then(|c| {
+                c.provider.clone().map(|provider| {
+                    (
+                        c.config.database.clone().unwrap_or_default(),
+                        c.config.label.clone(),
+                        provider,
+                    )
+                })
+            })
+    };
+    let Some((db_name, conn_label, provider)) = connection else {
+        return;
+    };
+
+    let home = paths::home_dir().to_path_buf();
+    let default_format = crate::execute_to_file::ExecuteToFileFormat::Csv;
+    let path_rx = cx.prompt_for_new_path(&home, Some(default_format.default_file_name()));
+    cx.spawn_in(window, async move |workspace, cx| {
+        let Some(output_path) = path_rx.await.log_err().and_then(|r| r.log_err()).flatten() else {
+            return;
+        };
+        let format = crate::execute_to_file::ExecuteToFileFormat::for_path(&output_path);
+        workspace
+            .update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.panel::<DatabasePanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.start_export_to_file(
+                            format!("Execute to File: {conn_label}").into(),
+                            provider,
+                            db_name,
+                            sql,
+                            output_path,
+                            format,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .ok();
+    })
+    .detach();
+}
+
+/// Returns the active editor's on-disk absolute path, if it has one (a saved
+/// `.sql` file, not a scratch/unsaved buffer).
+fn active_editor_file_path(
+    editor: &Entity<Editor>,
+    cx: &App,
+) -> Option<std::path::PathBuf> {
+    let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+    let abs_path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
+    Some(abs_path)
+}
+
+/// Saves the active SQL file's currently active connection (and database) as
+/// its run configuration, so `run_sql_file` can later target the same data
+/// source with one action regardless of what connection happens to be active
+/// at that later time.
+pub fn save_run_configuration(
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
+        cx.propagate();
+        return;
+    };
+    let store = panel.read(cx).store.clone();
+    let active_item = workspace.active_item(cx);
+    let Some(editor) = active_item.and_then(|item| item.act_as::<Editor>(cx)) else {
+        cx.propagate();
+        return;
+    };
+    let Some(file_path) = active_editor_file_path(&editor, cx) else {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::named("db-run-config-no-file".into()),
+                "Save this file before setting a run configuration for it.".to_string(),
+            ),
+            cx,
+        );
+        return;
+    };
+
+    let resolved = {
+        let store_ref = store.read(cx);
+        let connection_id = console_connection_for_editor(&editor, &store, cx)
+            .or_else(|| store_ref.active_connection().map(|c| c.config.id));
+        connection_id.and_then(|id| {
+            store_ref
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .map(|c| (id, c.config.label.clone(), c.config.database.clone()))
+        })
+    };
+    let Some((connection_id, label, database)) = resolved else {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::named("db-run-config-no-connection".into()),
+                "Open a console for a connection (or make one active) before saving a run configuration."
+                    .to_string(),
+            ),
+            cx,
+        );
+        return;
+    };
+
+    let name = file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("SQL file")
+        .to_string();
+    store.update(cx, |store, cx| {
+        store.set_run_configuration(
+            RunConfiguration {
+                id: uuid::Uuid::new_v4(),
+                name,
+                file_path,
+                connection_id,
+                database,
+            },
+            cx,
+        );
+    });
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::named("db-run-config-saved".into()),
+            format!("Run configuration saved: always runs against \"{label}\"."),
+        ),
+        cx,
+    );
+}
+
+/// Runs the active SQL file against its saved run configuration, ignoring
+/// whichever connection is currently active in the panel. Fails gracefully
+/// (a toast, not a panic) when the file has no saved configuration or when
+/// the configuration's connection no longer exists.
+pub fn run_sql_file(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
+        cx.propagate();
+        return;
+    };
+    let store = panel.read(cx).store.clone();
+    let active_item = workspace.active_item(cx);
+    let Some(editor) = active_item.and_then(|item| item.act_as::<Editor>(cx)) else {
+        cx.propagate();
+        return;
+    };
+    let Some(file_path) = active_editor_file_path(&editor, cx) else {
+        cx.propagate();
+        return;
+    };
+
+    let config = store
+        .read(cx)
+        .run_configuration_for_path(&file_path)
+        .cloned();
+    let Some(config) = config else {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::named("db-run-config-missing".into()),
+                "No run configuration saved for this file yet — use Save Run Configuration first."
+                    .to_string(),
+            ),
+            cx,
+        );
+        return;
+    };
+
+    let connection_exists = store
+        .read(cx)
+        .connections()
+        .iter()
+        .any(|c| c.config.id == config.connection_id);
+    if !connection_exists {
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::named("db-run-config-stale".into()),
+                "This run configuration's connection no longer exists. Save a new one for this file."
+                    .to_string(),
+            ),
+            cx,
+        );
+        return;
+    }
+
+    store.update(cx, |store, cx| {
+        if let Some(database) = config.database.clone() {
+            store.set_connection_database(config.connection_id, database, cx);
+        }
+    });
+    editor.update(cx, |editor, _cx| {
+        editor.register_addon(DbQueryEditorAddon::new(config.connection_id));
+    });
+    run_current_sql_query(workspace, window, cx);
+}
+
 pub fn explain_current_sql_query(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -2656,6 +2922,7 @@ pub struct DatabasePanel {
     table_filter_is_regex: bool,
     selected_tree_node: Option<SelectedTreeNode>,
     dump: DumpUiState,
+    export: ExportUiState,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     tree_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -2669,6 +2936,19 @@ pub struct DatabasePanel {
 struct DumpUiState {
     tasks: Vec<DumpTask>,
     runners: Vec<(usize, Task<()>)>,
+    next_id: usize,
+}
+
+/// Background execute-to-file state, mirroring `DumpUiState` (same status
+/// strip, same `DumpTask`/`DumpStatus` types -- a streaming export and a
+/// native dump are both "a long background job that produces a file"). Each
+/// runner also carries the `cancelled` flag its `FileRowSink` checks, so
+/// dismissing a still-running export can ask it to stop and clean up its
+/// partial file instead of only dropping the task handle.
+#[derive(Default)]
+struct ExportUiState {
+    tasks: Vec<DumpTask>,
+    runners: Vec<(usize, Task<()>, Arc<std::sync::atomic::AtomicBool>)>,
     next_id: usize,
 }
 
@@ -3225,6 +3505,7 @@ impl DatabasePanel {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![
@@ -3987,6 +4268,116 @@ impl DatabasePanel {
                         .tooltip(Tooltip::text(if is_running { "Cancel" } else { "Dismiss" }))
                         .on_click(cx.listener(move |panel, _, _, cx| {
                             panel.dismiss_dump_task(task_id, cx);
+                        })),
+                    )
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .flex_none()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .children(rows)
+    }
+
+    fn start_export_to_file(
+        &mut self,
+        label: SharedString,
+        provider: std::sync::Arc<dyn db_client::provider::DbProvider>,
+        database: String,
+        sql: String,
+        output_path: std::path::PathBuf,
+        format: crate::execute_to_file::ExecuteToFileFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let task_id = self.export.next_id;
+        self.export.next_id += 1;
+        self.export.tasks.push(DumpTask {
+            id: task_id,
+            label,
+            status: DumpStatus::Running,
+        });
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let export = crate::execute_to_file::spawn_execute_to_file(
+            provider,
+            database,
+            sql,
+            output_path.clone(),
+            format,
+            cancelled.clone(),
+            cx,
+        );
+        let handle = cx.spawn(async move |panel, cx| {
+            let result = export.await;
+            panel
+                .update(cx, |panel, cx| {
+                    if let Some(task) = panel
+                        .export
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.id == task_id)
+                    {
+                        task.status = match result {
+                            Ok(rows) => DumpStatus::Done {
+                                output_path: format!("{} ({rows} rows)", output_path.display()),
+                            },
+                            Err(message) => DumpStatus::Failed { message },
+                        };
+                    }
+                    panel
+                        .export
+                        .runners
+                        .retain(|(running_id, ..)| *running_id != task_id);
+                    cx.notify();
+                })
+                .ok();
+        });
+        self.export.runners.push((task_id, handle, cancelled));
+        cx.notify();
+    }
+
+    fn dismiss_export_task(&mut self, task_id: usize, cx: &mut Context<Self>) {
+        // Ask a still-running export to stop at its next row/columns write
+        // instead of dropping the task handle outright, so `FileRowSink`
+        // reaches its own cleanup path (deleting the partial file) rather
+        // than being cut off mid-write.
+        if let Some((.., cancelled)) = self
+            .export
+            .runners
+            .iter()
+            .find(|(running_id, ..)| *running_id == task_id)
+        {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.export.tasks.retain(|task| task.id != task_id);
+        cx.notify();
+    }
+
+    fn render_export_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .export
+            .tasks
+            .iter()
+            .map(|task| {
+                let task_id = task.id;
+                let is_running = matches!(task.status, DumpStatus::Running);
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_1().child(render_dump_status_row(task, cx)))
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("export-task-dismiss-{task_id}")),
+                            if is_running {
+                                IconName::XCircle
+                            } else {
+                                IconName::Close
+                            },
+                        )
+                        .tooltip(Tooltip::text(if is_running { "Cancel" } else { "Dismiss" }))
+                        .on_click(cx.listener(move |panel, _, _, cx| {
+                            panel.dismiss_export_task(task_id, cx);
                         })),
                     )
             })
@@ -7192,6 +7583,9 @@ impl Render for DatabasePanel {
             .when(!self.dump.tasks.is_empty(), |el| {
                 el.child(self.render_dump_status(cx))
             })
+            .when(!self.export.tasks.is_empty(), |el| {
+                el.child(self.render_export_status(cx))
+            })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
@@ -8247,6 +8641,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -8405,6 +8800,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -8493,6 +8889,393 @@ mod tests {
         );
     }
 
+    async fn open_run_configuration_test_editor(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Editor> {
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    std::path::PathBuf::from("/fake-scripts/seed.sql"),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("seed.sql must open");
+        let editor = workspace
+            .read_with(cx, |_, cx| item.act_as::<Editor>(cx))
+            .expect("seed.sql must open as an editor");
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        editor
+    }
+
+    #[gpui::test]
+    async fn save_and_run_sql_file_targets_the_saved_connection_even_after_switching_active_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let config_a = db_client::ConnectionConfig {
+            label: "connection-a".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let config_b = db_client::ConnectionConfig {
+            label: "connection-b".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_a = config_a.id;
+        let connection_b = config_b.id;
+        let calls_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        init_test(cx);
+        cx.update(|cx| editor::init(cx));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let _ = terminal_panel;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config_a,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls_a.clone(),
+                }),
+                cx,
+            );
+            store.add_connected_for_test(
+                config_b,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls_b.clone(),
+                }),
+                cx,
+            );
+            store.set_active_connection(connection_a, cx);
+        });
+        cx.run_until_parked();
+
+        open_run_configuration_test_editor(&workspace, cx).await;
+        cx.run_until_parked();
+
+        // Save while connection A is active, then switch the active connection
+        // to B before running -- the run configuration must still target A.
+        workspace.update_in(cx, |workspace, window, cx| {
+            save_run_configuration(workspace, window, cx);
+        });
+        store.update(cx, |store, cx| {
+            store.set_active_connection(connection_b, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_sql_file(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls_a
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .as_slice(),
+            &["SELECT 1".to_string()],
+            "the saved run configuration must run against connection A regardless of B being active"
+        );
+        assert!(
+            calls_b
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .is_empty(),
+            "connection B must never see this file's query"
+        );
+    }
+
+    #[gpui::test]
+    async fn run_sql_file_without_a_saved_configuration_does_not_run_anything(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "connection-a".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        init_test(cx);
+        cx.update(|cx| editor::init(cx));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let _ = terminal_panel;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls.clone(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        open_run_configuration_test_editor(&workspace, cx).await;
+        cx.run_until_parked();
+
+        // No run configuration was ever saved for this file.
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_sql_file(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .is_empty(),
+            "a file with no saved run configuration must not run against any connection"
+        );
+    }
+
+    #[gpui::test]
+    async fn run_sql_file_with_a_deleted_connection_fails_gracefully(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "connection-a".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        init_test(cx);
+        cx.update(|cx| editor::init(cx));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let _ = terminal_panel;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls.clone(),
+                }),
+                cx,
+            );
+            store.set_active_connection(connection_id, cx);
+        });
+        cx.run_until_parked();
+
+        open_run_configuration_test_editor(&workspace, cx).await;
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            save_run_configuration(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The connection this run configuration points at is now gone.
+        store.update(cx, |store, cx| {
+            store.remove_connection(connection_id, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            run_sql_file(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .is_empty(),
+            "a run configuration whose connection was deleted must fail gracefully, not panic \
+             or silently run against some other connection"
+        );
+    }
+
     #[gpui::test]
     async fn run_query_sends_unrecognized_sql_to_database_and_shows_error(cx: &mut TestAppContext) {
         let config = db_client::ConnectionConfig {
@@ -8555,6 +9338,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -8716,6 +9500,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -8895,6 +9680,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -8973,6 +9759,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -9089,6 +9876,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -9169,6 +9957,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -9274,6 +10063,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -9396,6 +10186,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -9496,6 +10287,7 @@ mod tests {
                 table_filter_is_regex: false,
                 selected_tree_node: None,
                 dump: DumpUiState::default(),
+                export: ExportUiState::default(),
                 context_menu: None,
                 tree_scroll_handle: ScrollHandle::new(),
                 _subscriptions: Vec::new(),
@@ -10107,6 +10899,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -10199,6 +10992,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],
@@ -10342,6 +11136,7 @@ mod tests {
                     table_filter_is_regex: false,
                     selected_tree_node: None,
                     dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     _subscriptions: vec![sub],

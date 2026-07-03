@@ -6,6 +6,15 @@ use crate::schema::{
     QueryResult, SequenceInfo, TableInfo, TriggerInfo, UserInfo,
 };
 
+/// Receives a read query's columns and rows one at a time, so a caller can
+/// write them straight to a file without ever holding the full result set in
+/// memory. `write_row` returning `Err` aborts the query mid-stream (used to
+/// implement cancellation without a separate cancellation channel).
+pub trait RowSink: Send {
+    fn write_columns(&mut self, columns: &[String]) -> Result<()>;
+    fn write_row(&mut self, row: &[Option<String>]) -> Result<()>;
+}
+
 #[async_trait]
 pub trait DbProvider: Send + Sync {
     async fn ping(&self) -> Result<()>;
@@ -14,6 +23,29 @@ pub trait DbProvider: Send + Sync {
     async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>>;
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
+
+    /// Like `execute_query`, but pushes rows to `sink` as they arrive instead
+    /// of collecting them into a `QueryResult`, and is not bound by
+    /// `MAX_RESULT_ROWS` — for "execute to file" exports of result sets too
+    /// large for the grid. Returns the number of rows streamed.
+    ///
+    /// The default falls back to the capped `execute_query`, so drivers
+    /// without a real streaming override (SQLite, ClickHouse, Redis) still
+    /// work correctly, just capped the same as the grid. MySQL and
+    /// PostgreSQL override this with a genuinely unbounded stream.
+    async fn execute_query_streaming(
+        &self,
+        database: &str,
+        sql: &str,
+        sink: &mut dyn RowSink,
+    ) -> Result<u64> {
+        let result = self.execute_query(database, sql).await?;
+        sink.write_columns(&result.columns)?;
+        for row in &result.rows {
+            sink.write_row(row)?;
+        }
+        Ok(result.rows.len() as u64)
+    }
 
     async fn get_database_ddl(&self, database: &str) -> Result<String> {
         Ok(format!("CREATE DATABASE {database};\n"))

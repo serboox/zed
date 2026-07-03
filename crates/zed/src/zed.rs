@@ -1226,6 +1226,30 @@ fn register_actions(
                 db_client_ui::format_current_sql_query(workspace, window, cx);
             },
         )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::ExecuteToFile,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::execute_current_sql_query_to_file(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::SaveRunConfiguration,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::save_run_configuration(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::RunSqlFile,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::run_sql_file(workspace, window, cx);
+            },
+        )
         .register_action({
             let app_state = app_state.clone();
             move |_, _: &NewWindow, _, cx| {

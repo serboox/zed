@@ -24,6 +24,7 @@ use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
 const CONNECTIONS_FILE: &str = "db_connections.json";
+const RUN_CONFIGS_FILE: &str = "db_run_configs.json";
 const DDL_CACHE_FILE: &str = "db_ddl_cache.json";
 const SCHEMA_CACHE_FILE: &str = "db_schema_cache.json";
 
@@ -286,6 +287,7 @@ pub struct DatabaseStore {
     ddl_cache: HashMap<ConnectionId, DdlCache>,
     schema_cache: HashMap<ConnectionId, SchemaCache>,
     prefetching_schema: HashSet<ConnectionId>,
+    run_configurations: Vec<RunConfiguration>,
 }
 
 /// App-global handle to the single workspace `DatabaseStore`, set when the
@@ -404,6 +406,18 @@ impl DatabaseStore {
                 }
             })
             .detach();
+
+            cx.spawn(async move |this, cx| {
+                let configs = cx
+                    .background_executor()
+                    .spawn(async { load_run_configs_from_disk() })
+                    .await;
+                if !configs.is_empty() {
+                    this.update(cx, |store, _| store.run_configurations = configs)
+                        .ok();
+                }
+            })
+            .detach();
         }
 
         Self {
@@ -415,6 +429,7 @@ impl DatabaseStore {
             ddl_cache: HashMap::new(),
             schema_cache: HashMap::new(),
             prefetching_schema: HashSet::new(),
+            run_configurations: Vec::new(),
         }
     }
 
@@ -430,6 +445,43 @@ impl DatabaseStore {
         cx.background_executor()
             .spawn(async move { save_schema_cache_to_disk(&cache).log_err() })
             .detach();
+    }
+
+    fn persist_run_configurations(&self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let configs = self.run_configurations.clone();
+        cx.background_executor()
+            .spawn(async move { save_run_configs_to_disk(&configs).log_err() })
+            .detach();
+    }
+
+    pub fn run_configurations(&self) -> &[RunConfiguration] {
+        &self.run_configurations
+    }
+
+    /// The saved run configuration for `path`, if any. `path` is compared as
+    /// given (callers are expected to pass an absolute, canonicalized path,
+    /// matching how it was stored).
+    pub fn run_configuration_for_path(&self, path: &std::path::Path) -> Option<&RunConfiguration> {
+        self.run_configurations
+            .iter()
+            .find(|config| config.file_path == path)
+    }
+
+    /// Saves `config`, replacing any existing configuration for the same file
+    /// path (a file has at most one run configuration at a time).
+    pub fn set_run_configuration(&mut self, config: RunConfiguration, cx: &mut Context<Self>) {
+        self.run_configurations
+            .retain(|existing| existing.file_path != config.file_path);
+        self.run_configurations.push(config);
+        self.persist_run_configurations(cx);
+    }
+
+    pub fn remove_run_configuration(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.run_configurations.retain(|config| config.id != id);
+        self.persist_run_configurations(cx);
     }
 
     /// Fills each connection's empty schema maps from the persisted snapshot so
@@ -778,6 +830,18 @@ impl DatabaseStore {
         self.connections
             .iter()
             .find(|c| c.config.id == id && matches!(c.status, ConnectionStatus::Connected))
+    }
+
+    /// Points `id`'s connection at `database` for subsequent queries, without
+    /// touching any other connection field or persisting the change — used
+    /// when invoking a saved run configuration that targets a specific
+    /// database, so the run always lands where the user pinned it regardless
+    /// of whichever database happened to be selected last.
+    pub fn set_connection_database(&mut self, id: ConnectionId, database: String, cx: &mut Context<Self>) {
+        if let Some(connection) = self.connections.iter_mut().find(|c| c.config.id == id) {
+            connection.config.database = Some(database);
+            cx.notify();
+        }
     }
 
     pub fn set_active_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
@@ -2043,6 +2107,38 @@ fn save_schema_cache_to_disk(cache: &HashMap<ConnectionId, SchemaCache>) -> Resu
     Ok(())
 }
 
+/// A saved association between a `.sql` file and the connection (and
+/// optionally a specific database on it) it should always run against, so
+/// running the same maintenance script twice never risks targeting the wrong
+/// data source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunConfiguration {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub file_path: std::path::PathBuf,
+    pub connection_id: ConnectionId,
+    pub database: Option<String>,
+}
+
+fn run_configs_file_path() -> std::path::PathBuf {
+    paths::config_dir().join(RUN_CONFIGS_FILE)
+}
+
+/// Loads saved run configurations, returning an empty list when the file is
+/// missing or unreadable so a corrupt file never blocks startup.
+fn load_run_configs_from_disk() -> Vec<RunConfiguration> {
+    let Ok(bytes) = std::fs::read(run_configs_file_path()) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_run_configs_to_disk(configs: &[RunConfiguration]) -> Result<()> {
+    let json = serde_json::to_vec_pretty(configs)?;
+    std::fs::write(run_configs_file_path(), json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2951,6 +3047,98 @@ mod tests {
                 conn.expanded_tables
                     .contains_key(&("analytics".to_string(), "events".to_string())),
                 "columns indexed for non-primary databases within the budget"
+            );
+        });
+    }
+
+    #[test]
+    fn run_configuration_round_trips_through_serde() {
+        let config = RunConfiguration {
+            id: uuid::Uuid::new_v4(),
+            name: "Weekly cleanup".to_string(),
+            file_path: std::path::PathBuf::from("/scripts/weekly_cleanup.sql"),
+            connection_id: ConnectionConfig::default().id,
+            database: Some("analytics".to_string()),
+        };
+        let bytes = serde_json::to_vec(&config).expect("serialize");
+        let restored: RunConfiguration = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored, config);
+    }
+
+    #[gpui::test]
+    fn run_configuration_resolves_by_its_exact_file_path(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let connection_id = ConnectionConfig::default().id;
+        let path = std::path::PathBuf::from("/scripts/seed.sql");
+        store.update(cx, |store, cx| {
+            store.set_run_configuration(
+                RunConfiguration {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Seed".to_string(),
+                    file_path: path.clone(),
+                    connection_id,
+                    database: None,
+                },
+                cx,
+            );
+        });
+        store.read_with(cx, |store, _| {
+            let found = store
+                .run_configuration_for_path(&path)
+                .expect("configuration must resolve by its exact path");
+            assert_eq!(found.connection_id, connection_id);
+            assert!(
+                store
+                    .run_configuration_for_path(std::path::Path::new("/scripts/other.sql"))
+                    .is_none(),
+                "an unrelated path must not resolve to someone else's configuration"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn saving_a_second_run_configuration_for_the_same_file_replaces_the_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let path = std::path::PathBuf::from("/scripts/seed.sql");
+        let first_connection = ConnectionConfig::default().id;
+        let second_connection = ConnectionConfig::default().id;
+        store.update(cx, |store, cx| {
+            store.set_run_configuration(
+                RunConfiguration {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Seed".to_string(),
+                    file_path: path.clone(),
+                    connection_id: first_connection,
+                    database: None,
+                },
+                cx,
+            );
+            store.set_run_configuration(
+                RunConfiguration {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Seed".to_string(),
+                    file_path: path.clone(),
+                    connection_id: second_connection,
+                    database: None,
+                },
+                cx,
+            );
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .run_configurations()
+                    .iter()
+                    .filter(|config| config.file_path == path)
+                    .count(),
+                1,
+                "a file must have at most one run configuration at a time"
+            );
+            assert_eq!(
+                store.run_configuration_for_path(&path).unwrap().connection_id,
+                second_connection
             );
         });
     }

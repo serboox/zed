@@ -808,6 +808,18 @@ pub mod database_panel {
             /// Reformats the SQL in the current console query (keyword case,
             /// indentation, line breaks).
             FormatQuery,
+            /// Streams the full result of the current SQL query straight to a
+            /// CSV file, bypassing the results grid's row cap.
+            ExecuteToFile,
+            /// Saves the active SQL file's current connection and database as
+            /// its run configuration, so future runs always target the same
+            /// data source regardless of which connection happens to be
+            /// active at the time.
+            SaveRunConfiguration,
+            /// Runs the active SQL file against its saved run configuration,
+            /// ignoring whichever connection is currently active in the
+            /// panel.
+            RunSqlFile,
         ]
     );
 }

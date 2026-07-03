@@ -421,6 +421,86 @@ impl DbProvider for MySqlProvider {
         }
     }
 
+    async fn execute_query_streaming(
+        &self,
+        database: &str,
+        sql: &str,
+        sink: &mut dyn crate::provider::RowSink,
+    ) -> Result<u64> {
+        if !database.is_empty() {
+            let use_stmt = format!("USE `{}`", database.replace('`', "``"));
+            sqlx::raw_sql(&use_stmt)
+                .execute(&self.pool)
+                .await
+                .context("Failed to switch database")?;
+        }
+
+        let trimmed_upper = sql.trim().to_uppercase();
+        let is_read_query = trimmed_upper.starts_with("SELECT")
+            || trimmed_upper.starts_with("SHOW")
+            || trimmed_upper.starts_with("DESCRIBE")
+            || trimmed_upper.starts_with("EXPLAIN")
+            || trimmed_upper.starts_with("DESC")
+            || trimmed_upper.starts_with("WITH");
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            sql
+        );
+
+        if !is_read_query {
+            sqlx::query(&prefixed)
+                .execute(&self.pool)
+                .await
+                .context("Query execution failed")?;
+            return Ok(0);
+        }
+
+        // Unlike `execute_query`, this never breaks at `MAX_RESULT_ROWS` — the
+        // whole point of "execute to file" is exporting result sets too large
+        // for the grid. Cells are still capped for safety against a single
+        // multi-megabyte BLOB, but the row count itself is unbounded.
+        let mut stream = sqlx::raw_sql(&prefixed).fetch(&self.pool);
+        let mut columns: Vec<String> = Vec::new();
+        let mut row_count: u64 = 0;
+
+        while let Some(row) = stream.try_next().await.context("Query execution failed")? {
+            if columns.is_empty() {
+                columns = row
+                    .columns()
+                    .iter()
+                    .map(|column| column.name().to_string())
+                    .collect();
+                sink.write_columns(&columns)?;
+            }
+
+            let decoded: Vec<Option<String>> = (0..columns.len())
+                .map(|index| {
+                    row.try_get::<Option<String>, _>(index)
+                        .ok()
+                        .flatten()
+                        .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
+                        .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
+                        .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
+                        .or_else(|| {
+                            row.try_get::<Option<Vec<u8>>, _>(index)
+                                .ok()
+                                .flatten()
+                                .map(bytes_to_string)
+                        })
+                        .map(cap_cell)
+                })
+                .collect();
+            sink.write_row(&decoded)?;
+            row_count += 1;
+        }
+
+        if columns.is_empty() {
+            sink.write_columns(&[])?;
+        }
+        Ok(row_count)
+    }
+
     async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
         let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, Vec<u8>)>(
             "-- name: ListIndexes :many
