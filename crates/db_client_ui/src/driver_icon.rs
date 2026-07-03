@@ -14,6 +14,10 @@ pub(crate) fn brand_icon_path(driver: DatabaseDriver) -> &'static str {
         DatabaseDriver::SQLite => "icons/db_brands/sqlite.svg",
         DatabaseDriver::ClickHouse => "icons/db_brands/clickhouse.svg",
         DatabaseDriver::Redis => "icons/db_brands/redis.svg",
+        // No bundled asset yet (a real logo needs a verified CC0/CC-BY
+        // source); `brand_icon`'s `with_fallback` renders the generic glyph
+        // tinted with `brand_color` below until one is added.
+        DatabaseDriver::MongoDB => "icons/db_brands/mongodb.svg",
     }
 }
 
@@ -26,6 +30,7 @@ pub(crate) fn brand_color(driver: DatabaseDriver) -> Hsla {
         DatabaseDriver::SQLite => 0x0B7FCC,
         DatabaseDriver::ClickHouse => 0xF9FF69,
         DatabaseDriver::Redis => 0xD82C20,
+        DatabaseDriver::MongoDB => 0x47A248,
     };
     rgb(hex).into()
 }
@@ -58,6 +63,7 @@ mod tests {
             DatabaseDriver::SQLite,
             DatabaseDriver::ClickHouse,
             DatabaseDriver::Redis,
+            DatabaseDriver::MongoDB,
         ];
 
         let mut seen = std::collections::HashSet::new();
@@ -82,6 +88,7 @@ mod tests {
             (DatabaseDriver::SQLite, 0x0B7FCC),
             (DatabaseDriver::ClickHouse, 0xF9FF69),
             (DatabaseDriver::Redis, 0xD82C20),
+            (DatabaseDriver::MongoDB, 0x47A248),
         ];
         for (driver, hex) in cases {
             assert_eq!(

@@ -4,6 +4,7 @@ use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
     RuntimeProvider, SshAuth, SshAuthMethod, SshTunnel,
     clickhouse::ClickHouseProvider,
+    mongo_provider::MongoProvider,
     mysql::MySqlProvider,
     on_runtime,
     postgres::PostgresProvider,
@@ -1979,6 +1980,10 @@ async fn build_provider(
         DatabaseDriver::Redis => {
             let config = effective_config.clone();
             Arc::new(on_runtime(async move { RedisProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::MongoDB => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { MongoProvider::connect(&config).await }).await?)
         }
     };
     let provider: Arc<dyn DbProvider> = Arc::new(RuntimeProvider::new(raw));

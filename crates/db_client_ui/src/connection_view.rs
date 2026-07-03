@@ -619,6 +619,12 @@ impl Render for ConnectionView {
                 DatabaseDriver::Redis,
                 selected_driver,
                 cx,
+            ))
+            .child(Self::render_driver_row(
+                "MongoDB",
+                DatabaseDriver::MongoDB,
+                selected_driver,
+                cx,
             ));
 
         let header = h_flex()

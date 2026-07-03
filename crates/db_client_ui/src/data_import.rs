@@ -172,7 +172,10 @@ pub fn disable_indexes_statements(driver: DatabaseDriver, table: &str) -> Option
             "SET session_replication_role = replica".to_string(),
             "SET session_replication_role = DEFAULT".to_string(),
         )),
-        DatabaseDriver::SQLite | DatabaseDriver::ClickHouse | DatabaseDriver::Redis => None,
+        DatabaseDriver::SQLite
+        | DatabaseDriver::ClickHouse
+        | DatabaseDriver::Redis
+        | DatabaseDriver::MongoDB => None,
     }
 }
 

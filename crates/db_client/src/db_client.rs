@@ -1,5 +1,6 @@
 pub mod clickhouse;
 pub mod connection;
+pub mod mongo_provider;
 pub mod mysql;
 pub mod postgres;
 pub mod provider;

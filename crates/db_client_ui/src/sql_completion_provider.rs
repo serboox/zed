@@ -111,6 +111,7 @@ fn keywords_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::SQLite => SQLITE_KEYWORDS,
         DatabaseDriver::ClickHouse => CLICKHOUSE_KEYWORDS,
         DatabaseDriver::Redis => &[],
+        DatabaseDriver::MongoDB => &[],
     };
     CORE_KEYWORDS.iter().chain(extra.iter()).copied().collect()
 }
@@ -122,6 +123,7 @@ fn functions_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::SQLite => SQLITE_FUNCTIONS,
         DatabaseDriver::ClickHouse => CLICKHOUSE_FUNCTIONS,
         DatabaseDriver::Redis => &[],
+        DatabaseDriver::MongoDB => &[],
     };
     CORE_FUNCTIONS.iter().chain(extra.iter()).copied().collect()
 }

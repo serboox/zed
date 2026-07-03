@@ -13,7 +13,10 @@ use sqlparser::parser::Parser;
 ///
 /// `GenericDialect` is used as a placeholder for any future driver that gains
 /// its own `DatabaseDriver` variant before a matching sqlparser dialect exists.
-/// Redis has no SQL grammar at all, so it deliberately has no dialect.
+/// Redis and MongoDB have no SQL grammar at all, so they deliberately have no
+/// dialect (MongoDB's console accepts its own tiny SELECT/INSERT/UPDATE/DELETE
+/// subset — see `db_client::mongo_provider` — which is not SQL and is not
+/// parsed by sqlparser).
 pub(crate) fn dialect_for_driver(driver: DatabaseDriver) -> Option<Box<dyn Dialect>> {
     match driver {
         DatabaseDriver::MySQL => Some(Box::new(MySqlDialect {})),
@@ -21,6 +24,7 @@ pub(crate) fn dialect_for_driver(driver: DatabaseDriver) -> Option<Box<dyn Diale
         DatabaseDriver::SQLite => Some(Box::new(SQLiteDialect {})),
         DatabaseDriver::ClickHouse => Some(Box::new(ClickHouseDialect {})),
         DatabaseDriver::Redis => None,
+        DatabaseDriver::MongoDB => None,
     }
 }
 

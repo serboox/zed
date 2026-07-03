@@ -39,6 +39,7 @@ pub enum DatabaseDriver {
     SQLite,
     ClickHouse,
     Redis,
+    MongoDB,
 }
 
 impl fmt::Display for DatabaseDriver {
@@ -49,6 +50,7 @@ impl fmt::Display for DatabaseDriver {
             DatabaseDriver::SQLite => write!(formatter, "SQLite"),
             DatabaseDriver::ClickHouse => write!(formatter, "ClickHouse"),
             DatabaseDriver::Redis => write!(formatter, "Redis"),
+            DatabaseDriver::MongoDB => write!(formatter, "MongoDB"),
         }
     }
 }
@@ -61,6 +63,7 @@ impl DatabaseDriver {
             DatabaseDriver::SQLite => 0,
             DatabaseDriver::ClickHouse => 8123,
             DatabaseDriver::Redis => 6379,
+            DatabaseDriver::MongoDB => 27017,
         }
     }
 
