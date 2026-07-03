@@ -156,6 +156,32 @@ pub fn build_insert_statements(
     statements
 }
 
+/// Statements to run before and after a bulk load to skip index/trigger
+/// maintenance per row, or `None` when the driver has no clean equivalent
+/// (SQLite, ClickHouse, Redis).
+pub fn disable_indexes_statements(driver: DatabaseDriver, table: &str) -> Option<(String, String)> {
+    match driver {
+        DatabaseDriver::MySQL => Some((
+            format!("ALTER TABLE {} DISABLE KEYS", driver.quote_identifier(table)),
+            format!("ALTER TABLE {} ENABLE KEYS", driver.quote_identifier(table)),
+        )),
+        // Postgres has no bulk "disable indexes" statement; disabling triggers
+        // (which also suspends FK-enforcement triggers) is the closest
+        // equivalent a bulk load actually benefits from.
+        DatabaseDriver::PostgreSQL => Some((
+            "SET session_replication_role = replica".to_string(),
+            "SET session_replication_role = DEFAULT".to_string(),
+        )),
+        DatabaseDriver::SQLite | DatabaseDriver::ClickHouse | DatabaseDriver::Redis => None,
+    }
+}
+
+/// Renders a source row back out as a single line for the import error file,
+/// using the same delimiter the file was parsed with.
+fn format_error_line(row: &[String], delimiter: char) -> String {
+    row.join(&delimiter.to_string())
+}
+
 // Default file column for a target column: an exact (case-insensitive) header
 // match, otherwise the same position, otherwise unset.
 fn default_mapping(target_columns: &[String], headers: &[String]) -> Vec<Option<usize>> {
@@ -175,6 +201,10 @@ fn default_mapping(target_columns: &[String], headers: &[String]) -> Vec<Option<
 const IMPORT_BATCH_SIZE: usize = 200;
 const PREVIEW_ROW_LIMIT: usize = 20;
 
+/// Charsets offered for decoding the source file before parsing. Label strings
+/// match what `encoding_rs::Encoding::for_label` accepts.
+const IMPORT_CHARSETS: &[&str] = &["utf-8", "windows-1251", "iso-8859-1", "utf-16"];
+
 pub struct ImportDataView {
     focus_handle: FocusHandle,
     store: Entity<DatabaseStore>,
@@ -184,9 +214,13 @@ pub struct ImportDataView {
     driver: DatabaseDriver,
     target_columns: Vec<String>,
     path_editor: Entity<Editor>,
+    loaded_path: Option<String>,
     delimiter: char,
     has_header: bool,
     null_on_empty: bool,
+    charset: &'static str,
+    continue_on_error: bool,
+    disable_indexes: bool,
     parsed: Option<ParsedFile>,
     mapping: Vec<Option<usize>>,
     status: Option<String>,
@@ -219,9 +253,13 @@ impl ImportDataView {
             driver,
             target_columns,
             path_editor,
+            loaded_path: None,
             delimiter: ',',
             has_header: true,
             null_on_empty: true,
+            charset: "utf-8",
+            continue_on_error: false,
+            disable_indexes: false,
             parsed: None,
             mapping,
             status: None,
@@ -238,11 +276,19 @@ impl ImportDataView {
         }
         let has_header = self.has_header;
         let chosen_delimiter = self.delimiter;
+        let charset = self.charset;
         self.status = Some("Loading…".into());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
             let read = cx
-                .background_spawn(async move { std::fs::read_to_string(&path) })
+                .background_spawn(async move {
+                    let bytes = std::fs::read(&read_path)?;
+                    let encoding =
+                        encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+                    let (decoded, _, _) = encoding.decode(&bytes);
+                    std::io::Result::Ok(decoded.into_owned())
+                })
                 .await;
             this.update(cx, |view, cx| {
                 match read {
@@ -257,6 +303,7 @@ impl ImportDataView {
                         view.mapping = default_mapping(&view.target_columns, &parsed.headers);
                         view.status = Some(format!("Loaded {} rows.", parsed.rows.len()));
                         view.parsed = Some(parsed);
+                        view.loaded_path = Some(path);
                     }
                     Err(error) => {
                         view.status = Some(format!("Could not read file: {error}"));
@@ -276,6 +323,13 @@ impl ImportDataView {
             cx.notify();
             return;
         };
+        // Continuing past a failed row needs to know exactly which row failed,
+        // so each row becomes its own statement instead of one shared batch.
+        let batch_size = if self.continue_on_error {
+            1
+        } else {
+            IMPORT_BATCH_SIZE
+        };
         let statements = build_insert_statements(
             &self.table,
             self.driver,
@@ -283,7 +337,7 @@ impl ImportDataView {
             &parsed.rows,
             &self.mapping,
             self.null_on_empty,
-            IMPORT_BATCH_SIZE,
+            batch_size,
         );
         if statements.is_empty() {
             self.status = Some("Map at least one column before importing.".into());
@@ -294,28 +348,90 @@ impl ImportDataView {
         let store = self.store.clone();
         let connection_id = self.connection_id;
         let database = self.database.clone();
+        let continue_on_error = self.continue_on_error;
+        let delimiter = self.delimiter;
+        let error_file_path = self
+            .loaded_path
+            .as_ref()
+            .map(|path| format!("{path}.errors.txt"));
+        let disable_indexes = self
+            .disable_indexes
+            .then(|| disable_indexes_statements(self.driver, &self.table))
+            .flatten();
         self.importing = true;
         self.status = Some("Importing…".into());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
+            if let Some((pre, _)) = &disable_indexes {
+                let task = store.update(cx, |store, cx| {
+                    store.execute_query(connection_id, database.clone(), pre.clone(), cx)
+                });
+                task.await.log_err();
+            }
+
             let mut imported = 0usize;
+            let mut failed_rows: Vec<&Vec<String>> = Vec::new();
             let mut failure: Option<String> = None;
-            for statement in statements {
+            for (index, statement) in statements.into_iter().enumerate() {
                 let task = store.update(cx, |store, cx| {
                     store.execute_query(connection_id, database.clone(), statement, cx)
                 });
                 match task.await {
                     Ok(_) => imported += 1,
                     Err(error) => {
-                        failure = Some(error.to_string());
-                        break;
+                        if continue_on_error {
+                            if let Some(row) = parsed.rows.get(index) {
+                                failed_rows.push(row);
+                            }
+                        } else {
+                            failure = Some(error.to_string());
+                            break;
+                        }
                     }
                 }
             }
+
+            if let Some((_, post)) = &disable_indexes {
+                let task = store.update(cx, |store, cx| {
+                    store.execute_query(connection_id, database.clone(), post.clone(), cx)
+                });
+                task.await.log_err();
+            }
+
+            let mut error_file_write_failed = None;
+            if !failed_rows.is_empty()
+                && let Some(error_file_path) = &error_file_path
+            {
+                let lines: Vec<String> = failed_rows
+                    .iter()
+                    .map(|row| format_error_line(row, delimiter))
+                    .collect();
+                let contents = lines.join("\n");
+                let error_file_path = error_file_path.clone();
+                let write = cx
+                    .background_spawn(async move { std::fs::write(&error_file_path, contents) })
+                    .await;
+                if let Err(error) = write {
+                    error_file_write_failed = Some(error.to_string());
+                }
+            }
+
             this.update(cx, |view, cx| {
                 view.importing = false;
                 view.status = Some(match failure {
-                    Some(error) => format!("Import failed after {imported} batch(es): {error}"),
+                    Some(error) => format!("Import failed after {imported} row(s): {error}"),
+                    None if !failed_rows.is_empty() => {
+                        let failed = failed_rows.len();
+                        match (&error_file_path, error_file_write_failed) {
+                            (Some(path), None) => format!(
+                                "Imported {imported} rows, {failed} failed (see {path})."
+                            ),
+                            (_, Some(write_error)) => format!(
+                                "Imported {imported} rows, {failed} failed (could not write error file: {write_error})."
+                            ),
+                            (None, None) => format!("Imported {imported} rows, {failed} failed."),
+                        }
+                    }
                     None => format!("Imported {total_rows} rows."),
                 });
                 cx.notify();
@@ -331,6 +447,34 @@ impl ImportDataView {
             *slot = source;
             cx.notify();
         }
+    }
+
+    fn render_charset_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.charset;
+        let view = cx.entity().downgrade();
+
+        PopoverMenu::new("import-charset")
+            .trigger(
+                Button::new("import-charset-trigger", current)
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for charset in IMPORT_CHARSETS {
+                        let view = view.clone();
+                        menu = menu.entry(*charset, None, move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.charset = charset;
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                    }
+                    menu
+                }))
+            })
     }
 
     fn render_mapping_row(
@@ -408,7 +552,10 @@ impl Render for ImportDataView {
         }
         let has_header = self.has_header;
         let null_on_empty = self.null_on_empty;
+        let continue_on_error = self.continue_on_error;
+        let disable_indexes = self.disable_indexes;
         let importing = self.importing;
+        let charset_picker = self.render_charset_picker(cx).into_any_element();
 
         v_flex()
             .key_context("DataImport")
@@ -452,7 +599,36 @@ impl Render for ImportDataView {
                             },
                         )),
                     )
-                    .child(Label::new("Insert empty as NULL").size(LabelSize::Small)),
+                    .child(Label::new("Insert empty as NULL").size(LabelSize::Small))
+                    .child(Label::new("Charset").size(LabelSize::Small).color(Color::Muted))
+                    .child(charset_picker),
+            )
+            .child(
+                h_flex()
+                    .gap_4()
+                    .child(
+                        Checkbox::new("continue-on-error", continue_on_error.into()).on_click(
+                            cx.listener(|view, _, _, cx| {
+                                view.continue_on_error = !view.continue_on_error;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        Label::new("Continue on error, write failures to file")
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        Checkbox::new("disable-indexes", disable_indexes.into()).on_click(
+                            cx.listener(|view, _, _, cx| {
+                                view.disable_indexes = !view.disable_indexes;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        Label::new("Disable indexes/triggers during load").size(LabelSize::Small),
+                    ),
             )
             .child(Divider::horizontal())
             .child(Label::new("Column mapping").size(LabelSize::Small).color(Color::Muted))
@@ -580,5 +756,265 @@ mod tests {
         let statements =
             build_insert_statements("t", DatabaseDriver::MySQL, &target, &rows, &mapping, true, 2);
         assert_eq!(statements.len(), 3);
+    }
+
+    #[test]
+    fn disable_indexes_statements_covers_mysql_and_postgres_only() {
+        let (pre, post) = disable_indexes_statements(DatabaseDriver::MySQL, "people")
+            .expect("MySQL should offer a disable-keys pair");
+        assert_eq!(pre, "ALTER TABLE `people` DISABLE KEYS");
+        assert_eq!(post, "ALTER TABLE `people` ENABLE KEYS");
+
+        let (pre, post) = disable_indexes_statements(DatabaseDriver::PostgreSQL, "people")
+            .expect("Postgres should offer a session_replication_role pair");
+        assert_eq!(pre, "SET session_replication_role = replica");
+        assert_eq!(post, "SET session_replication_role = DEFAULT");
+
+        assert!(disable_indexes_statements(DatabaseDriver::SQLite, "people").is_none());
+        assert!(disable_indexes_statements(DatabaseDriver::ClickHouse, "people").is_none());
+        assert!(disable_indexes_statements(DatabaseDriver::Redis, "people").is_none());
+    }
+
+    #[test]
+    fn format_error_line_joins_cells_with_the_delimiter() {
+        let row = vec!["2".to_string(), "BAD".to_string()];
+        assert_eq!(format_error_line(&row, ','), "2,BAD");
+        assert_eq!(format_error_line(&row, '\t'), "2\tBAD");
+    }
+
+    struct RecordingProvider {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_containing: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl db_client::provider::DbProvider for RecordingProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::schema::DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(
+            &self,
+            _database: &str,
+        ) -> anyhow::Result<Vec<db_client::schema::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<Vec<db_client::schema::ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            self.log.lock().unwrap().push(sql.to_string());
+            if let Some(needle) = self.fail_containing
+                && sql.contains(needle)
+            {
+                return Err(anyhow::anyhow!("simulated row failure"));
+            }
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn test_import_view(
+        cx: &mut gpui::TestAppContext,
+        provider: RecordingProvider,
+    ) -> (
+        gpui::WindowHandle<ImportDataView>,
+        Entity<DatabaseStore>,
+        ConnectionId,
+    ) {
+        let connection_id = uuid::Uuid::new_v4();
+        let store = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+
+            let store = cx.new(DatabaseStore::new);
+            store.update(cx, |store, cx| {
+                let mut config = db_client::ConnectionConfig::default();
+                config.id = connection_id;
+                store.add_connected_for_test(config, std::sync::Arc::new(provider), cx);
+            });
+            store
+        });
+        let window = cx.add_window({
+            let store = store.clone();
+            move |window, cx| {
+                ImportDataView::new(
+                    store,
+                    connection_id,
+                    "public".to_string(),
+                    "people".to_string(),
+                    DatabaseDriver::MySQL,
+                    vec!["id".to_string(), "name".to_string()],
+                    window,
+                    cx,
+                )
+            }
+        });
+        (window, store, connection_id)
+    }
+
+    #[gpui::test]
+    async fn import_continues_past_a_failed_row_and_writes_it_to_an_error_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _store, _connection_id) = test_import_view(
+            cx,
+            RecordingProvider {
+                log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_containing: Some("BAD"),
+            },
+        );
+
+        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let csv_path = dir.join("rows.csv");
+        std::fs::write(&csv_path, "id,name\n1,Alice\n2,BAD\n3,Claire\n").expect("write fixture csv");
+        let csv_path_string = csv_path.to_string_lossy().to_string();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.path_editor
+                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.load_file(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.mapping = vec![Some(0), Some(1)];
+                view.continue_on_error = true;
+                view.run_import(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let status = window
+            .read_with(cx, |view, _cx| view.status.clone())
+            .unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some(format!("Imported 2 rows, 1 failed (see {csv_path_string}.errors.txt).").as_str()),
+            "real per-row failures should be counted and reported without aborting: {status:?}"
+        );
+
+        let error_path = format!("{csv_path_string}.errors.txt");
+        let error_contents =
+            std::fs::read_to_string(&error_path).expect("the error file should have been written");
+        assert_eq!(
+            error_contents.trim(),
+            "2,BAD",
+            "the failed row's raw text must appear in the error file, valid rows must not"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn import_disables_and_reenables_indexes_around_a_mysql_load(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (window, _store, _connection_id) = test_import_view(
+            cx,
+            RecordingProvider {
+                log: log.clone(),
+                fail_containing: None,
+            },
+        );
+
+        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let csv_path = dir.join("rows.csv");
+        std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").expect("write fixture csv");
+        let csv_path_string = csv_path.to_string_lossy().to_string();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.path_editor
+                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.load_file(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.mapping = vec![Some(0), Some(1)];
+                view.disable_indexes = true;
+                view.run_import(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let statements = log.lock().unwrap().clone();
+        assert_eq!(
+            statements.first().map(String::as_str),
+            Some("ALTER TABLE `people` DISABLE KEYS"),
+            "the disable statement must run before any row insert: {statements:?}"
+        );
+        assert_eq!(
+            statements.last().map(String::as_str),
+            Some("ALTER TABLE `people` ENABLE KEYS"),
+            "the re-enable statement must run after every row insert: {statements:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn import_decodes_a_non_utf8_file_using_the_selected_charset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _store, _connection_id) = test_import_view(
+            cx,
+            RecordingProvider {
+                log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_containing: None,
+            },
+        );
+
+        // "Имя" (name, in Cyrillic) encoded as windows-1251, not valid UTF-8.
+        let (encoded, _, _) = encoding_rs::WINDOWS_1251.encode("id,Имя\n1,Тест\n");
+        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let csv_path = dir.join("cyrillic.csv");
+        std::fs::write(&csv_path, &encoded).expect("write fixture csv");
+        let csv_path_string = csv_path.to_string_lossy().to_string();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.path_editor
+                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.charset = "windows-1251";
+                view.load_file(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let parsed = window.read_with(cx, |view, _cx| view.parsed.clone()).unwrap();
+        let parsed = parsed.expect("file should have loaded and parsed");
+        assert_eq!(parsed.headers, vec!["id".to_string(), "Имя".to_string()]);
+        assert_eq!(parsed.rows, vec![vec!["1".to_string(), "Тест".to_string()]]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
