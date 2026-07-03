@@ -1,11 +1,11 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
-use crate::connection::ConnectionConfig;
+use crate::connection::{ConnectionConfig, SslMode};
 use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
@@ -17,14 +17,38 @@ pub struct PostgresProvider {
     pool: PgPool,
 }
 
+fn postgres_ssl_mode(mode: SslMode) -> PgSslMode {
+    match mode {
+        SslMode::Disabled => PgSslMode::Disable,
+        SslMode::Require => PgSslMode::Require,
+        SslMode::VerifyCa => PgSslMode::VerifyCa,
+        SslMode::VerifyFull => PgSslMode::VerifyFull,
+    }
+}
+
+pub(crate) fn postgres_connect_options(config: &ConnectionConfig) -> PgConnectOptions {
+    let mut opts = PgConnectOptions::new()
+        .host(&config.host)
+        .port(config.port)
+        .username(&config.username)
+        .password(&config.password)
+        .database(config.database.as_deref().unwrap_or("postgres"))
+        .ssl_mode(postgres_ssl_mode(config.ssl_mode));
+    if let Some(ca_path) = &config.ssl_ca_path {
+        opts = opts.ssl_root_cert(ca_path);
+    }
+    if let Some(cert_path) = &config.ssl_client_cert_path {
+        opts = opts.ssl_client_cert(cert_path);
+    }
+    if let Some(key_path) = &config.ssl_client_key_path {
+        opts = opts.ssl_client_key(key_path);
+    }
+    opts
+}
+
 impl PostgresProvider {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
-        let opts = PgConnectOptions::new()
-            .host(&config.host)
-            .port(config.port)
-            .username(&config.username)
-            .password(&config.password)
-            .database(config.database.as_deref().unwrap_or("postgres"));
+        let opts = postgres_connect_options(config);
         // Single connection: `execute_query` relies on `SET search_path`
         // staying applied for the query that follows it, which only holds
         // when both run on the same physical connection. The metadata
@@ -413,6 +437,55 @@ impl DbProvider for PostgresProvider {
 
 /// Integration tests against a real Postgres server.
 ///
+#[cfg(test)]
+mod connect_options_tests {
+    use super::postgres_connect_options;
+    use crate::connection::{ConnectionConfig, DatabaseDriver, SslMode};
+    use sqlx::postgres::PgSslMode;
+
+    fn base_config() -> ConnectionConfig {
+        ConnectionConfig {
+            driver: DatabaseDriver::PostgreSQL,
+            host: "db.example.com".to_string(),
+            port: 5432,
+            username: "postgres".to_string(),
+            password: "secret".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ssl_mode_disabled_by_default() {
+        let opts = postgres_connect_options(&base_config());
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::Disable));
+    }
+
+    #[test]
+    fn ssl_mode_require_maps_to_require() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::Require;
+        let opts = postgres_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::Require));
+    }
+
+    #[test]
+    fn ssl_mode_verify_ca_maps_to_verify_ca() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::VerifyCa;
+        config.ssl_ca_path = Some("/tmp/ca.pem".to_string());
+        let opts = postgres_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::VerifyCa));
+    }
+
+    #[test]
+    fn ssl_mode_verify_full_maps_to_verify_full() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::VerifyFull;
+        let opts = postgres_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull));
+    }
+}
+
 /// Set POSTGRES_TEST_URL=postgres://user:password@host:port/dbname before
 /// running, then use `cargo test -p db_client -- --include-ignored` to
 /// execute. Mirrors the MySQL provider's integration_tests convention.

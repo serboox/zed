@@ -11,6 +11,7 @@ pub mod ssh_tunnel;
 
 pub use connection::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, MAX_FOLDER_DEPTH,
+    SshAuthMethod, SslMode,
 };
 pub use provider::DbProvider;
 pub use runtime::{RuntimeProvider, on_runtime};
@@ -18,7 +19,7 @@ pub use schema::{
     ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult,
     TableInfo, TableKind, TriggerInfo, UserInfo,
 };
-pub use ssh_tunnel::SshTunnel;
+pub use ssh_tunnel::{SshAuth, SshTunnel};
 
 /// Client name reported to the server in the `ApplicationName` tag (useful for
 /// query analytics). Neutral by default; override via `application_name_comment`

@@ -2,7 +2,7 @@ use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
-    RuntimeProvider, SshTunnel,
+    RuntimeProvider, SshAuth, SshAuthMethod, SshTunnel,
     clickhouse::ClickHouseProvider,
     mysql::MySqlProvider,
     on_runtime,
@@ -118,11 +118,19 @@ fn connection_credentials_url(id: ConnectionId) -> String {
     format!("db_client://connection/{id}")
 }
 
-/// Returns a copy of `config` with the password cleared. The on-disk JSON must
-/// never hold the plaintext password; the secret lives in the OS keychain.
+/// Keychain key for a connection's SSH tunnel password. Separate entry from
+/// the DB password so the two secrets don't collide or get confused.
+fn ssh_connection_credentials_url(id: ConnectionId) -> String {
+    format!("db_client://connection/{id}/ssh")
+}
+
+/// Returns a copy of `config` with both the DB password and the SSH tunnel
+/// password cleared. The on-disk JSON must never hold either plaintext
+/// secret; both live in the OS keychain.
 fn redact_password(config: &ConnectionConfig) -> ConnectionConfig {
     let mut redacted = config.clone();
     redacted.password = String::new();
+    redacted.ssh_password = String::new();
     redacted
 }
 
@@ -152,6 +160,32 @@ async fn read_connection_password(
 ) -> Result<Option<String>> {
     let credentials = provider
         .read_credentials(&connection_credentials_url(id), cx)
+        .await?;
+    Ok(credentials.map(|(_username, password)| String::from_utf8_lossy(&password).into_owned()))
+}
+
+async fn store_connection_ssh_password(
+    provider: &Arc<dyn CredentialsProvider>,
+    config: &ConnectionConfig,
+    cx: &AsyncApp,
+) -> Result<()> {
+    provider
+        .write_credentials(
+            &ssh_connection_credentials_url(config.id),
+            config.ssh_username.as_deref().unwrap_or(""),
+            config.ssh_password.as_bytes(),
+            cx,
+        )
+        .await
+}
+
+async fn read_connection_ssh_password(
+    provider: &Arc<dyn CredentialsProvider>,
+    id: ConnectionId,
+    cx: &AsyncApp,
+) -> Result<Option<String>> {
+    let credentials = provider
+        .read_credentials(&ssh_connection_credentials_url(id), cx)
         .await?;
     Ok(credentials.map(|(_username, password)| String::from_utf8_lossy(&password).into_owned()))
 }
@@ -261,6 +295,18 @@ impl DatabaseStore {
                                     .flatten()
                             {
                                 config.password = password;
+                            }
+                        }
+                        if config.ssh_auth_method == SshAuthMethod::Password
+                            && config.ssh_password.is_empty()
+                        {
+                            if let Some(password) =
+                                read_connection_ssh_password(&provider, config.id, cx)
+                                    .await
+                                    .log_err()
+                                    .flatten()
+                            {
+                                config.ssh_password = password;
                             }
                         }
                     }
@@ -677,6 +723,10 @@ impl DatabaseStore {
                 .delete_credentials(&connection_credentials_url(id), cx)
                 .await
                 .log_err();
+            provider
+                .delete_credentials(&ssh_connection_credentials_url(id), cx)
+                .await
+                .log_err();
         })
         .detach();
         self.persist_connections(cx);
@@ -697,6 +747,13 @@ impl DatabaseStore {
             for config in &configs {
                 if !config.password.is_empty() {
                     store_connection_password(&provider, config, cx)
+                        .await
+                        .log_err();
+                }
+                if config.ssh_auth_method == SshAuthMethod::Password
+                    && !config.ssh_password.is_empty()
+                {
+                    store_connection_ssh_password(&provider, config, cx)
                         .await
                         .log_err();
                 }
@@ -1714,11 +1771,15 @@ async fn build_provider(
 ) -> Result<(Arc<dyn DbProvider>, Option<SshTunnel>)> {
     let (effective_config, tunnel) = if config.uses_ssh() {
         let ssh_host = config.ssh_host.as_deref().unwrap_or_default();
+        let auth = match config.ssh_auth_method {
+            SshAuthMethod::Password => SshAuth::Password(&config.ssh_password),
+            SshAuthMethod::KeyFile => SshAuth::KeyFile(config.ssh_private_key_path.as_deref()),
+        };
         let tunnel = SshTunnel::establish(
             ssh_host,
             config.ssh_port,
             config.ssh_username.as_deref(),
-            config.ssh_private_key_path.as_deref(),
+            auth,
             &config.host,
             config.port,
         )
@@ -2061,6 +2122,16 @@ mod tests {
     }
 
     #[test]
+    fn redacts_ssh_password_too() {
+        let config = ConnectionConfig {
+            ssh_password: "tunnel-secret".to_string(),
+            ..ConnectionConfig::default()
+        };
+        let redacted = redact_password(&config);
+        assert!(redacted.ssh_password.is_empty());
+    }
+
+    #[test]
     fn credentials_url_is_stable_per_id() {
         let id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -2094,6 +2165,54 @@ mod tests {
             .await
             .expect("read password");
         assert_eq!(after, None);
+    }
+
+    #[gpui::test]
+    async fn ssh_password_roundtrips_through_provider_independently_of_db_password(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let provider: Arc<dyn CredentialsProvider> = Arc::new(MockCredentials::default());
+        let config = ConnectionConfig {
+            password: "db-secret".to_string(),
+            ssh_auth_method: SshAuthMethod::Password,
+            ssh_password: "tunnel-secret".to_string(),
+            ..ConnectionConfig::default()
+        };
+        let async_cx = cx.to_async();
+
+        store_connection_password(&provider, &config, &async_cx)
+            .await
+            .expect("write db password");
+        store_connection_ssh_password(&provider, &config, &async_cx)
+            .await
+            .expect("write ssh password");
+
+        let db_password = read_connection_password(&provider, config.id, &async_cx)
+            .await
+            .expect("read db password");
+        let ssh_password = read_connection_ssh_password(&provider, config.id, &async_cx)
+            .await
+            .expect("read ssh password");
+        assert_eq!(db_password.as_deref(), Some("db-secret"));
+        assert_eq!(ssh_password.as_deref(), Some("tunnel-secret"));
+
+        provider
+            .delete_credentials(&ssh_connection_credentials_url(config.id), &async_cx)
+            .await
+            .expect("delete ssh password");
+        let db_password_still_there = read_connection_password(&provider, config.id, &async_cx)
+            .await
+            .expect("read db password");
+        let ssh_password_after_delete =
+            read_connection_ssh_password(&provider, config.id, &async_cx)
+                .await
+                .expect("read ssh password");
+        assert_eq!(
+            db_password_still_there.as_deref(),
+            Some("db-secret"),
+            "deleting the SSH secret must not touch the unrelated DB password entry"
+        );
+        assert_eq!(ssh_password_after_delete, None);
     }
 
     struct SchemaMockProvider;

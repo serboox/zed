@@ -1,5 +1,5 @@
 use crate::driver_icon::brand_icon;
-use db_client::{ConnectionConfig, DatabaseDriver};
+use db_client::{ConnectionConfig, DatabaseDriver, SshAuthMethod, SslMode};
 use editor::Editor;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
@@ -68,6 +68,12 @@ pub struct ConnectionView {
     ssh_port_editor: Entity<Editor>,
     ssh_username_editor: Entity<Editor>,
     ssh_key_path_editor: Entity<Editor>,
+    ssh_auth_method: SshAuthMethod,
+    ssh_password_editor: Entity<Editor>,
+    ssl_mode: SslMode,
+    ssl_ca_path_editor: Entity<Editor>,
+    ssl_client_cert_path_editor: Entity<Editor>,
+    ssl_client_key_path_editor: Entity<Editor>,
     test_state: TestState,
     pub on_confirm: Option<Box<dyn FnOnce(ConnectionConfig, &mut App)>>,
 }
@@ -102,6 +108,12 @@ impl ConnectionView {
         let ssh_port_editor = make_editor("SSH Port", "22", window, cx);
         let ssh_username_editor = make_editor("SSH Username", "", window, cx);
         let ssh_key_path_editor = make_editor("~/.ssh/id_rsa", "", window, cx);
+        let ssh_password_editor = make_editor("SSH Password", "", window, cx);
+        let ssl_ca_path_editor = make_editor("CA Certificate Path (optional)", "", window, cx);
+        let ssl_client_cert_path_editor =
+            make_editor("Client Certificate Path (optional)", "", window, cx);
+        let ssl_client_key_path_editor =
+            make_editor("Client Key Path (optional)", "", window, cx);
 
         Self {
             focus_handle,
@@ -122,6 +134,12 @@ impl ConnectionView {
             ssh_port_editor,
             ssh_username_editor,
             ssh_key_path_editor,
+            ssh_auth_method: SshAuthMethod::KeyFile,
+            ssh_password_editor,
+            ssl_mode: SslMode::Disabled,
+            ssl_ca_path_editor,
+            ssl_client_cert_path_editor,
+            ssl_client_key_path_editor,
             test_state: TestState::Idle,
             on_confirm: None,
         }
@@ -194,6 +212,26 @@ impl ConnectionView {
             window,
             cx,
         );
+        let ssh_password_editor =
+            make_editor("SSH Password", &config.ssh_password, window, cx);
+        let ssl_ca_path_editor = make_editor(
+            "CA Certificate Path (optional)",
+            config.ssl_ca_path.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        let ssl_client_cert_path_editor = make_editor(
+            "Client Certificate Path (optional)",
+            config.ssl_client_cert_path.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        let ssl_client_key_path_editor = make_editor(
+            "Client Key Path (optional)",
+            config.ssl_client_key_path.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
 
         Self {
             focus_handle,
@@ -214,6 +252,12 @@ impl ConnectionView {
             ssh_port_editor,
             ssh_username_editor,
             ssh_key_path_editor,
+            ssh_auth_method: config.ssh_auth_method,
+            ssh_password_editor,
+            ssl_mode: config.ssl_mode,
+            ssl_ca_path_editor,
+            ssl_client_cert_path_editor,
+            ssl_client_key_path_editor,
             test_state: TestState::Idle,
             on_confirm: None,
         }
@@ -314,6 +358,18 @@ impl ConnectionView {
         } else {
             None
         };
+        let ssh_password = if self.use_ssh {
+            Self::read_text(&self.ssh_password_editor, cx)
+        } else {
+            String::new()
+        };
+        let ssh_auth_method = self.ssh_auth_method;
+
+        let ssl_mode = self.ssl_mode;
+        let non_empty = |text: String| if text.is_empty() { None } else { Some(text) };
+        let ssl_ca_path = non_empty(Self::read_text(&self.ssl_ca_path_editor, cx));
+        let ssl_client_cert_path = non_empty(Self::read_text(&self.ssl_client_cert_path_editor, cx));
+        let ssl_client_key_path = non_empty(Self::read_text(&self.ssl_client_key_path_editor, cx));
 
         if driver.is_file_based() {
             let path = Self::read_text(&self.host_editor, cx);
@@ -343,6 +399,12 @@ impl ConnectionView {
                 ssh_port,
                 ssh_username,
                 ssh_private_key_path,
+                ssh_auth_method,
+                ssh_password,
+                ssl_mode,
+                ssl_ca_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
                 folder,
                 folder_id: None,
                 order: 0,
@@ -384,12 +446,42 @@ impl ConnectionView {
             ssh_port,
             ssh_username,
             ssh_private_key_path,
+            ssh_auth_method,
+            ssh_password,
+            ssl_mode,
+            ssl_ca_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
             folder,
             folder_id: None,
             order: 0,
             env_color,
             read_only: self.read_only,
         })
+    }
+
+    fn render_chip(
+        label: &'static str,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &gpui::ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .id(SharedString::from(format!("chip-{label}")))
+            .debug_selector(move || format!("chip-{label}"))
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_selected, |el| el.bg(colors.element_selected))
+            .when(!is_selected, |el| el.hover(|el| el.bg(colors.element_hover)))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::Small)
+                    .color(if is_selected { Color::Default } else { Color::Muted }),
+            )
+            .on_click(cx.listener(on_click))
     }
 
     fn render_field(
@@ -679,6 +771,87 @@ impl Render for ConnectionView {
                     field_border,
                     field_bg,
                 ))
+                .when(
+                    matches!(
+                        selected_driver,
+                        DatabaseDriver::MySQL | DatabaseDriver::PostgreSQL
+                    ),
+                    |el| {
+                        el.child(
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Label::new("SSL Mode").size(LabelSize::Small).color(Color::Muted))
+                                        .child(Self::render_chip(
+                                            "Disabled",
+                                            self.ssl_mode == SslMode::Disabled,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.ssl_mode = SslMode::Disabled;
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(Self::render_chip(
+                                            "Require",
+                                            self.ssl_mode == SslMode::Require,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.ssl_mode = SslMode::Require;
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(Self::render_chip(
+                                            "Verify CA",
+                                            self.ssl_mode == SslMode::VerifyCa,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.ssl_mode = SslMode::VerifyCa;
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(Self::render_chip(
+                                            "Verify Full",
+                                            self.ssl_mode == SslMode::VerifyFull,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.ssl_mode = SslMode::VerifyFull;
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                                .when(
+                                    matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull),
+                                    |el| {
+                                        el.child(Self::render_field(
+                                            "CA Certificate Path",
+                                            self.ssl_ca_path_editor.clone(),
+                                            field_border,
+                                            field_bg,
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(div().flex_1().child(Self::render_field(
+                                                    "Client Certificate Path",
+                                                    self.ssl_client_cert_path_editor.clone(),
+                                                    field_border,
+                                                    field_bg,
+                                                )))
+                                                .child(div().flex_1().child(Self::render_field(
+                                                    "Client Key Path",
+                                                    self.ssl_client_key_path_editor.clone(),
+                                                    field_border,
+                                                    field_bg,
+                                                ))),
+                                        )
+                                    },
+                                ),
+                        )
+                    },
+                )
             })
             .child(
                 h_flex()
@@ -723,22 +896,49 @@ impl Render for ConnectionView {
                                     field_bg,
                                 ))),
                         )
+                        .child(Self::render_field(
+                            "SSH Username",
+                            self.ssh_username_editor.clone(),
+                            field_border,
+                            field_bg,
+                        ))
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(div().flex_1().child(Self::render_field(
-                                    "SSH Username",
-                                    self.ssh_username_editor.clone(),
-                                    field_border,
-                                    field_bg,
-                                )))
-                                .child(div().flex_1().child(Self::render_field(
-                                    "Private Key Path",
-                                    self.ssh_key_path_editor.clone(),
-                                    field_border,
-                                    field_bg,
-                                ))),
-                        ),
+                                .child(Self::render_chip(
+                                    "Key File",
+                                    self.ssh_auth_method == SshAuthMethod::KeyFile,
+                                    cx,
+                                    |this, _, _, cx| {
+                                        this.ssh_auth_method = SshAuthMethod::KeyFile;
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(Self::render_chip(
+                                    "Password",
+                                    self.ssh_auth_method == SshAuthMethod::Password,
+                                    cx,
+                                    |this, _, _, cx| {
+                                        this.ssh_auth_method = SshAuthMethod::Password;
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                        .child(if self.ssh_auth_method == SshAuthMethod::KeyFile {
+                            Self::render_field(
+                                "Private Key Path",
+                                self.ssh_key_path_editor.clone(),
+                                field_border,
+                                field_bg,
+                            )
+                        } else {
+                            Self::render_field(
+                                "SSH Password",
+                                self.ssh_password_editor.clone(),
+                                field_border,
+                                field_bg,
+                            )
+                        }),
                 )
             })
             .child(div().h(px(1.)).w_full().bg(divider))
@@ -979,6 +1179,72 @@ mod tests {
             config.read_only,
             "a real click on the read-only checkbox must flip the built config's flag"
         );
+    }
+
+    #[gpui::test]
+    async fn clicking_ssl_mode_and_ssh_auth_chips_updates_the_built_config(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.host_editor
+                    .update(cx, |ed, cx| ed.set_text("db.example.com", window, cx));
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("root", window, cx));
+                view.use_ssh = true;
+                view.ssh_host_editor
+                    .update(cx, |ed, cx| ed.set_text("bastion.example.com", window, cx));
+                view.ssh_username_editor
+                    .update(cx, |ed, cx| ed.set_text("tunneluser", window, cx));
+            })
+            .unwrap();
+
+        let default_config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert_eq!(default_config.ssl_mode, SslMode::Disabled);
+        assert_eq!(default_config.ssh_auth_method, SshAuthMethod::KeyFile);
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        let require_chip = cx
+            .debug_bounds("chip-Require")
+            .expect("the SSL Require chip should be rendered for a MySQL connection")
+            .center();
+        cx.simulate_click(require_chip, gpui::Modifiers::none());
+
+        let password_chip = cx
+            .debug_bounds("chip-Password")
+            .expect("the SSH auth-method Password chip should be rendered while SSH is enabled")
+            .center();
+        cx.simulate_click(password_chip, gpui::Modifiers::none());
+
+        window
+            .update(cx, |view, window, cx| {
+                view.ssh_password_editor
+                    .update(cx, |ed, cx| ed.set_text("tunnel-secret", window, cx));
+            })
+            .unwrap();
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert_eq!(
+            config.ssl_mode,
+            SslMode::Require,
+            "a real click on the Require chip must select SSL Require in the built config"
+        );
+        assert_eq!(
+            config.ssh_auth_method,
+            SshAuthMethod::Password,
+            "a real click on the Password chip must switch the built config off key-file auth"
+        );
+        assert_eq!(config.ssh_password, "tunnel-secret");
     }
 
     #[gpui::test]

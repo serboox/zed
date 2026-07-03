@@ -1,14 +1,14 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
 pub use crate::{MAX_CELL_BYTES, is_cell_possibly_truncated};
 use crate::{MAX_RESULT_ROWS, cap_cell};
 
-use crate::connection::ConnectionConfig;
+use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
 use crate::schema::{
     ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind, QueryResult,
@@ -19,16 +19,38 @@ pub struct MySqlProvider {
     pool: MySqlPool,
 }
 
+fn mysql_ssl_mode(mode: SslMode) -> MySqlSslMode {
+    match mode {
+        SslMode::Disabled => MySqlSslMode::Disabled,
+        SslMode::Require => MySqlSslMode::Required,
+        SslMode::VerifyCa => MySqlSslMode::VerifyCa,
+        SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+    }
+}
+
+pub(crate) fn mysql_connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
+    let mut opts = MySqlConnectOptions::new()
+        .host(&config.host)
+        .port(config.port)
+        .username(&config.username)
+        .password(&config.password)
+        .database(config.database.as_deref().unwrap_or(""))
+        .ssl_mode(mysql_ssl_mode(config.ssl_mode));
+    if let Some(ca_path) = &config.ssl_ca_path {
+        opts = opts.ssl_ca(ca_path);
+    }
+    if let Some(cert_path) = &config.ssl_client_cert_path {
+        opts = opts.ssl_client_cert(cert_path);
+    }
+    if let Some(key_path) = &config.ssl_client_key_path {
+        opts = opts.ssl_client_key(key_path);
+    }
+    opts
+}
+
 impl MySqlProvider {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
-        let url = format!(
-            "mysql://{}:{}@{}:{}/{}",
-            urlencoding_encode(&config.username),
-            urlencoding_encode(&config.password),
-            config.host,
-            config.port,
-            config.database.as_deref().unwrap_or(""),
-        );
+        let opts = mysql_connect_options(config);
         // Single connection: `execute_query` relies on `USE` staying applied
         // for the query that follows it, which only holds when both run on the
         // same physical connection. The metadata queries are fully qualified,
@@ -36,7 +58,7 @@ impl MySqlProvider {
         // single-user GUI client.
         let pool = MySqlPoolOptions::new()
             .max_connections(1)
-            .connect(&url)
+            .connect_with(opts)
             .await
             .context("Failed to connect to MySQL")?;
         Ok(Self { pool })
@@ -75,49 +97,52 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-pub(crate) fn urlencoding_encode(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                output.push(byte as char);
-            }
-            other => {
-                output.push('%');
-                output.push(char::from_digit((other >> 4) as u32, 16).unwrap_or('0'));
-                output.push(char::from_digit((other & 0xf) as u32, 16).unwrap_or('0'));
-            }
+#[cfg(test)]
+mod connect_options_tests {
+    use super::mysql_connect_options;
+    use crate::connection::{ConnectionConfig, SslMode};
+    use sqlx::mysql::MySqlSslMode;
+
+    fn base_config() -> ConnectionConfig {
+        ConnectionConfig {
+            driver: crate::connection::DatabaseDriver::MySQL,
+            host: "db.example.com".to_string(),
+            port: 3306,
+            username: "root".to_string(),
+            password: "secret".to_string(),
+            ..Default::default()
         }
     }
-    output
-}
-
-#[cfg(test)]
-mod encoding_tests {
-    use super::urlencoding_encode;
 
     #[test]
-    fn test_urlencoding_alphanumeric_passthrough() {
-        assert_eq!(urlencoding_encode("root"), "root");
-        assert_eq!(urlencoding_encode("MyUser123"), "MyUser123");
-        assert_eq!(urlencoding_encode("a-b_c.d~e"), "a-b_c.d~e");
+    fn ssl_mode_disabled_by_default() {
+        let opts = mysql_connect_options(&base_config());
+        assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::Disabled));
     }
 
     #[test]
-    fn test_urlencoding_special_chars() {
-        assert_eq!(urlencoding_encode("p@ss!"), "p%40ss%21");
-        assert_eq!(urlencoding_encode("pa ss"), "pa%20ss");
-        assert_eq!(urlencoding_encode(""), "");
+    fn ssl_mode_require_maps_to_required() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::Require;
+        let opts = mysql_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::Required));
     }
 
     #[test]
-    fn test_urlencoding_at_sign() {
-        assert_eq!(urlencoding_encode("user@host"), "user%40host");
+    fn ssl_mode_verify_ca_maps_to_verify_ca() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::VerifyCa;
+        config.ssl_ca_path = Some("/tmp/ca.pem".to_string());
+        let opts = mysql_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::VerifyCa));
     }
 
     #[test]
-    fn test_urlencoding_slash() {
-        assert_eq!(urlencoding_encode("pass/word"), "pass%2fword");
+    fn ssl_mode_verify_full_maps_to_verify_identity() {
+        let mut config = base_config();
+        config.ssl_mode = SslMode::VerifyFull;
+        let opts = mysql_connect_options(&config);
+        assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::VerifyIdentity));
     }
 }
 

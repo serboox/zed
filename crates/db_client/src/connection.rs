@@ -80,6 +80,30 @@ impl DatabaseDriver {
     }
 }
 
+/// SSL/TLS mode for network drivers that support encrypted connections
+/// (MySQL, PostgreSQL). Maps onto each driver's native SSL mode enum at
+/// connect time — see `DatabaseDriver`-specific connect-options builders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SslMode {
+    /// Establish an unencrypted connection.
+    #[default]
+    Disabled,
+    /// Require an encrypted connection; fail if one cannot be established.
+    Require,
+    /// Require encryption and verify the server certificate against `ssl_ca_path`.
+    VerifyCa,
+    /// Like `VerifyCa`, but also verify the server host name matches the certificate.
+    VerifyFull,
+}
+
+/// How the SSH tunnel authenticates to the bastion host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SshAuthMethod {
+    #[default]
+    KeyFile,
+    Password,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: ConnectionId,
@@ -101,6 +125,22 @@ pub struct ConnectionConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_private_key_path: Option<String>,
+    /// Chooses between `ssh_private_key_path` and `ssh_password` for tunnel auth.
+    #[serde(default)]
+    pub ssh_auth_method: SshAuthMethod,
+    /// Plaintext only in memory; redacted to empty before the connection tree
+    /// is written to disk, same as `password`. The real secret lives in the
+    /// OS keychain.
+    #[serde(default)]
+    pub ssh_password: String,
+    #[serde(default)]
+    pub ssl_mode: SslMode,
+    #[serde(default)]
+    pub ssl_ca_path: Option<String>,
+    #[serde(default)]
+    pub ssl_client_cert_path: Option<String>,
+    #[serde(default)]
+    pub ssl_client_key_path: Option<String>,
     /// Legacy flat folder name, kept only so old config files still load. New
     /// code groups by `folder_id`; migration converts this into a `Folder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +192,12 @@ impl Default for ConnectionConfig {
             ssh_port: 22,
             ssh_username: None,
             ssh_private_key_path: None,
+            ssh_auth_method: SshAuthMethod::KeyFile,
+            ssh_password: String::new(),
+            ssl_mode: SslMode::Disabled,
+            ssl_ca_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
             folder: None,
             folder_id: None,
             order: 0,
