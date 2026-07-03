@@ -229,14 +229,13 @@ impl<T: ScrollableHandle> UniformListDecoration for ScrollbarStateWrapper<T> {
         &self,
         _visible_range: Range<usize>,
         _bounds: Bounds<Pixels>,
-        scroll_offset: Point<Pixels>,
+        _scroll_offset: Point<Pixels>,
         _item_height: Pixels,
         _item_count: usize,
         _window: &mut Window,
         _cx: &mut App,
     ) -> gpui::AnyElement {
         ScrollbarElement {
-            origin: -scroll_offset,
             state: self.0.clone(),
         }
         .into_any()
@@ -902,23 +901,34 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
 
 impl<T: ScrollableHandle> Render for ScrollbarState<T> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // This scrollbar is a normal child of the div it decorates (see
-        // `render_scrollbar`), so GPUI's own `overflow_scroll` paint-time
-        // offset shifts it exactly like any other child of that scrollable
-        // content. Counter that shift so the thumb stays pinned to the
-        // viewport regardless of scroll position on either axis -- the same
-        // compensation `UniformListDecoration::compute` already applies for
-        // list-based scrollbars, which sit outside the normal child flow.
-        ScrollbarElement {
-            state: cx.entity(),
-            origin: -self.scroll_handle().offset(),
-        }
+        ScrollbarElement { state: cx.entity() }
     }
 }
 
 struct ScrollbarElement<T: ScrollableHandle> {
-    origin: Point<Pixels>,
     state: Entity<ScrollbarState<T>>,
+}
+
+impl<T: ScrollableHandle> ScrollbarElement<T> {
+    // This scrollbar is a normal child of the div it decorates (see
+    // `render_scrollbar`), so GPUI's own `overflow_scroll` paint-time offset
+    // shifts it exactly like any other child of that scrollable content.
+    // Counter that shift so the thumb stays pinned to the viewport
+    // regardless of scroll position on either axis -- the same compensation
+    // `UniformListDecoration::compute` already applies for list-based
+    // scrollbars, which sit outside the normal child flow.
+    //
+    // This must be read fresh on every `prepaint`/`paint` call rather than
+    // captured once in `Render::render`: a fast scroll can fire several
+    // offset updates on the scrolled content's own element (applied
+    // immediately by GPUI, no entity notify needed) before this entity's
+    // `render` runs again, so a value cached at render time lags behind the
+    // content it's supposed to track -- the visible symptom was the
+    // scrollbar's own track jumping to the wrong position on every such
+    // frame ("shaking") whenever the user scrolled quickly.
+    fn origin(&self, cx: &App) -> Point<Pixels> {
+        -self.state.read(cx).scroll_handle().offset()
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -1148,6 +1158,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let origin = self.origin(cx);
         let prepaint_state =
             self.state
                 .read(cx)
@@ -1176,7 +1187,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
 
                                 let scroll_track_bounds = Bounds::from_anchor_and_size(
                                     track_anchor,
-                                    self.origin + bounds.corner(track_anchor),
+                                    origin + bounds.corner(track_anchor),
                                     bounds.size.apply_along(axis.invert(), |_| {
                                         width
                                             + match state.style {
@@ -1315,7 +1326,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
             return;
         };
 
-        let bounds = Bounds::new(self.origin + origin, size);
+        let bounds = Bounds::new(self.origin(cx) + origin, size);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let colors = cx.theme().colors();
 
@@ -1729,6 +1740,79 @@ mod tests {
             v_before.origin.y, v_after.origin.y,
             "the vertical thumb's along-axis (vertical) position MUST move when scrolling \
              vertically -- this is the regression-proof half of the fix"
+        );
+    }
+
+    // Mirrors `generic_scrollbar_cross_axis_position_is_unaffected_by_scroll`
+    // with the axes swapped -- the exact real-world report was "the vertical
+    // scrollbar shakes when you swipe horizontally". Also fires several
+    // offset changes before a single draw, matching how a fast wheel scroll
+    // dispatches multiple deltas well before the scrollbar entity's own
+    // render cycle would otherwise catch up: `ScrollbarState::render` used to
+    // capture the compensating origin once per render, so a rapid scroll
+    // could paint several frames against a stale offset. The fix computes it
+    // fresh on every `prepaint`/`paint` instead.
+    #[gpui::test]
+    fn generic_scrollbar_vertical_thumb_position_is_unaffected_by_a_fast_horizontal_scroll(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let handle = ScrollHandle::new();
+        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame { handle: handle.clone(), state: None });
+        let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let v_before = view
+            .update(cx, |frame, _window, cx| {
+                frame
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |state, _cx| state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds))
+            })
+            .unwrap()
+            .expect("vertical thumb should exist before scroll");
+
+        // Several horizontal offset changes in a row, with no draw between
+        // them -- exactly what a fast wheel scroll produces before the next
+        // paint. Only the LAST one should matter to the final paint.
+        handle.set_offset(point(px(-100.), px(0.)));
+        handle.set_offset(point(px(-300.), px(0.)));
+        handle.set_offset(point(px(-700.), px(0.)));
+        handle.set_offset(point(px(-1000.), px(0.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let v_after = view
+            .update(cx, |frame, _window, cx| {
+                frame
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |state, _cx| state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds))
+            })
+            .unwrap()
+            .expect("vertical thumb should still exist after a horizontal scroll");
+
+        assert_eq!(
+            v_before.origin.x, v_after.origin.x,
+            "the vertical thumb's on-screen horizontal position must not drift after a fast \
+             horizontal scroll: before {:?}, after {:?}",
+            v_before, v_after
+        );
+        assert_eq!(
+            v_before.origin.y, v_after.origin.y,
+            "the vertical thumb's on-screen vertical position must not move just because the \
+             HORIZONTAL offset changed: before {:?}, after {:?}",
+            v_before, v_after
         );
     }
 

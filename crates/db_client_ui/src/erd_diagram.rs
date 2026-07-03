@@ -1293,4 +1293,86 @@ mod tests {
         })
         .expect("window should build");
     }
+
+    // Mirrors `scroll_container_geometry_stays_stable_across_a_scroll_and_an_idle_render`
+    // but scrolls the HORIZONTAL axis only -- the exact inverse of that test,
+    // and the exact user-reported symptom ("the vertical scrollbar shakes
+    // when you swipe horizontally"). A real horizontal wheel event goes
+    // through the container's own scroll handling (unlike the mirrored test,
+    // which sets the offset directly), since input plumbing is precisely
+    // what a wheel-driven horizontal scroll needs to prove.
+    #[gpui::test]
+    fn scroll_container_geometry_stays_stable_across_a_horizontal_scroll(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(6);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+
+        let bounds_initial = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should have painted bounds");
+        let max_offset_initial = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+        assert!(
+            max_offset_initial.x > px(0.),
+            "expected horizontal overflow for 6 tables at 3/row in a 400px-wide viewport, got \
+             {max_offset_initial:?}"
+        );
+
+        let center = bounds_initial.center();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: center,
+            delta: gpui::ScrollDelta::Pixels(point(-max_offset_initial.x / 2.0, px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        draw_erd_frame(&mut cx);
+
+        let offset_after = erd.read_with(&cx, |view, _| view.scroll_handle.offset());
+        assert!(
+            offset_after.x < px(0.),
+            "a real horizontal wheel event must actually move the horizontal scroll offset, got \
+             {offset_after:?}"
+        );
+        assert_eq!(
+            offset_after.y,
+            px(0.),
+            "a horizontal-only wheel event must not touch the vertical offset"
+        );
+
+        let bounds_after_h_scroll = cx
+            .debug_bounds("ERD_SCROLL")
+            .expect("scroll container should still have painted bounds after a scroll");
+        let max_offset_after_h_scroll =
+            erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+
+        assert_eq!(
+            bounds_after_h_scroll.origin, bounds_initial.origin,
+            "the scroll container's own on-screen position must not move because its CONTENT \
+             scrolled horizontally -- a horizontal scroll must never shift the container's \
+             origin (this is the user-reported 'vertical scrollbar shakes' symptom)"
+        );
+        assert_eq!(
+            bounds_after_h_scroll.size, bounds_initial.size,
+            "the scroll container's own on-screen size must not change because its content \
+             scrolled horizontally"
+        );
+        assert_eq!(
+            max_offset_after_h_scroll, max_offset_initial,
+            "max_offset must not change just because the current horizontal scroll position \
+             changed"
+        );
+    }
+
 }
