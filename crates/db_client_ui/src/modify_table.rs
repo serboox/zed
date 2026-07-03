@@ -1,5 +1,5 @@
 use db_client::connection::{ConnectionId, DatabaseDriver};
-use db_client::schema::ColumnInfo;
+use db_client::schema::{CheckConstraintInfo, ColumnInfo, FkInfo, IndexInfo};
 use editor::Editor;
 use gpui::{
     Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*,
@@ -241,6 +241,286 @@ fn fold_mysql_rename_modify(
 }
 
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexChange {
+    Add {
+        name: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
+    Drop {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForeignKeyChange {
+    Add {
+        name: String,
+        from_column: String,
+        to_table: String,
+        to_column: String,
+    },
+    Drop {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckChange {
+    Add { name: String, expression: String },
+    Drop { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IndexDraftSnapshot {
+    original_name: Option<String>,
+    name: String,
+    columns_csv: String,
+    unique: bool,
+    dropped: bool,
+}
+
+fn index_diff_changes(drafts: &[IndexDraftSnapshot]) -> Vec<IndexChange> {
+    let mut changes = Vec::new();
+    for draft in drafts {
+        match &draft.original_name {
+            None if !draft.dropped && !draft.name.trim().is_empty() => {
+                let columns: Vec<String> = draft
+                    .columns_csv
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !columns.is_empty() {
+                    changes.push(IndexChange::Add {
+                        name: draft.name.trim().to_string(),
+                        columns,
+                        unique: draft.unique,
+                    });
+                }
+            }
+            // Editing an existing index's columns or uniqueness in place isn't
+            // supported by any dialect directly; drop it and add a
+            // replacement instead.
+            Some(original_name) if draft.dropped => {
+                changes.push(IndexChange::Drop {
+                    name: original_name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
+pub fn generate_index_statements(
+    table: &str,
+    driver: DatabaseDriver,
+    changes: &[IndexChange],
+) -> Vec<String> {
+    let table_ident = driver.quote_identifier(table);
+    changes
+        .iter()
+        .map(|change| match change {
+            IndexChange::Add {
+                name,
+                columns,
+                unique,
+            } => {
+                let cols = columns
+                    .iter()
+                    .map(|c| driver.quote_identifier(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let unique_kw = if *unique { "UNIQUE " } else { "" };
+                format!(
+                    "CREATE {unique_kw}INDEX {} ON {table_ident} ({cols});",
+                    driver.quote_identifier(name)
+                )
+            }
+            IndexChange::Drop { name } => match driver {
+                DatabaseDriver::MySQL => format!(
+                    "ALTER TABLE {table_ident} DROP INDEX {};",
+                    driver.quote_identifier(name)
+                ),
+                _ => format!("DROP INDEX {};", driver.quote_identifier(name)),
+            },
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FkDraftSnapshot {
+    original_name: Option<String>,
+    name: String,
+    from_column: String,
+    to_table: String,
+    to_column: String,
+    dropped: bool,
+}
+
+fn fk_diff_changes(drafts: &[FkDraftSnapshot]) -> Vec<ForeignKeyChange> {
+    let mut changes = Vec::new();
+    for draft in drafts {
+        match &draft.original_name {
+            None if !draft.dropped
+                && !draft.name.trim().is_empty()
+                && !draft.from_column.trim().is_empty()
+                && !draft.to_table.trim().is_empty()
+                && !draft.to_column.trim().is_empty() =>
+            {
+                changes.push(ForeignKeyChange::Add {
+                    name: draft.name.trim().to_string(),
+                    from_column: draft.from_column.trim().to_string(),
+                    to_table: draft.to_table.trim().to_string(),
+                    to_column: draft.to_column.trim().to_string(),
+                });
+            }
+            Some(original_name) if draft.dropped => {
+                changes.push(ForeignKeyChange::Drop {
+                    name: original_name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
+// SQLite can only declare foreign keys at table-creation time; adding or
+// dropping one on an existing table would require recreating the table,
+// which is out of scope here, so it emits no statements for SQLite.
+pub fn generate_foreign_key_statements(
+    table: &str,
+    driver: DatabaseDriver,
+    changes: &[ForeignKeyChange],
+) -> Vec<String> {
+    if driver == DatabaseDriver::SQLite {
+        return Vec::new();
+    }
+    let table_ident = driver.quote_identifier(table);
+    changes
+        .iter()
+        .map(|change| match change {
+            ForeignKeyChange::Add {
+                name,
+                from_column,
+                to_table,
+                to_column,
+            } => format!(
+                "ALTER TABLE {table_ident} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
+                driver.quote_identifier(name),
+                driver.quote_identifier(from_column),
+                driver.quote_identifier(to_table),
+                driver.quote_identifier(to_column),
+            ),
+            ForeignKeyChange::Drop { name } => match driver {
+                DatabaseDriver::MySQL => format!(
+                    "ALTER TABLE {table_ident} DROP FOREIGN KEY {};",
+                    driver.quote_identifier(name)
+                ),
+                _ => format!(
+                    "ALTER TABLE {table_ident} DROP CONSTRAINT {};",
+                    driver.quote_identifier(name)
+                ),
+            },
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CheckDraftSnapshot {
+    original_name: Option<String>,
+    name: String,
+    expression: String,
+    dropped: bool,
+}
+
+fn check_diff_changes(drafts: &[CheckDraftSnapshot]) -> Vec<CheckChange> {
+    let mut changes = Vec::new();
+    for draft in drafts {
+        match &draft.original_name {
+            None if !draft.dropped
+                && !draft.name.trim().is_empty()
+                && !draft.expression.trim().is_empty() =>
+            {
+                changes.push(CheckChange::Add {
+                    name: draft.name.trim().to_string(),
+                    expression: draft.expression.trim().to_string(),
+                });
+            }
+            Some(original_name) if draft.dropped => {
+                changes.push(CheckChange::Drop {
+                    name: original_name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
+// SQLite cannot add or drop a CHECK constraint on an existing table without
+// recreating it, which is out of scope here, so it emits no statements for
+// SQLite.
+pub fn generate_check_statements(
+    table: &str,
+    driver: DatabaseDriver,
+    changes: &[CheckChange],
+) -> Vec<String> {
+    if driver == DatabaseDriver::SQLite {
+        return Vec::new();
+    }
+    let table_ident = driver.quote_identifier(table);
+    changes
+        .iter()
+        .map(|change| match change {
+            CheckChange::Add { name, expression } => format!(
+                "ALTER TABLE {table_ident} ADD CONSTRAINT {} CHECK ({expression});",
+                driver.quote_identifier(name)
+            ),
+            CheckChange::Drop { name } => match driver {
+                DatabaseDriver::MySQL => format!(
+                    "ALTER TABLE {table_ident} DROP CHECK {};",
+                    driver.quote_identifier(name)
+                ),
+                _ => format!(
+                    "ALTER TABLE {table_ident} DROP CONSTRAINT {};",
+                    driver.quote_identifier(name)
+                ),
+            },
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct IndexDraft {
+    original: Option<IndexInfo>,
+    name: Entity<Editor>,
+    columns: Entity<Editor>,
+    unique: bool,
+    dropped: bool,
+}
+
+#[derive(Clone)]
+struct FkDraft {
+    original: Option<FkInfo>,
+    name: Entity<Editor>,
+    from_column: Entity<Editor>,
+    to_table: Entity<Editor>,
+    to_column: Entity<Editor>,
+    dropped: bool,
+}
+
+#[derive(Clone)]
+struct CheckDraft {
+    original: Option<CheckConstraintInfo>,
+    name: Entity<Editor>,
+    expression: Entity<Editor>,
+    dropped: bool,
+}
+
 pub struct ModifyTableView {
     focus_handle: FocusHandle,
     store: Entity<DatabaseStore>,
@@ -249,6 +529,9 @@ pub struct ModifyTableView {
     database: String,
     table: String,
     drafts: Vec<ColumnDraft>,
+    index_drafts: Vec<IndexDraft>,
+    fk_drafts: Vec<FkDraft>,
+    check_drafts: Vec<CheckDraft>,
     status: Option<SharedString>,
     busy: bool,
 }
@@ -261,12 +544,27 @@ impl ModifyTableView {
         database: String,
         table: String,
         columns: &[ColumnInfo],
+        indexes: &[IndexInfo],
+        foreign_keys: &[FkInfo],
+        checks: &[CheckConstraintInfo],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let drafts = columns
             .iter()
             .map(|column| Self::draft_from_column(column.clone(), window, cx))
+            .collect();
+        let index_drafts = indexes
+            .iter()
+            .map(|index| Self::index_draft_from_info(index.clone(), window, cx))
+            .collect();
+        let fk_drafts = foreign_keys
+            .iter()
+            .map(|fk| Self::fk_draft_from_info(fk.clone(), window, cx))
+            .collect();
+        let check_drafts = checks
+            .iter()
+            .map(|check| Self::check_draft_from_info(check.clone(), window, cx))
             .collect();
         Self {
             focus_handle: cx.focus_handle(),
@@ -276,9 +574,151 @@ impl ModifyTableView {
             database,
             table,
             drafts,
+            index_drafts,
+            fk_drafts,
+            check_drafts,
             status: None,
             busy: false,
         }
+    }
+
+    fn index_draft_from_info(
+        index: IndexInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> IndexDraft {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(index.name.clone(), window, cx);
+            editor
+        });
+        let columns = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(index.columns.join(", "), window, cx);
+            editor
+        });
+        let unique = index.unique;
+        IndexDraft {
+            original: Some(index),
+            name,
+            columns,
+            unique,
+            dropped: false,
+        }
+    }
+
+    fn add_blank_index(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("index_name", window, cx);
+            editor
+        });
+        let columns = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("column1, column2", window, cx);
+            editor
+        });
+        self.index_drafts.push(IndexDraft {
+            original: None,
+            name,
+            columns,
+            unique: false,
+            dropped: false,
+        });
+        cx.notify();
+    }
+
+    fn fk_draft_from_info(fk: FkInfo, window: &mut Window, cx: &mut Context<Self>) -> FkDraft {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(fk.name.clone(), window, cx);
+            editor
+        });
+        let from_column = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(fk.from_column.clone(), window, cx);
+            editor
+        });
+        let to_table = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(fk.to_table.clone(), window, cx);
+            editor
+        });
+        let to_column = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(fk.to_column.clone(), window, cx);
+            editor
+        });
+        FkDraft {
+            original: Some(fk),
+            name,
+            from_column,
+            to_table,
+            to_column,
+            dropped: false,
+        }
+    }
+
+    fn add_blank_fk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let make = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(placeholder, window, cx);
+                editor
+            })
+        };
+        self.fk_drafts.push(FkDraft {
+            original: None,
+            name: make("fk_name", window, cx),
+            from_column: make("column", window, cx),
+            to_table: make("referenced_table", window, cx),
+            to_column: make("referenced_column", window, cx),
+            dropped: false,
+        });
+        cx.notify();
+    }
+
+    fn check_draft_from_info(
+        check: CheckConstraintInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> CheckDraft {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(check.name.clone(), window, cx);
+            editor
+        });
+        let expression = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(check.expression.clone(), window, cx);
+            editor
+        });
+        CheckDraft {
+            original: Some(check),
+            name,
+            expression,
+            dropped: false,
+        }
+    }
+
+    fn add_blank_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("check_name", window, cx);
+            editor
+        });
+        let expression = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("expression, e.g. amount >= 0", window, cx);
+            editor
+        });
+        self.check_drafts.push(CheckDraft {
+            original: None,
+            name,
+            expression,
+            dropped: false,
+        });
+        cx.notify();
     }
 
     fn draft_from_column(
@@ -346,9 +786,64 @@ impl ModifyTableView {
             .collect()
     }
 
+    fn index_snapshot(&self, cx: &Context<Self>) -> Vec<IndexDraftSnapshot> {
+        self.index_drafts
+            .iter()
+            .map(|draft| IndexDraftSnapshot {
+                original_name: draft.original.as_ref().map(|index| index.name.clone()),
+                name: draft.name.read(cx).text(cx),
+                columns_csv: draft.columns.read(cx).text(cx),
+                unique: draft.unique,
+                dropped: draft.dropped,
+            })
+            .collect()
+    }
+
+    fn fk_snapshot(&self, cx: &Context<Self>) -> Vec<FkDraftSnapshot> {
+        self.fk_drafts
+            .iter()
+            .map(|draft| FkDraftSnapshot {
+                original_name: draft.original.as_ref().map(|fk| fk.name.clone()),
+                name: draft.name.read(cx).text(cx),
+                from_column: draft.from_column.read(cx).text(cx),
+                to_table: draft.to_table.read(cx).text(cx),
+                to_column: draft.to_column.read(cx).text(cx),
+                dropped: draft.dropped,
+            })
+            .collect()
+    }
+
+    fn check_snapshot(&self, cx: &Context<Self>) -> Vec<CheckDraftSnapshot> {
+        self.check_drafts
+            .iter()
+            .map(|draft| CheckDraftSnapshot {
+                original_name: draft.original.as_ref().map(|check| check.name.clone()),
+                name: draft.name.read(cx).text(cx),
+                expression: draft.expression.read(cx).text(cx),
+                dropped: draft.dropped,
+            })
+            .collect()
+    }
+
     fn pending_statements(&self, cx: &Context<Self>) -> Vec<String> {
-        let changes = diff_changes(&self.snapshot(cx));
-        generate_alter_statements(&self.table, self.driver, &changes)
+        let mut statements =
+            generate_alter_statements(&self.table, self.driver, &diff_changes(&self.snapshot(cx)));
+        statements.extend(generate_index_statements(
+            &self.table,
+            self.driver,
+            &index_diff_changes(&self.index_snapshot(cx)),
+        ));
+        statements.extend(generate_foreign_key_statements(
+            &self.table,
+            self.driver,
+            &fk_diff_changes(&self.fk_snapshot(cx)),
+        ));
+        statements.extend(generate_check_statements(
+            &self.table,
+            self.driver,
+            &check_diff_changes(&self.check_snapshot(cx)),
+        ));
+        statements
     }
 
     fn execute(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -428,6 +923,109 @@ impl ModifyTableView {
                     })),
             )
     }
+
+    fn render_index_row(
+        &self,
+        index: usize,
+        draft: &IndexDraft,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dropped = draft.dropped;
+        let unique = draft.unique;
+        let is_existing = draft.original.is_some();
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .py_0p5()
+            .when(dropped, |row| row.opacity(0.5))
+            .child(div().w(px(160.)).child(draft.name.clone()))
+            .child(div().w(px(220.)).child(draft.columns.clone()))
+            .child(
+                Checkbox::new(("index-unique", index), unique.into())
+                    .label("Unique")
+                    .disabled(is_existing)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.index_drafts.get_mut(index) {
+                            draft.unique = !draft.unique;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new(("drop-index", index), IconName::Trash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(if dropped { "Keep index" } else { "Drop index" }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.index_drafts.get_mut(index) {
+                            draft.dropped = !draft.dropped;
+                            cx.notify();
+                        }
+                    })),
+            )
+    }
+
+    fn render_fk_row(&self, index: usize, draft: &FkDraft, cx: &mut Context<Self>) -> impl IntoElement {
+        let dropped = draft.dropped;
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .py_0p5()
+            .when(dropped, |row| row.opacity(0.5))
+            .child(div().w(px(120.)).child(draft.name.clone()))
+            .child(div().w(px(100.)).child(draft.from_column.clone()))
+            .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
+            .child(div().w(px(120.)).child(draft.to_table.clone()))
+            .child(div().w(px(100.)).child(draft.to_column.clone()))
+            .child(
+                IconButton::new(("drop-fk", index), IconName::Trash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(if dropped {
+                        "Keep foreign key"
+                    } else {
+                        "Drop foreign key"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.fk_drafts.get_mut(index) {
+                            draft.dropped = !draft.dropped;
+                            cx.notify();
+                        }
+                    })),
+            )
+    }
+
+    fn render_check_row(
+        &self,
+        index: usize,
+        draft: &CheckDraft,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dropped = draft.dropped;
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .py_0p5()
+            .when(dropped, |row| row.opacity(0.5))
+            .child(div().w(px(160.)).child(draft.name.clone()))
+            .child(div().w(px(220.)).child(draft.expression.clone()))
+            .child(
+                IconButton::new(("drop-check", index), IconName::Trash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(if dropped {
+                        "Keep check constraint"
+                    } else {
+                        "Drop check constraint"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.check_drafts.get_mut(index) {
+                            draft.dropped = !draft.dropped;
+                            cx.notify();
+                        }
+                    })),
+            )
+    }
 }
 
 impl EventEmitter<DismissEvent> for ModifyTableView {}
@@ -453,6 +1051,24 @@ impl Render for ModifyTableView {
             .iter()
             .enumerate()
             .map(|(index, draft)| self.render_column_row(index, draft, cx).into_any_element())
+            .collect();
+        let index_rows: Vec<_> = self
+            .index_drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| self.render_index_row(index, draft, cx).into_any_element())
+            .collect();
+        let fk_rows: Vec<_> = self
+            .fk_drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| self.render_fk_row(index, draft, cx).into_any_element())
+            .collect();
+        let check_rows: Vec<_> = self
+            .check_drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| self.render_check_row(index, draft, cx).into_any_element())
             .collect();
         let title = format!("Modify {}.{}", self.database, self.table);
         let busy = self.busy;
@@ -482,6 +1098,56 @@ impl Render for ModifyTableView {
             .child(
                 Button::new("add-column", "Add Column")
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_column(window, cx))),
+            )
+            .child(Divider::horizontal())
+            .child(Label::new("Indexes").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                v_flex()
+                    .id("modify-indexes")
+                    .gap_0p5()
+                    .max_h(px(140.))
+                    .overflow_y_scroll()
+                    .children(index_rows),
+            )
+            .child(
+                Button::new("add-index", "Add Index")
+                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_index(window, cx))),
+            )
+            .child(Divider::horizontal())
+            .child(
+                Label::new("Foreign Keys")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .id("modify-fks")
+                    .gap_0p5()
+                    .max_h(px(140.))
+                    .overflow_y_scroll()
+                    .children(fk_rows),
+            )
+            .child(
+                Button::new("add-fk", "Add Foreign Key")
+                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_fk(window, cx))),
+            )
+            .child(Divider::horizontal())
+            .child(
+                Label::new("Check Constraints")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .id("modify-checks")
+                    .gap_0p5()
+                    .max_h(px(140.))
+                    .overflow_y_scroll()
+                    .children(check_rows),
+            )
+            .child(
+                Button::new("add-check", "Add Check Constraint")
+                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_check(window, cx))),
             )
             .child(Divider::horizontal())
             .child(Label::new("SQL Preview").size(LabelSize::Small).color(Color::Muted))
@@ -647,5 +1313,192 @@ mod tests {
         )]);
         let sql = generate_alter_statements("t", DatabaseDriver::MySQL, &changes);
         assert!(sql.is_empty());
+    }
+
+    fn index_draft(
+        original_name: Option<&str>,
+        name: &str,
+        columns_csv: &str,
+        unique: bool,
+        dropped: bool,
+    ) -> IndexDraftSnapshot {
+        IndexDraftSnapshot {
+            original_name: original_name.map(str::to_string),
+            name: name.to_string(),
+            columns_csv: columns_csv.to_string(),
+            unique,
+            dropped,
+        }
+    }
+
+    #[test]
+    fn add_index_generates_create_index_statement() {
+        let changes = index_diff_changes(&[index_draft(None, "idx_email", "email", true, false)]);
+        let sql = generate_index_statements("users", DatabaseDriver::PostgreSQL, &changes);
+        assert_eq!(
+            sql,
+            vec!["CREATE UNIQUE INDEX \"idx_email\" ON \"users\" (\"email\");"]
+        );
+    }
+
+    #[test]
+    fn add_composite_index_lists_all_columns_in_order() {
+        let changes = index_diff_changes(&[index_draft(
+            None,
+            "idx_name",
+            "last_name, first_name",
+            false,
+            false,
+        )]);
+        let sql = generate_index_statements("users", DatabaseDriver::MySQL, &changes);
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX `idx_name` ON `users` (`last_name`, `first_name`);"]
+        );
+    }
+
+    #[test]
+    fn drop_index_uses_alter_table_drop_index_on_mysql() {
+        let changes = index_diff_changes(&[index_draft(
+            Some("idx_old"),
+            "idx_old",
+            "",
+            false,
+            true,
+        )]);
+        let sql = generate_index_statements("t", DatabaseDriver::MySQL, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE `t` DROP INDEX `idx_old`;"]);
+    }
+
+    #[test]
+    fn drop_index_uses_bare_drop_index_on_postgres_and_sqlite() {
+        let changes = index_diff_changes(&[index_draft(
+            Some("idx_old"),
+            "idx_old",
+            "",
+            false,
+            true,
+        )]);
+        assert_eq!(
+            generate_index_statements("t", DatabaseDriver::PostgreSQL, &changes),
+            vec!["DROP INDEX \"idx_old\";"]
+        );
+        assert_eq!(
+            generate_index_statements("t", DatabaseDriver::SQLite, &changes),
+            vec!["DROP INDEX \"idx_old\";"]
+        );
+    }
+
+    fn fk_draft(
+        original_name: Option<&str>,
+        name: &str,
+        from_column: &str,
+        to_table: &str,
+        to_column: &str,
+        dropped: bool,
+    ) -> FkDraftSnapshot {
+        FkDraftSnapshot {
+            original_name: original_name.map(str::to_string),
+            name: name.to_string(),
+            from_column: from_column.to_string(),
+            to_table: to_table.to_string(),
+            to_column: to_column.to_string(),
+            dropped,
+        }
+    }
+
+    #[test]
+    fn add_foreign_key_generates_add_constraint_statement() {
+        let changes = fk_diff_changes(&[fk_draft(
+            None,
+            "fk_owner",
+            "owner_id",
+            "users",
+            "id",
+            false,
+        )]);
+        let sql = generate_foreign_key_statements("orders", DatabaseDriver::PostgreSQL, &changes);
+        assert_eq!(
+            sql,
+            vec![
+                "ALTER TABLE \"orders\" ADD CONSTRAINT \"fk_owner\" FOREIGN KEY (\"owner_id\") REFERENCES \"users\" (\"id\");"
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_foreign_key_differs_between_mysql_and_postgres() {
+        let changes = fk_diff_changes(&[fk_draft(
+            Some("fk_owner"),
+            "fk_owner",
+            "",
+            "",
+            "",
+            true,
+        )]);
+        assert_eq!(
+            generate_foreign_key_statements("orders", DatabaseDriver::MySQL, &changes),
+            vec!["ALTER TABLE `orders` DROP FOREIGN KEY `fk_owner`;"]
+        );
+        assert_eq!(
+            generate_foreign_key_statements("orders", DatabaseDriver::PostgreSQL, &changes),
+            vec!["ALTER TABLE \"orders\" DROP CONSTRAINT \"fk_owner\";"]
+        );
+    }
+
+    #[test]
+    fn foreign_key_statements_are_not_generated_for_sqlite() {
+        let changes = fk_diff_changes(&[fk_draft(
+            None,
+            "fk_owner",
+            "owner_id",
+            "users",
+            "id",
+            false,
+        )]);
+        assert!(generate_foreign_key_statements("orders", DatabaseDriver::SQLite, &changes).is_empty());
+    }
+
+    fn check_draft(
+        original_name: Option<&str>,
+        name: &str,
+        expression: &str,
+        dropped: bool,
+    ) -> CheckDraftSnapshot {
+        CheckDraftSnapshot {
+            original_name: original_name.map(str::to_string),
+            name: name.to_string(),
+            expression: expression.to_string(),
+            dropped,
+        }
+    }
+
+    #[test]
+    fn add_check_constraint_generates_add_constraint_statement() {
+        let changes = check_diff_changes(&[check_draft(None, "chk_amount", "amount >= 0", false)]);
+        let sql = generate_check_statements("orders", DatabaseDriver::PostgreSQL, &changes);
+        assert_eq!(
+            sql,
+            vec!["ALTER TABLE \"orders\" ADD CONSTRAINT \"chk_amount\" CHECK (amount >= 0);"]
+        );
+    }
+
+    #[test]
+    fn drop_check_constraint_differs_between_mysql_and_postgres() {
+        let changes = check_diff_changes(&[check_draft(Some("chk_amount"), "chk_amount", "", true)]);
+        assert_eq!(
+            generate_check_statements("orders", DatabaseDriver::MySQL, &changes),
+            vec!["ALTER TABLE `orders` DROP CHECK `chk_amount`;"]
+        );
+        assert_eq!(
+            generate_check_statements("orders", DatabaseDriver::PostgreSQL, &changes),
+            vec!["ALTER TABLE \"orders\" DROP CONSTRAINT \"chk_amount\";"]
+        );
+    }
+
+    #[test]
+    fn check_constraint_statements_are_not_generated_for_sqlite() {
+        let changes = check_diff_changes(&[check_draft(None, "chk_amount", "amount >= 0", false)]);
+        assert!(generate_check_statements("orders", DatabaseDriver::SQLite, &changes).is_empty());
     }
 }

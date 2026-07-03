@@ -3820,10 +3820,22 @@ impl DatabasePanel {
         let describe = self.store.update(cx, |store, cx| {
             store.describe_table(id, database.clone(), table.clone(), cx)
         });
+        let indexes = self.store.update(cx, |store, cx| {
+            store.list_indexes(id, database.clone(), table.clone(), cx)
+        });
+        let foreign_keys = self.store.update(cx, |store, cx| {
+            store.list_foreign_keys(id, database.clone(), table.clone(), cx)
+        });
+        let checks = self.store.update(cx, |store, cx| {
+            store.list_check_constraints(id, database.clone(), table.clone(), cx)
+        });
         let store = self.store.clone();
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_this, cx| {
             let columns = describe.await.unwrap_or_default();
+            let indexes = indexes.await.unwrap_or_default();
+            let foreign_keys = foreign_keys.await.unwrap_or_default();
+            let checks = checks.await.unwrap_or_default();
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.toggle_modal(window, cx, |window, cx| {
@@ -3834,6 +3846,9 @@ impl DatabasePanel {
                             database.clone(),
                             table.clone(),
                             &columns,
+                            &indexes,
+                            &foreign_keys,
+                            &checks,
                             window,
                             cx,
                         )

@@ -10,7 +10,8 @@ use db_client::{
     provider::DbProvider,
     redis_provider::RedisProvider,
     schema::{
-        ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, TableInfo, TriggerInfo, UserInfo,
+        CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, TableInfo,
+        TriggerInfo, UserInfo,
     },
     sqlite::SqliteProvider,
 };
@@ -1718,6 +1719,24 @@ impl DatabaseStore {
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
             provider.list_foreign_keys(&database, &table).await
+        })
+    }
+
+    pub fn list_check_constraints(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<CheckConstraintInfo>>> {
+        if !self.connections.iter().any(|c| c.config.id == id) {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.list_check_constraints(&database, &table).await
         })
     }
 
