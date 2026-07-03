@@ -308,6 +308,24 @@ fn parse_enum_values(data_type: &str) -> Vec<String> {
     values
 }
 
+// Parses the leading "YYYY-MM-DD" of a date or datetime string. Tolerant of a
+// trailing time portion (datetime values keep it after a space); returns None
+// for anything shorter or not matching the calendar-date grammar, so a blank
+// or malformed cell falls back to the popup's caller-supplied default instead
+// of panicking or silently misparsing.
+fn parse_date_prefix(text: &str) -> Option<time::Date> {
+    let date_part = text.get(0..10)?;
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    time::Date::parse(date_part, &format).ok()
+}
+
+// Formats a date as "YYYY-MM-DD", matching the format the grid already uses
+// for DATE columns and the date portion of DATETIME columns.
+fn format_date_ymd(date: time::Date) -> String {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    date.format(&format).unwrap_or_default()
+}
+
 // Distinct, already-loaded values of one column, offered as completions while
 // editing a cell of that column. Built entirely from `result.rows` already in
 // memory (no query), case-sensitive, capped so a large result set can't turn
@@ -728,6 +746,20 @@ struct EnumPopup {
     nullable: bool,
 }
 
+// An open calendar popup for a DATE/DATETIME cell editor. It writes into the
+// same free-text cell editor the text-typing path uses, so typing a date
+// manually keeps working unchanged; the calendar is a convenience on top, not
+// a replacement editor.
+struct DatePopup {
+    abs_idx: usize,
+    col_idx: usize,
+    is_datetime: bool,
+    // The calendar page currently shown; independent of any date already
+    // picked, so browsing months doesn't require a valid selection yet.
+    display_year: i32,
+    display_month: time::Month,
+}
+
 pub enum ResultViewEvent {
     ResultChanged,
 }
@@ -814,6 +846,8 @@ pub struct ResultView {
     fk_columns: std::collections::HashMap<usize, FkInfo>,
     // An open enum/set dropdown popup, if any. At most one at a time.
     enum_popup: Option<EnumPopup>,
+    // An open calendar popup for a DATE/DATETIME cell, if any. At most one at a time.
+    date_popup: Option<DatePopup>,
     // When true, a read-only value editor popup is shown near the selected cell,
     // displaying the full content of the selected cell.
     value_editor_open: bool,
@@ -1108,6 +1142,7 @@ impl ResultView {
             column_infos: None,
             fk_columns: std::collections::HashMap::new(),
             enum_popup: None,
+            date_popup: None,
             value_editor_open: false,
             value_editor: None,
             value_editor_size: None,
@@ -1981,6 +2016,7 @@ impl ResultView {
         self.column_infos = None;
         self.fk_columns.clear();
         self.enum_popup = None;
+        self.date_popup = None;
         self.sort_columns.clear();
     }
 
@@ -1991,6 +2027,7 @@ impl ResultView {
         self.column_infos = None;
         self.fk_columns.clear();
         self.enum_popup = None;
+        self.date_popup = None;
     }
 
     pub fn refresh_table_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2504,6 +2541,7 @@ impl ResultView {
             return;
         };
 
+        self.maybe_open_date_popup(abs_idx, col_idx, &initial, cx);
         self.spawn_cell_editor(
             abs_idx,
             col_idx,
@@ -2557,6 +2595,7 @@ impl ResultView {
             Some(CellValue::Text(text)) => text.clone(),
             _ => String::new(),
         };
+        self.maybe_open_date_popup(abs_idx, col_idx, &initial, cx);
         self.spawn_cell_editor(
             abs_idx,
             col_idx,
@@ -2638,6 +2677,35 @@ impl ResultView {
                     ),
             )
             .into_any_element()
+    }
+
+    // Opens the calendar popup alongside the just-spawned text editor when the
+    // column is DATE/DATETIME; a no-op for every other column kind. The
+    // calendar's initial page comes from the cell's current value when it
+    // parses as a date, falling back to today so an empty/NULL cell still
+    // opens on a sensible month rather than an arbitrary or invalid one.
+    fn maybe_open_date_popup(
+        &mut self,
+        abs_idx: usize,
+        col_idx: usize,
+        initial: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let is_datetime = match self.column_kind_at(col_idx) {
+            CellEditorKind::Date => false,
+            CellEditorKind::DateTime => true,
+            _ => return,
+        };
+        let page_date =
+            parse_date_prefix(initial).unwrap_or_else(|| time::OffsetDateTime::now_utc().date());
+        self.date_popup = Some(DatePopup {
+            abs_idx,
+            col_idx,
+            is_datetime,
+            display_year: page_date.year(),
+            display_month: page_date.month(),
+        });
+        cx.notify();
     }
 
     // Builds the overlay editor shared by loaded and added cell edits.
@@ -2780,6 +2848,7 @@ impl ResultView {
     }
 
     fn cancel_cell_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.date_popup = None;
         if self.cell_edit.take().is_some() {
             cx.notify();
         }
@@ -2915,6 +2984,7 @@ impl ResultView {
         // string. Set Empty Value is the only way to store a real "".
         if raw_text.is_empty() {
             self.cell_edit.take();
+            self.date_popup = None;
             cx.notify();
             return true;
         }
@@ -2947,6 +3017,7 @@ impl ResultView {
 
         // Validation passed — remove the editor from the slot.
         self.cell_edit.take();
+        self.date_popup = None;
         let new_value = CellValue::from_text(raw_text);
 
         // Added rows have no loaded value or key: the edit writes straight into
@@ -3121,6 +3192,65 @@ impl ResultView {
         } else {
             self.buffer_loaded_cell_value(popup.abs_idx, popup.col_idx, value, cx);
         }
+        cx.notify();
+    }
+
+    // Moves the calendar popup's displayed page by one month, wrapping the year
+    // at the December/January boundary. Browsing months never touches the cell
+    // editor's text or the popup's target cell.
+    fn date_popup_shift_month(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(popup) = self.date_popup.as_mut() else {
+            return;
+        };
+        if forward {
+            if popup.display_month == time::Month::December {
+                popup.display_year += 1;
+            }
+            popup.display_month = popup.display_month.next();
+        } else {
+            if popup.display_month == time::Month::January {
+                popup.display_year -= 1;
+            }
+            popup.display_month = popup.display_month.previous();
+        }
+        cx.notify();
+    }
+
+    // Writes the picked day into the open cell editor's text and closes the
+    // calendar popup. For a DATETIME column, any time-of-day portion already in
+    // the editor (typed or left at its default) is preserved rather than reset,
+    // so picking a day never clobbers a time the user already set.
+    fn apply_date_selection(
+        &mut self,
+        date: time::Date,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(popup) = self.date_popup.take() else {
+            return;
+        };
+        let Some(edit) = self.cell_edit.as_ref() else {
+            cx.notify();
+            return;
+        };
+        let editor = edit.editor.clone();
+        let date_text = format_date_ymd(date);
+        let new_text = if popup.is_datetime {
+            let current = editor.read(cx).text(cx);
+            let time_part = current.get(11..).filter(|t| !t.is_empty());
+            match time_part {
+                Some(time_part) => format!("{date_text} {time_part}"),
+                None => format!("{date_text} 00:00:00"),
+            }
+        } else {
+            date_text
+        };
+        editor.update(cx, |editor, cx| {
+            editor.set_text(new_text, window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
@@ -7240,6 +7370,7 @@ impl ResultView {
                         el.child(overlay)
                     })
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
+                    .when_some(self.render_date_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_column_list_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_query_history_popup(cx), |el, popup| el.child(popup))
                     .into_any_element()
@@ -9158,6 +9289,157 @@ impl ResultView {
                         .occlude()
                         .min_w(gpui::px(120.0))
                         .children(items),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // Renders the calendar popup for an open DATE/DATETIME cell editor. Uses the
+    // same absolute-positioning technique as `render_enum_popup` (anchored to the
+    // edited cell's column/row via `column_edges` and the current scroll offset)
+    // so both popups sit consistently next to the cell they edit.
+    fn render_date_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let popup = self.date_popup.as_ref()?;
+        let (_, _, _, scroll_y) = axis_metrics(&self.scroll_handle, true);
+
+        let col_x = self
+            .column_edges
+            .get(popup.col_idx.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0);
+        let screen_x = (col_x + f32::from(self.h_scroll.offset().x)).max(0.0);
+        let screen_y =
+            (Self::GRID_HEADER_H + popup.abs_idx as f32 * Self::GRID_ROW_H + scroll_y).max(0.0);
+
+        let year = popup.display_year;
+        let month = popup.display_month;
+
+        let header_id = format!("DATE_POPUP_HEADER-{year:04}-{:02}", month as u8);
+        let header = h_flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_1()
+            .pb_1()
+            .child(
+                div()
+                    .id("date-popup-prev")
+                    .debug_selector(|| "date-popup-prev".to_string())
+                    .cursor_pointer()
+                    .hover(|el| el.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.date_popup_shift_month(false, cx);
+                    }))
+                    .child(Icon::new(IconName::ChevronLeft).size(IconSize::Small)),
+            )
+            .child(
+                div()
+                    .debug_selector(move || header_id)
+                    .child(Label::new(format!("{month} {year}")).size(LabelSize::Small)),
+            )
+            .child(
+                div()
+                    .id("date-popup-next")
+                    .debug_selector(|| "date-popup-next".to_string())
+                    .cursor_pointer()
+                    .hover(|el| el.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.date_popup_shift_month(true, cx);
+                    }))
+                    .child(Icon::new(IconName::ChevronRight).size(IconSize::Small)),
+            );
+
+        let weekday_row = h_flex().children(
+            ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+                .into_iter()
+                .map(|label| {
+                    div()
+                        .w(gpui::px(28.0))
+                        .items_center()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element()
+                }),
+        );
+
+        let first_of_month = time::Date::from_calendar_date(year, month, 1).ok();
+        let leading_blanks = first_of_month
+            .map(|date| date.weekday().number_days_from_sunday() as usize)
+            .unwrap_or(0);
+        let days_in_month = month.length(year);
+
+        let mut day_cells: Vec<AnyElement> = (0..leading_blanks)
+            .map(|_| div().w(gpui::px(28.0)).h(gpui::px(24.0)).into_any_element())
+            .collect();
+        for day in 1..=days_in_month {
+            let cell_id = format!("DATE_POPUP_DAY-{year:04}-{:02}-{day:02}", month as u8);
+            day_cells.push(
+                div()
+                    .id(SharedString::from(cell_id.clone()))
+                    .debug_selector(move || cell_id)
+                    .w(gpui::px(28.0))
+                    .h(gpui::px(24.0))
+                    .items_center()
+                    .flex()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Ok(date) = time::Date::from_calendar_date(year, month, day) {
+                            this.apply_date_selection(date, window, cx);
+                        }
+                    }))
+                    .child(Label::new(day.to_string()).size(LabelSize::Small))
+                    .into_any_element(),
+            );
+        }
+
+        let mut week_rows: Vec<AnyElement> = Vec::new();
+        let mut current_week: Vec<AnyElement> = Vec::new();
+        for cell in day_cells {
+            current_week.push(cell);
+            if current_week.len() == 7 {
+                week_rows.push(
+                    h_flex()
+                        .children(std::mem::take(&mut current_week))
+                        .into_any_element(),
+                );
+            }
+        }
+        if !current_week.is_empty() {
+            week_rows.push(h_flex().children(current_week).into_any_element());
+        }
+
+        let backdrop = div().absolute().inset_0().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.date_popup = None;
+                cx.notify();
+            }),
+        );
+
+        Some(
+            div()
+                .absolute()
+                .left(gpui::px(screen_x))
+                .top(gpui::px(screen_y))
+                .child(backdrop)
+                .child(
+                    popup_surface(cx)
+                        .id("date-popup")
+                        .debug_selector(|| "DATE_POPUP".to_string())
+                        .absolute()
+                        .left(gpui::px(0.0))
+                        .top(gpui::px(0.0))
+                        .p_2()
+                        .child(header)
+                        .child(weekday_row)
+                        .children(week_rows),
                 )
                 .into_any_element(),
         )
@@ -14992,6 +15274,224 @@ mod tests {
                 "a horizontal mouse-wheel/trackpad gesture over the grid must move the \
                  horizontal scroll offset, not just the drag-thumb; offset_before={offset_before}, \
                  offset_after={offset_after}"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_date_prefix_extracts_calendar_date_and_rejects_malformed_input() {
+        let format = time::macros::format_description!("[year]-[month]-[day]");
+        assert_eq!(
+            parse_date_prefix("2026-03-15"),
+            Some(time::Date::parse("2026-03-15", &format).unwrap())
+        );
+        assert_eq!(
+            parse_date_prefix("2026-03-15 08:30:00"),
+            Some(time::Date::parse("2026-03-15", &format).unwrap()),
+            "a datetime value's trailing time portion must not prevent parsing its date prefix"
+        );
+        assert_eq!(parse_date_prefix(""), None);
+        assert_eq!(parse_date_prefix("not a date"), None);
+        assert_eq!(parse_date_prefix("2026-13-40"), None, "an invalid calendar date must not parse");
+    }
+
+    #[test]
+    fn format_date_ymd_matches_the_grids_date_placeholder_format() {
+        let date = time::Date::from_calendar_date(2026, time::Month::March, 5).unwrap();
+        assert_eq!(format_date_ymd(date), "2026-03-05");
+    }
+
+    fn table_result_with_date_column(datetime: bool) -> QueryResult {
+        let (first, second) = if datetime {
+            ("2026-03-15 09:00:00", "2026-03-20 17:45:00")
+        } else {
+            ("2026-03-15", "2026-03-20")
+        };
+        QueryResult {
+            columns: vec!["id".to_string(), "signup_date".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some(first.to_string())],
+                vec![Some("2".to_string()), Some(second.to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    fn set_date_column_infos(view: &mut ResultView, datetime: bool) {
+        view.column_infos = Some(vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "int".to_string(),
+                is_nullable: false,
+                column_key: None,
+                default_value: None,
+                extra: String::new(),
+            },
+            ColumnInfo {
+                name: "signup_date".to_string(),
+                data_type: if datetime { "datetime".to_string() } else { "date".to_string() },
+                is_nullable: true,
+                column_key: None,
+                default_value: None,
+                extra: String::new(),
+            },
+        ]);
+    }
+
+    fn double_click_cell(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let center = debug_center(cx, selector);
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+    }
+
+    #[gpui::test]
+    fn date_cell_editor_opens_calendar_popup_and_day_click_writes_the_date(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_date_column(false));
+        view.update(&mut cx, |view, _cx| set_date_column_infos(view, false));
+
+        double_click_cell(&mut cx, "CELL-0-1");
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("DATE_POPUP").is_some(),
+            "double-clicking a DATE cell must open the calendar popup"
+        );
+        assert!(
+            cx.debug_bounds("DATE_POPUP_DAY-2026-03-15").is_some(),
+            "the cell's own date must be represented in the rendered day grid"
+        );
+
+        let day_20 = debug_center(&mut cx, "DATE_POPUP_DAY-2026-03-20");
+        cx.simulate_click(day_20, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("2026-03-20".to_string()),
+                "clicking a day in the calendar must write that date into the cell editor"
+            );
+            assert!(
+                view.date_popup.is_none(),
+                "picking a day on a DATE (non-datetime) column must close the popup"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn date_popup_next_month_navigates_the_displayed_calendar(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_date_column(false));
+        view.update(&mut cx, |view, _cx| set_date_column_infos(view, false));
+
+        double_click_cell(&mut cx, "CELL-0-1");
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("DATE_POPUP_HEADER-2026-03").is_some(),
+            "the popup must open on the cell's own month"
+        );
+
+        let next_button = debug_center(&mut cx, "date-popup-next");
+        cx.simulate_click(next_button, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("DATE_POPUP_HEADER-2026-04").is_some(),
+            "clicking next must advance the displayed calendar to the following month"
+        );
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("2026-03-15".to_string()),
+                "browsing months must not touch the cell editor's text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn datetime_cell_day_click_preserves_the_existing_time_of_day(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_date_column(true));
+        view.update(&mut cx, |view, _cx| set_date_column_infos(view, true));
+
+        double_click_cell(&mut cx, "CELL-0-1");
+        draw_result_view(window, &mut cx);
+
+        let day_20 = debug_center(&mut cx, "DATE_POPUP_DAY-2026-03-20");
+        cx.simulate_click(day_20, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, cx| {
+            let text = view
+                .cell_edit
+                .as_ref()
+                .map(|edit| edit.editor.read(cx).text(cx));
+            assert_eq!(
+                text,
+                Some("2026-03-20 09:00:00".to_string()),
+                "picking a new day on a DATETIME column must keep the time already in the cell"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn typing_a_date_manually_still_commits_via_the_text_fallback(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) =
+            table_backed_result_window_with(cx, table_result_with_date_column(false));
+        view.update(&mut cx, |view, _cx| set_date_column_infos(view, false));
+
+        double_click_cell(&mut cx, "CELL-0-1");
+        draw_result_view(window, &mut cx);
+        assert!(
+            cx.debug_bounds("DATE_POPUP").is_some(),
+            "the calendar popup opens alongside the text editor, not instead of it"
+        );
+
+        for _ in 0.."2026-03-15".len() {
+            cx.dispatch_action(editor::actions::Backspace);
+        }
+        cx.simulate_keystrokes("2 0 2 7 - 0 1 - 0 5");
+        cx.simulate_keystrokes("enter");
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("2027-01-05".to_string())),
+                "typing a date by hand, bypassing the calendar entirely, must still commit \
+                 normally on Enter"
+            );
+            // Enter is Excel-style commit-and-move: it commits row 0 then opens
+            // editing on row 1's own date cell, which correctly opens a fresh
+            // popup for that cell rather than leaving the old one behind.
+            assert_eq!(
+                view.date_popup.as_ref().map(|popup| popup.abs_idx),
+                Some(1),
+                "commit-and-move must close the old cell's popup and open a new one for the cell \
+                 it moved to, not leave the previous popup dangling"
             );
         });
     }
