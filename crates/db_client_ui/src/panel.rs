@@ -6915,6 +6915,8 @@ impl DatabasePanel {
         v_flex()
             .id("db-tree-background")
             .debug_selector(|| "DB-TREE-BACKGROUND".into())
+            .items_start()
+            .flex_shrink_0()
             .min_w_full()
             .min_h_full()
             .when(is_top_level_target, |el| {
@@ -7169,6 +7171,9 @@ impl Render for DatabasePanel {
                 div()
                     .id("db-panel-scroll")
                     .debug_selector(|| "DB-TREE-SCROLL".into())
+                    .flex()
+                    .flex_col()
+                    .items_start()
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
@@ -10244,12 +10249,19 @@ mod tests {
              handle must report a nonzero max scroll offset; got {max_offset_y:?}"
         );
 
+        // A row's own chrome (indent, chevron, driver icon + status dot, label
+        // column, and the New Query / Connect buttons) genuinely needs a little
+        // more than this test's narrow viewport even for a short label like
+        // "connection-79" -- that's real content width, not a bug, so this
+        // asserts "no row is dramatically wider than the viewport" rather than
+        // "zero scroll capacity", distinguishing it from the >100px overflow a
+        // genuinely long label produces in the sibling test above.
         let max_offset_x = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().x);
-        assert_eq!(
-            max_offset_x,
-            px(0.),
-            "no row's label is wider than the test window, so there is genuinely nothing to \
-             scroll horizontally yet; got {max_offset_x:?}"
+        assert!(
+            max_offset_x < px(100.),
+            "short connection labels should need at most a small amount of horizontal scroll \
+             for the row's own chrome, not the hundreds of pixels a genuinely long label would \
+             produce; got {max_offset_x:?}"
         );
     }
 
@@ -10257,31 +10269,28 @@ mod tests {
     // nonzero horizontal scroll range -- this is the counterpart to the
     // vertical-overflow test above, checking the `x` axis instead of `y`.
     //
-    // Currently ignored: this reproduces a real, unfixed bug, now narrowed
-    // considerably. Measured (via debug_bounds) at every level of the
-    // hierarchy -- db-panel-scroll, db-tree-background, and the connection
-    // row itself -- all report exactly the viewport width (259px), never
-    // wider. Ruled out: `.single_line()` on the label (prevents wrapping,
-    // doesn't affect measurement); `.self_start()` on the row or on
-    // db-tree-background (opts out of cross-axis stretch, no effect); a
-    // `flex_1()` spacer inside the row competing for space (removed
-    // entirely, no effect); the label's own intrinsic text width being the
-    // limiting factor (replaced the label's wrapper with an explicit,
-    // non-intrinsic `.w(px(2000.))` -- still clamped to exactly 259px). This
-    // last result is conclusive: even a `flex_none` child with a fixed,
-    // definite width far larger than the viewport gets shrunk to fit, which
-    // means Taffy's flex layout algorithm is not giving this axis
-    // content-based (shrink-to-fit) sizing under `overflow: scroll`, the way
-    // it would need to for a child to ever be measured wider than the
-    // container. GPUI maps `Overflow::Scroll` straight through to Taffy's
-    // own `Overflow::Scroll` (see `crates/gpui/src/style.rs`'s
-    // `From<Overflow> for taffy::style::Overflow`), so this now looks like
-    // it needs either a Taffy-level fix/workaround or a different layout
-    // structure for this specific horizontally-scrollable case, not a
-    // styling change within this file. Left as a fail-then-pass reproducer
-    // for whoever picks this up next.
+    // Root cause (previously an unfixed bug, now fixed): `db-panel-scroll` had
+    // no `align-items` override, so as either a block container (no `.flex()`
+    // at all) or a flex container it defaulted to stretching its single child
+    // to the viewport's exact width; `db-tree-background` (a `v_flex()`) had
+    // the same default-stretch problem for each row. Stretch bypasses
+    // content-based measurement entirely, so a row's true (potentially wider)
+    // content size never had a chance to propagate up regardless of what any
+    // individual child's width was set to -- explaining why even a
+    // `flex_none` child with an explicit, definite `.w(px(2000.))` still
+    // measured at exactly the viewport width. The fix: give `db-panel-scroll`
+    // an explicit `.flex().flex_col().items_start()` and `db-tree-background`
+    // an `.items_start()` too, so each level measures its child by content
+    // instead of stretching it. Their pre-existing `.min_w_full()` (and
+    // `.min_h_full()`) still act as a floor, so short rows keep filling the
+    // panel's width for a full-width hover/selection highlight; only rows
+    // that genuinely need more get to overflow and become scrollable.
+    // `db-tree-background` also needs `.flex_shrink_0()` -- without it,
+    // `db-panel-scroll` becoming a flex column made its single child a
+    // main-axis flex item, and the default `flex-shrink: 1` silently crushed
+    // it back down to the viewport *height*, breaking the vertical-overflow
+    // test above; `flex_shrink_0()` stops that regression.
     #[gpui::test]
-    #[ignore = "known bug: even a fixed-width flex_none child is shrunk to the viewport width under overflow:scroll, so horizontal scroll never activates regardless of content width -- likely needs a Taffy-level fix, see the comment above"]
     async fn database_explorer_tree_scrolls_horizontally_when_a_label_overflows_the_viewport(
         cx: &mut TestAppContext,
     ) {
