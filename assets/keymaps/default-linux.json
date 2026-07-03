@@ -734,7 +734,8 @@
     "bindings": {
       "ctrl-b": "database_panel::GoToDdl",
       "ctrl-q": "database_panel::QuickDocumentation",
-      "ctrl-alt-shift-u": "database_panel::ShowDiagram"
+      "ctrl-alt-shift-u": "database_panel::ShowDiagram",
+      "ctrl-n": "database_panel::GoToObject"
     }
   },
   {

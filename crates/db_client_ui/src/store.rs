@@ -58,6 +58,37 @@ struct SchemaCache {
     columns: HashMap<String, HashMap<String, Vec<ColumnInfo>>>,
 }
 
+/// The kind of a flattened schema entry, as surfaced to the go-to-object palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectKind {
+    Database,
+    Table,
+    View,
+    Column,
+}
+
+/// One database/table/view/column entry from the prefetched schema cache,
+/// flattened for fuzzy search. See `DatabaseStore::schema_objects`.
+#[derive(Debug, Clone)]
+pub struct SchemaObjectRef {
+    pub kind: SchemaObjectKind,
+    pub database: String,
+    pub table: Option<String>,
+    pub column: Option<String>,
+}
+
+impl SchemaObjectRef {
+    /// Fully-qualified label used for both fuzzy matching and display, e.g.
+    /// "db", "db.table", or "db.table.column".
+    pub fn display_label(&self) -> String {
+        match (&self.table, &self.column) {
+            (Some(table), Some(column)) => format!("{}.{table}.{column}", self.database),
+            (Some(table), None) => format!("{}.{table}", self.database),
+            (None, _) => self.database.clone(),
+        }
+    }
+}
+
 /// On-disk shape of the connection tree: the folder set plus the connections.
 /// Older config files held a bare `[ConnectionConfig]` array; `load_tree_from_disk`
 /// migrates those into this form.
@@ -567,6 +598,58 @@ impl DatabaseStore {
 
     pub fn connections(&self) -> &[ActiveConnection] {
         &self.connections
+    }
+
+    /// Flattens the prefetched schema cache of `id` into a single searchable
+    /// list of databases/tables/views/columns for the go-to-object palette.
+    /// Reads only what `prefetch_full_schema` already loaded -- never issues
+    /// a query itself, so an unprefetched connection simply returns nothing.
+    pub fn schema_objects(&self, id: ConnectionId) -> Vec<SchemaObjectRef> {
+        let Some(cache) = self.schema_cache.get(&id) else {
+            return Vec::new();
+        };
+        let mut objects = Vec::new();
+        for db in &cache.databases {
+            objects.push(SchemaObjectRef {
+                kind: SchemaObjectKind::Database,
+                database: db.name.clone(),
+                table: None,
+                column: None,
+            });
+            if let Some(tables) = cache.tables.get(&db.name) {
+                for table in tables {
+                    objects.push(SchemaObjectRef {
+                        kind: SchemaObjectKind::Table,
+                        database: db.name.clone(),
+                        table: Some(table.name.clone()),
+                        column: None,
+                    });
+                }
+            }
+            if let Some(views) = cache.views.get(&db.name) {
+                for view_name in views {
+                    objects.push(SchemaObjectRef {
+                        kind: SchemaObjectKind::View,
+                        database: db.name.clone(),
+                        table: Some(view_name.clone()),
+                        column: None,
+                    });
+                }
+            }
+            if let Some(tables_columns) = cache.columns.get(&db.name) {
+                for (table_name, columns) in tables_columns {
+                    for column in columns {
+                        objects.push(SchemaObjectRef {
+                            kind: SchemaObjectKind::Column,
+                            database: db.name.clone(),
+                            table: Some(table_name.clone()),
+                            column: Some(column.name.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        objects
     }
 
     pub fn active_connection_id(&self) -> Option<ConnectionId> {
@@ -2526,6 +2609,65 @@ mod tests {
             assert!(conn.databases.is_none(), "cache cleared on refresh");
             assert!(conn.expanded_databases.is_empty());
             assert!(conn.expanded_tables.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn schema_objects_flattens_the_prefetched_cache_for_the_go_to_object_palette(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(SchemaMockProvider), cx);
+        });
+        // Before the schema is prefetched there is nothing to flatten yet.
+        store.read_with(cx, |store, _| {
+            assert!(store.schema_objects(id).is_empty());
+        });
+
+        store.update(cx, |store, cx| {
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let objects = store.schema_objects(id);
+            let labels: Vec<String> = objects.iter().map(|o| o.display_label()).collect();
+            assert!(
+                labels.contains(&"shop".to_string()),
+                "expected the database itself: {labels:?}"
+            );
+            assert!(
+                labels.contains(&"shop.users".to_string()),
+                "expected the table: {labels:?}"
+            );
+            assert!(
+                labels.contains(&"shop.users.id".to_string()),
+                "expected the column: {labels:?}"
+            );
+            assert_eq!(
+                objects
+                    .iter()
+                    .find(|o| o.display_label() == "shop")
+                    .map(|o| o.kind),
+                Some(SchemaObjectKind::Database)
+            );
+            assert_eq!(
+                objects
+                    .iter()
+                    .find(|o| o.display_label() == "shop.users")
+                    .map(|o| o.kind),
+                Some(SchemaObjectKind::Table)
+            );
+            assert_eq!(
+                objects
+                    .iter()
+                    .find(|o| o.display_label() == "shop.users.id")
+                    .map(|o| o.kind),
+                Some(SchemaObjectKind::Column)
+            );
         });
     }
 

@@ -802,6 +802,12 @@ pub mod database_panel {
             QuickDocumentation,
             /// Shows an entity-relationship diagram for the selected database.
             ShowDiagram,
+            /// Opens a fuzzy-search palette over every database, table, view, and
+            /// column of the active connection.
+            GoToObject,
+            /// Reformats the SQL in the current console query (keyword case,
+            /// indentation, line breaks).
+            FormatQuery,
         ]
     );
 }

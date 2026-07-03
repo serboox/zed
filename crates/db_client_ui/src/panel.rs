@@ -10,6 +10,7 @@ use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
     ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree, plan_text_from_result,
 };
+use crate::go_to_object::GoToObjectPalette;
 use crate::modify_table::ModifyTableView;
 use crate::native_dump::{
     DumpRequest, DumpRunCallback, DumpStatus, DumpTask, NativeDumpDialog, apply_substitutions,
@@ -57,7 +58,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     notifications::NotificationId,
 };
-use zed_actions::database_panel::{GoToDdl, QuickDocumentation, ShowDiagram, ToggleFocus};
+use zed_actions::database_panel::{GoToDdl, GoToObject, QuickDocumentation, ShowDiagram, ToggleFocus};
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
 const ERD_TABLE_LIMIT: usize = 50;
@@ -3939,6 +3940,48 @@ impl DatabasePanel {
             .log_err();
     }
 
+    /// Opens the fuzzy go-to-object palette (Ctrl+N) for the connection the
+    /// tree selection currently targets, falling back to the active
+    /// connection when nothing is selected in the tree.
+    fn open_go_to_object_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let connection_id = self
+            .selected_tree_node
+            .as_ref()
+            .map(|node| node.connection_id)
+            .or_else(|| self.store.read(cx).active_connection_id());
+        let Some(connection_id) = connection_id else {
+            return;
+        };
+        let Some(connection) = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|c| c.config.id == connection_id)
+        else {
+            return;
+        };
+        let label = SharedString::from(connection.config.label.clone());
+        let driver = connection.config.driver;
+        let store = self.store.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let workspace_weak = cx.entity().downgrade();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    GoToObjectPalette::new(
+                        store,
+                        workspace_weak,
+                        connection_id,
+                        label,
+                        driver,
+                        window,
+                        cx,
+                    )
+                });
+            })
+            .log_err();
+    }
+
     /// Exports the whole Database Explorer (folder tree, all connection
     /// settings, the SQL console files, and optionally master-password-encrypted
     /// passwords) to one portable file the user picks.
@@ -6721,6 +6764,9 @@ impl Render for DatabasePanel {
             }))
             .on_action(cx.listener(|this, _: &ShowDiagram, window, cx| {
                 this.show_diagram_for_selection(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToObject, window, cx| {
+                this.open_go_to_object_palette(window, cx);
             }))
             .size_full()
             .relative()
@@ -10183,6 +10229,169 @@ mod tests {
                 .count()
         });
         assert_eq!(tabs, 1, "DDL Source must open as a tab in the active pane");
+    }
+
+    struct GoToObjectSchemaProvider;
+
+    #[async_trait::async_trait]
+    impl db_client::DbProvider for GoToObjectSchemaProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(vec![db_client::DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(vec![db_client::TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            Ok(vec![db_client::ColumnInfo {
+                name: "id".into(),
+                data_type: "int".into(),
+                is_nullable: false,
+                column_key: Some("PRI".into()),
+                default_value: None,
+                extra: String::new(),
+            }])
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: vec!["id".to_string()],
+                rows: vec![vec![Some("1".to_string())]],
+                rows_affected: 1,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok("TABLE_DDL".to_string())
+        }
+        async fn get_database_ddl(&self, _database: &str) -> anyhow::Result<String> {
+            Ok("DATABASE_DDL".to_string())
+        }
+    }
+
+    // Real end-to-end proof of the go-to-object palette (Ctrl+N ->
+    // database_panel::GoToObject): dispatches the real action exactly as the
+    // real keymap resolves it, types a real fuzzy query into the picker,
+    // confirms with a real Enter keystroke, and asserts a ResultView tab for
+    // the matched table opened in the active pane -- not an internal method
+    // call standing in for the interaction.
+    #[gpui::test]
+    async fn go_to_object_action_opens_the_matched_table_as_a_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        // The picker crate's query editor goes through ui_input's type-erased
+        // editor factory, which only `editor::init` registers -- db_client_ui's
+        // own cell editors construct `editor::Editor` directly and never hit it.
+        cx.update(|cx| editor::init(cx));
+        // This test harness loads no production keymap, so mirror the real
+        // global (unscoped) "enter" -> menu::Confirm binding the picker relies
+        // on (assets/keymaps/default-linux.json has no "context" on that block).
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new("enter", menu::Confirm, None)]);
+        });
+        let config = db_client::ConnectionConfig {
+            label: "go-to-object".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(
+                    config,
+                    std::sync::Arc::new(GoToObjectSchemaProvider),
+                    cx,
+                );
+                store.prefetch_full_schema(connection_id, cx).detach();
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(GoToObject);
+        cx.run_until_parked();
+
+        let has_modal = workspace.read_with(&cx, |workspace, cx| {
+            workspace.active_modal::<GoToObjectPalette>(cx).is_some()
+        });
+        assert!(
+            has_modal,
+            "Ctrl+N (database_panel::GoToObject) must open the go-to-object palette as a modal"
+        );
+
+        cx.simulate_keystrokes("u s e r s");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let tabs = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ResultView>()
+                .count()
+        });
+        assert_eq!(
+            tabs, 1,
+            "confirming the 'users' match must open its data grid as a tab"
+        );
+        let tab_title = workspace.read_with(&cx, |workspace, cx| {
+            use workspace::Item;
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ResultView>()
+                .next()
+                .map(|view| view.read(cx).tab_content_text(0, cx))
+        });
+        assert_eq!(tab_title, Some(SharedString::from("users")));
+
+        let has_modal_after_confirm = workspace.read_with(&cx, |workspace, cx| {
+            workspace.active_modal::<GoToObjectPalette>(cx).is_some()
+        });
+        assert!(
+            !has_modal_after_confirm,
+            "confirming a match must dismiss the palette"
+        );
     }
 
     #[gpui::test]
