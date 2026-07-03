@@ -10,6 +10,7 @@ use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
     ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree, plan_text_from_result,
 };
+use crate::full_text_search::FullTextSearchView;
 use crate::go_to_object::GoToObjectPalette;
 use crate::modify_table::ModifyTableView;
 use crate::native_dump::{
@@ -4413,6 +4414,61 @@ impl DatabasePanel {
         .detach_and_log_err(cx);
     }
 
+    fn open_full_text_search(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (provider, driver, label) = {
+            let store = self.store.read(cx);
+            let Some(connection) = store.connections().iter().find(|c| c.config.id == id) else {
+                return;
+            };
+            let Some(provider) = connection.provider.clone() else {
+                return;
+            };
+            (
+                provider,
+                connection.config.driver,
+                SharedString::from(connection.config.label.clone()),
+            )
+        };
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            let tables = provider
+                .list_tables(&database)
+                .await
+                .log_err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|table| table.name)
+                .collect::<Vec<_>>();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let view = cx.new(|cx| {
+                        FullTextSearchView::new(
+                            store,
+                            workspace.weak_handle(),
+                            id,
+                            label,
+                            database,
+                            driver,
+                            tables,
+                            window,
+                            cx,
+                        )
+                    });
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn open_compare_picker(
         &mut self,
         id: ConnectionId,
@@ -5414,6 +5470,15 @@ impl DatabasePanel {
                                         move |window, cx| {
                                             entity.update(cx, |panel, cx| {
                                                 panel.open_erd_diagram(id, db.clone(), window, cx);
+                                            });
+                                        }
+                                    })
+                                    .entry("Search Data…", None, {
+                                        let entity = entity.clone();
+                                        let db = db.clone();
+                                        move |window, cx| {
+                                            entity.update(cx, |panel, cx| {
+                                                panel.open_full_text_search(id, db.clone(), window, cx);
                                             });
                                         }
                                     })

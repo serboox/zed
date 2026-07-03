@@ -7,6 +7,7 @@ mod ddl_source;
 mod driver_icon;
 mod erd_diagram;
 mod explain_plan;
+mod full_text_search;
 mod go_to_object;
 mod modify_table;
 pub mod native_dump;
