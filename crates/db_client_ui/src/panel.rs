@@ -4996,6 +4996,169 @@ impl DatabasePanel {
         .detach_and_log_err(cx);
     }
 
+    /// Same picker flow as `open_compare_picker`, but for structural
+    /// comparison: the chosen second table's schema is diffed against
+    /// `left_table`'s instead of their row data.
+    fn open_schema_compare_picker(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        left_table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == id)
+            .and_then(|connection| connection.provider.clone());
+        let Some(provider) = provider else { return };
+        let left_for_filter = left_table.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let candidates: Vec<String> = provider
+                .list_tables(&database)
+                .await
+                .log_err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|table| table.name)
+                .filter(|name| name != &left_for_filter)
+                .collect();
+            this.update_in(cx, |panel, window, cx| {
+                let weak = cx.entity().downgrade();
+                let title = left_table.clone();
+                let database = database.clone();
+                let on_pick: ComparePickCallback = Arc::new(move |right_table, window, cx| {
+                    weak.update(cx, |panel, cx| {
+                        panel.start_schema_compare(
+                            id,
+                            database.clone(),
+                            left_table.clone(),
+                            right_table,
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                });
+                panel
+                    .workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |_window, cx| {
+                            ComparePickerView::new(title.clone(), candidates.clone(), on_pick, cx)
+                        });
+                    })
+                    .log_err();
+            })
+            .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Fetches both tables' full structural introspection (columns, indexes,
+    /// foreign keys, checks), diffs them, and opens the result as a
+    /// `SchemaDiffView` -- the "from" side is `left_table` (what gets
+    /// altered), the "to" side is `right_table` (the desired shape).
+    fn start_schema_compare(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        left_table: String,
+        right_table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (provider, driver) = {
+            let store_ref = self.store.read(cx);
+            let Some(connection) = store_ref.connections().iter().find(|c| c.config.id == id)
+            else {
+                return;
+            };
+            let Some(provider) = connection.provider.clone() else {
+                return;
+            };
+            (provider, connection.config.driver)
+        };
+        let workspace = self.workspace.clone();
+        let store = self.store.downgrade();
+        let panel_weak = cx.entity().downgrade();
+        let title: SharedString = format!("Schema: {left_table} vs {right_table}").into();
+        let from_table = left_table.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            let (
+                left_columns,
+                left_indexes,
+                left_fks,
+                left_checks,
+                right_columns,
+                right_indexes,
+                right_fks,
+                right_checks,
+            ) = futures::join!(
+                provider.describe_table(&database, &left_table),
+                provider.list_indexes(&database, &left_table),
+                provider.list_foreign_keys(&database, &left_table),
+                provider.list_check_constraints(&database, &left_table),
+                provider.describe_table(&database, &right_table),
+                provider.list_indexes(&database, &right_table),
+                provider.list_foreign_keys(&database, &right_table),
+                provider.list_check_constraints(&database, &right_table),
+            );
+            let from = crate::schema_diff::TableSchema {
+                columns: left_columns.unwrap_or_default(),
+                indexes: left_indexes.unwrap_or_default(),
+                foreign_keys: left_fks.unwrap_or_default(),
+                checks: left_checks.unwrap_or_default(),
+            };
+            let to = crate::schema_diff::TableSchema {
+                columns: right_columns.unwrap_or_default(),
+                indexes: right_indexes.unwrap_or_default(),
+                foreign_keys: right_fks.unwrap_or_default(),
+                checks: right_checks.unwrap_or_default(),
+            };
+            let diff = crate::schema_diff::SchemaDiff::compute(&from, &to);
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let workspace_weak = workspace.weak_handle();
+                    let on_run: Arc<dyn Fn(String, &mut Window, &mut App)> =
+                        Arc::new(move |script, _window, cx| {
+                            let workspace_weak = workspace_weak.clone();
+                            let store = store.clone();
+                            panel_weak
+                                .update_in(cx, |_panel, window, cx| {
+                                    DatabasePanel::open_sql_query_with_text(
+                                        workspace_weak,
+                                        store,
+                                        id,
+                                        script,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        });
+                    let view = cx.new(|cx| {
+                        crate::schema_diff::SchemaDiffView::new(
+                            &diff,
+                            &from_table,
+                            driver,
+                            title,
+                            on_run,
+                            window,
+                            cx,
+                        )
+                    });
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                })
+                .log_err();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn open_query_params_prompt(
         &mut self,
         connection_id: ConnectionId,
@@ -6232,6 +6395,22 @@ impl DatabasePanel {
                                                         move |window, cx| {
                                                             entity.update(cx, |panel, cx| {
                                                                 panel.open_compare_picker(
+                                                                    id,
+                                                                    db.clone(),
+                                                                    tbl.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    })
+                                                    .entry("Compare Schema…", None, {
+                                                        let entity = entity.clone();
+                                                        let db = db.clone();
+                                                        let tbl = tbl.clone();
+                                                        move |window, cx| {
+                                                            entity.update(cx, |panel, cx| {
+                                                                panel.open_schema_compare_picker(
                                                                     id,
                                                                     db.clone(),
                                                                     tbl.clone(),
@@ -9826,6 +10005,147 @@ mod tests {
         assert_eq!(
             compare_tabs, 1,
             "Compare Data must open as a tab in the active pane"
+        );
+    }
+
+    // Returns a different column list per table name so a real structural
+    // diff exists between "left" (missing "email", has a nullable "legacy")
+    // and "right" (has "email" as NOT NULL, no "legacy").
+    struct SchemaCompareProvider;
+
+    #[async_trait::async_trait]
+    impl db_client::DbProvider for SchemaCompareProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            table: &str,
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            let id = db_client::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "int".to_string(),
+                is_nullable: false,
+                column_key: Some("PRI".to_string()),
+                default_value: None,
+                extra: String::new(),
+            };
+            Ok(if table == "right" {
+                vec![
+                    id,
+                    db_client::ColumnInfo {
+                        name: "email".to_string(),
+                        data_type: "varchar(255)".to_string(),
+                        is_nullable: false,
+                        column_key: None,
+                        default_value: None,
+                        extra: String::new(),
+                    },
+                ]
+            } else {
+                vec![
+                    id,
+                    db_client::ColumnInfo {
+                        name: "legacy".to_string(),
+                        data_type: "tinyint".to_string(),
+                        is_nullable: true,
+                        column_key: None,
+                        default_value: None,
+                        extra: String::new(),
+                    },
+                ]
+            })
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            unreachable!("this fake only exercises schema introspection")
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[gpui::test]
+    async fn schema_compare_opens_a_diff_view_with_the_migration_script(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "schema-compare".to_string(),
+            auto_connect: false,
+            driver: db_client::DatabaseDriver::PostgreSQL,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(
+                    config,
+                    std::sync::Arc::new(SchemaCompareProvider),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_schema_compare(
+                connection_id,
+                "public".to_string(),
+                "left".to_string(),
+                "right".to_string(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let script = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<crate::schema_diff::SchemaDiffView>()
+                .next()
+                .map(|view| view.read(cx).script_text())
+        });
+        let script = script.expect("Compare Schema must open a SchemaDiffView tab");
+        assert!(
+            script.contains("ADD COLUMN \"email\""),
+            "the script must add the column only present on the right side: {script}"
+        );
+        assert!(
+            script.contains("DROP COLUMN \"legacy\""),
+            "the script must drop the column only present on the left side: {script}"
         );
     }
 

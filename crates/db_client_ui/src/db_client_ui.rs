@@ -14,6 +14,7 @@ mod modify_table;
 pub mod native_dump;
 mod panel;
 mod result_view;
+mod schema_diff;
 mod sql_ast;
 mod sql_binder;
 mod sql_completion_provider;
