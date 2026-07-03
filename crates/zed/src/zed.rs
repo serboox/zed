@@ -1250,6 +1250,14 @@ fn register_actions(
                 db_client_ui::run_sql_file(workspace, window, cx);
             },
         )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::ToggleInlineResults,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::toggle_inline_results(workspace, window, cx);
+            },
+        )
         .register_action({
             let app_state = app_state.clone();
             move |_, _: &NewWindow, _, cx| {

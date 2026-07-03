@@ -820,6 +820,9 @@ pub mod database_panel {
             /// ignoring whichever connection is currently active in the
             /// panel.
             RunSqlFile,
+            /// Toggles showing each statement's result inline, below the
+            /// statement, instead of only in the bottom-dock results tab.
+            ToggleInlineResults,
         ]
     );
 }

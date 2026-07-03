@@ -138,6 +138,7 @@ struct QueryExecutionMarker {
 struct DbQueryEditorAddon {
     connection_id: ConnectionId,
     query_markers: Vec<QueryExecutionMarker>,
+    inline_results: Option<Entity<crate::inline_results::InlineResultsController>>,
 }
 
 impl editor::Addon for DbQueryEditorAddon {
@@ -172,6 +173,7 @@ impl DbQueryEditorAddon {
         Self {
             connection_id,
             query_markers: Vec::new(),
+            inline_results: None,
         }
     }
 
@@ -1621,6 +1623,7 @@ fn statement_at_cursor(text: &str, cursor: usize) -> String {
 struct SqlStatementRun {
     sql: String,
     start_row: u32,
+    end_row: u32,
 }
 
 fn row_for_byte_offset(text: &str, offset: usize) -> u32 {
@@ -1673,6 +1676,7 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
             statements.push(SqlStatementRun {
                 sql: sql.to_string(),
                 start_row: row_for_byte_offset(text, trimmed.start),
+                end_row: row_for_byte_offset(text, trimmed.end),
             });
         }
         start = end + 1;
@@ -1683,6 +1687,7 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
         statements.push(SqlStatementRun {
             sql: sql.to_string(),
             start_row: row_for_byte_offset(text, trimmed.start),
+            end_row: row_for_byte_offset(text, trimmed.end),
         });
     }
     statements
@@ -2598,6 +2603,50 @@ pub fn run_sql_file(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
     run_current_sql_query(workspace, window, cx);
 }
 
+/// Toggles whether the active console shows each statement's result inline,
+/// below the statement, in addition to the existing bottom-dock results tab
+/// (which is never removed by this toggle -- turning it back off simply
+/// clears the inline blocks and leaves the bottom-dock behavior exactly as
+/// it always was). This is a per-console setting, not global: two open
+/// consoles can independently be in inline or bottom-dock-only mode.
+pub fn toggle_inline_results(
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let active_item = workspace.active_item(cx);
+    let Some(editor) = active_item.and_then(|item| item.act_as::<Editor>(cx)) else {
+        cx.propagate();
+        return;
+    };
+    let Some(bound_connection_id) = editor
+        .read(cx)
+        .addon::<DbQueryEditorAddon>()
+        .map(|addon| addon.connection_id)
+    else {
+        cx.propagate();
+        return;
+    };
+
+    let controller = editor.update(cx, |editor, cx| {
+        let weak_editor = cx.weak_entity();
+        if editor.addon::<DbQueryEditorAddon>().is_none() {
+            editor.register_addon(DbQueryEditorAddon::new(bound_connection_id));
+        }
+        let controller = editor
+            .addon::<DbQueryEditorAddon>()
+            .and_then(|addon| addon.inline_results.clone())
+            .unwrap_or_else(|| {
+                cx.new(|_| crate::inline_results::InlineResultsController::new(weak_editor))
+            });
+        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+            addon.inline_results = Some(controller.clone());
+        }
+        controller
+    });
+    controller.update(cx, |controller, cx| controller.toggle(cx));
+}
+
 pub fn explain_current_sql_query(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -2735,6 +2784,7 @@ fn run_sql_from_editor(
             (!sql.is_empty()).then_some(SqlStatementRun {
                 sql,
                 start_row: statement.start_row,
+                end_row: statement.end_row,
             })
         })
         .collect();
@@ -2821,11 +2871,19 @@ fn run_sql_from_editor(
     cx.spawn_in(window, async move |_workspace, cx| {
         let mut connected = connected;
         for statement in statements {
-            editor.update(cx, |editor, cx| {
+            let inline_view = editor.update(cx, |editor, cx| {
+                let controller = editor
+                    .addon::<DbQueryEditorAddon>()
+                    .and_then(|addon| addon.inline_results.clone());
                 if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
                     addon.mark_query(statement.start_row, QueryExecutionStatus::Running);
                     cx.notify();
                 }
+                controller.and_then(|controller| {
+                    controller.update(cx, |controller, cx| {
+                        controller.begin_statement(statement.start_row, statement.end_row, cx)
+                    })
+                })
             });
             result_view.update(cx, |view, cx| {
                 view.clear_table_context();
@@ -2843,9 +2901,11 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
-                    result_view.update(cx, |view, cx| {
-                        view.set_error(format!("Could not connect to '{conn_label}': {err}"), cx);
-                    });
+                    let message = format!("Could not connect to '{conn_label}': {err}");
+                    if let Some(inline_view) = &inline_view {
+                        inline_view.update(cx, |view, cx| view.set_error(message.clone(), cx));
+                    }
+                    result_view.update(cx, |view, cx| view.set_error(message, cx));
                     return anyhow::Ok(());
                 }
                 connected = true;
@@ -2864,6 +2924,9 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
+                    if let Some(inline_view) = &inline_view {
+                        inline_view.update(cx, |view, cx| view.set_result(&result, cx));
+                    }
                     let table_context = select_table_reference(&sql).map(|reference| {
                         let database = reference.database.unwrap_or_else(|| db_name.clone());
                         (database, reference.table)
@@ -2890,6 +2953,9 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
+                    if let Some(inline_view) = &inline_view {
+                        inline_view.update(cx, |view, cx| view.set_error(err.to_string(), cx));
+                    }
                     result_view.update(cx, |view, cx| view.set_error(err.to_string(), cx));
                     return anyhow::Ok(());
                 }
@@ -8081,14 +8147,17 @@ mod tests {
                 super::SqlStatementRun {
                     sql: "SELECT 1".to_string(),
                     start_row: 0,
+                    end_row: 0,
                 },
                 super::SqlStatementRun {
                     sql: "SELECT *\nFROM schema.table".to_string(),
                     start_row: 2,
+                    end_row: 3,
                 },
                 super::SqlStatementRun {
                     sql: "SHOW CREATE TABLE schema.table".to_string(),
                     start_row: 4,
+                    end_row: 4,
                 },
             ]
         );
