@@ -1,10 +1,12 @@
 use crate::store::{CliQueryOutput, DatabaseStore};
 use agent::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 use agent_client_protocol::schema::v1 as acp;
+use db_client::DatabaseDriver;
 use gpui::{App, SharedString, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 type Result<T, E = String> = core::result::Result<T, E>;
@@ -15,6 +17,8 @@ const MAX_CELL_CHARS: usize = 500;
 pub fn init() {
     agent::register_extra_tool(|| DbListConnectionsTool.erase());
     agent::register_extra_tool(|| DbRunQueryTool.erase());
+    agent::register_extra_tool(|| DbDescribeSchemaTool.erase());
+    agent::register_extra_tool(|| DbExplainErrorTool.erase());
 }
 
 fn no_store_message() -> String {
@@ -276,12 +280,473 @@ impl AgentTool for DbRunQueryTool {
     }
 }
 
+fn resolve_connection(
+    store: &DatabaseStore,
+    connection: &str,
+) -> Result<(db_client::ConnectionId, DatabaseDriver, Option<String>)> {
+    let id = store
+        .resolve_connection_id(connection)
+        .ok_or_else(|| format!("No database connection matching '{connection}'"))?;
+    let connection = store
+        .connections()
+        .iter()
+        .find(|c| c.config.id == id)
+        .ok_or_else(|| format!("No database connection matching '{connection}'"))?;
+    Ok((id, connection.config.driver, connection.config.database.clone()))
+}
+
+fn resolve_database(input_database: &Option<String>, default_database: Option<String>) -> Result<String> {
+    input_database
+        .clone()
+        .filter(|database| !database.is_empty())
+        .or(default_database)
+        .ok_or_else(|| {
+            "No database specified and the connection has no default database".to_string()
+        })
+}
+
+/// Formats cached schema info (tables and their columns) for a connection,
+/// optionally narrowed to one database and/or one table. Reads only the
+/// already-prefetched schema cache -- never queries the database itself, so
+/// it works for a read-only connection and never blocks on the network.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct DbDescribeSchemaInput {
+    /// Connection id or label (see `db_list_connections`).
+    pub connection: String,
+    /// Database/schema to describe. Defaults to the connection's database.
+    #[serde(default)]
+    pub database: Option<String>,
+    /// Restrict to this single table. When omitted, every cached table's
+    /// columns are listed.
+    #[serde(default)]
+    pub table: Option<String>,
+}
+
+pub struct DbDescribeSchemaTool;
+
+impl AgentTool for DbDescribeSchemaTool {
+    type Input = DbDescribeSchemaInput;
+    type Output = String;
+
+    const NAME: &'static str = "db_describe_schema";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        match input {
+            Ok(input) => format!("Describe schema for {}", input.connection).into(),
+            Err(_) => "Describe database schema".into(),
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        let store = match store(cx) {
+            Ok(store) => store,
+            Err(message) => return Task::ready(Err(message)),
+        };
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(|error| error.to_string())?;
+            store.update(cx, |store, _cx| describe_schema(store, &input))
+        })
+    }
+}
+
+fn describe_schema(store: &DatabaseStore, input: &DbDescribeSchemaInput) -> Result<String> {
+    let (id, _driver, default_database) = resolve_connection(store, &input.connection)?;
+    let database = resolve_database(&input.database, default_database)?;
+    let tables = match &input.table {
+        Some(table) => vec![table.clone()],
+        None => store.cached_table_names(id, &database),
+    };
+    if tables.is_empty() {
+        return Ok(format!(
+            "No cached schema for database '{database}'. Open the Database Explorer and \
+             expand this connection first, or run db_run_query against it once to trigger \
+             a prefetch."
+        ));
+    }
+    let mut output = String::new();
+    for table in &tables {
+        let columns = store.cached_table_columns(id, &database, table);
+        if columns.is_empty() {
+            let _ = writeln!(output, "{table}: (no cached columns)");
+            continue;
+        }
+        let _ = writeln!(output, "{table}:");
+        for column in &columns {
+            let nullable = if column.is_nullable { "NULL" } else { "NOT NULL" };
+            let key = column
+                .column_key
+                .as_deref()
+                .map(|key| format!(" [{key}]"))
+                .unwrap_or_default();
+            let _ = writeln!(output, "  {} {} {nullable}{key}", column.name, column.data_type);
+        }
+    }
+    Ok(output)
+}
+
+/// Walks a parsed SQL statement and collects every distinct table name it
+/// references (FROM/JOIN targets, INSERT/UPDATE/DELETE targets, subqueries),
+/// in first-seen order. Returns an empty list on a parse failure -- the
+/// caller falls back to reporting the raw error without schema context
+/// rather than failing the whole tool call.
+fn referenced_tables(sql: &str, driver: DatabaseDriver) -> Vec<String> {
+    struct TableCollector {
+        tables: Vec<String>,
+    }
+    impl sqlparser::ast::Visitor for TableCollector {
+        type Break = ();
+        fn pre_visit_relation(
+            &mut self,
+            relation: &sqlparser::ast::ObjectName,
+        ) -> ControlFlow<Self::Break> {
+            let (_, table) = crate::sql_binder::database_and_table(relation);
+            if !self.tables.contains(&table) {
+                self.tables.push(table);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let Some(dialect) = crate::sql_ast::dialect_for_driver(driver) else {
+        return Vec::new();
+    };
+    let Ok(statements) = sqlparser::parser::Parser::parse_sql(dialect.as_ref(), sql) else {
+        return Vec::new();
+    };
+    let mut collector = TableCollector { tables: Vec::new() };
+    for statement in &statements {
+        let _ = sqlparser::ast::Visit::visit(statement, &mut collector);
+    }
+    collector.tables
+}
+
+/// Bundles a failed statement and the driver's error message with the real
+/// column list of every table the statement references, resolved against the
+/// cached schema, so the calling model can spot e.g. a typo'd column name
+/// against the table's actual columns instead of guessing blind.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct DbExplainErrorInput {
+    /// Connection id or label (see `db_list_connections`).
+    pub connection: String,
+    /// Database/schema the statement targeted. Defaults to the connection's database.
+    #[serde(default)]
+    pub database: Option<String>,
+    /// The SQL statement that failed.
+    pub sql: String,
+    /// The error message the database returned.
+    pub error: String,
+}
+
+pub struct DbExplainErrorTool;
+
+impl AgentTool for DbExplainErrorTool {
+    type Input = DbExplainErrorInput;
+    type Output = String;
+
+    const NAME: &'static str = "db_explain_error";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        _input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        "Explain database error".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        let store = match store(cx) {
+            Ok(store) => store,
+            Err(message) => return Task::ready(Err(message)),
+        };
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(|error| error.to_string())?;
+            store.update(cx, |store, _cx| explain_error(store, &input))
+        })
+    }
+}
+
+fn explain_error(store: &DatabaseStore, input: &DbExplainErrorInput) -> Result<String> {
+    let (id, driver, default_database) = resolve_connection(store, &input.connection)?;
+    let database = resolve_database(&input.database, default_database)?;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "Error: {}", input.error);
+    let _ = writeln!(output, "Statement: {}", input.sql);
+
+    let tables = referenced_tables(&input.sql, driver);
+    if tables.is_empty() {
+        let _ = write!(
+            output,
+            "\nNo table references could be parsed from the statement."
+        );
+        return Ok(output);
+    }
+    let _ = write!(output, "\nReferenced tables (from cached schema):");
+    for table in &tables {
+        let columns = store.cached_table_columns(id, &database, table);
+        if columns.is_empty() {
+            let _ = write!(
+                output,
+                "\n{table}: not found in cached schema for database '{database}' (check for \
+                 a typo, or the schema may not be prefetched yet)"
+            );
+        } else {
+            let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
+            let _ = write!(output, "\n{table}: {}", names.join(", "));
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::GlobalDatabaseStore;
     use db_client::ConnectionConfig;
     use gpui::AppContext as _;
+
+    struct SchemaContextMockProvider;
+
+    #[async_trait::async_trait]
+    impl db_client::provider::DbProvider for SchemaContextMockProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(vec![db_client::DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(vec![db_client::TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            table: &str,
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            if table != "users" {
+                return Ok(Vec::new());
+            }
+            Ok(vec![
+                db_client::ColumnInfo {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    is_nullable: false,
+                    column_key: Some("PRI".into()),
+                    default_value: None,
+                    extra: String::new(),
+                },
+                db_client::ColumnInfo {
+                    name: "email".into(),
+                    data_type: "varchar(255)".into(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ])
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: vec!["id".to_string()],
+                rows: vec![vec![Some("1".to_string())]],
+                rows_affected: 1,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok("TABLE_DDL".to_string())
+        }
+    }
+
+    /// Seeds a global store with one connected connection whose schema cache
+    /// has been fully prefetched from `SchemaContextMockProvider`.
+    async fn seeded_store_with_schema(cx: &mut gpui::TestAppContext) -> String {
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        let connection = id.to_string();
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(SchemaContextMockProvider), cx);
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| cx.set_global(GlobalDatabaseStore(store.clone())));
+        connection
+    }
+
+    #[gpui::test]
+    async fn db_describe_schema_lists_every_cached_table_by_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let connection = seeded_store_with_schema(cx).await;
+        let task = cx.update(|cx| {
+            let (event_stream, _receiver) = ToolCallEventStream::test();
+            Arc::new(DbDescribeSchemaTool).run(
+                ToolInput::resolved(DbDescribeSchemaInput {
+                    connection,
+                    database: Some("shop".to_string()),
+                    table: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let output = task.await.expect("describing schema succeeds");
+        assert!(output.contains("users:"));
+        assert!(output.contains("id int NOT NULL [PRI]"));
+        assert!(output.contains("email varchar(255) NOT NULL"));
+    }
+
+    #[gpui::test]
+    async fn db_describe_schema_narrows_to_one_table_when_given(cx: &mut gpui::TestAppContext) {
+        let connection = seeded_store_with_schema(cx).await;
+        let task = cx.update(|cx| {
+            let (event_stream, _receiver) = ToolCallEventStream::test();
+            Arc::new(DbDescribeSchemaTool).run(
+                ToolInput::resolved(DbDescribeSchemaInput {
+                    connection,
+                    database: Some("shop".to_string()),
+                    table: Some("users".to_string()),
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let output = task.await.expect("describing one table succeeds");
+        assert_eq!(output.matches("users:").count(), 1);
+        assert!(output.contains("email"));
+    }
+
+    #[gpui::test]
+    async fn db_describe_schema_reports_unknown_connection_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        cx.update(|cx| cx.set_global(GlobalDatabaseStore(store.clone())));
+        let task = cx.update(|cx| {
+            let (event_stream, _receiver) = ToolCallEventStream::test();
+            Arc::new(DbDescribeSchemaTool).run(
+                ToolInput::resolved(DbDescribeSchemaInput {
+                    connection: "nonexistent".to_string(),
+                    database: None,
+                    table: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let error = task.await.expect_err("an unknown connection must error, not panic");
+        assert!(error.contains("nonexistent"));
+    }
+
+    #[gpui::test]
+    async fn db_explain_error_resolves_the_typo_free_column_list_for_referenced_tables(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let connection = seeded_store_with_schema(cx).await;
+        let task = cx.update(|cx| {
+            let (event_stream, _receiver) = ToolCallEventStream::test();
+            Arc::new(DbExplainErrorTool).run(
+                ToolInput::resolved(DbExplainErrorInput {
+                    connection,
+                    database: Some("shop".to_string()),
+                    // "emial" is a typo for the real "email" column.
+                    sql: "SELECT emial FROM users".to_string(),
+                    error: "Unknown column 'emial' in 'field list'".to_string(),
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let output = task.await.expect("explaining the error succeeds");
+        assert!(output.contains("Unknown column 'emial'"));
+        assert!(
+            output.contains("users: id, email"),
+            "must resolve the referenced table's real columns so the typo is spottable: {output}"
+        );
+    }
+
+    #[gpui::test]
+    async fn db_explain_error_reports_unknown_connection_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        cx.update(|cx| cx.set_global(GlobalDatabaseStore(store.clone())));
+        let task = cx.update(|cx| {
+            let (event_stream, _receiver) = ToolCallEventStream::test();
+            Arc::new(DbExplainErrorTool).run(
+                ToolInput::resolved(DbExplainErrorInput {
+                    connection: "nonexistent".to_string(),
+                    database: None,
+                    sql: "SELECT 1".to_string(),
+                    error: "boom".to_string(),
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let error = task.await.expect_err("an unknown connection must error, not panic");
+        assert!(error.contains("nonexistent"));
+    }
+
+    #[test]
+    fn referenced_tables_extracts_from_from_join_insert_update_and_delete() {
+        assert_eq!(
+            referenced_tables("SELECT * FROM users", DatabaseDriver::MySQL),
+            vec!["users".to_string()]
+        );
+        assert_eq!(
+            referenced_tables(
+                "SELECT * FROM orders o JOIN users u ON u.id = o.user_id",
+                DatabaseDriver::PostgreSQL
+            ),
+            vec!["orders".to_string(), "users".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("INSERT INTO users (id) VALUES (1)", DatabaseDriver::MySQL),
+            vec!["users".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("UPDATE users SET email = 'x'", DatabaseDriver::MySQL),
+            vec!["users".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("DELETE FROM users WHERE id = 1", DatabaseDriver::MySQL),
+            vec!["users".to_string()]
+        );
+        assert!(referenced_tables("not valid sql (((", DatabaseDriver::MySQL).is_empty());
+    }
 
     #[gpui::test]
     async fn db_list_connections_tool_reads_global_store(cx: &mut gpui::TestAppContext) {
