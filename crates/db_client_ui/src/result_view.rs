@@ -8174,10 +8174,13 @@ impl ResultView {
         ) else {
             return;
         };
+        let quote = self.identifier_quote(cx);
         let escaped = value.replace('\'', "''");
         let sql = format!(
-            "SELECT * FROM `{}` WHERE `{}` = '{}'",
-            fk.to_table, fk.to_column, escaped
+            "SELECT * FROM {} WHERE {} = '{}'",
+            quote_identifier(quote, &fk.to_table),
+            quote_identifier(quote, &fk.to_column),
+            escaped
         );
         self.run_sql(store, conn_id, db, sql, cx);
     }
@@ -14391,6 +14394,91 @@ mod tests {
             rows_affected: 0,
             execution_time_ms: 0,
         }
+    }
+
+    fn table_result_with_customer_fk_column() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".to_string(), "customer_id".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("42".to_string())],
+                vec![Some("2".to_string()), Some("43".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    // navigate_to_fk_row used to hardcode MySQL-style backtick quoting for the
+    // generated lookup query, which produced invalid SQL against PostgreSQL
+    // (and SQLite) connections, whose identifier quote character is `"`.
+    #[gpui::test]
+    fn navigate_to_fk_row_quotes_identifiers_for_the_active_driver(cx: &mut gpui::TestAppContext) {
+        init_result_view_test(cx);
+        let connection_id = uuid::Uuid::new_v4();
+        let store = cx.update(|cx| {
+            let store = cx.new(DatabaseStore::new);
+            store.update(cx, |store, cx| {
+                let mut config = db_client::ConnectionConfig::default();
+                config.id = connection_id;
+                config.driver = DatabaseDriver::PostgreSQL;
+                // A connected fake provider, not `add_connection`, so
+                // `run_sql`'s background fill never attempts a real network
+                // connection using this driver's default host/port.
+                store.add_connected_for_test(config, Arc::new(ReadOnlyProbeProvider), cx);
+            });
+            store
+        });
+
+        let window = cx.add_window({
+            let store = store.downgrade();
+            move |window, cx| {
+                let mut view = ResultView::new("orders", cx).with_table_context(
+                    store,
+                    connection_id,
+                    "public".to_string(),
+                    "orders".to_string(),
+                    window,
+                    cx,
+                );
+                view.set_result(table_result_with_customer_fk_column(), cx);
+                view.fk_columns.insert(
+                    1,
+                    FkInfo {
+                        name: "orders_customer_id_fkey".to_string(),
+                        from_column: "customer_id".to_string(),
+                        to_table: "customers".to_string(),
+                        to_column: "id".to_string(),
+                    },
+                );
+                view
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+
+        let fk_cell = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_click(fk_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.selected_cell,
+                Some((0, 1)),
+                "a real click on the FK cell should select it"
+            );
+        });
+
+        cx.dispatch_action(NavigateToFkRow);
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.base_sql.as_deref(),
+                Some(r#"SELECT * FROM "customers" WHERE "id" = '42'"#),
+                "a real NavigateToFkRow dispatch must quote identifiers using the active \
+                 connection's driver (double quotes for PostgreSQL), not hardcoded MySQL backticks"
+            );
+        });
     }
 
     // Registers the same "enter"/"shift-enter" -> ConfirmCompletion/ConfirmCompletionReplace
