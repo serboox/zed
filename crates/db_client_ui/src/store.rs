@@ -10,8 +10,8 @@ use db_client::{
     provider::DbProvider,
     redis_provider::RedisProvider,
     schema::{
-        CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, TableInfo,
-        TriggerInfo, UserInfo,
+        CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, IndexInfo, ProcedureInfo,
+        SequenceInfo, TableInfo, TriggerInfo, UserInfo,
     },
     sqlite::SqliteProvider,
 };
@@ -238,6 +238,9 @@ pub struct ActiveConnection {
     pub databases: Option<Vec<DatabaseInfo>>,
     pub expanded_databases: HashMap<String, Vec<TableInfo>>,
     pub db_views: HashMap<String, Vec<String>>,
+    pub db_procedures: HashMap<String, Vec<ProcedureInfo>>,
+    pub db_sequences: HashMap<String, Vec<SequenceInfo>>,
+    pub db_events: HashMap<String, Vec<EventInfo>>,
     pub expanded_tables: HashMap<(String, String), Vec<ColumnInfo>>,
     pub table_indexes: HashMap<(String, String), Vec<IndexInfo>>,
     pub table_fks: HashMap<(String, String), Vec<FkInfo>>,
@@ -255,6 +258,9 @@ impl ActiveConnection {
             databases: None,
             expanded_databases: HashMap::new(),
             db_views: HashMap::new(),
+            db_procedures: HashMap::new(),
+            db_sequences: HashMap::new(),
+            db_events: HashMap::new(),
             expanded_tables: HashMap::new(),
             table_indexes: HashMap::new(),
             table_fks: HashMap::new(),
@@ -651,6 +657,50 @@ impl DatabaseStore {
             }
         }
         objects
+    }
+
+    /// Resolves `connection` (an id or its label) to a `ConnectionId`, the
+    /// same lookup `run_query_for_cli` uses so a connection can be named
+    /// either way.
+    pub fn resolve_connection_id(&self, connection: &str) -> Option<ConnectionId> {
+        self.connections
+            .iter()
+            .find(|c| c.config.id.to_string() == connection || c.config.label == connection)
+            .map(|c| c.config.id)
+    }
+
+    /// Cached column info for one table, read only from what
+    /// `prefetch_full_schema` already loaded -- never issues a query itself.
+    /// Returns an empty vec if the table hasn't been cached yet.
+    pub fn cached_table_columns(
+        &self,
+        id: ConnectionId,
+        database: &str,
+        table: &str,
+    ) -> Vec<ColumnInfo> {
+        self.schema_cache
+            .get(&id)
+            .and_then(|cache| cache.columns.get(database))
+            .and_then(|tables| tables.get(table))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every cached table and view name for one database, read only from
+    /// what `prefetch_full_schema` already loaded.
+    pub fn cached_table_names(&self, id: ConnectionId, database: &str) -> Vec<String> {
+        let Some(cache) = self.schema_cache.get(&id) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = cache
+            .tables
+            .get(database)
+            .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+            .unwrap_or_default();
+        if let Some(views) = cache.views.get(database) {
+            names.extend(views.iter().cloned());
+        }
+        names
     }
 
     pub fn active_connection_id(&self) -> Option<ConnectionId> {
@@ -1286,16 +1336,27 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let (tables, views) =
-                futures::join!(provider.list_tables(&database), provider.list_views(&database));
+            let (tables, views, procedures, sequences, events) = futures::join!(
+                provider.list_tables(&database),
+                provider.list_views(&database),
+                provider.list_procedures(&database),
+                provider.list_sequences(&database),
+                provider.list_events(&database)
+            );
             let tables = tables?;
             let views = views.unwrap_or_default();
+            let procedures = procedures.unwrap_or_default();
+            let sequences = sequences.unwrap_or_default();
+            let events = events.unwrap_or_default();
             this.update(cx, |this, cx| {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
                 };
                 conn.expanded_databases.insert(database.clone(), tables);
-                conn.db_views.insert(database, views);
+                conn.db_views.insert(database.clone(), views);
+                conn.db_procedures.insert(database.clone(), procedures);
+                conn.db_sequences.insert(database.clone(), sequences);
+                conn.db_events.insert(database, events);
                 cx.emit(DatabaseStoreEvent::SchemaChanged);
                 cx.notify();
             })
@@ -1494,6 +1555,9 @@ impl DatabaseStore {
             conn.databases = None;
             conn.expanded_databases.clear();
             conn.db_views.clear();
+            conn.db_procedures.clear();
+            conn.db_sequences.clear();
+            conn.db_events.clear();
             conn.expanded_tables.clear();
             conn.table_indexes.clear();
             conn.table_fks.clear();
@@ -2360,6 +2424,138 @@ mod tests {
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
             Ok(String::new())
         }
+    }
+
+    struct RoutineMockProvider;
+
+    #[async_trait::async_trait]
+    impl DbProvider for RoutineMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(vec![DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(vec![TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn list_procedures(&self, _database: &str) -> Result<Vec<ProcedureInfo>> {
+            Ok(vec![ProcedureInfo {
+                name: "recalc_totals".into(),
+                kind: db_client::schema::ProcedureKind::Procedure,
+                definition: Some("BEGIN UPDATE orders SET total = 0; END".into()),
+            }])
+        }
+        async fn list_sequences(&self, _database: &str) -> Result<Vec<SequenceInfo>> {
+            Ok(vec![SequenceInfo {
+                name: "orders_id_seq".into(),
+                current_value: Some(42),
+                increment: Some(1),
+            }])
+        }
+        async fn list_events(&self, _database: &str) -> Result<Vec<EventInfo>> {
+            Ok(vec![EventInfo {
+                name: "nightly_cleanup".into(),
+                status: Some("ENABLED".into()),
+                definition: Some("DELETE FROM sessions WHERE expired = 1".into()),
+            }])
+        }
+    }
+
+    #[gpui::test]
+    fn toggle_database_expanded_loads_procedures_sequences_and_events(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(RoutineMockProvider), cx);
+            store
+                .toggle_database_expanded(id, "shop".to_string(), cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
+            let procedures = conn.db_procedures.get("shop").expect("procedures cached");
+            assert_eq!(procedures.len(), 1);
+            assert_eq!(procedures[0].name, "recalc_totals");
+            assert_eq!(
+                procedures[0].definition.as_deref(),
+                Some("BEGIN UPDATE orders SET total = 0; END")
+            );
+
+            let sequences = conn.db_sequences.get("shop").expect("sequences cached");
+            assert_eq!(sequences.len(), 1);
+            assert_eq!(sequences[0].name, "orders_id_seq");
+            assert_eq!(sequences[0].current_value, Some(42));
+
+            let events = conn.db_events.get("shop").expect("events cached");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].name, "nightly_cleanup");
+        });
+    }
+
+    #[gpui::test]
+    fn refresh_schema_cache_clears_procedures_sequences_and_events(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(RoutineMockProvider), cx);
+            store
+                .toggle_database_expanded(id, "shop".to_string(), cx)
+                .detach();
+        });
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            assert!(!conn.db_procedures.is_empty());
+        });
+
+        store.update(cx, |store, cx| {
+            store.refresh_schema_cache(id, cx).detach();
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            assert!(
+                conn.db_procedures.is_empty(),
+                "refreshing the schema cache must drop stale cached routines"
+            );
+            assert!(conn.db_sequences.is_empty());
+            assert!(conn.db_events.is_empty());
+        });
     }
 
     struct MultiDbSchemaMockProvider;

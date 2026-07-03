@@ -10,7 +10,7 @@ use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
-    ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
+    ProcedureKind, QueryResult, SequenceInfo, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
 pub struct PostgresProvider {
@@ -432,6 +432,29 @@ impl DbProvider for PostgresProvider {
                     definition: Some(definition),
                 },
             )
+            .collect())
+    }
+
+    async fn list_sequences(&self, database: &str) -> Result<Vec<SequenceInfo>> {
+        let rows = sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
+            "-- name: ListSequences :many
+             SELECT sequencename, last_value, increment_by
+             FROM pg_sequences
+             WHERE schemaname = $1
+             ORDER BY sequencename",
+        )
+        .bind(database)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list sequences")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, current_value, increment)| SequenceInfo {
+                name,
+                current_value,
+                increment,
+            })
             .collect())
     }
 

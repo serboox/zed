@@ -2645,6 +2645,9 @@ pub struct DatabasePanel {
     editing_folder: Option<EditingFolder>,
     drag_target: Option<DropTarget>,
     views_expanded: HashSet<(ConnectionId, String)>,
+    procedures_expanded: HashSet<(ConnectionId, String)>,
+    sequences_expanded: HashSet<(ConnectionId, String)>,
+    events_expanded: HashSet<(ConnectionId, String)>,
     table_indexes_expanded: HashSet<(ConnectionId, String, String)>,
     table_fks_expanded: HashSet<(ConnectionId, String, String)>,
     table_triggers_expanded: HashSet<(ConnectionId, String, String)>,
@@ -3211,6 +3214,9 @@ impl DatabasePanel {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -4978,10 +4984,16 @@ impl DatabasePanel {
         let entity = cx.entity();
         let env_color = conn.config.env_color.clone();
         let db_views = conn.db_views.clone();
+        let db_procedures = conn.db_procedures.clone();
+        let db_sequences = conn.db_sequences.clone();
+        let db_events = conn.db_events.clone();
         let table_indexes = conn.table_indexes.clone();
         let table_fks = conn.table_fks.clone();
         let table_triggers = conn.table_triggers;
         let views_expanded = self.views_expanded.clone();
+        let procedures_expanded = self.procedures_expanded.clone();
+        let sequences_expanded = self.sequences_expanded.clone();
+        let events_expanded = self.events_expanded.clone();
         let indexes_expanded = self.table_indexes_expanded.clone();
         let fks_expanded = self.table_fks_expanded.clone();
         let triggers_expanded = self.table_triggers_expanded.clone();
@@ -5298,6 +5310,10 @@ impl DatabasePanel {
 
                     let db_row = div()
                         .id(ElementId::from(SharedString::from(format!("db-row-{}-{}", id, db_name))))
+                        .debug_selector({
+                            let db_name = db_name.clone();
+                            move || format!("db-row-{}-{}", id, db_name)
+                        })
                         .flex()
                         .flex_row()
                         .items_center()
@@ -6295,12 +6311,32 @@ impl DatabasePanel {
                                                         )
                                                         .when(is_trig_expanded, |el| {
                                                             el.children(table_trig_data.into_iter().map(|t| {
+                                                                let entity = entity.clone();
+                                                                let workspace = self.workspace.clone();
+                                                                let source = t.definition.clone().unwrap_or_else(|| {
+                                                                    format!("-- source unavailable for {}", t.name)
+                                                                });
                                                                 h_flex()
+                                                                    .id(ElementId::from(SharedString::from(format!("trigger-{}-{}-{}-{}", id, db_for_table, table_name, t.name))))
+                                                                    .debug_selector({
+                                                                        let db = db_for_table.clone();
+                                                                        let tbl = table_name.clone();
+                                                                        let name = t.name.clone();
+                                                                        move || format!("trigger-{}-{}-{}-{}", id, db, tbl, name)
+                                                                    })
                                                                     .gap_1()
                                                                     .items_center()
                                                                     .pl(px(64.))
                                                                     .pr_2()
                                                                     .py_1()
+                                                                    .cursor_pointer()
+                                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                                    .on_click(move |_, window, cx| {
+                                                                        let source = source.clone();
+                                                                        entity.update(cx, |panel, cx| {
+                                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
+                                                                        });
+                                                                    })
                                                                     .child(Icon::new(IconName::BoltFilled).size(IconSize::XSmall).color(Color::Muted))
                                                                     .child(Label::new(t.name).size(LabelSize::XSmall))
                                                                     .child(Label::new(format!("{} {}", t.timing, t.event)).size(LabelSize::XSmall).color(Color::Muted))
@@ -6456,6 +6492,224 @@ impl DatabasePanel {
                                                 right_click_menu(SharedString::from(format!("view-ctx-{}-{}-{}", id, db_name, vi)))
                                                     .trigger(move |_, _, _| view_row)
                                                     .menu(view_ctx_menu)
+                                            }))
+                                        }),
+                                )
+                            })
+                            .when_some(db_procedures.get(&db_name).cloned(), |el, procedures| {
+                                if procedures.is_empty() {
+                                    return el;
+                                }
+                                let procedures_key = (id, db_name.clone());
+                                let is_procedures_expanded = procedures_expanded.contains(&procedures_key);
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .id(ElementId::from(SharedString::from(format!("procedures-group-{}-{}", id, db_name))))
+                                                .debug_selector({
+                                                    let db_name = db_name.clone();
+                                                    move || format!("procedures-group-{}-{}", id, db_name)
+                                                })
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .pl(px(32.))
+                                                .pr_2()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if this.procedures_expanded.contains(&procedures_key) {
+                                                        this.procedures_expanded.remove(&procedures_key);
+                                                    } else {
+                                                        this.procedures_expanded.insert(procedures_key.clone());
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    Icon::new(if is_procedures_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(Icon::new(IconName::Code).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("Routines ({})", procedures.len())).size(LabelSize::Small).color(Color::Muted)),
+                                        )
+                                        .when(is_procedures_expanded, |el| {
+                                            el.children(procedures.into_iter().map(|procedure| {
+                                                let entity = entity.clone();
+                                                let workspace = self.workspace.clone();
+                                                let source = procedure.definition.clone().unwrap_or_else(|| {
+                                                    format!("-- source unavailable for {}", procedure.name)
+                                                });
+                                                h_flex()
+                                                    .id(ElementId::from(SharedString::from(format!("procedure-{}-{}-{}", id, db_name, procedure.name))))
+                                                    .debug_selector({
+                                                        let db_name = db_name.clone();
+                                                        let name = procedure.name.clone();
+                                                        move || format!("procedure-{}-{}-{}", id, db_name, name)
+                                                    })
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .pl(px(48.))
+                                                    .pr_2()
+                                                    .py_1()
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                    .on_click(move |_, window, cx| {
+                                                        let source = source.clone();
+                                                        entity.update(cx, |panel, cx| {
+                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
+                                                        });
+                                                    })
+                                                    .child(Icon::new(IconName::Code).size(IconSize::XSmall).color(Color::Muted))
+                                                    .child(Label::new(procedure.name).size(LabelSize::Small))
+                                                    .child(Label::new(match procedure.kind {
+                                                        db_client::schema::ProcedureKind::Function => "FUNCTION",
+                                                        db_client::schema::ProcedureKind::Procedure => "PROCEDURE",
+                                                    }).size(LabelSize::XSmall).color(Color::Muted))
+                                                    .into_any_element()
+                                            }))
+                                        }),
+                                )
+                            })
+                            .when_some(db_sequences.get(&db_name).cloned(), |el, sequences| {
+                                if sequences.is_empty() {
+                                    return el;
+                                }
+                                let sequences_key = (id, db_name.clone());
+                                let is_sequences_expanded = sequences_expanded.contains(&sequences_key);
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .id(ElementId::from(SharedString::from(format!("sequences-group-{}-{}", id, db_name))))
+                                                .debug_selector({
+                                                    let db_name = db_name.clone();
+                                                    move || format!("sequences-group-{}-{}", id, db_name)
+                                                })
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .pl(px(32.))
+                                                .pr_2()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if this.sequences_expanded.contains(&sequences_key) {
+                                                        this.sequences_expanded.remove(&sequences_key);
+                                                    } else {
+                                                        this.sequences_expanded.insert(sequences_key.clone());
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    Icon::new(if is_sequences_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("Sequences ({})", sequences.len())).size(LabelSize::Small).color(Color::Muted)),
+                                        )
+                                        .when(is_sequences_expanded, |el| {
+                                            el.children(sequences.into_iter().map(|seq| {
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .pl(px(48.))
+                                                    .pr_2()
+                                                    .py_1()
+                                                    .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
+                                                    .child(Label::new(seq.name).size(LabelSize::Small))
+                                                    .when_some(seq.current_value, |el, value| {
+                                                        el.child(Label::new(format!("current: {value}")).size(LabelSize::XSmall).color(Color::Muted))
+                                                    })
+                                            }))
+                                        }),
+                                )
+                            })
+                            .when_some(db_events.get(&db_name).cloned(), |el, events| {
+                                if events.is_empty() {
+                                    return el;
+                                }
+                                let events_key = (id, db_name.clone());
+                                let is_events_expanded = events_expanded.contains(&events_key);
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .id(ElementId::from(SharedString::from(format!("events-group-{}-{}", id, db_name))))
+                                                .debug_selector({
+                                                    let db_name = db_name.clone();
+                                                    move || format!("events-group-{}-{}", id, db_name)
+                                                })
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .pl(px(32.))
+                                                .pr_2()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if this.events_expanded.contains(&events_key) {
+                                                        this.events_expanded.remove(&events_key);
+                                                    } else {
+                                                        this.events_expanded.insert(events_key.clone());
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    Icon::new(if is_events_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("Events ({})", events.len())).size(LabelSize::Small).color(Color::Muted)),
+                                        )
+                                        .when(is_events_expanded, |el| {
+                                            el.children(events.into_iter().map(|event| {
+                                                let entity = entity.clone();
+                                                let workspace = self.workspace.clone();
+                                                let source = event.definition.clone().unwrap_or_else(|| {
+                                                    format!("-- source unavailable for {}", event.name)
+                                                });
+                                                h_flex()
+                                                    .id(ElementId::from(SharedString::from(format!("event-{}-{}-{}", id, db_name, event.name))))
+                                                    .debug_selector({
+                                                        let db_name = db_name.clone();
+                                                        let name = event.name.clone();
+                                                        move || format!("event-{}-{}-{}", id, db_name, name)
+                                                    })
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .pl(px(48.))
+                                                    .pr_2()
+                                                    .py_1()
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                    .on_click(move |_, window, cx| {
+                                                        let source = source.clone();
+                                                        entity.update(cx, |panel, cx| {
+                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
+                                                        });
+                                                    })
+                                                    .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Muted))
+                                                    .child(Label::new(event.name).size(LabelSize::Small))
+                                                    .when_some(event.status, |el, status| {
+                                                        el.child(Label::new(status).size(LabelSize::XSmall).color(Color::Muted))
+                                                    })
+                                                    .into_any_element()
                                             }))
                                         }),
                                 )
@@ -7608,6 +7862,9 @@ mod tests {
             expanded_database_set: std::collections::HashSet::new(),
             expanded_table_set: std::collections::HashSet::new(),
             db_views: std::collections::HashMap::new(),
+            db_procedures: std::collections::HashMap::new(),
+            db_sequences: std::collections::HashMap::new(),
+            db_events: std::collections::HashMap::new(),
             table_indexes: std::collections::HashMap::new(),
             table_fks: std::collections::HashMap::new(),
             table_triggers: std::collections::HashMap::new(),
@@ -7974,6 +8231,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -8129,6 +8389,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -8276,6 +8539,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -8434,6 +8700,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -8610,6 +8879,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -8685,6 +8957,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -8798,6 +9073,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -8875,6 +9153,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -8977,6 +9258,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -9096,6 +9380,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -9193,6 +9480,9 @@ mod tests {
                 editing_folder: None,
                 drag_target: None,
                 views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
                 table_indexes_expanded: HashSet::default(),
                 table_fks_expanded: HashSet::default(),
                 table_triggers_expanded: HashSet::default(),
@@ -9801,6 +10091,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -9890,6 +10183,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -10026,6 +10322,9 @@ mod tests {
                     editing_folder: None,
                     drag_target: None,
                     views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
                     table_indexes_expanded: HashSet::default(),
                     table_fks_expanded: HashSet::default(),
                     table_triggers_expanded: HashSet::default(),
@@ -10306,6 +10605,144 @@ mod tests {
                 "toggling again must collapse the Server Objects node"
             );
         });
+    }
+
+    struct RoutineTreeProvider;
+
+    #[async_trait::async_trait]
+    impl db_client::DbProvider for RoutineTreeProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+            Ok(vec![db_client::DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> anyhow::Result<Vec<db_client::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> anyhow::Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn list_procedures(
+            &self,
+            _database: &str,
+        ) -> anyhow::Result<Vec<db_client::schema::ProcedureInfo>> {
+            Ok(vec![db_client::schema::ProcedureInfo {
+                name: "recalc_totals".into(),
+                kind: db_client::schema::ProcedureKind::Procedure,
+                definition: Some("BEGIN UPDATE orders SET total = 0; END".into()),
+            }])
+        }
+    }
+
+    // Real end-to-end proof that the "Routines" tree section (feature-gap item
+    // 11) is reachable and functional purely through simulated clicks: expand
+    // the database row, expand the Routines group it reveals, click a
+    // procedure leaf, and confirm its cached source opens as a console tab --
+    // not a call into the render/toggle methods directly.
+    #[gpui::test]
+    async fn clicking_a_procedure_row_opens_its_source_as_a_console_tab(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "routine-tree".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(config, std::sync::Arc::new(RoutineTreeProvider), cx);
+                // Populates only `conn.databases` (so the tree can render a
+                // db-row to click) without touching `expanded_databases`,
+                // which would otherwise make the click below take the
+                // already-cached shortcut path and skip the real
+                // list_procedures/list_sequences/list_events fetch this test
+                // exists to prove.
+                store
+                    .ensure_schema_for_completion(connection_id, String::new(), cx)
+                    .detach();
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let db_row = debug_center(&mut cx, format!("db-row-{}-shop", connection_id).leak());
+        cx.simulate_click(db_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let routines_header = debug_center(
+            &mut cx,
+            format!("procedures-group-{}-shop", connection_id).leak(),
+        );
+        cx.simulate_click(routines_header, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let procedure_row = debug_center(
+            &mut cx,
+            format!("procedure-{}-shop-recalc_totals", connection_id).leak(),
+        );
+        cx.simulate_click(procedure_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let editor_text = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .map(|editor| editor.read(cx).text(cx))
+        });
+        assert_eq!(
+            editor_text.as_deref(),
+            Some("BEGIN UPDATE orders SET total = 0; END"),
+            "clicking a Routines leaf must open its cached source as a real console tab"
+        );
     }
 
     #[gpui::test]

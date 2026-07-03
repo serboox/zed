@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::schema::{
-    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, QueryResult,
-    TableInfo, TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo,
+    QueryResult, SequenceInfo, TableInfo, TriggerInfo, UserInfo,
 };
 
 #[async_trait]
@@ -44,6 +44,17 @@ pub trait DbProvider: Send + Sync {
     }
 
     async fn list_triggers(&self, _database: &str, _table: &str) -> Result<Vec<TriggerInfo>> {
+        Ok(Vec::new())
+    }
+
+    // Sequences and scheduled events are not universal SQL concepts: MySQL has
+    // no native sequence object (before MariaDB) and PostgreSQL has no native
+    // event scheduler, so most drivers keep the empty default here.
+    async fn list_sequences(&self, _database: &str) -> Result<Vec<SequenceInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_events(&self, _database: &str) -> Result<Vec<EventInfo>> {
         Ok(Vec::new())
     }
 

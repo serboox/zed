@@ -11,7 +11,7 @@ use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
 use crate::schema::{
-    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo,
     ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
@@ -504,6 +504,29 @@ impl DbProvider for MySqlProvider {
                     definition: Some(bytes_to_string(definition)),
                 },
             )
+            .collect())
+    }
+
+    async fn list_events(&self, database: &str) -> Result<Vec<EventInfo>> {
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Option<Vec<u8>>)>(
+            "-- name: ListEvents :many
+             SELECT EVENT_NAME, STATUS, EVENT_DEFINITION
+             FROM information_schema.EVENTS
+             WHERE EVENT_SCHEMA = ?
+             ORDER BY EVENT_NAME",
+        )
+        .bind(database)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list events")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, status, definition)| EventInfo {
+                name: bytes_to_string(name),
+                status: Some(bytes_to_string(status)),
+                definition: definition.map(bytes_to_string),
+            })
             .collect())
     }
 
