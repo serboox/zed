@@ -13377,6 +13377,142 @@ mod tests {
         });
     }
 
+    struct ReadOnlyProbeProvider;
+
+    #[async_trait::async_trait]
+    impl db_client::provider::DbProvider for ReadOnlyProbeProvider {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> anyhow::Result<Vec<db_client::schema::DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(
+            &self,
+            _database: &str,
+        ) -> anyhow::Result<Vec<db_client::schema::TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(&self, _database: &str, _sql: &str) -> anyhow::Result<QueryResult> {
+            Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    // A real cell edit (double-click, clear, type, Enter to commit-and-move)
+    // followed by the real SubmitEdits action must be rejected on a read-only
+    // connection instead of silently reaching the database. This builds its
+    // own window (instead of `table_backed_result_window`) because that
+    // helper's `DatabaseStore` is a local variable dropped once it returns,
+    // whereas this test needs a store entity that stays alive so it can be
+    // read after the connection is added.
+    #[gpui::test]
+    fn submit_edits_is_rejected_with_a_clear_error_on_a_read_only_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_result_view_test(cx);
+        let conn_id = uuid::Uuid::new_v4();
+        let store = cx.update(|cx| {
+            let store = cx.new(DatabaseStore::new);
+            store.update(cx, |store, cx| {
+                let mut config = db_client::ConnectionConfig::default();
+                config.id = conn_id;
+                config.label = "prod".to_string();
+                config.read_only = true;
+                store.add_connected_for_test(config, Arc::new(ReadOnlyProbeProvider), cx);
+            });
+            store
+        });
+
+        let result = sample_table_result();
+        let window = cx.add_window({
+            let store = store.downgrade();
+            move |window, cx| {
+                let mut view = ResultView::new("users", cx).with_table_context(
+                    store,
+                    conn_id,
+                    "public".to_string(),
+                    "users".to_string(),
+                    window,
+                    cx,
+                );
+                view.set_result(result, cx);
+                view
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            view.primary_key_columns = Some(vec!["id".to_string()]);
+        });
+
+        let cell_center = debug_center(&mut cx, "CELL-0-1");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: cell_center,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view(window, &mut cx);
+
+        for _ in 0.."Alice".len() {
+            cx.dispatch_action(editor::actions::Backspace);
+        }
+        cx.simulate_keystrokes("z e d");
+        cx.simulate_keystrokes("enter");
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            assert_eq!(
+                view.pending_cell_value(0, 1),
+                Some(&CellValue::Text("zed".to_string())),
+                "the real edit must be buffered as a pending change before Submit"
+            );
+        });
+
+        cx.dispatch_action(SubmitEdits);
+        cx.run_until_parked();
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _cx| {
+            let error = view
+                .error
+                .as_deref()
+                .expect("a read-only connection must surface a clear rejection error");
+            assert!(
+                error.contains("read-only"),
+                "the error should explain the write was blocked: {error}"
+            );
+        });
+    }
+
     #[gpui::test]
     fn rollback_clears_staged_and_pending_changes(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) = table_backed_result_window(cx);

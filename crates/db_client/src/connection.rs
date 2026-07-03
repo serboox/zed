@@ -115,6 +115,11 @@ pub struct ConnectionConfig {
     /// (LOCAL / STAGE / PROD). Shown as a colored circle next to the connection.
     #[serde(default)]
     pub env_color: Option<String>,
+    /// When set, every write path for this connection (grid edits, row
+    /// insert/delete, DDL/DML execution, Drop/Truncate, agent writes) is
+    /// rejected instead of reaching the database.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl ConnectionConfig {
@@ -151,6 +156,7 @@ impl Default for ConnectionConfig {
             folder_id: None,
             order: 0,
             env_color: None,
+            read_only: false,
         }
     }
 }

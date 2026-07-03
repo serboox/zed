@@ -126,6 +126,10 @@ fn redact_password(config: &ConnectionConfig) -> ConnectionConfig {
     redacted
 }
 
+fn read_only_error(label: &str) -> anyhow::Error {
+    anyhow::anyhow!("Connection '{label}' is read-only — write and DDL statements are blocked.")
+}
+
 async fn store_connection_password(
     provider: &Arc<dyn CredentialsProvider>,
     config: &ConnectionConfig,
@@ -1425,8 +1429,11 @@ impl DatabaseStore {
         sql: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<db_client::schema::QueryResult>> {
-        if !self.connections.iter().any(|c| c.config.id == id) {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if conn.config.read_only && crate::db_agent_tools::requires_confirmation(&sql) {
+            return Task::ready(Err(read_only_error(&conn.config.label)));
         }
 
         self.record_query_history(sql.clone(), cx);
@@ -1632,8 +1639,11 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if !self.connections.iter().any(|c| c.config.id == id) {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if conn.config.read_only {
+            return Task::ready(Err(read_only_error(&conn.config.label)));
         }
         cx.spawn(async move |this, cx| {
             let provider = this
@@ -1650,8 +1660,11 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if !self.connections.iter().any(|c| c.config.id == id) {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if conn.config.read_only {
+            return Task::ready(Err(read_only_error(&conn.config.label)));
         }
         cx.spawn(async move |this, cx| {
             let provider = this
@@ -2577,5 +2590,65 @@ mod tests {
             assert_eq!(output.rows, vec![vec![Some("1".to_string())]]);
             assert_eq!(output.execution_time_ms, 7);
         }
+    }
+
+    #[gpui::test]
+    async fn execute_query_blocks_writes_but_allows_reads_on_a_read_only_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut config = ConnectionConfig::default();
+        config.label = "prod".into();
+        config.read_only = true;
+        let id = config.id;
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(CliMockProvider), cx);
+        });
+
+        let write = store.update(cx, |store, cx| {
+            store.execute_query(id, String::new(), "UPDATE users SET name = 'x'".into(), cx)
+        });
+        let error = write
+            .await
+            .expect_err("a write must be rejected on a read-only connection");
+        assert!(
+            error.to_string().contains("read-only"),
+            "the error should explain why the write was blocked: {error}"
+        );
+
+        let read = store.update(cx, |store, cx| {
+            store.execute_query(id, String::new(), "SELECT 1".into(), cx)
+        });
+        read.await
+            .expect("reads must still run on a read-only connection");
+    }
+
+    #[gpui::test]
+    async fn truncate_and_drop_table_are_blocked_on_a_read_only_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut config = ConnectionConfig::default();
+        config.read_only = true;
+        let id = config.id;
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(CliMockProvider), cx);
+        });
+
+        let truncate = store.update(cx, |store, cx| {
+            store.truncate_table(id, "shop".into(), "users".into(), cx)
+        });
+        assert!(
+            truncate.await.is_err(),
+            "Truncate Table must be blocked on a read-only connection"
+        );
+
+        let drop = store.update(cx, |store, cx| {
+            store.drop_table(id, "shop".into(), "users".into(), cx)
+        });
+        assert!(
+            drop.await.is_err(),
+            "Drop Table must be blocked on a read-only connection"
+        );
     }
 }

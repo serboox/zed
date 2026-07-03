@@ -101,7 +101,7 @@ fn sql_word_tokens(sql: &str) -> Vec<String> {
 /// `WITH ... DELETE` data-modifying CTE or a chained write is rejected. Keywords
 /// inside quotes or comments are ignored. Anything unrecognized is rejected too,
 /// which is the safe default for a read-only agent.
-fn is_read_only_sql(sql: &str) -> bool {
+pub(crate) fn is_read_only_sql(sql: &str) -> bool {
     let tokens = sql_word_tokens(sql);
     let Some(first) = tokens.first() else {
         return false;
@@ -116,7 +116,7 @@ fn is_read_only_sql(sql: &str) -> bool {
 
 /// A statement that is not read-only changes data or schema, so the agent must
 /// ask the user to confirm before running it.
-fn requires_confirmation(sql: &str) -> bool {
+pub(crate) fn requires_confirmation(sql: &str) -> bool {
     !is_read_only_sql(sql)
 }
 

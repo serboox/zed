@@ -62,6 +62,7 @@ pub struct ConnectionView {
     folder_editor: Entity<Editor>,
     color_editor: Entity<Editor>,
     auto_connect: bool,
+    read_only: bool,
     use_ssh: bool,
     ssh_host_editor: Entity<Editor>,
     ssh_port_editor: Entity<Editor>,
@@ -115,6 +116,7 @@ impl ConnectionView {
             folder_editor,
             color_editor,
             auto_connect: true,
+            read_only: false,
             use_ssh: false,
             ssh_host_editor,
             ssh_port_editor,
@@ -206,6 +208,7 @@ impl ConnectionView {
             folder_editor,
             color_editor,
             auto_connect: config.auto_connect,
+            read_only: config.read_only,
             use_ssh,
             ssh_host_editor,
             ssh_port_editor,
@@ -344,6 +347,7 @@ impl ConnectionView {
                 folder_id: None,
                 order: 0,
                 env_color,
+                read_only: self.read_only,
             });
         }
 
@@ -384,6 +388,7 @@ impl ConnectionView {
             folder_id: None,
             order: 0,
             env_color,
+            read_only: self.read_only,
         })
     }
 
@@ -745,27 +750,62 @@ impl Render for ConnectionView {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_1p5()
+                            .gap_3()
                             .child(
-                                Checkbox::new(
-                                    "auto-connect",
-                                    if self.auto_connect {
-                                        ToggleState::Selected
-                                    } else {
-                                        ToggleState::Unselected
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    |this, _state, _, cx| {
-                                        this.auto_connect = !this.auto_connect;
-                                        cx.notify();
-                                    },
-                                )),
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        Checkbox::new(
+                                            "auto-connect",
+                                            if self.auto_connect {
+                                                ToggleState::Selected
+                                            } else {
+                                                ToggleState::Unselected
+                                            },
+                                        )
+                                        .on_click(cx.listener(
+                                            |this, _state, _, cx| {
+                                                this.auto_connect = !this.auto_connect;
+                                                cx.notify();
+                                            },
+                                        )),
+                                    )
+                                    .child(
+                                        Label::new("Auto-connect on startup")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             )
                             .child(
-                                Label::new("Auto-connect on startup")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "read-only-checkbox".to_string())
+                                            .child(
+                                                Checkbox::new(
+                                                    "read-only",
+                                                    if self.read_only {
+                                                        ToggleState::Selected
+                                                    } else {
+                                                        ToggleState::Unselected
+                                                    },
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _state, _, cx| {
+                                                        this.read_only = !this.read_only;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                            ),
+                                    )
+                                    .child(
+                                        Label::new("Read-only (block all writes)")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             ),
                     )
                     .child(
@@ -897,6 +937,69 @@ mod tests {
             .unwrap()
             .expect("config should build");
         assert_eq!(config.env_color.as_deref(), Some(production_hex));
+    }
+
+    #[gpui::test]
+    async fn clicking_the_read_only_checkbox_toggles_it_in_the_built_config(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.host_editor
+                    .update(cx, |ed, cx| ed.set_text("127.0.0.1", window, cx));
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("root", window, cx));
+            })
+            .unwrap();
+
+        let default_config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert!(
+            !default_config.read_only,
+            "a new connection must default to read-write"
+        );
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let checkbox = cx
+            .debug_bounds("read-only-checkbox")
+            .expect("the read-only checkbox should be rendered")
+            .center();
+        cx.simulate_click(checkbox, gpui::Modifiers::none());
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert!(
+            config.read_only,
+            "a real click on the read-only checkbox must flip the built config's flag"
+        );
+    }
+
+    #[gpui::test]
+    async fn new_with_config_preserves_an_existing_read_only_flag(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut source = ConnectionConfig::default();
+        source.host = "127.0.0.1".to_string();
+        source.username = "root".to_string();
+        source.read_only = true;
+
+        let window =
+            cx.add_window(|window, cx| ConnectionView::new_with_config(&source, window, cx));
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert!(
+            config.read_only,
+            "editing an existing read-only connection must not silently clear the flag"
+        );
     }
 
     #[gpui::test]
