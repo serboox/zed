@@ -1962,6 +1962,28 @@ impl DatabaseStore {
         })
     }
 
+    pub fn rename_table(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        old_name: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if conn.config.read_only {
+            return Task::ready(Err(read_only_error(&conn.config.label)));
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.rename_table(&database, &old_name, &new_name).await
+        })
+    }
+
     fn record_query_history(&mut self, sql: String, cx: &mut Context<Self>) {
         let trimmed = sql.trim().to_string();
         if trimmed.is_empty() {

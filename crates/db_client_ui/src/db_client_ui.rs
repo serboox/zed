@@ -14,6 +14,7 @@ mod inline_results;
 mod modify_table;
 pub mod native_dump;
 mod panel;
+mod rename_refactor;
 mod result_view;
 mod schema_diff;
 mod sql_ast;

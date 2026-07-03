@@ -3326,6 +3326,178 @@ impl Render for QueryParamsView {
     }
 }
 
+/// One place `RenameTableView` found the table's current name referenced --
+/// either an open console buffer (excerpt is the matching line's text) or a
+/// cached database-side routine/trigger/event source (excerpt is a short
+/// snippet), so the user can see what needs attention before confirming.
+struct RenameTableUsage {
+    label: SharedString,
+    excerpt: SharedString,
+}
+
+type RenameConfirmCallback = Arc<dyn Fn(String, &mut Window, &mut App)>;
+
+/// Renames a table with a find-usages preview: open console buffers that
+/// reference the table are listed and rewritten in place on confirm (a real
+/// text substitution of the matched identifier, not just a warning), while
+/// database-side routine/trigger/event source can only be flagged as needing
+/// a manual update -- changing that requires its own `ALTER PROCEDURE`-style
+/// statement per object, which is out of scope for a table rename.
+struct RenameTableView {
+    focus_handle: FocusHandle,
+    old_name: SharedString,
+    new_name_editor: Entity<Editor>,
+    usages: Vec<RenameTableUsage>,
+    has_db_side_usages: bool,
+    on_confirm: RenameConfirmCallback,
+}
+
+impl RenameTableView {
+    fn new(
+        old_name: String,
+        usages: Vec<RenameTableUsage>,
+        has_db_side_usages: bool,
+        on_confirm: RenameConfirmCallback,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let new_name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(old_name.clone(), window, cx);
+            editor.select_all(&Default::default(), window, cx);
+            editor
+        });
+        Self {
+            focus_handle: cx.focus_handle(),
+            old_name: old_name.into(),
+            new_name_editor,
+            usages,
+            has_db_side_usages,
+            on_confirm,
+        }
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let new_name = self.new_name_editor.read(cx).text(cx).trim().to_string();
+        if new_name.is_empty() || new_name == self.old_name.as_ref() {
+            cx.emit(DismissEvent);
+            return;
+        }
+        (self.on_confirm.clone())(new_name, window, cx);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for RenameTableView {}
+
+impl ModalView for RenameTableView {}
+
+impl Focusable for RenameTableView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for RenameTableView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let usage_rows: Vec<_> = self
+            .usages
+            .iter()
+            .map(|usage| {
+                v_flex()
+                    .gap_0p5()
+                    .child(Label::new(usage.label.clone()).size(LabelSize::Small))
+                    .child(
+                        Label::new(usage.excerpt.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            })
+            .collect();
+        v_flex()
+            .key_context("RenameTable")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(px(460.))
+            .p_3()
+            .gap_2()
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(crate::widgets::dialog_header(
+                "Rename Table",
+                "rename-table-close",
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+            ))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("New name").size(LabelSize::Small))
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.new_name_editor.clone()),
+                    ),
+            )
+            .when(!self.usages.is_empty(), |el| {
+                el.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(format!(
+                                "{} usage{} found",
+                                self.usages.len(),
+                                if self.usages.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(LabelSize::Small),
+                        )
+                        .child(
+                            v_flex()
+                                .id("rename-table-usages")
+                                .gap_1()
+                                .max_h(px(180.))
+                                .overflow_y_scroll()
+                                .children(usage_rows),
+                        ),
+                )
+            })
+            .when(self.has_db_side_usages, |el| {
+                el.child(
+                    Label::new(
+                        "Some routines, triggers, or events also reference this table -- \
+                         their source is not rewritten automatically and needs a manual update.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("rename-table-cancel", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "rename-table-confirm".into())
+                            .child(
+                                Button::new("rename-table-confirm", "Rename")
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
 /// Workspace modal that picks the second table for the Compare Data flow, then
 /// hands the chosen table to `on_pick` (the panel runs the comparison).
 type ComparePickCallback = Arc<dyn Fn(String, &mut Window, &mut App)>;
@@ -5403,6 +5575,154 @@ impl DatabasePanel {
             .log_err();
     }
 
+    /// Opens the rename dialog for a table: scans every open console buffer
+    /// and this connection's already-cached routine/trigger/event source for
+    /// whole-word references to `table` before the user even picks a new
+    /// name, so the usage preview is available immediately.
+    fn open_rename_table_dialog(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.store.read(cx).connections().iter().any(|c| c.config.id == id) {
+            return;
+        }
+
+        let mut usages = Vec::new();
+        let mut console_matches: Vec<(Entity<Editor>, String)> = Vec::new();
+        if let Some(workspace) = self.workspace.upgrade() {
+            let store = self.store.clone();
+            for pane in workspace.read(cx).panes() {
+                for editor in pane.read(cx).items_of_type::<Editor>() {
+                    if console_connection_for_editor(&editor, &store, cx).is_none() {
+                        continue;
+                    }
+                    let text = editor.read(cx).text(cx);
+                    let matches = crate::rename_refactor::find_name_usages(&text, &table);
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    let file_label = active_editor_file_path(&editor, cx)
+                        .and_then(|path| {
+                            path.file_name().map(|name| name.to_string_lossy().into_owned())
+                        })
+                        .unwrap_or_else(|| "console".to_string());
+                    for usage in &matches {
+                        usages.push(RenameTableUsage {
+                            label: format!("{file_label}:{}", usage.line).into(),
+                            excerpt: usage.excerpt.clone().into(),
+                        });
+                    }
+                    console_matches.push((editor.clone(), text));
+                }
+            }
+        }
+
+        let mut has_db_side_usages = false;
+        if let Some(conn) = self.store.read(cx).connections().iter().find(|c| c.config.id == id) {
+            let mut db_side_sources: Vec<(String, Option<String>)> = Vec::new();
+            if let Some(procedures) = conn.db_procedures.get(&database) {
+                db_side_sources.extend(
+                    procedures
+                        .iter()
+                        .map(|p| (format!("procedure {}", p.name), p.definition.clone())),
+                );
+            }
+            if let Some(events) = conn.db_events.get(&database) {
+                db_side_sources.extend(
+                    events
+                        .iter()
+                        .map(|e| (format!("event {}", e.name), e.definition.clone())),
+                );
+            }
+            if let Some(triggers) = conn.table_triggers.get(&(database.clone(), table.clone())) {
+                db_side_sources.extend(
+                    triggers
+                        .iter()
+                        .map(|t| (format!("trigger {}", t.name), t.definition.clone())),
+                );
+            }
+            for (label, definition) in db_side_sources {
+                let Some(definition) = definition else {
+                    continue;
+                };
+                let matches = crate::rename_refactor::find_name_usages(&definition, &table);
+                if !matches.is_empty() {
+                    has_db_side_usages = true;
+                    usages.push(RenameTableUsage {
+                        label: label.into(),
+                        excerpt: matches[0].excerpt.clone().into(),
+                    });
+                }
+            }
+        }
+
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        let old_table = table.clone();
+        let on_confirm: RenameConfirmCallback = Arc::new(move |new_name, window, cx| {
+            let database = database.clone();
+            let old_table = old_table.clone();
+            let console_matches = console_matches.clone();
+            let new_name_for_task = new_name.clone();
+            let rename_task = store.update(cx, |store, cx| {
+                store.rename_table(id, database, old_table.clone(), new_name_for_task, cx)
+            });
+            let workspace = workspace.clone();
+            window
+                .spawn(cx, async move |cx| {
+                    let result = rename_task.await;
+                    if result.is_ok() {
+                        for (editor, text) in console_matches {
+                            let rewritten =
+                                crate::rename_refactor::replace_name_usages(&text, &old_table, &new_name);
+                            editor
+                                .update_in(cx, |editor, window, cx| {
+                                    editor.set_text(rewritten, window, cx);
+                                })
+                                .ok();
+                        }
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::named("db-rename-table-done".into()),
+                                        format!("Renamed to \"{new_name}\"."),
+                                    ),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    } else if let Err(error) = result {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::named("db-rename-table-failed".into()),
+                                        format!("Rename failed: {error}"),
+                                    ),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }
+                    anyhow::Ok(())
+                })
+                .detach();
+        });
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RenameTableView::new(table, usages, has_db_side_usages, on_confirm, window, cx)
+                });
+            })
+            .log_err();
+    }
+
     /// Decides whether a table name passes the explorer filter and, if so,
     /// which byte range to highlight. `None` means the table is filtered out.
     /// In regex mode an invalid pattern (passed as `filter_regex == None` while
@@ -6829,18 +7149,19 @@ impl DatabasePanel {
                                                         }
                                                     })
                                                     .separator()
-                                                    .entry("Rename Table", None, {
+                                                    .entry("Rename Table...", None, {
                                                         let entity = entity.clone();
+                                                        let db = db.clone();
                                                         let tbl = tbl.clone();
-                                                        let workspace = workspace.clone();
                                                         move |window, cx| {
-                                                            let sql = format!(
-                                                                "ALTER TABLE {} RENAME TO {};",
-                                                                driver.quote_identifier(&tbl),
-                                                                driver.quote_identifier(&format!("{}_renamed", tbl)),
-                                                            );
                                                             entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
+                                                                panel.open_rename_table_dialog(
+                                                                    id,
+                                                                    db.clone(),
+                                                                    tbl.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
                                                             });
                                                         }
                                                     })
@@ -6902,26 +7223,6 @@ impl DatabasePanel {
                                                         let workspace = workspace.clone();
                                                         move |window, cx| {
                                                             let sql = Self::generate_mock_data(&tbl, driver, &cols, 10);
-                                                            entity.update(cx, |panel, cx| {
-                                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
-                                                            });
-                                                        }
-                                                    })
-                                                    .separator()
-                                                    .entry("Rename Table (Script)", None, {
-                                                        let entity = entity.clone();
-                                                        let tbl = tbl.clone();
-                                                        let db = db.clone();
-                                                        let workspace = workspace.clone();
-                                                        move |window, cx| {
-                                                            let sql = match driver {
-                                                                DatabaseDriver::MySQL => format!(
-                                                                    "-- name: RenameTable :exec\nRENAME TABLE `{db}`.`{tbl}` TO `{db}`.`new_name`;"),
-                                                                DatabaseDriver::SQLite => format!(
-                                                                    "-- name: RenameTable :exec\nALTER TABLE \"{tbl}\" RENAME TO \"new_name\";"),
-                                                                _ => format!(
-                                                                    "-- name: RenameTable :exec\nALTER TABLE \"{db}\".\"{tbl}\" RENAME TO \"new_name\";"),
-                                                            };
                                                             entity.update(cx, |panel, cx| {
                                                                 Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                                             });
@@ -12473,5 +12774,197 @@ mod tests {
                 assert_eq!(names, vec!["id".to_string(), "name".to_string()]);
             })
             .unwrap();
+    }
+
+    // Real end-to-end proof of table rename with find-usages: two real console
+    // editors are open, one referencing the table being renamed and one not.
+    // Confirming the real "Rename" button must (a) send the correct RENAME
+    // statement to the connection, (b) rewrite the referencing console's
+    // buffer in place, and (c) leave the unrelated console untouched.
+    #[gpui::test]
+    async fn rename_table_dialog_rewrites_referencing_consoles_only(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "rename".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                std::sync::Arc::new(RecordingMockProvider {
+                    calls: calls.clone(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let referencing_sql = "SELECT * FROM orders WHERE id = 1;";
+        let referencing_editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(referencing_sql, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        let unrelated_sql = "SELECT * FROM customers;";
+        let unrelated_editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(unrelated_sql, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        cx.run_until_parked();
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| workspace.panel::<DatabasePanel>(cx))
+            .expect("panel must be registered");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rename_table_dialog(
+                connection_id,
+                "shop".to_string(),
+                "orders".to_string(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let usage_count = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<RenameTableView>(cx)
+                .expect("rename dialog must open as a workspace modal")
+                .read(cx)
+                .usages
+                .len()
+        });
+        assert_eq!(
+            usage_count, 1,
+            "only the referencing console must show up in the usage preview"
+        );
+
+        let new_name_editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<RenameTableView>(cx)
+                .expect("rename dialog must still be open")
+                .read(cx)
+                .new_name_editor
+                .clone()
+        });
+        new_name_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("purchases", window, cx);
+        });
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let confirm_point = debug_center(cx, "rename-table-confirm");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: confirm_point,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: confirm_point,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("mock call log should not be poisoned")
+                .as_slice(),
+            &["ALTER TABLE orders RENAME TO purchases".to_string()],
+            "a real confirm click must send the rename statement to the connection"
+        );
+        let referencing_text = referencing_editor.read_with(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            referencing_text, "SELECT * FROM purchases WHERE id = 1;",
+            "the referencing console's buffer must be rewritten in place"
+        );
+        let unrelated_text = unrelated_editor.read_with(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            unrelated_text, unrelated_sql,
+            "a console that never referenced the table must be left untouched"
+        );
+        let has_modal_after_confirm = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<RenameTableView>(cx).is_some()
+        });
+        assert!(!has_modal_after_confirm, "confirming must dismiss the dialog");
     }
 }

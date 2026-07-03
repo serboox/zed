@@ -570,17 +570,41 @@ impl DbProvider for PostgresProvider {
     }
 
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        let sql = format!(
-            "-- name: RenameTable :exec\nALTER TABLE \"{}\".\"{}\" RENAME TO \"{}\"",
-            database.replace('"', "\"\""),
-            old_name.replace('"', "\"\""),
-            new_name.replace('"', "\"\""),
-        );
-        sqlx::query(&sql)
+        sqlx::query(&rename_table_sql(database, old_name, new_name))
             .execute(&self.pool)
             .await
             .context("Failed to rename table")?;
         Ok(())
+    }
+}
+
+fn rename_table_sql(database: &str, old_name: &str, new_name: &str) -> String {
+    format!(
+        "-- name: RenameTable :exec\nALTER TABLE \"{}\".\"{}\" RENAME TO \"{}\"",
+        database.replace('"', "\"\""),
+        old_name.replace('"', "\"\""),
+        new_name.replace('"', "\"\""),
+    )
+}
+
+#[cfg(test)]
+mod rename_table_tests {
+    use super::*;
+
+    #[test]
+    fn rename_table_sql_qualifies_the_schema_and_keeps_the_new_name_unqualified() {
+        assert_eq!(
+            rename_table_sql("public", "users", "customers"),
+            "-- name: RenameTable :exec\nALTER TABLE \"public\".\"users\" RENAME TO \"customers\""
+        );
+    }
+
+    #[test]
+    fn rename_table_sql_escapes_embedded_double_quotes() {
+        assert_eq!(
+            rename_table_sql("pu\"blic", "us\"ers", "cust\"omers"),
+            "-- name: RenameTable :exec\nALTER TABLE \"pu\"\"blic\".\"us\"\"ers\" RENAME TO \"cust\"\"omers\""
+        );
     }
 }
 

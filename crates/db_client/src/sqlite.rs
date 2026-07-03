@@ -244,14 +244,10 @@ impl DbProvider for SqliteProvider {
     }
 
     async fn rename_table(&self, _database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        let safe_old = old_name.replace('"', "\"\"");
-        let safe_new = new_name.replace('"', "\"\"");
-        sqlx::query(&format!(
-            "ALTER TABLE \"{safe_old}\" RENAME TO \"{safe_new}\""
-        ))
-        .execute(&self.pool)
-        .await
-        .context("Failed to rename table")?;
+        sqlx::query(&rename_table_sql(old_name, new_name))
+            .execute(&self.pool)
+            .await
+            .context("Failed to rename table")?;
         Ok(())
     }
 
@@ -329,6 +325,12 @@ impl DbProvider for SqliteProvider {
             })
         }
     }
+}
+
+fn rename_table_sql(old_name: &str, new_name: &str) -> String {
+    let safe_old = old_name.replace('"', "\"\"");
+    let safe_new = new_name.replace('"', "\"\"");
+    format!("ALTER TABLE \"{safe_old}\" RENAME TO \"{safe_new}\"")
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -409,6 +411,22 @@ fn extract_check_constraints(create_table_sql: &str) -> Vec<CheckConstraintInfo>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_table_sql_quotes_both_names() {
+        assert_eq!(
+            rename_table_sql("users", "customers"),
+            "ALTER TABLE \"users\" RENAME TO \"customers\""
+        );
+    }
+
+    #[test]
+    fn rename_table_sql_escapes_embedded_double_quotes() {
+        assert_eq!(
+            rename_table_sql("us\"ers", "cust\"omers"),
+            "ALTER TABLE \"us\"\"ers\" RENAME TO \"cust\"\"omers\""
+        );
+    }
 
     // Gates the "NULL decodes as 0" hypothesis from the grid UX audit: writes
     // a genuine SQL NULL into a TEXT and an INTEGER column and decodes it

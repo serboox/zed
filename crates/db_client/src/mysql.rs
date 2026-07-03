@@ -656,18 +656,42 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        let sql = format!(
-            "RENAME TABLE `{}`.`{}` TO `{}`.`{}`",
-            database.replace('`', "``"),
-            old_name.replace('`', "``"),
-            database.replace('`', "``"),
-            new_name.replace('`', "``")
-        );
-        sqlx::query(&sql)
+        sqlx::query(&rename_table_sql(database, old_name, new_name))
             .execute(&self.pool)
             .await
             .context("Failed to rename table")?;
         Ok(())
+    }
+}
+
+fn rename_table_sql(database: &str, old_name: &str, new_name: &str) -> String {
+    format!(
+        "RENAME TABLE `{}`.`{}` TO `{}`.`{}`",
+        database.replace('`', "``"),
+        old_name.replace('`', "``"),
+        database.replace('`', "``"),
+        new_name.replace('`', "``")
+    )
+}
+
+#[cfg(test)]
+mod rename_table_tests {
+    use super::*;
+
+    #[test]
+    fn rename_table_sql_qualifies_both_sides_with_the_database() {
+        assert_eq!(
+            rename_table_sql("shop", "users", "customers"),
+            "RENAME TABLE `shop`.`users` TO `shop`.`customers`"
+        );
+    }
+
+    #[test]
+    fn rename_table_sql_escapes_embedded_backticks() {
+        assert_eq!(
+            rename_table_sql("sh`op", "us`ers", "cust`omers"),
+            "RENAME TABLE `sh``op`.`us``ers` TO `sh``op`.`cust``omers`"
+        );
     }
 }
 
