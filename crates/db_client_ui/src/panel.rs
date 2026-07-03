@@ -2285,6 +2285,52 @@ pub fn run_current_sql_query(
     run_sql_from_editor(workspace, window, cx, |sql| sql);
 }
 
+pub fn format_current_sql_query(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
+        cx.propagate();
+        return;
+    };
+    let store = panel.read(cx).store.clone();
+    let active_item = workspace.active_item(cx);
+    let editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
+    let Some(editor) = editor else {
+        cx.propagate();
+        return;
+    };
+    let Some(connection_id) = console_connection_for_editor(&editor, &store, cx) else {
+        cx.propagate();
+        return;
+    };
+
+    let driver = {
+        let store_ref = store.read(cx);
+        store_ref
+            .connections()
+            .iter()
+            .find(|c| c.config.id == connection_id)
+            .or_else(|| store_ref.active_connection())
+            .map(|c| c.config.driver)
+    };
+    let Some(driver) = driver else {
+        return;
+    };
+
+    let text = editor.read(cx).text(cx);
+    let Some(formatted) = crate::sql_ast::format_sql(&text, driver) else {
+        return;
+    };
+    if formatted == text {
+        return;
+    }
+    editor.update(cx, |editor, cx| {
+        editor.set_text(formatted, window, cx);
+    });
+}
+
 pub fn explain_current_sql_query(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -8251,6 +8297,125 @@ mod tests {
                 .and_then(|view| view.read(cx).error.clone())
         });
         assert_eq!(error.as_deref(), Some("database rejected statement"));
+    }
+
+    #[gpui::test]
+    async fn format_query_reformats_valid_sql_and_leaves_malformed_sql_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "format console".to_string(),
+            database: Some("scratch".to_string()),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    dump: DumpUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| {
+                language::Buffer::local("select id, name from users where id = 1", cx)
+            });
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            format_current_sql_query(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "SELECT\n  id,\n  name\nFROM\n  users\nWHERE\n  id = 1;\n",
+            "a real FormatQuery dispatch must reformat the console buffer in place"
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("select id, from where;", window, cx);
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            format_current_sql_query(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "select id, from where;",
+            "malformed SQL being edited must be left byte-for-byte untouched, never partially \
+             formatted or truncated"
+        );
     }
 
     // Guards the bottom-dock requirement: each connection gets exactly one

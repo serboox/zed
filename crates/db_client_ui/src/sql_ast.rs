@@ -109,6 +109,45 @@ pub(crate) fn statement_spans(text: &str) -> Vec<Range<usize>> {
     spans
 }
 
+/// Pretty-prints every statement in `text` (keyword case, indentation, line
+/// breaks), preserving statement boundaries. Returns `None` — leaving the
+/// buffer untouched — if the driver has no SQL dialect, `text` has no
+/// non-empty statements, or ANY statement fails to parse: a console buffer is
+/// edited live and is often mid-edit or intentionally incomplete, so a
+/// formatter that "does its best" on unparseable input risks silently
+/// mangling text the user hasn't finished typing yet.
+pub(crate) fn format_sql(text: &str, driver: DatabaseDriver) -> Option<String> {
+    let dialect = dialect_for_driver(driver)?;
+    let format_dialect = match driver {
+        DatabaseDriver::PostgreSQL => sqlformat::Dialect::PostgreSql,
+        _ => sqlformat::Dialect::Generic,
+    };
+    let options = sqlformat::FormatOptions {
+        uppercase: Some(true),
+        dialect: format_dialect,
+        ..Default::default()
+    };
+
+    let mut formatted_statements = Vec::new();
+    for span in statement_spans(text) {
+        let trimmed = text[span].trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        Parser::parse_sql(dialect.as_ref(), trimmed).ok()?;
+        formatted_statements.push(sqlformat::format(
+            trimmed,
+            &sqlformat::QueryParams::None,
+            &options,
+        ));
+    }
+
+    if formatted_statements.is_empty() {
+        return None;
+    }
+    Some(format!("{};\n", formatted_statements.join(";\n\n")))
+}
+
 /// Finds the byte-range of the statement containing `offset`, per [`statement_spans`].
 pub(crate) fn statement_span_at(text: &str, offset: usize) -> Option<Range<usize>> {
     let offset = offset.min(text.len());
@@ -257,6 +296,47 @@ mod tests {
         let text = "SELECT 1;";
         let statement = try_parse_statement_at(text, DatabaseDriver::Redis, 0);
         assert!(statement.is_none());
+    }
+
+    #[test]
+    fn format_sql_uppercases_keywords_and_breaks_clauses_onto_their_own_lines() {
+        let text = "select id, name from users where id = 1 order by name";
+        let formatted = format_sql(text, DatabaseDriver::MySQL).expect("valid SQL formats");
+        assert_eq!(
+            formatted,
+            "SELECT\n  id,\n  name\nFROM\n  users\nWHERE\n  id = 1\nORDER BY\n  name;\n"
+        );
+    }
+
+    #[test]
+    fn format_sql_formats_each_statement_independently_and_preserves_boundaries() {
+        let text = "select 1; select 2";
+        let formatted = format_sql(text, DatabaseDriver::MySQL).expect("valid SQL formats");
+        assert_eq!(formatted, "SELECT\n  1;\n\nSELECT\n  2;\n");
+    }
+
+    #[test]
+    fn format_sql_returns_none_and_does_not_touch_the_buffer_on_a_parse_failure() {
+        let text = "select id, from where;";
+        assert!(format_sql(text, DatabaseDriver::MySQL).is_none());
+    }
+
+    #[test]
+    fn format_sql_returns_none_for_an_incomplete_statement_being_typed() {
+        let text = "select id, name from";
+        assert!(format_sql(text, DatabaseDriver::MySQL).is_none());
+    }
+
+    #[test]
+    fn format_sql_returns_none_for_redis_which_has_no_sql_dialect() {
+        let text = "GET foo";
+        assert!(format_sql(text, DatabaseDriver::Redis).is_none());
+    }
+
+    #[test]
+    fn format_sql_returns_none_for_empty_or_whitespace_only_text() {
+        assert!(format_sql("", DatabaseDriver::MySQL).is_none());
+        assert!(format_sql("   \n  ", DatabaseDriver::MySQL).is_none());
     }
 
     #[test]
