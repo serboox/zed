@@ -101,6 +101,7 @@ impl ConnectionView {
         let port_editor = make_editor("Port", "3306", window, cx);
         let username_editor = make_editor("Username", "root", window, cx);
         let password_editor = make_editor("Password", "", window, cx);
+        password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
         let database_editor = make_editor("Database (optional)", "", window, cx);
         let folder_editor = make_editor(FOLDER_PLACEHOLDER, "", window, cx);
         let color_editor = make_editor(COLOR_PLACEHOLDER, "", window, cx);
@@ -109,6 +110,7 @@ impl ConnectionView {
         let ssh_username_editor = make_editor("SSH Username", "", window, cx);
         let ssh_key_path_editor = make_editor("~/.ssh/id_rsa", "", window, cx);
         let ssh_password_editor = make_editor("SSH Password", "", window, cx);
+        ssh_password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
         let ssl_ca_path_editor = make_editor("CA Certificate Path (optional)", "", window, cx);
         let ssl_client_cert_path_editor =
             make_editor("Client Certificate Path (optional)", "", window, cx);
@@ -176,6 +178,7 @@ impl ConnectionView {
         let port_editor = make_editor("Port", &port_str, window, cx);
         let username_editor = make_editor("Username", &config.username, window, cx);
         let password_editor = make_editor("Password", &config.password, window, cx);
+        password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
         let db_initial = config.database.as_deref().unwrap_or("");
         let database_editor = make_editor("Database (optional)", db_initial, window, cx);
         let folder_editor = make_editor(
@@ -214,6 +217,7 @@ impl ConnectionView {
         );
         let ssh_password_editor =
             make_editor("SSH Password", &config.ssh_password, window, cx);
+        ssh_password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
         let ssl_ca_path_editor = make_editor(
             "CA Certificate Path (optional)",
             config.ssl_ca_path.as_deref().unwrap_or(""),
@@ -1392,6 +1396,66 @@ mod tests {
             .read_with(cx, |view, cx| view.build_config(cx))
             .unwrap();
         assert!(config.is_none(), "missing host must fail validation");
+    }
+
+    #[gpui::test]
+    async fn password_fields_render_masked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.password_editor
+                    .update(cx, |ed, cx| ed.set_text("s3cr3t-pw", window, cx));
+                view.ssh_password_editor
+                    .update(cx, |ed, cx| ed.set_text("ssh-s3cr3t", window, cx));
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("alice", window, cx));
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, window, cx| {
+                // The rendered (display) text of a masked editor is bullets, not
+                // the real characters; a plain-text field would echo them back.
+                let password_display = view
+                    .password_editor
+                    .update(cx, |ed, cx| ed.snapshot(window, cx).display_snapshot.text());
+                assert!(
+                    !password_display.contains("s3cr3t-pw"),
+                    "password field must not render its plaintext"
+                );
+                assert!(
+                    password_display.chars().all(|c| c == '*'),
+                    "password field must render as mask chars, got {password_display:?}"
+                );
+
+                let ssh_display = view
+                    .ssh_password_editor
+                    .update(cx, |ed, cx| ed.snapshot(window, cx).display_snapshot.text());
+                assert!(
+                    !ssh_display.contains("ssh-s3cr3t"),
+                    "ssh password field must not render its plaintext"
+                );
+                assert!(
+                    ssh_display.chars().all(|c| c == '*'),
+                    "ssh password field must render as mask chars, got {ssh_display:?}"
+                );
+
+                // A non-secret field is unaffected: it still shows real text.
+                let username_display = view
+                    .username_editor
+                    .update(cx, |ed, cx| ed.snapshot(window, cx).display_snapshot.text());
+                assert_eq!(
+                    username_display, "alice",
+                    "non-secret fields must remain visible"
+                );
+
+                // The underlying value is preserved for building the config.
+                let stored = ConnectionView::read_text(&view.password_editor, cx);
+                assert_eq!(stored, "s3cr3t-pw", "masking must not alter the stored value");
+            })
+            .unwrap();
     }
 
     #[test]
