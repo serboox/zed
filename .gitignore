@@ -56,6 +56,9 @@ crates/docs_preprocessor/actions.json
 /december-2025-releases.md
 /docs/december-2025-documentation-gaps.md
 
+# Local-only documents, never committed
+/docs/
+
 # NixOS integration test state
 .nixos-test-history
 .claude/napkin.md
