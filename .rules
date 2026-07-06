@@ -32,6 +32,14 @@
   - Use `cx.background_executor().timer(duration).await` (or `cx.background_executor.timer(duration).await` in `TestAppContext`) so the work is scheduled on GPUI's dispatcher.
   - Avoid `smol::Timer::after(...)` for test timeouts when you rely on `run_until_parked()`, because it may not be tracked by GPUI's scheduler and can lead to "nothing left to run" when pumping.
 
+# UI bugfix verification
+
+* A UI bugfix is not validated until a test proves it, not until it compiles and "looks right" against a reference pattern. The test must:
+  - **Fail against the pre-fix code.** Temporarily revert the fix, rerun the test, confirm it genuinely fails, then reapply the fix and confirm it passes. A test that would pass regardless of whether the bug exists is not evidence of anything and must not be cited as validation.
+  - **Simulate the real reported interaction**, not call the internal handler directly. Use real mouse-down/move/up sequences with genuine pixel/offset math for scroll, drag, and click_count; real keystroke dispatch for typing. Assert on rendered/painted output or a concrete geometric proxy (e.g. `ScrollHandle::max_offset()`, measured content size vs. viewport size) — not only on internal boolean/enum state when the bug report describes something visible.
+* "This is hard to test in GPUI" is never a reason to skip verification. If a genuine limitation exists, state it explicitly and prominently in the report (what specifically couldn't be measured, and why), and still attempt the closest achievable proxy rather than skipping the check.
+* This applies to every UI bugfix, not just one crate: a fix declared "done" on code-reasoning alone (no simulated test, or a test that only exercises internal function calls) has repeatedly turned out to still be broken in the running app while looking complete on paper.
+
 # GPUI
 
 GPUI is a UI framework which also provides primitives for state and concurrency management.
