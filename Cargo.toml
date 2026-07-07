@@ -191,6 +191,7 @@ members = [
     "crates/snippet",
     "crates/snippet_provider",
     "crates/snippets_ui",
+    "crates/sql_semantic_tokens_lsp",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",

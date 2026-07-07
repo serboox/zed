@@ -141,6 +141,16 @@ pub(crate) static RENDERED_ROW_COUNT: std::sync::atomic::AtomicUsize =
 const MAX_CELL_DISPLAY_CHARS: usize = 200;
 const ROW_GUTTER_WIDTH: f32 = 48.0;
 
+// `anyhow::Error`'s `Display` (used by `.to_string()`) prints only the
+// outermost context message, discarding the wrapped driver error underneath
+// (e.g. the actual message sqlx/scylla got back from the database). `Debug`
+// prints the full "Caused by: 0: ... 1: ..." chain instead, which is what a
+// user needs to diagnose a real failure rather than a generic
+// "Query execution failed".
+fn format_query_error(err: &anyhow::Error) -> String {
+    format!("{err:?}")
+}
+
 // A lively rotating loading indicator. A short rotation period reads as active
 // work; kept in one place so every spinner in the grid looks the same.
 fn loading_spinner(id: impl Into<ElementId>, size: IconSize) -> impl IntoElement {
@@ -367,7 +377,10 @@ impl CompletionProvider for CellValueCompletionProvider {
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
         let snapshot = buffer.read(cx).snapshot();
         let offset = buffer_position.to_offset(&snapshot);
-        let query: String = snapshot.text_for_range(0..offset).collect::<String>().to_lowercase();
+        let query: String = snapshot
+            .text_for_range(0..offset)
+            .collect::<String>()
+            .to_lowercase();
         let replace_range = snapshot.anchor_before(0)..snapshot.anchor_after(offset);
         let completions = self
             .values
@@ -1367,9 +1380,9 @@ impl ResultView {
                     // (mixed/non-numeric columns), matching how aggregates already treat
                     // numeric values in `compute_column_aggregates`.
                     let ord = match (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                        (Ok(a_num), Ok(b_num)) => {
-                            a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
-                        }
+                        (Ok(a_num), Ok(b_num)) => a_num
+                            .partial_cmp(&b_num)
+                            .unwrap_or(std::cmp::Ordering::Equal),
                         _ => a_val.cmp(b_val),
                     };
                     let ord = if sc.ascending { ord } else { ord.reverse() };
@@ -1458,17 +1471,20 @@ impl ResultView {
                 if !self.numeric_columns.get(data_col).copied().unwrap_or(false) {
                     return None;
                 }
-                result.rows.iter().fold(None, |range: Option<(f64, f64)>, row| {
-                    let value = row
-                        .get(data_col)
-                        .and_then(|cell| cell.as_deref())
-                        .and_then(|text| text.parse::<f64>().ok());
-                    match (range, value) {
-                        (None, Some(v)) => Some((v, v)),
-                        (Some((lo, hi)), Some(v)) => Some((lo.min(v), hi.max(v))),
-                        (range, None) => range,
-                    }
-                })
+                result
+                    .rows
+                    .iter()
+                    .fold(None, |range: Option<(f64, f64)>, row| {
+                        let value = row
+                            .get(data_col)
+                            .and_then(|cell| cell.as_deref())
+                            .and_then(|text| text.parse::<f64>().ok());
+                        match (range, value) {
+                            (None, Some(v)) => Some((v, v)),
+                            (Some((lo, hi)), Some(v)) => Some((lo.min(v), hi.max(v))),
+                            (range, None) => range,
+                        }
+                    })
             })
             .collect();
 
@@ -2105,7 +2121,7 @@ impl ResultView {
                 this.is_loading = false;
                 match outcome {
                     Ok(result) => this.set_result(result, cx),
-                    Err(err) => this.set_error(err.to_string(), cx),
+                    Err(err) => this.set_error(format_query_error(&err), cx),
                 }
             })
             .log_err();
@@ -2184,7 +2200,8 @@ impl ResultView {
     // formatted view. Runs in render(), where a Window is available.
     fn sync_special_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let special = self.active_special();
-        if special == SpecialResult::None || self.special_built_for == Some(self.result_generation) {
+        if special == SpecialResult::None || self.special_built_for == Some(self.result_generation)
+        {
             return;
         }
         let Some(result) = self.result.clone() else {
@@ -2232,8 +2249,9 @@ impl ResultView {
                             sql: self.base_sql.clone().unwrap_or_default(),
                         }
                     });
-                let view =
-                    cx.new(|cx| crate::explain_plan::ExplainPlanView::new(roots, query_context, window, cx));
+                let view = cx.new(|cx| {
+                    crate::explain_plan::ExplainPlanView::new(roots, query_context, window, cx)
+                });
                 self.explain_view = Some(view);
                 self.ddl_view = None;
             }
@@ -2288,11 +2306,7 @@ impl ResultView {
                     .gap_2()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new(title)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
                     .child(div().flex_1())
                     .child(
                         Button::new("special-show-as-table", "Show as Table")
@@ -2432,7 +2446,7 @@ impl ResultView {
                         }
                     }
                     Err(err) => {
-                        this.update(cx, |view, cx| view.set_error(err.to_string(), cx))
+                        this.update(cx, |view, cx| view.set_error(format_query_error(&err), cx))
                             .ok();
                         return;
                     }
@@ -2663,7 +2677,14 @@ impl ResultView {
         if let Some(display_idx) = self.display_idx_of(abs_idx) {
             self.select_cell_from_click(abs_idx, display_idx, col_idx, false, false);
         }
-        self.begin_added_cell_edit(abs_idx, col_idx, added_idx, CellEditEntry::CursorEnd, window, cx);
+        self.begin_added_cell_edit(
+            abs_idx,
+            col_idx,
+            added_idx,
+            CellEditEntry::CursorEnd,
+            window,
+            cx,
+        );
     }
 
     fn render_cell_editor(editor: Entity<Editor>) -> AnyElement {
@@ -2675,7 +2696,11 @@ impl ResultView {
             .into_any_element()
     }
 
-    fn render_typed_cell_body(body: AnyElement, align_right: bool, text_debug_id: String) -> AnyElement {
+    fn render_typed_cell_body(
+        body: AnyElement,
+        align_right: bool,
+        text_debug_id: String,
+    ) -> AnyElement {
         h_flex()
             .size_full()
             .gap_1()
@@ -2752,7 +2777,11 @@ impl ResultView {
         // never reach this function (begin_cell_edit routes them to a dedicated
         // toggle/popup before an inline editor is ever spawned).
         let completion_values = matches!(column_kind, CellEditorKind::Text)
-            .then(|| self.result.as_ref().map(|result| distinct_column_values(result, col_idx)))
+            .then(|| {
+                self.result
+                    .as_ref()
+                    .map(|result| distinct_column_values(result, col_idx))
+            })
             .flatten()
             .filter(|values| !values.is_empty());
         let editor = cx.new(|cx| {
@@ -3605,9 +3634,8 @@ impl ResultView {
         let col_count = self.result.as_ref().map_or(0, |r| r.columns.len());
 
         // A single copied value fills the whole current selection.
-        let single_value_fill = grid.len() == 1
-            && grid[0].len() == 1
-            && self.selected_cell_range.is_some();
+        let single_value_fill =
+            grid.len() == 1 && grid[0].len() == 1 && self.selected_cell_range.is_some();
 
         self.run_edit_batch(cx, |this, cx| {
             if single_value_fill {
@@ -3644,12 +3672,7 @@ impl ResultView {
                     let Some(&col) = vis_cols.get(anchor_vis + col_offset) else {
                         continue;
                     };
-                    this.write_cell_value(
-                        target_abs,
-                        col,
-                        CellValue::from_text(value.clone()),
-                        cx,
-                    );
+                    this.write_cell_value(target_abs, col, CellValue::from_text(value.clone()), cx);
                 }
             }
         });
@@ -4049,7 +4072,7 @@ impl ResultView {
                     return Ok(());
                 };
                 if let Err(err) = task.await {
-                    this.update(cx, |this, cx| this.set_error(err.to_string(), cx))
+                    this.update(cx, |this, cx| this.set_error(format_query_error(&err), cx))
                         .log_err();
                     return Ok(());
                 }
@@ -4167,7 +4190,7 @@ impl ResultView {
                 return Ok(());
             };
             if let Err(err) = task.await {
-                this.update(cx, |this, cx| this.set_error(err.to_string(), cx))
+                this.update(cx, |this, cx| this.set_error(format_query_error(&err), cx))
                     .log_err();
                 return Ok(());
             }
@@ -5138,8 +5161,12 @@ impl ResultView {
                     format!("{n:.2}")
                 }
             };
-            let min_s = numeric_min.map(format_numeric).unwrap_or_else(|| "—".to_string());
-            let max_s = numeric_max.map(format_numeric).unwrap_or_else(|| "—".to_string());
+            let min_s = numeric_min
+                .map(format_numeric)
+                .unwrap_or_else(|| "—".to_string());
+            let max_s = numeric_max
+                .map(format_numeric)
+                .unwrap_or_else(|| "—".to_string());
             let avg = numeric_sum / count as f64;
             format!(
                 "COUNT {count} | NULLS {null_count} | MIN {min_s} | MAX {max_s} | SUM {numeric_sum} | AVG {avg:.2}"
@@ -5511,12 +5538,12 @@ impl ResultView {
                     // nothing ever cancelled the cell edit. Intercepting during
                     // the action capture phase (before the Editor's own handler
                     // runs) and stopping propagation is what actually cancels it.
-                    .capture_action(cx.listener(
-                        |this, _: &editor::actions::Cancel, window, cx| {
+                    .capture_action(
+                        cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
                             this.cancel_cell_edit(window, cx);
                             cx.stop_propagation();
-                        },
-                    ))
+                        }),
+                    )
                     .child(Self::render_cell_editor(editor))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
@@ -6019,12 +6046,12 @@ impl ResultView {
                     // See the equivalent branch in the non-transposed grid: Escape
                     // resolves to the `editor::Cancel` action, not a raw keystroke,
                     // so it must be intercepted during the action capture phase.
-                    .capture_action(cx.listener(
-                        |this, _: &editor::actions::Cancel, window, cx| {
+                    .capture_action(
+                        cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
                             this.cancel_cell_edit(window, cx);
                             cx.stop_propagation();
-                        },
-                    ))
+                        }),
+                    )
                     .child(Self::render_cell_editor(editor))
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
@@ -7542,7 +7569,6 @@ impl ResultView {
             .into_any_element()
     }
 
-
     fn selected_cell_full_value(&self) -> Option<String> {
         let (abs_idx, col_idx) = self.selected_cell?;
         // Pending edit wins over the loaded value.
@@ -8088,7 +8114,6 @@ impl ResultView {
         )
     }
 
-
     fn record_view_display_idx(&self) -> Option<usize> {
         // Clamp to the filtered display order so changing filters never leaves
         // a stale index pointing past the end.
@@ -8345,7 +8370,6 @@ impl ResultView {
         self.record_view_row = Some(next);
         cx.notify();
     }
-
 
     fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_editor.is_none() {
@@ -8687,7 +8711,6 @@ impl ResultView {
         )
     }
 
-
     fn recompute_local_filter(&mut self, cx: &mut Context<Self>) {
         let num_cols = self.result.as_ref().map(|r| r.columns.len()).unwrap_or(0);
         self.local_filters = (0..num_cols)
@@ -8785,7 +8808,6 @@ impl ResultView {
                 .children(cells),
         )
     }
-
 
     fn toggle_column_list(&mut self, cx: &mut Context<Self>) {
         self.column_list_visible = !self.column_list_visible;
@@ -9371,10 +9393,9 @@ impl ResultView {
                     .child(Icon::new(IconName::ChevronRight).size(IconSize::Small)),
             );
 
-        let weekday_row = h_flex().children(
-            ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
-                .into_iter()
-                .map(|label| {
+        let weekday_row =
+            h_flex().children(["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].into_iter().map(
+                |label| {
                     div()
                         .w(gpui::px(28.0))
                         .items_center()
@@ -9386,8 +9407,8 @@ impl ResultView {
                                 .color(Color::Muted),
                         )
                         .into_any_element()
-                }),
-        );
+                },
+            ));
 
         let first_of_month = time::Date::from_calendar_date(year, month, 1).ok();
         let leading_blanks = first_of_month
@@ -10123,7 +10144,10 @@ impl Render for ResultView {
                 }
                 // Type-to-replace: a printable character starts an edit that
                 // overwrites the cell (shift for uppercase is allowed).
-                if !modifiers.control && !modifiers.platform && !modifiers.alt && !modifiers.function
+                if !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !modifiers.function
                 {
                     if let Some(text) = keystroke.key_char.as_ref() {
                         if text.chars().count() == 1
@@ -10287,6 +10311,30 @@ impl Render for ResultView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_query_error_preserves_the_driver_message_under_the_generic_context() {
+        // Simulates a provider call like `.context("Query execution failed")?`
+        // wrapping a driver-returned error (e.g. sqlx's or scylla's own error
+        // type), the way `crates/db_client/src/{mysql,postgres,sqlite,
+        // cassandra_provider}.rs` do. `.to_string()` on the resulting
+        // `anyhow::Error` would only print "Query execution failed" and lose
+        // the actual database-reported detail below it.
+        let driver_error = anyhow::anyhow!(
+            "error returned from database: 1146 (42S02): Table 'app.does_not_exist' doesn't exist"
+        );
+        let wrapped = driver_error.context("Query execution failed");
+
+        let shown = format_query_error(&wrapped);
+        assert!(
+            shown.contains("Table 'app.does_not_exist' doesn't exist"),
+            "expected the underlying driver message in the formatted error, got: {shown:?}"
+        );
+        assert!(
+            shown.contains("Query execution failed"),
+            "the generic context should still be present as the top-level message, got: {shown:?}"
+        );
+    }
 
     #[test]
     fn display_cell_bounds_huge_values_and_preserves_formatting() {
@@ -11306,7 +11354,10 @@ mod tests {
             let tint = cx.theme().colors().text_accent;
             assert!(!view.heatmap_enabled);
             // id column (0) ranges 1..=2 (export_fixture's two rows) once loaded.
-            assert_eq!(view.heatmap_ranges.get(0).copied().flatten(), Some((1.0, 2.0)));
+            assert_eq!(
+                view.heatmap_ranges.get(0).copied().flatten(),
+                Some((1.0, 2.0))
+            );
             // With heatmap mode off, the renderer's own decision function must
             // never tint a cell, regardless of the column's range.
             assert_eq!(view.heatmap_cell_bg(0, Some("1"), base, tint), None);
@@ -11957,9 +12008,7 @@ mod tests {
     // erases it back to nothing before clicking away — the net effect at
     // commit time is still "empty", so the original NULL must be kept.
     #[gpui::test]
-    fn typing_then_clearing_a_null_cell_before_commit_keeps_it_null(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn typing_then_clearing_a_null_cell_before_commit_keeps_it_null(cx: &mut gpui::TestAppContext) {
         let (window, view, mut cx) =
             table_backed_result_window_with(cx, table_result_with_null_cell());
         let null_cell = debug_center(&mut cx, "CELL-0-1");
@@ -12352,16 +12401,26 @@ mod tests {
         draw_result_view(window, &mut cx);
 
         cx.simulate_keystrokes("down");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 0))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 0)))
+        });
         cx.simulate_keystrokes("right");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 1))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 1)))
+        });
         cx.simulate_keystrokes("up");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 1))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 1)))
+        });
         cx.simulate_keystrokes("left");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 0)))
+        });
         // Clamps at the top-left edge.
         cx.simulate_keystrokes("up left");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 0)))
+        });
     }
 
     #[gpui::test]
@@ -12372,13 +12431,21 @@ mod tests {
         draw_result_view(window, &mut cx);
 
         cx.simulate_keystrokes("enter");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 0))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 0)))
+        });
         cx.simulate_keystrokes("tab");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((1, 1))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 1)))
+        });
         cx.simulate_keystrokes("shift-enter");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 1))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 1)))
+        });
         cx.simulate_keystrokes("shift-tab");
-        view.update(&mut cx, |view, _| assert_eq!(view.selected_cell, Some((0, 0))));
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((0, 0)))
+        });
     }
 
     #[gpui::test]
@@ -12784,7 +12851,10 @@ mod tests {
         // A known numeric type is numeric even before any values are seen.
         let no_values: [Option<&str>; 0] = [];
         assert!(column_is_numeric(Some("int"), no_values.into_iter()));
-        assert!(column_is_numeric(Some("decimal(10,2)"), no_values.into_iter()));
+        assert!(column_is_numeric(
+            Some("decimal(10,2)"),
+            no_values.into_iter()
+        ));
 
         // A known text type is not numeric even when its values look like numbers.
         let numeric_looking = [Some("1"), Some("2")];
@@ -12795,10 +12865,7 @@ mod tests {
 
         // With no type metadata, the values decide.
         assert!(column_is_numeric(None, [Some("1"), Some("2")].into_iter()));
-        assert!(!column_is_numeric(
-            None,
-            [Some("1"), Some("x")].into_iter()
-        ));
+        assert!(!column_is_numeric(None, [Some("1"), Some("x")].into_iter()));
     }
 
     #[test]
@@ -12905,7 +12972,10 @@ mod tests {
         view.update(&mut cx, |view, _| {
             assert_eq!(
                 view.sort_columns,
-                vec![SortColumn { col_idx: 0, ascending: true }]
+                vec![SortColumn {
+                    col_idx: 0,
+                    ascending: true
+                }]
             );
         });
 
@@ -12916,8 +12986,14 @@ mod tests {
             assert_eq!(
                 view.sort_columns,
                 vec![
-                    SortColumn { col_idx: 0, ascending: true },
-                    SortColumn { col_idx: 1, ascending: true },
+                    SortColumn {
+                        col_idx: 0,
+                        ascending: true
+                    },
+                    SortColumn {
+                        col_idx: 1,
+                        ascending: true
+                    },
                 ],
                 "shift-click must add a secondary sort key, not replace the primary one"
             );
@@ -12938,8 +13014,14 @@ mod tests {
             assert_eq!(
                 view.sort_columns,
                 vec![
-                    SortColumn { col_idx: 0, ascending: true },
-                    SortColumn { col_idx: 1, ascending: false },
+                    SortColumn {
+                        col_idx: 0,
+                        ascending: true
+                    },
+                    SortColumn {
+                        col_idx: 1,
+                        ascending: false
+                    },
                 ],
                 "shift-clicking an existing secondary sort column must toggle its direction"
             );
@@ -13623,8 +13705,10 @@ mod tests {
         let copied = cx
             .read_from_clipboard()
             .and_then(|clipboard| clipboard.text())
-            .expect("a real ctrl-c keystroke must write the selection to the clipboard through \
-                     the production keymap binding and action dispatch");
+            .expect(
+                "a real ctrl-c keystroke must write the selection to the clipboard through \
+                     the production keymap binding and action dispatch",
+            );
         assert_eq!(copied, "id,name\n2,Bob\n");
     }
 
@@ -13660,8 +13744,10 @@ mod tests {
         let copied = cx
             .read_from_clipboard()
             .and_then(|clipboard| clipboard.text())
-            .expect("a real ctrl-c keystroke must write the selected range to the clipboard \
-                     as TSV by default");
+            .expect(
+                "a real ctrl-c keystroke must write the selected range to the clipboard \
+                     as TSV by default",
+            );
         assert_eq!(copied, "id\tname\n1\tAlice\n2\tBob\n");
     }
 
@@ -13967,11 +14053,7 @@ mod tests {
                 execution_time_ms: 0,
             })
         }
-        async fn get_table_ddl(
-            &self,
-            _database: &str,
-            _table: &str,
-        ) -> anyhow::Result<String> {
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
             Ok(String::new())
         }
     }
@@ -14908,16 +14990,16 @@ mod tests {
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, _cx| {
             assert_ne!(
-                view.cell_edit.as_ref().map(|edit| (edit.abs_idx, edit.col_idx)),
+                view.cell_edit
+                    .as_ref()
+                    .map(|edit| (edit.abs_idx, edit.col_idx)),
                 Some((1, 1)),
                 "the second enter must commit the accepted completion and move off the cell"
             );
-            let rendered = view
-                .pending_cell_value(1, 1)
-                .map(|value| match value {
-                    CellValue::Text(text) => text.clone(),
-                    other => panic!("expected a text edit, got {other:?}"),
-                });
+            let rendered = view.pending_cell_value(1, 1).map(|value| match value {
+                CellValue::Text(text) => text.clone(),
+                other => panic!("expected a text edit, got {other:?}"),
+            });
             assert_eq!(rendered, Some("red".to_string()));
         });
     }
@@ -15086,7 +15168,10 @@ mod tests {
                 "a real ctrl-d keystroke must reach the grid's own fill-down handler, not the \
                  competing editor::SelectNext keymap binding, when no cell editor is focused"
             );
-            assert_eq!(view.pending_cell_value(2, 1), Some(&CellValue::Text("Zed".to_string())));
+            assert_eq!(
+                view.pending_cell_value(2, 1),
+                Some(&CellValue::Text("Zed".to_string()))
+            );
         });
 
         let left_cell = debug_center(&mut cx, "CELL-0-0");
@@ -15130,8 +15215,10 @@ mod tests {
         let cut = cx
             .read_from_clipboard()
             .and_then(|clipboard| clipboard.text())
-            .expect("a real ctrl-x keystroke must reach the grid's own cut handler and write to \
-                     the clipboard, not the competing editor::Cut keymap binding");
+            .expect(
+                "a real ctrl-x keystroke must reach the grid's own cut handler and write to \
+                     the clipboard, not the competing editor::Cut keymap binding",
+            );
         assert!(cut.contains("Pasted"));
         view.update(&mut cx, |view, _| {
             assert_eq!(
@@ -15265,7 +15352,8 @@ mod tests {
         draw_result_view(window, &mut cx);
         view.update(&mut cx, |view, _cx| {
             assert_eq!(
-                view.pending_cell_value(0, 0).map(|v| render_cell_value(v).0),
+                view.pending_cell_value(0, 0)
+                    .map(|v| render_cell_value(v).0),
                 Some("105".to_string()),
                 "the committed value must be exactly what was typed, never doubled or concatenated \
                  with the original"
@@ -15314,7 +15402,11 @@ mod tests {
         );
         assert_eq!(parse_date_prefix(""), None);
         assert_eq!(parse_date_prefix("not a date"), None);
-        assert_eq!(parse_date_prefix("2026-13-40"), None, "an invalid calendar date must not parse");
+        assert_eq!(
+            parse_date_prefix("2026-13-40"),
+            None,
+            "an invalid calendar date must not parse"
+        );
     }
 
     #[test]
@@ -15352,7 +15444,11 @@ mod tests {
             },
             ColumnInfo {
                 name: "signup_date".to_string(),
-                data_type: if datetime { "datetime".to_string() } else { "date".to_string() },
+                data_type: if datetime {
+                    "datetime".to_string()
+                } else {
+                    "date".to_string()
+                },
                 is_nullable: true,
                 column_key: None,
                 default_value: None,

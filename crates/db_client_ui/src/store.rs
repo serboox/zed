@@ -4,6 +4,7 @@ use credentials_provider::CredentialsProvider;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
     RuntimeProvider, SshAuth, SshAuthMethod, SshTunnel,
+    cassandra_provider::CassandraProvider,
     clickhouse::ClickHouseProvider,
     mongo_provider::MongoProvider,
     mysql::MySqlProvider,
@@ -17,7 +18,9 @@ use db_client::{
     },
     sqlite::SqliteProvider,
 };
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Task, TaskExt as _};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Task, TaskExt as _,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -838,7 +841,12 @@ impl DatabaseStore {
     /// when invoking a saved run configuration that targets a specific
     /// database, so the run always lands where the user pinned it regardless
     /// of whichever database happened to be selected last.
-    pub fn set_connection_database(&mut self, id: ConnectionId, database: String, cx: &mut Context<Self>) {
+    pub fn set_connection_database(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(connection) = self.connections.iter_mut().find(|c| c.config.id == id) {
             connection.config.database = Some(database);
             cx.notify();
@@ -1021,7 +1029,11 @@ impl DatabaseStore {
             }
         }
         for config in connections {
-            if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == config.id) {
+            if let Some(conn) = self
+                .connections
+                .iter_mut()
+                .find(|c| c.config.id == config.id)
+            {
                 conn.config = config;
             } else {
                 self.connections.push(ActiveConnection::new(config));
@@ -2105,6 +2117,10 @@ async fn build_provider(
             let config = effective_config.clone();
             Arc::new(on_runtime(async move { MongoProvider::connect(&config).await }).await?)
         }
+        DatabaseDriver::Cassandra => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { CassandraProvider::connect(&config).await }).await?)
+        }
     };
     let provider: Arc<dyn DbProvider> = Arc::new(RuntimeProvider::new(raw));
     Ok((provider, tunnel))
@@ -2323,7 +2339,12 @@ mod tests {
             assert_eq!(store.folders().len(), 1);
             assert_eq!(store.connections().len(), 1);
             assert_eq!(
-                store.folders().iter().find(|f| f.id == folder_id).unwrap().name,
+                store
+                    .folders()
+                    .iter()
+                    .find(|f| f.id == folder_id)
+                    .unwrap()
+                    .name,
                 "Renamed"
             );
             assert_eq!(
@@ -2695,7 +2716,11 @@ mod tests {
         });
         cx.run_until_parked();
         store.read_with(cx, |store, _| {
-            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
             assert!(!conn.db_procedures.is_empty());
         });
 
@@ -2705,7 +2730,11 @@ mod tests {
         cx.run_until_parked();
 
         store.read_with(cx, |store, _| {
-            let conn = store.connections().iter().find(|c| c.config.id == id).unwrap();
+            let conn = store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == id)
+                .unwrap();
             assert!(
                 conn.db_procedures.is_empty(),
                 "refreshing the schema cache must drop stale cached routines"
@@ -2733,7 +2762,11 @@ mod tests {
             ])
         }
         async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
-            let name = if database == "shop" { "users" } else { "events" };
+            let name = if database == "shop" {
+                "users"
+            } else {
+                "events"
+            };
             Ok(vec![TableInfo {
                 name: name.into(),
                 kind: db_client::schema::TableKind::Table,
@@ -2818,7 +2851,9 @@ mod tests {
             table_fetch.await.expect("connected fetch"),
             "CREATE TABLE `users` (id INT)"
         );
-        let db_fetch = store.update(cx, |store, cx| store.get_database_ddl(id, "shop".into(), cx));
+        let db_fetch = store.update(cx, |store, cx| {
+            store.get_database_ddl(id, "shop".into(), cx)
+        });
         assert_eq!(
             db_fetch.await.expect("connected fetch"),
             "CREATE DATABASE `shop`"
@@ -2833,7 +2868,9 @@ mod tests {
             table_cached.await.expect("cached while offline"),
             "CREATE TABLE `users` (id INT)"
         );
-        let db_cached = store.update(cx, |store, cx| store.get_database_ddl(id, "shop".into(), cx));
+        let db_cached = store.update(cx, |store, cx| {
+            store.get_database_ddl(id, "shop".into(), cx)
+        });
         assert_eq!(
             db_cached.await.expect("cached while offline"),
             "CREATE DATABASE `shop`"
@@ -3193,7 +3230,10 @@ mod tests {
                 "a file must have at most one run configuration at a time"
             );
             assert_eq!(
-                store.run_configuration_for_path(&path).unwrap().connection_id,
+                store
+                    .run_configuration_for_path(&path)
+                    .unwrap()
+                    .connection_id,
                 second_connection
             );
         });
@@ -3230,9 +3270,16 @@ mod tests {
         let restored: HashMap<ConnectionId, SchemaCache> =
             serde_json::from_slice(&bytes).expect("deserialize");
         let snapshot = restored.get(&id).expect("connection entry");
-        assert_eq!(snapshot.databases.first().map(|d| d.name.as_str()), Some("shop"));
         assert_eq!(
-            snapshot.tables.get("shop").and_then(|t| t.first()).map(|t| t.name.as_str()),
+            snapshot.databases.first().map(|d| d.name.as_str()),
+            Some("shop")
+        );
+        assert_eq!(
+            snapshot
+                .tables
+                .get("shop")
+                .and_then(|t| t.first())
+                .map(|t| t.name.as_str()),
             Some("users")
         );
         assert_eq!(

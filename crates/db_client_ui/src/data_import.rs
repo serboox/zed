@@ -5,11 +5,9 @@ use gpui::{
     px,
 };
 use ui::prelude::*;
-use workspace::ModalView;
-use ui::{
-    Button, ButtonStyle, Checkbox, ContextMenu, Divider, Label, PopoverMenu,
-};
+use ui::{Button, ButtonStyle, Checkbox, ContextMenu, Divider, Label, PopoverMenu};
 use util::ResultExt;
+use workspace::ModalView;
 
 use crate::store::DatabaseStore;
 
@@ -162,7 +160,10 @@ pub fn build_insert_statements(
 pub fn disable_indexes_statements(driver: DatabaseDriver, table: &str) -> Option<(String, String)> {
     match driver {
         DatabaseDriver::MySQL => Some((
-            format!("ALTER TABLE {} DISABLE KEYS", driver.quote_identifier(table)),
+            format!(
+                "ALTER TABLE {} DISABLE KEYS",
+                driver.quote_identifier(table)
+            ),
             format!("ALTER TABLE {} ENABLE KEYS", driver.quote_identifier(table)),
         )),
         // Postgres has no bulk "disable indexes" statement; disabling triggers
@@ -175,7 +176,8 @@ pub fn disable_indexes_statements(driver: DatabaseDriver, table: &str) -> Option
         DatabaseDriver::SQLite
         | DatabaseDriver::ClickHouse
         | DatabaseDriver::Redis
-        | DatabaseDriver::MongoDB => None,
+        | DatabaseDriver::MongoDB
+        | DatabaseDriver::Cassandra => None,
     }
 }
 
@@ -199,7 +201,6 @@ fn default_mapping(target_columns: &[String], headers: &[String]) -> Vec<Option<
         })
         .collect()
 }
-
 
 const IMPORT_BATCH_SIZE: usize = 200;
 const PREVIEW_ROW_LIMIT: usize = 20;
@@ -287,8 +288,8 @@ impl ImportDataView {
             let read = cx
                 .background_spawn(async move {
                     let bytes = std::fs::read(&read_path)?;
-                    let encoding =
-                        encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+                    let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())
+                        .unwrap_or(encoding_rs::UTF_8);
                     let (decoded, _, _) = encoding.decode(&bytes);
                     std::io::Result::Ok(decoded.into_owned())
                 })
@@ -480,11 +481,7 @@ impl ImportDataView {
             })
     }
 
-    fn render_mapping_row(
-        &self,
-        target_index: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_mapping_row(&self, target_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let target = self.target_columns[target_index].clone();
         let headers = self
             .parsed
@@ -516,8 +513,10 @@ impl ImportDataView {
                             menu = menu.entry("(skip)", None, {
                                 let view = view.clone();
                                 move |_, cx| {
-                                    view.update(cx, |this, cx| this.set_mapping(target_index, None, cx))
-                                        .ok();
+                                    view.update(cx, |this, cx| {
+                                        this.set_mapping(target_index, None, cx)
+                                    })
+                                    .ok();
                                 }
                             });
                             for (source_index, header) in headers.iter().enumerate() {
@@ -578,8 +577,9 @@ impl Render for ImportDataView {
                     .gap_2()
                     .child(div().flex_1().child(self.path_editor.clone()))
                     .child(
-                        ui::Button::new("load-file", "Load")
-                            .on_click(cx.listener(|view, _, window, cx| view.load_file(window, cx))),
+                        ui::Button::new("load-file", "Load").on_click(
+                            cx.listener(|view, _, window, cx| view.load_file(window, cx)),
+                        ),
                     ),
             )
             .child(
@@ -603,7 +603,11 @@ impl Render for ImportDataView {
                         )),
                     )
                     .child(Label::new("Insert empty as NULL").size(LabelSize::Small))
-                    .child(Label::new("Charset").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new("Charset")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(charset_picker),
             )
             .child(
@@ -634,7 +638,11 @@ impl Render for ImportDataView {
                     ),
             )
             .child(Divider::horizontal())
-            .child(Label::new("Column mapping").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new("Column mapping")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
             .child(
                 div()
                     .id("mapping-scroll")
@@ -662,15 +670,16 @@ impl Render for ImportDataView {
                     .justify_end()
                     .gap_2()
                     .child(
-                        ui::Button::new("cancel-import", "Cancel").on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                        ),
+                        ui::Button::new("cancel-import", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         ui::Button::new("run-import", "Import")
                             .style(ButtonStyle::Filled)
                             .disabled(importing)
-                            .on_click(cx.listener(|view, _, window, cx| view.run_import(window, cx))),
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.run_import(window, cx)),
+                            ),
                     ),
             )
     }
@@ -704,7 +713,11 @@ mod tests {
 
     #[test]
     fn parses_quoted_fields_with_embedded_delimiter_and_quotes() {
-        let parsed = parse_delimited("name,note\n\"Smith, Jr.\",\"He said \"\"hi\"\"\"", ',', true);
+        let parsed = parse_delimited(
+            "name,note\n\"Smith, Jr.\",\"He said \"\"hi\"\"\"",
+            ',',
+            true,
+        );
         assert_eq!(parsed.rows[0][0], "Smith, Jr.");
         assert_eq!(parsed.rows[0][1], "He said \"hi\"");
     }
@@ -756,8 +769,15 @@ mod tests {
         let target = vec!["id".to_string()];
         let rows: Vec<Vec<String>> = (0..5).map(|n| vec![n.to_string()]).collect();
         let mapping = vec![Some(0)];
-        let statements =
-            build_insert_statements("t", DatabaseDriver::MySQL, &target, &rows, &mapping, true, 2);
+        let statements = build_insert_statements(
+            "t",
+            DatabaseDriver::MySQL,
+            &target,
+            &rows,
+            &mapping,
+            true,
+            2,
+        );
         assert_eq!(statements.len(), 3);
     }
 
@@ -886,16 +906,19 @@ mod tests {
             },
         );
 
-        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let csv_path = dir.join("rows.csv");
-        std::fs::write(&csv_path, "id,name\n1,Alice\n2,BAD\n3,Claire\n").expect("write fixture csv");
+        std::fs::write(&csv_path, "id,name\n1,Alice\n2,BAD\n3,Claire\n")
+            .expect("write fixture csv");
         let csv_path_string = csv_path.to_string_lossy().to_string();
 
         window
             .update(cx, |view, window, cx| {
-                view.path_editor
-                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.path_editor.update(cx, |ed, cx| {
+                    ed.set_text(csv_path_string.clone(), window, cx)
+                });
                 view.load_file(window, cx);
             })
             .unwrap();
@@ -944,7 +967,8 @@ mod tests {
             },
         );
 
-        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let csv_path = dir.join("rows.csv");
         std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").expect("write fixture csv");
@@ -952,8 +976,9 @@ mod tests {
 
         window
             .update(cx, |view, window, cx| {
-                view.path_editor
-                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.path_editor.update(cx, |ed, cx| {
+                    ed.set_text(csv_path_string.clone(), window, cx)
+                });
                 view.load_file(window, cx);
             })
             .unwrap();
@@ -997,7 +1022,8 @@ mod tests {
 
         // "Имя" (name, in Cyrillic) encoded as windows-1251, not valid UTF-8.
         let (encoded, _, _) = encoding_rs::WINDOWS_1251.encode("id,Имя\n1,Тест\n");
-        let dir = std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("db_client_import_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let csv_path = dir.join("cyrillic.csv");
         std::fs::write(&csv_path, &encoded).expect("write fixture csv");
@@ -1005,15 +1031,18 @@ mod tests {
 
         window
             .update(cx, |view, window, cx| {
-                view.path_editor
-                    .update(cx, |ed, cx| ed.set_text(csv_path_string.clone(), window, cx));
+                view.path_editor.update(cx, |ed, cx| {
+                    ed.set_text(csv_path_string.clone(), window, cx)
+                });
                 view.charset = "windows-1251";
                 view.load_file(window, cx);
             })
             .unwrap();
         cx.run_until_parked();
 
-        let parsed = window.read_with(cx, |view, _cx| view.parsed.clone()).unwrap();
+        let parsed = window
+            .read_with(cx, |view, _cx| view.parsed.clone())
+            .unwrap();
         let parsed = parsed.expect("file should have loaded and parsed");
         assert_eq!(parsed.headers, vec!["id".to_string(), "Имя".to_string()]);
         assert_eq!(parsed.rows, vec![vec!["1".to_string(), "Тест".to_string()]]);

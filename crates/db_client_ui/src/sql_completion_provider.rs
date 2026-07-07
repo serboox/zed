@@ -15,18 +15,94 @@ use theme::ActiveTheme as _;
 use ui::IconName;
 
 pub(crate) const CORE_KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON",
-    "USING", "AND", "OR", "NOT", "IN", "IS", "NULL", "AS", "DISTINCT", "ORDER", "GROUP", "BY",
-    "HAVING", "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",
-    "TABLE", "VIEW", "INDEX", "DROP", "ALTER", "ADD", "COLUMN", "PRIMARY", "KEY", "UNIQUE",
-    "REFERENCES", "FOREIGN", "CONSTRAINT", "DEFAULT", "SHOW", "DESCRIBE", "EXPLAIN", "USE", "LIKE",
-    "BETWEEN", "EXISTS", "UNION", "ALL", "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "ASC",
-    "DESC", "WITH", "TRUNCATE",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "FULL",
+    "CROSS",
+    "ON",
+    "USING",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "IS",
+    "NULL",
+    "AS",
+    "DISTINCT",
+    "ORDER",
+    "GROUP",
+    "BY",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "CREATE",
+    "TABLE",
+    "VIEW",
+    "INDEX",
+    "DROP",
+    "ALTER",
+    "ADD",
+    "COLUMN",
+    "PRIMARY",
+    "KEY",
+    "UNIQUE",
+    "REFERENCES",
+    "FOREIGN",
+    "CONSTRAINT",
+    "DEFAULT",
+    "SHOW",
+    "DESCRIBE",
+    "EXPLAIN",
+    "USE",
+    "LIKE",
+    "BETWEEN",
+    "EXISTS",
+    "UNION",
+    "ALL",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "CAST",
+    "ASC",
+    "DESC",
+    "WITH",
+    "TRUNCATE",
 ];
 
 const CORE_FUNCTIONS: &[&str] = &[
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF", "ABS", "ROUND", "FLOOR", "CEIL",
-    "LENGTH", "LOWER", "UPPER", "TRIM", "REPLACE", "SUBSTRING", "CONCAT", "NOW",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "COALESCE",
+    "NULLIF",
+    "ABS",
+    "ROUND",
+    "FLOOR",
+    "CEIL",
+    "LENGTH",
+    "LOWER",
+    "UPPER",
+    "TRIM",
+    "REPLACE",
+    "SUBSTRING",
+    "CONCAT",
+    "NOW",
 ];
 
 const MYSQL_KEYWORDS: &[&str] = &[
@@ -112,6 +188,7 @@ fn keywords_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::ClickHouse => CLICKHOUSE_KEYWORDS,
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
+        DatabaseDriver::Cassandra => &[],
     };
     CORE_KEYWORDS.iter().chain(extra.iter()).copied().collect()
 }
@@ -124,6 +201,7 @@ fn functions_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::ClickHouse => CLICKHOUSE_FUNCTIONS,
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
+        DatabaseDriver::Cassandra => &[],
     };
     CORE_FUNCTIONS.iter().chain(extra.iter()).copied().collect()
 }
@@ -339,7 +417,11 @@ fn split_qualified(raw: &str) -> (Option<String>, String) {
         Some((schema, name)) => {
             let schema = trim(schema);
             (
-                if schema.is_empty() { None } else { Some(schema) },
+                if schema.is_empty() {
+                    None
+                } else {
+                    Some(schema)
+                },
                 trim(name),
             )
         }
@@ -466,7 +548,10 @@ fn ast_tables_in_scope(
 
 /// Resolves a qualifier to the referenced table: an alias maps to its table,
 /// otherwise a direct table-name match maps to itself.
-pub(crate) fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> Option<&'a TableRef> {
+pub(crate) fn resolve_table_ref<'a>(
+    qualifier: &str,
+    tables: &'a [TableRef],
+) -> Option<&'a TableRef> {
     tables
         .iter()
         .find(|t| {
@@ -474,7 +559,11 @@ pub(crate) fn resolve_table_ref<'a>(qualifier: &str, tables: &'a [TableRef]) -> 
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
         })
-        .or_else(|| tables.iter().find(|t| t.name.eq_ignore_ascii_case(qualifier)))
+        .or_else(|| {
+            tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(qualifier))
+        })
 }
 
 fn resolve_table(qualifier: &str, tables: &[TableRef]) -> Option<String> {
@@ -497,14 +586,18 @@ fn build_candidates(
             for (name, is_view) in objects {
                 items.push(CandidateItem {
                     text: name.clone(),
-                    kind: if *is_view { ItemKind::View } else { ItemKind::Table },
+                    kind: if *is_view {
+                        ItemKind::View
+                    } else {
+                        ItemKind::Table
+                    },
                     detail: None,
                 });
             }
         }
         // `alias.`/`table.` -> that table's columns.
-        let table = resolve_table(qualifier, &context.tables_in_scope)
-            .unwrap_or_else(|| qualifier.clone());
+        let table =
+            resolve_table(qualifier, &context.tables_in_scope).unwrap_or_else(|| qualifier.clone());
         if let Some(columns) = schema.columns_by_table.get(&table.to_lowercase()) {
             for (name, data_type) in columns {
                 items.push(CandidateItem {
@@ -542,7 +635,11 @@ fn build_candidates(
             for (name, is_view) in &schema.tables {
                 items.push(CandidateItem {
                     text: name.clone(),
-                    kind: if *is_view { ItemKind::View } else { ItemKind::Table },
+                    kind: if *is_view {
+                        ItemKind::View
+                    } else {
+                        ItemKind::Table
+                    },
                     detail: None,
                 });
             }
@@ -793,19 +890,19 @@ impl CompletionProvider for SqlCompletionProvider {
         let full_text: String = buffer.read(cx).snapshot().text();
         let cursor_offset = text_before.len();
         let heuristic_context = parse_context(&text_before);
-        let (context, extra_columns) =
-            match ast_tables_in_scope(&full_text, driver, cursor_offset) {
-                Some((tables_in_scope, extra_columns)) => (
-                    ParsedContext {
-                        qualifier: heuristic_context.qualifier,
-                        kind: heuristic_context.kind,
-                        tables_in_scope,
-                        cte_names: heuristic_context.cte_names,
-                    },
-                    extra_columns,
-                ),
-                None => (heuristic_context, HashMap::new()),
-            };
+        let (context, extra_columns) = match ast_tables_in_scope(&full_text, driver, cursor_offset)
+        {
+            Some((tables_in_scope, extra_columns)) => (
+                ParsedContext {
+                    qualifier: heuristic_context.qualifier,
+                    kind: heuristic_context.kind,
+                    tables_in_scope,
+                    cte_names: heuristic_context.cte_names,
+                },
+                extra_columns,
+            ),
+            None => (heuristic_context, HashMap::new()),
+        };
 
         let icon_colors = {
             let colors = cx.theme().colors();
@@ -847,7 +944,9 @@ impl CompletionProvider for SqlCompletionProvider {
             && snapshot.columns_by_table.is_empty()
         {
             store
-                .update(cx, |store, cx| store.prefetch_full_schema(connection_id, cx))
+                .update(cx, |store, cx| {
+                    store.prefetch_full_schema(connection_id, cx)
+                })
                 .detach();
         }
         // A derived-table/CTE alias has no real table to look up columns
@@ -857,7 +956,10 @@ impl CompletionProvider for SqlCompletionProvider {
         for (alias, columns) in extra_columns {
             snapshot.columns_by_table.insert(
                 alias.to_lowercase(),
-                columns.into_iter().map(|name| (name, String::new())).collect(),
+                columns
+                    .into_iter()
+                    .map(|name| (name, String::new()))
+                    .collect(),
             );
         }
 
@@ -955,7 +1057,10 @@ mod tests {
 
     #[test]
     fn qualifier_is_identifier_before_dot() {
-        assert_eq!(extract_qualifier("SELECT * FROM s.tab"), Some("s".to_string()));
+        assert_eq!(
+            extract_qualifier("SELECT * FROM s.tab"),
+            Some("s".to_string())
+        );
         assert_eq!(extract_qualifier("SELECT u.").as_deref(), Some("u"));
         assert_eq!(extract_qualifier("SELECT col"), None);
         assert_eq!(extract_qualifier("SELECT "), None);
@@ -1050,12 +1155,26 @@ mod tests {
     fn after_from_suggests_tables_and_keywords() {
         let context = ctx("SELECT * FROM ");
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "users" && i.kind == ItemKind::Table));
-        assert!(items.iter().any(|i| i.kind == ItemKind::Schema && i.text == "instruments"));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "users" && i.kind == ItemKind::Table)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.kind == ItemKind::Schema && i.text == "instruments")
+        );
         assert!(items.iter().any(|i| i.kind == ItemKind::Keyword));
         // Tables rank before keywords.
-        let first_keyword = items.iter().position(|i| i.kind == ItemKind::Keyword).unwrap();
-        let first_table = items.iter().position(|i| i.kind == ItemKind::Table).unwrap();
+        let first_keyword = items
+            .iter()
+            .position(|i| i.kind == ItemKind::Keyword)
+            .unwrap();
+        let first_table = items
+            .iter()
+            .position(|i| i.kind == ItemKind::Table)
+            .unwrap();
         assert!(first_table < first_keyword);
     }
 
@@ -1063,8 +1182,16 @@ mod tests {
     fn alias_dot_suggests_that_tables_columns() {
         let context = ctx("SELECT * FROM users u WHERE u.");
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "id" && i.kind == ItemKind::Column));
-        assert!(items.iter().any(|i| i.text == "email" && i.kind == ItemKind::Column));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "id" && i.kind == ItemKind::Column)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "email" && i.kind == ItemKind::Column)
+        );
         // Only columns for a qualified completion.
         assert!(items.iter().all(|i| i.kind == ItemKind::Column));
     }
@@ -1073,7 +1200,11 @@ mod tests {
     fn schema_dot_suggests_schema_objects() {
         let context = ctx("SELECT * FROM instruments.");
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "splits" && i.kind == ItemKind::Table));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "splits" && i.kind == ItemKind::Table)
+        );
         assert!(items.iter().any(|i| i.text == "prices"));
     }
 
@@ -1088,22 +1219,38 @@ mod tests {
             cte_names: Vec::new(),
         };
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "id" && i.kind == ItemKind::Column));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "id" && i.kind == ItemKind::Column)
+        );
         assert!(items.iter().any(|i| i.kind == ItemKind::Function));
     }
 
     #[test]
     fn cte_names_are_parsed_and_offered_as_tables() {
         let context = ctx("WITH recent AS (SELECT 1), totals AS (SELECT 2) SELECT * FROM ");
-        assert_eq!(context.cte_names, vec!["recent".to_string(), "totals".to_string()]);
+        assert_eq!(
+            context.cte_names,
+            vec!["recent".to_string(), "totals".to_string()]
+        );
         let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "recent" && i.kind == ItemKind::Table));
-        assert!(items.iter().any(|i| i.text == "totals" && i.kind == ItemKind::Table));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "recent" && i.kind == ItemKind::Table)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "totals" && i.kind == ItemKind::Table)
+        );
     }
 
     #[test]
     fn subquery_scope_prefers_inner_tables() {
-        let context = ctx("SELECT * FROM outer_tbl o WHERE o.id IN (SELECT id FROM inner_tbl x WHERE x.");
+        let context =
+            ctx("SELECT * FROM outer_tbl o WHERE o.id IN (SELECT id FROM inner_tbl x WHERE x.");
         // The innermost open paren scopes to the subquery's tables.
         assert_eq!(
             context.tables_in_scope,
@@ -1113,7 +1260,10 @@ mod tests {
                 schema: None,
             }]
         );
-        assert_eq!(resolve_table("x", &context.tables_in_scope).as_deref(), Some("inner_tbl"));
+        assert_eq!(
+            resolve_table("x", &context.tables_in_scope).as_deref(),
+            Some("inner_tbl")
+        );
     }
 
     #[test]
@@ -1133,9 +1283,10 @@ mod tests {
         // No identifier typed after WHERE: candidates must still include the
         // in-scope table's columns (the editor filters interactively).
         let mut schema = sample_schema();
-        schema
-            .columns_by_table
-            .insert("splits".to_string(), vec![("ratio".to_string(), "double".to_string())]);
+        schema.columns_by_table.insert(
+            "splits".to_string(),
+            vec![("ratio".to_string(), "double".to_string())],
+        );
         let context = ParsedContext {
             qualifier: None,
             kind: ContextKind::Columns,
@@ -1147,7 +1298,11 @@ mod tests {
             cte_names: Vec::new(),
         };
         let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "ratio" && i.kind == ItemKind::Column));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "ratio" && i.kind == ItemKind::Column)
+        );
     }
 
     #[test]
@@ -1189,7 +1344,10 @@ mod tests {
             alias: Some("q".to_string()),
             schema: None,
         }));
-        assert_eq!(extra_columns.get("q"), Some(&vec!["a".to_string(), "c".to_string()]));
+        assert_eq!(
+            extra_columns.get("q"),
+            Some(&vec!["a".to_string(), "c".to_string()])
+        );
     }
 
     #[test]
@@ -1207,7 +1365,10 @@ mod tests {
         for (alias, columns) in extra_columns {
             schema.columns_by_table.insert(
                 alias.to_lowercase(),
-                columns.into_iter().map(|name| (name, String::new())).collect(),
+                columns
+                    .into_iter()
+                    .map(|name| (name, String::new()))
+                    .collect(),
             );
         }
         let context = ParsedContext {
@@ -1217,8 +1378,16 @@ mod tests {
             cte_names: Vec::new(),
         };
         let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
-        assert!(items.iter().any(|i| i.text == "a" && i.kind == ItemKind::Column));
-        assert!(items.iter().any(|i| i.text == "c" && i.kind == ItemKind::Column));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "a" && i.kind == ItemKind::Column)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.text == "c" && i.kind == ItemKind::Column)
+        );
     }
 
     #[test]

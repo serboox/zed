@@ -114,8 +114,7 @@ impl ConnectionView {
         let ssl_ca_path_editor = make_editor("CA Certificate Path (optional)", "", window, cx);
         let ssl_client_cert_path_editor =
             make_editor("Client Certificate Path (optional)", "", window, cx);
-        let ssl_client_key_path_editor =
-            make_editor("Client Key Path (optional)", "", window, cx);
+        let ssl_client_key_path_editor = make_editor("Client Key Path (optional)", "", window, cx);
 
         Self {
             focus_handle,
@@ -215,8 +214,7 @@ impl ConnectionView {
             window,
             cx,
         );
-        let ssh_password_editor =
-            make_editor("SSH Password", &config.ssh_password, window, cx);
+        let ssh_password_editor = make_editor("SSH Password", &config.ssh_password, window, cx);
         ssh_password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
         let ssl_ca_path_editor = make_editor(
             "CA Certificate Path (optional)",
@@ -372,7 +370,8 @@ impl ConnectionView {
         let ssl_mode = self.ssl_mode;
         let non_empty = |text: String| if text.is_empty() { None } else { Some(text) };
         let ssl_ca_path = non_empty(Self::read_text(&self.ssl_ca_path_editor, cx));
-        let ssl_client_cert_path = non_empty(Self::read_text(&self.ssl_client_cert_path_editor, cx));
+        let ssl_client_cert_path =
+            non_empty(Self::read_text(&self.ssl_client_cert_path_editor, cx));
         let ssl_client_key_path = non_empty(Self::read_text(&self.ssl_client_key_path_editor, cx));
 
         if driver.is_file_based() {
@@ -479,11 +478,17 @@ impl ConnectionView {
             .rounded_md()
             .cursor_pointer()
             .when(is_selected, |el| el.bg(colors.element_selected))
-            .when(!is_selected, |el| el.hover(|el| el.bg(colors.element_hover)))
+            .when(!is_selected, |el| {
+                el.hover(|el| el.bg(colors.element_hover))
+            })
             .child(
                 Label::new(label)
                     .size(LabelSize::Small)
-                    .color(if is_selected { Color::Default } else { Color::Muted }),
+                    .color(if is_selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
             )
             .on_click(cx.listener(on_click))
     }
@@ -629,6 +634,12 @@ impl Render for ConnectionView {
                 DatabaseDriver::MongoDB,
                 selected_driver,
                 cx,
+            ))
+            .child(Self::render_driver_row(
+                "Cassandra",
+                DatabaseDriver::Cassandra,
+                selected_driver,
+                cx,
             ));
 
         let header = h_flex()
@@ -662,8 +673,12 @@ impl Render for ConnectionView {
             )
             .child({
                 let color_raw = Self::read_text(&self.color_editor, cx);
-                let current_norm = parse_hex_color(color_raw.trim())
-                    .map(|_| format!("#{}", color_raw.trim().trim_start_matches('#').to_lowercase()));
+                let current_norm = parse_hex_color(color_raw.trim()).map(|_| {
+                    format!(
+                        "#{}",
+                        color_raw.trim().trim_start_matches('#').to_lowercase()
+                    )
+                });
                 let swatch_color = parse_hex_color(color_raw.trim())
                     .map(|(r, g, b)| gpui::rgb(rgb_to_u32(r, g, b)));
                 let accent = cx.theme().colors().text_accent;
@@ -672,8 +687,8 @@ impl Render for ConnectionView {
                 for (name, hex) in ENV_COLOR_PRESETS {
                     let hex = *hex;
                     let is_selected = current_norm.as_deref() == Some(hex);
-                    let dot_color = parse_hex_color(hex)
-                        .map(|(r, g, b)| gpui::rgb(rgb_to_u32(r, g, b)));
+                    let dot_color =
+                        parse_hex_color(hex).map(|(r, g, b)| gpui::rgb(rgb_to_u32(r, g, b)));
                     presets = presets.child(
                         h_flex()
                             .id(SharedString::from(format!("env-preset-{name}")))
@@ -794,7 +809,11 @@ impl Render for ConnectionView {
                                     h_flex()
                                         .items_center()
                                         .gap_2()
-                                        .child(Label::new("SSL Mode").size(LabelSize::Small).color(Color::Muted))
+                                        .child(
+                                            Label::new("SSL Mode")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
                                         .child(Self::render_chip(
                                             "Disabled",
                                             self.ssl_mode == SslMode::Disabled,
@@ -833,7 +852,10 @@ impl Render for ConnectionView {
                                         )),
                                 )
                                 .when(
-                                    matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull),
+                                    matches!(
+                                        self.ssl_mode,
+                                        SslMode::VerifyCa | SslMode::VerifyFull
+                                    ),
                                     |el| {
                                         el.child(Self::render_field(
                                             "CA Certificate Path",
@@ -974,12 +996,12 @@ impl Render for ConnectionView {
                                                 ToggleState::Unselected
                                             },
                                         )
-                                        .on_click(cx.listener(
-                                            |this, _state, _, cx| {
+                                        .on_click(
+                                            cx.listener(|this, _state, _, cx| {
                                                 this.auto_connect = !this.auto_connect;
                                                 cx.notify();
-                                            },
-                                        )),
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         Label::new("Auto-connect on startup")
@@ -1003,12 +1025,10 @@ impl Render for ConnectionView {
                                                         ToggleState::Unselected
                                                     },
                                                 )
-                                                .on_click(cx.listener(
-                                                    |this, _state, _, cx| {
-                                                        this.read_only = !this.read_only;
-                                                        cx.notify();
-                                                    },
-                                                )),
+                                                .on_click(cx.listener(|this, _state, _, cx| {
+                                                    this.read_only = !this.read_only;
+                                                    cx.notify();
+                                                })),
                                             ),
                                     )
                                     .child(
@@ -1453,7 +1473,10 @@ mod tests {
 
                 // The underlying value is preserved for building the config.
                 let stored = ConnectionView::read_text(&view.password_editor, cx);
-                assert_eq!(stored, "s3cr3t-pw", "masking must not alter the stored value");
+                assert_eq!(
+                    stored, "s3cr3t-pw",
+                    "masking must not alter the stored value"
+                );
             })
             .unwrap();
     }

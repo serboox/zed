@@ -18,6 +18,7 @@ pub(crate) fn brand_icon_path(driver: DatabaseDriver) -> &'static str {
         // source); `brand_icon`'s `with_fallback` renders the generic glyph
         // tinted with `brand_color` below until one is added.
         DatabaseDriver::MongoDB => "icons/db_brands/mongodb.svg",
+        DatabaseDriver::Cassandra => "icons/db_brands/cassandra.svg",
     }
 }
 
@@ -31,6 +32,7 @@ pub(crate) fn brand_color(driver: DatabaseDriver) -> Hsla {
         DatabaseDriver::ClickHouse => 0xF9FF69,
         DatabaseDriver::Redis => 0xD82C20,
         DatabaseDriver::MongoDB => 0x47A248,
+        DatabaseDriver::Cassandra => 0x1287B1,
     };
     rgb(hex).into()
 }
@@ -64,6 +66,7 @@ mod tests {
             DatabaseDriver::ClickHouse,
             DatabaseDriver::Redis,
             DatabaseDriver::MongoDB,
+            DatabaseDriver::Cassandra,
         ];
 
         let mut seen = std::collections::HashSet::new();
@@ -89,6 +92,7 @@ mod tests {
             (DatabaseDriver::ClickHouse, 0xF9FF69),
             (DatabaseDriver::Redis, 0xD82C20),
             (DatabaseDriver::MongoDB, 0x47A248),
+            (DatabaseDriver::Cassandra, 0x1287B1),
         ];
         for (driver, hex) in cases {
             assert_eq!(

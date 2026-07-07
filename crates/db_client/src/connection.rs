@@ -40,6 +40,7 @@ pub enum DatabaseDriver {
     ClickHouse,
     Redis,
     MongoDB,
+    Cassandra,
 }
 
 impl fmt::Display for DatabaseDriver {
@@ -51,6 +52,7 @@ impl fmt::Display for DatabaseDriver {
             DatabaseDriver::ClickHouse => write!(formatter, "ClickHouse"),
             DatabaseDriver::Redis => write!(formatter, "Redis"),
             DatabaseDriver::MongoDB => write!(formatter, "MongoDB"),
+            DatabaseDriver::Cassandra => write!(formatter, "Cassandra"),
         }
     }
 }
@@ -64,6 +66,7 @@ impl DatabaseDriver {
             DatabaseDriver::ClickHouse => 8123,
             DatabaseDriver::Redis => 6379,
             DatabaseDriver::MongoDB => 27017,
+            DatabaseDriver::Cassandra => 9042,
         }
     }
 
@@ -216,10 +219,7 @@ mod tests {
 
     #[test]
     fn quote_identifier_uses_backticks_for_mysql_and_escapes_embedded_backticks() {
-        assert_eq!(
-            DatabaseDriver::MySQL.quote_identifier("orders"),
-            "`orders`"
-        );
+        assert_eq!(DatabaseDriver::MySQL.quote_identifier("orders"), "`orders`");
         assert_eq!(
             DatabaseDriver::MySQL.quote_identifier("weird`name"),
             "`weird``name`"
@@ -233,12 +233,10 @@ mod tests {
             DatabaseDriver::SQLite,
             DatabaseDriver::ClickHouse,
             DatabaseDriver::Redis,
+            DatabaseDriver::Cassandra,
         ] {
             assert_eq!(driver.quote_identifier("orders"), "\"orders\"");
-            assert_eq!(
-                driver.quote_identifier("weird\"name"),
-                "\"weird\"\"name\""
-            );
+            assert_eq!(driver.quote_identifier("weird\"name"), "\"weird\"\"name\"");
         }
     }
 }

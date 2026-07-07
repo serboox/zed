@@ -22,7 +22,9 @@ use crate::sql_completion_provider::install_on_editor;
 use crate::store::{
     ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RunConfiguration,
 };
+use anyhow::Context as _;
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
     schema::ColumnInfo,
@@ -33,8 +35,8 @@ use gpui::{
     AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
     DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    WeakEntity, Window, anchored, deferred, div, px,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
+    Window, anchored, deferred, div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -42,6 +44,7 @@ use project::{
     DocumentHighlight, InlayHint, InvalidationStrategy, Location, LocationLink, ProjectTransaction,
     lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
 };
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -50,18 +53,21 @@ use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
 use ui::{
-    CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName,
-    IconSize, Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
-    prelude::*, right_click_menu,
+    CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
+    Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
+    right_click_menu,
 };
 use util::ResultExt as _;
+use util::TryFutureExt as _;
 use workspace::{
     Event as WorkspaceEvent, ItemHandle, ModalView, OpenOptions, OpenVisible, Pane, Toast,
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::NotificationId,
 };
-use zed_actions::database_panel::{GoToDdl, GoToObject, QuickDocumentation, ShowDiagram, ToggleFocus};
+use zed_actions::database_panel::{
+    GoToDdl, GoToObject, QuickDocumentation, ShowDiagram, ToggleFocus,
+};
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
 const ERD_TABLE_LIMIT: usize = 50;
@@ -594,7 +600,11 @@ fn column_reference_at_offset(text: &str, offset: usize) -> Option<SqlColumnRefe
             if column.is_empty() || qualifier.is_empty() {
                 return None;
             }
-            (Some(qualifier.to_string()), column.to_string(), start + dot + 1)
+            (
+                Some(qualifier.to_string()),
+                column.to_string(),
+                start + dot + 1,
+            )
         }
         None => (None, word.to_string(), start),
     };
@@ -698,16 +708,23 @@ fn innermost_scope_end(text: &str, scope_start: usize) -> usize {
 // resolve a column's `alias`/`table` qualifier and to scope a bare column. When
 // `offset` sits inside a subquery, only that subquery's own FROM/JOIN tables are
 // considered, so a reused alias in an outer query never shadows the inner one.
-fn from_tables_at_offset(text: &str, offset: usize) -> Vec<crate::sql_completion_provider::TableRef> {
+fn from_tables_at_offset(
+    text: &str,
+    offset: usize,
+) -> Vec<crate::sql_completion_provider::TableRef> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_start = text[..cursor]
+        .rfind(';')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let statement_end = text[cursor..]
         .find(';')
         .map(|index| cursor + index)
         .unwrap_or(text.len());
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
-    let scope_start = crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
+    let scope_start =
+        crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
     let scope_end = innermost_scope_end(statement, scope_start);
     crate::sql_completion_provider::parse_table_refs(&statement[scope_start..scope_end])
 }
@@ -773,7 +790,10 @@ fn find_on_duplicate_key_update(statement: &str) -> Option<usize> {
 // target table instead of the trailing SELECT's FROM tables.
 fn insert_column_context_at_offset(text: &str, offset: usize) -> Option<InsertColumnContext> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_start = text[..cursor]
+        .rfind(';')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let statement_end = text[cursor..]
         .find(';')
         .map(|index| cursor + index)
@@ -833,14 +853,18 @@ struct DerivedTableRef {
 // outer query resolves through the derived table to its real source column.
 fn derived_tables_at_offset(text: &str, offset: usize) -> Vec<DerivedTableRef> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor].rfind(';').map(|index| index + 1).unwrap_or(0);
+    let statement_start = text[..cursor]
+        .rfind(';')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let statement_end = text[cursor..]
         .find(';')
         .map(|index| cursor + index)
         .unwrap_or(text.len());
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
-    let scope_start = crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
+    let scope_start =
+        crate::sql_completion_provider::innermost_scope_start(&statement[..relative_cursor]);
     let scope_end = innermost_scope_end(statement, scope_start);
     derived_tables_in_scope(&statement[scope_start..scope_end])
 }
@@ -897,7 +921,12 @@ fn derived_tables_in_scope(scope: &str) -> Vec<DerivedTableRef> {
         while alias_end < bytes.len() && is_sql_word_byte(bytes[alias_end]) {
             alias_end += 1;
         }
-        if alias_end > alias_start && subquery.trim_start().to_ascii_lowercase().starts_with("select") {
+        if alias_end > alias_start
+            && subquery
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("select")
+        {
             derived.push(DerivedTableRef {
                 alias: scope[alias_start..alias_end].to_string(),
                 projections: derived_table_projections(subquery),
@@ -1041,7 +1070,8 @@ fn derived_table_projections(subquery: &str) -> HashMap<String, (Option<String>,
         let Some((qualifier, column)) = first_qualified_reference(expr) else {
             continue;
         };
-        let Some(table_ref) = crate::sql_completion_provider::resolve_table_ref(&qualifier, &tables)
+        let Some(table_ref) =
+            crate::sql_completion_provider::resolve_table_ref(&qualifier, &tables)
         else {
             continue;
         };
@@ -1285,7 +1315,9 @@ impl SemanticsProvider for DbSemanticsProvider {
                                 word_start..word_end,
                                 Some(focus_column),
                                 cx,
-                                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                                move |store, cx| {
+                                    store.get_table_ddl(connection_id, database, table, cx)
+                                },
                             ));
                         }
                     }
@@ -1331,7 +1363,9 @@ impl SemanticsProvider for DbSemanticsProvider {
                                 word_start..word_end,
                                 Some(real_column),
                                 cx,
-                                move |store, cx| store.get_table_ddl(connection_id, database, table, cx),
+                                move |store, cx| {
+                                    store.get_table_ddl(connection_id, database, table, cx)
+                                },
                             ));
                         }
                     }
@@ -1387,9 +1421,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                                 conn.expanded_tables
                                     .get(&(database, table.clone()))
                                     .is_some_and(|columns| {
-                                        columns
-                                            .iter()
-                                            .any(|c| c.name.eq_ignore_ascii_case(&column))
+                                        columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column))
                                     })
                             })
                             .collect::<Vec<_>>();
@@ -1530,12 +1562,12 @@ impl DbSemanticsProvider {
                     conn,
                 )?;
                 let target = match target {
-                    crate::sql_binder::NavigationTarget::Table { database, table, .. } => {
-                        AstDefinitionTarget::Table {
-                            database: database.or(default_database)?,
-                            table,
-                        }
-                    }
+                    crate::sql_binder::NavigationTarget::Table {
+                        database, table, ..
+                    } => AstDefinitionTarget::Table {
+                        database: database.or(default_database)?,
+                        table,
+                    },
                     crate::sql_binder::NavigationTarget::Database { database, .. } => {
                         AstDefinitionTarget::Database { database }
                     }
@@ -1606,11 +1638,26 @@ impl DbSemanticsProvider {
     }
 }
 
+// A cursor sitting immediately after a statement's own `;` (e.g. the caret
+// left at end-of-line right after typing or clicking there) must still
+// resolve to that statement, not the next one -- otherwise `rfind`/`find`
+// below would put the boundary semicolon on the "before cursor" side and
+// hand back the following statement instead. `;` is ASCII, so stepping back
+// one byte can never land inside a multi-byte UTF-8 sequence.
+fn rewind_past_own_semicolon(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    if cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b';') {
+        cursor - 1
+    } else {
+        cursor
+    }
+}
+
 // Returns the `;`-delimited SQL statement that contains the byte offset
 // `cursor`, trimmed. `;` is ASCII so byte scanning stays on char boundaries.
 #[cfg(test)]
 fn statement_at_cursor(text: &str, cursor: usize) -> String {
-    let cursor = cursor.min(text.len());
+    let cursor = rewind_past_own_semicolon(text, cursor);
     let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
     let end = text[cursor..]
         .find(';')
@@ -1650,13 +1697,50 @@ fn trim_sql_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
 }
 
 fn statement_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
-    let cursor = cursor.min(text.len());
+    let cursor = rewind_past_own_semicolon(text, cursor);
     let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
     let end = text[cursor..]
         .find(';')
         .map(|i| cursor + i)
         .unwrap_or(text.len());
     trim_sql_range(text, start..end)
+}
+
+// Finds the byte offset, relative to `s`, of the first byte that is not
+// leading whitespace or a leading comment (`-- ...` to end of line, or
+// `/* ... */`, including multi-line block comments). Returns `s.len()` if
+// `s` is nothing but whitespace/comments.
+//
+// This only recognizes `--`/`/*` at a position where a new token is
+// expected (right after whitespace or a prior comment), so it deliberately
+// does not special-case `--`/`/*` appearing inside a string literal at the
+// very start of a statement -- a statement essentially never begins with a
+// string literal, so a full SQL tokenizer would be overkill here.
+fn skip_leading_whitespace_and_comments(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut offset = 0;
+    loop {
+        let after_whitespace = s[offset..].len() - s[offset..].trim_start().len();
+        offset += after_whitespace;
+        if bytes.get(offset..offset + 2) == Some(b"--") {
+            let line_end = s[offset..]
+                .find('\n')
+                .map(|i| offset + i + 1)
+                .unwrap_or(s.len());
+            offset = line_end;
+            continue;
+        }
+        if bytes.get(offset..offset + 2) == Some(b"/*") {
+            let comment_end = s[offset + 2..]
+                .find("*/")
+                .map(|i| offset + 2 + i + 2)
+                .unwrap_or(s.len());
+            offset = comment_end;
+            continue;
+        }
+        break;
+    }
+    offset
 }
 
 fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementRun> {
@@ -1668,27 +1752,33 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
     let Some(selected_text) = text.get(range.clone()) else {
         return Vec::new();
     };
+    let push_statement = |statements: &mut Vec<SqlStatementRun>, trimmed: Range<usize>| {
+        let Some(segment) = text.get(trimmed.clone()) else {
+            return;
+        };
+        let content_offset = trimmed.start + skip_leading_whitespace_and_comments(segment);
+        if content_offset >= trimmed.end {
+            // The whole interval is comments/whitespace -- nothing to run.
+            return;
+        }
+        let Some(sql) = text.get(content_offset..trimmed.end) else {
+            return;
+        };
+        statements.push(SqlStatementRun {
+            sql: sql.to_string(),
+            start_row: row_for_byte_offset(text, content_offset),
+            end_row: row_for_byte_offset(text, trimmed.end),
+        });
+    };
     for relative_semicolon in selected_text.match_indices(';').map(|(ix, _)| ix) {
         let end = range.start + relative_semicolon;
-        if let Some(trimmed) = trim_sql_range(text, start..end)
-            && let Some(sql) = text.get(trimmed.clone())
-        {
-            statements.push(SqlStatementRun {
-                sql: sql.to_string(),
-                start_row: row_for_byte_offset(text, trimmed.start),
-                end_row: row_for_byte_offset(text, trimmed.end),
-            });
+        if let Some(trimmed) = trim_sql_range(text, start..end) {
+            push_statement(&mut statements, trimmed);
         }
         start = end + 1;
     }
-    if let Some(trimmed) = trim_sql_range(text, start..range.end)
-        && let Some(sql) = text.get(trimmed.clone())
-    {
-        statements.push(SqlStatementRun {
-            sql: sql.to_string(),
-            start_row: row_for_byte_offset(text, trimmed.start),
-            end_row: row_for_byte_offset(text, trimmed.end),
-        });
+    if let Some(trimmed) = trim_sql_range(text, start..range.end) {
+        push_statement(&mut statements, trimmed);
     }
     statements
 }
@@ -1949,8 +2039,7 @@ async fn run_sql_validation(
     connection_id: ConnectionId,
     cx: &mut AsyncApp,
 ) {
-    let Some(buffer) =
-        editor.read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
+    let Some(buffer) = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).as_singleton())
     else {
         return;
     };
@@ -2378,7 +2467,10 @@ pub fn execute_current_sql_query_to_file(
             full.get(lo..hi).map(str::to_string)
         } else {
             let cursor = selection.head().to_offset(&snapshot).0;
-            statement_range_at_cursor(&full, cursor).map(|range| full[range].to_string())
+            statement_range_at_cursor(&full, cursor)
+                .map(|range| statement_runs_in_range(&full, range))
+                .and_then(|runs| runs.into_iter().next())
+                .map(|run| run.sql)
         }
     });
     let Some(sql) = sql else { return };
@@ -2450,10 +2542,7 @@ pub fn execute_current_sql_query_to_file(
 
 /// Returns the active editor's on-disk absolute path, if it has one (a saved
 /// `.sql` file, not a scratch/unsaved buffer).
-fn active_editor_file_path(
-    editor: &Entity<Editor>,
-    cx: &App,
-) -> Option<std::path::PathBuf> {
+fn active_editor_file_path(editor: &Entity<Editor>, cx: &App) -> Option<std::path::PathBuf> {
     let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
     let abs_path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
     Some(abs_path)
@@ -2987,11 +3076,53 @@ pub struct DatabasePanel {
     server_users: HashMap<ConnectionId, Vec<(String, String)>>,
     table_filter_is_regex: bool,
     selected_tree_node: Option<SelectedTreeNode>,
+    selected_entity: Option<SelectedEntity>,
     dump: DumpUiState,
     export: ExportUiState,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     tree_scroll_handle: ScrollHandle,
+    // True until the first `DatabaseStoreEvent` after load carries the
+    // disk-loaded folders/connections. There's nothing to restore no
+    // persisted collapse state was found, so as soon as real ids exist,
+    // everything is collapsed by default instead of the empty-set default of
+    // "nothing collapsed" (fully expanded).
+    initial_collapse_pending: bool,
+    pending_tree_state_serialization: Task<Option<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A tree row that can be the target of a click-to-select highlight,
+/// independent of `active_connection_id` (which connection new queries
+/// target) and `selected_tree_node` (which database/table an action like
+/// Quick Documentation targets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedEntity {
+    Folder(FolderId),
+    Connection(ConnectionId),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct SerializedDatabasePanel {
+    #[serde(default)]
+    collapsed_folders: HashSet<FolderId>,
+    #[serde(default)]
+    collapsed_connections: HashSet<ConnectionId>,
+    #[serde(default)]
+    views_expanded: HashSet<(ConnectionId, String)>,
+    #[serde(default)]
+    procedures_expanded: HashSet<(ConnectionId, String)>,
+    #[serde(default)]
+    sequences_expanded: HashSet<(ConnectionId, String)>,
+    #[serde(default)]
+    events_expanded: HashSet<(ConnectionId, String)>,
+    #[serde(default)]
+    table_indexes_expanded: HashSet<(ConnectionId, String, String)>,
+    #[serde(default)]
+    table_fks_expanded: HashSet<(ConnectionId, String, String)>,
+    #[serde(default)]
+    table_triggers_expanded: HashSet<(ConnectionId, String, String)>,
+    #[serde(default)]
+    server_objects_expanded: HashSet<ConnectionId>,
 }
 
 /// Background native-dump state owned by the panel: the visible task list for the
@@ -3191,9 +3322,10 @@ impl Render for MasterPasswordView {
                     .justify_end()
                     .gap_2()
                     .when(self.allow_skip, |row| {
-                        row.child(Button::new("master-password-skip", "Skip passwords").on_click(
-                            cx.listener(|this, _, window, cx| this.skip(window, cx)),
-                        ))
+                        row.child(
+                            Button::new("master-password-skip", "Skip passwords")
+                                .on_click(cx.listener(|this, _, window, cx| this.skip(window, cx))),
+                        )
                     })
                     .child(
                         Button::new("master-password-cancel", "Cancel")
@@ -3489,9 +3621,9 @@ impl Render for RenameTableView {
                             .child(
                                 Button::new("rename-table-confirm", "Rename")
                                     .style(ButtonStyle::Filled)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.confirm(window, cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.confirm(window, cx)),
+                                    ),
                             ),
                     ),
             )
@@ -3619,28 +3751,26 @@ impl Focusable for QuickDocView {
 
 impl Render for QuickDocView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
-            .columns
-            .iter()
-            .map(|col| {
-                let overlays = DatabasePanel::column_overlay_icons(col, false);
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .py_0p5()
-                    .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
-                    .child(
-                        Label::new(col.data_type.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .children(
-                        overlays
-                            .into_iter()
-                            .map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
-                    )
-            })
-            .collect();
+        let rows: Vec<_> =
+            self.columns
+                .iter()
+                .map(|col| {
+                    let overlays = DatabasePanel::column_overlay_icons(col, false);
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .py_0p5()
+                        .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
+                        .child(
+                            Label::new(col.data_type.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .children(overlays.into_iter().map(|(icon, color)| {
+                            Icon::new(icon).size(IconSize::XSmall).color(color)
+                        }))
+                })
+                .collect();
         v_flex()
             .key_context("QuickDoc")
             .track_focus(&self.focus_handle)
@@ -3667,10 +3797,38 @@ impl Render for QuickDocView {
 }
 
 impl DatabasePanel {
+    fn serialization_key(workspace: &Workspace) -> Option<String> {
+        workspace
+            .database_id()
+            .map(|id| i64::from(id).to_string())
+            .or(workspace.session_id())
+            .map(|id| format!("DatabasePanel-{id:?}"))
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
+        let serialized_panel = match workspace
+            .read_with(&cx, |workspace, _| Self::serialization_key(workspace))
+            .ok()
+            .flatten()
+        {
+            Some(serialization_key) => {
+                let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
+                cx.background_spawn(async move { kvp.read_kvp(&serialization_key) })
+                    .await
+                    .context("loading database panel")
+                    .log_err()
+                    .flatten()
+                    .map(|panel| serde_json::from_str::<SerializedDatabasePanel>(&panel))
+                    .transpose()
+                    .log_err()
+                    .flatten()
+            }
+            None => None,
+        };
+
         let result = workspace.update_in(&mut cx, |workspace, window, cx| {
             let store = cx.new(|cx| DatabaseStore::new(cx));
             cx.set_global(crate::store::GlobalDatabaseStore(store.clone()));
@@ -3682,13 +3840,15 @@ impl DatabasePanel {
                 ed.set_placeholder_text("Filter tables...", window, cx);
                 ed
             });
+            let initial_collapse_pending = serialized_panel.is_none();
             cx.new(|cx| {
                 let store_subscription = cx.subscribe(
                     &store,
-                    |_this: &mut DatabasePanel,
+                    |this: &mut DatabasePanel,
                      _store: Entity<DatabaseStore>,
                      _event: &DatabaseStoreEvent,
                      cx: &mut Context<DatabasePanel>| {
+                        this.apply_initial_collapse_if_needed(cx);
                         cx.notify();
                     },
                 );
@@ -3721,31 +3881,35 @@ impl DatabasePanel {
                         cx.notify();
                     },
                 );
+                let restored = serialized_panel.unwrap_or_default();
                 DatabasePanel {
                     focus_handle,
                     store,
                     workspace: workspace_handle,
                     history_expanded: false,
                     table_filter_editor,
-                    collapsed_folders: HashSet::default(),
-                    collapsed_connections: HashSet::default(),
+                    collapsed_folders: restored.collapsed_folders,
+                    collapsed_connections: restored.collapsed_connections,
                     editing_folder: None,
                     drag_target: None,
-                    views_expanded: HashSet::default(),
-                    procedures_expanded: HashSet::default(),
-                    sequences_expanded: HashSet::default(),
-                    events_expanded: HashSet::default(),
-                    table_indexes_expanded: HashSet::default(),
-                    table_fks_expanded: HashSet::default(),
-                    table_triggers_expanded: HashSet::default(),
-                    server_objects_expanded: HashSet::default(),
+                    views_expanded: restored.views_expanded,
+                    procedures_expanded: restored.procedures_expanded,
+                    sequences_expanded: restored.sequences_expanded,
+                    events_expanded: restored.events_expanded,
+                    table_indexes_expanded: restored.table_indexes_expanded,
+                    table_fks_expanded: restored.table_fks_expanded,
+                    table_triggers_expanded: restored.table_triggers_expanded,
+                    server_objects_expanded: restored.server_objects_expanded,
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
+                    initial_collapse_pending,
+                    pending_tree_state_serialization: Task::ready(None),
                     _subscriptions: vec![
                         store_subscription,
                         workspace_subscription,
@@ -3755,6 +3919,56 @@ impl DatabasePanel {
             })
         });
         result
+    }
+
+    /// Populates `collapsed_folders`/`collapsed_connections` with every id the
+    /// store currently knows about, the first time real (disk-loaded) ids show
+    /// up, when there was nothing persisted to restore. Without this, the
+    /// empty default sets mean "nothing collapsed" i.e. the whole tree renders
+    /// expanded on first launch (or after any persistence miss).
+    fn apply_initial_collapse_if_needed(&mut self, cx: &mut Context<Self>) {
+        if !self.initial_collapse_pending {
+            return;
+        }
+        let store = self.store.read(cx);
+        if store.folders().is_empty() && store.connections().is_empty() {
+            return;
+        }
+        self.collapsed_folders = store.folders().iter().map(|f| f.id).collect();
+        self.collapsed_connections = store.connections().iter().map(|c| c.config.id).collect();
+        self.initial_collapse_pending = false;
+    }
+
+    fn serialize_tree_state(&mut self, cx: &mut Context<Self>) {
+        let Some(serialization_key) = self
+            .workspace
+            .read_with(cx, |workspace, _| Self::serialization_key(workspace))
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let serialized = SerializedDatabasePanel {
+            collapsed_folders: self.collapsed_folders.clone(),
+            collapsed_connections: self.collapsed_connections.clone(),
+            views_expanded: self.views_expanded.clone(),
+            procedures_expanded: self.procedures_expanded.clone(),
+            sequences_expanded: self.sequences_expanded.clone(),
+            events_expanded: self.events_expanded.clone(),
+            table_indexes_expanded: self.table_indexes_expanded.clone(),
+            table_fks_expanded: self.table_fks_expanded.clone(),
+            table_triggers_expanded: self.table_triggers_expanded.clone(),
+            server_objects_expanded: self.server_objects_expanded.clone(),
+        };
+        let kvp = KeyValueStore::global(cx);
+        self.pending_tree_state_serialization = cx.background_spawn(
+            async move {
+                kvp.write_kvp(serialization_key, serde_json::to_string(&serialized)?)
+                    .await?;
+                anyhow::Ok(())
+            }
+            .log_err(),
+        );
     }
 
     fn open_add_connection_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3802,6 +4016,7 @@ impl DatabasePanel {
         if !self.collapsed_folders.remove(&folder) {
             self.collapsed_folders.insert(folder);
         }
+        self.serialize_tree_state(cx);
         cx.notify();
     }
 
@@ -3823,6 +4038,7 @@ impl DatabasePanel {
                     .detach_and_log_err(cx);
             }
         }
+        self.serialize_tree_state(cx);
         cx.notify();
     }
 
@@ -3847,6 +4063,7 @@ impl DatabasePanel {
         self.server_objects_expanded.clear();
         self.store
             .update(cx, |store, cx| store.collapse_all_schema(cx));
+        self.serialize_tree_state(cx);
         cx.notify();
     }
 
@@ -3859,6 +4076,7 @@ impl DatabasePanel {
         self.store
             .update(cx, |store, cx| store.expand_all_databases(cx))
             .detach_and_log_err(cx);
+        self.serialize_tree_state(cx);
         cx.notify();
     }
 
@@ -3873,6 +4091,7 @@ impl DatabasePanel {
     ) {
         if let Some(parent) = parent {
             self.collapsed_folders.remove(&parent);
+            self.serialize_tree_state(cx);
         }
         let new_id = self.store.update(cx, |store, cx| {
             store.add_folder("New Folder".into(), parent, cx)
@@ -4006,6 +4225,7 @@ impl DatabasePanel {
         let name = folder.name.clone();
         let entity = cx.entity();
         let is_drop_target = self.drag_target == Some(DropTarget::Folder(folder_id));
+        let is_selected = self.selected_entity == Some(SelectedEntity::Folder(folder_id));
         let editing = self
             .editing_folder
             .as_ref()
@@ -4024,6 +4244,9 @@ impl DatabasePanel {
             .pr_2()
             .pl(px(8. + depth as f32 * 12.))
             .rounded_sm()
+            .when(is_selected, |el| {
+                el.bg(cx.theme().colors().element_selected)
+            })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .when(is_drop_target, |el| {
                 el.bg(cx.theme().colors().drop_target_background)
@@ -4071,6 +4294,7 @@ impl DatabasePanel {
         let row = row
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_entity = Some(SelectedEntity::Folder(folder_id));
                 this.toggle_folder_collapsed(folder_id, cx);
             }))
             .on_drag(DraggedDbItem::Folder(folder_id), {
@@ -4090,7 +4314,11 @@ impl DatabasePanel {
             .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::Folder(folder_id), cx);
             }))
-            .child(Label::new(name.clone()).size(LabelSize::Small).single_line());
+            .child(
+                Label::new(name.clone())
+                    .size(LabelSize::Small)
+                    .single_line(),
+            );
 
         right_click_menu(ElementId::from(SharedString::from(format!(
             "folder-menu-{folder_id}"
@@ -4411,8 +4639,15 @@ impl DatabasePanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.toggle_modal(window, cx, |window, cx| {
-                    NativeDumpDialog::new(driver, config, preset_databases, preset_tables, window, cx)
-                        .on_run(on_run)
+                    NativeDumpDialog::new(
+                        driver,
+                        config,
+                        preset_databases,
+                        preset_tables,
+                        window,
+                        cx,
+                    )
+                    .on_run(on_run)
                 });
             })
             .log_err();
@@ -4951,7 +5186,12 @@ impl DatabasePanel {
                 .spawn(async move { std::fs::read(&read_path) })
                 .await;
             let Some(bytes) = bytes.log_err() else {
-                show_db_toast(&workspace, "db-import-read", "Could not read the export file.", cx);
+                show_db_toast(
+                    &workspace,
+                    "db-import-read",
+                    "Could not read the export file.",
+                    cx,
+                );
                 return;
             };
             let Some(bundle) = serde_json::from_slice::<ExportBundle>(&bytes).log_err() else {
@@ -5009,25 +5249,26 @@ impl DatabasePanel {
             let workspace_for_modal = workspace.clone();
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let on_result: MasterPasswordCallback = Arc::new(move |password, _window, cx| {
-                        let Some(master) = password else {
-                            return;
-                        };
-                        match decrypt_secrets(&secrets, &master) {
-                            Ok(secrets) => {
-                                store_for_modal
-                                    .update(cx, |store, cx| store.restore_secrets(secrets, cx))
-                                    .detach();
-                            }
-                            Err(_) => show_db_toast(
-                                &workspace_for_modal,
-                                "db-import-decrypt",
-                                "Could not decrypt passwords; everything else was restored. \
+                    let on_result: MasterPasswordCallback =
+                        Arc::new(move |password, _window, cx| {
+                            let Some(master) = password else {
+                                return;
+                            };
+                            match decrypt_secrets(&secrets, &master) {
+                                Ok(secrets) => {
+                                    store_for_modal
+                                        .update(cx, |store, cx| store.restore_secrets(secrets, cx))
+                                        .detach();
+                                }
+                                Err(_) => show_db_toast(
+                                    &workspace_for_modal,
+                                    "db-import-decrypt",
+                                    "Could not decrypt passwords; everything else was restored. \
                                  Connecting will ask for the password.",
-                                cx,
-                            ),
-                        }
-                    });
+                                    cx,
+                                ),
+                            }
+                        });
                     workspace.toggle_modal(window, cx, |window, cx| {
                         MasterPasswordView::new(
                             "Restore saved passwords",
@@ -5371,8 +5612,9 @@ impl DatabasePanel {
             };
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let view = cx
-                        .new(|cx| CompareDataView::new(left, right, key_columns, title, window, cx));
+                    let view = cx.new(|cx| {
+                        CompareDataView::new(left, right, key_columns, title, window, cx)
+                    });
                     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
                 })
                 .log_err();
@@ -5587,7 +5829,13 @@ impl DatabasePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.store.read(cx).connections().iter().any(|c| c.config.id == id) {
+        if !self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .any(|c| c.config.id == id)
+        {
             return;
         }
 
@@ -5607,7 +5855,8 @@ impl DatabasePanel {
                     }
                     let file_label = active_editor_file_path(&editor, cx)
                         .and_then(|path| {
-                            path.file_name().map(|name| name.to_string_lossy().into_owned())
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
                         })
                         .unwrap_or_else(|| "console".to_string());
                     for usage in &matches {
@@ -5622,7 +5871,13 @@ impl DatabasePanel {
         }
 
         let mut has_db_side_usages = false;
-        if let Some(conn) = self.store.read(cx).connections().iter().find(|c| c.config.id == id) {
+        if let Some(conn) = self
+            .store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|c| c.config.id == id)
+        {
             let mut db_side_sources: Vec<(String, Option<String>)> = Vec::new();
             if let Some(procedures) = conn.db_procedures.get(&database) {
                 db_side_sources.extend(
@@ -5677,8 +5932,9 @@ impl DatabasePanel {
                     let result = rename_task.await;
                     if result.is_ok() {
                         for (editor, text) in console_matches {
-                            let rewritten =
-                                crate::rename_refactor::replace_name_usages(&text, &old_table, &new_name);
+                            let rewritten = crate::rename_refactor::replace_name_usages(
+                                &text, &old_table, &new_name,
+                            );
                             editor
                                 .update_in(cx, |editor, window, cx| {
                                     editor.set_text(rewritten, window, cx);
@@ -5752,10 +6008,12 @@ impl DatabasePanel {
     fn toggle_server_objects(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         if self.server_objects_expanded.contains(&id) {
             self.server_objects_expanded.remove(&id);
+            self.serialize_tree_state(cx);
             cx.notify();
             return;
         }
         self.server_objects_expanded.insert(id);
+        self.serialize_tree_state(cx);
         if !self.server_users.contains_key(&id) {
             let task = self.store.update(cx, |store, cx| store.list_users(id, cx));
             cx.spawn(async move |this, cx| {
@@ -5947,6 +6205,243 @@ impl DatabasePanel {
         format!("DELETE FROM {}\nWHERE {};", qt, where_clause)
     }
 
+    fn selected_connection(&self, cx: &Context<Self>) -> Option<ActiveConnection> {
+        match self.selected_entity {
+            Some(SelectedEntity::Connection(id)) => self
+                .store
+                .read(cx)
+                .connections()
+                .iter()
+                .find(|conn| conn.config.id == id)
+                .cloned(),
+            _ => None,
+        }
+    }
+
+    /// Whether the selected connection can move up/down among its siblings
+    /// (same folder, ordered by `config.order`) — mirrors the sibling lookup
+    /// `DatabaseStore::reorder_connection` does internally, so the button's
+    /// enabled state always matches whether the move would actually happen.
+    fn selected_connection_move_bounds(
+        &self,
+        id: ConnectionId,
+        cx: &Context<Self>,
+    ) -> (bool, bool) {
+        let store = self.store.read(cx);
+        let Some(folder_id) = store
+            .connections()
+            .iter()
+            .find(|conn| conn.config.id == id)
+            .map(|conn| conn.config.folder_id)
+        else {
+            return (false, false);
+        };
+        let mut siblings: Vec<(ConnectionId, i64)> = store
+            .connections()
+            .iter()
+            .filter(|conn| conn.config.folder_id == folder_id)
+            .map(|conn| (conn.config.id, conn.config.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings
+            .iter()
+            .position(|(sibling_id, _)| *sibling_id == id)
+        else {
+            return (false, false);
+        };
+        (position > 0, position + 1 < siblings.len())
+    }
+
+    /// The single action bar for whichever connection is currently selected
+    /// in the tree (`self.selected_entity`), replacing the ten action icons
+    /// that used to be duplicated on every connection row. Always rendered
+    /// (so the layout doesn't jump on every click); every button disables
+    /// itself when nothing selectable is selected.
+    fn render_selection_action_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let selected = self.selected_connection(cx);
+        let has_selection = selected.is_some();
+        let id = selected.as_ref().map(|conn| conn.config.id);
+        let is_connected = selected
+            .as_ref()
+            .is_some_and(|conn| matches!(conn.status, ConnectionStatus::Connected));
+        let label = selected.as_ref().map(|conn| conn.config.label.clone());
+        let driver = selected.as_ref().map(|conn| conn.config.driver);
+        let config_for_edit = selected.as_ref().map(|conn| conn.config.clone());
+        let dump_label = driver.and_then(dump_menu_label);
+        let (can_move_up, can_move_down) = id
+            .map(|id| self.selected_connection_move_bounds(id, cx))
+            .unwrap_or((false, false));
+
+        // `IconButton`'s own debug selector defaults to `"ICON-{icon:?}"`
+        // (see `IconButton::new`), which is not unique enough for tests to
+        // target a specific action here — each button is wrapped in a plain
+        // div carrying an explicit, stable selector instead.
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                div()
+                    .debug_selector(|| "selection-new-query".to_string())
+                    .child(
+                        IconButton::new("selection-new-query", IconName::File)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection)
+                            .tooltip(Tooltip::text("New SQL Query"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let (Some(id), Some(label)) = (id, label.clone()) else {
+                                    return;
+                                };
+                                this.workspace
+                                    .update(cx, |workspace, cx| {
+                                        open_new_sql_query(workspace, id, label, window, cx);
+                                    })
+                                    .log_err();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-connect".to_string())
+                    .child(
+                        IconButton::new("selection-connect", IconName::PlayFilled)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection || is_connected)
+                            .tooltip(Tooltip::text("Connect"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.connect(id, cx).detach_and_log_err(cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-refresh".to_string())
+                    .child(
+                        IconButton::new("selection-refresh", IconName::RefreshTitle)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection || !is_connected)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-disconnect".to_string())
+                    .child(
+                        IconButton::new("selection-disconnect", IconName::Disconnected)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection || !is_connected)
+                            .tooltip(Tooltip::text("Disconnect"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.disconnect(id, cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-move-up".to_string())
+                    .child(
+                        IconButton::new("selection-move-up", IconName::ChevronUp)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!can_move_up)
+                            .tooltip(Tooltip::text("Move Up"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.reorder_connection(id, -1, cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-move-down".to_string())
+                    .child(
+                        IconButton::new("selection-move-down", IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!can_move_down)
+                            .tooltip(Tooltip::text("Move Down"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.reorder_connection(id, 1, cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div().debug_selector(|| "selection-edit".to_string()).child(
+                    IconButton::new("selection-edit", IconName::Pencil)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(!has_selection)
+                        .tooltip(Tooltip::text("Edit Connection"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Some(config) = config_for_edit.clone() else {
+                                return;
+                            };
+                            this.open_edit_connection_modal(config, window, cx);
+                        })),
+                ),
+            )
+            .child(
+                div().debug_selector(|| "selection-dump".to_string()).child(
+                    IconButton::new("selection-dump", IconName::Download)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(!has_selection || dump_label.is_none())
+                        .tooltip(Tooltip::text(dump_label.unwrap_or("Export with dump tool")))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Some(id) = id else { return };
+                            this.open_dump_dialog(id, Vec::new(), Vec::new(), window, cx);
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-duplicate".to_string())
+                    .child(
+                        IconButton::new("selection-duplicate", IconName::Copy)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection)
+                            .tooltip(Tooltip::text("Duplicate Connection"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.duplicate_connection(id, cx);
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "selection-delete".to_string())
+                    .child(
+                        IconButton::new("selection-delete", IconName::Trash)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!has_selection)
+                            .tooltip(Tooltip::text("Remove Connection"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(id) = id else { return };
+                                this.store.update(cx, |store, cx| {
+                                    store.remove_connection(id, cx);
+                                });
+                            })),
+                    ),
+            )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         v_flex()
             .child(
@@ -5995,6 +6490,7 @@ impl DatabasePanel {
                             ),
                     ),
             )
+            .child(self.render_selection_action_bar(cx))
             .child(
                 div()
                     .flex()
@@ -6035,10 +6531,8 @@ impl DatabasePanel {
         let connection_folder = conn.config.folder_id;
         let drag_label: SharedString = conn.config.label.clone().into();
         let label = conn.config.label.clone();
-        let query_label = conn.config.label.clone();
         let driver_label = conn.config.driver.to_string();
         let driver = conn.config.driver;
-        let config_for_edit = conn.config.clone();
 
         let status_color = match &conn.status {
             ConnectionStatus::Connected => Color::Success,
@@ -6056,6 +6550,7 @@ impl DatabasePanel {
         };
 
         let is_active = self.store.read(cx).active_connection_id() == Some(id);
+        let is_selected = self.selected_entity == Some(SelectedEntity::Connection(id));
         let databases = conn.databases.clone();
         let expanded_databases = conn.expanded_databases.clone();
         let expanded_database_set = conn.expanded_database_set.clone();
@@ -6102,14 +6597,19 @@ impl DatabasePanel {
                     .py_1()
                     .rounded_sm()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .when(is_active, |el| el.bg(cx.theme().colors().element_selected))
-                    .when(is_connected, |el| {
-                        el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    .when(is_active || is_selected, |el| {
+                        el.bg(cx.theme().colors().element_selected)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_entity = Some(SelectedEntity::Connection(id));
+                        if is_connected {
                             this.store.update(cx, |store, cx| {
                                 store.set_active_connection(id, cx);
                             });
-                        }))
-                    })
+                        }
+                        cx.notify();
+                    }))
                     .on_drag(DraggedDbItem::Connection(id), move |_, _, _, cx| {
                         Self::drag_preview(drag_label.clone(), IconName::DatabaseZap, cx)
                     })
@@ -6190,120 +6690,6 @@ impl DatabasePanel {
                             .flex_none()
                             .child(Label::new(label).size(LabelSize::Small).single_line())
                             .child(Label::new(driver_label).size(LabelSize::XSmall).color(Color::Muted)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new(SharedString::from(format!("new-query-{}", id)), IconName::File)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("New SQL Query"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let query_label = query_label.clone();
-                                this.workspace
-                                    .update(cx, |workspace, cx| {
-                                        open_new_sql_query(workspace, id, query_label, window, cx);
-                                    })
-                                    .log_err();
-                            })),
-                    )
-                    .when(!is_connected, |el| {
-                        el.child(
-                            IconButton::new(SharedString::from(format!("connect-{}", id)), IconName::PlayFilled)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Connect"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |store, cx| {
-                                        store.connect(id, cx).detach_and_log_err(cx);
-                                    });
-                                })),
-                        )
-                    })
-                    .when(is_connected, |el| {
-                        el.child(
-                            IconButton::new(SharedString::from(format!("refresh-{}", id)), IconName::RefreshTitle)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Refresh"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |store, cx| {
-                                        store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
-                                    });
-                                })),
-                        )
-                        .child(
-                            IconButton::new(SharedString::from(format!("disconnect-{}", id)), IconName::Disconnected)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Disconnect"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |store, cx| {
-                                        store.disconnect(id, cx);
-                                    });
-                                })),
-                        )
-                    })
-                    .child(
-                        IconButton::new(SharedString::from(format!("move-up-{}", id)), IconName::ChevronUp)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Move Up"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |store, cx| {
-                                    store.reorder_connection(id, -1, cx);
-                                });
-                            })),
-                    )
-                    .child(
-                        IconButton::new(SharedString::from(format!("move-down-{}", id)), IconName::ChevronDown)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Move Down"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |store, cx| {
-                                    store.reorder_connection(id, 1, cx);
-                                });
-                            })),
-                    )
-                    .child(
-                        IconButton::new(SharedString::from(format!("edit-conn-{}", id)), IconName::Pencil)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Edit Connection"))
-                            .on_click(cx.listener({
-                                let config = config_for_edit;
-                                move |this, _, window, cx| {
-                                    this.open_edit_connection_modal(config.clone(), window, cx);
-                                }
-                            })),
-                    )
-                    .when(dump_menu_label(driver).is_some(), |row| {
-                        row.child(
-                            IconButton::new(
-                                SharedString::from(format!("dump-conn-{}", id)),
-                                IconName::Download,
-                            )
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text(
-                                dump_menu_label(driver).unwrap_or("Export with dump tool"),
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_dump_dialog(id, Vec::new(), Vec::new(), window, cx);
-                            })),
-                        )
-                    })
-                    .child(
-                        IconButton::new(SharedString::from(format!("dup-conn-{}", id)), IconName::Copy)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Duplicate Connection"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |store, cx| {
-                                    store.duplicate_connection(id, cx);
-                                });
-                            })),
-                    )
-                    .child(
-                        IconButton::new(SharedString::from(format!("delete-conn-{}", id)), IconName::Trash)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Remove Connection"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |store, cx| {
-                                    store.remove_connection(id, cx);
-                                });
-                            })),
                     ),
             )
             .when_some(error_message, |el, msg| {
@@ -7298,6 +7684,7 @@ impl DatabasePanel {
                                                                     } else {
                                                                         this.table_indexes_expanded.insert(idx_key.clone());
                                                                     }
+                                                                    this.serialize_tree_state(cx);
                                                                     cx.notify();
                                                                 }))
                                                                 .child(
@@ -7350,6 +7737,7 @@ impl DatabasePanel {
                                                                     } else {
                                                                         this.table_fks_expanded.insert(fk_key.clone());
                                                                     }
+                                                                    this.serialize_tree_state(cx);
                                                                     cx.notify();
                                                                 }))
                                                                 .child(
@@ -7399,6 +7787,7 @@ impl DatabasePanel {
                                                                     } else {
                                                                         this.table_triggers_expanded.insert(trig_key.clone());
                                                                     }
+                                                                    this.serialize_tree_state(cx);
                                                                     cx.notify();
                                                                 }))
                                                                 .child(
@@ -7475,6 +7864,7 @@ impl DatabasePanel {
                                                     } else {
                                                         this.views_expanded.insert(views_key.clone());
                                                     }
+                                                    this.serialize_tree_state(cx);
                                                     cx.notify();
                                                 }))
                                                 .child(
@@ -7628,6 +8018,7 @@ impl DatabasePanel {
                                                     } else {
                                                         this.procedures_expanded.insert(procedures_key.clone());
                                                     }
+                                                    this.serialize_tree_state(cx);
                                                     cx.notify();
                                                 }))
                                                 .child(
@@ -7708,6 +8099,7 @@ impl DatabasePanel {
                                                     } else {
                                                         this.sequences_expanded.insert(sequences_key.clone());
                                                     }
+                                                    this.serialize_tree_state(cx);
                                                     cx.notify();
                                                 }))
                                                 .child(
@@ -7767,6 +8159,7 @@ impl DatabasePanel {
                                                     } else {
                                                         this.events_expanded.insert(events_key.clone());
                                                     }
+                                                    this.serialize_tree_state(cx);
                                                     cx.notify();
                                                 }))
                                                 .child(
@@ -8465,6 +8858,105 @@ mod tests {
     }
 
     #[test]
+    fn skip_leading_whitespace_and_comments_handles_all_cases() {
+        use super::skip_leading_whitespace_and_comments as skip;
+
+        assert_eq!(skip(""), 0);
+        assert_eq!(skip("   \n\t "), 6);
+        assert_eq!(skip("-- comment\nSELECT 1"), "-- comment\n".len());
+        assert_eq!(skip("/* comment */SELECT 1"), "/* comment */".len());
+        assert_eq!(
+            skip("/* multi\nline\ncomment */SELECT 1"),
+            "/* multi\nline\ncomment */".len()
+        );
+        assert_eq!(
+            skip("  -- one\n  /* two */  -- three\nSELECT 1"),
+            "  -- one\n  /* two */  -- three\n".len()
+        );
+        // No trailing content after the comment at all.
+        assert_eq!(skip("-- only a comment"), "-- only a comment".len());
+        assert_eq!(skip("   "), 3);
+        // Unterminated block comment consumes to the end.
+        assert_eq!(skip("/* never closed"), "/* never closed".len());
+    }
+
+    // The exact text from the bug report: three statements separated by `;`,
+    // the first and third followed by a same-line trailing `-- N` comment.
+    const CURSOR_BUG_REPORT_SQL: &str = "SELECT COUNT(*) FROM instruments.financials_values; -- 228475\nSELECT * FROM instruments.financials_values;\n\nSELECT COUNT(*) FROM instruments.financials_indicators; -- 233\n";
+
+    fn run_at_cursor(text: &str, cursor: usize) -> Option<super::SqlStatementRun> {
+        super::statement_range_at_cursor(text, cursor)
+            .map(|range| super::statement_runs_in_range(text, range))
+            .and_then(|runs| runs.into_iter().next())
+    }
+
+    #[test]
+    fn cursor_on_second_statement_does_not_pick_up_previous_trailing_comment() {
+        let text = CURSOR_BUG_REPORT_SQL;
+        // A few cursor positions inside "SELECT * FROM instruments.financials_values".
+        let second_statement_start = text.find("SELECT *").expect("second SELECT");
+        for delta in [0usize, 5, 15, 30] {
+            let cursor = second_statement_start + delta;
+            let run = run_at_cursor(text, cursor)
+                .unwrap_or_else(|| panic!("expected a statement run at cursor {cursor}"));
+            assert!(
+                !run.sql.contains("228475"),
+                "the trailing comment from statement 1 leaked into statement 2's sql: {:?}",
+                run.sql
+            );
+            assert!(
+                run.sql
+                    .contains("SELECT * FROM instruments.financials_values"),
+                "expected statement 2's sql, got {:?}",
+                run.sql
+            );
+            assert_eq!(
+                run.start_row, 1,
+                "statement 2 must be attributed to row 1 (its own line), not row 0 \
+                 (statement 1's line, where the trailing comment sits); cursor={cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_right_after_second_statements_own_semicolon_still_runs_second_statement() {
+        let text = CURSOR_BUG_REPORT_SQL;
+        let semicolon = text
+            .find("financials_values;\n\nSELECT COUNT")
+            .expect("second statement's semicolon")
+            + "financials_values;".len()
+            - 1;
+        assert_eq!(text.as_bytes()[semicolon], b';');
+        let cursor = semicolon + 1;
+
+        let run = run_at_cursor(text, cursor).expect("expected a statement run");
+        assert!(
+            run.sql.contains("financials_values") && !run.sql.contains("financials_indicators"),
+            "cursor right after statement 2's own ';' must still run statement 2, got {:?}",
+            run.sql
+        );
+        assert_eq!(run.start_row, 1);
+    }
+
+    #[test]
+    fn cursor_on_first_and_third_statements_still_resolve_correctly() {
+        let text = CURSOR_BUG_REPORT_SQL;
+
+        let first_cursor = text
+            .find("COUNT(*) FROM instruments.financials_values")
+            .unwrap()
+            + 5;
+        let first = run_at_cursor(text, first_cursor).expect("first statement run");
+        assert!(first.sql.contains("COUNT(*)") && first.sql.contains("financials_values"));
+        assert_eq!(first.start_row, 0);
+
+        let third_cursor = text.find("financials_indicators").unwrap() + 5;
+        let third = run_at_cursor(text, third_cursor).expect("third statement run");
+        assert!(third.sql.contains("financials_indicators"));
+        assert_eq!(third.start_row, 3);
+    }
+
+    #[test]
     fn table_reference_at_offset_resolves_schema_qualified_table() {
         let text = "SELECT * FROM public.users WHERE id = 1";
         let offset = text.find("users").expect("users in sql") + 2;
@@ -8622,10 +9114,13 @@ mod tests {
     fn from_tables_at_offset_scopes_a_reused_alias_to_its_own_subquery() {
         let text = "SELECT outer_s.name FROM accounts AS outer_s WHERE outer_s.id IN \
             (SELECT inner_s.id FROM instruments.splits AS inner_s WHERE inner_s.operation = 1)";
-        let inner_offset = text.rfind("inner_s.operation").expect("inner column in sql");
+        let inner_offset = text
+            .rfind("inner_s.operation")
+            .expect("inner column in sql");
         let inner_tables = super::from_tables_at_offset(text, inner_offset);
-        let inner_resolved = crate::sql_completion_provider::resolve_table_ref("inner_s", &inner_tables)
-            .expect("subquery alias resolves");
+        let inner_resolved =
+            crate::sql_completion_provider::resolve_table_ref("inner_s", &inner_tables)
+                .expect("subquery alias resolves");
         assert_eq!(inner_resolved.name, "splits");
         assert!(
             crate::sql_completion_provider::resolve_table_ref("outer_s", &inner_tables).is_none(),
@@ -8634,8 +9129,9 @@ mod tests {
 
         let outer_offset = text.find("outer_s.name").expect("outer column in sql");
         let outer_tables = super::from_tables_at_offset(text, outer_offset);
-        let outer_resolved = crate::sql_completion_provider::resolve_table_ref("outer_s", &outer_tables)
-            .expect("outer alias resolves");
+        let outer_resolved =
+            crate::sql_completion_provider::resolve_table_ref("outer_s", &outer_tables)
+                .expect("outer alias resolves");
         assert_eq!(outer_resolved.name, "accounts");
     }
 
@@ -8658,8 +9154,7 @@ mod tests {
 
     #[test]
     fn insert_column_context_resolves_column_list_to_target_table() {
-        let text =
-            "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname) SELECT 1, 2, 3;";
+        let text = "INSERT INTO ec_fmedia.quotes_pair_translate (pair_ID, lang_id, shortname) SELECT 1, 2, 3;";
         let offset = text.find("shortname").expect("column in sql") + 2;
         let context = super::insert_column_context_at_offset(text, offset).expect("insert context");
         assert_eq!(context.database.as_deref(), Some("ec_fmedia"));
@@ -8671,8 +9166,7 @@ mod tests {
 
     #[test]
     fn insert_column_context_finds_on_duplicate_key_update_span() {
-        let text =
-            "INSERT INTO t (a, b) SELECT 1, 2 ON DUPLICATE KEY UPDATE a = VALUES(a), b = VALUES(b);";
+        let text = "INSERT INTO t (a, b) SELECT 1, 2 ON DUPLICATE KEY UPDATE a = VALUES(a), b = VALUES(b);";
         let context = super::insert_column_context_at_offset(text, 0).expect("insert context");
         assert_eq!(context.table, "t");
         let clause_start = context.on_duplicate_key_update.expect("clause span");
@@ -8841,9 +9335,7 @@ mod tests {
         assert_eq!(super::table_reference_at_offset(text, from_offset), None);
         assert_eq!(super::table_reference_at_offset(text, where_offset), None);
         // A real table name is unaffected by the keyword filter.
-        assert!(
-            super::table_reference_at_offset(text, text.find("users").unwrap() + 1).is_some()
-        );
+        assert!(super::table_reference_at_offset(text, text.find("users").unwrap() + 1).is_some());
     }
 
     #[test]
@@ -9352,6 +9844,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -9511,6 +10006,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -9648,8 +10146,11 @@ mod tests {
         init_test(cx);
         cx.update(|cx| editor::init(cx));
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
-            .await;
+        fs.insert_tree(
+            "/fake-scripts",
+            serde_json::json!({ "seed.sql": "SELECT 1;" }),
+        )
+        .await;
         let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
         let window =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -9694,6 +10195,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -9779,8 +10283,11 @@ mod tests {
         init_test(cx);
         cx.update(|cx| editor::init(cx));
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
-            .await;
+        fs.insert_tree(
+            "/fake-scripts",
+            serde_json::json!({ "seed.sql": "SELECT 1;" }),
+        )
+        .await;
         let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
         let window =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -9825,6 +10332,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -9884,8 +10394,11 @@ mod tests {
         init_test(cx);
         cx.update(|cx| editor::init(cx));
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/fake-scripts", serde_json::json!({ "seed.sql": "SELECT 1;" }))
-            .await;
+        fs.insert_tree(
+            "/fake-scripts",
+            serde_json::json!({ "seed.sql": "SELECT 1;" }),
+        )
+        .await;
         let project = Project::test(fs.clone(), ["/fake-scripts".as_ref()], cx).await;
         let window =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -9930,6 +10443,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -10049,6 +10565,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -10211,6 +10730,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -10227,9 +10749,8 @@ mod tests {
         cx.run_until_parked();
 
         let editor = workspace.update_in(cx, |workspace, window, cx| {
-            let buffer = cx.new(|cx| {
-                language::Buffer::local("select id, name from users where id = 1", cx)
-            });
+            let buffer =
+                cx.new(|cx| language::Buffer::local("select id, name from users where id = 1", cx));
             let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
             let editor = cx.new(|cx| {
                 let mut editor = Editor::for_multibuffer(multi, None, window, cx);
@@ -10391,6 +10912,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -10470,6 +10994,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -10728,6 +11255,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -10809,6 +11339,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -10915,6 +11448,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -10985,6 +11521,112 @@ mod tests {
         });
     }
 
+    // Uses the real `DatabasePanel::load()` entry point (not a hand-built
+    // struct literal) specifically because that's where the kvp read/restore
+    // and the "nothing persisted yet -> collapse everything" fallback live.
+    #[gpui::test]
+    async fn tree_state_defaults_to_fully_collapsed_then_persists_across_a_simulated_restart(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "persist-tree".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let folder = Folder::new("Prod".to_string(), None, 0);
+        let folder_id = folder.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(config.clone(), std::sync::Arc::new(MockProvider), cx);
+                store.folders.push(folder.clone());
+                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+            });
+        });
+        cx.run_until_parked();
+
+        // Nothing was ever persisted for this brand-new workspace, so the
+        // panel must fall back to collapsing everything it just learned
+        // about rather than leaving the empty-set default of "expanded".
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.collapsed_folders.contains(&folder_id),
+                "first launch with nothing persisted must collapse every folder by default"
+            );
+            assert!(
+                panel.collapsed_connections.contains(&connection_id),
+                "first launch with nothing persisted must collapse every connection by default"
+            );
+        });
+
+        // Expand both; each toggle also persists the new state in the
+        // background (`serialize_tree_state`).
+        panel.update(&mut cx, |panel, cx| {
+            panel.toggle_folder_collapsed(folder_id, cx);
+            panel.toggle_connection_collapsed(connection_id, cx);
+        });
+        cx.run_until_parked();
+
+        // A fresh `DatabasePanel::load()` against the very same workspace
+        // simulates a restart: it must restore the expanded state instead of
+        // re-collapsing everything, because a real persisted state now exists.
+        let restarted_panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        restarted_panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+                store.folders.push(folder);
+                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+            });
+        });
+        cx.run_until_parked();
+
+        restarted_panel.read_with(&cx, |panel, _| {
+            assert!(
+                !panel.collapsed_folders.contains(&folder_id),
+                "a restart must restore the persisted expanded folder, not re-collapse it"
+            );
+            assert!(
+                !panel.collapsed_connections.contains(&connection_id),
+                "a restart must restore the persisted expanded connection, not re-collapse it"
+            );
+        });
+    }
+
     // `handle_drop` had zero test coverage of any kind -- not even a direct
     // function call -- despite being the whole mechanism behind drag-and-drop
     // reparenting in the tree. Per this session's own lesson (a test calling
@@ -11038,6 +11680,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -11081,9 +11726,21 @@ mod tests {
             );
         });
 
-        cx.simulate_mouse_down(connection_source, MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_move(folder_target, Some(MouseButton::Left), gpui::Modifiers::none());
-        cx.simulate_mouse_move(folder_target, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_down(
+            connection_source,
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            folder_target,
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            folder_target,
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
         cx.simulate_mouse_up(folder_target, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
 
@@ -11139,6 +11796,9 @@ mod tests {
                 server_users: HashMap::default(),
                 table_filter_is_regex: false,
                 selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -11390,7 +12050,12 @@ mod tests {
         );
 
         cx.update(|_window, cx| {
-            install_db_editor_features(editor.clone(), store.downgrade(), workspace.downgrade(), cx);
+            install_db_editor_features(
+                editor.clone(),
+                store.downgrade(),
+                workspace.downgrade(),
+                cx,
+            );
         });
 
         assert!(
@@ -11452,15 +12117,19 @@ mod tests {
         });
 
         cx.update(|_window, cx| {
-            install_db_editor_features(editor.clone(), store.downgrade(), workspace.downgrade(), cx);
+            install_db_editor_features(
+                editor.clone(),
+                store.downgrade(),
+                workspace.downgrade(),
+                cx,
+            );
         });
         cx.run_until_parked();
 
         assert!(
-            buffer
-                .read_with(cx, |buffer, _| buffer
-                    .buffer_diagnostics(Some(SQL_VALIDATOR_SERVER_ID))
-                    .is_empty()),
+            buffer.read_with(cx, |buffer, _| buffer
+                .buffer_diagnostics(Some(SQL_VALIDATOR_SERVER_ID))
+                .is_empty()),
             "the very first validation pass still has to wait out the debounce"
         );
 
@@ -11487,7 +12156,10 @@ mod tests {
             Some(id)
         );
         let unrelated = std::path::Path::new("/tmp/not-a-console.sql");
-        assert_eq!(super::connection_id_from_console_path(unrelated, &[id]), None);
+        assert_eq!(
+            super::connection_id_from_console_path(unrelated, &[id]),
+            None
+        );
     }
 
     // The reinstall hook runs for every new editor; it must leave editors that are
@@ -11751,6 +12423,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -11844,6 +12519,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -11988,6 +12666,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12365,6 +13046,11 @@ mod tests {
             });
         });
         cx.run_until_parked();
+        // Connections start collapsed by default; this test clicks into the
+        // connection's tree, so it must be expanded first.
+        panel.update(&mut cx, |panel, cx| {
+            panel.toggle_connection_collapsed(connection_id, cx);
+        });
 
         workspace.update_in(&mut cx, |workspace, window, cx| {
             workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
@@ -12403,6 +13089,384 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn clicking_a_folder_or_a_disconnected_connection_row_selects_and_highlights_it(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "select-me".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        let folder_id = panel
+            .update(&mut cx, |panel, cx| {
+                panel
+                    .store
+                    .update(cx, |store, cx| store.add_folder("Prod".into(), None, cx))
+            })
+            .expect("folder must be created");
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+            // Everything starts collapsed by default; expand the top level so
+            // both rows are actually laid out and clickable.
+            panel.collapsed_folders.clear();
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.selected_entity, None, "nothing is selected yet");
+        });
+
+        // Click the connection row first: unlike the folder row, selecting it
+        // must not itself change the tree layout (no toggling, no auto-expand),
+        // so this click's bounds stay valid for the follow-up assertions.
+        let conn_bounds = cx
+            .debug_bounds(format!("conn-header-{connection_id}").leak())
+            .expect("expected debug bounds for conn-header");
+        let conn_row = gpui::Point {
+            x: conn_bounds.origin.x + px(20.),
+            y: conn_bounds.center().y,
+        };
+        cx.simulate_click(conn_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity,
+                Some(SelectedEntity::Connection(connection_id)),
+                "a real click on a disconnected connection row must select it"
+            );
+        });
+        panel.read_with(&cx, |panel, cx| {
+            let status = panel
+                .store
+                .read(cx)
+                .connections()
+                .iter()
+                .find(|c| c.config.id == connection_id)
+                .map(|c| c.status.clone());
+            assert!(
+                matches!(status, Some(ConnectionStatus::Disconnected)),
+                "selecting a disconnected connection row must not connect it, got {status:?}"
+            );
+        });
+
+        let folder_row = debug_center(&mut cx, format!("folder-row-{folder_id}").leak());
+        cx.simulate_click(folder_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity,
+                Some(SelectedEntity::Folder(folder_id)),
+                "clicking a different row moves the selection to it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn connection_row_no_longer_renders_its_own_action_icons(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "no-row-icons".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        for selector in [
+            format!("new-query-{connection_id}"),
+            format!("connect-{connection_id}"),
+            format!("move-up-{connection_id}"),
+            format!("move-down-{connection_id}"),
+            format!("edit-conn-{connection_id}"),
+            format!("dup-conn-{connection_id}"),
+            format!("delete-conn-{connection_id}"),
+        ] {
+            assert!(
+                cx.debug_bounds(selector.clone().leak()).is_none(),
+                "the per-row action icon {selector:?} must no longer be rendered on a connection row"
+            );
+        }
+        assert!(
+            cx.debug_bounds("selection-connect").is_some(),
+            "the unified action bar's Connect button must be rendered instead"
+        );
+    }
+
+    #[gpui::test]
+    async fn selection_action_bar_is_disabled_until_a_connection_is_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "bar-enable".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        // Uses Duplicate rather than Connect: Connect spawns a real network
+        // task on the shared Tokio runtime (see `runtime.rs`) that outlives
+        // this test's teardown against an unreachable default host/port,
+        // which aborts the process. Duplicate exercises the same
+        // disabled-until-selected wiring synchronously.
+        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
+        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let count = panel.store.read(cx).connections().len();
+            assert_eq!(
+                count, 1,
+                "the Duplicate button must do nothing while no connection is selected"
+            );
+        });
+
+        let conn_bounds = cx
+            .debug_bounds(format!("conn-header-{connection_id}").leak())
+            .expect("expected debug bounds for conn-header");
+        let conn_row = gpui::Point {
+            x: conn_bounds.origin.x + px(20.),
+            y: conn_bounds.center().y,
+        };
+        cx.simulate_click(conn_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
+        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let labels: Vec<String> = panel
+                .store
+                .read(cx)
+                .connections()
+                .iter()
+                .map(|c| c.config.label.clone())
+                .collect();
+            assert!(
+                labels.iter().any(|label| label.ends_with("(copy)")),
+                "the Duplicate button must duplicate the selected connection once one is selected, got {labels:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn selection_action_bar_targets_the_selected_connection_not_another_one(
+        cx: &mut TestAppContext,
+    ) {
+        let config_a = db_client::ConnectionConfig {
+            label: "bar-target-a".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let config_b = db_client::ConnectionConfig {
+            label: "bar-target-b".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let id_b = config_b.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config_a, cx);
+                store.add_connection(config_b, cx);
+            });
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let conn_b_bounds = cx
+            .debug_bounds(format!("conn-header-{id_b}").leak())
+            .expect("expected debug bounds for conn-header of B");
+        let conn_b_row = gpui::Point {
+            x: conn_b_bounds.origin.x + px(20.),
+            y: conn_b_bounds.center().y,
+        };
+        cx.simulate_click(conn_b_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity,
+                Some(SelectedEntity::Connection(id_b))
+            );
+        });
+
+        // Uses Duplicate rather than Connect: Connect spawns a real network
+        // task on the shared Tokio runtime (see `runtime.rs`) that outlives
+        // this test's teardown against an unreachable default host/port,
+        // which aborts the process. Duplicate exercises the same
+        // selected-connection targeting synchronously.
+        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
+        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let labels: Vec<String> = panel
+                .store
+                .read(cx)
+                .connections()
+                .iter()
+                .map(|c| c.config.label.clone())
+                .collect();
+            assert!(
+                labels.contains(&"bar-target-b (copy)".to_string()),
+                "duplicating must target the selected connection B, got {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"bar-target-a (copy)".to_string()),
+                "the unselected connection A must be left untouched, got {labels:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn connection_right_click_opens_connection_menu(cx: &mut TestAppContext) {
         let config = db_client::ConnectionConfig {
             label: "ctx-conn".to_string(),
@@ -12420,12 +13484,7 @@ mod tests {
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.deploy_connection_context_menu(
-                connection_id,
-                gpui::Point::default(),
-                window,
-                cx,
-            );
+            panel.deploy_connection_context_menu(connection_id, gpui::Point::default(), window, cx);
         });
 
         panel.read_with(&cx, |panel, _| {
@@ -12837,6 +13896,9 @@ mod tests {
                     server_users: HashMap::default(),
                     table_filter_is_regex: false,
                     selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12965,6 +14027,9 @@ mod tests {
         let has_modal_after_confirm = workspace.read_with(cx, |workspace, cx| {
             workspace.active_modal::<RenameTableView>(cx).is_some()
         });
-        assert!(!has_modal_after_confirm, "confirming must dismiss the dialog");
+        assert!(
+            !has_modal_after_confirm,
+            "confirming must dismiss the dialog"
+        );
     }
 }
