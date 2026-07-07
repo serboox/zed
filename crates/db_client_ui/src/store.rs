@@ -1333,6 +1333,46 @@ impl DatabaseStore {
         self.persist_connections(cx);
     }
 
+    /// Reorders `folder_id` among its sibling folders (same `parent_id`) by
+    /// swapping order with the neighbor in `direction` (-1 up, +1 down).
+    /// No-op at the boundary. Mirrors `reorder_connection`.
+    pub fn reorder_folder(&mut self, folder_id: FolderId, direction: i64, cx: &mut Context<Self>) {
+        let Some(current) = self
+            .folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| (f.parent_id, f.order))
+        else {
+            return;
+        };
+        let (parent, order) = current;
+        let mut siblings: Vec<(FolderId, i64)> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == parent)
+            .map(|f| (f.id, f.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings.iter().position(|(id, _)| *id == folder_id) else {
+            return;
+        };
+        let target = position as i64 + direction;
+        if target < 0 || target as usize >= siblings.len() {
+            return;
+        }
+        let (neighbor_id, neighbor_order) = siblings[target as usize];
+        for folder in self.folders.iter_mut() {
+            if folder.id == folder_id {
+                folder.order = neighbor_order;
+            } else if folder.id == neighbor_id {
+                folder.order = order;
+            }
+        }
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+    }
+
     pub fn connect(&mut self, id: ConnectionId, cx: &mut Context<Self>) -> Task<Result<()>> {
         let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));

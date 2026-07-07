@@ -4217,6 +4217,36 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    /// Whether `folder_id` can move up/down among its sibling folders (same
+    /// `parent_id`, ordered by `order`) — mirrors the sibling lookup
+    /// `DatabaseStore::reorder_folder` does internally, so a menu entry's
+    /// visibility always matches whether the move would actually happen.
+    fn folder_move_bounds(&self, folder_id: FolderId, cx: &Context<Self>) -> (bool, bool) {
+        let store = self.store.read(cx);
+        let Some(parent_id) = store
+            .folders()
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .map(|folder| folder.parent_id)
+        else {
+            return (false, false);
+        };
+        let mut siblings: Vec<(FolderId, i64)> = store
+            .folders()
+            .iter()
+            .filter(|folder| folder.parent_id == parent_id)
+            .map(|folder| (folder.id, folder.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings
+            .iter()
+            .position(|(sibling_id, _)| *sibling_id == folder_id)
+        else {
+            return (false, false);
+        };
+        (position > 0, position + 1 < siblings.len())
+    }
+
     fn render_folder_row(
         &self,
         folder: &Folder,
@@ -4229,6 +4259,7 @@ impl DatabasePanel {
         let entity = cx.entity();
         let is_drop_target = self.drag_target == Some(DropTarget::Folder(folder_id));
         let is_selected = self.selected_entity == Some(SelectedEntity::Folder(folder_id));
+        let (can_move_up, can_move_down) = self.folder_move_bounds(folder_id, cx);
         let editing = self
             .editing_folder
             .as_ref()
@@ -4346,6 +4377,27 @@ impl DatabasePanel {
                             panel.new_connection_in_folder(Some(folder_id), window, cx);
                         });
                     }
+                })
+                .separator()
+                .when(can_move_up, |menu| {
+                    let entity = entity.clone();
+                    menu.entry("Move Up", None, move |_, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.reorder_folder(folder_id, -1, cx);
+                            });
+                        });
+                    })
+                })
+                .when(can_move_down, |menu| {
+                    let entity = entity.clone();
+                    menu.entry("Move Down", None, move |_, cx| {
+                        entity.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.reorder_folder(folder_id, 1, cx);
+                            });
+                        });
+                    })
                 })
                 .separator()
                 .entry("Rename", None, {
@@ -11757,6 +11809,118 @@ mod tests {
                 Some(folder_id),
                 "dropping the connection row onto the folder row must reparent it via the real \
                  on_drag/on_drop path, not merely by calling handle_drop directly"
+            );
+        });
+    }
+
+    // Folders had no way to change their sibling order at all before this
+    // test's fix -- only connections could be reordered via the selection
+    // action bar's Move Up/Down buttons. Drives the real right-click gesture
+    // (mouse-down, mouse-up to open the popover, then a click on the rendered
+    // "Move Down" entry) rather than calling `reorder_folder` directly, per
+    // this session's own lesson that a direct call can pass while the real
+    // event-driven path is broken.
+    #[gpui::test]
+    async fn folder_context_menu_move_down_reorders_siblings(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, _panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
+                dump: DumpUiState::default(),
+                export: ExportUiState::default(),
+                context_menu: None,
+                tree_scroll_handle: ScrollHandle::new(),
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        let folder_a = store
+            .update(cx, |store, cx| store.add_folder("A".into(), None, cx))
+            .expect("folder a must be created");
+        let folder_b = store
+            .update(cx, |store, cx| store.add_folder("B".into(), None, cx))
+            .expect("folder b must be created");
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let mut folders = store.folders().to_vec();
+            folders.sort_by_key(|f| f.order);
+            assert_eq!(
+                folders.iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![folder_a, folder_b],
+                "A must sort before B before any reordering"
+            );
+        });
+
+        let folder_a_row = debug_center(cx, format!("folder-row-{folder_a}").leak());
+        cx.simulate_mouse_move(folder_a_row, None, gpui::Modifiers::none());
+        cx.simulate_mouse_down(folder_a_row, MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(folder_a_row, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let move_down_item = debug_center(cx, "MENU_ITEM-Move Down".to_string().leak());
+        cx.simulate_click(move_down_item, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let mut folders = store.folders().to_vec();
+            folders.sort_by_key(|f| f.order);
+            assert_eq!(
+                folders.iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![folder_b, folder_a],
+                "clicking Move Down on A's real context menu must swap it below B"
             );
         });
     }
