@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ui::{
-    Button, ButtonCommon, ButtonStyle, Checkbox, Color, CommonAnimationExt, ContextMenu, Divider,
-    Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu, ScrollableHandle, Tooltip,
-    prelude::*, right_click_menu,
+    Button, ButtonCommon, ButtonStyle, Checkbox, Color, CommonAnimationExt, ContextMenu,
+    CopyButton, Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu,
+    ScrollableHandle, Tooltip, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 
@@ -147,7 +147,7 @@ const ROW_GUTTER_WIDTH: f32 = 48.0;
 // prints the full "Caused by: 0: ... 1: ..." chain instead, which is what a
 // user needs to diagnose a real failure rather than a generic
 // "Query execution failed".
-fn format_query_error(err: &anyhow::Error) -> String {
+pub(crate) fn format_query_error(err: &anyhow::Error) -> String {
     format!("{err:?}")
 }
 
@@ -5399,15 +5399,26 @@ impl ResultView {
             .p_4()
             .child(Icon::new(IconName::Warning).color(Color::Error))
             .child(
-                div()
-                    .id("query-error")
-                    .max_w(px(560.))
-                    .max_h(px(240.))
-                    .overflow_y_scroll()
+                v_flex()
+                    .gap_1()
+                    .items_end()
                     .child(
-                        Label::new(error.to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
+                        div()
+                            .id("query-error-copy-hitbox")
+                            .debug_selector(|| "query-error-copy".to_string())
+                            .child(CopyButton::new("query-error-copy", error.to_string())),
+                    )
+                    .child(
+                        div()
+                            .id("query-error")
+                            .max_w(px(560.))
+                            .max_h(px(240.))
+                            .overflow_y_scroll()
+                            .child(
+                                Label::new(error.to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Error),
+                            ),
                     ),
             )
     }
@@ -10333,6 +10344,49 @@ mod tests {
         assert!(
             shown.contains("Query execution failed"),
             "the generic context should still be present as the top-level message, got: {shown:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_copy_button_on_a_query_error_puts_the_full_message_on_the_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let error_message =
+            "Query execution failed\n\nCaused by:\n    Table 'app.does_not_exist' doesn't exist";
+        let window = cx.add_window(|_window, cx| ResultView::new("error-copy", cx));
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(cx, |view, _window, cx| {
+                view.set_error(error_message.to_string(), cx)
+            })
+            .unwrap();
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let target = cx
+            .debug_bounds("query-error-copy")
+            .map(|bounds| bounds.center())
+            .expect("the error's copy button should render");
+        cx.simulate_click(target, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let clipboard = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("the error message should be on the clipboard after the click");
+        assert_eq!(
+            clipboard, error_message,
+            "the copy button must put the full error text on the clipboard, not a truncated preview"
         );
     }
 

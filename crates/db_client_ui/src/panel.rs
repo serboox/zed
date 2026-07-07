@@ -17,7 +17,7 @@ use crate::native_dump::{
     DumpRequest, DumpRunCallback, DumpStatus, DumpTask, NativeDumpDialog, apply_substitutions,
     render_dump_status_row, spawn_dump,
 };
-use crate::result_view::ResultView;
+use crate::result_view::{ResultView, format_query_error};
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{
     ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RunConfiguration,
@@ -2990,7 +2990,8 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
-                    let message = format!("Could not connect to '{conn_label}': {err}");
+                    let message =
+                        format!("Could not connect to '{conn_label}': {}", format_query_error(&err));
                     if let Some(inline_view) = &inline_view {
                         inline_view.update(cx, |view, cx| view.set_error(message.clone(), cx));
                     }
@@ -3043,9 +3044,11 @@ fn run_sql_from_editor(
                         }
                     });
                     if let Some(inline_view) = &inline_view {
-                        inline_view.update(cx, |view, cx| view.set_error(err.to_string(), cx));
+                        inline_view.update(cx, |view, cx| {
+                            view.set_error(format_query_error(&err), cx)
+                        });
                     }
-                    result_view.update(cx, |view, cx| view.set_error(err.to_string(), cx));
+                    result_view.update(cx, |view, cx| view.set_error(format_query_error(&err), cx));
                     return anyhow::Ok(());
                 }
             }
@@ -6921,7 +6924,7 @@ impl DatabasePanel {
                                                                 execution_time_ms: 0,
                                                             }, cx);
                                                         }
-                                                        Err(e) => view.set_error(e.to_string(), cx),
+                                                        Err(e) => view.set_error(format_query_error(&e), cx),
                                                     });
                                                     ws.update_in(cx, |ws, window, cx| {
                                                         ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -6958,7 +6961,7 @@ impl DatabasePanel {
                                                                 execution_time_ms: 0,
                                                             }, cx);
                                                         }
-                                                        Err(e) => view.set_error(e.to_string(), cx),
+                                                        Err(e) => view.set_error(format_query_error(&e), cx),
                                                     });
                                                     ws.update_in(cx, |ws, window, cx| {
                                                         ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -7128,7 +7131,7 @@ impl DatabasePanel {
                                                         let outcome = task.await;
                                                         rv.update(cx, |view, cx| match outcome {
                                                             Ok(r) => view.set_result(r, cx),
-                                                            Err(e) => view.set_error(e.to_string(), cx),
+                                                            Err(e) => view.set_error(format_query_error(&e), cx),
                                                         });
                                                         workspace.update_in(cx, |ws, window, cx| {
                                                             ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -7231,7 +7234,7 @@ impl DatabasePanel {
                                                                     let outcome = task.await;
                                                                     rv.update(cx, |view, cx| match outcome {
                                                                         Ok(r) => view.set_result(r, cx),
-                                                                        Err(e) => view.set_error(e.to_string(), cx),
+                                                                        Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
                                                                         ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -7483,7 +7486,7 @@ impl DatabasePanel {
                                                                                 execution_time_ms: 0,
                                                                             }, cx);
                                                                         }
-                                                                        Err(e) => view.set_error(e.to_string(), cx),
+                                                                        Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
                                                                         ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -7524,7 +7527,7 @@ impl DatabasePanel {
                                                                                 execution_time_ms: 0,
                                                                             }, cx);
                                                                         }
-                                                                        Err(e) => view.set_error(e.to_string(), cx),
+                                                                        Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
                                                                         ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
@@ -7963,7 +7966,7 @@ impl DatabasePanel {
                                                                                 let outcome = task.await;
                                                                                 rv.update(cx, |view, cx| match outcome {
                                                                                     Ok(r) => view.set_result(r, cx),
-                                                                                    Err(e) => view.set_error(e.to_string(), cx),
+                                                                                    Err(e) => view.set_error(format_query_error(&e), cx),
                                                                                 });
                                                                                 ws.update_in(cx, |ws, window, cx| {
                                                                                     ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);

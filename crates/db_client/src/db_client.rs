@@ -44,7 +44,16 @@ pub const DEFAULT_PAGE_SIZE: usize = 500;
 /// LIMIT. A safety net so a query that slips past the UI's default limit cannot
 /// pull an unbounded result into memory and freeze the client. Shared by every
 /// provider so the cap is uniform across drivers.
-pub const MAX_RESULT_ROWS: usize = 2_000;
+pub const MAX_RESULT_ROWS: usize = 500;
+
+/// Uniform ceiling on how long any single database call (query execution,
+/// connect, schema lookup, ...) may run before it is aborted with a timeout
+/// error, applied once in [`runtime::on_runtime`] so it covers every
+/// [`provider::DbProvider`] method for every current and future driver
+/// without each one needing its own timeout. Long enough that a genuinely
+/// slow query the user is deliberately waiting on is not cut off — if they
+/// no longer want the result, disconnecting is the intended way to cancel.
+pub const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Per-cell byte cap kept in memory. A single BLOB/TEXT cell can be many
 /// megabytes; decode truncates each value here so the in-memory result stays

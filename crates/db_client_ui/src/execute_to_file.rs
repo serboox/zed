@@ -177,11 +177,7 @@ mod tests {
         async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
             Ok(Vec::new())
         }
-        async fn describe_table(
-            &self,
-            _database: &str,
-            _table: &str,
-        ) -> Result<Vec<ColumnInfo>> {
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
             Ok(Vec::new())
         }
         async fn execute_query(&self, _database: &str, _sql: &str) -> Result<QueryResult> {
@@ -235,8 +231,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.csv");
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut sink =
-            FileRowSink::create(&path, ExecuteToFileFormat::Csv, cancelled).unwrap();
+        let mut sink = FileRowSink::create(&path, ExecuteToFileFormat::Csv, cancelled).unwrap();
         sink.write_columns(&["id".to_string(), "note".to_string()])
             .unwrap();
         sink.write_row(&[Some("1".to_string()), Some("has, a comma".to_string())])
@@ -250,10 +245,12 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn streaming_beyond_the_grid_row_cap_writes_every_row_to_disk(cx: &mut gpui::TestAppContext) {
-        // MAX_RESULT_ROWS is 2_000 -- proves execute_query_streaming's bypass
-        // of the grid's cap actually reaches the file, not just the trait
-        // default (which would silently re-cap at 2_000 via execute_query).
+    async fn streaming_beyond_the_grid_row_cap_writes_every_row_to_disk(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Proves execute_query_streaming's bypass of the grid's row cap
+        // actually reaches the file, not just the trait default (which would
+        // silently re-cap at MAX_RESULT_ROWS via execute_query).
         let row_count = 5_000;
         let provider: Arc<dyn db_client::provider::DbProvider> =
             Arc::new(ManyRowsProvider { row_count });
@@ -285,7 +282,7 @@ mod tests {
         assert_eq!(
             lines.count(),
             row_count,
-            "every row beyond MAX_RESULT_ROWS (2_000) must still reach the file"
+            "every row beyond MAX_RESULT_ROWS must still reach the file"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -321,7 +318,10 @@ mod tests {
             )
         });
         let result = task.await;
-        assert!(result.is_err(), "a cancelled export must report failure, not silent success");
+        assert!(
+            result.is_err(),
+            "a cancelled export must report failure, not silent success"
+        );
         assert!(
             !path.exists(),
             "a cancelled export must delete its partial file, not leave a truncated one behind"

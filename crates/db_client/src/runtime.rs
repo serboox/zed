@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::runtime::{Handle, Runtime};
 
+use crate::QUERY_TIMEOUT;
 use crate::provider::DbProvider;
 use crate::schema::{
     ColumnInfo, DatabaseInfo, IndexInfo, ProcedureInfo, QueryResult, TableInfo, TriggerInfo,
@@ -38,8 +39,28 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    on_runtime_with_timeout(QUERY_TIMEOUT, future).await
+}
+
+/// Core of [`on_runtime`], taking the timeout explicitly so tests can exercise
+/// the timeout-error path with a short duration instead of waiting out the
+/// real 30-minute `QUERY_TIMEOUT`.
+async fn on_runtime_with_timeout<T, F>(timeout: std::time::Duration, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
     let handle: Handle = runtime()?.handle().clone();
-    match handle.spawn(future).await {
+    let bounded = async move {
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Database call timed out after {} minutes",
+                timeout.as_secs() / 60
+            )),
+        }
+    };
+    match handle.spawn(bounded).await {
         Ok(output) => output,
         Err(join_error) => Err(anyhow::anyhow!("database task failed: {join_error}")),
     }
@@ -176,6 +197,22 @@ mod tests {
             futures::executor::block_on(on_runtime(async { anyhow::bail!("inner failure") }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inner failure"));
+    }
+
+    #[test]
+    fn on_runtime_aborts_a_call_that_never_resolves_once_its_timeout_elapses() {
+        // A future that never completes stands in for a query that hangs on
+        // an unresponsive server. Uses a short custom timeout rather than the
+        // real 30-minute QUERY_TIMEOUT so the test itself completes quickly.
+        let result: Result<()> = futures::executor::block_on(on_runtime_with_timeout(
+            std::time::Duration::from_millis(50),
+            std::future::pending(),
+        ));
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("timed out"),
+            "expected a timeout error, got: {message}"
+        );
     }
 
     struct TokioProbeProvider {

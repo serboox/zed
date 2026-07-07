@@ -10,7 +10,7 @@ use ui::{Button, ButtonStyle, Icon, IconName, Label, LabelSize};
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
 
-use crate::result_view::ResultView;
+use crate::result_view::{ResultView, format_query_error};
 use crate::store::DatabaseStore;
 
 /// Upper bound on rows fetched per table, so a term that matches almost every
@@ -263,7 +263,7 @@ impl FullTextSearchView {
                 let outcome = task.await;
                 rv.update(cx, |view, cx| match outcome {
                     Ok(result) => view.set_result(result, cx),
-                    Err(err) => view.set_error(err.to_string(), cx),
+                    Err(err) => view.set_error(format_query_error(&err), cx),
                 });
                 workspace
                     .update_in(cx, |workspace, window, cx| {
