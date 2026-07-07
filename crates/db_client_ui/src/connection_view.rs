@@ -612,14 +612,20 @@ impl Render for ConnectionView {
                 cx,
             ))
             .child(Self::render_driver_row(
-                "SQLite",
-                DatabaseDriver::SQLite,
+                "MongoDB",
+                DatabaseDriver::MongoDB,
                 selected_driver,
                 cx,
             ))
             .child(Self::render_driver_row(
-                "ClickHouse",
-                DatabaseDriver::ClickHouse,
+                "Cassandra",
+                DatabaseDriver::Cassandra,
+                selected_driver,
+                cx,
+            ))
+            .child(Self::render_driver_row(
+                "SQLite",
+                DatabaseDriver::SQLite,
                 selected_driver,
                 cx,
             ))
@@ -630,14 +636,8 @@ impl Render for ConnectionView {
                 cx,
             ))
             .child(Self::render_driver_row(
-                "MongoDB",
-                DatabaseDriver::MongoDB,
-                selected_driver,
-                cx,
-            ))
-            .child(Self::render_driver_row(
-                "Cassandra",
-                DatabaseDriver::Cassandra,
+                "ClickHouse",
+                DatabaseDriver::ClickHouse,
                 selected_driver,
                 cx,
             ));
