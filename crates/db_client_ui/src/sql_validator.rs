@@ -45,6 +45,9 @@ pub(crate) fn validate(
     default_database: Option<&str>,
     schema: &dyn SchemaLookup,
 ) -> Vec<SqlDiagnostic> {
+    if driver == DatabaseDriver::MongoDB {
+        return validate_mongo_shell(text);
+    }
     let Some(dialect) = dialect_for_driver(driver) else {
         return Vec::new();
     };
@@ -78,6 +81,32 @@ pub(crate) fn validate(
                     message: err.to_string(),
                 });
             }
+        }
+    }
+    diagnostics
+}
+
+/// Validates each mongo shell statement in `text` with the same tiny parser
+/// `MongoProvider::execute_query` runs at execution time, so a syntax mistake
+/// is flagged in the editor before Ctrl+Enter, not after a failed round trip.
+/// Mongo shell has no real dialect for `sqlparser`, so this bypasses it
+/// entirely rather than misparsing shell calls as SQL.
+fn validate_mongo_shell(text: &str) -> Vec<SqlDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for span in statement_spans(text) {
+        let Some(statement_text) = text.get(span.clone()) else {
+            continue;
+        };
+        if statement_text.trim().is_empty() {
+            continue;
+        }
+        if let Err(error) = db_client::mongo_provider::parse_mongo_shell_statement(statement_text)
+        {
+            diagnostics.push(SqlDiagnostic {
+                range: span,
+                level: DiagnosticLevel::Warning,
+                message: error.to_string(),
+            });
         }
     }
     diagnostics
@@ -434,6 +463,28 @@ mod tests {
         let schema = FakeSchema::default();
         assert!(validate("not sql at all (((", DatabaseDriver::Redis, None, &schema).is_empty());
         assert!(validate("SELECT * FROM db.missing", DatabaseDriver::Redis, None, &schema).is_empty());
+    }
+
+    #[test]
+    fn mongo_shell_commands_are_validated_by_the_shell_parser_not_sqlparser() {
+        let schema = FakeSchema::default();
+        assert!(
+            validate(
+                "db.users.find({status: 'active'})",
+                DatabaseDriver::MongoDB,
+                None,
+                &schema,
+            )
+            .is_empty()
+        );
+
+        let diagnostics = validate("db.help()", DatabaseDriver::MongoDB, None, &schema);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Unsupported mongo shell command"));
+
+        // A plain SQL statement is not a mongo shell command either.
+        let diagnostics = validate("SELECT * FROM users", DatabaseDriver::MongoDB, None, &schema);
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]

@@ -3169,6 +3169,16 @@ fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
     }
 }
 
+/// Label for the button/tooltip that opens a new query console, tailored to
+/// the driver's actual query language — MongoDB's console takes mongo shell
+/// commands (`db.<collection>.find({...})`), not SQL.
+fn new_query_button_label(driver: DatabaseDriver) -> &'static str {
+    match driver {
+        DatabaseDriver::MongoDB => "New Query",
+        _ => "New SQL Query",
+    }
+}
+
 /// The tree node the keyboard acts on. A node is a database (table = None) or a
 /// table within it, so Go to DDL / Quick Documentation / Show Diagram know their
 /// target without a pointer event.
@@ -6344,7 +6354,9 @@ impl DatabasePanel {
                         IconButton::new("selection-new-query", IconName::File)
                             .icon_size(IconSize::XSmall)
                             .disabled(!has_selection)
-                            .tooltip(Tooltip::text("New SQL Query"))
+                            .tooltip(Tooltip::text(
+                                driver.map_or("New SQL Query", new_query_button_label),
+                            ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let (Some(id), Some(label)) = (id, label.clone()) else {
                                     return;
@@ -8862,6 +8874,13 @@ mod tests {
     // Stands in for the inline assistant's ctrl-enter binding in the conflict
     // test below, so the real `assistant` crate need not be linked.
     actions!(db_console_probe, [CompetingAssistProbe]);
+
+    #[test]
+    fn new_query_button_label_is_driver_specific_for_mongo() {
+        assert_eq!(new_query_button_label(DatabaseDriver::MongoDB), "New Query");
+        assert_eq!(new_query_button_label(DatabaseDriver::MySQL), "New SQL Query");
+        assert_eq!(new_query_button_label(DatabaseDriver::Cassandra), "New SQL Query");
+    }
 
     #[test]
     fn parse_env_color_accepts_valid_hex_and_rejects_junk() {

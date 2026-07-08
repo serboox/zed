@@ -94,29 +94,54 @@ pub enum MongoOperationKind {
     Write,
 }
 
-/// A tiny SQL-shaped subset translated onto MongoDB's document model, chosen
-/// over accepting raw MongoDB extended-JSON so the console/grid experience
-/// stays consistent with the SQL drivers (same `SELECT`/`INSERT`/`UPDATE`/
-/// `DELETE` shapes users already type). This intentionally supports only a
-/// single equality `WHERE` clause and a flat `SET`/column list — it is not a
-/// SQL parser and does not aim to be one.
+/// A parsed `db.<collection>.<method>(<args>)` mongo shell command. This is
+/// the actual language MongoDB users type (in `mongosh`, Compass, and every
+/// other Mongo client) — not a SQL dialect. Arguments are relaxed-JSON
+/// (unquoted object keys allowed, single or double quoted strings), parsed by
+/// [`ValueParser`], with the shell's `ObjectId(...)` constructor understood
+/// for `_id` filters.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MongoStatement {
-    Select {
+    Find {
         collection: String,
         filter: Document,
         limit: Option<i64>,
     },
-    Insert {
+    FindOne {
+        collection: String,
+        filter: Document,
+    },
+    InsertOne {
         collection: String,
         document: Document,
     },
-    Update {
+    InsertMany {
+        collection: String,
+        documents: Vec<Document>,
+    },
+    UpdateOne {
         collection: String,
         filter: Document,
         update: Document,
     },
-    Delete {
+    UpdateMany {
+        collection: String,
+        filter: Document,
+        update: Document,
+    },
+    DeleteOne {
+        collection: String,
+        filter: Document,
+    },
+    DeleteMany {
+        collection: String,
+        filter: Document,
+    },
+    Aggregate {
+        collection: String,
+        pipeline: Vec<Document>,
+    },
+    CountDocuments {
         collection: String,
         filter: Document,
     },
@@ -125,217 +150,555 @@ pub enum MongoStatement {
 impl MongoStatement {
     pub fn kind(&self) -> MongoOperationKind {
         match self {
-            MongoStatement::Select { .. } => MongoOperationKind::Read,
-            MongoStatement::Insert { .. }
-            | MongoStatement::Update { .. }
-            | MongoStatement::Delete { .. } => MongoOperationKind::Write,
+            MongoStatement::Find { .. }
+            | MongoStatement::FindOne { .. }
+            | MongoStatement::Aggregate { .. }
+            | MongoStatement::CountDocuments { .. } => MongoOperationKind::Read,
+            MongoStatement::InsertOne { .. }
+            | MongoStatement::InsertMany { .. }
+            | MongoStatement::UpdateOne { .. }
+            | MongoStatement::UpdateMany { .. }
+            | MongoStatement::DeleteOne { .. }
+            | MongoStatement::DeleteMany { .. } => MongoOperationKind::Write,
         }
     }
 }
 
-fn parse_literal(raw: &str) -> Bson {
-    let trimmed = raw.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-    {
-        return Bson::String(inner.to_string());
-    }
-    if let Some(inner) = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-    {
-        return Bson::String(inner.to_string());
-    }
-    match trimmed {
-        "true" => return Bson::Boolean(true),
-        "false" => return Bson::Boolean(false),
-        "null" => return Bson::Null,
-        _ => {}
-    }
-    if let Ok(int) = trimmed.parse::<i64>() {
-        return Bson::Int64(int);
-    }
-    if let Ok(float) = trimmed.parse::<f64>() {
-        return Bson::Double(float);
-    }
-    Bson::String(trimmed.to_string())
+const SUPPORTED_METHODS: &str = "find, findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, countDocuments";
+
+fn unsupported_command_error(text: &str) -> anyhow::Error {
+    anyhow!(
+        "Unsupported mongo shell command: '{}'. Supported: {}.",
+        text.chars().take(80).collect::<String>(),
+        SUPPORTED_METHODS
+    )
 }
 
-/// Parses `<field> = <value>` into a single-key equality filter document.
-/// Only a single equality clause is supported — deliberately, see
-/// [`MongoStatement`]'s doc comment.
-fn parse_equality_filter(clause: &str) -> Result<Document> {
-    let (field, value) = clause
-        .split_once('=')
-        .ok_or_else(|| anyhow!("WHERE clause must be a single \"field = value\" equality"))?;
-    Ok(doc! { field.trim().to_string(): parse_literal(value) })
-}
-
-/// Parses the tiny SQL-shaped subset described on [`MongoStatement`].
-pub fn parse_mongo_statement(text: &str) -> Result<MongoStatement> {
-    let text = text.trim().trim_end_matches(';').trim();
-    let upper = text.to_uppercase();
-
-    if let Some(rest) = strip_prefix_ci(text, "SELECT") {
-        let from_idx = find_keyword(rest, "FROM")
-            .ok_or_else(|| anyhow!("SELECT statement is missing FROM <collection>"))?;
-        let after_from = rest[from_idx + 4..].trim();
-
-        let (collection_and_where, limit) = match find_keyword(after_from, "LIMIT") {
-            Some(idx) => {
-                let limit_str = after_from[idx + 5..].trim();
-                let limit = limit_str
-                    .parse::<i64>()
-                    .context("LIMIT must be a plain integer")?;
-                (after_from[..idx].trim(), Some(limit))
-            }
-            None => (after_from, None),
-        };
-
-        let (collection, filter) = match find_keyword(collection_and_where, "WHERE") {
-            Some(idx) => (
-                collection_and_where[..idx].trim(),
-                parse_equality_filter(collection_and_where[idx + 5..].trim())?,
-            ),
-            None => (collection_and_where.trim(), Document::new()),
-        };
-        if collection.is_empty() {
-            bail!("SELECT statement is missing a collection name after FROM");
-        }
-        return Ok(MongoStatement::Select {
-            collection: collection.to_string(),
-            filter,
-            limit,
-        });
-    }
-
-    if let Some(rest) = strip_prefix_ci(text, "INSERT INTO") {
-        let open_paren = rest
-            .find('(')
-            .ok_or_else(|| anyhow!("INSERT statement is missing a (columns) list"))?;
-        let collection = rest[..open_paren].trim().to_string();
-        let close_paren = rest[open_paren..]
-            .find(')')
-            .map(|i| open_paren + i)
-            .ok_or_else(|| anyhow!("INSERT statement's (columns) list is unterminated"))?;
-        let columns: Vec<String> = rest[open_paren + 1..close_paren]
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
-
-        let values_idx = find_keyword(&rest[close_paren..], "VALUES")
-            .map(|i| close_paren + i)
-            .ok_or_else(|| anyhow!("INSERT statement is missing VALUES (...)"))?;
-        let values_rest = &rest[values_idx + 6..];
-        let values_open = values_rest
-            .find('(')
-            .ok_or_else(|| anyhow!("INSERT statement's VALUES list is missing an opening paren"))?;
-        let values_close = values_rest[values_open..]
-            .find(')')
-            .map(|i| values_open + i)
-            .ok_or_else(|| anyhow!("INSERT statement's VALUES list is unterminated"))?;
-        let values: Vec<&str> = values_rest[values_open + 1..values_close]
-            .split(',')
-            .collect();
-
-        if columns.len() != values.len() {
-            bail!(
-                "INSERT column count ({}) does not match value count ({})",
-                columns.len(),
-                values.len()
-            );
-        }
-        let mut document = Document::new();
-        for (column, value) in columns.into_iter().zip(values) {
-            document.insert(column, parse_literal(value));
-        }
-        return Ok(MongoStatement::Insert {
-            collection,
-            document,
-        });
-    }
-
-    if let Some(rest) = strip_prefix_ci(text, "UPDATE") {
-        let set_idx =
-            find_keyword(rest, "SET").ok_or_else(|| anyhow!("UPDATE statement is missing SET"))?;
-        let collection = rest[..set_idx].trim().to_string();
-        let after_set = rest[set_idx + 3..].trim();
-
-        let (assignments, filter) = match find_keyword(after_set, "WHERE") {
-            Some(idx) => (
-                after_set[..idx].trim(),
-                parse_equality_filter(after_set[idx + 5..].trim())?,
-            ),
-            None => (after_set, Document::new()),
-        };
-
-        let mut set_doc = Document::new();
-        for assignment in assignments.split(',') {
-            let (field, value) = assignment
-                .split_once('=')
-                .ok_or_else(|| anyhow!("SET clause must be a comma-separated \"field = value\" list"))?;
-            set_doc.insert(field.trim().to_string(), parse_literal(value));
-        }
-        return Ok(MongoStatement::Update {
-            collection,
-            filter,
-            update: doc! { "$set": set_doc },
-        });
-    }
-
-    if let Some(rest) = strip_prefix_ci(text, "DELETE FROM") {
-        let (collection, filter) = match find_keyword(rest, "WHERE") {
-            Some(idx) => (
-                rest[..idx].trim(),
-                parse_equality_filter(rest[idx + 5..].trim())?,
-            ),
-            None => (rest.trim(), Document::new()),
-        };
-        if collection.is_empty() {
-            bail!("DELETE statement is missing a collection name after FROM");
-        }
-        return Ok(MongoStatement::Delete {
-            collection: collection.to_string(),
-            filter,
-        });
-    }
-
-    bail!(
-        "unsupported statement (expected SELECT/INSERT INTO/UPDATE/DELETE FROM): {}",
-        upper.chars().take(40).collect::<String>()
-    );
-}
-
-fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() < prefix.len() {
+/// Strips a case-insensitive `db.` prefix, mongo shell's fixed handle for the
+/// current database (e.g. `db.users.find(...)`).
+fn strip_db_prefix(text: &str) -> Option<&str> {
+    if text.len() < 2 || !text.is_char_boundary(2) || !text[..2].eq_ignore_ascii_case("db") {
         return None;
     }
-    if text[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(text[prefix.len()..].trim())
-    } else {
-        None
+    text[2..].trim_start().strip_prefix('.')
+}
+
+/// Parses a mongo shell command of the form `db.<collection>.<method>(<args>)`,
+/// optionally followed by chained calls like `.limit(10)`.
+pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
+    let text = text.trim().trim_end_matches(';').trim();
+    let rest = strip_db_prefix(text).ok_or_else(|| {
+        anyhow!("expected a mongo shell command like db.<collection>.find({{...}})")
+    })?;
+
+    // `db.<collection>.<method>(...)` has a '.' before its first '(';
+    // database-level calls like `db.help()` or `db.stats()` don't, and are
+    // reported as unsupported rather than misparsed as a missing collection.
+    let paren_idx = rest.find('(');
+    let dot_idx = rest.find('.');
+    let Some(dot) = dot_idx.filter(|&d| paren_idx.is_none_or(|p| d < p)) else {
+        return Err(unsupported_command_error(text));
+    };
+    let collection = rest[..dot].trim();
+    if collection.is_empty() || !collection.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!("invalid collection name '{}'", collection);
+    }
+
+    let calls = parse_call_chain(rest[dot + 1..].trim())?;
+    let (method, args) = calls
+        .first()
+        .ok_or_else(|| anyhow!("expected a method call like db.{}.find({{...}})", collection))?;
+
+    match method.as_str() {
+        "find" => {
+            let filter = parse_optional_doc_arg(args)?;
+            let limit = extract_limit(&calls[1..])?;
+            Ok(MongoStatement::Find {
+                collection: collection.to_string(),
+                filter,
+                limit,
+            })
+        }
+        "findOne" => Ok(MongoStatement::FindOne {
+            collection: collection.to_string(),
+            filter: parse_optional_doc_arg(args)?,
+        }),
+        "insertOne" => Ok(MongoStatement::InsertOne {
+            collection: collection.to_string(),
+            document: parse_required_doc_arg(args)?,
+        }),
+        "insertMany" => Ok(MongoStatement::InsertMany {
+            collection: collection.to_string(),
+            documents: parse_array_of_docs_arg(args)?,
+        }),
+        "updateOne" | "updateMany" => {
+            let (filter, update) = parse_two_doc_args(args)?;
+            if method == "updateOne" {
+                Ok(MongoStatement::UpdateOne {
+                    collection: collection.to_string(),
+                    filter,
+                    update,
+                })
+            } else {
+                Ok(MongoStatement::UpdateMany {
+                    collection: collection.to_string(),
+                    filter,
+                    update,
+                })
+            }
+        }
+        "deleteOne" => Ok(MongoStatement::DeleteOne {
+            collection: collection.to_string(),
+            filter: parse_optional_doc_arg(args)?,
+        }),
+        "deleteMany" => Ok(MongoStatement::DeleteMany {
+            collection: collection.to_string(),
+            filter: parse_optional_doc_arg(args)?,
+        }),
+        "aggregate" => Ok(MongoStatement::Aggregate {
+            collection: collection.to_string(),
+            pipeline: parse_array_of_docs_arg(args)?,
+        }),
+        "countDocuments" => Ok(MongoStatement::CountDocuments {
+            collection: collection.to_string(),
+            filter: parse_optional_doc_arg(args)?,
+        }),
+        _ => Err(unsupported_command_error(text)),
     }
 }
 
-/// Finds a whole-word, case-insensitive keyword occurrence (not inside a
-/// longer identifier) — good enough for this deliberately tiny grammar, which
-/// never needs to look inside quoted string literals for a keyword.
-fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
-    let upper = text.to_uppercase();
-    let keyword_upper = keyword.to_uppercase();
-    let mut search_from = 0;
-    while let Some(relative) = upper[search_from..].find(&keyword_upper) {
-        let idx = search_from + relative;
-        let before_ok = idx == 0 || !upper.as_bytes()[idx - 1].is_ascii_alphanumeric();
-        let after_idx = idx + keyword_upper.len();
-        let after_ok = after_idx >= upper.len() || !upper.as_bytes()[after_idx].is_ascii_alphanumeric();
-        if before_ok && after_ok {
-            return Some(idx);
+/// Splits `<method1>(<args1>).<method2>(<args2>)...` into its calls, respecting
+/// parens and quoted strings nested inside each call's arguments.
+fn parse_call_chain(text: &str) -> Result<Vec<(String, String)>> {
+    let mut calls = Vec::new();
+    let mut remaining = text.trim();
+    loop {
+        if remaining.is_empty() {
+            break;
         }
-        search_from = idx + 1;
+        let open = remaining
+            .find('(')
+            .ok_or_else(|| anyhow!("expected a method call like .find({{...}}) near '{}'", remaining))?;
+        let method = remaining[..open].trim();
+        if method.is_empty() || !method.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!("invalid method name '{}'", method);
+        }
+        let close = find_matching_paren(&remaining[open..])? + open;
+        let args = remaining[open + 1..close].trim().to_string();
+        calls.push((method.to_string(), args));
+        let after = remaining[close + 1..].trim_start();
+        if after.is_empty() {
+            break;
+        }
+        remaining = after
+            .strip_prefix('.')
+            .ok_or_else(|| anyhow!("unexpected trailing text after method call: '{}'", after))?
+            .trim_start();
     }
-    None
+    Ok(calls)
+}
+
+/// Finds the index (within `s`, which must start with `'('`) of the matching
+/// closing paren, skipping over parens that appear inside quoted strings.
+fn find_matching_paren(s: &str) -> Result<usize> {
+    let mut depth = 0i32;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => in_string = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("unterminated '(' — missing closing ')'")
+}
+
+fn parse_optional_doc_arg(args: &str) -> Result<Document> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(Document::new());
+    }
+    let mut parser = ValueParser::new(trimmed);
+    let value = parser.parse_value()?;
+    parser.expect_end()?;
+    match value {
+        Bson::Document(doc) => Ok(doc),
+        other => bail!("expected a filter document, found {}", bson_type_name(&other)),
+    }
+}
+
+fn parse_required_doc_arg(args: &str) -> Result<Document> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        bail!("this method requires a document argument");
+    }
+    let mut parser = ValueParser::new(trimmed);
+    let value = parser.parse_value()?;
+    parser.expect_end()?;
+    match value {
+        Bson::Document(doc) => Ok(doc),
+        other => bail!("expected a document, found {}", bson_type_name(&other)),
+    }
+}
+
+fn parse_array_of_docs_arg(args: &str) -> Result<Vec<Document>> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        bail!("this method requires an array-of-documents argument");
+    }
+    let mut parser = ValueParser::new(trimmed);
+    let value = parser.parse_value()?;
+    parser.expect_end()?;
+    match value {
+        Bson::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Bson::Document(doc) => Ok(doc),
+                other => Err(anyhow!(
+                    "expected an array of documents, found {} inside the array",
+                    bson_type_name(&other)
+                )),
+            })
+            .collect(),
+        other => bail!("expected an array of documents, found {}", bson_type_name(&other)),
+    }
+}
+
+fn parse_two_doc_args(args: &str) -> Result<(Document, Document)> {
+    let mut parser = ValueParser::new(args.trim());
+    let first = parser.parse_value()?;
+    parser.skip_ws();
+    parser.expect(',')?;
+    let second = parser.parse_value()?;
+    parser.expect_end()?;
+    let filter = match first {
+        Bson::Document(doc) => doc,
+        other => bail!(
+            "expected a filter document as the first argument, found {}",
+            bson_type_name(&other)
+        ),
+    };
+    let update = match second {
+        Bson::Document(doc) => doc,
+        other => bail!(
+            "expected an update document as the second argument, found {}",
+            bson_type_name(&other)
+        ),
+    };
+    Ok((filter, update))
+}
+
+/// Looks for a chained `.limit(<n>)` call, used by `find(...).limit(10)`.
+fn extract_limit(chained_calls: &[(String, String)]) -> Result<Option<i64>> {
+    for (method, args) in chained_calls {
+        if method == "limit" {
+            let n: i64 = args
+                .trim()
+                .parse()
+                .context("limit(...) must be a plain integer")?;
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+/// A recursive-descent parser for mongo shell arguments: relaxed JSON that
+/// additionally allows unquoted object keys and the `ObjectId("...")`
+/// constructor mongo shell users write for `_id` filters.
+struct ValueParser<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> ValueParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.input[self.pos..].chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += c.len_utf8();
+        Some(c)
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_whitespace() {
+                self.pos += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn expect(&mut self, expected: char) -> Result<()> {
+        self.skip_ws();
+        match self.bump() {
+            Some(c) if c == expected => Ok(()),
+            Some(c) => bail!("expected '{}', found '{}'", expected, c),
+            None => bail!("expected '{}', found end of input", expected),
+        }
+    }
+
+    fn expect_end(&mut self) -> Result<()> {
+        self.skip_ws();
+        if self.pos < self.input.len() {
+            bail!("unexpected trailing characters: '{}'", &self.input[self.pos..]);
+        }
+        Ok(())
+    }
+
+    fn parse_value(&mut self) -> Result<Bson> {
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => self.parse_object().map(Bson::Document),
+            Some('[') => self.parse_array().map(Bson::Array),
+            Some('"') | Some('\'') => self.parse_string().map(Bson::String),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            Some(c) if c.is_alphabetic() || c == '_' => self.parse_ident_value(),
+            Some(c) => bail!("unexpected character '{}' in mongo shell argument", c),
+            None => bail!("unexpected end of input while parsing a value"),
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<Document> {
+        self.expect('{')?;
+        let mut document = Document::new();
+        self.skip_ws();
+        if self.peek() == Some('}') {
+            self.bump();
+            return Ok(document);
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_key()?;
+            self.skip_ws();
+            self.expect(':')?;
+            let value = self.parse_value()?;
+            document.insert(key, value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some('}') => {
+                    self.bump();
+                    break;
+                }
+                Some(c) => bail!("expected ',' or '}}' in object, found '{}'", c),
+                None => bail!("unterminated object literal"),
+            }
+        }
+        Ok(document)
+    }
+
+    fn parse_key(&mut self) -> Result<String> {
+        self.skip_ws();
+        match self.peek() {
+            Some('"') | Some('\'') => self.parse_string(),
+            Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_alphanumeric() || c == '_' || c == '$' {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                Ok(self.input[start..self.pos].to_string())
+            }
+            Some(c) => bail!("expected an object key, found '{}'", c),
+            None => bail!("unterminated object literal (missing key)"),
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Vec<Bson>> {
+        self.expect('[')?;
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.bump();
+            return Ok(items);
+        }
+        loop {
+            let value = self.parse_value()?;
+            items.push(value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some(']') => {
+                    self.bump();
+                    break;
+                }
+                Some(c) => bail!("expected ',' or ']' in array, found '{}'", c),
+                None => bail!("unterminated array literal"),
+            }
+        }
+        Ok(items)
+    }
+
+    fn parse_string(&mut self) -> Result<String> {
+        let quote = self
+            .bump()
+            .filter(|c| *c == '\'' || *c == '"')
+            .ok_or_else(|| anyhow!("expected a quoted string"))?;
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                Some('\\') => match self.bump() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some(c) => out.push(c),
+                    None => bail!("unterminated string escape"),
+                },
+                Some(c) if c == quote => break,
+                Some(c) => out.push(c),
+                None => bail!("unterminated string literal"),
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_number(&mut self) -> Result<Bson> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.bump();
+        }
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let mut is_float = false;
+        if self.peek() == Some('.') {
+            is_float = true;
+            self.bump();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            is_float = true;
+            self.bump();
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.bump();
+            }
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        let text = &self.input[start..self.pos];
+        if is_float {
+            text.parse::<f64>()
+                .map(Bson::Double)
+                .map_err(|_| anyhow!("invalid number literal '{}'", text))
+        } else {
+            text.parse::<i64>()
+                .map(Bson::Int64)
+                .map_err(|_| anyhow!("invalid number literal '{}'", text))
+        }
+    }
+
+    fn parse_ident_value(&mut self) -> Result<Bson> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_alphanumeric() || c == '_' {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let ident = &self.input[start..self.pos];
+        match ident {
+            "true" => Ok(Bson::Boolean(true)),
+            "false" => Ok(Bson::Boolean(false)),
+            "null" | "undefined" => Ok(Bson::Null),
+            "ObjectId" => {
+                let hex = self.parse_constructor_string_arg()?;
+                mongodb::bson::oid::ObjectId::parse_str(&hex)
+                    .map(Bson::ObjectId)
+                    .map_err(|error| anyhow!("invalid ObjectId '{}': {}", hex, error))
+            }
+            "NumberLong" => {
+                let value = self.parse_constructor_number_arg()?;
+                value
+                    .parse::<i64>()
+                    .map(Bson::Int64)
+                    .map_err(|_| anyhow!("invalid NumberLong value '{}'", value))
+            }
+            "NumberInt" => {
+                let value = self.parse_constructor_number_arg()?;
+                value
+                    .parse::<i32>()
+                    .map(Bson::Int32)
+                    .map_err(|_| anyhow!("invalid NumberInt value '{}'", value))
+            }
+            other => bail!("unrecognized identifier '{}' in mongo shell argument", other),
+        }
+    }
+
+    fn parse_constructor_string_arg(&mut self) -> Result<String> {
+        self.skip_ws();
+        self.expect('(')?;
+        self.skip_ws();
+        let value = self.parse_string()?;
+        self.skip_ws();
+        self.expect(')')?;
+        Ok(value)
+    }
+
+    fn parse_constructor_number_arg(&mut self) -> Result<String> {
+        self.skip_ws();
+        self.expect('(')?;
+        self.skip_ws();
+        let value = match self.peek() {
+            Some('"') | Some('\'') => self.parse_string()?,
+            _ => {
+                let start = self.pos;
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '-') {
+                    self.bump();
+                }
+                self.input[start..self.pos].to_string()
+            }
+        };
+        self.skip_ws();
+        self.expect(')')?;
+        Ok(value)
+    }
 }
 
 /// Flattens a document's top-level fields into `QueryResult` columns, in
@@ -486,10 +849,10 @@ impl DbProvider for MongoProvider {
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
-        let statement = parse_mongo_statement(sql)?;
+        let statement = parse_mongo_shell_statement(sql)?;
 
         let result = match statement {
-            MongoStatement::Select {
+            MongoStatement::Find {
                 collection,
                 filter,
                 limit,
@@ -510,7 +873,15 @@ impl DbProvider for MongoProvider {
                 }
                 documents_to_query_result(documents)
             }
-            MongoStatement::Insert {
+            MongoStatement::FindOne { collection, filter } => {
+                let coll = self.collection(database, &collection);
+                let document = coll
+                    .find_one(filter)
+                    .await
+                    .context("MongoDB findOne failed")?;
+                documents_to_query_result(document.into_iter().collect())
+            }
+            MongoStatement::InsertOne {
                 collection,
                 document,
             } => {
@@ -525,7 +896,40 @@ impl DbProvider for MongoProvider {
                     execution_time_ms: 0,
                 }
             }
-            MongoStatement::Update {
+            MongoStatement::InsertMany {
+                collection,
+                documents,
+            } => {
+                let coll = self.collection(database, &collection);
+                let count = documents.len() as u64;
+                coll.insert_many(documents)
+                    .await
+                    .context("MongoDB insertMany failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: count,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::UpdateOne {
+                collection,
+                filter,
+                update,
+            } => {
+                let coll = self.collection(database, &collection);
+                let outcome = coll
+                    .update_one(filter, update)
+                    .await
+                    .context("MongoDB updateOne failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: outcome.modified_count,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::UpdateMany {
                 collection,
                 filter,
                 update,
@@ -542,7 +946,20 @@ impl DbProvider for MongoProvider {
                     execution_time_ms: 0,
                 }
             }
-            MongoStatement::Delete { collection, filter } => {
+            MongoStatement::DeleteOne { collection, filter } => {
+                let coll = self.collection(database, &collection);
+                let outcome = coll
+                    .delete_one(filter)
+                    .await
+                    .context("MongoDB deleteOne failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: outcome.deleted_count,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::DeleteMany { collection, filter } => {
                 let coll = self.collection(database, &collection);
                 let outcome = coll
                     .delete_many(filter)
@@ -552,6 +969,38 @@ impl DbProvider for MongoProvider {
                     columns: vec![],
                     rows: vec![],
                     rows_affected: outcome.deleted_count,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::Aggregate {
+                collection,
+                pipeline,
+            } => {
+                let coll = self.collection(database, &collection);
+                let mut cursor = coll
+                    .aggregate(pipeline)
+                    .await
+                    .context("MongoDB aggregate failed")?;
+                let mut documents = Vec::new();
+                while let Some(document) = cursor
+                    .try_next()
+                    .await
+                    .context("Failed to read a MongoDB aggregate result")?
+                {
+                    documents.push(mongodb::bson::from_document(document)?);
+                }
+                documents_to_query_result(documents)
+            }
+            MongoStatement::CountDocuments { collection, filter } => {
+                let coll = self.collection(database, &collection);
+                let count = coll
+                    .count_documents(filter)
+                    .await
+                    .context("MongoDB countDocuments failed")?;
+                QueryResult {
+                    columns: vec!["count".to_string()],
+                    rows: vec![vec![Some(count.to_string())]],
+                    rows_affected: 0,
                     execution_time_ms: 0,
                 }
             }
@@ -661,12 +1110,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_extracts_collection_filter_and_limit() {
+    fn parse_find_extracts_collection_filter_and_chained_limit() {
         let statement =
-            parse_mongo_statement("SELECT * FROM users WHERE status = 'active' LIMIT 10").unwrap();
+            parse_mongo_shell_statement("db.users.find({status: 'active'}).limit(10)").unwrap();
         assert_eq!(
             statement,
-            MongoStatement::Select {
+            MongoStatement::Find {
                 collection: "users".to_string(),
                 filter: doc! { "status": "active" },
                 limit: Some(10),
@@ -676,11 +1125,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_without_where_or_limit_uses_an_empty_filter() {
-        let statement = parse_mongo_statement("select * from users").unwrap();
+    fn parse_find_without_args_or_limit_uses_an_empty_filter() {
+        let statement = parse_mongo_shell_statement("db.users.find()").unwrap();
         assert_eq!(
             statement,
-            MongoStatement::Select {
+            MongoStatement::Find {
                 collection: "users".to_string(),
                 filter: Document::new(),
                 limit: None,
@@ -689,12 +1138,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_insert_zips_columns_and_values_by_position() {
-        let statement =
-            parse_mongo_statement("INSERT INTO users (name, age) VALUES ('Ada', 30)").unwrap();
+    fn parse_find_one_extracts_a_filter_document() {
+        let statement = parse_mongo_shell_statement("db.users.findOne({name: \"Ada\"})").unwrap();
         assert_eq!(
             statement,
-            MongoStatement::Insert {
+            MongoStatement::FindOne {
+                collection: "users".to_string(),
+                filter: doc! { "name": "Ada" },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_insert_one_parses_a_document_with_unquoted_keys() {
+        let statement =
+            parse_mongo_shell_statement("db.users.insertOne({name: 'Ada', age: 30})").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::InsertOne {
                 collection: "users".to_string(),
                 document: doc! { "name": "Ada", "age": 30i64 },
             }
@@ -703,44 +1164,72 @@ mod tests {
     }
 
     #[test]
-    fn parse_insert_rejects_mismatched_column_and_value_counts() {
-        let error = parse_mongo_statement("INSERT INTO users (name, age) VALUES ('Ada')")
-            .unwrap_err();
-        assert!(error.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn parse_update_builds_a_set_document_and_optional_filter() {
+    fn parse_insert_many_parses_an_array_of_documents() {
         let statement =
-            parse_mongo_statement("UPDATE users SET status = 'inactive' WHERE name = 'Ada'")
+            parse_mongo_shell_statement("db.users.insertMany([{name: 'Ada'}, {name: 'Grace'}])")
                 .unwrap();
         assert_eq!(
             statement,
-            MongoStatement::Update {
+            MongoStatement::InsertMany {
+                collection: "users".to_string(),
+                documents: vec![doc! { "name": "Ada" }, doc! { "name": "Grace" }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_insert_many_rejects_a_non_document_array_element() {
+        let error =
+            parse_mongo_shell_statement("db.users.insertMany([{name: 'Ada'}, 5])").unwrap_err();
+        assert!(error.to_string().contains("expected an array of documents"));
+    }
+
+    #[test]
+    fn parse_update_one_and_many_pass_the_update_document_through_unwrapped() {
+        let one = parse_mongo_shell_statement(
+            "db.users.updateOne({name: 'Ada'}, {$set: {status: 'inactive'}})",
+        )
+        .unwrap();
+        assert_eq!(
+            one,
+            MongoStatement::UpdateOne {
                 collection: "users".to_string(),
                 filter: doc! { "name": "Ada" },
                 update: doc! { "$set": { "status": "inactive" } },
             }
         );
-        assert_eq!(statement.kind(), MongoOperationKind::Write);
+        assert_eq!(one.kind(), MongoOperationKind::Write);
+
+        let many = parse_mongo_shell_statement(
+            "db.users.updateMany({status: 'active'}, {$set: {flag: true}})",
+        )
+        .unwrap();
+        assert_eq!(
+            many,
+            MongoStatement::UpdateMany {
+                collection: "users".to_string(),
+                filter: doc! { "status": "active" },
+                update: doc! { "$set": { "flag": true } },
+            }
+        );
     }
 
     #[test]
-    fn parse_delete_supports_an_optional_where_clause() {
-        let statement = parse_mongo_statement("DELETE FROM users WHERE name = 'Ada'").unwrap();
+    fn parse_delete_one_and_many_support_an_optional_filter() {
+        let one = parse_mongo_shell_statement("db.users.deleteOne({name: 'Ada'})").unwrap();
         assert_eq!(
-            statement,
-            MongoStatement::Delete {
+            one,
+            MongoStatement::DeleteOne {
                 collection: "users".to_string(),
                 filter: doc! { "name": "Ada" },
             }
         );
-        assert_eq!(statement.kind(), MongoOperationKind::Write);
+        assert_eq!(one.kind(), MongoOperationKind::Write);
 
-        let unfiltered = parse_mongo_statement("DELETE FROM users").unwrap();
+        let many_unfiltered = parse_mongo_shell_statement("db.users.deleteMany({})").unwrap();
         assert_eq!(
-            unfiltered,
-            MongoStatement::Delete {
+            many_unfiltered,
+            MongoStatement::DeleteMany {
                 collection: "users".to_string(),
                 filter: Document::new(),
             }
@@ -748,20 +1237,79 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_unsupported_statement_shapes() {
-        let error = parse_mongo_statement("DROP TABLE users").unwrap_err();
-        assert!(error.to_string().contains("unsupported statement"));
+    fn parse_aggregate_extracts_the_pipeline_stages() {
+        let statement = parse_mongo_shell_statement(
+            "db.orders.aggregate([{$match: {status: 'shipped'}}, {$count: 'total'}])",
+        )
+        .unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::Aggregate {
+                collection: "orders".to_string(),
+                pipeline: vec![
+                    doc! { "$match": { "status": "shipped" } },
+                    doc! { "$count": "total" },
+                ],
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Read);
     }
 
     #[test]
-    fn parse_literal_infers_string_bool_null_int_and_float() {
-        assert_eq!(parse_literal("'hi'"), Bson::String("hi".to_string()));
-        assert_eq!(parse_literal("\"hi\""), Bson::String("hi".to_string()));
-        assert_eq!(parse_literal("true"), Bson::Boolean(true));
-        assert_eq!(parse_literal("null"), Bson::Null);
-        assert_eq!(parse_literal("42"), Bson::Int64(42));
-        assert_eq!(parse_literal("3.5"), Bson::Double(3.5));
-        assert_eq!(parse_literal("bareword"), Bson::String("bareword".to_string()));
+    fn parse_count_documents_extracts_a_filter() {
+        let statement =
+            parse_mongo_shell_statement("db.users.countDocuments({active: true})").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::CountDocuments {
+                collection: "users".to_string(),
+                filter: doc! { "active": true },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_object_id_constructor_produces_a_real_object_id_filter() {
+        let statement = parse_mongo_shell_statement(
+            "db.users.find({_id: ObjectId(\"507f1f77bcf86cd799439011\")})",
+        )
+        .unwrap();
+        let expected_id =
+            mongodb::bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::Find {
+                collection: "users".to_string(),
+                filter: doc! { "_id": expected_id },
+                limit: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_database_level_command_with_a_clear_unsupported_error() {
+        let error = parse_mongo_shell_statement("db.help()").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Unsupported mongo shell command"));
+        assert!(message.contains("db.help()"));
+        assert!(message.contains("countDocuments"));
+    }
+
+    #[test]
+    fn parse_rejects_an_unrecognized_method_on_a_collection() {
+        let error = parse_mongo_shell_statement("db.users.drop()").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Unsupported mongo shell command"));
+    }
+
+    #[test]
+    fn parse_rejects_text_that_does_not_start_with_db() {
+        let error = parse_mongo_shell_statement("SELECT * FROM users").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected a mongo shell command")
+        );
     }
 
     #[test]
