@@ -283,6 +283,7 @@ impl ActiveConnection {
 pub enum DatabaseStoreEvent {
     ConnectionsChanged,
     SchemaChanged,
+    ExecJobsChanged,
 }
 
 /// Whichever kind of tunnel keeps a connection's underlying driver reachable
@@ -305,6 +306,8 @@ pub struct DatabaseStore {
     schema_cache: HashMap<ConnectionId, SchemaCache>,
     prefetching_schema: HashSet<ConnectionId>,
     run_configurations: Vec<RunConfiguration>,
+    pub exec_jobs: Vec<crate::sql_exec::ExecJob>,
+    pub(crate) next_exec_job_id: usize,
 }
 
 /// App-global handle to the single workspace `DatabaseStore`, set when the
@@ -465,6 +468,8 @@ impl DatabaseStore {
             schema_cache: HashMap::new(),
             prefetching_schema: HashSet::new(),
             run_configurations: Vec::new(),
+            exec_jobs: Vec::new(),
+            next_exec_job_id: 0,
         }
     }
 

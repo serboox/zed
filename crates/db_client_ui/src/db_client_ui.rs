@@ -21,6 +21,7 @@ mod schema_diff;
 mod sql_ast;
 mod sql_binder;
 mod sql_completion_provider;
+pub mod sql_exec;
 mod sql_validator;
 mod store;
 mod table_copy;
@@ -31,6 +32,7 @@ pub use panel::{
     format_current_sql_query, new_query_for_active_connection, open_new_sql_query,
     run_current_sql_query, run_sql_file, save_run_configuration, toggle_inline_results,
 };
+pub use sql_exec::ExecStatusIndicator;
 pub use store::{CliQueryOutput, DatabaseStore, GlobalDatabaseStore};
 
 use gpui::App;

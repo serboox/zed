@@ -441,14 +441,10 @@ fn show_create_table_reference(sql: &str) -> Option<SqlTableReference> {
 fn statement_table_reference_at_offset(text: &str, offset: usize) -> Option<SqlTableReference> {
     let lexical_reference = lexical_table_reference_at_offset(text, offset)?;
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor]
-        .rfind(';')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let statement_end = text[cursor..]
-        .find(';')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len());
+    let Range {
+        start: statement_start,
+        end: statement_end,
+    } = statement_bounds_at_offset(text, cursor);
     let statement = &text[statement_start..statement_end];
     let mut statement_reference =
         show_create_table_reference(statement).or_else(|| select_table_reference(statement))?;
@@ -511,14 +507,10 @@ fn show_create_database_reference(sql: &str) -> Option<SqlDatabaseReference> {
 // cursor is on the table part, so the table path keeps its existing behavior.
 fn database_reference_at_offset(text: &str, offset: usize) -> Option<SqlDatabaseReference> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor]
-        .rfind(';')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let statement_end = text[cursor..]
-        .find(';')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len());
+    let Range {
+        start: statement_start,
+        end: statement_end,
+    } = statement_bounds_at_offset(text, cursor);
     let statement = &text[statement_start..statement_end];
 
     if let Some(mut reference) = show_create_database_reference(statement) {
@@ -716,14 +708,10 @@ fn from_tables_at_offset(
     offset: usize,
 ) -> Vec<crate::sql_completion_provider::TableRef> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor]
-        .rfind(';')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let statement_end = text[cursor..]
-        .find(';')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len());
+    let Range {
+        start: statement_start,
+        end: statement_end,
+    } = statement_bounds_at_offset(text, cursor);
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
     let scope_start =
@@ -793,14 +781,10 @@ fn find_on_duplicate_key_update(statement: &str) -> Option<usize> {
 // target table instead of the trailing SELECT's FROM tables.
 fn insert_column_context_at_offset(text: &str, offset: usize) -> Option<InsertColumnContext> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor]
-        .rfind(';')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let statement_end = text[cursor..]
-        .find(';')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len());
+    let Range {
+        start: statement_start,
+        end: statement_end,
+    } = statement_bounds_at_offset(text, cursor);
     let statement = &text[statement_start..statement_end];
     let target = insert_into_target(statement)?;
     let bytes = statement.as_bytes();
@@ -856,14 +840,10 @@ struct DerivedTableRef {
 // outer query resolves through the derived table to its real source column.
 fn derived_tables_at_offset(text: &str, offset: usize) -> Vec<DerivedTableRef> {
     let cursor = offset.min(text.len());
-    let statement_start = text[..cursor]
-        .rfind(';')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let statement_end = text[cursor..]
-        .find(';')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len());
+    let Range {
+        start: statement_start,
+        end: statement_end,
+    } = statement_bounds_at_offset(text, cursor);
     let statement = &text[statement_start..statement_end];
     let relative_cursor = (cursor - statement_start).min(statement.len());
     let scope_start =
@@ -1641,6 +1621,75 @@ impl DbSemanticsProvider {
     }
 }
 
+// Byte offsets of every top-level `;` in `text` -- i.e. semicolons that are
+// NOT inside a `'...'` or `"..."` string literal. Both SQL's doubled-quote
+// escape (`''`/`""`) and a backslash escape are honored, so a `;` embedded in
+// a value (e.g. a PHP-serialized string like `a:9:{i:60;i:1;...}`) is never
+// mistaken for a statement boundary. Comments are not tracked here (only
+// `skip_leading_whitespace_and_comments` handles those, at the very start of
+// a statement) -- a `;` inside a `-- ...`/`/* ... */` comment mid-statement
+// is a rare enough case to leave as a known gap. Operating on bytes is safe:
+// the characters checked (`'`, `"`, `;`, `\`) are all ASCII, so they can
+// never appear as part of a multi-byte UTF-8 continuation sequence.
+fn unquoted_semicolon_offsets(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut offsets = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(q) => {
+                if byte == b'\\' && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if byte == q {
+                    if bytes.get(index + 1) == Some(&q) {
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                index += 1;
+            }
+            None => {
+                if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
+                } else if byte == b';' {
+                    offsets.push(index);
+                }
+                index += 1;
+            }
+        }
+    }
+    offsets
+}
+
+// The `;`-delimited statement bounds containing byte offset `cursor`, aware
+// of string-literal-quoted semicolons via `unquoted_semicolon_offsets`. This
+// is the single shared implementation for every "which statement is the
+// cursor in" resolution (run-at-cursor, FK/table/database reference
+// look-up, completion scoping, INSERT column context) -- do not reintroduce
+// a local `rfind(';')`/`find(';')` pair, which silently breaks on any value
+// containing a semicolon.
+fn statement_bounds_at_offset(text: &str, cursor: usize) -> Range<usize> {
+    let cursor = cursor.min(text.len());
+    let offsets = unquoted_semicolon_offsets(text);
+    let start = offsets
+        .iter()
+        .rev()
+        .find(|&&offset| offset < cursor)
+        .map(|&offset| offset + 1)
+        .unwrap_or(0);
+    let end = offsets
+        .iter()
+        .find(|&&offset| offset >= cursor)
+        .copied()
+        .unwrap_or(text.len());
+    start..end
+}
+
 // A cursor sitting immediately after a statement's own `;` (e.g. the caret
 // left at end-of-line right after typing or clicking there) must still
 // resolve to that statement, not the next one -- otherwise `rfind`/`find`
@@ -1661,17 +1710,13 @@ fn rewind_past_own_semicolon(text: &str, cursor: usize) -> usize {
 #[cfg(test)]
 fn statement_at_cursor(text: &str, cursor: usize) -> String {
     let cursor = rewind_past_own_semicolon(text, cursor);
-    let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
-    let end = text[cursor..]
-        .find(';')
-        .map(|i| cursor + i)
-        .unwrap_or(text.len());
-    text[start..end].trim().to_string()
+    let bounds = statement_bounds_at_offset(text, cursor);
+    text[bounds].trim().to_string()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SqlStatementRun {
-    sql: String,
+pub(crate) struct SqlStatementRun {
+    pub(crate) sql: String,
     start_row: u32,
     end_row: u32,
 }
@@ -1701,12 +1746,7 @@ fn trim_sql_range(text: &str, range: Range<usize>) -> Option<Range<usize>> {
 
 fn statement_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
     let cursor = rewind_past_own_semicolon(text, cursor);
-    let start = text[..cursor].rfind(';').map(|i| i + 1).unwrap_or(0);
-    let end = text[cursor..]
-        .find(';')
-        .map(|i| cursor + i)
-        .unwrap_or(text.len());
-    trim_sql_range(text, start..end)
+    trim_sql_range(text, statement_bounds_at_offset(text, cursor))
 }
 
 // Finds the byte offset, relative to `s`, of the first byte that is not
@@ -1746,15 +1786,12 @@ fn skip_leading_whitespace_and_comments(s: &str) -> usize {
     offset
 }
 
-fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementRun> {
+pub(crate) fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementRun> {
     let Some(range) = trim_sql_range(text, range) else {
         return Vec::new();
     };
     let mut statements = Vec::new();
     let mut start = range.start;
-    let Some(selected_text) = text.get(range.clone()) else {
-        return Vec::new();
-    };
     let push_statement = |statements: &mut Vec<SqlStatementRun>, trimmed: Range<usize>| {
         let Some(segment) = text.get(trimmed.clone()) else {
             return;
@@ -1773,12 +1810,17 @@ fn statement_runs_in_range(text: &str, range: Range<usize>) -> Vec<SqlStatementR
             end_row: row_for_byte_offset(text, trimmed.end),
         });
     };
-    for relative_semicolon in selected_text.match_indices(';').map(|(ix, _)| ix) {
-        let end = range.start + relative_semicolon;
-        if let Some(trimmed) = trim_sql_range(text, start..end) {
+    for semicolon in unquoted_semicolon_offsets(text) {
+        if semicolon < range.start {
+            continue;
+        }
+        if semicolon >= range.end {
+            break;
+        }
+        if let Some(trimmed) = trim_sql_range(text, start..semicolon) {
             push_statement(&mut statements, trimmed);
         }
-        start = end + 1;
+        start = semicolon + 1;
     }
     if let Some(trimmed) = trim_sql_range(text, start..range.end) {
         push_statement(&mut statements, trimmed);
@@ -5157,6 +5199,31 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    fn open_exec_dialog(
+        &mut self,
+        id: ConnectionId,
+        database: String,
+        connection_label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let label_for_run = connection_label.clone();
+        let on_run: crate::sql_exec::ExecRunCallback =
+            Arc::new(move |sql_text, _window, cx: &mut App| {
+                store.update(cx, |store, cx| {
+                    store.start_exec_job(id, database.clone(), label_for_run.clone(), sql_text, cx);
+                });
+            });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    crate::sql_exec::ExecDialog::new(connection_label, window, cx).on_run(on_run)
+                });
+            })
+            .log_err();
+    }
+
     fn dismiss_dump_task(&mut self, task_id: usize, cx: &mut Context<Self>) {
         // Dropping the runner handle cancels a dump that is still running.
         self.dump
@@ -6761,6 +6828,8 @@ impl DatabasePanel {
         // (see `IconButton::new`), which is not unique enough for tests to
         // target a specific action here — each button is wrapped in a plain
         // div carrying an explicit, stable selector instead.
+        let label_for_exec = label.clone();
+        let database_for_exec = database.clone();
         h_flex()
             .gap_1()
             .px_2()
@@ -6798,6 +6867,29 @@ impl DatabasePanel {
                                     .log_err();
                             })),
                     ),
+            )
+            .child(
+                div().debug_selector(|| "selection-exec".to_string()).child(
+                    IconButton::new("selection-exec", IconName::Terminal)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(!has_selection || driver == Some(DatabaseDriver::Aerospike))
+                        .tooltip(Tooltip::text(
+                            "Exec — run a heavy or multi-statement script, separate from \
+                             the SQL Queries console",
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let (Some(id), Some(label)) = (id, label_for_exec.clone()) else {
+                                return;
+                            };
+                            this.open_exec_dialog(
+                                id,
+                                database_for_exec.clone(),
+                                label.into(),
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
             )
             .child(
                 div()
@@ -9435,10 +9527,7 @@ mod tests {
     #[test]
     fn new_query_button_label_is_driver_specific_for_mongo() {
         assert_eq!(new_query_button_label(DatabaseDriver::MongoDB), "Queries");
-        assert_eq!(
-            new_query_button_label(DatabaseDriver::MySQL),
-            "SQL Queries"
-        );
+        assert_eq!(new_query_button_label(DatabaseDriver::MySQL), "SQL Queries");
         assert_eq!(
             new_query_button_label(DatabaseDriver::Cassandra),
             "SQL Queries"
@@ -9493,6 +9582,49 @@ mod tests {
                     sql: "SHOW CREATE TABLE schema.table".to_string(),
                     start_row: 4,
                     end_row: 4,
+                },
+            ]
+        );
+    }
+
+    // Fails against the pre-fix code (`statement_at_cursor`/`statement_range_at_cursor`
+    // used a plain `rfind(';')`/`find(';')` pair): a semicolon embedded inside a
+    // quoted string value -- e.g. a PHP-serialized column value like
+    // `a:9:{i:60;i:1;...}` -- was mistaken for a statement boundary, truncating
+    // "Run statement at cursor" to a syntactically broken fragment ending mid-string.
+    #[test]
+    fn statement_at_cursor_does_not_split_on_a_semicolon_inside_a_string_literal() {
+        let text = "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;s:4:\"week\";i:1;}');\nSELECT 1;";
+        assert_eq!(
+            super::statement_at_cursor(text, 10),
+            "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;s:4:\"week\";i:1;}')"
+        );
+        // The cursor in the second, unrelated statement must still resolve to
+        // just that statement, not accidentally swallow the first one too.
+        let second_start = text.rfind("SELECT 1").expect("SELECT 1 present");
+        assert_eq!(
+            super::statement_at_cursor(text, second_start + 3),
+            "SELECT 1"
+        );
+    }
+
+    #[test]
+    fn statement_runs_in_range_does_not_split_a_multi_row_insert_on_embedded_semicolons() {
+        let text = "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;}'), ('b;c');\nSELECT 1;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+
+        assert_eq!(
+            runs,
+            vec![
+                super::SqlStatementRun {
+                    sql: "INSERT INTO t (data) VALUES ('a:9:{i:60;i:1;}'), ('b;c')".to_string(),
+                    start_row: 0,
+                    end_row: 0,
+                },
+                super::SqlStatementRun {
+                    sql: "SELECT 1".to_string(),
+                    start_row: 1,
+                    end_row: 1,
                 },
             ]
         );
@@ -10111,18 +10243,12 @@ mod tests {
             "a whitespace-only console counts as empty"
         );
         assert_eq!(
-            super::append_sample_query(
-                "SELECT 1;",
-                "SELECT * FROM users LIMIT 1;"
-            ),
+            super::append_sample_query("SELECT 1;", "SELECT * FROM users LIMIT 1;"),
             "SELECT 1;\nSELECT * FROM users LIMIT 1;",
             "existing content must be preserved, with the sample appended on a new line"
         );
         assert_eq!(
-            super::append_sample_query(
-                "SELECT 1;\n\n",
-                "SELECT * FROM users LIMIT 1;"
-            ),
+            super::append_sample_query("SELECT 1;\n\n", "SELECT * FROM users LIMIT 1;"),
             "SELECT 1;\nSELECT * FROM users LIMIT 1;",
             "trailing blank lines in the existing console must not accumulate on every append"
         );
@@ -14422,6 +14548,62 @@ mod tests {
             assert!(
                 !labels.contains(&"bar-target-a (copy)".to_string()),
                 "the unselected connection A must be left untouched, got {labels:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_the_exec_button_opens_the_exec_dialog_for_the_selected_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "exec-ui-test".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let conn_bounds = cx
+            .debug_bounds(format!("conn-header-{connection_id}").leak())
+            .expect("expected debug bounds for conn-header");
+        let conn_row = gpui::Point {
+            x: conn_bounds.origin.x + px(20.),
+            y: conn_bounds.center().y,
+        };
+        cx.simulate_click(conn_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity,
+                Some(SelectedEntity::Connection(connection_id)),
+                "the connection row must be selected before the Exec button is enabled"
+            );
+        });
+
+        let exec_button = debug_center(&mut cx, "selection-exec");
+        cx.simulate_click(exec_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        workspace.update(&mut cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .active_modal::<crate::sql_exec::ExecDialog>(cx)
+                    .is_some(),
+                "clicking the Exec button must open the ExecDialog modal"
             );
         });
     }
