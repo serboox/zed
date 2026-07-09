@@ -1,4 +1,7 @@
-use api_client::{Collection, Environment, Folder, FolderId, HttpMethod, Request, RequestBody};
+use api_client::{
+    ApiKeyPlacement, AuthConfig, Collection, Environment, Folder, FolderId, HttpMethod, Request,
+    RequestBody,
+};
 use serde_json::{Value, json};
 
 /// Serializes `header` rows to Postman's own header shape:
@@ -17,11 +20,106 @@ fn headers_to_postman(headers: &[api_client::Header]) -> Vec<Value> {
         .collect()
 }
 
-fn body_text(body: &RequestBody) -> String {
+/// Serializes `body` to Postman's own `body` shape -- the exact inverse of
+/// `PostmanBody`'s `Deserialize` impl in `import.rs`. Body kinds this crate
+/// has no Postman-native representation for (`FormData`, `Binary`) fall back
+/// to an empty raw body, matching how `import.rs` never produces them either.
+fn body_to_postman(body: &RequestBody) -> Value {
     match body {
-        RequestBody::Raw { text, .. } => text.clone(),
-        _ => String::new(),
+        RequestBody::Raw { text, .. } => json!({ "mode": "raw", "raw": text }),
+        RequestBody::UrlEncoded(pairs) => json!({
+            "mode": "urlencoded",
+            "urlencoded": pairs
+                .iter()
+                .map(|(key, value)| json!({ "key": key, "value": value, "disabled": false }))
+                .collect::<Vec<_>>(),
+        }),
+        RequestBody::GraphQl { query, variables } => json!({
+            "mode": "graphql",
+            "graphql": { "query": query, "variables": variables },
+        }),
+        RequestBody::None | RequestBody::FormData(_) | RequestBody::Binary { .. } => {
+            json!({ "mode": "raw", "raw": "" })
+        }
     }
+}
+
+/// Serializes `auth` to Postman's own `auth` block shape -- the exact
+/// inverse of `parse_postman_auth` in `import.rs`. `AuthConfig::Inherit`
+/// exports as no `auth` key at all (`None`), matching Postman's own
+/// omit-to-inherit convention; `OAuth2`/`AwsSigV4` have no Postman-native
+/// auth type, so they export as `"noauth"` rather than losing the request
+/// silently or crashing the export.
+fn auth_to_postman(auth: &AuthConfig) -> Option<Value> {
+    match auth {
+        AuthConfig::Inherit => None,
+        AuthConfig::None | AuthConfig::OAuth2(_) | AuthConfig::AwsSigV4(_) => {
+            Some(json!({ "type": "noauth" }))
+        }
+        AuthConfig::Basic { username, password } => Some(json!({
+            "type": "basic",
+            "basic": [
+                { "key": "username", "value": username },
+                { "key": "password", "value": password },
+            ],
+        })),
+        AuthConfig::Bearer { token } => Some(json!({
+            "type": "bearer",
+            "bearer": [{ "key": "token", "value": token }],
+        })),
+        AuthConfig::ApiKey {
+            key,
+            value,
+            placement,
+        } => Some(json!({
+            "type": "apikey",
+            "apikey": [
+                { "key": "key", "value": key },
+                { "key": "value", "value": value },
+                {
+                    "key": "in",
+                    "value": if *placement == ApiKeyPlacement::Query { "query" } else { "header" },
+                },
+            ],
+        })),
+        AuthConfig::Jwt(config) => Some(json!({
+            "type": "jwt",
+            "jwt": [
+                { "key": "algorithm", "value": config.algorithm.as_str() },
+                { "key": "secret", "value": config.secret },
+                { "key": "isSecretBase64Encoded", "value": config.is_secret_base64_encoded },
+                { "key": "payload", "value": config.payload },
+                { "key": "headerPrefix", "value": config.header_prefix },
+                {
+                    "key": "addTokenTo",
+                    "value": if config.add_to_query_param { "queryParams" } else { "header" },
+                },
+                { "key": "queryParamKey", "value": config.query_param_key },
+            ],
+        })),
+    }
+}
+
+/// Serializes a request's scripts to Postman's `event` array -- the exact
+/// inverse of `scripts_from_events` in `import.rs`. An empty script produces
+/// no `event` entry for that listener, matching how a Postman request with
+/// no script for a given phase omits it entirely rather than emitting an
+/// entry with empty `exec`.
+fn scripts_to_postman(request: &Request) -> Vec<Value> {
+    let mut events = Vec::new();
+    if !request.pre_request_script.is_empty() {
+        events.push(json!({
+            "listen": "prerequest",
+            "script": { "type": "text/javascript", "exec": [request.pre_request_script] },
+        }));
+    }
+    if !request.test_script.is_empty() {
+        events.push(json!({
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [request.test_script] },
+        }));
+    }
+    events
 }
 
 /// Serializes one `Request`'s saved examples to Postman's embedded
@@ -58,16 +156,25 @@ fn request_to_postman_item(request: &Request) -> Value {
         HttpMethod::Custom(name) => name.clone(),
         other => other.as_str().to_string(),
     };
-    json!({
+    let mut postman_request = json!({
+        "method": method,
+        "url": { "raw": request.url },
+        "header": headers_to_postman(&request.headers),
+        "body": body_to_postman(&request.body),
+    });
+    if let Some(auth) = auth_to_postman(&request.auth) {
+        postman_request["auth"] = auth;
+    }
+    let mut item = json!({
         "name": request.name,
-        "request": {
-            "method": method,
-            "url": { "raw": request.url },
-            "header": headers_to_postman(&request.headers),
-            "body": { "mode": "raw", "raw": body_text(&request.body) },
-        },
+        "request": postman_request,
         "response": examples_to_postman(request),
-    })
+    });
+    let events = scripts_to_postman(request);
+    if !events.is_empty() {
+        item["event"] = json!(events);
+    }
+    item
 }
 
 /// Builds the `item` array for one folder level: every request directly in
@@ -244,6 +351,137 @@ mod tests {
         assert_eq!(examples[0].name, "200 OK");
         assert_eq!(examples[0].response_status, 200);
         assert_eq!(examples[0].response_body, r#"{"id":1}"#);
+    }
+
+    #[test]
+    fn basic_auth_round_trips_through_export_and_reimport() {
+        let collection = Collection::new("Sample API".to_string());
+        let mut request = Request::new(collection.id, "Get users".to_string());
+        request.auth = AuthConfig::Basic {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+
+        match &reimported.requests[0].auth {
+            AuthConfig::Basic { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected AuthConfig::Basic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jwt_auth_round_trips_through_export_and_reimport() {
+        let collection = Collection::new("Sample API".to_string());
+        let mut request = Request::new(collection.id, "Get users".to_string());
+        request.auth = AuthConfig::Jwt(api_client::JwtAuthConfig {
+            algorithm: api_client::JwtAlgorithm::HS384,
+            secret: "changeit".to_string(),
+            is_secret_base64_encoded: true,
+            payload: r#"{"sub":"user-1"}"#.to_string(),
+            header_prefix: "Bearer".to_string(),
+            add_to_query_param: true,
+            query_param_key: "token".to_string(),
+        });
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+
+        match &reimported.requests[0].auth {
+            AuthConfig::Jwt(config) => {
+                assert_eq!(config.algorithm, api_client::JwtAlgorithm::HS384);
+                assert_eq!(config.secret, "changeit");
+                assert!(config.is_secret_base64_encoded);
+                assert_eq!(config.payload, r#"{"sub":"user-1"}"#);
+                assert!(config.add_to_query_param);
+                assert_eq!(config.query_param_key, "token");
+            }
+            other => panic!("expected AuthConfig::Jwt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_inherited_auth_config_exports_with_no_auth_key_and_reimports_as_inherit() {
+        let collection = Collection::new("Sample API".to_string());
+        let request = Request::new(collection.id, "Get users".to_string());
+        assert!(matches!(request.auth, AuthConfig::Inherit));
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        assert!(
+            !serde_json::from_str::<Value>(&exported).unwrap()["item"][0]["request"]
+                .as_object()
+                .unwrap()
+                .contains_key("auth")
+        );
+
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+        assert!(matches!(reimported.requests[0].auth, AuthConfig::Inherit));
+    }
+
+    #[test]
+    fn pre_request_and_test_scripts_round_trip_through_export_and_reimport() {
+        let collection = Collection::new("Sample API".to_string());
+        let mut request = Request::new(collection.id, "Get users".to_string());
+        request.pre_request_script = "pm.environment.set(\"x\", 1);".to_string();
+        request.test_script = "pm.test(\"ok\", () => {});".to_string();
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+
+        assert_eq!(
+            reimported.requests[0].pre_request_script,
+            "pm.environment.set(\"x\", 1);"
+        );
+        assert_eq!(
+            reimported.requests[0].test_script,
+            "pm.test(\"ok\", () => {});"
+        );
+    }
+
+    #[test]
+    fn a_urlencoded_body_round_trips_through_export_and_reimport() {
+        let collection = Collection::new("Sample API".to_string());
+        let mut request = Request::new(collection.id, "Login".to_string());
+        request.body = RequestBody::UrlEncoded(vec![(
+            "grant_type".to_string(),
+            "client_credentials".to_string(),
+        )]);
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+
+        match &reimported.requests[0].body {
+            RequestBody::UrlEncoded(pairs) => assert_eq!(
+                pairs,
+                &vec![("grant_type".to_string(), "client_credentials".to_string())]
+            ),
+            other => panic!("expected RequestBody::UrlEncoded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_graphql_body_round_trips_through_export_and_reimport() {
+        let collection = Collection::new("Sample API".to_string());
+        let mut request = Request::new(collection.id, "Query users".to_string());
+        request.body = RequestBody::GraphQl {
+            query: "query { users { id } }".to_string(),
+            variables: "{}".to_string(),
+        };
+
+        let exported = export_postman_collection(&collection, &[], &[request]);
+        let reimported = crate::import::parse_postman_collection(&exported).unwrap();
+
+        match &reimported.requests[0].body {
+            RequestBody::GraphQl { query, variables } => {
+                assert_eq!(query, "query { users { id } }");
+                assert_eq!(variables, "{}");
+            }
+            other => panic!("expected RequestBody::GraphQl, got {other:?}"),
+        }
     }
 
     #[test]

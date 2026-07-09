@@ -90,6 +90,25 @@ pub fn build_resolved_request(
                 config,
             );
         }
+        AuthConfig::Jwt(config) => {
+            if let Some(token) = crate::jwt::sign_jwt(config) {
+                if config.add_to_query_param {
+                    let key = if config.query_param_key.is_empty() {
+                        "token".to_string()
+                    } else {
+                        resolve(&config.query_param_key)
+                    };
+                    append_query_params(&mut url, &[(key, token)]);
+                } else {
+                    let prefix = if config.header_prefix.is_empty() {
+                        "Bearer".to_string()
+                    } else {
+                        config.header_prefix.clone()
+                    };
+                    headers.push(("Authorization".to_string(), format!("{prefix} {token}")));
+                }
+            }
+        }
         AuthConfig::Inherit | AuthConfig::None => {}
     }
 

@@ -1,9 +1,11 @@
 use anyhow::{Context as _, Result, bail};
 use api_client::{
-    AuthConfig, Collection, CollectionId, Environment, Folder, FolderId, Header, HttpMethod,
-    RawBodyContentType, Request, RequestBody, SavedExample, Variable,
+    ApiKeyPlacement, AuthConfig, Collection, CollectionId, Environment, Folder, FolderId, Header,
+    HttpMethod, JwtAlgorithm, JwtAuthConfig, RawBodyContentType, Request, RequestBody,
+    SavedExample, Variable,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// A folder-less request paste has nowhere to live in the tree on its own,
 /// so importing a single cURL command always needs a target collection (and
@@ -190,6 +192,10 @@ struct PostmanItem {
     /// `request`, not nested inside it, matching Postman's own schema.
     #[serde(default)]
     response: Vec<PostmanResponse>,
+    /// Pre-request/test scripts, a sibling of `request` in Postman's schema
+    /// (not nested inside it) -- see `scripts_from_events`.
+    #[serde(default)]
+    event: Vec<PostmanEvent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +207,143 @@ struct PostmanRequest {
     header: Vec<PostmanHeader>,
     #[serde(default)]
     body: Option<PostmanBody>,
+    #[serde(default)]
+    auth: Option<PostmanAuth>,
+}
+
+/// Postman's auth block: `{"type": "bearer", "bearer": [{"key":"token", ...}]}`
+/// -- the type name doubles as the key of the array holding that type's own
+/// params, so every auth type's param list is captured by the same flattened
+/// map rather than one dedicated field per type.
+#[derive(Debug, Deserialize)]
+struct PostmanAuth {
+    r#type: String,
+    #[serde(flatten)]
+    params: HashMap<String, Vec<PostmanAuthParam>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostmanAuthParam {
+    key: String,
+    #[serde(default)]
+    value: serde_json::Value,
+}
+
+fn auth_param_string(params: &[PostmanAuthParam], key: &str) -> String {
+    params
+        .iter()
+        .find(|param| param.key == key)
+        .map(|param| match &param.value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+fn auth_param_bool(params: &[PostmanAuthParam], key: &str) -> bool {
+    params
+        .iter()
+        .find(|param| param.key == key)
+        .and_then(|param| param.value.as_bool())
+        .unwrap_or(false)
+}
+
+/// Maps a Postman `auth` block to `AuthConfig`. `"noauth"` and any
+/// unrecognized/absent type map to `AuthConfig::None` -- Postman's own
+/// default when no `auth` key is present on a request is "inherit from
+/// parent", but since collection/folder-level auth isn't modeled on this
+/// side yet (see the module doc comment), there is nothing to inherit from,
+/// so `None` is the closer match than `Inherit`.
+fn parse_postman_auth(auth: PostmanAuth) -> AuthConfig {
+    let empty = Vec::new();
+    let params = auth.params.get(&auth.r#type).unwrap_or(&empty);
+    match auth.r#type.as_str() {
+        "noauth" => AuthConfig::None,
+        "basic" => AuthConfig::Basic {
+            username: auth_param_string(params, "username"),
+            password: auth_param_string(params, "password"),
+        },
+        "bearer" => AuthConfig::Bearer {
+            token: auth_param_string(params, "token"),
+        },
+        "apikey" => AuthConfig::ApiKey {
+            key: auth_param_string(params, "key"),
+            value: auth_param_string(params, "value"),
+            placement: if auth_param_string(params, "in") == "query" {
+                ApiKeyPlacement::Query
+            } else {
+                ApiKeyPlacement::Header
+            },
+        },
+        "jwt" => AuthConfig::Jwt(JwtAuthConfig {
+            algorithm: JwtAlgorithm::from_str(&auth_param_string(params, "algorithm")),
+            secret: auth_param_string(params, "secret"),
+            is_secret_base64_encoded: auth_param_bool(params, "isSecretBase64Encoded"),
+            payload: auth_param_string(params, "payload"),
+            header_prefix: auth_param_string(params, "headerPrefix"),
+            add_to_query_param: auth_param_string(params, "addTokenTo") == "queryParams",
+            query_param_key: auth_param_string(params, "queryParamKey"),
+        }),
+        _ => AuthConfig::None,
+    }
+}
+
+/// One `event` entry: `{"listen": "prerequest"|"test", "script": {"exec": [...]}}`.
+#[derive(Debug, Deserialize)]
+struct PostmanEvent {
+    listen: String,
+    #[serde(default)]
+    script: Option<PostmanScript>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostmanScript {
+    #[serde(default)]
+    exec: Option<PostmanScriptExec>,
+}
+
+/// Postman inconsistently emits `exec` as either an array of lines or a
+/// single string -- both are seen in real exports.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PostmanScriptExec {
+    Lines(Vec<String>),
+    Single(String),
+}
+
+impl PostmanScriptExec {
+    fn joined(&self) -> String {
+        match self {
+            PostmanScriptExec::Lines(lines) => lines.join("\n"),
+            PostmanScriptExec::Single(text) => text.clone(),
+        }
+    }
+}
+
+/// Splits `event` entries into `(pre_request_script, test_script)`,
+/// matching `Request::pre_request_script`/`test_script`. Multiple events
+/// with the same `listen` value (unusual, but not disallowed by the schema)
+/// are joined with a blank line rather than the later one silently winning.
+fn scripts_from_events(events: Vec<PostmanEvent>) -> (String, String) {
+    let mut pre_request_lines = Vec::new();
+    let mut test_lines = Vec::new();
+    for event in events {
+        let Some(exec) = event.script.and_then(|script| script.exec) else {
+            continue;
+        };
+        let joined = exec.joined();
+        if joined.is_empty() {
+            continue;
+        }
+        match event.listen.as_str() {
+            "prerequest" => pre_request_lines.push(joined),
+            "test" => test_lines.push(joined),
+            _ => {}
+        }
+    }
+    (pre_request_lines.join("\n\n"), test_lines.join("\n\n"))
 }
 
 /// One embedded "saved example" response, Postman's own name and JSON shape
@@ -249,6 +392,27 @@ struct PostmanBody {
     mode: String,
     #[serde(default)]
     raw: String,
+    #[serde(default)]
+    urlencoded: Vec<PostmanUrlEncodedParam>,
+    #[serde(default)]
+    graphql: Option<PostmanGraphQl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostmanUrlEncodedParam {
+    key: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostmanGraphQl {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    variables: String,
 }
 
 /// The result of importing a Postman collection: a `Collection` plus every
@@ -325,15 +489,40 @@ fn import_item(
                 description: None,
             })
             .collect();
-        if let Some(body) = postman_request.body
-            && body.mode == "raw"
-            && !body.raw.is_empty()
-        {
-            request.body = RequestBody::Raw {
-                content_type: guess_body_content_type(&body.raw),
-                text: body.raw,
-            };
+        if let Some(body) = postman_request.body {
+            match body.mode.as_str() {
+                "raw" if !body.raw.is_empty() => {
+                    request.body = RequestBody::Raw {
+                        content_type: guess_body_content_type(&body.raw),
+                        text: body.raw,
+                    };
+                }
+                "urlencoded" if !body.urlencoded.is_empty() => {
+                    request.body = RequestBody::UrlEncoded(
+                        body.urlencoded
+                            .into_iter()
+                            .filter(|param| !param.disabled)
+                            .map(|param| (param.key, param.value))
+                            .collect(),
+                    );
+                }
+                "graphql" => {
+                    if let Some(graphql) = body.graphql {
+                        request.body = RequestBody::GraphQl {
+                            query: graphql.query,
+                            variables: graphql.variables,
+                        };
+                    }
+                }
+                _ => {}
+            }
         }
+        if let Some(auth) = postman_request.auth {
+            request.auth = parse_postman_auth(auth);
+        }
+        let (pre_request_script, test_script) = scripts_from_events(item.event);
+        request.pre_request_script = pre_request_script;
+        request.test_script = test_script;
         request.examples = item
             .response
             .into_iter()
@@ -812,6 +1001,187 @@ mod tests {
         assert_eq!(example.response_body, r#"{"id":1}"#);
         assert_eq!(example.request_method, HttpMethod::Get);
         assert_eq!(example.request_url, "https://api.example.com/users");
+    }
+
+    const SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS: &str = r#"{
+        "info": { "name": "Sample API" },
+        "item": [
+            {
+                "name": "Basic auth request",
+                "request": {
+                    "method": "GET",
+                    "url": { "raw": "https://api.example.com/basic" },
+                    "auth": {
+                        "type": "basic",
+                        "basic": [
+                            { "key": "username", "value": "alice" },
+                            { "key": "password", "value": "secret" }
+                        ]
+                    }
+                },
+                "event": [
+                    { "listen": "prerequest", "script": { "exec": ["pm.environment.set(\"x\", 1);"] } },
+                    { "listen": "test", "script": { "exec": ["pm.test(\"ok\", () => {});"] } }
+                ]
+            },
+            {
+                "name": "JWT auth request",
+                "request": {
+                    "method": "GET",
+                    "url": { "raw": "https://api.example.com/jwt" },
+                    "auth": {
+                        "type": "jwt",
+                        "jwt": [
+                            { "key": "algorithm", "value": "HS256" },
+                            { "key": "secret", "value": "changeit" },
+                            { "key": "isSecretBase64Encoded", "value": false },
+                            { "key": "payload", "value": "{\"sub\":\"user-1\"}" },
+                            { "key": "headerPrefix", "value": "Bearer" },
+                            { "key": "addTokenTo", "value": "header" }
+                        ]
+                    }
+                }
+            },
+            {
+                "name": "No auth request",
+                "request": {
+                    "method": "GET",
+                    "url": { "raw": "https://api.example.com/public" },
+                    "auth": { "type": "noauth" }
+                }
+            },
+            {
+                "name": "Form request",
+                "request": {
+                    "method": "POST",
+                    "url": { "raw": "https://api.example.com/form" },
+                    "body": {
+                        "mode": "urlencoded",
+                        "urlencoded": [
+                            { "key": "grant_type", "value": "client_credentials" },
+                            { "key": "disabled_field", "value": "x", "disabled": true }
+                        ]
+                    }
+                }
+            },
+            {
+                "name": "GraphQL request",
+                "request": {
+                    "method": "POST",
+                    "url": { "raw": "https://api.example.com/graphql" },
+                    "body": {
+                        "mode": "graphql",
+                        "graphql": {
+                            "query": "query { users { id } }",
+                            "variables": "{}"
+                        }
+                    }
+                }
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn basic_auth_is_parsed_from_the_postman_auth_block() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "Basic auth request")
+            .unwrap();
+        match &request.auth {
+            AuthConfig::Basic { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected AuthConfig::Basic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_request_and_test_scripts_are_parsed_from_the_event_array() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "Basic auth request")
+            .unwrap();
+        assert_eq!(request.pre_request_script, "pm.environment.set(\"x\", 1);");
+        assert_eq!(request.test_script, "pm.test(\"ok\", () => {});");
+    }
+
+    #[test]
+    fn jwt_auth_is_parsed_from_the_postman_auth_block() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "JWT auth request")
+            .unwrap();
+        match &request.auth {
+            AuthConfig::Jwt(config) => {
+                assert_eq!(config.algorithm, JwtAlgorithm::HS256);
+                assert_eq!(config.secret, "changeit");
+                assert!(!config.is_secret_base64_encoded);
+                assert_eq!(config.payload, r#"{"sub":"user-1"}"#);
+                assert_eq!(config.header_prefix, "Bearer");
+                assert!(!config.add_to_query_param);
+            }
+            other => panic!("expected AuthConfig::Jwt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_noauth_block_maps_to_auth_config_none() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "No auth request")
+            .unwrap();
+        assert!(matches!(request.auth, AuthConfig::None));
+    }
+
+    #[test]
+    fn a_urlencoded_body_skips_disabled_fields() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "Form request")
+            .unwrap();
+        match &request.body {
+            RequestBody::UrlEncoded(pairs) => {
+                assert_eq!(
+                    pairs,
+                    &vec![("grant_type".to_string(), "client_credentials".to_string())]
+                );
+            }
+            other => panic!("expected RequestBody::UrlEncoded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_graphql_body_is_parsed_into_query_and_variables() {
+        let imported =
+            parse_postman_collection(SAMPLE_POSTMAN_COLLECTION_WITH_AUTH_AND_SCRIPTS).unwrap();
+        let request = imported
+            .requests
+            .iter()
+            .find(|request| request.name == "GraphQL request")
+            .unwrap();
+        match &request.body {
+            RequestBody::GraphQl { query, variables } => {
+                assert_eq!(query, "query { users { id } }");
+                assert_eq!(variables, "{}");
+            }
+            other => panic!("expected RequestBody::GraphQl, got {other:?}"),
+        }
     }
 
     const SAMPLE_POSTMAN_ENVIRONMENT: &str = r#"{

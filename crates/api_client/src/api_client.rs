@@ -8,6 +8,7 @@ pub mod grpc_dynamic_codec;
 pub mod grpc_reflection;
 pub mod history;
 pub mod http_send;
+pub mod jwt;
 pub mod network_runtime;
 pub mod oauth2;
 pub mod request;
@@ -30,6 +31,7 @@ pub use http_send::{
     HttpResponseSummary, ParsedCookie, ResolvedRequest, build_resolved_request, execute,
     parse_set_cookie_headers,
 };
+pub use jwt::sign_jwt;
 pub use oauth2::{
     OAuth2Config, OAuth2GrantType, PkcePendingAuthorization, TokenRequest, TokenResponse,
     authorization_code_token_request, begin_pkce_authorization, build_authorization_url,
@@ -39,7 +41,8 @@ pub use oauth2::{
 pub use prost_reflect::DescriptorPool;
 pub use request::{
     ApiKeyPlacement, AuthConfig, ExampleId, FormDataField, FormDataValue, Header, HttpMethod,
-    QueryParam, RawBodyContentType, Request, RequestBody, RequestId, RequestSettings, SavedExample,
+    JwtAlgorithm, JwtAuthConfig, QueryParam, RawBodyContentType, Request, RequestBody, RequestId,
+    RequestSettings, SavedExample,
 };
 pub use scripting::{
     ScriptRequestData, ScriptResponseData, ScriptRunResult, TestResult, run_pre_request_script,

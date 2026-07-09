@@ -2,9 +2,9 @@ use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::ApiClientStore;
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{
-    ApiKeyPlacement, AuthConfig, AwsSigV4Config, Header, HistoryEntry, HttpMethod, OAuth2Config,
-    OAuth2GrantType, QueryParam, RawBodyContentType, Request, RequestBody, RequestId, ResolveMode,
-    SavedExample, SystemDynamicVariableSource,
+    ApiKeyPlacement, AuthConfig, AwsSigV4Config, Header, HistoryEntry, HttpMethod, JwtAlgorithm,
+    JwtAuthConfig, OAuth2Config, OAuth2GrantType, QueryParam, RawBodyContentType, Request,
+    RequestBody, RequestId, ResolveMode, SavedExample, SystemDynamicVariableSource,
 };
 use editor::{Editor, EditorEvent, HighlightKey};
 use gpui::{
@@ -228,6 +228,7 @@ enum AuthKind {
     ApiKey,
     OAuth2,
     AwsSigV4,
+    Jwt,
 }
 
 /// Status of the last "Get New Access Token" attempt -- surfaced next to
@@ -274,6 +275,13 @@ pub struct RequestView {
     aws_region_editor: Entity<Editor>,
     aws_service_editor: Entity<Editor>,
     aws_session_token_editor: Entity<Editor>,
+    jwt_algorithm: JwtAlgorithm,
+    jwt_secret_editor: Entity<Editor>,
+    jwt_is_secret_base64_encoded: bool,
+    jwt_payload_editor: Entity<Editor>,
+    jwt_header_prefix_editor: Entity<Editor>,
+    jwt_add_to_query_param: bool,
+    jwt_query_param_key_editor: Entity<Editor>,
     send_state: SendState,
     response_tab: ResponseTab,
     pretty_body_editor: Entity<Editor>,
@@ -387,6 +395,15 @@ impl RequestView {
                     String::new(),
                     ApiKeyPlacement::Header,
                 ),
+                AuthConfig::Jwt(_) => (
+                    AuthKind::Jwt,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    ApiKeyPlacement::Header,
+                ),
             };
 
         let oauth2_config = match &request.auth {
@@ -397,6 +414,11 @@ impl RequestView {
         let aws_config = match &request.auth {
             AuthConfig::AwsSigV4(config) => config.clone(),
             _ => AwsSigV4Config::default(),
+        };
+
+        let jwt_config = match &request.auth {
+            AuthConfig::Jwt(config) => config.clone(),
+            _ => JwtAuthConfig::default(),
         };
 
         let auth_username_editor = new_single_line_editor("Username", &username, window, cx);
@@ -432,6 +454,19 @@ impl RequestView {
             window,
             cx,
         );
+        let jwt_secret_editor = new_single_line_editor("Secret", &jwt_config.secret, window, cx);
+        let jwt_payload_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_placeholder_text(r#"{"sub":"user-1"}"#, window, cx);
+            if !jwt_config.payload.is_empty() {
+                editor.set_text(jwt_config.payload.clone(), window, cx);
+            }
+            editor
+        });
+        let jwt_header_prefix_editor =
+            new_single_line_editor("Bearer", &jwt_config.header_prefix, window, cx);
+        let jwt_query_param_key_editor =
+            new_single_line_editor("token", &jwt_config.query_param_key, window, cx);
 
         let pretty_body_editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
@@ -509,6 +544,13 @@ impl RequestView {
             aws_region_editor,
             aws_service_editor,
             aws_session_token_editor,
+            jwt_algorithm: jwt_config.algorithm,
+            jwt_secret_editor,
+            jwt_is_secret_base64_encoded: jwt_config.is_secret_base64_encoded,
+            jwt_payload_editor,
+            jwt_header_prefix_editor,
+            jwt_add_to_query_param: jwt_config.add_to_query_param,
+            jwt_query_param_key_editor,
             send_state: SendState::Idle,
             response_tab: ResponseTab::Pretty,
             pretty_body_editor,
@@ -658,6 +700,33 @@ impl RequestView {
         );
         this.watch_editor(
             this.aws_session_token_editor.clone(),
+            window,
+            cx,
+            |this, _, cx| {
+                this.persist_auth(cx);
+            },
+        );
+        this.watch_editor(this.jwt_secret_editor.clone(), window, cx, |this, _, cx| {
+            this.persist_auth(cx);
+        });
+        this.watch_editor(
+            this.jwt_payload_editor.clone(),
+            window,
+            cx,
+            |this, _, cx| {
+                this.persist_auth(cx);
+            },
+        );
+        this.watch_editor(
+            this.jwt_header_prefix_editor.clone(),
+            window,
+            cx,
+            |this, _, cx| {
+                this.persist_auth(cx);
+            },
+        );
+        this.watch_editor(
+            this.jwt_query_param_key_editor.clone(),
             window,
             cx,
             |this, _, cx| {
@@ -887,6 +956,15 @@ impl RequestView {
                 service: self.aws_service_editor.read(cx).text(cx),
                 session_token: self.aws_session_token_editor.read(cx).text(cx),
             }),
+            AuthKind::Jwt => AuthConfig::Jwt(JwtAuthConfig {
+                algorithm: self.jwt_algorithm,
+                secret: self.jwt_secret_editor.read(cx).text(cx),
+                is_secret_base64_encoded: self.jwt_is_secret_base64_encoded,
+                payload: self.jwt_payload_editor.read(cx).text(cx),
+                header_prefix: self.jwt_header_prefix_editor.read(cx).text(cx),
+                add_to_query_param: self.jwt_add_to_query_param,
+                query_param_key: self.jwt_query_param_key_editor.read(cx).text(cx),
+            }),
         };
         let request_id = self.request_id;
         self.store.update(cx, |store, cx| {
@@ -923,6 +1001,24 @@ impl RequestView {
 
     fn set_api_key_placement(&mut self, placement: ApiKeyPlacement, cx: &mut Context<Self>) {
         self.auth_api_key_placement = placement;
+        self.persist_auth(cx);
+        cx.notify();
+    }
+
+    fn set_jwt_algorithm(&mut self, algorithm: JwtAlgorithm, cx: &mut Context<Self>) {
+        self.jwt_algorithm = algorithm;
+        self.persist_auth(cx);
+        cx.notify();
+    }
+
+    fn set_jwt_secret_base64_encoded(&mut self, is_base64_encoded: bool, cx: &mut Context<Self>) {
+        self.jwt_is_secret_base64_encoded = is_base64_encoded;
+        self.persist_auth(cx);
+        cx.notify();
+    }
+
+    fn set_jwt_add_to_query_param(&mut self, add_to_query_param: bool, cx: &mut Context<Self>) {
+        self.jwt_add_to_query_param = add_to_query_param;
         self.persist_auth(cx);
         cx.notify();
     }
@@ -1704,6 +1800,15 @@ impl RequestView {
                             |this, _, _, cx| {
                                 this.set_auth_kind(AuthKind::AwsSigV4, cx);
                             },
+                        ))
+                        .child(Self::render_chip_scoped(
+                            "auth-kind",
+                            "JWT Bearer",
+                            auth_kind == AuthKind::Jwt,
+                            cx,
+                            |this, _, _, cx| {
+                                this.set_auth_kind(AuthKind::Jwt, cx);
+                            },
                         )),
                 );
                 match auth_kind {
@@ -1899,6 +2004,109 @@ impl RequestView {
                                 self.aws_session_token_editor.clone(),
                                 cx,
                             ));
+                    }
+                    AuthKind::Jwt => {
+                        let algorithm = self.jwt_algorithm;
+                        let is_base64_encoded = self.jwt_is_secret_base64_encoded;
+                        let add_to_query_param = self.jwt_add_to_query_param;
+                        let algorithm_row = [
+                            (JwtAlgorithm::HS256, "HS256"),
+                            (JwtAlgorithm::HS384, "HS384"),
+                            (JwtAlgorithm::HS512, "HS512"),
+                            (JwtAlgorithm::RS256, "RS256"),
+                            (JwtAlgorithm::RS384, "RS384"),
+                            (JwtAlgorithm::RS512, "RS512"),
+                        ]
+                        .into_iter()
+                        .fold(h_flex().gap_1(), |row, (value, label)| {
+                            row.child(Self::render_chip_scoped(
+                                "jwt-algorithm",
+                                label,
+                                algorithm == value,
+                                cx,
+                                move |this, _, _, cx| {
+                                    this.set_jwt_algorithm(value, cx);
+                                },
+                            ))
+                        });
+                        column = column
+                            .child(algorithm_row)
+                            .child(Self::render_field(
+                                "Secret".into(),
+                                self.jwt_secret_editor.clone(),
+                                cx,
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Self::render_chip_scoped(
+                                        "jwt-secret-encoding",
+                                        "Plain Text",
+                                        !is_base64_encoded,
+                                        cx,
+                                        |this, _, _, cx| {
+                                            this.set_jwt_secret_base64_encoded(false, cx)
+                                        },
+                                    ))
+                                    .child(Self::render_chip_scoped(
+                                        "jwt-secret-encoding",
+                                        "Base64",
+                                        is_base64_encoded,
+                                        cx,
+                                        |this, _, _, cx| {
+                                            this.set_jwt_secret_base64_encoded(true, cx)
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Label::new("Payload (JSON claims)")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child({
+                                let colors = cx.theme().colors();
+                                div()
+                                    .w_full()
+                                    .min_h(px(120.))
+                                    .px_2()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .bg(colors.background)
+                                    .child(self.jwt_payload_editor.clone())
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Self::render_chip_scoped(
+                                        "jwt-token-placement",
+                                        "Header",
+                                        !add_to_query_param,
+                                        cx,
+                                        |this, _, _, cx| this.set_jwt_add_to_query_param(false, cx),
+                                    ))
+                                    .child(Self::render_chip_scoped(
+                                        "jwt-token-placement",
+                                        "Query Param",
+                                        add_to_query_param,
+                                        cx,
+                                        |this, _, _, cx| this.set_jwt_add_to_query_param(true, cx),
+                                    )),
+                            );
+                        column = if add_to_query_param {
+                            column.child(Self::render_field(
+                                "Query Param Key".into(),
+                                self.jwt_query_param_key_editor.clone(),
+                                cx,
+                            ))
+                        } else {
+                            column.child(Self::render_field(
+                                "Header Prefix".into(),
+                                self.jwt_header_prefix_editor.clone(),
+                                cx,
+                            ))
+                        };
                     }
                 }
                 column.into_any_element()
@@ -2750,6 +2958,56 @@ mod tests {
                     assert_eq!(config.service, "execute-api");
                 }
                 other => panic!("expected AuthConfig::AwsSigV4, got {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn switching_to_jwt_and_typing_a_secret_and_payload_persists_the_full_config(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let auth_tab = debug_center(&mut cx, "request-chip-Authorization");
+        cx.simulate_click(auth_tab, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let jwt_chip = debug_center(&mut cx, "auth-kind-chip-JWT Bearer");
+        cx.simulate_click(jwt_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, _| assert_eq!(view.auth_kind, AuthKind::Jwt));
+        draw(&mut cx);
+
+        let hs384_chip = debug_center(&mut cx, "jwt-algorithm-chip-HS384");
+        cx.simulate_click(hs384_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let secret_editor = view.read_with(&cx, |view, _| view.jwt_secret_editor.clone());
+        let payload_editor = view.read_with(&cx, |view, _| view.jwt_payload_editor.clone());
+        view.update_in(&mut cx, |_, window, cx| {
+            secret_editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.simulate_input("test-secret");
+        cx.run_until_parked();
+        view.update_in(&mut cx, |_, window, cx| {
+            payload_editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.simulate_input(r#"{"sub":"user-1"}"#);
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            match &request.auth {
+                AuthConfig::Jwt(config) => {
+                    assert_eq!(config.algorithm, JwtAlgorithm::HS384);
+                    assert_eq!(config.secret, "test-secret");
+                    assert_eq!(config.payload, r#"{"sub":"user-1"}"#);
+                    assert!(!config.add_to_query_param);
+                }
+                other => panic!("expected AuthConfig::Jwt, got {other:?}"),
             }
         });
     }

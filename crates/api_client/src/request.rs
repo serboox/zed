@@ -99,12 +99,75 @@ pub enum RequestBody {
     Binary {
         path: PathBuf,
     },
+    GraphQl {
+        query: String,
+        #[serde(default)]
+        variables: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiKeyPlacement {
     Header,
     Query,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum JwtAlgorithm {
+    #[default]
+    HS256,
+    HS384,
+    HS512,
+    RS256,
+    RS384,
+    RS512,
+}
+
+impl JwtAlgorithm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JwtAlgorithm::HS256 => "HS256",
+            JwtAlgorithm::HS384 => "HS384",
+            JwtAlgorithm::HS512 => "HS512",
+            JwtAlgorithm::RS256 => "RS256",
+            JwtAlgorithm::RS384 => "RS384",
+            JwtAlgorithm::RS512 => "RS512",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "HS384" => JwtAlgorithm::HS384,
+            "HS512" => JwtAlgorithm::HS512,
+            "RS256" => JwtAlgorithm::RS256,
+            "RS384" => JwtAlgorithm::RS384,
+            "RS512" => JwtAlgorithm::RS512,
+            _ => JwtAlgorithm::HS256,
+        }
+    }
+}
+
+/// Postman's "jwt bearer" auth type: a JWT is signed from `payload` with
+/// `secret` and attached either as a bearer token header (with `header_prefix`,
+/// e.g. `"Bearer"`) or as a query parameter named `query_param_key`. `secret`
+/// is plaintext only in memory, exactly like `AuthConfig::Basic`'s `password`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JwtAuthConfig {
+    #[serde(default)]
+    pub algorithm: JwtAlgorithm,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default)]
+    pub is_secret_base64_encoded: bool,
+    /// The JWT claims, as JSON text (Postman calls this the "payload").
+    #[serde(default)]
+    pub payload: String,
+    #[serde(default)]
+    pub header_prefix: String,
+    #[serde(default)]
+    pub add_to_query_param: bool,
+    #[serde(default)]
+    pub query_param_key: String,
 }
 
 /// How a request authenticates. Secret fields (`password`, `token`, `value`)
@@ -138,6 +201,7 @@ pub enum AuthConfig {
     },
     OAuth2(crate::oauth2::OAuth2Config),
     AwsSigV4(crate::aws_sigv4::AwsSigV4Config),
+    Jwt(JwtAuthConfig),
 }
 
 pub type ExampleId = Uuid;
