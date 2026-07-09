@@ -166,8 +166,7 @@ fn write_askpass_script() -> Result<(std::path::PathBuf, tempfile::TempDir)> {
     let script_path = dir.path().join("askpass.sh");
     let script = format!("#!/bin/sh\nprintf '%s' \"${ASKPASS_ENV_VAR}\"\n");
     {
-        let mut file =
-            std::fs::File::create(&script_path).context("creating askpass script")?;
+        let mut file = std::fs::File::create(&script_path).context("creating askpass script")?;
         file.write_all(script.as_bytes())
             .context("writing askpass script")?;
     }
@@ -203,7 +202,10 @@ mod tests {
                 .any(|w| w == ["-i", "/home/alice/.ssh/id_rsa"]),
             "the configured key path must be passed via -i: {args:?}"
         );
-        assert_eq!(args.last().map(String::as_str), Some("alice@bastion.example.com"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("alice@bastion.example.com")
+        );
     }
 
     #[test]

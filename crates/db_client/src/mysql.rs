@@ -1020,7 +1020,10 @@ mod integration_tests {
             .await
             .expect("Failed to connect");
         let result = provider
-            .execute_query("", "SELECT CAST(NULL AS CHAR) AS text_col, CAST(NULL AS SIGNED) AS int_col")
+            .execute_query(
+                "",
+                "SELECT CAST(NULL AS CHAR) AS text_col, CAST(NULL AS SIGNED) AS int_col",
+            )
             .await
             .expect("Failed to execute query");
 

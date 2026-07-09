@@ -6,12 +6,12 @@ use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
 use crate::connection::{ConnectionConfig, SslMode};
-use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
-    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo,
-    ProcedureKind, QueryResult, SequenceInfo, TableInfo, TableKind, TriggerInfo, UserInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind,
+    QueryResult, SequenceInfo, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
+use crate::{MAX_RESULT_ROWS, cap_cell};
 
 pub struct PostgresProvider {
     pool: PgPool,

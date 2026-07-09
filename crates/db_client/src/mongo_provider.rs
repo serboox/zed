@@ -200,14 +200,21 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
         return Err(unsupported_command_error(text));
     };
     let collection = rest[..dot].trim();
-    if collection.is_empty() || !collection.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if collection.is_empty()
+        || !collection
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         bail!("invalid collection name '{}'", collection);
     }
 
     let calls = parse_call_chain(rest[dot + 1..].trim())?;
-    let (method, args) = calls
-        .first()
-        .ok_or_else(|| anyhow!("expected a method call like db.{}.find({{...}})", collection))?;
+    let (method, args) = calls.first().ok_or_else(|| {
+        anyhow!(
+            "expected a method call like db.{}.find({{...}})",
+            collection
+        )
+    })?;
 
     match method.as_str() {
         "find" => {
@@ -276,11 +283,18 @@ fn parse_call_chain(text: &str) -> Result<Vec<(String, String)>> {
         if remaining.is_empty() {
             break;
         }
-        let open = remaining
-            .find('(')
-            .ok_or_else(|| anyhow!("expected a method call like .find({{...}}) near '{}'", remaining))?;
+        let open = remaining.find('(').ok_or_else(|| {
+            anyhow!(
+                "expected a method call like .find({{...}}) near '{}'",
+                remaining
+            )
+        })?;
         let method = remaining[..open].trim();
-        if method.is_empty() || !method.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if method.is_empty()
+            || !method
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             bail!("invalid method name '{}'", method);
         }
         let close = find_matching_paren(&remaining[open..])? + open;
@@ -340,7 +354,10 @@ fn parse_optional_doc_arg(args: &str) -> Result<Document> {
     parser.expect_end()?;
     match value {
         Bson::Document(doc) => Ok(doc),
-        other => bail!("expected a filter document, found {}", bson_type_name(&other)),
+        other => bail!(
+            "expected a filter document, found {}",
+            bson_type_name(&other)
+        ),
     }
 }
 
@@ -377,7 +394,10 @@ fn parse_array_of_docs_arg(args: &str) -> Result<Vec<Document>> {
                 )),
             })
             .collect(),
-        other => bail!("expected an array of documents, found {}", bson_type_name(&other)),
+        other => bail!(
+            "expected an array of documents, found {}",
+            bson_type_name(&other)
+        ),
     }
 }
 
@@ -464,7 +484,10 @@ impl<'a> ValueParser<'a> {
     fn expect_end(&mut self) -> Result<()> {
         self.skip_ws();
         if self.pos < self.input.len() {
-            bail!("unexpected trailing characters: '{}'", &self.input[self.pos..]);
+            bail!(
+                "unexpected trailing characters: '{}'",
+                &self.input[self.pos..]
+            );
         }
         Ok(())
     }
@@ -667,7 +690,10 @@ impl<'a> ValueParser<'a> {
                     .map(Bson::Int32)
                     .map_err(|_| anyhow!("invalid NumberInt value '{}'", value))
             }
-            other => bail!("unrecognized identifier '{}' in mongo shell argument", other),
+            other => bail!(
+                "unrecognized identifier '{}' in mongo shell argument",
+                other
+            ),
         }
     }
 
@@ -775,7 +801,10 @@ impl DbProvider for MongoProvider {
             .list_database_names()
             .await
             .context("Failed to list MongoDB databases")?;
-        Ok(names.into_iter().map(|name| DatabaseInfo { name }).collect())
+        Ok(names
+            .into_iter()
+            .map(|name| DatabaseInfo { name })
+            .collect())
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
@@ -826,7 +855,9 @@ impl DbProvider for MongoProvider {
                     order.push(key.clone());
                 }
                 *presence.entry(key.clone()).or_insert(0) += 1;
-                types.entry(key.clone()).or_insert_with(|| bson_type_name(value));
+                types
+                    .entry(key.clone())
+                    .or_insert_with(|| bson_type_name(value));
             }
         }
 
@@ -1029,7 +1060,11 @@ impl DbProvider for MongoProvider {
             table, count
         );
         for column in columns {
-            let nullable = if column.is_nullable { " (optional)" } else { "" };
+            let nullable = if column.is_nullable {
+                " (optional)"
+            } else {
+                ""
+            };
             summary.push_str(&format!(
                 "--   {}: {}{}\n",
                 column.name, column.data_type, nullable
@@ -1305,11 +1340,7 @@ mod tests {
     #[test]
     fn parse_rejects_text_that_does_not_start_with_db() {
         let error = parse_mongo_shell_statement("SELECT * FROM users").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("expected a mongo shell command")
-        );
+        assert!(error.to_string().contains("expected a mongo shell command"));
     }
 
     #[test]

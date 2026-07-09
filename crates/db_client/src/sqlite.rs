@@ -7,12 +7,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::connection::ConnectionConfig;
-use crate::{MAX_RESULT_ROWS, cap_cell};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
     TriggerInfo,
 };
+use crate::{MAX_RESULT_ROWS, cap_cell};
 
 pub struct SqliteProvider {
     pool: SqlitePool,
@@ -279,11 +279,7 @@ impl DbProvider for SqliteProvider {
                         // erroring, so nullness must be checked before any
                         // typed decode is attempted, not inferred from decode
                         // failure.
-                        if row
-                            .try_get_raw(index)
-                            .map(|v| v.is_null())
-                            .unwrap_or(false)
-                        {
+                        if row.try_get_raw(index).map(|v| v.is_null()).unwrap_or(false) {
                             return None;
                         }
                         row.try_get::<Option<String>, _>(index)
@@ -359,14 +355,19 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 // one.
 fn explicit_constraint_name(sql: &str, check_keyword_start: usize) -> Option<String> {
     let prefix = sql[..check_keyword_start].trim_end();
-    let name_start = prefix.rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+    let name_start = prefix
+        .rfind(|c: char| c.is_whitespace())
+        .map_or(0, |i| i + 1);
     let name = &prefix[name_start..];
     if name.is_empty() {
         return None;
     }
     let before_name = prefix[..name_start].trim_end();
     if before_name.to_uppercase().ends_with("CONSTRAINT") {
-        Some(name.trim_matches(|c| c == '"' || c == '`' || c == '\'').to_string())
+        Some(
+            name.trim_matches(|c| c == '"' || c == '`' || c == '\'')
+                .to_string(),
+        )
     } else {
         None
     }
@@ -381,10 +382,8 @@ fn extract_check_constraints(create_table_sql: &str) -> Vec<CheckConstraintInfo>
     while let Some(rel_pos) = upper[search_start..].find("CHECK") {
         let keyword_start = search_start + rel_pos;
         let keyword_end = keyword_start + "CHECK".len();
-        let word_boundary_before =
-            keyword_start == 0 || !is_ident_byte(bytes[keyword_start - 1]);
-        let word_boundary_after =
-            keyword_end >= bytes.len() || !is_ident_byte(bytes[keyword_end]);
+        let word_boundary_before = keyword_start == 0 || !is_ident_byte(bytes[keyword_start - 1]);
+        let word_boundary_after = keyword_end >= bytes.len() || !is_ident_byte(bytes[keyword_end]);
         let mut cursor = keyword_end;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
