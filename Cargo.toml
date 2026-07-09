@@ -936,7 +936,10 @@ webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev 
 
 [profile.dev]
 split-debuginfo = "unpacked"
-incremental = true
+# Incremental compilation is disabled so sccache (rustc-wrapper) can cache
+# Rust builds; sccache does not cache incremental artifacts, so with
+# incremental = true it never gets any Rust cache hits.
+incremental = false
 codegen-units = 16
 debug = "limited"
 
