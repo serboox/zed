@@ -4538,10 +4538,7 @@ impl ResultView {
 
     fn row_sql_values(row: &[Option<String>]) -> String {
         row.iter()
-            .map(|cell| match cell.as_deref() {
-                None => "NULL".to_string(),
-                Some(value) => format!("'{}'", value.replace('\'', "''")),
-            })
+            .map(|cell| sql_literal(cell.as_deref()))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -11399,7 +11396,7 @@ mod tests {
         let sql = ResultView::export_sql_multi_insert(&result, "users", '`');
         assert_eq!(
             sql,
-            "INSERT INTO `users` (`id`, `name`) VALUES\n  ('1', 'Alice'),\n  ('2', NULL);\n"
+            "INSERT INTO `users` (`id`, `name`) VALUES\n  (1, 'Alice'),\n  (2, NULL);\n"
         );
     }
 
@@ -14158,7 +14155,7 @@ mod tests {
             .expect("copy selection should write INSERT text to clipboard");
         assert_eq!(
             copied,
-            "INSERT INTO `users` (`id`, `name`) VALUES ('2', 'Bob');\n"
+            "INSERT INTO `users` (`id`, `name`) VALUES (2, 'Bob');\n"
         );
     }
 
@@ -14183,7 +14180,7 @@ mod tests {
             .expect("copy selection should write multi INSERT text to clipboard");
         assert_eq!(
             copied,
-            "INSERT INTO `users` (`id`, `name`) VALUES\n  ('1', 'Alice'),\n  ('2', 'Bob');\n"
+            "INSERT INTO `users` (`id`, `name`) VALUES\n  (1, 'Alice'),\n  (2, 'Bob');\n"
         );
     }
 
