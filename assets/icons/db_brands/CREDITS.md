@@ -9,10 +9,13 @@ License: https://github.com/devicons/devicon/blob/master/LICENSE (MIT)
 | File             | Source path in devicon                     |
 |------------------|--------------------------------------------|
 | `mysql.svg`      | `icons/mysql/mysql-original.svg`           |
-| `postgresql.svg` | `icons/postgresql/postgresql-original.svg` |
+| `postgresql.svg` | `icons/postgresql/postgresql-plain.svg`    |
 | `sqlite.svg`     | `icons/sqlite/sqlite-original.svg`         |
 | `clickhouse.svg` | `icons/clickhouse/clickhouse-original.svg` |
 | `redis.svg`      | `icons/redis/redis-original.svg`           |
+| `mongodb.svg`    | `icons/mongodb/mongodb-original.svg`       |
+| `cassandra.svg`  | `icons/cassandra/cassandra-original.svg`   |
+| `aerospike.svg`  | `icons/aerospike/aerospike-original.svg`   |
 
 The depicted logos are trademarks of their respective owners. They are used
 here only to identify the corresponding database engine; the MIT license above
