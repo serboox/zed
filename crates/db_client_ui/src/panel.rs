@@ -75,6 +75,19 @@ use zed_actions::database_panel::{
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
 const ERD_TABLE_LIMIT: usize = 50;
 
+/// Base left padding and per-level step for every row in the connection
+/// tree (folders, connections, databases, tables, columns, and every
+/// nested grouping under them). Every row's indentation must be derived
+/// from its tree level via this single function so the guide rhythm stays
+/// consistent end-to-end, instead of each nesting level hardcoding its own
+/// pixel offset.
+const TREE_ROW_BASE_INDENT: f32 = 8.;
+const TREE_ROW_INDENT_STEP: f32 = 12.;
+
+fn tree_indent(level: usize) -> Pixels {
+    px(TREE_ROW_BASE_INDENT + level as f32 * TREE_ROW_INDENT_STEP)
+}
+
 fn parse_env_color(s: &str) -> Option<gpui::Rgba> {
     let hex = s.trim().trim_start_matches('#');
     if hex.len() != 6 {
@@ -4700,8 +4713,9 @@ impl DatabasePanel {
             .gap_1()
             .py_1()
             .pr_2()
-            .pl(px(8. + depth as f32 * 12.))
+            .pl(tree_indent(depth))
             .rounded_sm()
+            .relative()
             .when(is_selected, |el| {
                 el.bg(cx.theme().colors().element_selected)
             })
@@ -4716,6 +4730,20 @@ impl DatabasePanel {
             .when(is_after_target, |el| {
                 el.border_b_2()
                     .border_color(cx.theme().colors().text_accent)
+            })
+            .when(is_selected, |el| {
+                // Absolutely positioned so the accent never perturbs row layout
+                // (a real border would shift every child right by its width,
+                // which previously broke a fixed-offset click test).
+                el.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(cx.theme().colors().text_accent),
+                )
             })
             .child(
                 h_flex()
@@ -7116,7 +7144,7 @@ impl DatabasePanel {
     ) -> impl IntoElement + use<> {
         let id = conn.config.id;
         let is_collapsed = self.collapsed_connections.contains(&id);
-        let indent = px(8. + depth as f32 * 12.);
+        let indent = tree_indent(depth);
         let connection_folder = conn.config.folder_id;
         let drag_label: SharedString = conn.config.label.clone().into();
         let label = conn.config.label.clone();
@@ -7205,9 +7233,25 @@ impl DatabasePanel {
                     .pl(indent)
                     .py_1()
                     .rounded_sm()
+                    .relative()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .when(is_active || is_selected, |el| {
                         el.bg(cx.theme().colors().element_selected)
+                    })
+                    .when(is_active || is_selected, |el| {
+                        // Absolutely positioned so the accent never perturbs row
+                        // layout (a real border would shift every child right by
+                        // its width, which previously broke a fixed-offset click
+                        // test that clicks the row at a hardcoded x-offset).
+                        el.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(cx.theme().colors().text_accent),
+                        )
                     })
                     .when(is_before_target, |el| {
                         el.border_t_2().border_color(cx.theme().colors().text_accent)
@@ -7347,7 +7391,7 @@ impl DatabasePanel {
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
-                                .pl(px(16.))
+                                .pl(tree_indent(depth + 1))
                                 .pr_2()
                                 .py_1()
                                 .cursor_pointer()
@@ -7374,7 +7418,7 @@ impl DatabasePanel {
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .pl(px(32.))
+                                    .pl(tree_indent(depth + 2))
                                     .pr_2()
                                     .py_1()
                                     .child(Icon::new(IconName::Person).size(IconSize::XSmall).color(Color::Muted))
@@ -7394,7 +7438,7 @@ impl DatabasePanel {
                                         .flex_row()
                                         .items_center()
                                         .gap_1()
-                                        .pl(px(48.))
+                                        .pl(tree_indent(depth + 3))
                                         .pr_2()
                                         .py_1()
                                         .child(Label::new(name).size(LabelSize::XSmall).single_line())
@@ -7426,7 +7470,7 @@ impl DatabasePanel {
                         .flex_row()
                         .items_center()
                         .gap_1()
-                        .pl(px(16.))
+                        .pl(tree_indent(depth + 1))
                         .pr_2()
                         .py_1()
                         .cursor_pointer()
@@ -7713,7 +7757,7 @@ impl DatabasePanel {
                                         .flex_row()
                                         .items_center()
                                         .gap_1()
-                                        .pl(px(32.))
+                                        .pl(tree_indent(depth + 2))
                                         .pr_2()
                                         .py_1()
                                         .cursor_pointer()
@@ -8324,7 +8368,7 @@ impl DatabasePanel {
                                                         .flex_row()
                                                         .items_center()
                                                         .gap_1()
-                                                        .pl(px(48.))
+                                                        .pl(tree_indent(depth + 3))
                                                         .pr_2()
                                                         .py_1()
                                                         .child(
@@ -8359,7 +8403,7 @@ impl DatabasePanel {
                                                                 .flex_row()
                                                                 .items_center()
                                                                 .gap_1()
-                                                                .pl(px(48.))
+                                                                .pl(tree_indent(depth + 3))
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
@@ -8386,7 +8430,7 @@ impl DatabasePanel {
                                                                 h_flex()
                                                                     .gap_1()
                                                                     .items_center()
-                                                                    .pl(px(64.))
+                                                                    .pl(tree_indent(depth + 4))
                                                                     .pr_2()
                                                                     .py_1()
                                                                     .child(Icon::new(IconName::Hash).size(IconSize::XSmall).color(Color::Muted))
@@ -8412,7 +8456,7 @@ impl DatabasePanel {
                                                                 .flex_row()
                                                                 .items_center()
                                                                 .gap_1()
-                                                                .pl(px(48.))
+                                                                .pl(tree_indent(depth + 3))
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
@@ -8439,7 +8483,7 @@ impl DatabasePanel {
                                                                 h_flex()
                                                                     .gap_1()
                                                                     .items_center()
-                                                                    .pl(px(64.))
+                                                                    .pl(tree_indent(depth + 4))
                                                                     .pr_2()
                                                                     .py_1()
                                                                     .child(Icon::new(IconName::Link).size(IconSize::XSmall).color(Color::Muted))
@@ -8462,7 +8506,7 @@ impl DatabasePanel {
                                                                 .flex_row()
                                                                 .items_center()
                                                                 .gap_1()
-                                                                .pl(px(48.))
+                                                                .pl(tree_indent(depth + 3))
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
@@ -8501,7 +8545,7 @@ impl DatabasePanel {
                                                                     })
                                                                     .gap_1()
                                                                     .items_center()
-                                                                    .pl(px(64.))
+                                                                    .pl(tree_indent(depth + 4))
                                                                     .pr_2()
                                                                     .py_1()
                                                                     .cursor_pointer()
@@ -8539,7 +8583,7 @@ impl DatabasePanel {
                                                 .flex_row()
                                                 .items_center()
                                                 .gap_1()
-                                                .pl(px(32.))
+                                                .pl(tree_indent(depth + 2))
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
@@ -8566,7 +8610,7 @@ impl DatabasePanel {
                                                 let view_row = h_flex()
                                                     .gap_1()
                                                     .items_center()
-                                                    .pl(px(48.))
+                                                    .pl(tree_indent(depth + 3))
                                                     .pr_2()
                                                     .py_1()
                                                     .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Muted))
@@ -8697,7 +8741,7 @@ impl DatabasePanel {
                                                 .flex_row()
                                                 .items_center()
                                                 .gap_1()
-                                                .pl(px(32.))
+                                                .pl(tree_indent(depth + 2))
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
@@ -8735,7 +8779,7 @@ impl DatabasePanel {
                                                     })
                                                     .gap_1()
                                                     .items_center()
-                                                    .pl(px(48.))
+                                                    .pl(tree_indent(depth + 3))
                                                     .pr_2()
                                                     .py_1()
                                                     .cursor_pointer()
@@ -8778,7 +8822,7 @@ impl DatabasePanel {
                                                 .flex_row()
                                                 .items_center()
                                                 .gap_1()
-                                                .pl(px(32.))
+                                                .pl(tree_indent(depth + 2))
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
@@ -8805,7 +8849,7 @@ impl DatabasePanel {
                                                 h_flex()
                                                     .gap_1()
                                                     .items_center()
-                                                    .pl(px(48.))
+                                                    .pl(tree_indent(depth + 3))
                                                     .pr_2()
                                                     .py_1()
                                                     .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
@@ -8838,7 +8882,7 @@ impl DatabasePanel {
                                                 .flex_row()
                                                 .items_center()
                                                 .gap_1()
-                                                .pl(px(32.))
+                                                .pl(tree_indent(depth + 2))
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
@@ -8876,7 +8920,7 @@ impl DatabasePanel {
                                                     })
                                                     .gap_1()
                                                     .items_center()
-                                                    .pl(px(48.))
+                                                    .pl(tree_indent(depth + 3))
                                                     .pr_2()
                                                     .py_1()
                                                     .cursor_pointer()
@@ -9014,7 +9058,9 @@ impl DatabasePanel {
                         // A continuous guide line sits under the parent's chevron and runs
                         // down the whole child block, so nesting reads at a glance.
                         let guide_color = cx.theme().colors().border_variant;
-                        let guide_left = px(8. + depth as f32 * 12. + 6.);
+                        let guide_left = px(
+                            TREE_ROW_BASE_INDENT + depth as f32 * TREE_ROW_INDENT_STEP + 6.,
+                        );
                         elements.push(
                             v_flex()
                                 .child(row)
@@ -9536,6 +9582,19 @@ mod tests {
             new_query_button_label(DatabaseDriver::Aerospike),
             "Get / Put / Scan"
         );
+    }
+
+    #[test]
+    fn tree_indent_grows_linearly_and_matches_the_previous_hardcoded_offsets() {
+        // These four levels correspond to the connection tree's nesting
+        // (connection -> server-objects/databases -> tables/users -> columns)
+        // and must land close to the pixel values the tree used before every
+        // row's indentation was unified onto this one formula.
+        assert_eq!(tree_indent(0), px(8.));
+        assert_eq!(tree_indent(1), px(20.));
+        assert_eq!(tree_indent(2), px(32.));
+        assert_eq!(tree_indent(3), px(44.));
+        assert_eq!(tree_indent(4), px(56.));
     }
 
     #[test]
