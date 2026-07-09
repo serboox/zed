@@ -132,7 +132,12 @@ pub enum NativeDumpEvent {
 
 /// Replaces the supported patterns in an output path. Unknown patterns are left
 /// untouched so a stray brace never corrupts the path silently.
-pub fn apply_substitutions(path: &str, data_source: &str, database: &str, timestamp: &str) -> String {
+pub fn apply_substitutions(
+    path: &str,
+    data_source: &str,
+    database: &str,
+    timestamp: &str,
+) -> String {
     path.replace("{timestamp}", timestamp)
         .replace("{data_source}", data_source)
         .replace("{database}", database)
@@ -232,14 +237,10 @@ pub struct DumpTask {
 pub fn render_dump_status_row(task: &DumpTask, cx: &App) -> impl IntoElement {
     let (icon, color, detail): (IconName, Color, SharedString) = match &task.status {
         DumpStatus::Running => (IconName::ArrowCircle, Color::Accent, "Running…".into()),
-        DumpStatus::Done { output_path } => (
-            IconName::Check,
-            Color::Success,
-            output_path.clone().into(),
-        ),
-        DumpStatus::Failed { message } => {
-            (IconName::XCircle, Color::Error, message.clone().into())
+        DumpStatus::Done { output_path } => {
+            (IconName::Check, Color::Success, output_path.clone().into())
         }
+        DumpStatus::Failed { message } => (IconName::XCircle, Color::Error, message.clone().into()),
     };
     h_flex()
         .w_full()
@@ -459,7 +460,10 @@ impl NativeDumpDialog {
             output_editor,
             databases_editor,
             tables_editor,
-            option_enabled: DUMP_OPTIONS.iter().map(|option| option.default_on).collect(),
+            option_enabled: DUMP_OPTIONS
+                .iter()
+                .map(|option| option.default_on)
+                .collect(),
             on_run: None,
         }
     }
@@ -519,7 +523,11 @@ impl NativeDumpDialog {
             .w_full()
             .gap_2()
             .items_center()
-            .child(div().w(px(150.)).child(Label::new(label).size(LabelSize::Small)))
+            .child(
+                div()
+                    .w(px(150.))
+                    .child(Label::new(label).size(LabelSize::Small)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -556,12 +564,15 @@ impl Render for NativeDumpDialog {
             .enumerate()
             .zip(self.option_enabled.iter())
             .map(|((index, option), enabled)| {
-                h_flex().gap_2().items_center().child(
-                    Checkbox::new(("dump-option", index), (*enabled).into()).on_click(
-                        cx.listener(move |this, _, _window, cx| this.toggle_option(index, cx)),
-                    ),
-                )
-                .child(Label::new(option.label).size(LabelSize::Small))
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Checkbox::new(("dump-option", index), (*enabled).into()).on_click(
+                            cx.listener(move |this, _, _window, cx| this.toggle_option(index, cx)),
+                        ),
+                    )
+                    .child(Label::new(option.label).size(LabelSize::Small))
             })
             .collect::<Vec<_>>();
 
@@ -603,7 +614,14 @@ impl Render for NativeDumpDialog {
             .child(self.field_row("Databases to dump:", &self.databases_editor.clone(), cx))
             .child(self.field_row("Tables to dump:", &self.tables_editor.clone(), cx))
             .child(Divider::horizontal())
-            .child(h_flex().w_full().gap_4().items_start().child(left_column).child(right_column))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .items_start()
+                    .child(left_column)
+                    .child(right_column),
+            )
             .child(Divider::horizontal())
             .child(
                 div()
@@ -634,12 +652,12 @@ impl Render for NativeDumpDialog {
                                 cx.emit(DismissEvent);
                             })),
                     )
-                    .child(
-                        Button::new("dump-cancel", "Cancel").on_click(cx.listener(|_, _, _, cx| {
+                    .child(Button::new("dump-cancel", "Cancel").on_click(cx.listener(
+                        |_, _, _, cx| {
                             cx.emit(NativeDumpEvent::Dismissed);
                             cx.emit(DismissEvent);
-                        })),
-                    ),
+                        },
+                    ))),
             )
     }
 }
@@ -711,8 +729,14 @@ mod tests {
         request.databases = vec!["shop".to_string()];
         request.tables = vec!["orders".to_string(), "items".to_string()];
         let args = build_dump_args(&request, "out.sql");
-        let shop = args.iter().position(|a| a == "shop").expect("database present");
-        let orders = args.iter().position(|a| a == "orders").expect("table present");
+        let shop = args
+            .iter()
+            .position(|a| a == "shop")
+            .expect("database present");
+        let orders = args
+            .iter()
+            .position(|a| a == "orders")
+            .expect("table present");
         assert!(shop < orders);
         assert!(!args.contains(&"--databases".to_string()));
     }
@@ -747,8 +771,16 @@ mod tests {
     #[test]
     fn args_never_contain_a_password() {
         let args = build_dump_args(&mysql_request(), "out.sql");
-        assert!(!args.iter().any(|arg| arg == "-p" || arg.starts_with("--password")));
-        assert!(!args.iter().any(|arg| arg.contains("PGPASSWORD") || arg.contains("MYSQL_PWD")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-p" || arg.starts_with("--password"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("PGPASSWORD") || arg.contains("MYSQL_PWD"))
+        );
     }
 
     #[test]
@@ -756,7 +788,10 @@ mod tests {
         let mut args = build_dump_args(&mysql_request(), "out.sql");
         let path = Path::new("/tmp/creds.cnf");
         prepend_password_file(&mut args, DatabaseDriver::MySQL, path);
-        assert_eq!(args.first().map(String::as_str), Some("--defaults-extra-file=/tmp/creds.cnf"));
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("--defaults-extra-file=/tmp/creds.cnf")
+        );
         // Postgres relies on PGPASSFILE, so its argv is untouched.
         let mut pg_args = vec!["-f".to_string(), "out.sql".to_string()];
         prepend_password_file(&mut pg_args, DatabaseDriver::PostgreSQL, path);
@@ -772,7 +807,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_file(&path).ok();
@@ -793,7 +831,14 @@ mod tests {
     async fn toggling_an_option_updates_the_command_preview(cx: &mut TestAppContext) {
         init_test(cx);
         let window = cx.add_window(|window, cx| {
-            NativeDumpDialog::new(DatabaseDriver::MySQL, sample_config(), Vec::new(), Vec::new(), window, cx)
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
         });
 
         let before = window
@@ -815,13 +860,21 @@ mod tests {
     async fn output_field_change_is_reflected_in_preview(cx: &mut TestAppContext) {
         init_test(cx);
         let window = cx.add_window(|window, cx| {
-            NativeDumpDialog::new(DatabaseDriver::MySQL, sample_config(), Vec::new(), Vec::new(), window, cx)
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
         });
 
         window
             .update(cx, |view, window, cx| {
-                view.output_editor
-                    .update(cx, |editor, cx| editor.set_text("/tmp/custom.sql", window, cx));
+                view.output_editor.update(cx, |editor, cx| {
+                    editor.set_text("/tmp/custom.sql", window, cx)
+                });
             })
             .unwrap();
 
@@ -835,7 +888,14 @@ mod tests {
     async fn run_emits_request_with_current_fields(cx: &mut TestAppContext) {
         init_test(cx);
         let window = cx.add_window(|window, cx| {
-            NativeDumpDialog::new(DatabaseDriver::MySQL, sample_config(), Vec::new(), Vec::new(), window, cx)
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
         });
         let view = window.root(cx).unwrap();
 

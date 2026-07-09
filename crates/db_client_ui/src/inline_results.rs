@@ -195,10 +195,19 @@ impl Render for InlineResultView {
             .text_size(px(12.));
 
         match &self.state {
-            InlineResultState::Loading => container.child(Label::new("Running…").color(Color::Muted)),
-            InlineResultState::Error(message) => {
-                container.child(Label::new(message.clone()).color(Color::Error))
+            InlineResultState::Loading => {
+                container.child(Label::new("Running…").color(Color::Muted))
             }
+            InlineResultState::Error(message) => container.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .child(Label::new(message.clone()).color(Color::Error)),
+            ),
             InlineResultState::Loaded {
                 columns,
                 rows,
@@ -207,7 +216,7 @@ impl Render for InlineResultView {
                 let header = h_flex().gap_2().children(columns.iter().map(|column| {
                     div()
                         .flex_1()
-                        .font_weight(gpui::FontWeight::BOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .child(column.clone())
                 }));
                 let body = rows.iter().map(|row| {
@@ -223,8 +232,11 @@ impl Render for InlineResultView {
                     .children(body)
                     .when(hidden > 0, |el| {
                         el.child(
-                            Label::new(format!("{hidden} more row{}…", if hidden == 1 { "" } else { "s" }))
-                                .color(Color::Muted),
+                            Label::new(format!(
+                                "{hidden} more row{}…",
+                                if hidden == 1 { "" } else { "s" }
+                            ))
+                            .color(Color::Muted),
                         )
                     })
             }
@@ -269,7 +281,9 @@ mod tests {
             let buffer = MultiBuffer::build_simple("SELECT 1;\nSELECT 2;", cx);
             Editor::for_multibuffer(buffer, None, window, cx)
         });
-        let editor = window.root(cx).expect("window root must be the constructed editor");
+        let editor = window
+            .root(cx)
+            .expect("window root must be the constructed editor");
         let weak_editor = editor.downgrade();
 
         assert_eq!(
@@ -315,7 +329,9 @@ mod tests {
             let buffer = MultiBuffer::build_simple("SELECT 1;", cx);
             Editor::for_multibuffer(buffer, None, window, cx)
         });
-        let editor = window.root(cx).expect("window root must be the constructed editor");
+        let editor = window
+            .root(cx)
+            .expect("window root must be the constructed editor");
         let controller = cx.new(|_| InlineResultsController::new(editor.downgrade()));
         controller.update(cx, |controller, cx| controller.toggle(cx));
 
@@ -338,7 +354,9 @@ mod tests {
             let buffer = MultiBuffer::build_simple("SELECT 1;\nSELECT 2;", cx);
             Editor::for_multibuffer(buffer, None, window, cx)
         });
-        let editor = window.root(cx).expect("window root must be the constructed editor");
+        let editor = window
+            .root(cx)
+            .expect("window root must be the constructed editor");
         let controller = cx.new(|_| InlineResultsController::new(editor.downgrade()));
         controller.update(cx, |controller, cx| controller.toggle(cx));
 
@@ -361,7 +379,9 @@ mod tests {
             let buffer = MultiBuffer::build_simple("SELECT 1;", cx);
             Editor::for_multibuffer(buffer, None, window, cx)
         });
-        let editor = window.root(cx).expect("window root must be the constructed editor");
+        let editor = window
+            .root(cx)
+            .expect("window root must be the constructed editor");
         let controller = cx.new(|_| InlineResultsController::new(editor.downgrade()));
 
         let view = controller.update(cx, |controller, cx| controller.begin_statement(0, 0, cx));

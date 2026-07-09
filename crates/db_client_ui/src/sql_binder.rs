@@ -209,10 +209,7 @@ pub(crate) fn database_and_table(name: &ObjectName) -> (Option<String>, String) 
     match parts.len() {
         0 => (None, String::new()),
         1 => (None, parts[0].clone()),
-        len => (
-            Some(parts[len - 2].clone()),
-            parts[len - 1].clone(),
-        ),
+        len => (Some(parts[len - 2].clone()), parts[len - 1].clone()),
     }
 }
 
@@ -379,7 +376,8 @@ fn bind_select(
     for table_with_joins in &select.from {
         for join in &table_with_joins.joins {
             if let Some(constraint_expr) = join_constraint_expr(&join.join_operator) {
-                if let Some(hit) = resolve_expr_at(constraint_expr, ctes, &local_tables, target, ctx)
+                if let Some(hit) =
+                    resolve_expr_at(constraint_expr, ctes, &local_tables, target, ctx)
                 {
                     return Some(hit);
                 }
@@ -422,7 +420,8 @@ fn bind_table_with_joins(
     ctx: &BindCtx,
     local_tables: &mut HashMap<String, TableBinding>,
 ) -> Option<NavigationTarget> {
-    if let Some(hit) = bind_table_factor(&table_with_joins.relation, ctes, target, ctx, local_tables)
+    if let Some(hit) =
+        bind_table_factor(&table_with_joins.relation, ctes, target, ctx, local_tables)
     {
         return Some(hit);
     }
@@ -510,10 +509,9 @@ fn collect_table_binding(
             let (database, table) = database_and_table(name);
             let key_from_name = table.to_ascii_lowercase();
             let binding = if database.is_none() {
-                ctes.get(&key_from_name).cloned().unwrap_or(TableBinding::Real {
-                    database,
-                    table,
-                })
+                ctes.get(&key_from_name)
+                    .cloned()
+                    .unwrap_or(TableBinding::Real { database, table })
             } else {
                 TableBinding::Real { database, table }
             };
@@ -523,7 +521,9 @@ fn collect_table_binding(
                 .unwrap_or(key_from_name);
             Some((alias_key, binding))
         }
-        TableFactor::Derived { subquery, alias, .. } => {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
             let alias = alias.as_ref()?;
             let (projections, names) = select_projections(subquery, ctes, ctx);
             Some((
@@ -549,7 +549,10 @@ fn select_projections(
     query: &Query,
     ctes: &HashMap<String, TableBinding>,
     ctx: &BindCtx,
-) -> (HashMap<String, (Option<String>, String, String)>, Vec<String>) {
+) -> (
+    HashMap<String, (Option<String>, String, String)>,
+    Vec<String>,
+) {
     let mut projections = HashMap::default();
     let mut names = Vec::new();
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -766,7 +769,10 @@ fn resolve_column(
                             .clone()
                             .or_else(|| ctx.default_database.map(str::to_string));
                         if let Some(resolved_database) = resolved_database {
-                            if ctx.schema.table_has_column(&resolved_database, table, column) {
+                            if ctx
+                                .schema
+                                .table_has_column(&resolved_database, table, column)
+                            {
                                 owners.push(NavigationTarget::Column {
                                     database: database.clone(),
                                     table: table.clone(),
@@ -790,7 +796,11 @@ fn resolve_column(
                     }
                 }
             }
-            if owners.len() == 1 { owners.pop() } else { None }
+            if owners.len() == 1 {
+                owners.pop()
+            } else {
+                None
+            }
         }
     }
 }
@@ -1169,7 +1179,12 @@ fn scope_tables_in_statement(
         Statement::Update(update) => {
             let ctes = HashMap::default();
             let mut local_tables = HashMap::default();
-            collect_tables_into(std::slice::from_ref(&update.table), &ctes, ctx, &mut local_tables);
+            collect_tables_into(
+                std::slice::from_ref(&update.table),
+                &ctes,
+                ctx,
+                &mut local_tables,
+            );
             if let Some(from) = &update.from {
                 let tables = match from {
                     UpdateTableFromKind::BeforeSet(tables)
@@ -1250,7 +1265,8 @@ fn scope_tables_in_select(
     ctx: &BindCtx,
 ) -> Option<HashMap<String, TableBinding>> {
     for table_with_joins in &select.from {
-        if let Some(deeper) = scope_tables_in_table_factor(&table_with_joins.relation, ctes, target, ctx)
+        if let Some(deeper) =
+            scope_tables_in_table_factor(&table_with_joins.relation, ctes, target, ctx)
         {
             return Some(deeper);
         }
@@ -1322,7 +1338,9 @@ fn scope_tables_in_table_factor(
                 return Some(deeper);
             }
             for join in &table_with_joins.joins {
-                if let Some(deeper) = scope_tables_in_table_factor(&join.relation, ctes, target, ctx) {
+                if let Some(deeper) =
+                    scope_tables_in_table_factor(&join.relation, ctes, target, ctx)
+                {
                     return Some(deeper);
                 }
             }
@@ -1463,8 +1481,7 @@ mod tests {
         let text = "SELECT q1.currency_short_name FROM \
             (SELECT qca.currency_short_name FROM ec_fmedia.quotes_currency_attr qca) q1";
         let schema = FakeSchema::default();
-        let offset =
-            text.find("q1.currency_short_name").expect("marker present") + "q1.".len();
+        let offset = text.find("q1.currency_short_name").expect("marker present") + "q1.".len();
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("derived column resolves");
         match target {
@@ -1512,8 +1529,10 @@ mod tests {
             (SELECT inner_s.id FROM instruments.splits AS inner_s WHERE inner_s.operation = 1)";
         let schema = FakeSchema::default();
 
-        let inner_offset =
-            text.rfind("inner_s.operation").expect("inner marker present") + "inner_s.".len();
+        let inner_offset = text
+            .rfind("inner_s.operation")
+            .expect("inner marker present")
+            + "inner_s.".len();
         let (inner_target, _) =
             resolve_navigation_at(text, DatabaseDriver::MySQL, inner_offset, None, &schema)
                 .expect("inner column resolves");
@@ -1558,8 +1577,11 @@ mod tests {
     #[test]
     fn bare_column_stays_unresolved_when_ambiguous_across_from_tables() {
         let text = "SELECT flag FROM db.orders o, db.shipments s WHERE flag = 1";
-        let schema =
-            FakeSchema::with_table("db", "orders", &["flag"]).and_table("db", "shipments", &["flag"]);
+        let schema = FakeSchema::with_table("db", "orders", &["flag"]).and_table(
+            "db",
+            "shipments",
+            &["flag"],
+        );
         let offset = text.find("flag").expect("marker present");
         assert!(
             resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema).is_none(),
@@ -1591,7 +1613,9 @@ mod tests {
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("table name resolves");
         match target {
-            NavigationTarget::Table { database, table, .. } => {
+            NavigationTarget::Table {
+                database, table, ..
+            } => {
                 assert_eq!(database.as_deref(), Some("db"));
                 assert_eq!(table, "orders");
             }
@@ -1607,7 +1631,9 @@ mod tests {
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("alias resolves to its own table");
         match target {
-            NavigationTarget::Table { database, table, .. } => {
+            NavigationTarget::Table {
+                database, table, ..
+            } => {
                 assert_eq!(database.as_deref(), Some("db"));
                 assert_eq!(table, "orders");
             }
@@ -1623,7 +1649,9 @@ mod tests {
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("insert target table resolves");
         match target {
-            NavigationTarget::Table { database, table, .. } => {
+            NavigationTarget::Table {
+                database, table, ..
+            } => {
                 assert_eq!(database.as_deref(), Some("db"));
                 assert_eq!(table, "orders");
             }
@@ -1639,7 +1667,9 @@ mod tests {
         let text = "SELECT flag FROM db.orders";
         let schema = FakeSchema::with_table("db", "orders", &["flag"]);
         let offset = text.find("flag").expect("marker present");
-        assert!(resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema).is_some());
+        assert!(
+            resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema).is_some()
+        );
     }
 
     /// A real production-shaped query: `INSERT ... SELECT` with two derived
@@ -1691,8 +1721,7 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
                         name                   = VALUES(pair_name_export_trans);";
         let schema = FakeSchema::default();
 
-        let offset =
-            text.find("q1.currency_short_name").expect("marker present") + "q1.".len();
+        let offset = text.find("q1.currency_short_name").expect("marker present") + "q1.".len();
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("derived-table column resolves in the real query");
         match target {
@@ -1757,15 +1786,19 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
 
     #[test]
     fn values_function_argument_resolves_to_the_insert_target_not_a_same_named_from_column() {
-        let text =
-            "INSERT INTO shipments (status) SELECT s.status FROM staging s \
+        let text = "INSERT INTO shipments (status) SELECT s.status FROM staging s \
              ON DUPLICATE KEY UPDATE status = VALUES(status)";
         let schema = FakeSchema::with_table("db", "staging", &["status"]);
         let offset = text.rfind("VALUES(status)").expect("marker present") + "VALUES(".len();
         let (target, _) = resolve_navigation_at(text, DatabaseDriver::MySQL, offset, None, &schema)
             .expect("VALUES(col) argument resolves");
         match target {
-            NavigationTarget::Column { database, table, column, .. } => {
+            NavigationTarget::Column {
+                database,
+                table,
+                column,
+                ..
+            } => {
                 assert_eq!(database, None);
                 assert_eq!(table, "shipments");
                 assert_eq!(column, "status");
@@ -1868,8 +1901,10 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
                         name                   = VALUES(pair_name_export_trans);";
         let schema = FakeSchema::default();
 
-        let column_list_offset =
-            text.find("pair_ID, lang_id, shortname").expect("marker present") + 2;
+        let column_list_offset = text
+            .find("pair_ID, lang_id, shortname")
+            .expect("marker present")
+            + 2;
         let (column_list_target, _) = resolve_navigation_at(
             text,
             DatabaseDriver::MySQL,
@@ -1886,8 +1921,9 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
             other => panic!("expected a column target, got {other:?}"),
         }
 
-        let assignment_offset =
-            text.rfind("shortname              =").expect("marker present");
+        let assignment_offset = text
+            .rfind("shortname              =")
+            .expect("marker present");
         let (assignment_target, _) = resolve_navigation_at(
             text,
             DatabaseDriver::MySQL,
@@ -1904,8 +1940,8 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
             other => panic!("expected a column target, got {other:?}"),
         }
 
-        let values_offset = text.rfind("VALUES(shortname)").expect("marker present")
-            + "VALUES(".len();
+        let values_offset =
+            text.rfind("VALUES(shortname)").expect("marker present") + "VALUES(".len();
         let (values_target, _) =
             resolve_navigation_at(text, DatabaseDriver::MySQL, values_offset, None, &schema)
                 .expect("VALUES(col) argument resolves");
@@ -2018,9 +2054,9 @@ ON DUPLICATE KEY UPDATE shortname              = VALUES(shortname),
                 table: "quotes_pair_attr".to_string(),
             })
         );
-        assert!(matches!(bindings.get("q1"), Some(ScopeBinding::Derived { .. })));
+        assert!(matches!(
+            bindings.get("q1"),
+            Some(ScopeBinding::Derived { .. })
+        ));
     }
 }
-
-
-

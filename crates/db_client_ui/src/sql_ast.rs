@@ -13,11 +13,12 @@ use sqlparser::parser::Parser;
 ///
 /// `GenericDialect` is used as a placeholder for any future driver that gains
 /// its own `DatabaseDriver` variant before a matching sqlparser dialect exists.
-/// Redis, MongoDB, and Cassandra have no SQL grammar at all, so they
-/// deliberately have no dialect (MongoDB's console accepts its own tiny
+/// Redis, MongoDB, Cassandra, and Aerospike have no SQL grammar at all, so
+/// they deliberately have no dialect (MongoDB's console accepts its own tiny
 /// SELECT/INSERT/UPDATE/DELETE subset — see `db_client::mongo_provider` —
-/// and Cassandra's CQL — see `db_client::cassandra_provider` — neither of
-/// which is SQL, so neither is parsed by sqlparser).
+/// Cassandra's CQL — see `db_client::cassandra_provider` — neither of
+/// which is SQL, so neither is parsed by sqlparser; Aerospike has no query
+/// language at all and is accessed through its own Get/Put/Scan form).
 pub(crate) fn dialect_for_driver(driver: DatabaseDriver) -> Option<Box<dyn Dialect>> {
     match driver {
         DatabaseDriver::MySQL => Some(Box::new(MySqlDialect {})),
@@ -27,6 +28,7 @@ pub(crate) fn dialect_for_driver(driver: DatabaseDriver) -> Option<Box<dyn Diale
         DatabaseDriver::Redis => None,
         DatabaseDriver::MongoDB => None,
         DatabaseDriver::Cassandra => None,
+        DatabaseDriver::Aerospike => None,
     }
 }
 

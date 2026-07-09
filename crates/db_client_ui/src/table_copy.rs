@@ -92,7 +92,11 @@ fn type_for_category(target: DatabaseDriver, category: TypeCategory) -> &'static
 ///
 /// A same-driver copy always passes the source type through unchanged and
 /// exact -- the common case, and the only one that is guaranteed lossless.
-pub fn map_column_type(source: DatabaseDriver, target: DatabaseDriver, source_type: &str) -> (String, bool) {
+pub fn map_column_type(
+    source: DatabaseDriver,
+    target: DatabaseDriver,
+    source_type: &str,
+) -> (String, bool) {
     if source == target {
         return (source_type.to_string(), true);
     }
@@ -253,8 +257,12 @@ pub fn spawn_table_copy(
                 ));
             }
         } else {
-            let (create_sql, _warnings) =
-                generate_create_table_sql(source_driver, target_driver, &target_table, &source_columns);
+            let (create_sql, _warnings) = generate_create_table_sql(
+                source_driver,
+                target_driver,
+                &target_table,
+                &source_columns,
+            );
             target_provider
                 .execute_query(&target_database, &create_sql)
                 .await
@@ -287,9 +295,12 @@ pub fn spawn_table_copy(
         let consumer = async move {
             let mut total = 0u64;
             while let Ok(batch) = receiver.recv().await {
-                let Some(statement) =
-                    build_copy_insert_statement(target_driver, &target_table, &column_names, &batch)
-                else {
+                let Some(statement) = build_copy_insert_statement(
+                    target_driver,
+                    &target_table,
+                    &column_names,
+                    &batch,
+                ) else {
                     continue;
                 };
                 target_provider
@@ -333,12 +344,16 @@ mod tests {
 
     #[test]
     fn cross_driver_common_types_map_to_known_equivalents() {
-        let (mapped, exact) = map_column_type(DatabaseDriver::MySQL, DatabaseDriver::PostgreSQL, "int(11)");
+        let (mapped, exact) =
+            map_column_type(DatabaseDriver::MySQL, DatabaseDriver::PostgreSQL, "int(11)");
         assert_eq!(mapped, "integer");
         assert!(exact);
 
-        let (mapped, exact) =
-            map_column_type(DatabaseDriver::PostgreSQL, DatabaseDriver::MySQL, "timestamp");
+        let (mapped, exact) = map_column_type(
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::MySQL,
+            "timestamp",
+        );
         assert_eq!(mapped, "datetime");
         assert!(exact);
     }
@@ -348,7 +363,10 @@ mod tests {
         let (mapped, exact) =
             map_column_type(DatabaseDriver::PostgreSQL, DatabaseDriver::MySQL, "jsonb");
         assert_eq!(mapped, "text");
-        assert!(!exact, "an unmapped type must be reported as a fallback, not silently exact");
+        assert!(
+            !exact,
+            "an unmapped type must be reported as a fallback, not silently exact"
+        );
     }
 
     #[test]
@@ -357,8 +375,12 @@ mod tests {
             column("id", "int", false),
             column("name", "varchar(255)", true),
         ];
-        let (sql, warnings) =
-            generate_create_table_sql(DatabaseDriver::MySQL, DatabaseDriver::MySQL, "people", &columns);
+        let (sql, warnings) = generate_create_table_sql(
+            DatabaseDriver::MySQL,
+            DatabaseDriver::MySQL,
+            "people",
+            &columns,
+        );
         assert_eq!(
             sql,
             "CREATE TABLE `people` (`id` int NOT NULL, `name` varchar(255))"
@@ -369,8 +391,12 @@ mod tests {
     #[test]
     fn create_table_sql_warns_on_fallback_types() {
         let columns = vec![column("payload", "jsonb", true)];
-        let (_, warnings) =
-            generate_create_table_sql(DatabaseDriver::PostgreSQL, DatabaseDriver::MySQL, "events", &columns);
+        let (_, warnings) = generate_create_table_sql(
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::MySQL,
+            "events",
+            &columns,
+        );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("payload"));
     }
@@ -378,7 +404,10 @@ mod tests {
     #[test]
     fn compatible_columns_require_same_count_and_names_in_order() {
         let source = vec![column("id", "int", false), column("name", "text", true)];
-        let same = vec![column("id", "integer", false), column("name", "varchar", true)];
+        let same = vec![
+            column("id", "integer", false),
+            column("name", "varchar", true),
+        ];
         assert!(columns_look_compatible(&source, &same));
 
         let reordered = vec![column("name", "text", true), column("id", "int", false)];
@@ -409,7 +438,10 @@ mod tests {
 
     #[test]
     fn insert_statement_is_none_for_an_empty_batch() {
-        assert!(build_copy_insert_statement(DatabaseDriver::MySQL, "t", &["id".to_string()], &[]).is_none());
+        assert!(
+            build_copy_insert_statement(DatabaseDriver::MySQL, "t", &["id".to_string()], &[])
+                .is_none()
+        );
     }
 
     struct RecordingProvider {
@@ -458,10 +490,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn spawn_table_copy_creates_the_table_then_batches_every_row(cx: &mut gpui::TestAppContext) {
-        let rows: Vec<Vec<Option<String>>> = (0..1200)
-            .map(|i| vec![Some(i.to_string())])
-            .collect();
+    async fn spawn_table_copy_creates_the_table_then_batches_every_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let rows: Vec<Vec<Option<String>>> = (0..1200).map(|i| vec![Some(i.to_string())]).collect();
         let source: Arc<dyn DbProvider> = Arc::new(RecordingProvider {
             rows: rows.clone(),
             inserted: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -537,12 +569,18 @@ mod tests {
         task.await.expect("copy must succeed");
 
         let statements = inserted.lock().unwrap().clone();
-        assert_eq!(statements.len(), 1, "no CREATE TABLE when columns already match");
+        assert_eq!(
+            statements.len(),
+            1,
+            "no CREATE TABLE when columns already match"
+        );
         assert!(statements[0].starts_with("INSERT INTO"));
     }
 
     #[gpui::test]
-    async fn spawn_table_copy_rejects_an_incompatible_existing_table(cx: &mut gpui::TestAppContext) {
+    async fn spawn_table_copy_rejects_an_incompatible_existing_table(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let source: Arc<dyn DbProvider> = Arc::new(RecordingProvider {
             rows: vec![vec![Some("1".to_string())]],
             inserted: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -565,14 +603,22 @@ mod tests {
                 "dst_db".to_string(),
                 "people".to_string(),
                 DatabaseDriver::MySQL,
-                Some(vec![column("id", "int", false), column("extra", "text", true)]),
+                Some(vec![
+                    column("id", "int", false),
+                    column("extra", "text", true),
+                ]),
                 cancelled,
                 cx,
             )
         });
-        let error = task.await.expect_err("mismatched column count must be rejected");
+        let error = task
+            .await
+            .expect_err("mismatched column count must be rejected");
         assert!(error.contains("different column layout"));
-        assert!(inserted.lock().unwrap().is_empty(), "must not have inserted anything");
+        assert!(
+            inserted.lock().unwrap().is_empty(),
+            "must not have inserted anything"
+        );
     }
 
     #[gpui::test]
@@ -605,7 +651,9 @@ mod tests {
                 cx,
             )
         });
-        let error = task.await.expect_err("a cancelled copy must report failure");
+        let error = task
+            .await
+            .expect_err("a cancelled copy must report failure");
         assert!(error.contains("cancelled"));
         assert!(
             inserted.lock().unwrap().is_empty(),

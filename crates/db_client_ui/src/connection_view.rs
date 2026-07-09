@@ -1,5 +1,8 @@
 use crate::driver_icon::brand_icon;
-use db_client::{ConnectionConfig, DatabaseDriver, SshAuthMethod, SslMode};
+use db_client::{
+    ConnectionConfig, DatabaseDriver, KubernetesRelayCommandKind, KubernetesTargetKind,
+    KubernetesTunnelModeKind, SshAuthMethod, SslMode, kubernetes_tunnel_caveat,
+};
 use editor::Editor;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
@@ -74,6 +77,14 @@ pub struct ConnectionView {
     ssl_ca_path_editor: Entity<Editor>,
     ssl_client_cert_path_editor: Entity<Editor>,
     ssl_client_key_path_editor: Entity<Editor>,
+    use_kubernetes_tunnel: bool,
+    k8s_context_editor: Entity<Editor>,
+    k8s_namespace_editor: Entity<Editor>,
+    k8s_kubeconfig_path_editor: Entity<Editor>,
+    k8s_tunnel_mode: KubernetesTunnelModeKind,
+    k8s_relay_command: KubernetesRelayCommandKind,
+    k8s_target_kind: KubernetesTargetKind,
+    k8s_target_name_editor: Entity<Editor>,
     test_state: TestState,
     pub on_confirm: Option<Box<dyn FnOnce(ConnectionConfig, &mut App)>>,
 }
@@ -115,6 +126,15 @@ impl ConnectionView {
         let ssl_client_cert_path_editor =
             make_editor("Client Certificate Path (optional)", "", window, cx);
         let ssl_client_key_path_editor = make_editor("Client Key Path (optional)", "", window, cx);
+        let k8s_context_editor = make_editor("Kubeconfig Context", "", window, cx);
+        let k8s_namespace_editor = make_editor("Namespace", "default", window, cx);
+        let k8s_kubeconfig_path_editor = make_editor(
+            "Kubeconfig Path (optional, defaults to ~/.kube/config)",
+            "",
+            window,
+            cx,
+        );
+        let k8s_target_name_editor = make_editor("Pod or Service name", "", window, cx);
 
         Self {
             focus_handle,
@@ -141,6 +161,14 @@ impl ConnectionView {
             ssl_ca_path_editor,
             ssl_client_cert_path_editor,
             ssl_client_key_path_editor,
+            use_kubernetes_tunnel: false,
+            k8s_context_editor,
+            k8s_namespace_editor,
+            k8s_kubeconfig_path_editor,
+            k8s_tunnel_mode: KubernetesTunnelModeKind::PortForward,
+            k8s_relay_command: KubernetesRelayCommandKind::Socat,
+            k8s_target_kind: KubernetesTargetKind::Pod,
+            k8s_target_name_editor,
             test_state: TestState::Idle,
             on_confirm: None,
         }
@@ -235,6 +263,23 @@ impl ConnectionView {
             cx,
         );
 
+        let use_kubernetes_tunnel = config.uses_kubernetes_tunnel();
+        let k8s_context_editor = make_editor(
+            "Kubeconfig Context",
+            config.k8s_context.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        let k8s_namespace_editor = make_editor("Namespace", &config.k8s_namespace, window, cx);
+        let k8s_kubeconfig_path_editor = make_editor(
+            "Kubeconfig Path (optional, defaults to ~/.kube/config)",
+            config.k8s_kubeconfig_path.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        let k8s_target_name_editor =
+            make_editor("Pod or Service name", &config.k8s_target_name, window, cx);
+
         Self {
             focus_handle,
             title: "Edit Connection".into(),
@@ -260,6 +305,14 @@ impl ConnectionView {
             ssl_ca_path_editor,
             ssl_client_cert_path_editor,
             ssl_client_key_path_editor,
+            use_kubernetes_tunnel,
+            k8s_context_editor,
+            k8s_namespace_editor,
+            k8s_kubeconfig_path_editor,
+            k8s_tunnel_mode: config.k8s_tunnel_mode,
+            k8s_relay_command: config.k8s_relay_command,
+            k8s_target_kind: config.k8s_target_kind,
+            k8s_target_name_editor,
             test_state: TestState::Idle,
             on_confirm: None,
         }
@@ -374,6 +427,26 @@ impl ConnectionView {
             non_empty(Self::read_text(&self.ssl_client_cert_path_editor, cx));
         let ssl_client_key_path = non_empty(Self::read_text(&self.ssl_client_key_path_editor, cx));
 
+        let k8s_context = if self.use_kubernetes_tunnel {
+            let c = Self::read_text(&self.k8s_context_editor, cx);
+            if c.is_empty() { None } else { Some(c) }
+        } else {
+            None
+        };
+        let k8s_namespace = {
+            let n = Self::read_text(&self.k8s_namespace_editor, cx);
+            if n.is_empty() {
+                "default".to_string()
+            } else {
+                n
+            }
+        };
+        let k8s_kubeconfig_path = non_empty(Self::read_text(&self.k8s_kubeconfig_path_editor, cx));
+        let k8s_tunnel_mode = self.k8s_tunnel_mode;
+        let k8s_relay_command = self.k8s_relay_command;
+        let k8s_target_kind = self.k8s_target_kind;
+        let k8s_target_name = Self::read_text(&self.k8s_target_name_editor, cx);
+
         if driver.is_file_based() {
             let path = Self::read_text(&self.host_editor, cx);
             if path.is_empty() {
@@ -408,6 +481,13 @@ impl ConnectionView {
                 ssl_ca_path,
                 ssl_client_cert_path,
                 ssl_client_key_path,
+                k8s_context,
+                k8s_namespace,
+                k8s_kubeconfig_path,
+                k8s_tunnel_mode,
+                k8s_relay_command,
+                k8s_target_kind,
+                k8s_target_name,
                 folder,
                 folder_id: None,
                 order: 0,
@@ -455,6 +535,13 @@ impl ConnectionView {
             ssl_ca_path,
             ssl_client_cert_path,
             ssl_client_key_path,
+            k8s_context,
+            k8s_namespace,
+            k8s_kubeconfig_path,
+            k8s_tunnel_mode,
+            k8s_relay_command,
+            k8s_target_kind,
+            k8s_target_name,
             folder,
             folder_id: None,
             order: 0,
@@ -578,6 +665,10 @@ impl Render for ConnectionView {
         let is_file_based = self.selected_driver.is_file_based();
         let selected_driver = self.selected_driver;
         let use_ssh = self.use_ssh;
+        let use_kubernetes_tunnel = self.use_kubernetes_tunnel;
+        let k8s_tunnel_mode = self.k8s_tunnel_mode;
+        let k8s_relay_command = self.k8s_relay_command;
+        let k8s_target_kind = self.k8s_target_kind;
 
         let colors = cx.theme().colors();
         let page_bg = colors.editor_background;
@@ -626,6 +717,12 @@ impl Render for ConnectionView {
             .child(Self::render_driver_row(
                 "SQLite",
                 DatabaseDriver::SQLite,
+                selected_driver,
+                cx,
+            ))
+            .child(Self::render_driver_row(
+                "Aerospike",
+                DatabaseDriver::Aerospike,
                 selected_driver,
                 cx,
             ))
@@ -969,6 +1066,179 @@ impl Render for ConnectionView {
                                 self.ssh_password_editor.clone(),
                                 field_border,
                                 field_bg,
+                            )
+                        }),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .debug_selector(|| "use-kubernetes-tunnel-checkbox".to_string())
+                            .child(
+                                Checkbox::new(
+                                    "use-kubernetes-tunnel",
+                                    if use_kubernetes_tunnel {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.use_kubernetes_tunnel = !this.use_kubernetes_tunnel;
+                                    cx.notify();
+                                })),
+                            ),
+                    )
+                    .child(Label::new("Kubernetes Tunnel").size(LabelSize::Small)),
+            )
+            .when(use_kubernetes_tunnel, |el| {
+                el.child(
+                    v_flex()
+                        .gap_2()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(divider)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().flex_1().child(Self::render_field(
+                                    "Kubeconfig Context",
+                                    self.k8s_context_editor.clone(),
+                                    field_border,
+                                    field_bg,
+                                )))
+                                .child(div().flex_1().child(Self::render_field(
+                                    "Namespace",
+                                    self.k8s_namespace_editor.clone(),
+                                    field_border,
+                                    field_bg,
+                                ))),
+                        )
+                        .child(Self::render_field(
+                            "Kubeconfig Path (optional)",
+                            self.k8s_kubeconfig_path_editor.clone(),
+                            field_border,
+                            field_bg,
+                        ))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Self::render_chip(
+                                    "Pod",
+                                    k8s_target_kind == KubernetesTargetKind::Pod,
+                                    cx,
+                                    |this, _, _, cx| {
+                                        this.k8s_target_kind = KubernetesTargetKind::Pod;
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(Self::render_chip(
+                                    "Service",
+                                    k8s_target_kind == KubernetesTargetKind::Service,
+                                    cx,
+                                    |this, _, _, cx| {
+                                        this.k8s_target_kind = KubernetesTargetKind::Service;
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                        .child(Self::render_field(
+                            if k8s_target_kind == KubernetesTargetKind::Pod {
+                                "Pod name"
+                            } else {
+                                "Service name"
+                            },
+                            self.k8s_target_name_editor.clone(),
+                            field_border,
+                            field_bg,
+                        ))
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new("Tunnel mode")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Self::render_chip(
+                                            "Port-forward",
+                                            k8s_tunnel_mode == KubernetesTunnelModeKind::PortForward,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.k8s_tunnel_mode =
+                                                    KubernetesTunnelModeKind::PortForward;
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(Self::render_chip(
+                                            "Exec (kubectl exec)",
+                                            k8s_tunnel_mode == KubernetesTunnelModeKind::Exec,
+                                            cx,
+                                            |this, _, _, cx| {
+                                                this.k8s_tunnel_mode =
+                                                    KubernetesTunnelModeKind::Exec;
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Label::new(match k8s_tunnel_mode {
+                                        KubernetesTunnelModeKind::PortForward => {
+                                            "Requires the 'portforward' RBAC permission on the target pod or service."
+                                        }
+                                        KubernetesTunnelModeKind::Exec => {
+                                            "Requires the 'exec' RBAC permission. Bridges the connection through a relay binary already present in the container."
+                                        }
+                                    })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                ),
+                        )
+                        .when(k8s_tunnel_mode == KubernetesTunnelModeKind::Exec, |el| {
+                            el.child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(Self::render_chip(
+                                        "socat",
+                                        k8s_relay_command == KubernetesRelayCommandKind::Socat,
+                                        cx,
+                                        |this, _, _, cx| {
+                                            this.k8s_relay_command =
+                                                KubernetesRelayCommandKind::Socat;
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(Self::render_chip(
+                                        "nc",
+                                        k8s_relay_command == KubernetesRelayCommandKind::Nc,
+                                        cx,
+                                        |this, _, _, cx| {
+                                            this.k8s_relay_command = KubernetesRelayCommandKind::Nc;
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                        })
+                        .when_some(kubernetes_tunnel_caveat(selected_driver), |el, caveat| {
+                            el.child(
+                                div()
+                                    .debug_selector(|| "k8s-tunnel-caveat".to_string())
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(page_bg)
+                                    .border_1()
+                                    .border_color(divider)
+                                    .child(
+                                        Label::new(caveat)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
                             )
                         }),
                 )
@@ -1487,5 +1757,122 @@ mod tests {
         ConnectionView::to_item_events(&DismissEvent, &mut |event| events.push(event));
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], ItemEvent::CloseItem));
+    }
+
+    #[gpui::test]
+    async fn clicking_the_kubernetes_checkbox_and_mode_chips_updates_the_built_config(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.host_editor
+                    .update(cx, |ed, cx| ed.set_text("localhost", window, cx));
+                view.username_editor
+                    .update(cx, |ed, cx| ed.set_text("root", window, cx));
+            })
+            .unwrap();
+
+        let before = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert!(
+            !before.uses_kubernetes_tunnel(),
+            "a new connection must default to no Kubernetes tunnel"
+        );
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        // A real click on the checkbox -- not a direct field assignment --
+        // is what must reveal the Kubernetes fields, mirroring the existing
+        // SSH/read-only checkbox tests' philosophy of driving the actual
+        // event path.
+        let checkbox = cx
+            .debug_bounds("use-kubernetes-tunnel-checkbox")
+            .expect("the Kubernetes tunnel checkbox should be rendered")
+            .center();
+        cx.simulate_click(checkbox, gpui::Modifiers::none());
+
+        window
+            .update(cx, |view, window, cx| {
+                view.k8s_context_editor
+                    .update(cx, |ed, cx| ed.set_text("prod-cluster", window, cx));
+                view.k8s_target_name_editor
+                    .update(cx, |ed, cx| ed.set_text("aerospike-0", window, cx));
+            })
+            .unwrap();
+
+        // A real click on the "Exec" mode chip -- not a direct field
+        // assignment -- must switch the mode used when the config is built.
+        let exec_chip = cx
+            .debug_bounds("chip-Exec (kubectl exec)")
+            .expect("the Exec mode chip should be rendered")
+            .center();
+        cx.simulate_click(exec_chip, gpui::Modifiers::none());
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert!(config.uses_kubernetes_tunnel());
+        assert_eq!(config.k8s_context.as_deref(), Some("prod-cluster"));
+        assert_eq!(config.k8s_target_name, "aerospike-0");
+        assert_eq!(
+            config.k8s_tunnel_mode,
+            db_client::KubernetesTunnelModeKind::Exec,
+            "clicking the Exec chip must select Exec mode in the built config"
+        );
+
+        // A real click on the "Service" target-kind chip must flip the
+        // target from the default Pod to Service.
+        let service_chip = cx
+            .debug_bounds("chip-Service")
+            .expect("the Service target chip should be rendered")
+            .center();
+        cx.simulate_click(service_chip, gpui::Modifiers::none());
+
+        let config = window
+            .read_with(cx, |view, cx| view.build_config(cx))
+            .unwrap()
+            .expect("config should build");
+        assert_eq!(
+            config.k8s_target_kind,
+            db_client::KubernetesTargetKind::Service,
+            "clicking the Service chip must select the Service target kind"
+        );
+    }
+
+    #[gpui::test]
+    async fn kubernetes_tunnel_caveat_only_paints_for_aerospike(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ConnectionView::new(window, cx));
+
+        window
+            .update(cx, |view, window, cx| {
+                view.use_kubernetes_tunnel = true;
+                view.set_driver(DatabaseDriver::MySQL, window, cx);
+            })
+            .unwrap();
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        assert!(
+            cx.debug_bounds("k8s-tunnel-caveat").is_none(),
+            "MySQL has no cluster peer-discovery caveat and must not render one"
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                view.set_driver(DatabaseDriver::Aerospike, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("k8s-tunnel-caveat").is_some(),
+            "switching to Aerospike with the Kubernetes tunnel enabled must paint the caveat"
+        );
     }
 }

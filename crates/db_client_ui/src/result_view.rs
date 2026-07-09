@@ -127,8 +127,43 @@ actions!(
         ToggleChart,
         /// Pins this result tab so the next query opens a new tab instead of reusing it.
         TogglePinResult,
+        /// Moves the selected cell to the first column of its row.
+        SelectRowStart,
+        /// Moves the selected cell to the last column of its row.
+        SelectRowEnd,
+        /// Moves the selected cell to the first cell of the grid.
+        SelectFirstCell,
+        /// Moves the selected cell to the last cell of the grid.
+        SelectLastCell,
+        /// Moves the selected cell up by one page of rows.
+        SelectPageUp,
+        /// Moves the selected cell down by one page of rows.
+        SelectPageDown,
     ]
 );
+
+// PageUp/PageDown move the selection by this many rows. Not derived from the
+// viewport's actual visible row count (UniformListScrollHandle does not expose
+// it precomputed) — a fixed jump is simpler and matches common grid editors'
+// "big enough to be useful" page-navigation feel.
+const PAGE_ROW_JUMP: usize = 20;
+
+// Projects a lat/lon pair to a normalized (x, y) fraction in [0, 1] using an
+// equirectangular projection, for plotting on the geo-viewer's offline scatter
+// map. Returns None for non-finite or out-of-range coordinates so callers can
+// skip them instead of plotting nonsense off the visible canvas.
+fn project_lat_lon(lat: f64, lon: f64) -> Option<(f32, f32)> {
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+    {
+        return None;
+    }
+    let x = ((lon + 180.0) / 360.0) as f32;
+    let y = ((90.0 - lat) / 180.0) as f32;
+    Some((x, y))
+}
 
 // Total rows the grid actually built across all frames. Used by tests to verify
 // the table virtualizes (only the visible window is built, not the whole result).
@@ -1775,6 +1810,81 @@ impl ResultView {
             .selected_cell_full_value()
             .as_deref()
             .is_some_and(cell_value_needs_expanded_editor);
+    }
+
+    // Selects the cell at the given position in `filtered_display_order` (not
+    // `display_row_entries`, so this deliberately matches `move_active_cell`'s
+    // plain-arrow navigation and, like it, does not visit staged "added" rows)
+    // and scrolls the row into view. Shared by the Home/End/first/last/page
+    // keyboard-navigation actions below.
+    fn select_display_cell(&mut self, display_idx: usize, col_pos: usize, cx: &mut Context<Self>) {
+        let Some(&abs_idx) = self.filtered_display_order.get(display_idx) else {
+            return;
+        };
+        let Some(&col_idx) = self.visible_columns.get(col_pos) else {
+            return;
+        };
+        self.selected_cell = Some((abs_idx, col_idx));
+        self.selected_cell_range = None;
+        self.selected_rows.clear();
+        self.scroll_handle
+            .scroll_to_item(display_idx, gpui::ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn current_display_idx(&self) -> usize {
+        self.selected_cell
+            .and_then(|(abs_idx, _)| {
+                self.filtered_display_order
+                    .iter()
+                    .position(|&a| a == abs_idx)
+            })
+            .unwrap_or(0)
+    }
+
+    fn current_col_pos(&self) -> usize {
+        self.selected_cell
+            .and_then(|(_, col_idx)| self.visible_columns.iter().position(|&c| c == col_idx))
+            .unwrap_or(0)
+    }
+
+    fn select_row_start(&mut self, cx: &mut Context<Self>) {
+        self.select_display_cell(self.current_display_idx(), 0, cx);
+    }
+
+    fn select_row_end(&mut self, cx: &mut Context<Self>) {
+        if self.visible_columns.is_empty() {
+            return;
+        }
+        self.select_display_cell(
+            self.current_display_idx(),
+            self.visible_columns.len() - 1,
+            cx,
+        );
+    }
+
+    fn select_first_cell(&mut self, cx: &mut Context<Self>) {
+        self.select_display_cell(0, 0, cx);
+    }
+
+    fn select_last_cell(&mut self, cx: &mut Context<Self>) {
+        let row_count = self.filtered_display_order.len();
+        if row_count == 0 || self.visible_columns.is_empty() {
+            return;
+        }
+        self.select_display_cell(row_count - 1, self.visible_columns.len() - 1, cx);
+    }
+
+    fn move_page(&mut self, delta_row: isize, cx: &mut Context<Self>) {
+        let row_count = self.filtered_display_order.len();
+        if row_count == 0 || self.visible_columns.is_empty() {
+            return;
+        }
+        let new_display_idx = self
+            .current_display_idx()
+            .saturating_add_signed(delta_row)
+            .min(row_count - 1);
+        self.select_display_cell(new_display_idx, self.current_col_pos(), cx);
     }
 
     fn begin_cell_drag(&mut self, abs_idx: usize, cell_idx: usize) {
@@ -9214,9 +9324,9 @@ impl ResultView {
         result: &QueryResult,
         lat: usize,
         lon: usize,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let points: Vec<(String, String)> = result
+        let raw_points: Vec<(String, String)> = result
             .rows
             .iter()
             .filter_map(|row| {
@@ -9225,26 +9335,106 @@ impl ResultView {
                 Some((lat_value, lon_value))
             })
             .collect();
-        let rows: Vec<AnyElement> = points
+        let plotted: Vec<(f32, f32)> = raw_points
+            .iter()
+            .filter_map(|(lat_value, lon_value)| {
+                let lat_num: f64 = lat_value.trim().parse().ok()?;
+                let lon_num: f64 = lon_value.trim().parse().ok()?;
+                project_lat_lon(lat_num, lon_num)
+            })
+            .collect();
+        let plotted_count = plotted.len();
+
+        let point_color = cx.theme().status().info;
+        let grid_color = cx.theme().colors().border;
+        let plot = div()
+            .flex_1()
+            .w_full()
+            .min_h(px(160.))
+            .border_1()
+            .border_color(grid_color)
+            .child(
+                gpui::canvas(
+                    move |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let origin = bounds.origin;
+                        let width = bounds.size.width;
+                        let height = bounds.size.height;
+
+                        // Gridlines every 60° longitude / 30° latitude, as a
+                        // coarse offline frame of reference for the plot.
+                        for lon_deg in (-180..=180).step_by(60) {
+                            let x = origin.x + width * ((lon_deg as f32 + 180.0) / 360.0);
+                            let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                            builder.move_to(gpui::point(x, origin.y));
+                            builder.line_to(gpui::point(x, origin.y + height));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, grid_color);
+                            }
+                        }
+                        for lat_deg in (-90..=90).step_by(30) {
+                            let y = origin.y + height * ((90.0 - lat_deg as f32) / 180.0);
+                            let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                            builder.move_to(gpui::point(origin.x, y));
+                            builder.line_to(gpui::point(origin.x + width, y));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, grid_color);
+                            }
+                        }
+
+                        const DOT_SIZE: f32 = 4.0;
+                        for (x_frac, y_frac) in &plotted {
+                            let center = gpui::point(
+                                origin.x + width * *x_frac,
+                                origin.y + height * *y_frac,
+                            );
+                            let dot_bounds = gpui::Bounds {
+                                origin: gpui::point(
+                                    center.x - px(DOT_SIZE / 2.0),
+                                    center.y - px(DOT_SIZE / 2.0),
+                                ),
+                                size: gpui::size(px(DOT_SIZE), px(DOT_SIZE)),
+                            };
+                            window.paint_quad(gpui::fill(dot_bounds, point_color));
+                        }
+                    },
+                )
+                .size_full(),
+            );
+
+        let skipped = raw_points.len() - plotted_count;
+        let summary = if skipped > 0 {
+            format!(
+                "{} geo points ({skipped} skipped: invalid or out of range)",
+                raw_points.len()
+            )
+        } else {
+            format!("{} geo points", raw_points.len())
+        };
+        let rows: Vec<AnyElement> = raw_points
             .iter()
             .take(500)
             .map(|(lat_value, lon_value)| {
                 Label::new(SharedString::from(format!("{lat_value}, {lon_value}")))
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
                     .into_any_element()
             })
             .collect();
         v_flex()
-            .id("chart-geo-list")
+            .id("chart-geo-map")
             .flex_1()
-            .gap_1()
-            .overflow_y_scroll()
+            .gap_2()
+            .child(Label::new(SharedString::from(summary)).size(LabelSize::Small))
+            .child(plot)
             .child(
-                Label::new(SharedString::from(format!("{} geo points", points.len())))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                v_flex()
+                    .id("chart-geo-list")
+                    .max_h(px(96.))
+                    .gap_1()
+                    .overflow_y_scroll()
+                    .children(rows),
             )
-            .children(rows)
             .into_any_element()
     }
 
@@ -10300,6 +10490,24 @@ impl Render for ResultView {
             .on_action(cx.listener(|this, _: &ToggleChart, _window, cx| {
                 this.toggle_chart(cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectRowStart, _window, cx| {
+                this.select_row_start(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectRowEnd, _window, cx| {
+                this.select_row_end(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirstCell, _window, cx| {
+                this.select_first_cell(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectLastCell, _window, cx| {
+                this.select_last_cell(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPageUp, _window, cx| {
+                this.move_page(-(PAGE_ROW_JUMP as isize), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPageDown, _window, cx| {
+                this.move_page(PAGE_ROW_JUMP as isize, cx);
+            }))
             .when_some(filter_bar, |el, bar| el.child(bar))
             .child(div().flex_1().overflow_hidden().child(content))
             .when_some(self.render_record_view_panel(cx), |el, panel| {
@@ -11348,6 +11556,25 @@ mod tests {
         assert_eq!(ResultView::series_bounds(&negative), Some((-2.0, 5.0)));
 
         assert_eq!(ResultView::series_bounds(&[]), None);
+    }
+
+    #[test]
+    fn project_lat_lon_maps_corners_and_center() {
+        // Equirectangular projection: (-180, 90) is the top-left corner, (180,
+        // -90) is the bottom-right corner, and the origin is the center.
+        assert_eq!(project_lat_lon(90.0, -180.0), Some((0.0, 0.0)));
+        assert_eq!(project_lat_lon(-90.0, 180.0), Some((1.0, 1.0)));
+        assert_eq!(project_lat_lon(0.0, 0.0), Some((0.5, 0.5)));
+    }
+
+    #[test]
+    fn project_lat_lon_rejects_out_of_range_and_non_finite() {
+        assert_eq!(project_lat_lon(91.0, 0.0), None);
+        assert_eq!(project_lat_lon(-91.0, 0.0), None);
+        assert_eq!(project_lat_lon(0.0, 181.0), None);
+        assert_eq!(project_lat_lon(0.0, -181.0), None);
+        assert_eq!(project_lat_lon(f64::NAN, 0.0), None);
+        assert_eq!(project_lat_lon(0.0, f64::INFINITY), None);
     }
 
     #[test]
@@ -12610,6 +12837,93 @@ mod tests {
             ]
         );
         assert!(ResultView::parse_tsv_grid("").is_empty());
+    }
+
+    #[gpui::test]
+    fn real_home_end_and_page_keystrokes_navigate_through_the_production_keymap_binding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", SelectRowStart, Some("DbResultView")),
+                gpui::KeyBinding::new("end", SelectRowEnd, Some("DbResultView")),
+                gpui::KeyBinding::new("ctrl-home", SelectFirstCell, Some("DbResultView")),
+                gpui::KeyBinding::new("ctrl-end", SelectLastCell, Some("DbResultView")),
+                gpui::KeyBinding::new("pageup", SelectPageUp, Some("DbResultView")),
+                gpui::KeyBinding::new("pagedown", SelectPageDown, Some("DbResultView")),
+            ]);
+        });
+
+        // 3 rows (id, name) — sample_table_result, identity display order.
+        let (window, view, mut cx) = table_backed_result_window(cx);
+        let middle_id_cell = debug_center(&mut cx, "CELL-1-0");
+        cx.simulate_click(middle_id_cell, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(view.selected_cell, Some((1, 0)));
+        });
+
+        cx.simulate_keystrokes("end");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((1, 1)),
+                "End must jump to the last column of the same row"
+            );
+        });
+
+        cx.simulate_keystrokes("home");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((1, 0)),
+                "Home must jump to the first column of the same row"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-end");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((2, 1)),
+                "Ctrl+End must jump to the last cell of the whole grid"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-home");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((0, 0)),
+                "Ctrl+Home must jump to the first cell of the whole grid"
+            );
+        });
+
+        // With only 3 rows, a page-sized jump clamps to the last/first row
+        // rather than overshooting past the grid.
+        cx.simulate_keystrokes("pagedown");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((2, 0)),
+                "Page Down must clamp to the last row when the grid is shorter than a page"
+            );
+        });
+
+        cx.simulate_keystrokes("pageup");
+        draw_result_view(window, &mut cx);
+        view.update(&mut cx, |view, _| {
+            assert_eq!(
+                view.selected_cell,
+                Some((0, 0)),
+                "Page Up must clamp to the first row when the grid is shorter than a page"
+            );
+        });
     }
 
     #[gpui::test]

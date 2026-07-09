@@ -1,10 +1,22 @@
 use gpui::{
-    Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Window, canvas, point, prelude::*, px,
+    Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Window, actions, canvas, point, prelude::*, px,
 };
 use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*, rems_from_px};
 use workspace::{Item, item::ItemEvent};
+
+actions!(
+    erd_view,
+    [
+        /// Copies the diagram as a Mermaid erDiagram document.
+        CopyMermaid,
+        /// Copies the diagram as a Graphviz DOT document.
+        CopyDot,
+        /// Copies the diagram as a standalone SVG image document.
+        CopySvg,
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErdColumn {
@@ -267,6 +279,145 @@ pub fn to_dot(tables: &[ErdTable], relationships: &[ErdRelationship]) -> String 
     out
 }
 
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// SVG is a standalone document viewed outside the running app (an exported
+// file, not app chrome), so it uses fixed colors rather than `cx.theme()`
+// tokens -- there is no theme to read at export time and the file must still
+// render correctly when opened later, in another viewer, on another machine.
+const SVG_BORDER: &str = "#666666";
+const SVG_HEADER_FILL: &str = "#e0e0e0";
+const SVG_BODY_FILL: &str = "#ffffff";
+const SVG_TEXT: &str = "#1a1a1a";
+const SVG_MUTED_TEXT: &str = "#666666";
+const SVG_LINE: &str = "#888888";
+const SVG_PK: &str = "#b8860b";
+const SVG_FK: &str = "#4169aa";
+
+/// Render the schema as a standalone SVG document: one rect+text block per
+/// table (mirroring `render_table_box`'s layout) and one polyline+arrowhead
+/// per relationship (mirroring the on-screen elbow routing), all at zoom 1.0
+/// so the exported file matches the diagram's un-zoomed proportions.
+pub fn to_svg(tables: &[ErdTable], relationships: &[ErdRelationship]) -> String {
+    let positions = layout_positions(tables.len(), DEFAULT_COLUMNS_PER_ROW);
+    let mut boxes: Vec<(String, f32, f32, f32, f32)> = Vec::with_capacity(tables.len());
+    let mut total_width: f32 = 1.0;
+    let mut total_height: f32 = 1.0;
+    for (table, (row, column)) in tables.iter().zip(&positions) {
+        let (origin_x, origin_y) = box_origin(*row, *column);
+        let height = box_height(table.columns.len());
+        total_width = total_width.max(origin_x + BOX_WIDTH + OUTER_PADDING);
+        total_height = total_height.max(origin_y + height + OUTER_PADDING);
+        boxes.push((table.name.clone(), origin_x, origin_y, BOX_WIDTH, height));
+    }
+    let find_box = |name: &str| {
+        boxes
+            .iter()
+            .find(|(n, ..)| n == name)
+            .map(|(_, x, y, w, h)| (*x, *y, *w, *h))
+    };
+
+    let mut out = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{total_width}\" height=\"{total_height}\" \
+         viewBox=\"0 0 {total_width} {total_height}\" font-family=\"sans-serif\">\n\
+         <rect x=\"0\" y=\"0\" width=\"{total_width}\" height=\"{total_height}\" fill=\"{SVG_BODY_FILL}\"/>\n"
+    );
+
+    for relationship in relationships {
+        let (Some(from_box), Some(to_box)) = (
+            find_box(&relationship.from_table),
+            find_box(&relationship.to_table),
+        ) else {
+            continue;
+        };
+        let waypoints = elbow_route(from_box, to_box);
+        let Some(tail) = waypoints.get(waypoints.len().saturating_sub(2)) else {
+            continue;
+        };
+        let Some(tip) = waypoints.last() else {
+            continue;
+        };
+        let arrow = arrowhead_triangle(*tail, *tip, ARROW_SIZE);
+        let points = waypoints
+            .iter()
+            .map(|(x, y)| format!("{x},{y}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "<polyline points=\"{points}\" fill=\"none\" stroke=\"{SVG_LINE}\" stroke-width=\"{LINE_STROKE}\"/>\n"
+        ));
+        out.push_str(&format!(
+            "<polygon points=\"{},{} {},{} {},{}\" fill=\"{SVG_LINE}\"/>\n",
+            arrow[0].0, arrow[0].1, arrow[1].0, arrow[1].1, arrow[2].0, arrow[2].1
+        ));
+    }
+
+    for table in tables {
+        let Some((x, y, w, h)) = find_box(&table.name) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"{SVG_BODY_FILL}\" \
+             stroke=\"{SVG_BORDER}\" stroke-width=\"1\" rx=\"4\"/>\n"
+        ));
+        out.push_str(&format!(
+            "<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{HEADER_HEIGHT}\" fill=\"{SVG_HEADER_FILL}\" \
+             stroke=\"{SVG_BORDER}\" stroke-width=\"1\"/>\n"
+        ));
+        out.push_str(&format!(
+            "<text x=\"{}\" y=\"{}\" font-size=\"{HEADER_FONT}\" font-weight=\"bold\" fill=\"{SVG_TEXT}\">{}</text>\n",
+            x + CELL_PADDING,
+            y + HEADER_HEIGHT / 2.0 + HEADER_FONT / 3.0,
+            escape_xml(&table.name)
+        ));
+        let visible = displayed_column_count(table.columns.len());
+        for (index, column) in table.columns.iter().take(visible).enumerate() {
+            let row_y = y + HEADER_HEIGHT + index as f32 * ROW_HEIGHT;
+            let text_y = row_y + ROW_HEIGHT / 2.0 + COLUMN_FONT / 3.0;
+            let (marker, marker_color) = if column.is_primary_key {
+                ("PK ", SVG_PK)
+            } else if column.is_foreign_key {
+                ("FK ", SVG_FK)
+            } else {
+                ("", SVG_MUTED_TEXT)
+            };
+            out.push_str(&format!(
+                "<text x=\"{}\" y=\"{text_y}\" font-size=\"{COLUMN_FONT}\" fill=\"{marker_color}\">{}</text>\n",
+                x + CELL_PADDING,
+                escape_xml(marker)
+            ));
+            out.push_str(&format!(
+                "<text x=\"{}\" y=\"{text_y}\" font-size=\"{COLUMN_FONT}\" fill=\"{SVG_TEXT}\">{}</text>\n",
+                x + CELL_PADDING + 16.0,
+                escape_xml(&column.name)
+            ));
+            out.push_str(&format!(
+                "<text x=\"{}\" y=\"{text_y}\" font-size=\"{COLUMN_FONT}\" fill=\"{SVG_MUTED_TEXT}\" text-anchor=\"end\">{}</text>\n",
+                x + w - CELL_PADDING,
+                escape_xml(&column.data_type)
+            ));
+        }
+        let hidden = table.columns.len().saturating_sub(visible);
+        if hidden > 0 {
+            let row_y = y + HEADER_HEIGHT + visible as f32 * ROW_HEIGHT;
+            out.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\" font-size=\"{COLUMN_FONT}\" fill=\"{SVG_MUTED_TEXT}\">+{hidden} more</text>\n",
+                x + CELL_PADDING,
+                row_y + ROW_HEIGHT / 2.0 + COLUMN_FONT / 3.0
+            ));
+        }
+    }
+
+    out.push_str("</svg>\n");
+    out
+}
+
 struct PlacedTable {
     table: ErdTable,
     origin_x: f32,
@@ -280,6 +431,7 @@ pub struct ErdView {
     relationships: Vec<ErdRelationship>,
     mermaid: String,
     dot: String,
+    svg: String,
     total_width: f32,
     total_height: f32,
     scroll_handle: ScrollHandle,
@@ -299,6 +451,7 @@ impl ErdView {
     ) -> Self {
         let mermaid = to_mermaid(&tables, &relationships);
         let dot = to_dot(&tables, &relationships);
+        let svg = to_svg(&tables, &relationships);
         let positions = layout_positions(tables.len(), DEFAULT_COLUMNS_PER_ROW);
         let mut placed = Vec::with_capacity(tables.len());
         let mut total_width: f32 = 0.0;
@@ -306,7 +459,8 @@ impl ErdView {
         for (table, (row, column)) in tables.into_iter().zip(positions) {
             let (origin_x, origin_y) = box_origin(row, column);
             total_width = total_width.max(origin_x + BOX_WIDTH + OUTER_PADDING);
-            total_height = total_height.max(origin_y + box_height(table.columns.len()) + OUTER_PADDING);
+            total_height =
+                total_height.max(origin_y + box_height(table.columns.len()) + OUTER_PADDING);
             placed.push(PlacedTable {
                 table,
                 origin_x,
@@ -320,12 +474,25 @@ impl ErdView {
             relationships,
             mermaid,
             dot,
+            svg,
             total_width: total_width.max(1.0),
             total_height: total_height.max(1.0),
             scroll_handle: ScrollHandle::new(),
             zoom: 1.0,
             pan_origin: None,
         }
+    }
+
+    fn copy_mermaid(&self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.mermaid.clone()));
+    }
+
+    fn copy_dot(&self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.dot.clone()));
+    }
+
+    fn copy_svg(&self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.svg.clone()));
     }
 
     fn zoom_in(&mut self, cx: &mut Context<Self>) {
@@ -570,8 +737,6 @@ impl Render for ErdView {
             arrowheads.push(arrow.map(|(x, y)| point(px(scaled(x, zoom)), px(scaled(y, zoom)))));
         }
 
-        let mermaid = self.mermaid.clone();
-        let dot = self.dot.clone();
         let stroke_width = px(scaled(LINE_STROKE, zoom));
 
         let mut surface = div()
@@ -619,6 +784,9 @@ impl Render for ErdView {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(colors.editor_background)
+            .on_action(cx.listener(|this, _: &CopyMermaid, _window, cx| this.copy_mermaid(cx)))
+            .on_action(cx.listener(|this, _: &CopyDot, _window, cx| this.copy_dot(cx)))
+            .on_action(cx.listener(|this, _: &CopySvg, _window, cx| this.copy_svg(cx)))
             .child(
                 h_flex()
                     .w_full()
@@ -636,11 +804,14 @@ impl Render for ErdView {
                             .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
                     )
                     .child(
-                        Button::new("erd-zoom-reset", format!("{}%", (zoom * 100.0).round() as i32))
-                            .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::Small)
-                            .tooltip(Tooltip::text("Reset zoom to 100%"))
-                            .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
+                        Button::new(
+                            "erd-zoom-reset",
+                            format!("{}%", (zoom * 100.0).round() as i32),
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::text("Reset zoom to 100%"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
                     )
                     .child(
                         IconButton::new("erd-zoom-in", IconName::Plus)
@@ -653,20 +824,23 @@ impl Render for ErdView {
                             .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .tooltip(Tooltip::text("Copy the diagram as Mermaid erDiagram"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    mermaid.clone(),
-                                ));
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_mermaid(cx))),
                     )
                     .child(
                         Button::new("erd-copy-dot", "Copy DOT")
                             .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .tooltip(Tooltip::text("Copy the diagram as Graphviz DOT"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(dot.clone()));
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_dot(cx))),
+                    )
+                    .child(
+                        Button::new("erd-copy-svg", "Export SVG")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text(
+                                "Copy the diagram as a standalone SVG image document",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_svg(cx))),
                     ),
             )
             .child(
@@ -809,6 +983,79 @@ mod tests {
     }
 
     #[test]
+    fn to_svg_emits_a_well_formed_document_with_tables_and_a_relationship() {
+        let (tables, relationships) = sample();
+        let svg = to_svg(&tables, &relationships);
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(
+            svg.contains(">users<"),
+            "table name should appear as text content"
+        );
+        assert!(svg.contains(">orders<"));
+        assert!(
+            svg.contains(">PK </text>"),
+            "primary key marker should be rendered"
+        );
+        assert!(
+            svg.contains(">FK </text>"),
+            "foreign key marker should be rendered"
+        );
+        assert!(
+            svg.contains("<polyline"),
+            "relationship should render as a polyline"
+        );
+        assert!(
+            svg.contains("<polygon"),
+            "relationship should render an arrowhead polygon"
+        );
+    }
+
+    #[test]
+    fn to_svg_escapes_special_characters_in_table_and_column_names() {
+        let tables = vec![ErdTable {
+            name: "a<b>&\"c\"".into(),
+            columns: vec![ErdColumn {
+                name: "x&y".into(),
+                data_type: "varchar(10)".into(),
+                is_primary_key: false,
+                is_foreign_key: false,
+            }],
+        }];
+        let svg = to_svg(&tables, &[]);
+        assert!(
+            !svg.contains("a<b>&\"c\""),
+            "raw unescaped name must not appear"
+        );
+        assert!(svg.contains("a&lt;b&gt;&amp;&quot;c&quot;"));
+        assert!(svg.contains("x&amp;y"));
+    }
+
+    #[test]
+    fn to_svg_handles_empty_schema_without_panicking() {
+        let svg = to_svg(&[], &[]);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+    }
+
+    #[test]
+    fn to_svg_skips_relationships_whose_endpoint_table_is_missing() {
+        let (tables, _) = sample();
+        // Reference a table name that was never placed -- must be skipped, not panic.
+        let dangling = vec![ErdRelationship {
+            from_table: "orders".into(),
+            from_column: "user_id".into(),
+            to_table: "does_not_exist".into(),
+            to_column: "id".into(),
+        }];
+        let svg = to_svg(&tables, &dangling);
+        assert!(
+            !svg.contains("<polyline"),
+            "a dangling relationship must not be drawn"
+        );
+    }
+
+    #[test]
     fn layout_positions_wraps_after_columns_per_row() {
         let positions = layout_positions(5, 2);
         assert_eq!(positions, vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0)]);
@@ -850,8 +1097,9 @@ mod tests {
         });
 
         let (tables, relationships) = sample();
-        let view =
-            cx.add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        let view = cx.add_window(|window, cx| {
+            ErdView::new(tables, relationships, "Diagram: test", window, cx)
+        });
         view.update(cx, |view, _, _| {
             assert_eq!(view.placed.len(), 2);
             assert_eq!(view.relationships.len(), 1);
@@ -905,7 +1153,9 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_erd_frame(&mut cx);
 
-        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
         let max_offset = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
 
         assert!(
@@ -935,7 +1185,9 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_erd_frame(&mut cx);
-        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
 
         let max_offset_at_1x = erd.read_with(&cx, |view, _| view.scroll_handle.max_offset());
 
@@ -972,7 +1224,9 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_erd_frame(&mut cx);
-        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
 
         let scroll_bounds = cx
             .debug_bounds("ERD_SCROLL")
@@ -1032,7 +1286,9 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_erd_frame(&mut cx);
-        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
 
         let bounds_initial = cx
             .debug_bounds("ERD_SCROLL")
@@ -1115,7 +1371,11 @@ mod tests {
         let from_box = (0.0, 0.0, 100.0, 40.0);
         let to_box = (300.0, 200.0, 100.0, 40.0);
         let waypoints = elbow_route(from_box, to_box);
-        assert_eq!(waypoints.len(), 4, "route must be anchor, two bends, anchor");
+        assert_eq!(
+            waypoints.len(),
+            4,
+            "route must be anchor, two bends, anchor"
+        );
         let (start, bend1, bend2, end) = (waypoints[0], waypoints[1], waypoints[2], waypoints[3]);
         // Start and end anchor to box edges, not centers (50,20)/(350,220).
         assert_ne!(start, (50.0, 20.0));
@@ -1125,7 +1385,10 @@ mod tests {
         // run), which is not true of a straight two-point diagonal.
         assert_eq!(bend1.1, start.1, "first bend keeps the source anchor's y");
         assert_eq!(bend2.1, end.1, "second bend takes on the target anchor's y");
-        assert_eq!(bend1.0, bend2.0, "the two bends share an x (the vertical run)");
+        assert_eq!(
+            bend1.0, bend2.0,
+            "the two bends share an x (the vertical run)"
+        );
     }
 
     #[test]
@@ -1141,7 +1404,11 @@ mod tests {
     #[test]
     fn arrowhead_triangle_points_back_from_the_tip_along_the_line_direction() {
         let triangle = arrowhead_triangle((0.0, 0.0), (10.0, 0.0), 6.0);
-        assert_eq!(triangle[0], (10.0, 0.0), "tip sits exactly at the target point");
+        assert_eq!(
+            triangle[0],
+            (10.0, 0.0),
+            "tip sits exactly at the target point"
+        );
         assert_eq!(triangle[1], (4.0, 3.0));
         assert_eq!(triangle[2], (4.0, -3.0));
     }
@@ -1168,8 +1435,9 @@ mod tests {
         });
 
         let (tables, relationships) = sample();
-        let view = cx
-            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        let view = cx.add_window(|window, cx| {
+            ErdView::new(tables, relationships, "Diagram: test", window, cx)
+        });
         view.update(cx, |view, _, _| {
             let paths = view.relationship_paths();
             assert_eq!(paths.len(), 1, "expected exactly one relationship path");
@@ -1238,8 +1506,9 @@ mod tests {
         });
 
         let (tables, relationships) = sample();
-        let view = cx
-            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        let view = cx.add_window(|window, cx| {
+            ErdView::new(tables, relationships, "Diagram: test", window, cx)
+        });
         view.update(cx, |view, _window, cx| {
             assert_eq!(view.zoom, 1.0);
             for _ in 0..20 {
@@ -1265,8 +1534,9 @@ mod tests {
         });
 
         let (tables, relationships) = sample();
-        let view = cx
-            .add_window(|window, cx| ErdView::new(tables, relationships, "Diagram: test", window, cx));
+        let view = cx.add_window(|window, cx| {
+            ErdView::new(tables, relationships, "Diagram: test", window, cx)
+        });
         view.update(cx, |view, _window, _cx| {
             assert_eq!(view.zoom, 1.0);
 
@@ -1318,7 +1588,9 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_erd_frame(&mut cx);
-        let erd = window.update(&mut cx, |frame, _, _| frame.view.clone()).unwrap();
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
 
         let bounds_initial = cx
             .debug_bounds("ERD_SCROLL")
@@ -1374,5 +1646,4 @@ mod tests {
              changed"
         );
     }
-
 }

@@ -1,3 +1,4 @@
+mod aerospike_view;
 mod compare_data;
 mod connection_view;
 mod data_import;

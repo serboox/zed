@@ -204,7 +204,8 @@ impl FullTextSearchView {
                 });
                 let columns = describe_task.await.log_err().unwrap_or_default();
 
-                let sql = build_search_sql(driver, &table, &columns, &term, SEARCH_ROW_CAP_PER_TABLE);
+                let sql =
+                    build_search_sql(driver, &table, &columns, &term, SEARCH_ROW_CAP_PER_TABLE);
                 let outcome = match &sql {
                     Some(sql) => {
                         let query_task = store.update(cx, |store, cx| {
@@ -223,11 +224,7 @@ impl FullTextSearchView {
                     if let (Some(sql), Some(Ok(result))) = (sql, outcome)
                         && !result.rows.is_empty()
                     {
-                        view.results.push(TableSearchResult {
-                            table,
-                            sql,
-                            result,
-                        });
+                        view.results.push(TableSearchResult { table, sql, result });
                     }
                     cx.notify();
                 })
@@ -252,10 +249,12 @@ impl FullTextSearchView {
         let database = self.database.clone();
         let sql = hit.sql.clone();
         let title = SharedString::from(hit.table.clone());
-        let task = self
-            .store
-            .update(cx, |store, cx| store.execute_query(connection_id, database, sql, cx));
-        let result_view = cx.new(|cx| ResultView::new(title, cx));
+        let task = self.store.update(cx, |store, cx| {
+            store.execute_query(connection_id, database, sql, cx)
+        });
+        let store_weak = self.store.downgrade();
+        let env_color = crate::panel::connection_env_color(&store_weak, connection_id, cx);
+        let result_view = cx.new(|cx| ResultView::new(title, cx).with_env_color(env_color));
         let rv = result_view.clone();
         let workspace = self.workspace.clone();
         window
@@ -267,7 +266,13 @@ impl FullTextSearchView {
                 });
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(result_view),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
                     })
                     .log_err();
             })
@@ -328,9 +333,13 @@ impl Render for FullTextSearchView {
                     .py_1()
                     .child(Label::new(hit.table.clone()).size(LabelSize::Default))
                     .child(
-                        Label::new(format!("{} row{}", hit.result.rows.len(), if hit.result.rows.len() == 1 { "" } else { "s" }))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(format!(
+                            "{} row{}",
+                            hit.result.rows.len(),
+                            if hit.result.rows.len() == 1 { "" } else { "s" }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(
                         Button::new(("full-text-search-open", index), "Open")
@@ -353,7 +362,11 @@ impl Render for FullTextSearchView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(Label::new(format!("Search in {}", self.connection_label)).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(format!("Search in {}", self.connection_label))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -369,13 +382,31 @@ impl Render for FullTextSearchView {
                     ),
             )
             .when_some(self.status.clone(), |el, status| {
-                el.child(Label::new(status).size(LabelSize::Small).color(Color::Error))
+                el.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .color(Color::Warning)
+                                .size(IconSize::Small),
+                        )
+                        .child(
+                            Label::new(status)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        ),
+                )
             })
             .when_some(progress, |el, progress| {
                 el.child(
                     div()
                         .debug_selector(|| "SEARCH_PROGRESS".to_string())
-                        .child(Label::new(progress).size(LabelSize::Small).color(Color::Muted)),
+                        .child(
+                            Label::new(progress)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                 )
             })
             .child(

@@ -696,6 +696,7 @@
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "ctrl-shift-d": "debug_panel::ToggleFocus",
       "ctrl-alt-8": "database_panel::ToggleFocus",
+      "ctrl-alt-9": "api_client_panel::ToggleFocus",
       "ctrl-?": "agent::ToggleFocus",
       "alt-save": "workspace::SaveAll",
       "ctrl-alt-s": "workspace::SaveAll",
@@ -735,7 +736,21 @@
       "ctrl-b": "database_panel::GoToDdl",
       "ctrl-q": "database_panel::QuickDocumentation",
       "ctrl-alt-shift-u": "database_panel::ShowDiagram",
-      "ctrl-n": "database_panel::GoToObject"
+      "ctrl-n": "database_panel::GoToObject",
+      "left": "database_panel::CollapseSelectedEntry",
+      "right": "database_panel::ExpandSelectedEntry",
+      "shift-up": "database_panel::MoveSelectedUp",
+      "shift-down": "database_panel::MoveSelectedDown"
+    }
+  },
+  {
+    "context": "ApiClientPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "left": "api_client_panel::CollapseSelectedEntry",
+      "right": "api_client_panel::ExpandSelectedEntry",
+      "shift-up": "api_client_panel::MoveSelectedUp",
+      "shift-down": "api_client_panel::MoveSelectedDown"
     }
   },
   {
@@ -1624,7 +1639,41 @@
       "ctrl-alt-shift-enter": "db_result_view::CommitTransaction",
       "ctrl-f5": "db_result_view::ToggleLocalFilters",
       "ctrl-f12": "db_result_view::ToggleColumnList",
-      "ctrl-q": "db_result_view::QuickDoc"
+      "ctrl-q": "db_result_view::QuickDoc",
+      "home": "db_result_view::SelectRowStart",
+      "end": "db_result_view::SelectRowEnd",
+      "ctrl-home": "db_result_view::SelectFirstCell",
+      "ctrl-end": "db_result_view::SelectLastCell",
+      "pageup": "db_result_view::SelectPageUp",
+      "pagedown": "db_result_view::SelectPageDown"
+    }
+  },
+  {
+    "context": "ErdView",
+    "bindings": {
+      "ctrl-alt-m": "erd_view::CopyMermaid",
+      "ctrl-alt-d": "erd_view::CopyDot",
+      "ctrl-alt-s": "erd_view::CopySvg"
+    }
+  },
+  {
+    "context": "CompareData",
+    "bindings": {
+      "escape": "db_compare_data::CloseCompareData"
+    }
+  },
+  {
+    "context": "SchemaDiff",
+    "bindings": {
+      "ctrl-alt-c": "db_schema_diff::CopySchemaDiffScript",
+      "ctrl-enter": "db_schema_diff::RunSchemaDiffScript",
+      "escape": "db_schema_diff::CloseSchemaDiff"
+    }
+  },
+  {
+    "context": "DdlSource",
+    "bindings": {
+      "escape": "db_ddl_source::CloseDdlSource"
     }
   },
 ]

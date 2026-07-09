@@ -38954,3 +38954,33 @@ async fn test_select_delimiters_expansion(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectInsideDelimiters);
     cx.assert_editor_state("foo(«x, { a: 1 }ˇ»);");
 }
+
+#[test]
+fn test_apply_background_tint_is_noop_when_none() {
+    let background = Hsla {
+        h: 0.6,
+        s: 0.2,
+        l: 0.15,
+        a: 1.0,
+    };
+    assert_eq!(Editor::apply_background_tint(background, None), background);
+}
+
+#[test]
+fn test_apply_background_tint_blends_low_opacity_tint() {
+    let background = Hsla {
+        h: 0.6,
+        s: 0.2,
+        l: 0.15,
+        a: 1.0,
+    };
+    let tint = Hsla {
+        h: 0.0,
+        s: 0.8,
+        l: 0.5,
+        a: 1.0,
+    };
+    let tinted = Editor::apply_background_tint(background, Some(tint));
+    assert_ne!(tinted, background);
+    assert_eq!(tinted, background.blend(tint.opacity(0.05)));
+}

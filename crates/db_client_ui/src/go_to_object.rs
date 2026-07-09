@@ -107,7 +107,9 @@ impl GoToObjectDelegate {
         let task = self.store.update(cx, |store, cx| {
             store.execute_query(connection_id, database, sql, cx)
         });
-        let result_view = cx.new(|cx| ResultView::new(title, cx));
+        let store_weak = self.store.downgrade();
+        let env_color = crate::panel::connection_env_color(&store_weak, connection_id, cx);
+        let result_view = cx.new(|cx| ResultView::new(title, cx).with_env_color(env_color));
         let rv = result_view.clone();
         let workspace = self.workspace.clone();
         window
@@ -158,7 +160,11 @@ impl PickerDelegate for GoToObjectDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        format!("Go to database, table, view, or column in {}...", self.connection_label).into()
+        format!(
+            "Go to database, table, view, or column in {}...",
+            self.connection_label
+        )
+        .into()
     }
 
     fn update_matches(

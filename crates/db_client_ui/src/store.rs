@@ -2,8 +2,11 @@ use crate::db_migration::ConnectionSecrets;
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use db_client::{
-    ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId, MAX_FOLDER_DEPTH,
+    ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId,
+    KubernetesRelayCommand, KubernetesRelayCommandKind, KubernetesTarget, KubernetesTargetKind,
+    KubernetesTunnel, KubernetesTunnelMode, KubernetesTunnelModeKind, MAX_FOLDER_DEPTH,
     RuntimeProvider, SshAuth, SshAuthMethod, SshTunnel,
+    aerospike_provider::AerospikeProvider,
     cassandra_provider::CassandraProvider,
     clickhouse::ClickHouseProvider,
     mongo_provider::MongoProvider,
@@ -282,12 +285,22 @@ pub enum DatabaseStoreEvent {
     SchemaChanged,
 }
 
+/// Whichever kind of tunnel keeps a connection's underlying driver reachable
+/// on `127.0.0.1`, held alive for as long as the connection is open. Neither
+/// variant's payload is read again after construction -- it exists only so
+/// `Drop` tears the tunnel process down when the connection closes.
+#[allow(dead_code)]
+enum ActiveTunnel {
+    Ssh(SshTunnel),
+    Kubernetes(KubernetesTunnel),
+}
+
 pub struct DatabaseStore {
     pub connections: Vec<ActiveConnection>,
     pub folders: Vec<Folder>,
     pub query_history: Vec<String>,
     pub active_connection_id: Option<ConnectionId>,
-    ssh_tunnels: HashMap<ConnectionId, SshTunnel>,
+    tunnels: HashMap<ConnectionId, ActiveTunnel>,
     ddl_cache: HashMap<ConnectionId, DdlCache>,
     schema_cache: HashMap<ConnectionId, SchemaCache>,
     prefetching_schema: HashSet<ConnectionId>,
@@ -308,6 +321,24 @@ pub struct CliQueryOutput {
     pub rows: Vec<Vec<Option<String>>>,
     pub rows_affected: u64,
     pub execution_time_ms: u64,
+}
+
+/// One entry of the tree — a folder or a connection — for the drag-and-drop
+/// reordering API on `DatabaseStore`. Folders and connections share one
+/// `order` space per parent (see `next_order_in`), so a "sibling" list mixes
+/// both kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeItemRef {
+    Folder(FolderId),
+    Connection(ConnectionId),
+}
+
+/// Where a dragged item lands relative to the anchor sibling it was dropped
+/// next to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativePosition {
+    Before,
+    After,
 }
 
 impl DatabaseStore {
@@ -429,7 +460,7 @@ impl DatabaseStore {
             folders: Vec::new(),
             query_history: Vec::new(),
             active_connection_id: None,
-            ssh_tunnels: HashMap::new(),
+            tunnels: HashMap::new(),
             ddl_cache: HashMap::new(),
             schema_cache: HashMap::new(),
             prefetching_schema: HashSet::new(),
@@ -903,7 +934,7 @@ impl DatabaseStore {
         } else {
             return;
         }
-        self.ssh_tunnels.remove(&config_id);
+        self.tunnels.remove(&config_id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         self.persist_connections(cx);
@@ -922,7 +953,7 @@ impl DatabaseStore {
 
     pub fn remove_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         self.connections.retain(|c| c.config.id != id);
-        self.ssh_tunnels.remove(&id);
+        self.tunnels.remove(&id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         cx.spawn(async move |_this, cx| {
@@ -1373,6 +1404,108 @@ impl DatabaseStore {
         self.persist_connections(cx);
     }
 
+    fn tree_item_parent(&self, item: TreeItemRef) -> Option<Option<FolderId>> {
+        match item {
+            TreeItemRef::Folder(id) => self
+                .folders
+                .iter()
+                .find(|f| f.id == id)
+                .map(|f| f.parent_id),
+            TreeItemRef::Connection(id) => self
+                .connections
+                .iter()
+                .find(|c| c.config.id == id)
+                .map(|c| c.config.folder_id),
+        }
+    }
+
+    /// Folders and connections directly under `parent_id`, sorted by `order`.
+    fn combined_siblings(&self, parent_id: Option<FolderId>) -> Vec<TreeItemRef> {
+        let mut siblings: Vec<(TreeItemRef, i64)> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == parent_id)
+            .map(|f| (TreeItemRef::Folder(f.id), f.order))
+            .chain(
+                self.connections
+                    .iter()
+                    .filter(|c| c.config.folder_id == parent_id)
+                    .map(|c| (TreeItemRef::Connection(c.config.id), c.config.order)),
+            )
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        siblings.into_iter().map(|(item, _)| item).collect()
+    }
+
+    fn set_tree_item_order(&mut self, item: TreeItemRef, parent_id: Option<FolderId>, order: i64) {
+        match item {
+            TreeItemRef::Folder(id) => {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                    folder.parent_id = parent_id;
+                    folder.order = order;
+                }
+            }
+            TreeItemRef::Connection(id) => {
+                if let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) {
+                    conn.config.folder_id = parent_id;
+                    conn.config.order = order;
+                }
+            }
+        }
+    }
+
+    /// Moves `item` to sit immediately `position` (before/after) `anchor` among
+    /// `anchor`'s siblings, reparenting `item` under `anchor`'s parent if it
+    /// wasn't already there. Rejects moves that would create a cycle or push a
+    /// folder subtree past `MAX_FOLDER_DEPTH`, mirroring `move_folder`'s
+    /// guards. Returns whether the move ran.
+    pub fn reposition_item(
+        &mut self,
+        item: TreeItemRef,
+        anchor: TreeItemRef,
+        position: RelativePosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if item == anchor {
+            return false;
+        }
+        let Some(target_parent) = self.tree_item_parent(anchor) else {
+            return false;
+        };
+        if let TreeItemRef::Folder(item_id) = item {
+            if let Some(parent) = target_parent {
+                if parent == item_id || self.is_descendant_of(parent, item_id) {
+                    return false;
+                }
+                if self.folder_depth(parent) + self.subtree_height(item_id) > MAX_FOLDER_DEPTH {
+                    return false;
+                }
+            } else if self.subtree_height(item_id) > MAX_FOLDER_DEPTH {
+                return false;
+            }
+        }
+
+        let mut siblings = self.combined_siblings(target_parent);
+        siblings.retain(|sibling| *sibling != item);
+        let Some(anchor_index) = siblings.iter().position(|sibling| *sibling == anchor) else {
+            return false;
+        };
+        let insert_at = match position {
+            RelativePosition::Before => anchor_index,
+            RelativePosition::After => anchor_index + 1,
+        };
+        siblings.insert(insert_at, item);
+
+        for (index, sibling) in siblings.into_iter().enumerate() {
+            self.set_tree_item_order(sibling, target_parent, index as i64);
+        }
+
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        self.persist_connections(cx);
+        true
+    }
+
     pub fn connect(&mut self, id: ConnectionId, cx: &mut Context<Self>) -> Task<Result<()>> {
         let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
@@ -1394,7 +1527,7 @@ impl DatabaseStore {
                         conn.provider = Some(provider);
                         conn.status = ConnectionStatus::Connected;
                         if let Some(tunnel) = tunnel {
-                            this.ssh_tunnels.insert(id, tunnel);
+                            this.tunnels.insert(id, tunnel);
                         }
                         if this.active_connection_id.is_none() {
                             this.active_connection_id = Some(id);
@@ -1453,7 +1586,7 @@ impl DatabaseStore {
             config: conn.config.clone(),
             ..ActiveConnection::new(conn.config.clone())
         };
-        self.ssh_tunnels.remove(&id);
+        self.tunnels.remove(&id);
         if self.active_connection_id == Some(id) {
             self.active_connection_id = None;
         }
@@ -1802,6 +1935,67 @@ impl DatabaseStore {
         })
     }
 
+    /// Fetches a single Aerospike record by key. See
+    /// [`db_client::provider::DbProvider::get_record`].
+    pub fn get_record(
+        &mut self,
+        id: ConnectionId,
+        namespace: String,
+        set: String,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Vec<(String, String)>>>> {
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.get_record(&namespace, &set, &key).await
+        })
+    }
+
+    /// Writes bins to an Aerospike record by key. See
+    /// [`db_client::provider::DbProvider::put_record`].
+    pub fn put_record(
+        &mut self,
+        id: ConnectionId,
+        namespace: String,
+        set: String,
+        key: String,
+        bins: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+            return Task::ready(Err(anyhow::anyhow!("Connection not found")));
+        };
+        if conn.config.read_only {
+            return Task::ready(Err(read_only_error(&conn.config.label)));
+        }
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.put_record(&namespace, &set, &key, &bins).await
+        })
+    }
+
+    /// Scans up to `limit` Aerospike records in a namespace/set. See
+    /// [`db_client::provider::DbProvider::scan_records`].
+    pub fn scan_records(
+        &mut self,
+        id: ConnectionId,
+        namespace: String,
+        set: String,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<db_client::schema::QueryResult>> {
+        cx.spawn(async move |this, cx| {
+            let provider = this
+                .update(cx, |store, cx| store.ensure_connected(id, cx))?
+                .await?;
+            provider.scan_records(&namespace, &set, limit).await
+        })
+    }
+
     pub fn describe_table(
         &mut self,
         id: ConnectionId,
@@ -2107,7 +2301,7 @@ fn connect_task_result(connect_error: Option<String>) -> Result<()> {
 
 async fn build_provider(
     config: &ConnectionConfig,
-) -> Result<(Arc<dyn DbProvider>, Option<SshTunnel>)> {
+) -> Result<(Arc<dyn DbProvider>, Option<ActiveTunnel>)> {
     let (effective_config, tunnel) = if config.uses_ssh() {
         let ssh_host = config.ssh_host.as_deref().unwrap_or_default();
         let auth = match config.ssh_auth_method {
@@ -2127,7 +2321,40 @@ async fn build_provider(
         let mut modified = config.clone();
         modified.host = "127.0.0.1".to_string();
         modified.port = local_port;
-        (modified, Some(tunnel))
+        (modified, Some(ActiveTunnel::Ssh(tunnel)))
+    } else if config.uses_kubernetes_tunnel() {
+        let context = config.k8s_context.as_deref().unwrap_or_default();
+        let mode = match config.k8s_tunnel_mode {
+            KubernetesTunnelModeKind::PortForward => KubernetesTunnelMode::PortForward,
+            KubernetesTunnelModeKind::Exec => {
+                let relay = match config.k8s_relay_command {
+                    KubernetesRelayCommandKind::Socat => KubernetesRelayCommand::Socat,
+                    KubernetesRelayCommandKind::Nc => KubernetesRelayCommand::Nc,
+                };
+                KubernetesTunnelMode::Exec(relay)
+            }
+        };
+        let target = match config.k8s_target_kind {
+            KubernetesTargetKind::Pod => KubernetesTarget::Pod(config.k8s_target_name.clone()),
+            KubernetesTargetKind::Service => {
+                KubernetesTarget::Service(config.k8s_target_name.clone())
+            }
+        };
+        let tunnel = KubernetesTunnel::establish(
+            mode,
+            context,
+            &config.k8s_namespace,
+            config.k8s_kubeconfig_path.as_deref(),
+            target,
+            &config.host,
+            config.port,
+        )
+        .await?;
+        let local_port = tunnel.local_port();
+        let mut modified = config.clone();
+        modified.host = "127.0.0.1".to_string();
+        modified.port = local_port;
+        (modified, Some(ActiveTunnel::Kubernetes(tunnel)))
     } else {
         (config.clone(), None)
     };
@@ -2160,6 +2387,10 @@ async fn build_provider(
         DatabaseDriver::Cassandra => {
             let config = effective_config.clone();
             Arc::new(on_runtime(async move { CassandraProvider::connect(&config).await }).await?)
+        }
+        DatabaseDriver::Aerospike => {
+            let config = effective_config.clone();
+            Arc::new(on_runtime(async move { AerospikeProvider::connect(&config).await }).await?)
         }
     };
     let provider: Arc<dyn DbProvider> = Arc::new(RuntimeProvider::new(raw));
@@ -2450,6 +2681,189 @@ mod tests {
                 .config
                 .order;
             assert_eq!(order, 1);
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_item_reorders_same_parent_siblings(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let a = store.add_folder("A".into(), None, cx).expect("a");
+            let b = store.add_folder("B".into(), None, cx).expect("b");
+            let c = store.add_folder("C".into(), None, cx).expect("c");
+
+            // A, B, C -> drop A after C -> B, C, A.
+            assert!(store.reposition_item(
+                TreeItemRef::Folder(a),
+                TreeItemRef::Folder(c),
+                RelativePosition::After,
+                cx,
+            ));
+            assert_eq!(
+                store.combined_siblings(None),
+                [
+                    TreeItemRef::Folder(b),
+                    TreeItemRef::Folder(c),
+                    TreeItemRef::Folder(a),
+                ]
+            );
+
+            // Drop A before B -> A, B, C again.
+            assert!(store.reposition_item(
+                TreeItemRef::Folder(a),
+                TreeItemRef::Folder(b),
+                RelativePosition::Before,
+                cx,
+            ));
+            assert_eq!(
+                store.combined_siblings(None),
+                [
+                    TreeItemRef::Folder(a),
+                    TreeItemRef::Folder(b),
+                    TreeItemRef::Folder(c),
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_item_interleaves_folders_and_connections(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let folder = store.add_folder("F".into(), None, cx).expect("folder");
+            let conn = config_in(None, 1);
+            let conn_id = conn.id;
+            store.connections.push(ActiveConnection::new(conn));
+
+            // Root siblings today: folder (order 0), connection (order 1).
+            assert_eq!(
+                store.combined_siblings(None),
+                [
+                    TreeItemRef::Folder(folder),
+                    TreeItemRef::Connection(conn_id)
+                ]
+            );
+
+            // Drop the connection before the folder -> connection, folder.
+            assert!(store.reposition_item(
+                TreeItemRef::Connection(conn_id),
+                TreeItemRef::Folder(folder),
+                RelativePosition::Before,
+                cx,
+            ));
+            assert_eq!(
+                store.combined_siblings(None),
+                [
+                    TreeItemRef::Connection(conn_id),
+                    TreeItemRef::Folder(folder)
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_item_moves_across_parents(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let folder_a = store.add_folder("A".into(), None, cx).expect("a");
+            let folder_b = store.add_folder("B".into(), None, cx).expect("b");
+            let conn = config_in(Some(folder_a), 0);
+            let conn_id = conn.id;
+            store.connections.push(ActiveConnection::new(conn));
+            let anchor = config_in(Some(folder_b), 0);
+            let anchor_id = anchor.id;
+            store.connections.push(ActiveConnection::new(anchor));
+
+            // Drag the connection out of folder A and drop it after the
+            // connection already sitting in folder B.
+            assert!(store.reposition_item(
+                TreeItemRef::Connection(conn_id),
+                TreeItemRef::Connection(anchor_id),
+                RelativePosition::After,
+                cx,
+            ));
+
+            assert!(store.combined_siblings(Some(folder_a)).is_empty());
+            assert_eq!(
+                store.combined_siblings(Some(folder_b)),
+                [
+                    TreeItemRef::Connection(anchor_id),
+                    TreeItemRef::Connection(conn_id)
+                ]
+            );
+            let moved = store
+                .connections
+                .iter()
+                .find(|c| c.config.id == conn_id)
+                .expect("conn");
+            assert_eq!(moved.config.folder_id, Some(folder_b));
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_item_rejects_no_op_and_cycles(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let parent = store.add_folder("parent".into(), None, cx).expect("parent");
+            let child = store
+                .add_folder("child".into(), Some(parent), cx)
+                .expect("child");
+            let sibling = store
+                .add_folder("sibling".into(), None, cx)
+                .expect("sibling");
+
+            // Dropping an item relative to itself is a no-op.
+            assert!(!store.reposition_item(
+                TreeItemRef::Folder(sibling),
+                TreeItemRef::Folder(sibling),
+                RelativePosition::After,
+                cx,
+            ));
+
+            // Dropping a folder next to its own descendant would orphan the
+            // cycle — rejected, same guard as `move_folder`.
+            assert!(!store.reposition_item(
+                TreeItemRef::Folder(parent),
+                TreeItemRef::Folder(child),
+                RelativePosition::Before,
+                cx,
+            ));
+            store.folders.iter().for_each(|f| {
+                if f.id == parent {
+                    assert_eq!(
+                        f.parent_id, None,
+                        "rejected move must not mutate the parent"
+                    );
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_item_handles_single_item_list(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            let only = store.add_folder("only".into(), None, cx).expect("only");
+            let other_parent = store.add_folder("other".into(), None, cx).expect("other");
+
+            // A single-item sibling list has no valid anchor other than itself
+            // once "only" is excluded, but repositioning it relative to a
+            // folder under a different (empty) parent must still work cleanly.
+            assert!(store.reposition_item(
+                TreeItemRef::Folder(only),
+                TreeItemRef::Folder(other_parent),
+                RelativePosition::After,
+                cx,
+            ));
+            assert_eq!(
+                store
+                    .folders
+                    .iter()
+                    .find(|f| f.id == only)
+                    .unwrap()
+                    .parent_id,
+                None
+            );
         });
     }
 

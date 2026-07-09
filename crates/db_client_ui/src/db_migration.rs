@@ -76,13 +76,23 @@ pub struct ExportBundle {
     pub secrets: Option<EncryptedSecrets>,
 }
 
-fn derive_key_material(master_password: &str, salt: &[u8], iterations: u32) -> [u8; KEY_MATERIAL_LEN] {
+fn derive_key_material(
+    master_password: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; KEY_MATERIAL_LEN] {
     let mut material = [0u8; KEY_MATERIAL_LEN];
     pbkdf2::pbkdf2::<HmacSha256>(master_password.as_bytes(), salt, iterations, &mut material);
     material
 }
 
-fn mac_tag(mac_key: &[u8], salt: &[u8], iterations: u32, iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+fn mac_tag(
+    mac_key: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    iv: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
     let mut mac =
         HmacSha256::new_from_slice(mac_key).map_err(|_| anyhow!("invalid MAC key length"))?;
     mac.update(salt);
@@ -159,8 +169,7 @@ pub fn decrypt_secrets(
         .map_err(|_| anyhow!("invalid master password or corrupted export"))?;
     material.zeroize();
 
-    let secrets =
-        serde_json::from_slice(&plaintext).context("deserializing decrypted secrets")?;
+    let secrets = serde_json::from_slice(&plaintext).context("deserializing decrypted secrets")?;
     Ok(secrets)
 }
 

@@ -2,11 +2,23 @@ use db_client::connection::DatabaseDriver;
 use db_client::schema::{CheckConstraintInfo, ColumnInfo, FkInfo, IndexInfo};
 use gpui::{
     App, ClipboardItem, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, SharedString,
-    Window, prelude::*,
+    Window, actions, prelude::*,
 };
 use std::sync::Arc;
 use ui::{Divider, Icon, Tooltip, prelude::*};
 use workspace::{Item, item::ItemEvent};
+
+actions!(
+    db_schema_diff,
+    [
+        /// Copies the migration script to the clipboard.
+        CopySchemaDiffScript,
+        /// Opens the migration script as a runnable SQL console.
+        RunSchemaDiffScript,
+        /// Closes the Compare Schema view.
+        CloseSchemaDiff
+    ]
+);
 
 use crate::modify_table::{
     CheckChange, ColumnChange, ForeignKeyChange, IndexChange, generate_alter_statements,
@@ -65,7 +77,8 @@ pub fn diff_indexes(from: &[IndexInfo], to: &[IndexInfo]) -> Vec<IndexChange> {
                 unique: to_index.unique,
             }),
             Some(from_index)
-                if from_index.columns != to_index.columns || from_index.unique != to_index.unique =>
+                if from_index.columns != to_index.columns
+                    || from_index.unique != to_index.unique =>
             {
                 changes.push(IndexChange::Drop {
                     name: from_index.name.clone(),
@@ -351,6 +364,17 @@ impl Render for SchemaDiffView {
             .bg(cx.theme().colors().editor_background)
             .p_3()
             .gap_2()
+            .on_action(cx.listener(|this, _: &CopySchemaDiffScript, _window, cx| {
+                if !this.is_empty {
+                    cx.write_to_clipboard(ClipboardItem::new_string(this.script_text()));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RunSchemaDiffScript, window, cx| {
+                if !this.is_empty {
+                    (this.on_run.clone())(this.script_text(), window, cx);
+                }
+            }))
+            .on_action(cx.listener(|_, _: &CloseSchemaDiff, _window, cx| cx.emit(DismissEvent)))
             .child(
                 h_flex()
                     .w_full()
@@ -564,7 +588,10 @@ mod tests {
             checks: Vec::new(),
         };
         let to = TableSchema {
-            columns: vec![column("id", "int", false), column("email", "varchar(255)", false)],
+            columns: vec![
+                column("id", "int", false),
+                column("email", "varchar(255)", false),
+            ],
             indexes: vec![index("idx_email", &["email"], true)],
             foreign_keys: vec![fk("fk_customer", "customer_id", "customers", "id")],
             checks: vec![check("chk_email", "email <> ''")],

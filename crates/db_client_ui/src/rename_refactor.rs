@@ -95,7 +95,11 @@ mod tests {
     fn finds_whole_word_matches_only() {
         let text = "SELECT * FROM users WHERE id = 1;\nSELECT * FROM users_archive;";
         let usages = find_name_usages(text, "users");
-        assert_eq!(usages.len(), 1, "users_archive must not match a rename of users");
+        assert_eq!(
+            usages.len(),
+            1,
+            "users_archive must not match a rename of users"
+        );
         assert_eq!(usages[0].line, 1);
     }
 
@@ -137,6 +141,9 @@ mod tests {
     fn matches_across_multiple_lines_with_correct_line_numbers() {
         let text = "-- comment\nSELECT *\nFROM users\nWHERE users.id = 1;";
         let usages = find_name_usages(text, "users");
-        assert_eq!(usages.iter().map(|u| u.line).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            usages.iter().map(|u| u.line).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 }

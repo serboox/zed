@@ -292,10 +292,17 @@ fn resolve_connection(
         .iter()
         .find(|c| c.config.id == id)
         .ok_or_else(|| format!("No database connection matching '{connection}'"))?;
-    Ok((id, connection.config.driver, connection.config.database.clone()))
+    Ok((
+        id,
+        connection.config.driver,
+        connection.config.database.clone(),
+    ))
 }
 
-fn resolve_database(input_database: &Option<String>, default_database: Option<String>) -> Result<String> {
+fn resolve_database(
+    input_database: &Option<String>,
+    default_database: Option<String>,
+) -> Result<String> {
     input_database
         .clone()
         .filter(|database| !database.is_empty())
@@ -385,13 +392,21 @@ fn describe_schema(store: &DatabaseStore, input: &DbDescribeSchemaInput) -> Resu
         }
         let _ = writeln!(output, "{table}:");
         for column in &columns {
-            let nullable = if column.is_nullable { "NULL" } else { "NOT NULL" };
+            let nullable = if column.is_nullable {
+                "NULL"
+            } else {
+                "NOT NULL"
+            };
             let key = column
                 .column_key
                 .as_deref()
                 .map(|key| format!(" [{key}]"))
                 .unwrap_or_default();
-            let _ = writeln!(output, "  {} {} {nullable}{key}", column.name, column.data_type);
+            let _ = writeln!(
+                output,
+                "  {} {} {nullable}{key}",
+                column.name, column.data_type
+            );
         }
     }
     Ok(output)
@@ -606,9 +621,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn db_describe_schema_lists_every_cached_table_by_default(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn db_describe_schema_lists_every_cached_table_by_default(cx: &mut gpui::TestAppContext) {
         let connection = seeded_store_with_schema(cx).await;
         let task = cx.update(|cx| {
             let (event_stream, _receiver) = ToolCallEventStream::test();
@@ -666,7 +679,9 @@ mod tests {
                 cx,
             )
         });
-        let error = task.await.expect_err("an unknown connection must error, not panic");
+        let error = task
+            .await
+            .expect_err("an unknown connection must error, not panic");
         assert!(error.contains("nonexistent"));
     }
 
@@ -716,7 +731,9 @@ mod tests {
                 cx,
             )
         });
-        let error = task.await.expect_err("an unknown connection must error, not panic");
+        let error = task
+            .await
+            .expect_err("an unknown connection must error, not panic");
         assert!(error.contains("nonexistent"));
     }
 
@@ -810,7 +827,9 @@ mod tests {
     fn requires_confirmation_only_for_writes() {
         // Read-only statements run without confirmation.
         assert!(!requires_confirmation("SELECT * FROM t"));
-        assert!(!requires_confirmation("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!requires_confirmation(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
         assert!(!requires_confirmation("SHOW TABLES"));
         // Writes, DDL, data-modifying CTEs, and chained writes need confirmation.
         assert!(requires_confirmation("INSERT INTO t VALUES (1)"));
@@ -870,6 +889,9 @@ mod tests {
         )];
         let text = format_connections(&summaries);
         assert!(text.contains("Local MySQL (MySQL) [id: abc]"));
-        assert_eq!(format_connections(&[]), "No database connections are saved.");
+        assert_eq!(
+            format_connections(&[]),
+            "No database connections are saved."
+        );
     }
 }

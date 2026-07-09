@@ -1,12 +1,20 @@
 use editor::Editor;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Window,
-    prelude::*, px,
+    actions, prelude::*, px,
 };
 use ui::prelude::*;
 use ui::{Button, Divider, Icon, Label};
 use util::ResultExt;
 use workspace::{Item, item::ItemEvent};
+
+actions!(
+    db_ddl_source,
+    [
+        /// Closes the DDL Source view.
+        CloseDdlSource
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DdlColumn {
@@ -294,41 +302,45 @@ impl Render for DdlSourceView {
                 .collect::<Vec<_>>(),
         );
 
-        let detail = selected.and_then(|index| self.tables.get(index)).map(|table| {
-            v_flex()
-                .gap_2()
-                .child(Label::new(table.name.clone()))
-                .child(
-                    v_flex().gap_0p5().children(
-                        table
-                            .columns
-                            .iter()
-                            .map(|column| {
-                                h_flex()
-                                    .gap_2()
-                                    .child(Label::new(column.name.clone()).size(LabelSize::Small))
-                                    .child(
-                                        Label::new(column.data_type.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-                .child(Divider::horizontal())
-                .child(
-                    div()
-                        .id("ddl-raw")
-                        .max_h(px(180.0))
-                        .overflow_y_scroll()
-                        .child(
-                            Label::new(table.raw_sql.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
+        let detail = selected
+            .and_then(|index| self.tables.get(index))
+            .map(|table| {
+                v_flex()
+                    .gap_2()
+                    .child(Label::new(table.name.clone()))
+                    .child(
+                        v_flex().gap_0p5().children(
+                            table
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Label::new(column.name.clone()).size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            Label::new(column.data_type.clone())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                })
+                                .collect::<Vec<_>>(),
                         ),
-                )
-        });
+                    )
+                    .child(Divider::horizontal())
+                    .child(
+                        div()
+                            .id("ddl-raw")
+                            .max_h(px(180.0))
+                            .overflow_y_scroll()
+                            .child(
+                                Label::new(table.raw_sql.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+            });
 
         v_flex()
             .key_context("DdlSource")
@@ -336,6 +348,7 @@ impl Render for DdlSourceView {
             .size_full()
             .p_4()
             .gap_3()
+            .on_action(cx.listener(|_, _: &CloseDdlSource, _window, cx| cx.emit(DismissEvent)))
             .child(crate::widgets::dialog_header(
                 "SQL schema source",
                 "close-ddl",
@@ -352,7 +365,11 @@ impl Render for DdlSourceView {
                     ),
             )
             .when_some(self.status.clone(), |el, status| {
-                el.child(Label::new(status).size(LabelSize::Small).color(Color::Muted))
+                el.child(
+                    Label::new(status)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
             })
             .child(
                 h_flex()
@@ -392,7 +409,12 @@ mod tests {
         let sql = "CREATE TABLE t (\n  id INT,\n  ref INT,\n  PRIMARY KEY (id),\n  FOREIGN KEY (ref) REFERENCES o(id)\n);";
         let tables = parse_ddl_schema(sql);
         assert_eq!(tables[0].columns.len(), 2);
-        assert!(tables[0].columns.iter().all(|c| c.name == "id" || c.name == "ref"));
+        assert!(
+            tables[0]
+                .columns
+                .iter()
+                .all(|c| c.name == "id" || c.name == "ref")
+        );
     }
 
     #[test]

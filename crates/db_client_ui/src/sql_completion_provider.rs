@@ -189,6 +189,7 @@ fn keywords_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
         DatabaseDriver::Cassandra => &[],
+        DatabaseDriver::Aerospike => &[],
     };
     CORE_KEYWORDS.iter().chain(extra.iter()).copied().collect()
 }
@@ -202,6 +203,7 @@ fn functions_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
         DatabaseDriver::Cassandra => &[],
+        DatabaseDriver::Aerospike => &[],
     };
     CORE_FUNCTIONS.iter().chain(extra.iter()).copied().collect()
 }

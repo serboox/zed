@@ -1,4 +1,3 @@
-
 use std::ops::Range;
 
 use collections::HashSet;
@@ -100,8 +99,7 @@ fn validate_mongo_shell(text: &str) -> Vec<SqlDiagnostic> {
         if statement_text.trim().is_empty() {
             continue;
         }
-        if let Err(error) = db_client::mongo_provider::parse_mongo_shell_statement(statement_text)
-        {
+        if let Err(error) = db_client::mongo_provider::parse_mongo_shell_statement(statement_text) {
             diagnostics.push(SqlDiagnostic {
                 range: span,
                 level: DiagnosticLevel::Warning,
@@ -148,18 +146,21 @@ fn check_semantics(
     let mut cte_names = HashSet::default();
     collect_cte_names(statement, &mut cte_names);
 
-    let _ = visit_relations(statement, |name: &ObjectName| -> std::ops::ControlFlow<()> {
-        check_table_reference(
-            name,
-            &cte_names,
-            statement_text,
-            statement_offset,
-            default_database,
-            schema,
-            out,
-        );
-        std::ops::ControlFlow::Continue(())
-    });
+    let _ = visit_relations(
+        statement,
+        |name: &ObjectName| -> std::ops::ControlFlow<()> {
+            check_table_reference(
+                name,
+                &cte_names,
+                statement_text,
+                statement_offset,
+                default_database,
+                schema,
+                out,
+            );
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 
     let ctx = BindCtx {
         schema,
@@ -462,7 +463,15 @@ mod tests {
     fn redis_never_produces_a_diagnostic() {
         let schema = FakeSchema::default();
         assert!(validate("not sql at all (((", DatabaseDriver::Redis, None, &schema).is_empty());
-        assert!(validate("SELECT * FROM db.missing", DatabaseDriver::Redis, None, &schema).is_empty());
+        assert!(
+            validate(
+                "SELECT * FROM db.missing",
+                DatabaseDriver::Redis,
+                None,
+                &schema
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -480,10 +489,19 @@ mod tests {
 
         let diagnostics = validate("db.help()", DatabaseDriver::MongoDB, None, &schema);
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Unsupported mongo shell command"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Unsupported mongo shell command")
+        );
 
         // A plain SQL statement is not a mongo shell command either.
-        let diagnostics = validate("SELECT * FROM users", DatabaseDriver::MongoDB, None, &schema);
+        let diagnostics = validate(
+            "SELECT * FROM users",
+            DatabaseDriver::MongoDB,
+            None,
+            &schema,
+        );
         assert_eq!(diagnostics.len(), 1);
     }
 

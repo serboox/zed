@@ -1,3 +1,4 @@
+use crate::aerospike_view::AerospikeView;
 use crate::compare_data::CompareDataView;
 use crate::connection_view::ConnectionView;
 use crate::data_import::ImportDataView;
@@ -20,7 +21,8 @@ use crate::native_dump::{
 use crate::result_view::{ResultView, format_query_error};
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{
-    ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RunConfiguration,
+    ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RelativePosition,
+    RunConfiguration, TreeItemRef,
 };
 use anyhow::Context as _;
 use collections::{HashMap, HashSet};
@@ -66,7 +68,8 @@ use workspace::{
     notifications::NotificationId,
 };
 use zed_actions::database_panel::{
-    GoToDdl, GoToObject, QuickDocumentation, ShowDiagram, ToggleFocus,
+    CollapseSelectedEntry, ExpandSelectedEntry, GoToDdl, GoToObject, MoveSelectedDown,
+    MoveSelectedUp, QuickDocumentation, ShowDiagram, ToggleFocus,
 };
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
@@ -1796,10 +1799,16 @@ enum TreeNode {
     },
 }
 
-// Builds the nested tree under `parent_id`: child folders first (sorted by
-// order, then name), then connections (sorted by order, then label). Pure so
-// the grouping/sorting is unit-tested without the GPUI render path. `depth`
-// bounds recursion so cyclic stored data cannot loop forever.
+// Builds the nested tree under `parent_id`: folders and connections
+// interleaved by a single shared `order` space (tie-broken by name), then
+// recursed into. This must match `DatabaseStore::combined_siblings`'s
+// ordering exactly -- that is the space `reposition_item`'s precise
+// before/after drag-and-drop writes into, so a folder and a connection can
+// end up interleaved (e.g. connection, folder, connection); rendering
+// folders as a separate group first would silently disagree with where a
+// drag-and-drop reorder just placed things. Pure so the grouping/sorting is
+// unit-tested without the GPUI render path. `depth` bounds recursion so
+// cyclic stored data cannot loop forever.
 fn build_folder_tree(
     folders: &[Folder],
     connections: &[ActiveConnection],
@@ -1809,43 +1818,89 @@ fn build_folder_tree(
     if depth > db_client::MAX_FOLDER_DEPTH {
         return Vec::new();
     }
-    let mut nodes: Vec<TreeNode> = Vec::new();
 
-    let mut child_folders: Vec<&Folder> = folders
-        .iter()
-        .filter(|f| f.parent_id == parent_id)
-        .collect();
-    child_folders.sort_by(|a, b| {
-        a.order
-            .cmp(&b.order)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    for folder in child_folders {
-        nodes.push(TreeNode::Folder {
-            folder: folder.clone(),
-            children: build_folder_tree(folders, connections, Some(folder.id), depth + 1),
-        });
+    enum ChildItem<'a> {
+        Folder(&'a Folder),
+        Connection(usize),
     }
 
-    let mut child_connections: Vec<usize> = connections
+    let mut items: Vec<ChildItem> = folders
         .iter()
-        .enumerate()
-        .filter(|(_, c)| c.config.folder_id == parent_id)
-        .map(|(index, _)| index)
+        .filter(|f| f.parent_id == parent_id)
+        .map(ChildItem::Folder)
+        .chain(
+            connections
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.config.folder_id == parent_id)
+                .map(|(index, _)| ChildItem::Connection(index)),
+        )
         .collect();
-    child_connections.sort_by(|a, b| {
-        let left = &connections[*a].config;
-        let right = &connections[*b].config;
-        left.order
-            .cmp(&right.order)
-            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
-            .then_with(|| left.id.cmp(&right.id))
+    items.sort_by(|a, b| {
+        let (order_a, name_a) = match a {
+            ChildItem::Folder(folder) => (folder.order, folder.name.to_lowercase()),
+            ChildItem::Connection(index) => (
+                connections[*index].config.order,
+                connections[*index].config.label.to_lowercase(),
+            ),
+        };
+        let (order_b, name_b) = match b {
+            ChildItem::Folder(folder) => (folder.order, folder.name.to_lowercase()),
+            ChildItem::Connection(index) => (
+                connections[*index].config.order,
+                connections[*index].config.label.to_lowercase(),
+            ),
+        };
+        order_a.cmp(&order_b).then_with(|| name_a.cmp(&name_b))
     });
-    for index in child_connections {
-        nodes.push(TreeNode::Connection { index });
+
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    for item in items {
+        match item {
+            ChildItem::Folder(folder) => nodes.push(TreeNode::Folder {
+                folder: folder.clone(),
+                children: build_folder_tree(folders, connections, Some(folder.id), depth + 1),
+            }),
+            ChildItem::Connection(index) => nodes.push(TreeNode::Connection { index }),
+        }
     }
 
     nodes
+}
+
+// Flattens the top-level folder/connection tree into the same order
+// `render_tree_nodes` paints it in, skipping the children of collapsed
+// folders. Keyboard SelectNext/Previous/First/Last walk this list. Pure so
+// the ordering can be unit-tested without a GPUI render pass.
+fn flatten_navigable_entities(
+    nodes: &[TreeNode],
+    connections: &[ActiveConnection],
+    collapsed_folders: &HashSet<FolderId>,
+) -> Vec<SelectedEntity> {
+    let mut flat = Vec::new();
+    for node in nodes {
+        match node {
+            TreeNode::Folder { folder, children } => {
+                flat.push(SelectedEntity::Folder(folder.id));
+                if !collapsed_folders.contains(&folder.id) {
+                    flat.extend(flatten_navigable_entities(
+                        children,
+                        connections,
+                        collapsed_folders,
+                    ));
+                }
+            }
+            TreeNode::Connection { index } => {
+                // `render_tree_nodes` looks the index up in `connections` and
+                // silently skips it if stale; do the same here so the flattened
+                // list never gets out of sync with what is actually painted.
+                if let Some(conn) = connections.get(*index) {
+                    flat.push(SelectedEntity::Connection(conn.config.id));
+                }
+            }
+        }
+    }
+    flat
 }
 
 // A persistent .sql scratch file per connection, kept in the config dir so it
@@ -1954,6 +2009,22 @@ fn connection_id_from_console_path(
     })
 }
 
+pub(crate) fn connection_env_color(
+    store: &WeakEntity<DatabaseStore>,
+    connection_id: ConnectionId,
+    cx: &App,
+) -> Option<gpui::Hsla> {
+    store.upgrade().and_then(|store_entity| {
+        store_entity
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|c| c.config.id == connection_id)
+            .and_then(|c| c.config.env_color.as_deref().and_then(parse_env_color))
+            .map(gpui::Hsla::from)
+    })
+}
+
 fn install_db_editor_features(
     editor: Entity<Editor>,
     store: WeakEntity<DatabaseStore>,
@@ -1969,12 +2040,14 @@ fn install_db_editor_features(
         return;
     };
 
+    let env_color = connection_env_color(&store, connection_id, cx);
     let validation_store = store.clone();
     editor.update(cx, |editor, cx| {
         if editor.addon::<DbQueryEditorAddon>().is_none() {
             editor.register_addon(DbQueryEditorAddon::new(connection_id));
         }
         editor.set_show_runnables(true, cx);
+        editor.set_background_tint(env_color, cx);
         editor.set_semantics_provider(Some(Rc::new(DbSemanticsProvider {
             connection_id,
             store,
@@ -2201,11 +2274,30 @@ pub fn new_query_for_active_connection(
                     .find(|c| matches!(c.status, ConnectionStatus::Connected))
             })
             .or_else(|| store_ref.connections().first())
-            .map(|c| (c.config.id, c.config.label.clone()))
+            .cloned()
     };
-    if let Some((id, label)) = connection {
-        open_new_sql_query(workspace, id, label, window, cx);
+    let Some(connection) = connection else {
+        return;
+    };
+    let id = connection.config.id;
+    let label = connection.config.label.clone();
+    if connection.config.driver == DatabaseDriver::Aerospike {
+        let default_namespace = connection.config.database.unwrap_or_default();
+        let view = cx.new(|cx| {
+            AerospikeView::new(
+                store,
+                workspace.weak_handle(),
+                id,
+                label.into(),
+                default_namespace,
+                window,
+                cx,
+            )
+        });
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        return;
     }
+    open_new_sql_query(workspace, id, label, window, cx);
 }
 
 // Finds the result tab bound to `connection_id` in `pane`, or creates one, then
@@ -2990,8 +3082,10 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
-                    let message =
-                        format!("Could not connect to '{conn_label}': {}", format_query_error(&err));
+                    let message = format!(
+                        "Could not connect to '{conn_label}': {}",
+                        format_query_error(&err)
+                    );
                     if let Some(inline_view) = &inline_view {
                         inline_view.update(cx, |view, cx| view.set_error(message.clone(), cx));
                     }
@@ -3044,9 +3138,8 @@ fn run_sql_from_editor(
                         }
                     });
                     if let Some(inline_view) = &inline_view {
-                        inline_view.update(cx, |view, cx| {
-                            view.set_error(format_query_error(&err), cx)
-                        });
+                        inline_view
+                            .update(cx, |view, cx| view.set_error(format_query_error(&err), cx));
                     }
                     result_view.update(cx, |view, cx| view.set_error(format_query_error(&err), cx));
                     return anyhow::Ok(());
@@ -3175,6 +3268,7 @@ fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
 fn new_query_button_label(driver: DatabaseDriver) -> &'static str {
     match driver {
         DatabaseDriver::MongoDB => "New Query",
+        DatabaseDriver::Aerospike => "Get / Put / Scan",
         _ => "New SQL Query",
     }
 }
@@ -3198,11 +3292,27 @@ enum DraggedDbItem {
 }
 
 /// The folder currently highlighted as a drop target, or the top level when the
-/// pointer is over empty panel space.
+/// pointer is over empty panel space. `Folder` reparents-into (append at the
+/// end); the `Before*`/`After*` variants insert at the hovered row's exact
+/// sibling position instead, set when the pointer is over that row's top or
+/// bottom edge rather than its body.
 #[derive(Clone, Copy, PartialEq)]
 enum DropTarget {
     Folder(FolderId),
     TopLevel,
+    BeforeFolder(FolderId),
+    AfterFolder(FolderId),
+    BeforeConnection(ConnectionId),
+    AfterConnection(ConnectionId),
+}
+
+impl DraggedDbItem {
+    fn as_tree_item_ref(self) -> TreeItemRef {
+        match self {
+            DraggedDbItem::Connection(id) => TreeItemRef::Connection(id),
+            DraggedDbItem::Folder(id) => TreeItemRef::Folder(id),
+        }
+    }
 }
 
 /// Inline folder rename/create: an editor overlaid on the folder row. The
@@ -4033,6 +4143,134 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    // Keyboard tree navigation over the top-level folder/connection list (the
+    // `SelectedEntity` variants that already exist). Deeper row kinds
+    // (databases, tables, columns, indexes, ...) have no `SelectedEntity`
+    // variant of their own yet and are click-only; giving them keyboard
+    // navigation too would mean adding a variant per kind and threading
+    // selection through every one of those render functions, which is a much
+    // larger change than this pass — left as a follow-up.
+    fn navigable_entities(&self, cx: &App) -> Vec<SelectedEntity> {
+        let connections: Vec<ActiveConnection> =
+            self.store.read(cx).connections().iter().cloned().collect();
+        let folders: Vec<Folder> = self.store.read(cx).folders().to_vec();
+        let nodes = build_folder_tree(&folders, &connections, None, 1);
+        flatten_navigable_entities(&nodes, &connections, &self.collapsed_folders)
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        let entities = self.navigable_entities(cx);
+        if entities.is_empty() {
+            return;
+        }
+        let next = match self
+            .selected_entity
+            .and_then(|current| entities.iter().position(|e| *e == current))
+        {
+            Some(index) => entities.get(index + 1).copied().unwrap_or(entities[index]),
+            None => entities[0],
+        };
+        self.selected_entity = Some(next);
+        cx.notify();
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entities = self.navigable_entities(cx);
+        if entities.is_empty() {
+            return;
+        }
+        let previous = match self
+            .selected_entity
+            .and_then(|current| entities.iter().position(|e| *e == current))
+        {
+            Some(0) => entities[0],
+            Some(index) => entities[index - 1],
+            None => *entities.last().expect("checked non-empty above"),
+        };
+        self.selected_entity = Some(previous);
+        cx.notify();
+    }
+
+    fn select_first(
+        &mut self,
+        _: &menu::SelectFirst,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entities = self.navigable_entities(cx);
+        self.selected_entity = entities.into_iter().next();
+        cx.notify();
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        let entities = self.navigable_entities(cx);
+        self.selected_entity = entities.into_iter().next_back();
+        cx.notify();
+    }
+
+    // Enter/Space activates the selected row the same way a click does:
+    // opening a connection or toggling a folder's collapsed state.
+    fn confirm_selected(
+        &mut self,
+        _: &menu::Confirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.selected_entity {
+            Some(SelectedEntity::Folder(id)) => self.toggle_folder_collapsed(id, cx),
+            Some(SelectedEntity::Connection(id)) => {
+                self.store.update(cx, |store, cx| {
+                    store.set_active_connection(id, cx);
+                });
+            }
+            None => {}
+        }
+    }
+
+    // Left arrow collapses the selected folder if expanded, matching
+    // project_panel's CollapseSelectedEntry convention.
+    fn collapse_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(SelectedEntity::Folder(id)) = self.selected_entity
+            && !self.collapsed_folders.contains(&id)
+        {
+            self.toggle_folder_collapsed(id, cx);
+        }
+    }
+
+    // Right arrow expands the selected folder if collapsed, matching
+    // project_panel's ExpandSelectedEntry convention.
+    fn expand_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(SelectedEntity::Folder(id)) = self.selected_entity
+            && self.collapsed_folders.contains(&id)
+        {
+            self.toggle_folder_collapsed(id, cx);
+        }
+    }
+
+    // Shift+Up/Down reorders the selected folder or connection among its
+    // siblings, driving the same store methods as the "Move Up"/"Move Down"
+    // context-menu entries and the connection selection-action-bar buttons.
+    fn move_selected(&mut self, direction: i64, cx: &mut Context<Self>) {
+        match self.selected_entity {
+            Some(SelectedEntity::Folder(id)) => {
+                self.store.update(cx, |store, cx| {
+                    store.reorder_folder(id, direction, cx);
+                });
+            }
+            Some(SelectedEntity::Connection(id)) => {
+                self.store.update(cx, |store, cx| {
+                    store.reorder_connection(id, direction, cx);
+                });
+            }
+            None => {}
+        }
+    }
+
     fn toggle_connection_collapsed(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         let now_expanding = self.collapsed_connections.remove(&id);
         if !now_expanding {
@@ -4210,20 +4448,100 @@ impl DatabasePanel {
         cx.new(|_| DraggedDbItemPreview { label, icon })
     }
 
-    /// Applies a drop of `item` onto `target`. Folders reparent (cycle and depth
-    /// are guarded by the store); connections move into the target folder.
+    /// Classifies a pointer's relative vertical position within a folder row
+    /// (0.0 top .. 1.0 bottom) into a drop zone: the top and bottom quarters
+    /// insert before/after the row, the middle half reparents into it (folders
+    /// are the only rows that can contain children).
+    fn folder_drop_zone(relative_y: f32, folder_id: FolderId) -> DropTarget {
+        if relative_y < 0.25 {
+            DropTarget::BeforeFolder(folder_id)
+        } else if relative_y > 0.75 {
+            DropTarget::AfterFolder(folder_id)
+        } else {
+            DropTarget::Folder(folder_id)
+        }
+    }
+
+    /// Classifies a pointer's relative vertical position within a connection
+    /// row (0.0 top .. 1.0 bottom) into a drop zone. Connections can't contain
+    /// children, so the row splits evenly into before/after halves with no
+    /// reparent-into zone.
+    fn connection_drop_zone(relative_y: f32, connection_id: ConnectionId) -> DropTarget {
+        if relative_y < 0.5 {
+            DropTarget::BeforeConnection(connection_id)
+        } else {
+            DropTarget::AfterConnection(connection_id)
+        }
+    }
+
+    /// Applies a drop of `item` onto `target`. `Folder`/`TopLevel` reparent
+    /// (cycle and depth are guarded by the store, appending at the end);
+    /// `Before*`/`After*` insert `item` at that exact sibling position,
+    /// reparenting it too when the anchor lives under a different parent.
     fn handle_drop(&mut self, item: DraggedDbItem, target: DropTarget, cx: &mut Context<Self>) {
-        let folder = match target {
-            DropTarget::Folder(id) => Some(id),
-            DropTarget::TopLevel => None,
-        };
         self.drag_target = None;
-        self.store.update(cx, |store, cx| match item {
-            DraggedDbItem::Connection(id) => store.move_connection_to_folder(id, folder, cx),
-            DraggedDbItem::Folder(id) => {
-                store.move_folder(id, folder, cx);
+        match target {
+            DropTarget::Folder(id) => {
+                self.store.update(cx, |store, cx| match item {
+                    DraggedDbItem::Connection(cid) => {
+                        store.move_connection_to_folder(cid, Some(id), cx)
+                    }
+                    DraggedDbItem::Folder(fid) => {
+                        store.move_folder(fid, Some(id), cx);
+                    }
+                });
             }
-        });
+            DropTarget::TopLevel => {
+                self.store.update(cx, |store, cx| match item {
+                    DraggedDbItem::Connection(cid) => {
+                        store.move_connection_to_folder(cid, None, cx)
+                    }
+                    DraggedDbItem::Folder(fid) => {
+                        store.move_folder(fid, None, cx);
+                    }
+                });
+            }
+            DropTarget::BeforeFolder(anchor) => {
+                self.store.update(cx, |store, cx| {
+                    store.reposition_item(
+                        item.as_tree_item_ref(),
+                        TreeItemRef::Folder(anchor),
+                        RelativePosition::Before,
+                        cx,
+                    );
+                });
+            }
+            DropTarget::AfterFolder(anchor) => {
+                self.store.update(cx, |store, cx| {
+                    store.reposition_item(
+                        item.as_tree_item_ref(),
+                        TreeItemRef::Folder(anchor),
+                        RelativePosition::After,
+                        cx,
+                    );
+                });
+            }
+            DropTarget::BeforeConnection(anchor) => {
+                self.store.update(cx, |store, cx| {
+                    store.reposition_item(
+                        item.as_tree_item_ref(),
+                        TreeItemRef::Connection(anchor),
+                        RelativePosition::Before,
+                        cx,
+                    );
+                });
+            }
+            DropTarget::AfterConnection(anchor) => {
+                self.store.update(cx, |store, cx| {
+                    store.reposition_item(
+                        item.as_tree_item_ref(),
+                        TreeItemRef::Connection(anchor),
+                        RelativePosition::After,
+                        cx,
+                    );
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -4267,7 +4585,9 @@ impl DatabasePanel {
         let folder_id = folder.id;
         let name = folder.name.clone();
         let entity = cx.entity();
-        let is_drop_target = self.drag_target == Some(DropTarget::Folder(folder_id));
+        let is_reparent_target = self.drag_target == Some(DropTarget::Folder(folder_id));
+        let is_before_target = self.drag_target == Some(DropTarget::BeforeFolder(folder_id));
+        let is_after_target = self.drag_target == Some(DropTarget::AfterFolder(folder_id));
         let is_selected = self.selected_entity == Some(SelectedEntity::Folder(folder_id));
         let (can_move_up, can_move_down) = self.folder_move_bounds(folder_id, cx);
         let editing = self
@@ -4292,8 +4612,16 @@ impl DatabasePanel {
                 el.bg(cx.theme().colors().element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .when(is_drop_target, |el| {
+            .when(is_reparent_target, |el| {
                 el.bg(cx.theme().colors().drop_target_background)
+            })
+            .when(is_before_target, |el| {
+                el.border_t_2()
+                    .border_color(cx.theme().colors().text_accent)
+            })
+            .when(is_after_target, |el| {
+                el.border_b_2()
+                    .border_color(cx.theme().colors().text_accent)
             })
             .child(
                 h_flex()
@@ -4347,16 +4675,21 @@ impl DatabasePanel {
             })
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
-                    if event.bounds.contains(&event.event.position)
-                        && this.drag_target != Some(DropTarget::Folder(folder_id))
-                    {
-                        this.drag_target = Some(DropTarget::Folder(folder_id));
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    let relative_y =
+                        (event.event.position.y - event.bounds.origin.y) / event.bounds.size.height;
+                    let new_target = Self::folder_drop_zone(relative_y, folder_id);
+                    if this.drag_target != Some(new_target) {
+                        this.drag_target = Some(new_target);
                         cx.notify();
                     }
                 }),
             )
             .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
-                this.handle_drop(*item, DropTarget::Folder(folder_id), cx);
+                let target = this.drag_target.unwrap_or(DropTarget::Folder(folder_id));
+                this.handle_drop(*item, target, cx);
             }))
             .child(
                 Label::new(name.clone())
@@ -5517,6 +5850,37 @@ impl DatabasePanel {
         .detach_and_log_err(cx);
     }
 
+    /// Opens the Get/Put/Scan form for an Aerospike connection, in place of
+    /// the SQL console other drivers get — Aerospike has no query language.
+    fn open_new_aerospike_view(
+        &mut self,
+        id: ConnectionId,
+        label: String,
+        default_namespace: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let workspace = self.workspace.clone();
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let view = cx.new(|cx| {
+                AerospikeView::new(
+                    store,
+                    workspace.weak_handle(),
+                    id,
+                    label.into(),
+                    default_namespace,
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+    }
+
     fn open_full_text_search(
         &mut self,
         id: ConnectionId,
@@ -6331,6 +6695,10 @@ impl DatabasePanel {
             .is_some_and(|conn| matches!(conn.status, ConnectionStatus::Connected));
         let label = selected.as_ref().map(|conn| conn.config.label.clone());
         let driver = selected.as_ref().map(|conn| conn.config.driver);
+        let database = selected
+            .as_ref()
+            .and_then(|conn| conn.config.database.clone())
+            .unwrap_or_default();
         let config_for_edit = selected.as_ref().map(|conn| conn.config.clone());
         let dump_label = driver.and_then(dump_menu_label);
         let (can_move_up, can_move_down) = id
@@ -6361,6 +6729,16 @@ impl DatabasePanel {
                                 let (Some(id), Some(label)) = (id, label.clone()) else {
                                     return;
                                 };
+                                if driver == Some(DatabaseDriver::Aerospike) {
+                                    this.open_new_aerospike_view(
+                                        id,
+                                        label,
+                                        database.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    return;
+                                }
                                 this.workspace
                                     .update(cx, |workspace, cx| {
                                         open_new_sql_query(workspace, id, label, window, cx);
@@ -6607,6 +6985,24 @@ impl DatabasePanel {
             ConnectionStatus::Disconnected => Color::Muted,
             ConnectionStatus::Error(_) => Color::Error,
         };
+        // Shape (not just color) must carry connection state so it reads under
+        // color-vision deficiency: a colored dot alone was indistinguishable
+        // between states for a deuteranopic viewer.
+        let status_indicator = match &conn.status {
+            ConnectionStatus::Connected => {
+                Indicator::icon(Icon::new(IconName::Check)).color(status_color)
+            }
+            ConnectionStatus::Connecting => {
+                Indicator::icon(Icon::new(IconName::LoadCircle).with_rotate_animation(2))
+                    .color(status_color)
+            }
+            ConnectionStatus::Disconnected => {
+                Indicator::icon(Icon::new(IconName::Dash)).color(status_color)
+            }
+            ConnectionStatus::Error(_) => {
+                Indicator::icon(Icon::new(IconName::XCircleFilled)).color(status_color)
+            }
+        };
         let is_connected = matches!(conn.status, ConnectionStatus::Connected);
         let is_server_objects_expanded = self.server_objects_expanded.contains(&id);
         let server_users = self.server_users.get(&id).cloned();
@@ -6618,6 +7014,8 @@ impl DatabasePanel {
 
         let is_active = self.store.read(cx).active_connection_id() == Some(id);
         let is_selected = self.selected_entity == Some(SelectedEntity::Connection(id));
+        let is_before_target = self.drag_target == Some(DropTarget::BeforeConnection(id));
+        let is_after_target = self.drag_target == Some(DropTarget::AfterConnection(id));
         let databases = conn.databases.clone();
         let expanded_databases = conn.expanded_databases.clone();
         let expanded_database_set = conn.expanded_database_set.clone();
@@ -6667,6 +7065,12 @@ impl DatabasePanel {
                     .when(is_active || is_selected, |el| {
                         el.bg(cx.theme().colors().element_selected)
                     })
+                    .when(is_before_target, |el| {
+                        el.border_t_2().border_color(cx.theme().colors().text_accent)
+                    })
+                    .when(is_after_target, |el| {
+                        el.border_b_2().border_color(cx.theme().colors().text_accent)
+                    })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_entity = Some(SelectedEntity::Connection(id));
@@ -6680,11 +7084,24 @@ impl DatabasePanel {
                     .on_drag(DraggedDbItem::Connection(id), move |_, _, _, cx| {
                         Self::drag_preview(drag_label.clone(), IconName::DatabaseZap, cx)
                     })
+                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let relative_y = (event.event.position.y - event.bounds.origin.y)
+                            / event.bounds.size.height;
+                        let new_target = Self::connection_drop_zone(relative_y, id);
+                        if this.drag_target != Some(new_target) {
+                            this.drag_target = Some(new_target);
+                            cx.notify();
+                        }
+                    }))
                     .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
-                        let target = match connection_folder {
+                        let fallback = match connection_folder {
                             Some(folder_id) => DropTarget::Folder(folder_id),
                             None => DropTarget::TopLevel,
                         };
+                        let target = this.drag_target.unwrap_or(fallback);
                         this.handle_drop(*item, target, cx);
                     }))
                     .on_mouse_down(
@@ -6746,7 +7163,7 @@ impl DatabasePanel {
                                             .rounded_full()
                                             .border_1()
                                             .border_color(cx.theme().colors().panel_background)
-                                            .child(Indicator::dot().color(status_color)),
+                                            .child(status_indicator),
                                     ),
                             ),
                     )
@@ -6761,9 +7178,16 @@ impl DatabasePanel {
             )
             .when_some(error_message, |el, msg| {
                 el.child(
-                    div()
+                    h_flex()
+                        .gap_1()
+                        .items_center()
                         .px_4()
                         .py_1()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        )
                         .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error)),
                 )
             })
@@ -6783,7 +7207,7 @@ impl DatabasePanel {
                                 .pr_2()
                                 .py_1()
                                 .cursor_pointer()
-                                .hover(|s| s.bg(gpui::transparent_white()))
+                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_server_objects(id, cx);
                                 }))
@@ -6862,7 +7286,7 @@ impl DatabasePanel {
                         .pr_2()
                         .py_1()
                         .cursor_pointer()
-                        .hover(|s| s.bg(gpui::transparent_white()))
+                        .hover(|s| s.bg(cx.theme().colors().element_hover))
                         .on_click(cx.listener({
                             let db_name = db_name_for_click;
                             move |this, event: &ClickEvent, window, cx| {
@@ -6914,8 +7338,28 @@ impl DatabasePanel {
                                         let db = db.clone();
                                         let workspace = workspace.clone();
                                         move |window, cx| {
-                                            let sql = format!("SELECT * FROM {db} LIMIT 1;");
                                             entity.update(cx, |panel, cx| {
+                                                let connection = panel
+                                                    .store
+                                                    .read(cx)
+                                                    .connections()
+                                                    .iter()
+                                                    .find(|conn| conn.config.id == id)
+                                                    .cloned();
+                                                let Some(connection) = connection else {
+                                                    return;
+                                                };
+                                                if connection.config.driver == DatabaseDriver::Aerospike {
+                                                    panel.open_new_aerospike_view(
+                                                        id,
+                                                        connection.config.label,
+                                                        db.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    return;
+                                                }
+                                                let sql = format!("SELECT * FROM {db} LIMIT 1;");
                                                 Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
                                             });
                                         }
@@ -6967,7 +7411,11 @@ impl DatabasePanel {
                                                     store.list_procedures(id, db.clone(), cx)
                                                 });
                                                 let title = SharedString::from(format!("{db} – Procedures"));
-                                                let result_view = cx.new(|cx| ResultView::new(title, cx));
+                                                let store_weak = panel.store.downgrade();
+                                                let env_color = connection_env_color(&store_weak, id, cx);
+                                                let result_view = cx.new(|cx| {
+                                                    ResultView::new(title, cx).with_env_color(env_color)
+                                                });
                                                 let rv = result_view.clone();
                                                 let ws = workspace.clone();
                                                 cx.spawn_in(window, async move |_, cx| {
@@ -7007,7 +7455,11 @@ impl DatabasePanel {
                                                     store.list_users(id, cx)
                                                 });
                                                 let title = SharedString::from("Users");
-                                                let result_view = cx.new(|cx| ResultView::new(title, cx));
+                                                let store_weak = panel.store.downgrade();
+                                                let env_color = connection_env_color(&store_weak, id, cx);
+                                                let result_view = cx.new(|cx| {
+                                                    ResultView::new(title, cx).with_env_color(env_color)
+                                                });
                                                 let rv = result_view.clone();
                                                 let ws = workspace.clone();
                                                 cx.spawn_in(window, async move |_, cx| {
@@ -7185,10 +7637,12 @@ impl DatabasePanel {
                                                     });
                                                     let title = SharedString::from(tbl.as_str());
                                                     let workspace = this.workspace.clone();
+                                                    let env_color = connection_env_color(&store_weak, id, cx);
                                                     let result_view = cx.new(|cx| {
                                                         ResultView::new(title, cx)
                                                             .with_table_context(store_weak, id, db.clone(), tbl.clone(), window, cx)
                                                             .with_workspace(workspace.clone())
+                                                            .with_env_color(env_color)
                                                     });
                                                     let rv = result_view.clone();
                                                     cx.spawn_in(window, async move |_, cx| {
@@ -7288,10 +7742,12 @@ impl DatabasePanel {
                                                                 });
                                                                 let title = SharedString::from(tbl.as_str());
                                                                 let ws = workspace.clone();
+                                                                let env_color = connection_env_color(&store_weak, id, cx);
                                                                 let result_view = cx.new(|cx| {
                                                                     ResultView::new(title, cx)
                                                                         .with_table_context(store_weak, id, db.clone(), tbl.clone(), window, cx)
                                                                         .with_workspace(workspace.clone())
+                                                                        .with_env_color(env_color)
                                                                 });
                                                                 let rv = result_view.clone();
                                                                 cx.spawn_in(window, async move |_, cx| {
@@ -7530,7 +7986,11 @@ impl DatabasePanel {
                                                                     store.list_indexes(id, db.clone(), tbl.clone(), cx)
                                                                 });
                                                                 let title = SharedString::from(format!("{tbl} – Indexes"));
-                                                                let result_view = cx.new(|cx| ResultView::new(title, cx));
+                                                                let store_weak = panel.store.downgrade();
+                                                                let env_color = connection_env_color(&store_weak, id, cx);
+                                                                let result_view = cx.new(|cx| {
+                                                                    ResultView::new(title, cx).with_env_color(env_color)
+                                                                });
                                                                 let rv = result_view.clone();
                                                                 let ws = workspace.clone();
                                                                 cx.spawn_in(window, async move |_, cx| {
@@ -7571,7 +8031,11 @@ impl DatabasePanel {
                                                                     store.list_triggers(id, db.clone(), tbl.clone(), cx)
                                                                 });
                                                                 let title = SharedString::from(format!("{tbl} – Triggers"));
-                                                                let result_view = cx.new(|cx| ResultView::new(title, cx));
+                                                                let store_weak = panel.store.downgrade();
+                                                                let env_color = connection_env_color(&store_weak, id, cx);
+                                                                let result_view = cx.new(|cx| {
+                                                                    ResultView::new(title, cx).with_env_color(env_color)
+                                                                });
                                                                 let rv = result_view.clone();
                                                                 let ws = workspace.clone();
                                                                 cx.spawn_in(window, async move |_, cx| {
@@ -7744,7 +8208,7 @@ impl DatabasePanel {
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
-                                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                                     if this.table_indexes_expanded.contains(&idx_key) {
                                                                         this.table_indexes_expanded.remove(&idx_key);
@@ -7797,7 +8261,7 @@ impl DatabasePanel {
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
-                                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                                     if this.table_fks_expanded.contains(&fk_key) {
                                                                         this.table_fks_expanded.remove(&fk_key);
@@ -7847,7 +8311,7 @@ impl DatabasePanel {
                                                                 .pr_2()
                                                                 .py_1()
                                                                 .cursor_pointer()
-                                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                                     if this.table_triggers_expanded.contains(&trig_key) {
                                                                         this.table_triggers_expanded.remove(&trig_key);
@@ -7886,7 +8350,7 @@ impl DatabasePanel {
                                                                     .pr_2()
                                                                     .py_1()
                                                                     .cursor_pointer()
-                                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                     .on_click(move |_, window, cx| {
                                                                         let source = source.clone();
                                                                         entity.update(cx, |panel, cx| {
@@ -7924,7 +8388,7 @@ impl DatabasePanel {
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if this.views_expanded.contains(&views_key) {
                                                         this.views_expanded.remove(&views_key);
@@ -8024,7 +8488,11 @@ impl DatabasePanel {
                                                                             });
                                                                             let title = SharedString::from(vw.as_str());
                                                                             let ws = workspace.clone();
-                                                                            let result_view = cx.new(|cx| ResultView::new(title, cx));
+                                                                            let store_weak = panel.store.downgrade();
+                                                                            let env_color = connection_env_color(&store_weak, id, cx);
+                                                                            let result_view = cx.new(|cx| {
+                                                                                ResultView::new(title, cx).with_env_color(env_color)
+                                                                            });
                                                                             let rv = result_view.clone();
                                                                             cx.spawn_in(window, async move |_, cx| {
                                                                                 let outcome = task.await;
@@ -8078,7 +8546,7 @@ impl DatabasePanel {
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if this.procedures_expanded.contains(&procedures_key) {
                                                         this.procedures_expanded.remove(&procedures_key);
@@ -8116,7 +8584,7 @@ impl DatabasePanel {
                                                     .pr_2()
                                                     .py_1()
                                                     .cursor_pointer()
-                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                     .on_click(move |_, window, cx| {
                                                         let source = source.clone();
                                                         entity.update(cx, |panel, cx| {
@@ -8159,7 +8627,7 @@ impl DatabasePanel {
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if this.sequences_expanded.contains(&sequences_key) {
                                                         this.sequences_expanded.remove(&sequences_key);
@@ -8219,7 +8687,7 @@ impl DatabasePanel {
                                                 .pr_2()
                                                 .py_1()
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(gpui::transparent_white()))
+                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if this.events_expanded.contains(&events_key) {
                                                         this.events_expanded.remove(&events_key);
@@ -8257,7 +8725,7 @@ impl DatabasePanel {
                                                     .pr_2()
                                                     .py_1()
                                                     .cursor_pointer()
-                                                    .hover(|s| s.bg(gpui::transparent_white()))
+                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                     .on_click(move |_, window, cx| {
                                                         let source = source.clone();
                                                         entity.update(cx, |panel, cx| {
@@ -8307,7 +8775,7 @@ impl DatabasePanel {
                     .px_3()
                     .py_1()
                     .cursor_pointer()
-                    .hover(|style| style.bg(gpui::transparent_white()))
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .on_click(cx.listener({
                         let workspace = self.workspace.clone();
                         let store = self.store.downgrade();
@@ -8567,7 +9035,21 @@ impl DatabasePanel {
             .entry("New Query", None, {
                 let panel = panel.clone();
                 let workspace = workspace.clone();
+                let label = label.clone();
+                let default_database = default_database.clone();
                 move |window, cx| {
+                    if driver == DatabaseDriver::Aerospike {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_new_aerospike_view(
+                                id,
+                                label.clone(),
+                                default_database.clone().unwrap_or_default(),
+                                window,
+                                cx,
+                            );
+                        });
+                        return;
+                    }
                     panel.update(cx, |panel, cx| {
                         Self::open_sql_query_with_text(
                             workspace.clone(),
@@ -8716,6 +9198,23 @@ impl Render for DatabasePanel {
             }))
             .on_action(cx.listener(|this, _: &GoToObject, window, cx| {
                 this.open_go_to_object_palette(window, cx);
+            }))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::confirm_selected))
+            .on_action(cx.listener(|this, _: &CollapseSelectedEntry, _window, cx| {
+                this.collapse_selected(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExpandSelectedEntry, _window, cx| {
+                this.expand_selected(cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveSelectedUp, _window, cx| {
+                this.move_selected(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveSelectedDown, _window, cx| {
+                this.move_selected(1, cx);
             }))
             .size_full()
             .relative()
@@ -8878,8 +9377,18 @@ mod tests {
     #[test]
     fn new_query_button_label_is_driver_specific_for_mongo() {
         assert_eq!(new_query_button_label(DatabaseDriver::MongoDB), "New Query");
-        assert_eq!(new_query_button_label(DatabaseDriver::MySQL), "New SQL Query");
-        assert_eq!(new_query_button_label(DatabaseDriver::Cassandra), "New SQL Query");
+        assert_eq!(
+            new_query_button_label(DatabaseDriver::MySQL),
+            "New SQL Query"
+        );
+        assert_eq!(
+            new_query_button_label(DatabaseDriver::Cassandra),
+            "New SQL Query"
+        );
+        assert_eq!(
+            new_query_button_label(DatabaseDriver::Aerospike),
+            "Get / Put / Scan"
+        );
     }
 
     #[test]
@@ -9549,38 +10058,42 @@ mod tests {
     }
 
     #[test]
-    fn build_folder_tree_nests_folders_first_then_sorted_connections() {
-        let work = Folder::new("Work".into(), None, 0);
-        let personal = Folder::new("Personal".into(), None, 1);
-        let sub = Folder::new("Sub".into(), Some(work.id), 0);
-        let work_id = work.id;
+    fn build_folder_tree_interleaves_folders_and_connections_by_shared_order() {
+        // Folders and connections in this fixture deliberately occupy the
+        // same shared `order` space per parent -- the space
+        // `DatabaseStore::reposition_item`'s drag-and-drop writes into -- so
+        // the render order must interleave them by `order`, not group all
+        // folders before all connections.
+        let personal = Folder::new("Personal".into(), None, 0);
+        let sub = Folder::new("Sub".into(), Some(personal.id), 0);
+        let work = Folder::new("Work".into(), None, 2);
         let sub_id = sub.id;
-        let folders = vec![work, personal, sub];
+        let work_id = work.id;
+        let folders = vec![personal, sub, work];
         let connections = vec![
-            connection_in("beta", None, 1),
-            connection_in("alpha", None, 0),
+            connection_in("alpha", None, 1),
+            connection_in("beta", None, 3),
             connection_in("inner", Some(sub_id), 0),
-            connection_in("w1", Some(work_id), 5),
+            connection_in("w1", Some(work_id), 0),
         ];
 
         let nodes = super::build_folder_tree(&folders, &connections, None, 1);
 
-        // Folders come first, ordered by `order`: Work then Personal.
-        assert!(matches!(&nodes[0], TreeNode::Folder { folder, .. } if folder.name == "Work"));
-        assert!(matches!(&nodes[1], TreeNode::Folder { folder, .. } if folder.name == "Personal"));
-        // Then top-level connections, ordered by `order`: alpha (0) then beta (1).
-        let labels: Vec<&str> = nodes[2..]
-            .iter()
-            .filter_map(|node| match node {
-                TreeNode::Connection { index } => Some(connections[*index].config.label.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels, vec!["alpha", "beta"]);
+        // Top-level order 0..3: Personal(folder,0), alpha(conn,1),
+        // Work(folder,2), beta(conn,3) -- a folder and a connection
+        // alternate rather than all folders rendering first.
+        assert!(matches!(&nodes[0], TreeNode::Folder { folder, .. } if folder.name == "Personal"));
+        assert!(
+            matches!(&nodes[1], TreeNode::Connection { index } if connections[*index].config.label == "alpha")
+        );
+        assert!(matches!(&nodes[2], TreeNode::Folder { folder, .. } if folder.name == "Work"));
+        assert!(
+            matches!(&nodes[3], TreeNode::Connection { index } if connections[*index].config.label == "beta")
+        );
 
-        // Work nests the Sub folder (which holds "inner") and connection "w1".
+        // Personal nests the Sub folder (which holds "inner").
         let TreeNode::Folder { children, .. } = &nodes[0] else {
-            panic!("expected Work folder");
+            panic!("expected Personal folder");
         };
         assert!(matches!(&children[0], TreeNode::Folder { folder, .. } if folder.name == "Sub"));
         let TreeNode::Folder {
@@ -9616,6 +10129,55 @@ mod tests {
             current = children;
         }
         assert_eq!(depth, db_client::MAX_FOLDER_DEPTH);
+    }
+
+    #[test]
+    fn flatten_navigable_entities_matches_render_order_when_expanded() {
+        let work = Folder::new("Work".into(), None, 0);
+        let personal = Folder::new("Personal".into(), None, 1);
+        let work_id = work.id;
+        let personal_id = personal.id;
+        let folders = vec![work, personal];
+        let connections = vec![
+            connection_in("alpha", None, 0),
+            connection_in("w1", Some(work_id), 0),
+        ];
+        let alpha_id = connections[0].config.id;
+        let w1_id = connections[1].config.id;
+
+        let nodes = super::build_folder_tree(&folders, &connections, None, 1);
+        let flat = super::flatten_navigable_entities(&nodes, &connections, &HashSet::default());
+
+        assert_eq!(
+            flat,
+            vec![
+                SelectedEntity::Connection(alpha_id),
+                SelectedEntity::Folder(work_id),
+                SelectedEntity::Connection(w1_id),
+                SelectedEntity::Folder(personal_id),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_navigable_entities_skips_children_of_collapsed_folders() {
+        let work = Folder::new("Work".into(), None, 0);
+        let work_id = work.id;
+        let folders = vec![work];
+        let connections = vec![connection_in("w1", Some(work_id), 0)];
+        let nodes = super::build_folder_tree(&folders, &connections, None, 1);
+
+        let mut collapsed = HashSet::default();
+        collapsed.insert(work_id);
+        let flat = super::flatten_navigable_entities(&nodes, &connections, &collapsed);
+
+        assert_eq!(flat, vec![SelectedEntity::Folder(work_id)]);
+    }
+
+    #[test]
+    fn flatten_navigable_entities_is_empty_for_no_folders_or_connections() {
+        let flat = super::flatten_navigable_entities(&[], &[], &HashSet::default());
+        assert!(flat.is_empty());
     }
 
     fn test_column(key: Option<&str>, is_nullable: bool) -> ColumnInfo {
@@ -11940,6 +12502,120 @@ mod tests {
                 folders.iter().map(|f| f.id).collect::<Vec<_>>(),
                 vec![folder_b, folder_a],
                 "clicking Move Down on A's real context menu must swap it below B"
+            );
+        });
+    }
+
+    // Drives a real keystroke through the production keymap binding
+    // ("DatabasePanel" context), not a direct `move_selected` call, mirroring
+    // `folder_context_menu_move_down_reorders_siblings`'s philosophy of
+    // exercising the actual interaction path rather than an internal method.
+    #[gpui::test]
+    async fn shift_down_and_shift_up_reorder_the_selected_folder(cx: &mut TestAppContext) {
+        use zed_actions::database_panel::{MoveSelectedDown, MoveSelectedUp};
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("shift-down", MoveSelectedDown, Some("DatabasePanel")),
+                gpui::KeyBinding::new("shift-up", MoveSelectedUp, Some("DatabasePanel")),
+            ]);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let (store, _panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|_| DatabasePanel {
+                focus_handle,
+                store: store.clone(),
+                workspace: workspace_handle,
+                history_expanded: false,
+                table_filter_editor,
+                collapsed_folders: HashSet::default(),
+                collapsed_connections: HashSet::default(),
+                editing_folder: None,
+                drag_target: None,
+                views_expanded: HashSet::default(),
+                procedures_expanded: HashSet::default(),
+                sequences_expanded: HashSet::default(),
+                events_expanded: HashSet::default(),
+                table_indexes_expanded: HashSet::default(),
+                table_fks_expanded: HashSet::default(),
+                table_triggers_expanded: HashSet::default(),
+                server_objects_expanded: HashSet::default(),
+                server_users: HashMap::default(),
+                table_filter_is_regex: false,
+                selected_tree_node: None,
+                selected_entity: None,
+                initial_collapse_pending: false,
+                pending_tree_state_serialization: Task::ready(None),
+                dump: DumpUiState::default(),
+                export: ExportUiState::default(),
+                context_menu: None,
+                tree_scroll_handle: ScrollHandle::new(),
+                _subscriptions: Vec::new(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            (store, panel)
+        });
+
+        let folder_a = store
+            .update(cx, |store, cx| store.add_folder("A".into(), None, cx))
+            .expect("folder a must be created");
+        let folder_b = store
+            .update(cx, |store, cx| store.add_folder("B".into(), None, cx))
+            .expect("folder b must be created");
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        // A real click selects folder A, same as a user would before reordering
+        // it with the keyboard.
+        let folder_a_row = debug_center(cx, format!("folder-row-{folder_a}").leak());
+        cx.simulate_click(folder_a_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let mut folders = store.folders().to_vec();
+            folders.sort_by_key(|f| f.order);
+            assert_eq!(
+                folders.iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![folder_b, folder_a],
+                "Shift+Down on selected folder A must swap it below B"
+            );
+        });
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let mut folders = store.folders().to_vec();
+            folders.sort_by_key(|f| f.order);
+            assert_eq!(
+                folders.iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![folder_a, folder_b],
+                "Shift+Up on selected folder A must swap it back above B"
             );
         });
     }

@@ -823,6 +823,39 @@ pub mod database_panel {
             /// Toggles showing each statement's result inline, below the
             /// statement, instead of only in the bottom-dock results tab.
             ToggleInlineResults,
+            /// Collapses the selected folder in the Database Explorer tree.
+            CollapseSelectedEntry,
+            /// Expands the selected folder in the Database Explorer tree.
+            ExpandSelectedEntry,
+            /// Moves the selected folder or connection up among its siblings.
+            MoveSelectedUp,
+            /// Moves the selected folder or connection down among its siblings.
+            MoveSelectedDown,
+        ]
+    );
+}
+
+pub mod api_client_panel {
+    use gpui::actions;
+    actions!(
+        api_client_panel,
+        [
+            /// Toggles focus on the API client panel.
+            ToggleFocus,
+            /// Creates a new collection.
+            NewCollection,
+            /// Creates a new folder under the selected collection or folder.
+            NewFolder,
+            /// Creates a new request under the selected collection or folder.
+            NewRequest,
+            /// Collapses the selected folder in the API Client tree.
+            CollapseSelectedEntry,
+            /// Expands the selected folder in the API Client tree.
+            ExpandSelectedEntry,
+            /// Moves the selected folder or request up among its siblings.
+            MoveSelectedUp,
+            /// Moves the selected folder or request down among its siblings.
+            MoveSelectedDown,
         ]
     );
 }

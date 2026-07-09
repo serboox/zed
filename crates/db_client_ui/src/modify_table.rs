@@ -2,7 +2,8 @@ use db_client::connection::{ConnectionId, DatabaseDriver};
 use db_client::schema::{CheckConstraintInfo, ColumnInfo, FkInfo, IndexInfo};
 use editor::Editor;
 use gpui::{
-    Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Window, prelude::*,
+    Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Window,
+    prelude::*,
 };
 use ui::{Checkbox, Divider, Tooltip, prelude::*};
 use util::ResultExt;
@@ -155,7 +156,11 @@ pub fn generate_alter_statements(
                         driver.quote_identifier(name),
                         data_type
                     ));
-                    let null_op = if *nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                    let null_op = if *nullable {
+                        "DROP NOT NULL"
+                    } else {
+                        "SET NOT NULL"
+                    };
                     statements.push(format!(
                         "ALTER TABLE {table_ident} ALTER COLUMN {} {null_op};",
                         driver.quote_identifier(name)
@@ -239,7 +244,6 @@ fn fold_mysql_rename_modify(
     }
     statements
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexChange {
@@ -846,13 +850,38 @@ impl ModifyTableView {
         statements
     }
 
-    fn execute(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let statements = self.pending_statements(cx);
         if statements.is_empty() {
             self.status = Some("No changes to apply.".into());
             cx.notify();
             return;
         }
+        if statements
+            .iter()
+            .any(|statement| statement.contains("DROP "))
+        {
+            let msg = format!(
+                "Apply {} pending change(s) to {}.{}? This includes one or more DROP operations and cannot be undone.",
+                statements.len(),
+                self.database,
+                self.table,
+            );
+            let receiver =
+                window.prompt(PromptLevel::Warning, &msg, None, &["Apply", "Cancel"], cx);
+            cx.spawn_in(window, async move |this, cx| {
+                if receiver.await == Ok(0) {
+                    this.update(cx, |this, cx| this.run_statements(statements, cx))?;
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+        self.run_statements(statements, cx);
+    }
+
+    fn run_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
         self.busy = true;
         self.status = Some("Applying changes…".into());
         let connection_id = self.connection_id;
@@ -914,7 +943,11 @@ impl ModifyTableView {
             .child(
                 IconButton::new(("drop-column", index), IconName::Trash)
                     .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text(if dropped { "Keep column" } else { "Drop column" }))
+                    .tooltip(Tooltip::text(if dropped {
+                        "Keep column"
+                    } else {
+                        "Drop column"
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(draft) = this.drafts.get_mut(index) {
                             draft.dropped = !draft.dropped;
@@ -955,7 +988,11 @@ impl ModifyTableView {
             .child(
                 IconButton::new(("drop-index", index), IconName::Trash)
                     .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text(if dropped { "Keep index" } else { "Drop index" }))
+                    .tooltip(Tooltip::text(if dropped {
+                        "Keep index"
+                    } else {
+                        "Drop index"
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(draft) = this.index_drafts.get_mut(index) {
                             draft.dropped = !draft.dropped;
@@ -965,7 +1002,12 @@ impl ModifyTableView {
             )
     }
 
-    fn render_fk_row(&self, index: usize, draft: &FkDraft, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_fk_row(
+        &self,
+        index: usize,
+        draft: &FkDraft,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let dropped = draft.dropped;
         h_flex()
             .w_full()
@@ -1100,7 +1142,11 @@ impl Render for ModifyTableView {
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_column(window, cx))),
             )
             .child(Divider::horizontal())
-            .child(Label::new("Indexes").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new("Indexes")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
             .child(
                 v_flex()
                     .id("modify-indexes")
@@ -1150,7 +1196,11 @@ impl Render for ModifyTableView {
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_check(window, cx))),
             )
             .child(Divider::horizontal())
-            .child(Label::new("SQL Preview").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new("SQL Preview")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
             .child(
                 div()
                     .id("modify-sql-preview")
@@ -1164,7 +1214,11 @@ impl Render for ModifyTableView {
                     .child(Label::new(preview_text).size(LabelSize::Small)),
             )
             .when_some(self.status.clone(), |column, status| {
-                column.child(Label::new(status).size(LabelSize::Small).color(Color::Muted))
+                column.child(
+                    Label::new(status)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
             })
             .child(
                 h_flex()
@@ -1180,9 +1234,7 @@ impl Render for ModifyTableView {
                         Button::new("execute", "Execute")
                             .style(ButtonStyle::Filled)
                             .disabled(busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.execute(window, cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| this.execute(window, cx))),
                     ),
             )
     }
@@ -1359,26 +1411,16 @@ mod tests {
 
     #[test]
     fn drop_index_uses_alter_table_drop_index_on_mysql() {
-        let changes = index_diff_changes(&[index_draft(
-            Some("idx_old"),
-            "idx_old",
-            "",
-            false,
-            true,
-        )]);
+        let changes =
+            index_diff_changes(&[index_draft(Some("idx_old"), "idx_old", "", false, true)]);
         let sql = generate_index_statements("t", DatabaseDriver::MySQL, &changes);
         assert_eq!(sql, vec!["ALTER TABLE `t` DROP INDEX `idx_old`;"]);
     }
 
     #[test]
     fn drop_index_uses_bare_drop_index_on_postgres_and_sqlite() {
-        let changes = index_diff_changes(&[index_draft(
-            Some("idx_old"),
-            "idx_old",
-            "",
-            false,
-            true,
-        )]);
+        let changes =
+            index_diff_changes(&[index_draft(Some("idx_old"), "idx_old", "", false, true)]);
         assert_eq!(
             generate_index_statements("t", DatabaseDriver::PostgreSQL, &changes),
             vec!["DROP INDEX \"idx_old\";"]
@@ -1409,14 +1451,8 @@ mod tests {
 
     #[test]
     fn add_foreign_key_generates_add_constraint_statement() {
-        let changes = fk_diff_changes(&[fk_draft(
-            None,
-            "fk_owner",
-            "owner_id",
-            "users",
-            "id",
-            false,
-        )]);
+        let changes =
+            fk_diff_changes(&[fk_draft(None, "fk_owner", "owner_id", "users", "id", false)]);
         let sql = generate_foreign_key_statements("orders", DatabaseDriver::PostgreSQL, &changes);
         assert_eq!(
             sql,
@@ -1428,14 +1464,7 @@ mod tests {
 
     #[test]
     fn drop_foreign_key_differs_between_mysql_and_postgres() {
-        let changes = fk_diff_changes(&[fk_draft(
-            Some("fk_owner"),
-            "fk_owner",
-            "",
-            "",
-            "",
-            true,
-        )]);
+        let changes = fk_diff_changes(&[fk_draft(Some("fk_owner"), "fk_owner", "", "", "", true)]);
         assert_eq!(
             generate_foreign_key_statements("orders", DatabaseDriver::MySQL, &changes),
             vec!["ALTER TABLE `orders` DROP FOREIGN KEY `fk_owner`;"]
@@ -1448,15 +1477,11 @@ mod tests {
 
     #[test]
     fn foreign_key_statements_are_not_generated_for_sqlite() {
-        let changes = fk_diff_changes(&[fk_draft(
-            None,
-            "fk_owner",
-            "owner_id",
-            "users",
-            "id",
-            false,
-        )]);
-        assert!(generate_foreign_key_statements("orders", DatabaseDriver::SQLite, &changes).is_empty());
+        let changes =
+            fk_diff_changes(&[fk_draft(None, "fk_owner", "owner_id", "users", "id", false)]);
+        assert!(
+            generate_foreign_key_statements("orders", DatabaseDriver::SQLite, &changes).is_empty()
+        );
     }
 
     fn check_draft(
@@ -1485,7 +1510,8 @@ mod tests {
 
     #[test]
     fn drop_check_constraint_differs_between_mysql_and_postgres() {
-        let changes = check_diff_changes(&[check_draft(Some("chk_amount"), "chk_amount", "", true)]);
+        let changes =
+            check_diff_changes(&[check_draft(Some("chk_amount"), "chk_amount", "", true)]);
         assert_eq!(
             generate_check_statements("orders", DatabaseDriver::MySQL, &changes),
             vec!["ALTER TABLE `orders` DROP CHECK `chk_amount`;"]

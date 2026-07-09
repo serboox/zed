@@ -1072,6 +1072,11 @@ pub struct Editor {
     gutter_dimensions: GutterDimensions,
     style: Option<EditorStyle>,
     text_style_refinement: Option<TextStyleRefinement>,
+    /// Optional low-opacity background wash blended onto `editor_background`.
+    /// Used by callers (e.g. a per-connection accent color) to make an editor
+    /// surface visually distinguishable; `None` preserves the default theme
+    /// background exactly.
+    background_tint: Option<Hsla>,
     next_editor_action_id: EditorActionId,
     editor_actions: Rc<
         RefCell<BTreeMap<EditorActionId, Box<dyn Fn(&Editor, &mut Window, &mut Context<Self>)>>>,
@@ -2373,6 +2378,7 @@ impl Editor {
             serialize_selections: Task::ready(()),
             serialize_folds: Task::ready(()),
             text_style_refinement: None,
+            background_tint: None,
             load_diff_task: load_uncommitted_diff,
             temporary_diff_override: false,
             render_diff_hunks_as_unstaged: false,
@@ -3121,6 +3127,15 @@ impl Editor {
 
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    /// Sets a low-opacity background wash blended onto the editor's normal
+    /// background, e.g. to make a specific connection/environment
+    /// recognizable at a glance. Pass `None` to restore the default theme
+    /// background exactly.
+    pub fn set_background_tint(&mut self, tint: Option<Hsla>, cx: &mut Context<Self>) {
+        self.background_tint = tint;
+        cx.notify();
     }
 
     pub fn set_use_selection_highlight(&mut self, highlight: bool) {
@@ -8537,6 +8552,10 @@ impl Editor {
         cx.notify()
     }
 
+    pub fn is_masked(&self, cx: &App) -> bool {
+        self.display_map.read(cx).masked
+    }
+
     fn target_file<'a>(&self, cx: &'a App) -> Option<&'a dyn language::LocalFile> {
         self.active_buffer(cx)?
             .read(cx)
@@ -10791,6 +10810,16 @@ impl Editor {
         }
     }
 
+    /// Blends `tint` onto `background` at a low, fixed opacity so text and
+    /// highlight contrast painted on top remain legible. Returns `background`
+    /// unchanged when `tint` is `None`.
+    fn apply_background_tint(background: Hsla, tint: Option<Hsla>) -> Hsla {
+        match tint {
+            Some(tint) => background.blend(tint.opacity(0.05)),
+            None => background,
+        }
+    }
+
     fn create_style(&self, cx: &App) -> EditorStyle {
         let settings = ThemeSettings::get_global(cx);
 
@@ -10826,6 +10855,7 @@ impl Editor {
             EditorMode::Full { .. } => cx.theme().colors().editor_background,
             EditorMode::Minimap { .. } => cx.theme().colors().editor_background.opacity(0.7),
         };
+        let background = Self::apply_background_tint(background, self.background_tint);
 
         EditorStyle {
             background,

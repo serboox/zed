@@ -177,7 +177,8 @@ pub fn disable_indexes_statements(driver: DatabaseDriver, table: &str) -> Option
         | DatabaseDriver::ClickHouse
         | DatabaseDriver::Redis
         | DatabaseDriver::MongoDB
-        | DatabaseDriver::Cassandra => None,
+        | DatabaseDriver::Cassandra
+        | DatabaseDriver::Aerospike => None,
     }
 }
 

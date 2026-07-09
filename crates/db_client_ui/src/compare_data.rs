@@ -1,13 +1,22 @@
 use db_client::schema::QueryResult;
+use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, SharedString, Window,
-    prelude::*,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Window,
+    actions, prelude::*,
 };
-use std::collections::{HashMap, VecDeque};
-use ui::{Divider, Icon, Tooltip, prelude::*};
+use std::collections::{HashMap, HashSet, VecDeque};
+use ui::{Checkbox, Divider, Icon, Tooltip, prelude::*};
 use workspace::{Item, item::ItemEvent};
 
 const RENDERED_ROW_LIMIT: usize = 1000;
+
+actions!(
+    db_compare_data,
+    [
+        /// Closes the Compare Data view.
+        CloseCompareData
+    ]
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowDiffKind {
@@ -87,8 +96,10 @@ fn cells_equal(left: &Option<String>, right: &Option<String>, tolerance: Option<
                 return true;
             }
             if let Some(epsilon) = tolerance
-                && let (Ok(left_number), Ok(right_number)) =
-                    (left_value.trim().parse::<f64>(), right_value.trim().parse::<f64>())
+                && let (Ok(left_number), Ok(right_number)) = (
+                    left_value.trim().parse::<f64>(),
+                    right_value.trim().parse::<f64>(),
+                )
             {
                 return (left_number - right_number).abs() <= epsilon;
             }
@@ -261,6 +272,9 @@ pub struct CompareDataView {
     left: QueryResult,
     right: QueryResult,
     diff: DiffResult,
+    key_columns: HashSet<usize>,
+    tolerance_editor: Entity<Editor>,
+    tolerance_invalid: bool,
 }
 
 impl CompareDataView {
@@ -269,17 +283,56 @@ impl CompareDataView {
         right: QueryResult,
         key_columns: Option<Vec<usize>>,
         title: SharedString,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let diff = compute_diff(&left, &right, key_columns.as_deref(), None);
+        let key_columns: HashSet<usize> = key_columns.into_iter().flatten().collect();
+        let tolerance_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Tolerance (e.g. 0.01)", window, cx);
+            editor
+        });
         Self {
             focus_handle: cx.focus_handle(),
             title,
             left,
             right,
             diff,
+            key_columns,
+            tolerance_editor,
+            tolerance_invalid: false,
         }
+    }
+
+    // Re-derives the tolerance and key columns from their editable controls
+    // and recomputes the diff. Called whenever a control changes rather than
+    // live per-keystroke, since the tolerance text can be transiently invalid
+    // while being typed (e.g. "0." or "-").
+    fn recompute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tolerance_text = self.tolerance_editor.read(cx).text(cx);
+        let trimmed = tolerance_text.trim();
+        let tolerance = if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.parse::<f64>().ok()
+        };
+        self.tolerance_invalid = !trimmed.is_empty() && tolerance.is_none();
+
+        let mut key_columns: Vec<usize> = self.key_columns.iter().copied().collect();
+        key_columns.sort_unstable();
+        let key_columns = (!key_columns.is_empty()).then_some(key_columns);
+
+        self.diff = compute_diff(&self.left, &self.right, key_columns.as_deref(), tolerance);
+        let _ = window;
+        cx.notify();
+    }
+
+    fn toggle_key_column(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.key_columns.remove(&index) {
+            self.key_columns.insert(index);
+        }
+        self.recompute(window, cx);
     }
 
     fn cell_text(&self, row: &RowDiff, column: usize) -> Option<String> {
@@ -343,9 +396,62 @@ impl Render for CompareDataView {
             .child(Label::new(format!("+{}", self.diff.added)).color(Color::Created))
             .child(Label::new(format!("-{}", self.diff.removed)).color(Color::Deleted))
             .child(Label::new(format!("~{}", self.diff.changed)).color(Color::Modified))
+            .child(Label::new(format!("={}", self.diff.unchanged)).color(Color::Muted));
+
+        let key_picker = h_flex().gap_2().flex_wrap().items_center().children(
+            self.diff
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let selected = self.key_columns.contains(&index);
+                    Checkbox::new(("compare-key-col", index), selected.into())
+                        .label(name.clone())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_key_column(index, window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let controls = h_flex()
+            .gap_3()
+            .items_center()
             .child(
-                Label::new(format!("={}", self.diff.unchanged))
+                Label::new("Key columns:")
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+            .child(key_picker)
+            .child(Divider::vertical())
+            .child(
+                Label::new("Tolerance:")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().w(px(100.)).child(self.tolerance_editor.clone()))
+            .when(self.tolerance_invalid, |el| {
+                el.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .color(Color::Warning)
+                                .size(IconSize::XSmall),
+                        )
+                        .child(
+                            Label::new("Not a number, ignored")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        ),
+                )
+            })
+            .child(
+                Button::new("compare-recompute", "Re-compare")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, window, cx| this.recompute(window, cx))),
             );
 
         let column_header = h_flex().gap_2().px_1().children(
@@ -353,9 +459,11 @@ impl Render for CompareDataView {
                 .columns
                 .iter()
                 .map(|name| {
-                    div()
-                        .w(px(140.))
-                        .child(Label::new(name.clone()).size(LabelSize::Small).color(Color::Muted))
+                    div().w(px(140.)).child(
+                        Label::new(name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                 })
                 .collect::<Vec<_>>(),
         );
@@ -399,9 +507,11 @@ impl Render for CompareDataView {
                     .px_1()
                     .bg(row_bg)
                     .child(
-                        div()
-                            .w(px(14.))
-                            .child(Label::new(marker).size(LabelSize::Small).color(marker_color)),
+                        div().w(px(14.)).child(
+                            Label::new(marker)
+                                .size(LabelSize::Small)
+                                .color(marker_color),
+                        ),
                     )
                     .children(cells)
                     .into_any_element()
@@ -417,6 +527,7 @@ impl Render for CompareDataView {
             .bg(cx.theme().colors().editor_background)
             .p_3()
             .gap_2()
+            .on_action(cx.listener(|_, _: &CloseCompareData, _window, cx| cx.emit(DismissEvent)))
             .child(
                 h_flex()
                     .w_full()
@@ -432,9 +543,7 @@ impl Render for CompareDataView {
                     .child(
                         IconButton::new("close-compare", IconName::Close)
                             .tooltip(Tooltip::text("Close"))
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                            ),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     ),
             )
             .when(!self.diff.columns_aligned, |column| {
@@ -444,6 +553,8 @@ impl Render for CompareDataView {
                         .color(Color::Warning),
                 )
             })
+            .child(Divider::horizontal())
+            .child(controls)
             .child(Divider::horizontal())
             .child(column_header)
             .child(
@@ -476,7 +587,11 @@ mod tests {
             columns: columns.iter().map(|name| name.to_string()).collect(),
             rows: rows
                 .into_iter()
-                .map(|row| row.into_iter().map(|cell| cell.map(|value| value.to_string())).collect())
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| cell.map(|value| value.to_string()))
+                        .collect()
+                })
                 .collect(),
             rows_affected: 0,
             execution_time_ms: 0,
@@ -526,7 +641,13 @@ mod tests {
         let right = result(&["a"], vec![vec![Some("y")], vec![Some("z")]]);
 
         let diff = compute_diff(&left, &right, None, None);
-        assert_eq!(kinds(&diff).iter().filter(|k| **k == RowDiffKind::Unchanged).count(), 1);
+        assert_eq!(
+            kinds(&diff)
+                .iter()
+                .filter(|k| **k == RowDiffKind::Unchanged)
+                .count(),
+            1
+        );
         assert_eq!(diff.removed, 1);
         assert_eq!(diff.added, 1);
         assert_eq!(diff.changed, 0);
@@ -547,8 +668,14 @@ mod tests {
 
     #[test]
     fn mismatched_columns_compare_shared_only() {
-        let left = result(&["id", "name", "extra"], vec![vec![Some("1"), Some("a"), Some("L")]]);
-        let right = result(&["id", "name", "other"], vec![vec![Some("1"), Some("a"), Some("R")]]);
+        let left = result(
+            &["id", "name", "extra"],
+            vec![vec![Some("1"), Some("a"), Some("L")]],
+        );
+        let right = result(
+            &["id", "name", "other"],
+            vec![vec![Some("1"), Some("a"), Some("R")]],
+        );
 
         let diff = compute_diff(&left, &right, Some(&[0]), None);
         assert!(!diff.columns_aligned);

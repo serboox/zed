@@ -42,7 +42,9 @@ fn indent_width(line: &str) -> usize {
 // Strips leading indentation, tree connectors, and a leading "->" arrow so the
 // displayed node text is the operation itself.
 fn clean_node_text(line: &str) -> String {
-    let trimmed = line.trim_start_matches([' ', '\t', '|', '`', '+']).trim_start();
+    let trimmed = line
+        .trim_start_matches([' ', '\t', '|', '`', '+'])
+        .trim_start();
     // Strip the "->" arrow as a unit; otherwise strip any tree dashes ("|--").
     let without_arrow = trimmed
         .strip_prefix("->")
@@ -88,7 +90,10 @@ pub fn parse_plan_tree(text: &str) -> Vec<PlanNode> {
         stack.push(index);
     }
 
-    roots.iter().map(|&index| build_node(&arena, index)).collect()
+    roots
+        .iter()
+        .map(|&index| build_node(&arena, index))
+        .collect()
 }
 
 fn build_node(arena: &[RawNode], index: usize) -> PlanNode {
@@ -712,7 +717,9 @@ mod tests {
             self.queries.lock().unwrap().push(sql.to_string());
             Ok(QueryResult {
                 columns: vec!["QUERY PLAN".to_string()],
-                rows: vec![vec![Some(r#"[{"Plan": {"Node Type": "Seq Scan"}}]"#.to_string())]],
+                rows: vec![vec![Some(
+                    r#"[{"Plan": {"Node Type": "Seq Scan"}}]"#.to_string(),
+                )]],
                 rows_affected: 0,
                 execution_time_ms: 1,
             })
@@ -726,9 +733,8 @@ mod tests {
     fn toggling_to_flame_view_renders_proportional_spans(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let store = cx.new(DatabaseStore::new);
-        let window = cx.add_window(|window, cx| {
-            ExplainPlanView::new(sample_roots(), None, window, cx)
-        });
+        let window =
+            cx.add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, window, cx));
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         let _ = store;
 
@@ -779,9 +785,8 @@ mod tests {
     #[gpui::test]
     fn toggling_back_to_tree_view_still_works(cx: &mut gpui::TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|window, cx| {
-            ExplainPlanView::new(sample_roots(), None, window, cx)
-        });
+        let window =
+            cx.add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, window, cx));
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
 
         cx.update(|window, cx| {
