@@ -518,6 +518,144 @@ impl ApiClientPanel {
         });
     }
 
+    /// Imports every collection and environment from a Postman "Full Data
+    /// Export" ZIP file, picked via a native file dialog. Files that fail to
+    /// parse are logged individually rather than aborting the whole import
+    /// -- matches `crate::full_export::import_full_export`'s per-file error
+    /// collection.
+    fn start_import_full_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let path_rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let Some(path) = path_rx
+                .await
+                .log_err()
+                .and_then(|result| result.log_err())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next())
+            else {
+                return;
+            };
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&path) })
+                .await;
+            let Some(bytes) = bytes.log_err() else {
+                return;
+            };
+            let imported = cx
+                .background_executor()
+                .spawn(async move { crate::full_export::import_full_export(&bytes) })
+                .await;
+            let imported = match imported {
+                Ok(imported) => imported,
+                Err(error) => {
+                    log::error!("failed to import Postman full data export: {error}");
+                    return;
+                }
+            };
+            for failed in &imported.failed {
+                log::error!(
+                    "failed to import \"{}\" from the Postman full data export: {}",
+                    failed.file_name,
+                    failed.error
+                );
+            }
+            store.update(cx, |store, cx| {
+                for collection in imported.collections {
+                    store.import_collection(
+                        collection.collection,
+                        collection.folders,
+                        collection.requests,
+                        cx,
+                    );
+                }
+                for environment in imported.environments {
+                    let id = store.create_environment(environment.name.clone(), cx);
+                    store.update_environment(Some(id), cx, |stored| {
+                        stored.variables = environment.variables;
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Exports every collection and environment as a Postman "Full Data
+    /// Export" ZIP file -- the same multi-file layout Postman's own "Export
+    /// Data" produces, so it round-trips through `start_import_full_export`.
+    fn start_export_full_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let collections = store.collections.clone();
+        let folders = store.folders.clone();
+        let requests = store.requests.clone();
+        let environments = store.environments.clone();
+
+        let path_rx =
+            cx.prompt_for_new_path(paths::home_dir(), Some("postman-full-data-export.zip"));
+        cx.spawn_in(window, async move |_this, cx| {
+            let Some(path) = path_rx
+                .await
+                .log_err()
+                .and_then(|result| result.log_err())
+                .flatten()
+            else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move {
+                    let scoped_folders: Vec<Vec<Folder>> = collections
+                        .iter()
+                        .map(|collection| {
+                            folders
+                                .iter()
+                                .filter(|folder| folder.collection_id == collection.id)
+                                .cloned()
+                                .collect()
+                        })
+                        .collect();
+                    let scoped_requests: Vec<Vec<Request>> = collections
+                        .iter()
+                        .map(|collection| {
+                            requests
+                                .iter()
+                                .filter(|request| request.collection_id == collection.id)
+                                .cloned()
+                                .collect()
+                        })
+                        .collect();
+                    let exports: Vec<crate::full_export::CollectionExport> = collections
+                        .iter()
+                        .zip(scoped_folders.iter())
+                        .zip(scoped_requests.iter())
+                        .map(|((collection, folders), requests)| {
+                            crate::full_export::CollectionExport {
+                                collection,
+                                folders,
+                                requests,
+                            }
+                        })
+                        .collect();
+                    match crate::full_export::export_full_export(&exports, &environments) {
+                        Ok(bytes) => {
+                            std::fs::write(&path, bytes).log_err();
+                        }
+                        Err(error) => {
+                            log::error!("failed to export Postman full data export: {error}")
+                        }
+                    }
+                })
+                .await;
+        })
+        .detach();
+    }
+
     fn start_new_folder(
         &mut self,
         collection_id: CollectionId,
@@ -1348,12 +1486,30 @@ impl Render for ApiClientPanel {
                                 });
                             }
                         })
-                        .entry(
-                            "Import OpenAPI/Swagger Document",
-                            None,
+                        .entry("Import OpenAPI/Swagger Document", None, {
+                            let panel = panel.clone();
                             move |window, cx| {
                                 panel
                                     .update(cx, |panel, cx| panel.start_import_openapi(window, cx));
+                            }
+                        })
+                        .entry("Import Postman Full Data Export (.zip)...", None, {
+                            let panel = panel.clone();
+                            move |window, cx| {
+                                panel.update(cx, |panel, cx| {
+                                    panel.start_import_full_export(window, cx)
+                                });
+                            }
+                        })
+                        .entry(
+                            "Export Postman Full Data Export (.zip)...",
+                            None,
+                            {
+                                move |window, cx| {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.start_export_full_export(window, cx)
+                                    });
+                                }
                             },
                         )
                     });
@@ -1705,6 +1861,80 @@ mod tests {
             assert_eq!(store.requests.len(), 1);
             assert_eq!(store.requests[0].name, "Get users");
         });
+    }
+
+    #[gpui::test]
+    async fn importing_a_full_data_export_zip_through_the_real_file_dialog_creates_every_collection_and_environment(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+
+        let collection = api_client::Collection::new("API A".to_string());
+        let mut request = Request::new(collection.id, "Get users".to_string());
+        request.url = "https://api.example.com/users".to_string();
+        let environment = api_client::Environment::new("Staging".to_string());
+        let zip_bytes = crate::full_export::export_full_export(
+            &[crate::full_export::CollectionExport {
+                collection: &collection,
+                folders: &[],
+                requests: &[request],
+            }],
+            &[environment],
+        )
+        .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("full-export.zip");
+        std::fs::write(&zip_path, &zip_bytes).unwrap();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_import_full_export(window, cx)
+        });
+        cx.simulate_path_prompt_response(move |_options| Some(vec![zip_path]));
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.collections.len(), 1);
+            assert_eq!(store.collections[0].name, "API A");
+            assert_eq!(store.requests.len(), 1);
+            assert_eq!(store.requests[0].url, "https://api.example.com/users");
+            assert_eq!(store.environments.len(), 1);
+            assert_eq!(store.environments[0].name, "Staging");
+        });
+    }
+
+    #[gpui::test]
+    async fn exporting_a_full_data_export_zip_through_the_real_file_dialog_writes_every_collection_and_environment(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("API A".into(), cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("full-export.zip");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.start_export_full_export(window, cx)
+        });
+        cx.simulate_new_path_selection({
+            let zip_path = zip_path.clone();
+            move |_directory| Some(zip_path)
+        });
+        cx.run_until_parked();
+
+        let bytes = std::fs::read(&zip_path).expect("the export file should have been written");
+        let imported = crate::full_export::import_full_export(&bytes).unwrap();
+        assert!(imported.failed.is_empty());
+        assert_eq!(imported.collections.len(), 1);
+        assert_eq!(imported.collections[0].collection.name, "API A");
+        assert_eq!(imported.collections[0].requests.len(), 1);
     }
 
     #[gpui::test]

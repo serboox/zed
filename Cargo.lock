@@ -925,6 +925,7 @@ dependencies = [
  "zed-reqwest",
  "zed_actions",
  "zed_credentials_provider",
+ "zip",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 mod code_generator;
 mod environment_editor;
 mod export;
+mod full_export;
 mod grpc_view;
 mod history_view;
 mod import;
