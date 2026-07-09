@@ -1,6 +1,8 @@
+pub mod aerospike_provider;
 pub mod cassandra_provider;
 pub mod clickhouse;
 pub mod connection;
+pub mod kubernetes_tunnel;
 pub mod mongo_provider;
 pub mod mysql;
 pub mod postgres;
@@ -12,8 +14,12 @@ pub mod sqlite;
 pub mod ssh_tunnel;
 
 pub use connection::{
-    ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, MAX_FOLDER_DEPTH,
-    SshAuthMethod, SslMode,
+    ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, KubernetesRelayCommandKind,
+    KubernetesTargetKind, KubernetesTunnelModeKind, MAX_FOLDER_DEPTH, SshAuthMethod, SslMode,
+};
+pub use kubernetes_tunnel::{
+    KubernetesRelayCommand, KubernetesTarget, KubernetesTunnel, KubernetesTunnelMode,
+    kubernetes_tunnel_caveat,
 };
 pub use provider::DbProvider;
 pub use runtime::{RuntimeProvider, on_runtime};

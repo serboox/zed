@@ -170,6 +170,41 @@ impl DbProvider for RuntimeProvider {
         let new_name = new_name.to_owned();
         on_runtime(async move { inner.rename_table(&database, &old_name, &new_name).await }).await
     }
+
+    async fn get_record(
+        &self,
+        namespace: &str,
+        set: &str,
+        key: &str,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let inner = self.inner.clone();
+        let namespace = namespace.to_owned();
+        let set = set.to_owned();
+        let key = key.to_owned();
+        on_runtime(async move { inner.get_record(&namespace, &set, &key).await }).await
+    }
+
+    async fn put_record(
+        &self,
+        namespace: &str,
+        set: &str,
+        key: &str,
+        bins: &[(String, String)],
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let namespace = namespace.to_owned();
+        let set = set.to_owned();
+        let key = key.to_owned();
+        let bins = bins.to_vec();
+        on_runtime(async move { inner.put_record(&namespace, &set, &key, &bins).await }).await
+    }
+
+    async fn scan_records(&self, namespace: &str, set: &str, limit: usize) -> Result<QueryResult> {
+        let inner = self.inner.clone();
+        let namespace = namespace.to_owned();
+        let set = set.to_owned();
+        on_runtime(async move { inner.scan_records(&namespace, &set, limit).await }).await
+    }
 }
 
 #[cfg(test)]

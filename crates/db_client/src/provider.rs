@@ -114,4 +114,47 @@ pub trait DbProvider: Send + Sync {
         .await?;
         Ok(())
     }
+
+    /// Fetches a single record by key, for key-value drivers with no query
+    /// language (Aerospike). Returns bin/field name-value pairs, or `None`
+    /// when the key does not exist. The default errors clearly for every
+    /// driver that has a real query language instead.
+    async fn get_record(
+        &self,
+        _namespace: &str,
+        _set: &str,
+        _key: &str,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        Err(anyhow::anyhow!(
+            "This driver does not support key-based Get — use a query instead."
+        ))
+    }
+
+    /// Writes `bins` to a record by key, for key-value drivers with no query
+    /// language (Aerospike). See [`get_record`](Self::get_record).
+    async fn put_record(
+        &self,
+        _namespace: &str,
+        _set: &str,
+        _key: &str,
+        _bins: &[(String, String)],
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "This driver does not support key-based Put — use a query instead."
+        ))
+    }
+
+    /// Scans up to `limit` records in `namespace`/`set`, for key-value
+    /// drivers with no query language (Aerospike). See
+    /// [`get_record`](Self::get_record).
+    async fn scan_records(
+        &self,
+        _namespace: &str,
+        _set: &str,
+        _limit: usize,
+    ) -> Result<QueryResult> {
+        Err(anyhow::anyhow!(
+            "This driver does not support Scan — use a query instead."
+        ))
+    }
 }

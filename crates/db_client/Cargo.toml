@@ -22,6 +22,10 @@ serde_json.workspace = true
 smol.workspace = true
 uuid.workspace = true
 redis = { version = "0.27", features = ["tokio-comp"] }
+aerospike = { version = "3.0.0-alpha.1", default-features = false, features = [
+    "async",
+    "rt-tokio",
+] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "postgres", "sqlite", "json", "time"] }
 mongodb = "3.7"
 scylla = "1.7"

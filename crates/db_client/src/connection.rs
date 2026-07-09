@@ -41,6 +41,7 @@ pub enum DatabaseDriver {
     Redis,
     MongoDB,
     Cassandra,
+    Aerospike,
 }
 
 impl fmt::Display for DatabaseDriver {
@@ -53,6 +54,7 @@ impl fmt::Display for DatabaseDriver {
             DatabaseDriver::Redis => write!(formatter, "Redis"),
             DatabaseDriver::MongoDB => write!(formatter, "MongoDB"),
             DatabaseDriver::Cassandra => write!(formatter, "Cassandra"),
+            DatabaseDriver::Aerospike => write!(formatter, "Aerospike"),
         }
     }
 }
@@ -67,6 +69,7 @@ impl DatabaseDriver {
             DatabaseDriver::Redis => 6379,
             DatabaseDriver::MongoDB => 27017,
             DatabaseDriver::Cassandra => 9042,
+            DatabaseDriver::Aerospike => 3000,
         }
     }
 
@@ -110,6 +113,33 @@ pub enum SshAuthMethod {
     Password,
 }
 
+/// Which `kubectl` operation the Kubernetes tunnel uses. The user picks this
+/// explicitly based on which RBAC verb their account has (`portforward` or
+/// `exec`) -- there is no automatic detection or fallback between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KubernetesTunnelModeKind {
+    #[default]
+    PortForward,
+    Exec,
+}
+
+/// The relay binary `KubernetesTunnelModeKind::Exec` runs inside the target
+/// container to bridge its stdio to a TCP connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KubernetesRelayCommandKind {
+    #[default]
+    Socat,
+    Nc,
+}
+
+/// What the Kubernetes tunnel forwards to or execs into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KubernetesTargetKind {
+    #[default]
+    Pod,
+    Service,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: ConnectionId,
@@ -147,6 +177,27 @@ pub struct ConnectionConfig {
     pub ssl_client_cert_path: Option<String>,
     #[serde(default)]
     pub ssl_client_key_path: Option<String>,
+    /// Kubeconfig context name; presence gates whether the Kubernetes tunnel
+    /// is used, the same way `ssh_host.is_some()` gates the SSH tunnel.
+    #[serde(default)]
+    pub k8s_context: Option<String>,
+    #[serde(default = "default_k8s_namespace")]
+    pub k8s_namespace: String,
+    /// Overrides `kubectl`'s default kubeconfig lookup (`~/.kube/config`)
+    /// when set.
+    #[serde(default)]
+    pub k8s_kubeconfig_path: Option<String>,
+    #[serde(default)]
+    pub k8s_tunnel_mode: KubernetesTunnelModeKind,
+    /// Only meaningful when `k8s_tunnel_mode` is `Exec` -- `kubectl exec`
+    /// only ever targets a pod, never a service.
+    #[serde(default)]
+    pub k8s_relay_command: KubernetesRelayCommandKind,
+    #[serde(default)]
+    pub k8s_target_kind: KubernetesTargetKind,
+    /// Pod or Service name, per `k8s_target_kind`.
+    #[serde(default)]
+    pub k8s_target_name: String,
     /// Legacy flat folder name, kept only so old config files still load. New
     /// code groups by `folder_id`; migration converts this into a `Folder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +223,10 @@ impl ConnectionConfig {
     pub fn uses_ssh(&self) -> bool {
         self.ssh_host.is_some()
     }
+
+    pub fn uses_kubernetes_tunnel(&self) -> bool {
+        self.k8s_context.is_some()
+    }
 }
 
 fn default_true() -> bool {
@@ -180,6 +235,10 @@ fn default_true() -> bool {
 
 fn default_22() -> u16 {
     22
+}
+
+fn default_k8s_namespace() -> String {
+    "default".to_string()
 }
 
 impl Default for ConnectionConfig {
@@ -204,6 +263,13 @@ impl Default for ConnectionConfig {
             ssl_ca_path: None,
             ssl_client_cert_path: None,
             ssl_client_key_path: None,
+            k8s_context: None,
+            k8s_namespace: default_k8s_namespace(),
+            k8s_kubeconfig_path: None,
+            k8s_tunnel_mode: KubernetesTunnelModeKind::PortForward,
+            k8s_relay_command: KubernetesRelayCommandKind::Socat,
+            k8s_target_kind: KubernetesTargetKind::Pod,
+            k8s_target_name: String::new(),
             folder: None,
             folder_id: None,
             order: 0,
