@@ -1903,6 +1903,19 @@ fn flatten_navigable_entities(
     flat
 }
 
+// Appends a generated sample query (e.g. from a "New Query" context menu
+// entry) to the end of the console's existing text, so a quick-preview
+// action never silently discards whatever the user already had open. An
+// empty (or whitespace-only) console is replaced outright rather than
+// prefixed with a stray blank line.
+fn append_sample_query(existing: &str, sample: &str) -> String {
+    if existing.trim().is_empty() {
+        sample.to_string()
+    } else {
+        format!("{}\n{}", existing.trim_end(), sample)
+    }
+}
+
 // A persistent .sql scratch file per connection, kept in the config dir so it
 // survives restarts and never needs an explicit save.
 fn connection_query_path(connection_id: ConnectionId, label: &str) -> std::path::PathBuf {
@@ -2189,6 +2202,40 @@ pub fn open_new_sql_query(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    open_sql_query_console(workspace, connection_id, connection_label, None, window, cx);
+}
+
+/// Like [`open_new_sql_query`], but appends `text` (a generated sample query,
+/// e.g. from a "New Query" context menu entry) to the end of the connection's
+/// existing persistent console instead of leaving it untouched. There is only
+/// ever one query document per connection, so a generated sample joins
+/// whatever is already there rather than opening a separate throwaway buffer.
+pub fn open_sql_query_console_appending(
+    workspace: &mut Workspace,
+    connection_id: ConnectionId,
+    connection_label: String,
+    text: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_sql_query_console(
+        workspace,
+        connection_id,
+        connection_label,
+        Some(text),
+        window,
+        cx,
+    );
+}
+
+fn open_sql_query_console(
+    workspace: &mut Workspace,
+    connection_id: ConnectionId,
+    connection_label: String,
+    append_text: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let store = DatabaseStore::global(cx).map(|store| store.downgrade());
     let workspace_handle = workspace.weak_handle();
     let path = connection_query_path(connection_id, &connection_label);
@@ -2220,13 +2267,18 @@ pub fn open_new_sql_query(
         let item = open.await?;
 
         workspace
-            .update_in(cx, |_workspace, _window, cx| {
+            .update_in(cx, |_workspace, window, cx| {
                 let Some(editor) = item.act_as::<Editor>(cx) else {
                     return;
                 };
                 editor.update(cx, |editor, cx| {
                     editor.register_addon(DbQueryEditorAddon::new(connection_id));
                     editor.set_show_runnables(true, cx);
+                    if let Some(text) = append_text.as_deref().filter(|text| !text.is_empty()) {
+                        let combined = append_sample_query(&editor.text(cx), text);
+                        editor.set_text(combined, window, cx);
+                        editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+                    }
                 });
                 if let Some(store) = store.clone() {
                     install_db_editor_features(editor.clone(), store, workspace_handle.clone(), cx);
@@ -3267,9 +3319,9 @@ fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
 /// commands (`db.<collection>.find({...})`), not SQL.
 fn new_query_button_label(driver: DatabaseDriver) -> &'static str {
     match driver {
-        DatabaseDriver::MongoDB => "New Query",
+        DatabaseDriver::MongoDB => "Queries",
         DatabaseDriver::Aerospike => "Get / Put / Scan",
-        _ => "New SQL Query",
+        _ => "SQL Queries",
     }
 }
 
@@ -6723,7 +6775,7 @@ impl DatabasePanel {
                             .icon_size(IconSize::XSmall)
                             .disabled(!has_selection)
                             .tooltip(Tooltip::text(
-                                driver.map_or("New SQL Query", new_query_button_label),
+                                driver.map_or("SQL Queries", new_query_button_label),
                             ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let (Some(id), Some(label)) = (id, label.clone()) else {
@@ -7333,7 +7385,7 @@ impl DatabasePanel {
                                 let workspace = workspace.clone();
                                 move |menu, _, _| {
                                     menu
-                                    .entry("New Query", None, {
+                                    .entry(new_query_button_label(driver), None, {
                                         let entity = entity.clone();
                                         let db = db.clone();
                                         let workspace = workspace.clone();
@@ -7360,7 +7412,18 @@ impl DatabasePanel {
                                                     return;
                                                 }
                                                 let sql = format!("SELECT * FROM {db} LIMIT 1;");
-                                                Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, sql, window, cx);
+                                                workspace
+                                                    .update(cx, |workspace, cx| {
+                                                        open_sql_query_console_appending(
+                                                            workspace,
+                                                            id,
+                                                            connection.config.label,
+                                                            sql,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .log_err();
                                             });
                                         }
                                     })
@@ -9032,7 +9095,7 @@ impl DatabasePanel {
                     }
                 })
             })
-            .entry("New Query", None, {
+            .entry(new_query_button_label(driver), None, {
                 let panel = panel.clone();
                 let workspace = workspace.clone();
                 let label = label.clone();
@@ -9050,16 +9113,11 @@ impl DatabasePanel {
                         });
                         return;
                     }
-                    panel.update(cx, |panel, cx| {
-                        Self::open_sql_query_with_text(
-                            workspace.clone(),
-                            panel.store.downgrade(),
-                            id,
-                            String::new(),
-                            window,
-                            cx,
-                        );
-                    });
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            open_new_sql_query(workspace, id, label.clone(), window, cx);
+                        })
+                        .log_err();
                 }
             })
             .entry("Refresh", None, {
@@ -9376,14 +9434,14 @@ mod tests {
 
     #[test]
     fn new_query_button_label_is_driver_specific_for_mongo() {
-        assert_eq!(new_query_button_label(DatabaseDriver::MongoDB), "New Query");
+        assert_eq!(new_query_button_label(DatabaseDriver::MongoDB), "Queries");
         assert_eq!(
             new_query_button_label(DatabaseDriver::MySQL),
-            "New SQL Query"
+            "SQL Queries"
         );
         assert_eq!(
             new_query_button_label(DatabaseDriver::Cassandra),
-            "New SQL Query"
+            "SQL Queries"
         );
         assert_eq!(
             new_query_button_label(DatabaseDriver::Aerospike),
@@ -10027,6 +10085,46 @@ mod tests {
         assert_eq!(
             super::connection_id_from_console_path(&path, &[other]),
             None
+        );
+    }
+
+    // `open_new_sql_query` and `open_sql_query_console_appending` both resolve
+    // their target file through the same `connection_query_path`, so the two
+    // "New Query" entry points (toolbar button and context menu) always open
+    // the identical persistent document by construction; a full round trip
+    // through the real file-backed workspace item would additionally have to
+    // touch the real `paths::config_dir()` (FakeFs does not resolve absolute
+    // host paths outside its virtual root), which would risk writing a stray
+    // file into a real ~/.config directory during tests, so that path is not
+    // exercised end-to-end here. What genuinely needed proving is the
+    // "append, don't clobber" merge behavior, tested directly below.
+    #[test]
+    fn append_sample_query_joins_generated_sql_without_discarding_existing_text() {
+        assert_eq!(
+            super::append_sample_query("", "SELECT * FROM users LIMIT 1;"),
+            "SELECT * FROM users LIMIT 1;",
+            "an empty console should be filled with the sample, not prefixed with a blank line"
+        );
+        assert_eq!(
+            super::append_sample_query("   \n  ", "SELECT * FROM users LIMIT 1;"),
+            "SELECT * FROM users LIMIT 1;",
+            "a whitespace-only console counts as empty"
+        );
+        assert_eq!(
+            super::append_sample_query(
+                "SELECT 1;",
+                "SELECT * FROM users LIMIT 1;"
+            ),
+            "SELECT 1;\nSELECT * FROM users LIMIT 1;",
+            "existing content must be preserved, with the sample appended on a new line"
+        );
+        assert_eq!(
+            super::append_sample_query(
+                "SELECT 1;\n\n",
+                "SELECT * FROM users LIMIT 1;"
+            ),
+            "SELECT 1;\nSELECT * FROM users LIMIT 1;",
+            "trailing blank lines in the existing console must not accumulate on every append"
         );
     }
 
