@@ -10,6 +10,7 @@ use crate::driver_icon::brand_icon;
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
     ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree, plan_text_from_result,
+    supports_explain_plan,
 };
 use crate::full_text_search::FullTextSearchView;
 use crate::go_to_object::GoToObjectPalette;
@@ -3039,6 +3040,10 @@ pub fn explain_current_sql_query(
     let Some((id, database, driver)) = resolved else {
         return;
     };
+    if !supports_explain_plan(driver) {
+        cx.propagate();
+        return;
+    }
     panel.update(cx, |panel, cx| {
         panel.open_explain_plan(id, database, driver, sql, window, cx);
     });
@@ -3415,6 +3420,15 @@ fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
 /// hidden for it rather than generating a query that can only fail.
 fn supports_relational_query_features(driver: DatabaseDriver) -> bool {
     !matches!(driver, DatabaseDriver::MongoDB)
+}
+
+/// Whether `driver` has a fixed column/schema layout that "Modify Table…"
+/// and "Rename Table..." can alter with an `ALTER TABLE` statement. MongoDB
+/// collections have no fixed schema and Redis keys have no schema at all, so
+/// both actions are hidden rather than generating an `ALTER TABLE` statement
+/// that can only fail against either.
+fn supports_table_structure_changes(driver: DatabaseDriver) -> bool {
+    !matches!(driver, DatabaseDriver::MongoDB | DatabaseDriver::Redis)
 }
 
 /// Label for the button/tooltip that opens a new query console, tailored to
@@ -8083,15 +8097,17 @@ impl DatabasePanel {
                                                             });
                                                         }
                                                     })
-                                                    .entry("Modify Table…", None, {
-                                                        let entity = entity.clone();
-                                                        let db = db.clone();
-                                                        let tbl = tbl.clone();
-                                                        move |window, cx| {
-                                                            entity.update(cx, |panel, cx| {
-                                                                panel.open_modify_table(id, db.clone(), tbl.clone(), window, cx);
-                                                            });
-                                                        }
+                                                    .when(supports_table_structure_changes(driver), |menu| {
+                                                        menu.entry("Modify Table…", None, {
+                                                            let entity = entity.clone();
+                                                            let db = db.clone();
+                                                            let tbl = tbl.clone();
+                                                            move |window, cx| {
+                                                                entity.update(cx, |panel, cx| {
+                                                                    panel.open_modify_table(id, db.clone(), tbl.clone(), window, cx);
+                                                                });
+                                                            }
+                                                        })
                                                     })
                                                     .entry("Import Data…", None, {
                                                         let entity = entity.clone();
@@ -8341,21 +8357,23 @@ impl DatabasePanel {
                                                         }
                                                     })
                                                     .separator()
-                                                    .entry("Rename Table...", None, {
-                                                        let entity = entity.clone();
-                                                        let db = db.clone();
-                                                        let tbl = tbl.clone();
-                                                        move |window, cx| {
-                                                            entity.update(cx, |panel, cx| {
-                                                                panel.open_rename_table_dialog(
-                                                                    id,
-                                                                    db.clone(),
-                                                                    tbl.clone(),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }
+                                                    .when(supports_table_structure_changes(driver), |menu| {
+                                                        menu.entry("Rename Table...", None, {
+                                                            let entity = entity.clone();
+                                                            let db = db.clone();
+                                                            let tbl = tbl.clone();
+                                                            move |window, cx| {
+                                                                entity.update(cx, |panel, cx| {
+                                                                    panel.open_rename_table_dialog(
+                                                                        id,
+                                                                        db.clone(),
+                                                                        tbl.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
+                                                        })
                                                     })
                                                     .entry("Truncate Table", None, {
                                                         let entity = entity.clone();
@@ -9693,6 +9711,33 @@ mod tests {
             assert!(
                 supports_relational_query_features(driver),
                 "{driver:?} should still offer Search Data…/Compare Schema…"
+            );
+        }
+    }
+
+    // Before this fix, "Modify Table…" and "Rename Table..." were offered
+    // unconditionally for every driver, including MongoDB and Redis, whose
+    // `modify_table.rs` generators have no dialect branch for either --
+    // confirming one would send an ALTER TABLE statement that MongoDB's
+    // shell-command executor or Redis's whitespace-tokenized command
+    // executor can only fail on. This predicate is what gates both menu
+    // entries via `.when(...)` in `render_connection_item`.
+    #[test]
+    fn table_structure_changes_are_hidden_for_mongodb_and_redis() {
+        for driver in [DatabaseDriver::MongoDB, DatabaseDriver::Redis] {
+            assert!(!supports_table_structure_changes(driver));
+        }
+        for driver in [
+            DatabaseDriver::MySQL,
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::SQLite,
+            DatabaseDriver::ClickHouse,
+            DatabaseDriver::Cassandra,
+            DatabaseDriver::Aerospike,
+        ] {
+            assert!(
+                supports_table_structure_changes(driver),
+                "{driver:?} should still offer Modify Table…/Rename Table..."
             );
         }
     }
