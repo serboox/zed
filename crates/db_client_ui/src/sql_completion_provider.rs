@@ -180,15 +180,30 @@ const CLICKHOUSE_FUNCTIONS: &[&str] = &[
     "countIf",
 ];
 
+// CQL overlaps heavily with CORE_KEYWORDS (SELECT/FROM/WHERE/INSERT/UPDATE/...)
+// but has its own clauses with no SQL equivalent.
+const CASSANDRA_KEYWORDS: &[&str] = &[
+    "ALLOW",
+    "FILTERING",
+    "KEYSPACE",
+    "CONTAINS",
+    "MATERIALIZED",
+    "COUNTER",
+    "STATIC",
+    "FROZEN",
+    "IF",
+];
+const CASSANDRA_FUNCTIONS: &[&str] = &["TOKEN", "TTL", "WRITETIME", "UUID", "NOW", "TOJSON"];
+
 fn keywords_for(driver: DatabaseDriver) -> Vec<&'static str> {
     let extra = match driver {
         DatabaseDriver::MySQL => MYSQL_KEYWORDS,
         DatabaseDriver::PostgreSQL => POSTGRES_KEYWORDS,
         DatabaseDriver::SQLite => SQLITE_KEYWORDS,
         DatabaseDriver::ClickHouse => CLICKHOUSE_KEYWORDS,
+        DatabaseDriver::Cassandra => CASSANDRA_KEYWORDS,
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
-        DatabaseDriver::Cassandra => &[],
         DatabaseDriver::Aerospike => &[],
     };
     CORE_KEYWORDS.iter().chain(extra.iter()).copied().collect()
@@ -200,9 +215,9 @@ fn functions_for(driver: DatabaseDriver) -> Vec<&'static str> {
         DatabaseDriver::PostgreSQL => POSTGRES_FUNCTIONS,
         DatabaseDriver::SQLite => SQLITE_FUNCTIONS,
         DatabaseDriver::ClickHouse => CLICKHOUSE_FUNCTIONS,
+        DatabaseDriver::Cassandra => CASSANDRA_FUNCTIONS,
         DatabaseDriver::Redis => &[],
         DatabaseDriver::MongoDB => &[],
-        DatabaseDriver::Cassandra => &[],
         DatabaseDriver::Aerospike => &[],
     };
     CORE_FUNCTIONS.iter().chain(extra.iter()).copied().collect()
@@ -572,6 +587,53 @@ fn resolve_table(qualifier: &str, tables: &[TableRef]) -> Option<String> {
     resolve_table_ref(qualifier, tables).map(|t| t.name.clone())
 }
 
+// Methods the Mongo provider actually executes -- see the method match in
+// `db_client::mongo_provider`. Keeping this list in sync with that match is a
+// hidden constraint: suggesting a method here the provider doesn't implement
+// would autocomplete into a runtime "unsupported command" error.
+const MONGO_SHELL_METHODS: &[&str] = &[
+    "find",
+    "findOne",
+    "insertOne",
+    "insertMany",
+    "updateOne",
+    "updateMany",
+    "deleteOne",
+    "deleteMany",
+    "aggregate",
+    "countDocuments",
+];
+
+/// MongoDB shell queries (`db.<collection>.<method>(...)`) are JS
+/// method-chaining, not SQL, so the SQL-shaped `ParsedContext`/keyword tables
+/// above don't apply. This offers collection names right after `db.` and
+/// method names right after `db.<collection>.`.
+fn mongo_completions(text_before: &str, schema: &SchemaSnapshot) -> Vec<CandidateItem> {
+    let statement = current_statement(text_before).trim_start();
+    let Some(after_db) = statement.strip_prefix("db.") else {
+        return Vec::new();
+    };
+    match after_db.split_once('.') {
+        None => schema
+            .tables
+            .iter()
+            .map(|(name, _)| CandidateItem {
+                text: name.clone(),
+                kind: ItemKind::Table,
+                detail: None,
+            })
+            .collect(),
+        Some(_) => MONGO_SHELL_METHODS
+            .iter()
+            .map(|method| CandidateItem {
+                text: method.to_string(),
+                kind: ItemKind::Function,
+                detail: None,
+            })
+            .collect(),
+    }
+}
+
 /// Pure candidate builder: turns a schema snapshot + parsed context + dialect
 /// into the ordered list of suggestions, before any prefix filtering (the
 /// editor filters interactively).
@@ -579,7 +641,12 @@ fn build_candidates(
     context: &ParsedContext,
     schema: &SchemaSnapshot,
     driver: DatabaseDriver,
+    text_before: &str,
 ) -> Vec<CandidateItem> {
+    if driver == DatabaseDriver::MongoDB {
+        return mongo_completions(text_before, schema);
+    }
+
     let mut items: Vec<CandidateItem> = Vec::new();
 
     if let Some(qualifier) = &context.qualifier {
@@ -965,7 +1032,7 @@ impl CompletionProvider for SqlCompletionProvider {
             );
         }
 
-        let completions = build_candidates(&context, &snapshot, driver)
+        let completions = build_candidates(&context, &snapshot, driver, &text_before)
             .iter()
             .map(|item| make_completion(item, replace_range.clone(), &icon_colors))
             .collect();
@@ -1130,6 +1197,65 @@ mod tests {
         assert!(functions_for(DatabaseDriver::ClickHouse).contains(&"arrayJoin"));
     }
 
+    // CQL is close enough to SQL structurally that CORE_KEYWORDS already
+    // covers most of it; this only needed CQL's own extra clauses/functions.
+    #[test]
+    fn cassandra_gets_cql_specific_keywords_and_functions() {
+        assert!(keywords_for(DatabaseDriver::Cassandra).contains(&"ALLOW"));
+        assert!(keywords_for(DatabaseDriver::Cassandra).contains(&"FILTERING"));
+        assert!(keywords_for(DatabaseDriver::Cassandra).contains(&"SELECT"));
+        assert!(functions_for(DatabaseDriver::Cassandra).contains(&"TOKEN"));
+        assert!(functions_for(DatabaseDriver::Cassandra).contains(&"WRITETIME"));
+    }
+
+    // MongoDB shell queries are JS method-chaining, not SQL; before this fix
+    // Mongo connections got the exact same SQL keyword/table suggestions as
+    // every other driver (SELECT, FROM, WHERE...), which is nonsensical for
+    // `db.<collection>.<method>(...)` syntax.
+    #[test]
+    fn mongodb_suggests_collections_after_db_dot_and_methods_after_the_collection() {
+        let schema = sample_schema();
+        let context = ctx("");
+
+        let collection_items = build_candidates(&context, &schema, DatabaseDriver::MongoDB, "db.");
+        assert!(
+            collection_items
+                .iter()
+                .any(|i| i.text == "users" && i.kind == ItemKind::Table),
+            "typing `db.` should suggest collection names"
+        );
+        assert!(
+            !collection_items.iter().any(|i| i.kind == ItemKind::Keyword),
+            "MongoDB must not get SQL keyword suggestions"
+        );
+
+        let method_items =
+            build_candidates(&context, &schema, DatabaseDriver::MongoDB, "db.users.");
+        assert!(
+            method_items
+                .iter()
+                .any(|i| i.text == "find" && i.kind == ItemKind::Function),
+            "typing `db.users.` should suggest shell methods"
+        );
+        assert!(
+            method_items
+                .iter()
+                .any(|i| i.text == "insertOne" && i.kind == ItemKind::Function)
+        );
+        assert!(
+            !method_items
+                .iter()
+                .any(|i| i.kind == ItemKind::Table && i.text == "orders"),
+            "collection names must not be suggested once a collection is already chosen"
+        );
+
+        assert!(
+            build_candidates(&context, &schema, DatabaseDriver::MongoDB, "SELECT * FROM ")
+                .is_empty(),
+            "text that isn't a `db.` shell command has nothing sensible to suggest"
+        );
+    }
+
     fn sample_schema() -> SchemaSnapshot {
         let mut columns_by_table = HashMap::new();
         columns_by_table.insert(
@@ -1156,7 +1282,7 @@ mod tests {
     #[test]
     fn after_from_suggests_tables_and_keywords() {
         let context = ctx("SELECT * FROM ");
-        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1183,7 +1309,7 @@ mod tests {
     #[test]
     fn alias_dot_suggests_that_tables_columns() {
         let context = ctx("SELECT * FROM users u WHERE u.");
-        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1201,7 +1327,7 @@ mod tests {
     #[test]
     fn schema_dot_suggests_schema_objects() {
         let context = ctx("SELECT * FROM instruments.");
-        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1220,7 +1346,7 @@ mod tests {
             tables_in_scope: context.tables_in_scope,
             cte_names: Vec::new(),
         };
-        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1236,7 +1362,7 @@ mod tests {
             context.cte_names,
             vec!["recent".to_string(), "totals".to_string()]
         );
-        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &sample_schema(), DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1299,7 +1425,7 @@ mod tests {
             }],
             cte_names: Vec::new(),
         };
-        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
@@ -1379,7 +1505,7 @@ mod tests {
             tables_in_scope,
             cte_names: Vec::new(),
         };
-        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL);
+        let items = build_candidates(&context, &schema, DatabaseDriver::MySQL, "");
         assert!(
             items
                 .iter()
