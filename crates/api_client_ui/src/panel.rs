@@ -148,12 +148,14 @@ fn build_tree(
 }
 
 /// Flattens the tree into the same order it is painted, skipping the children
-/// of collapsed folders/collections. Keyboard SelectNext/Previous/First/Last
-/// walk this list. Mirrors `db_client_ui::panel::flatten_navigable_entities`.
+/// of folders/collections that aren't in `expanded_collections`/
+/// `expanded_folders` -- everything is collapsed by default unless its ID is
+/// explicitly present. Keyboard SelectNext/Previous/First/Last walk this
+/// list. Mirrors `db_client_ui::panel::flatten_navigable_entities`.
 fn flatten_navigable_entities(
     nodes: &[TreeNode],
-    collapsed_collections: &HashSet<CollectionId>,
-    collapsed_folders: &HashSet<FolderId>,
+    expanded_collections: &HashSet<CollectionId>,
+    expanded_folders: &HashSet<FolderId>,
 ) -> Vec<SelectedEntity> {
     let mut flat = Vec::new();
     for node in nodes {
@@ -163,21 +165,21 @@ fn flatten_navigable_entities(
                 children,
             } => {
                 flat.push(SelectedEntity::Collection(collection.id));
-                if !collapsed_collections.contains(&collection.id) {
+                if expanded_collections.contains(&collection.id) {
                     flat.extend(flatten_navigable_entities(
                         children,
-                        collapsed_collections,
-                        collapsed_folders,
+                        expanded_collections,
+                        expanded_folders,
                     ));
                 }
             }
             TreeNode::Folder { folder, children } => {
                 flat.push(SelectedEntity::Folder(folder.id));
-                if !collapsed_folders.contains(&folder.id) {
+                if expanded_folders.contains(&folder.id) {
                     flat.extend(flatten_navigable_entities(
                         children,
-                        collapsed_collections,
-                        collapsed_folders,
+                        expanded_collections,
+                        expanded_folders,
                     ));
                 }
             }
@@ -187,12 +189,44 @@ fn flatten_navigable_entities(
     flat
 }
 
+const TREE_VIEW_STATE_FILE: &str = "api_client_tree_view_state.json";
+
+fn tree_view_state_file_path() -> std::path::PathBuf {
+    paths::config_dir().join(TREE_VIEW_STATE_FILE)
+}
+
+/// Which collections/folders are expanded, persisted across restarts.
+/// Anything not in these sets starts collapsed by default -- a brand-new
+/// collection/folder, or the very first run before this file exists, is
+/// collapsed until the user explicitly expands it.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct TreeViewState {
+    #[serde(default)]
+    expanded_collections: HashSet<CollectionId>,
+    #[serde(default)]
+    expanded_folders: HashSet<FolderId>,
+}
+
+fn load_tree_view_state_from_disk() -> TreeViewState {
+    std::fs::read(tree_view_state_file_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_tree_view_state_to_disk(state: &TreeViewState) {
+    let Ok(json) = serde_json::to_vec_pretty(state) else {
+        return;
+    };
+    std::fs::write(tree_view_state_file_path(), json).log_err();
+}
+
 pub struct ApiClientPanel {
     focus_handle: FocusHandle,
     store: Entity<ApiClientStore>,
     workspace: WeakEntity<Workspace>,
-    collapsed_collections: HashSet<CollectionId>,
-    collapsed_folders: HashSet<FolderId>,
+    expanded_collections: HashSet<CollectionId>,
+    expanded_folders: HashSet<FolderId>,
     selected_entity: Option<SelectedEntity>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     tree_scroll_handle: ScrollHandle,
@@ -228,12 +262,13 @@ impl ApiClientPanel {
                         cx.notify();
                     },
                 );
+                let tree_view_state = load_tree_view_state_from_disk();
                 Self {
                     focus_handle,
                     store,
                     workspace: workspace_handle,
-                    collapsed_collections: HashSet::new(),
-                    collapsed_folders: HashSet::new(),
+                    expanded_collections: tree_view_state.expanded_collections,
+                    expanded_folders: tree_view_state.expanded_folders,
                     selected_entity: None,
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
@@ -244,23 +279,32 @@ impl ApiClientPanel {
         })
     }
 
+    fn persist_tree_view_state(&self) {
+        save_tree_view_state_to_disk(&TreeViewState {
+            expanded_collections: self.expanded_collections.clone(),
+            expanded_folders: self.expanded_folders.clone(),
+        });
+    }
+
     fn navigable_entities(&self, cx: &Context<Self>) -> Vec<SelectedEntity> {
         let store = self.store.read(cx);
         let nodes = build_tree(&store.collections, &store.folders, &store.requests);
-        flatten_navigable_entities(&nodes, &self.collapsed_collections, &self.collapsed_folders)
+        flatten_navigable_entities(&nodes, &self.expanded_collections, &self.expanded_folders)
     }
 
-    fn toggle_folder_collapsed(&mut self, id: FolderId, cx: &mut Context<Self>) {
-        if !self.collapsed_folders.remove(&id) {
-            self.collapsed_folders.insert(id);
+    fn toggle_folder_expanded(&mut self, id: FolderId, cx: &mut Context<Self>) {
+        if !self.expanded_folders.remove(&id) {
+            self.expanded_folders.insert(id);
         }
+        self.persist_tree_view_state();
         cx.notify();
     }
 
-    fn toggle_collection_collapsed(&mut self, id: CollectionId, cx: &mut Context<Self>) {
-        if !self.collapsed_collections.remove(&id) {
-            self.collapsed_collections.insert(id);
+    fn toggle_collection_expanded(&mut self, id: CollectionId, cx: &mut Context<Self>) {
+        if !self.expanded_collections.remove(&id) {
+            self.expanded_collections.insert(id);
         }
+        self.persist_tree_view_state();
         cx.notify();
     }
 
@@ -401,8 +445,8 @@ impl ApiClientPanel {
 
     fn confirm_selected(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_entity {
-            Some(SelectedEntity::Folder(id)) => self.toggle_folder_collapsed(id, cx),
-            Some(SelectedEntity::Collection(id)) => self.toggle_collection_collapsed(id, cx),
+            Some(SelectedEntity::Folder(id)) => self.toggle_folder_expanded(id, cx),
+            Some(SelectedEntity::Collection(id)) => self.toggle_collection_expanded(id, cx),
             Some(SelectedEntity::Request(id)) => self.open_request(id, window, cx),
             None => {}
         }
@@ -455,11 +499,11 @@ impl ApiClientPanel {
 
     fn collapse_selected(&mut self, cx: &mut Context<Self>) {
         match self.selected_entity {
-            Some(SelectedEntity::Folder(id)) if !self.collapsed_folders.contains(&id) => {
-                self.toggle_folder_collapsed(id, cx);
+            Some(SelectedEntity::Folder(id)) if self.expanded_folders.contains(&id) => {
+                self.toggle_folder_expanded(id, cx);
             }
-            Some(SelectedEntity::Collection(id)) if !self.collapsed_collections.contains(&id) => {
-                self.toggle_collection_collapsed(id, cx);
+            Some(SelectedEntity::Collection(id)) if self.expanded_collections.contains(&id) => {
+                self.toggle_collection_expanded(id, cx);
             }
             _ => {}
         }
@@ -467,11 +511,11 @@ impl ApiClientPanel {
 
     fn expand_selected(&mut self, cx: &mut Context<Self>) {
         match self.selected_entity {
-            Some(SelectedEntity::Folder(id)) if self.collapsed_folders.contains(&id) => {
-                self.toggle_folder_collapsed(id, cx);
+            Some(SelectedEntity::Folder(id)) if !self.expanded_folders.contains(&id) => {
+                self.toggle_folder_expanded(id, cx);
             }
-            Some(SelectedEntity::Collection(id)) if self.collapsed_collections.contains(&id) => {
-                self.toggle_collection_collapsed(id, cx);
+            Some(SelectedEntity::Collection(id)) if !self.expanded_collections.contains(&id) => {
+                self.toggle_collection_expanded(id, cx);
             }
             _ => {}
         }
@@ -1396,7 +1440,7 @@ impl ApiClientPanel {
                     children,
                 } => {
                     let collection_id = collection.id;
-                    let is_collapsed = self.collapsed_collections.contains(&collection_id);
+                    let is_collapsed = !self.expanded_collections.contains(&collection_id);
                     let is_selected =
                         self.selected_entity == Some(SelectedEntity::Collection(collection_id));
                     let panel = cx.entity();
@@ -1404,6 +1448,9 @@ impl ApiClientPanel {
                         .id(ElementId::from(SharedString::from(format!(
                             "api-client-collection-row-{collection_id}"
                         ))))
+                        .debug_selector(move || {
+                            format!("api-client-collection-row-{collection_id}")
+                        })
                         .w_full()
                         .pl(px(8. + depth as f32 * 16.))
                         .py_1()
@@ -1424,7 +1471,7 @@ impl ApiClientPanel {
                         .child(Label::new(collection.name.clone()).size(LabelSize::Small))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Collection(collection_id));
-                            this.toggle_collection_collapsed(collection_id, cx);
+                            this.toggle_collection_expanded(collection_id, cx);
                         }));
                     let menu = right_click_menu(ElementId::from(SharedString::from(format!(
                         "api-client-collection-menu-{collection_id}"
@@ -1445,7 +1492,7 @@ impl ApiClientPanel {
                     let folder_id = folder.id;
                     let collection_id = folder.collection_id;
                     let folder_name = folder.name.clone();
-                    let is_collapsed = self.collapsed_folders.contains(&folder_id);
+                    let is_collapsed = !self.expanded_folders.contains(&folder_id);
                     let is_selected =
                         self.selected_entity == Some(SelectedEntity::Folder(folder_id));
                     let is_reparent_target =
@@ -1492,7 +1539,7 @@ impl ApiClientPanel {
                         .child(Label::new(folder.name.clone()).size(LabelSize::Small))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Folder(folder_id));
-                            this.toggle_folder_collapsed(folder_id, cx);
+                            this.toggle_folder_expanded(folder_id, cx);
                         }))
                         .on_drag(DraggedApiItem::Folder(folder_id), {
                             let folder_name = folder_name.clone();
@@ -1932,6 +1979,15 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // Collections start collapsed by default -- expand it first, the same
+        // way a real user would, before the request row is visible at all.
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection_id}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
         let row = debug_center(
             &mut cx,
             format!("api-client-request-row-{request_id}").leak(),
@@ -1974,6 +2030,15 @@ mod tests {
             window.refresh();
             let _ = window.draw(cx);
         });
+        cx.run_until_parked();
+
+        // Collections start collapsed by default -- expand it first, the same
+        // way a real user would, before the request/folder rows are visible.
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection_id}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
         cx.run_until_parked();
 
         let request_source = debug_center(
@@ -2054,9 +2119,30 @@ mod tests {
         });
         let nodes = build_tree(&collections, &folders, &requests);
 
-        let expanded = flatten_navigable_entities(&nodes, &HashSet::new(), &HashSet::new());
+        // Everything starts collapsed by default: an empty expanded set must
+        // only reveal the top-level collection, not its children.
+        let collapsed = flatten_navigable_entities(&nodes, &HashSet::new(), &HashSet::new());
+        assert_eq!(collapsed, vec![SelectedEntity::Collection(collection_id)]);
+
+        let mut expanded_collections = HashSet::new();
+        expanded_collections.insert(collection_id);
+        let collection_expanded_only =
+            flatten_navigable_entities(&nodes, &expanded_collections, &HashSet::new());
         assert_eq!(
-            expanded,
+            collection_expanded_only,
+            vec![
+                SelectedEntity::Collection(collection_id),
+                SelectedEntity::Folder(folder_id),
+                SelectedEntity::Request(top_level_request),
+            ]
+        );
+
+        let mut expanded_folders = HashSet::new();
+        expanded_folders.insert(folder_id);
+        let fully_expanded =
+            flatten_navigable_entities(&nodes, &expanded_collections, &expanded_folders);
+        assert_eq!(
+            fully_expanded,
             vec![
                 SelectedEntity::Collection(collection_id),
                 SelectedEntity::Folder(folder_id),
@@ -2064,17 +2150,27 @@ mod tests {
                 SelectedEntity::Request(top_level_request),
             ]
         );
+    }
 
-        let mut collapsed_folders = HashSet::new();
-        collapsed_folders.insert(folder_id);
-        let collapsed = flatten_navigable_entities(&nodes, &HashSet::new(), &collapsed_folders);
-        assert_eq!(
-            collapsed,
-            vec![
-                SelectedEntity::Collection(collection_id),
-                SelectedEntity::Folder(folder_id),
-                SelectedEntity::Request(top_level_request),
-            ]
+    #[test]
+    fn tree_view_state_round_trips_through_json() {
+        let mut state = TreeViewState::default();
+        state.expanded_collections.insert(CollectionId::new_v4());
+        state.expanded_folders.insert(FolderId::new_v4());
+
+        let json = serde_json::to_vec(&state).unwrap();
+        let reloaded: TreeViewState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(reloaded.expanded_collections, state.expanded_collections);
+        assert_eq!(reloaded.expanded_folders, state.expanded_folders);
+    }
+
+    #[test]
+    fn tree_view_state_defaults_to_nothing_expanded() {
+        let state = TreeViewState::default();
+        assert!(
+            state.expanded_collections.is_empty() && state.expanded_folders.is_empty(),
+            "a fresh (or first-run, no persisted file) TreeViewState must default to \
+             everything collapsed"
         );
     }
 
@@ -2103,6 +2199,11 @@ mod tests {
                 panel.selected_entity,
                 Some(SelectedEntity::Collection(collection_id))
             );
+        });
+        // Collections start collapsed by default -- expand it, the same way
+        // a real user would, before the requests underneath are navigable.
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.expand_selected(cx);
         });
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.select_next(&menu::SelectNext, window, cx);
