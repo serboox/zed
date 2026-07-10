@@ -320,6 +320,8 @@ pub struct RequestView {
     scroll_handle: ScrollHandle,
     environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
     variable_picker_handle: ui::PopoverMenuHandle<ContextMenu>,
+    auto_header_enabled: Vec<bool>,
+    show_auto_headers: bool,
     response_fullscreen: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -592,6 +594,17 @@ impl RequestView {
             scroll_handle: ScrollHandle::new(),
             environment_pin_handle: ui::PopoverMenuHandle::default(),
             variable_picker_handle: ui::PopoverMenuHandle::default(),
+            auto_header_enabled: api_client::AUTO_HEADER_DEFAULTS
+                .iter()
+                .map(|(key, _)| {
+                    !request
+                        .settings
+                        .disabled_auto_headers
+                        .iter()
+                        .any(|name| name.trim().eq_ignore_ascii_case(key))
+                })
+                .collect(),
+            show_auto_headers: true,
             response_fullscreen: false,
             _subscriptions: Vec::new(),
         };
@@ -2017,6 +2030,134 @@ impl RequestView {
             )
     }
 
+    fn toggle_auto_header(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(enabled) = self.auto_header_enabled.get_mut(index) {
+            *enabled = !*enabled;
+        }
+        self.persist_disabled_auto_headers(cx);
+        cx.notify();
+    }
+
+    fn persist_disabled_auto_headers(&self, cx: &mut Context<Self>) {
+        let disabled: Vec<String> = api_client::AUTO_HEADER_DEFAULTS
+            .iter()
+            .zip(self.auto_header_enabled.iter())
+            .filter(|(_, enabled)| !**enabled)
+            .map(|((key, _), _)| key.to_string())
+            .collect();
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.settings.disabled_auto_headers = disabled;
+            });
+        });
+    }
+
+    fn toggle_show_auto_headers(&mut self, cx: &mut Context<Self>) {
+        self.show_auto_headers = !self.show_auto_headers;
+        cx.notify();
+    }
+
+    /// Every currently-enabled auto-generated header's `(key, value)` pair --
+    /// the exact set `build_resolved_request` layers on top of the user's own
+    /// headers at send time (skipping any the user already set explicitly
+    /// under the same name). Test-only: lets tests assert on the enabled set
+    /// without duplicating the zip/filter over `auto_header_enabled`.
+    #[cfg(test)]
+    fn enabled_auto_headers(&self) -> Vec<(String, String)> {
+        api_client::AUTO_HEADER_DEFAULTS
+            .iter()
+            .zip(self.auto_header_enabled.iter())
+            .filter(|(_, enabled)| **enabled)
+            .map(|((key, value), _)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The Postman-parity "auto-generated headers" section: a fixed set of
+    /// headers most HTTP clients send by default, each individually
+    /// toggleable but never editable/removable (unlike the user's own
+    /// headers below), plus two purely informational rows (Content-Length,
+    /// Host) that are never toggleable since they're always computed by the
+    /// HTTP transport from the final body/URL, not sent by us explicitly.
+    fn render_auto_headers(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut section = v_flex().gap_1().child(
+            div()
+                .id("hide-auto-headers-toggle")
+                .debug_selector(|| "hide-auto-headers-toggle".to_string())
+                .cursor_pointer()
+                .child(
+                    Label::new(if self.show_auto_headers {
+                        "Hide auto-generated headers"
+                    } else {
+                        "Show auto-generated headers"
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .on_click(cx.listener(|this, _, _window, cx| this.toggle_show_auto_headers(cx))),
+        );
+        if !self.show_auto_headers {
+            return section;
+        }
+        for (index, (key, value)) in api_client::AUTO_HEADER_DEFAULTS.iter().enumerate() {
+            let enabled = self.auto_header_enabled.get(index).copied().unwrap_or(true);
+            section = section.child(
+                h_flex()
+                    .id(SharedString::from(format!("auto-header-row-{index}")))
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "auto-header-toggle-icon-{index}"
+                            )))
+                            .debug_selector(move || format!("auto-header-toggle-{key}"))
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(if enabled {
+                                    IconName::Check
+                                } else {
+                                    IconName::Close
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_auto_header(index, cx);
+                            })),
+                    )
+                    .child(Label::new(*key).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(*value)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            );
+        }
+        for (key, placeholder) in [
+            ("Content-Length", "<calculated when request is sent>"),
+            ("Host", "<calculated when request is sent>"),
+        ] {
+            section = section.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Disabled),
+                    )
+                    .child(Label::new(key).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(placeholder)
+                            .size(LabelSize::Small)
+                            .color(Color::Disabled),
+                    ),
+            );
+        }
+        section
+    }
+
     fn render_key_value_rows(
         rows: &[KeyValueRow],
         add_label: &'static str,
@@ -2109,15 +2250,18 @@ impl RequestView {
                 cx,
             )
             .into_any_element(),
-            RequestTab::Headers => Self::render_key_value_rows(
-                &self.header_rows,
-                "Add Header",
-                Self::add_header_row,
-                Self::toggle_header_row,
-                Self::remove_header_row,
-                cx,
-            )
-            .into_any_element(),
+            RequestTab::Headers => v_flex()
+                .gap_2()
+                .child(self.render_auto_headers(cx))
+                .child(Self::render_key_value_rows(
+                    &self.header_rows,
+                    "Add Header",
+                    Self::add_header_row,
+                    Self::toggle_header_row,
+                    Self::remove_header_row,
+                    cx,
+                ))
+                .into_any_element(),
             RequestTab::Body => {
                 let body_kind = self.body_kind;
                 let content_type = self.body_content_type;
@@ -4209,6 +4353,50 @@ mod tests {
         view.read_with(&cx, |view, cx| {
             let text = view.body_editor.read(cx).text(cx);
             assert_eq!(text, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3\n  ]\n}");
+        });
+    }
+
+    #[gpui::test]
+    async fn unchecking_an_auto_header_removes_it_from_enabled_auto_headers_and_persists(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, _window, cx| {
+            view.active_tab = RequestTab::Headers;
+            cx.notify();
+        });
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                view.enabled_auto_headers()
+                    .iter()
+                    .any(|(key, _)| key == "User-Agent"),
+                "User-Agent is enabled by default"
+            );
+        });
+
+        let toggle = debug_center(&mut cx, "auto-header-toggle-User-Agent");
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                !view
+                    .enabled_auto_headers()
+                    .iter()
+                    .any(|(key, _)| key == "User-Agent"),
+                "unchecking the row must drop it from the set `build_resolved_request` layers onto the request"
+            );
+        });
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.settings.disabled_auto_headers,
+                vec!["User-Agent".to_string()],
+                "the toggle must persist to the store so it survives across app restarts, \
+                 the same way header_rows does"
+            );
         });
     }
 

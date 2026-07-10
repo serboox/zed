@@ -28,8 +28,8 @@ pub use grpc_descriptor::{
 pub use grpc_reflection::discover_via_reflection;
 pub use history::HistoryEntry;
 pub use http_send::{
-    HttpResponseSummary, ParsedCookie, ResolvedRequest, build_resolved_request, execute,
-    parse_set_cookie_headers,
+    AUTO_HEADER_DEFAULTS, HttpResponseSummary, ParsedCookie, ResolvedRequest,
+    build_resolved_request, execute, parse_set_cookie_headers,
 };
 pub use jwt::sign_jwt;
 pub use oauth2::{

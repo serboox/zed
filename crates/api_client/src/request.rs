@@ -264,6 +264,11 @@ pub struct RequestSettings {
     /// Timeout in milliseconds; `None` means no explicit timeout.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Names (matched case-insensitively) of the default auto-generated
+    /// headers -- see `http_send::AUTO_HEADER_DEFAULTS` -- that this request
+    /// has opted out of sending. Empty means every default is sent.
+    #[serde(default)]
+    pub disabled_auto_headers: Vec<String>,
 }
 
 impl Default for RequestSettings {
@@ -272,6 +277,7 @@ impl Default for RequestSettings {
             follow_redirects: true,
             verify_ssl: true,
             timeout_ms: None,
+            disabled_auto_headers: Vec::new(),
         }
     }
 }

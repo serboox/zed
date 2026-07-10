@@ -14,6 +14,43 @@ pub struct ResolvedRequest {
     pub body: Option<Vec<u8>>,
 }
 
+/// Headers most HTTP clients send by default, in the order they're applied.
+/// `Content-Length` and `Host` are deliberately not in this list -- both are
+/// computed by the HTTP transport itself from the final body/URL, so
+/// treating them as regular send-able headers here would risk the
+/// transport-computed value and a stale one we sent disagreeing.
+pub const AUTO_HEADER_DEFAULTS: &[(&str, &str)] = &[
+    ("Cache-Control", "no-cache"),
+    ("User-Agent", "ZedApiClient/1.0"),
+    ("Accept", "*/*"),
+    ("Accept-Encoding", "gzip, deflate, br"),
+    ("Connection", "keep-alive"),
+];
+
+/// Layers the enabled auto-generated headers (every `AUTO_HEADER_DEFAULTS`
+/// entry not named in `disabled`) onto `headers`, skipping (case- and
+/// whitespace-insensitively) any header already present under the same
+/// name -- a user-defined header always wins over the auto-generated
+/// default. Runs before auth signing so signature-based auth (e.g. AWS
+/// SigV4) covers these headers too, the same as any other header the user
+/// set explicitly.
+fn apply_auto_headers(headers: &mut Vec<(String, String)>, disabled: &[String]) {
+    for (key, value) in AUTO_HEADER_DEFAULTS {
+        let is_disabled = disabled
+            .iter()
+            .any(|name| name.trim().eq_ignore_ascii_case(key));
+        if is_disabled {
+            continue;
+        }
+        let already_present = headers
+            .iter()
+            .any(|(existing_key, _)| existing_key.trim().eq_ignore_ascii_case(key));
+        if !already_present {
+            headers.push((key.to_string(), value.to_string()));
+        }
+    }
+}
+
 /// Applies `resolve` (a `{{token}}` substitution function, typically
 /// `variable_resolution::resolve` bound to a `VariableContext`) to every
 /// user-facing string on `request`, merges enabled query params into the
@@ -38,6 +75,7 @@ pub fn build_resolved_request(
         .filter(|header| header.enabled && !header.key.is_empty())
         .map(|header| (resolve(&header.key), resolve(&header.value)))
         .collect();
+    apply_auto_headers(&mut headers, &request.settings.disabled_auto_headers);
 
     let body = match &request.body {
         RequestBody::Raw { text, .. } if !text.is_empty() => Some(resolve(text).into_bytes()),
@@ -282,8 +320,17 @@ mod tests {
         text.to_string()
     }
 
+    /// A request with every auto-generated default header disabled, so
+    /// existing assertions about `resolved.headers` don't have to account for
+    /// them -- the auto-header behavior itself is covered by the dedicated
+    /// `auto_header_*` tests below.
     fn base_request() -> Request {
-        Request::new(Uuid::new_v4(), "Test".to_string())
+        let mut request = Request::new(Uuid::new_v4(), "Test".to_string());
+        request.settings.disabled_auto_headers = AUTO_HEADER_DEFAULTS
+            .iter()
+            .map(|(key, _)| key.to_string())
+            .collect();
+        request
     }
 
     #[test]
@@ -437,5 +484,94 @@ mod tests {
     fn a_malformed_cookie_without_an_equals_sign_is_skipped() {
         let headers = vec![("Set-Cookie".to_string(), "not-a-valid-cookie".to_string())];
         assert!(parse_set_cookie_headers(&headers).is_empty());
+    }
+
+    #[test]
+    fn every_auto_header_default_is_enabled_when_none_are_disabled() {
+        let mut request = base_request();
+        request.settings.disabled_auto_headers = Vec::new();
+        let resolved = build_resolved_request(&request, &identity);
+        for (key, value) in AUTO_HEADER_DEFAULTS {
+            assert_eq!(
+                resolved
+                    .headers
+                    .iter()
+                    .find(|(existing_key, _)| existing_key == key)
+                    .map(|(_, existing_value)| existing_value.as_str()),
+                Some(*value),
+                "{key} should be sent with its default value"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_auto_header_is_not_sent() {
+        let mut request = base_request();
+        request.settings.disabled_auto_headers = vec!["User-Agent".to_string()];
+        let resolved = build_resolved_request(&request, &identity);
+        assert!(
+            !resolved
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("User-Agent"))
+        );
+        assert!(
+            resolved
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("Accept")),
+            "disabling one default must not disable the others"
+        );
+    }
+
+    #[test]
+    fn a_users_own_header_overrides_the_auto_generated_default_of_the_same_name() {
+        let mut request = base_request();
+        request.settings.disabled_auto_headers = Vec::new();
+        request.headers = vec![Header {
+            key: " user-agent ".into(),
+            value: "MyCustomAgent/2.0".into(),
+            enabled: true,
+            description: None,
+        }];
+        let resolved = build_resolved_request(&request, &identity);
+        let user_agent_headers: Vec<_> = resolved
+            .headers
+            .iter()
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("user-agent"))
+            .collect();
+        assert_eq!(
+            user_agent_headers,
+            vec![&(" user-agent ".to_string(), "MyCustomAgent/2.0".to_string())],
+            "the user's own header (even with surrounding whitespace) must win, with no duplicate added"
+        );
+    }
+
+    #[test]
+    fn auto_headers_are_included_in_the_aws_sigv4_signed_headers_set() {
+        let mut request = base_request();
+        request.settings.disabled_auto_headers = Vec::new();
+        request.url = "https://example.amazonaws.com/data".to_string();
+        request.auth = AuthConfig::AwsSigV4(crate::aws_sigv4::AwsSigV4Config {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: String::new(),
+            region: "us-east-1".to_string(),
+            service: "execute-api".to_string(),
+        });
+        let resolved = build_resolved_request(&request, &identity);
+        let authorization = resolved
+            .headers
+            .iter()
+            .find(|(key, _)| key == "Authorization")
+            .map(|(_, value)| value.clone())
+            .expect("SigV4 auth should add an Authorization header");
+        assert!(
+            authorization.contains("accept")
+                && authorization.contains("cache-control")
+                && authorization.contains("user-agent"),
+            "auto-generated headers must be part of the signed headers set \
+             (added before signing), not appended afterward unsigned: {authorization}"
+        );
     }
 }

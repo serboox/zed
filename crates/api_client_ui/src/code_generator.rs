@@ -45,9 +45,21 @@ mod tests {
     use api_client::{Environment, Header, HttpMethod, RawBodyContentType, RequestBody};
     use uuid::Uuid;
 
+    /// Every auto-generated default header disabled, so a `generate_curl`
+    /// assertion only has to reason about the headers the test itself set --
+    /// auto-header inclusion is covered by `http_send`'s own tests.
+    fn request_with_auto_headers_disabled(name: &str) -> Request {
+        let mut request = Request::new(Uuid::new_v4(), name.to_string());
+        request.settings.disabled_auto_headers = api_client::AUTO_HEADER_DEFAULTS
+            .iter()
+            .map(|(key, _)| key.to_string())
+            .collect();
+        request
+    }
+
     #[test]
     fn a_simple_get_request_becomes_a_one_line_curl_command() {
-        let mut request = Request::new(Uuid::new_v4(), "Ping".to_string());
+        let mut request = request_with_auto_headers_disabled("Ping");
         request.url = "https://api.example.com/ping".to_string();
         let global = Environment::global();
         let ctx = VariableContext {
@@ -61,7 +73,7 @@ mod tests {
 
     #[test]
     fn headers_are_appended_as_separate_flags() {
-        let mut request = Request::new(Uuid::new_v4(), "Ping".to_string());
+        let mut request = request_with_auto_headers_disabled("Ping");
         request.url = "https://api.example.com/ping".to_string();
         request.headers = vec![Header {
             key: "Accept".to_string(),
