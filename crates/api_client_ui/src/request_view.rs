@@ -1132,6 +1132,25 @@ impl RequestView {
         self.persist_headers(cx);
     }
 
+    /// Pretty-prints the Raw body editor's current text in place, matching
+    /// its content type. A no-op (rather than an error) when the text isn't
+    /// well-formed JSON/XML -- reuses the same detection `pretty_print_body`
+    /// already applies to response bodies, so a request body and a response
+    /// body format identically for the same content type.
+    fn format_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.body_editor.read(cx).text(cx);
+        let content_type = content_type_header_value(self.body_content_type);
+        let Some((formatted, _)) =
+            crate::response_view::pretty_print_body(text.as_bytes(), content_type)
+        else {
+            return;
+        };
+        self.body_editor.update(cx, |editor, cx| {
+            editor.set_text(formatted, window, cx);
+        });
+        self.persist_body(cx);
+    }
+
     fn set_auth_kind(&mut self, kind: AuthKind, cx: &mut Context<Self>) {
         self.auth_kind = kind;
         self.persist_auth(cx);
@@ -2036,7 +2055,20 @@ impl RequestView {
                                     cx,
                                 );
                             },
-                        ));
+                        ))
+                        .child(
+                            div()
+                                .id("request-format-body-hitbox")
+                                .debug_selector(|| "request-format-body".to_string())
+                                .child(
+                                    Button::new("request-format-body", "Format")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.format_body(window, cx);
+                                        })),
+                                ),
+                        );
                     let colors = cx.theme().colors();
                     column = column.child(type_row).child(
                         div()
@@ -3966,6 +3998,29 @@ mod tests {
                 content_type_rows[0].value_editor.read(cx).text(cx),
                 "application/xml"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_format_pretty_prints_a_minified_json_body(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, cx);
+            view.set_body_content_type(RawBodyContentType::Json, window, cx);
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text(r#"{"a":1,"b":[2,3]}"#, window, cx);
+            });
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let format_button = debug_center(&mut cx, "request-format-body");
+        cx.simulate_click(format_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let text = view.body_editor.read(cx).text(cx);
+            assert_eq!(text, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3\n  ]\n}");
         });
     }
 
