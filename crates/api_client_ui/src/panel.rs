@@ -4,6 +4,7 @@ use crate::store::{
 };
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{Collection, CollectionId, EnvironmentId, Folder, FolderId, Request, RequestId};
+use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
@@ -196,6 +197,114 @@ fn flatten_navigable_entities(
     flat
 }
 
+fn request_matches_search(request: &Request, query_lowercase: &str) -> bool {
+    request.name.to_lowercase().contains(query_lowercase)
+        || request.url.to_lowercase().contains(query_lowercase)
+}
+
+/// Prunes `nodes` down to requests matching `query` (by name or URL,
+/// case-insensitive) and, if `method_filters` is non-empty, whose method is
+/// one of the active filter chips -- keeping every folder/collection that
+/// either matches by name itself or has at least one matching descendant, so
+/// a match is never hidden behind a collapsed, filtered-out ancestor. Returns
+/// `nodes` unchanged when there is nothing to filter by.
+fn filter_tree(
+    nodes: Vec<TreeNode>,
+    query_lowercase: &str,
+    method_filters: &HashSet<String>,
+) -> Vec<TreeNode> {
+    if query_lowercase.is_empty() && method_filters.is_empty() {
+        return nodes;
+    }
+    nodes
+        .into_iter()
+        .filter_map(|node| match node {
+            TreeNode::Collection {
+                collection,
+                children,
+            } => {
+                let name_matches = collection.name.to_lowercase().contains(query_lowercase);
+                let filtered_children = filter_tree(children, query_lowercase, method_filters);
+                if name_matches || !filtered_children.is_empty() {
+                    Some(TreeNode::Collection {
+                        collection,
+                        children: filtered_children,
+                    })
+                } else {
+                    None
+                }
+            }
+            TreeNode::Folder { folder, children } => {
+                let name_matches = folder.name.to_lowercase().contains(query_lowercase);
+                let filtered_children = filter_tree(children, query_lowercase, method_filters);
+                if name_matches || !filtered_children.is_empty() {
+                    Some(TreeNode::Folder {
+                        folder,
+                        children: filtered_children,
+                    })
+                } else {
+                    None
+                }
+            }
+            TreeNode::Request(request) => {
+                let text_matches =
+                    query_lowercase.is_empty() || request_matches_search(&request, query_lowercase);
+                let method_matches =
+                    method_filters.is_empty() || method_filters.contains(request.method.as_str());
+                (text_matches && method_matches).then_some(TreeNode::Request(request))
+            }
+        })
+        .collect()
+}
+
+/// True when `nodes` (already run through `filter_tree`) contains no
+/// requests at all -- used to tell "the tree is genuinely empty" apart from
+/// "the filter matched nothing" so the two get different empty-state copy.
+fn tree_has_no_requests(nodes: &[TreeNode]) -> bool {
+    nodes.iter().all(|node| match node {
+        TreeNode::Collection { children, .. } | TreeNode::Folder { children, .. } => {
+            tree_has_no_requests(children)
+        }
+        TreeNode::Request(_) => false,
+    })
+}
+
+/// Finds every variable (collection-scoped, environment-scoped, and global)
+/// whose key contains `query_lowercase`, tagged with a human-readable scope
+/// label -- backs the `var:` search-prefix mode.
+fn search_variables(store: &ApiClientStore, query_lowercase: &str) -> Vec<VariableSearchResult> {
+    let mut results = Vec::new();
+    for collection in &store.collections {
+        for variable in &collection.variables {
+            if variable.key.to_lowercase().contains(query_lowercase) {
+                results.push(VariableSearchResult {
+                    key: variable.key.clone().into(),
+                    scope: format!("Collection: {}", collection.name).into(),
+                });
+            }
+        }
+    }
+    for environment in &store.environments {
+        for variable in &environment.variables {
+            if variable.key.to_lowercase().contains(query_lowercase) {
+                results.push(VariableSearchResult {
+                    key: variable.key.clone().into(),
+                    scope: format!("Environment: {}", environment.name).into(),
+                });
+            }
+        }
+    }
+    for variable in &store.global_environment.variables {
+        if variable.key.to_lowercase().contains(query_lowercase) {
+            results.push(VariableSearchResult {
+                key: variable.key.clone().into(),
+                scope: "Global".into(),
+            });
+        }
+    }
+    results
+}
+
 const TREE_VIEW_STATE_FILE: &str = "api_client_tree_view_state.json";
 
 fn tree_view_state_file_path() -> std::path::PathBuf {
@@ -238,7 +347,29 @@ pub struct ApiClientPanel {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     tree_scroll_handle: ScrollHandle,
     drag_target: Option<ApiDropTarget>,
+    search_editor: Entity<Editor>,
+    active_method_filters: HashSet<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The set of HTTP methods offered as quick filter chips in the tree search
+/// bar -- mirrors the method chips already offered in `RequestView`'s method
+/// selector.
+const METHOD_FILTER_CHIPS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+/// A prefix that switches the tree search box from filtering collections/
+/// folders/requests to searching environment/collection/global variable
+/// names instead -- kept as an explicit opt-in rather than merging both
+/// result shapes into one list, since "a request named X" and "a variable
+/// named X" are different enough kinds of match to confuse a unified list.
+const VARIABLE_SEARCH_PREFIX: &str = "var:";
+
+/// One variable match surfaced by a `var:` search, tagged with where it came
+/// from so the result list can show provenance (a variable named the same
+/// thing can exist in more than one scope at once).
+struct VariableSearchResult {
+    key: SharedString,
+    scope: SharedString,
 }
 
 impl EventEmitter<PanelEvent> for ApiClientPanel {}
@@ -254,17 +385,35 @@ impl ApiClientPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, _window, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             let store = cx.new(|cx| ApiClientStore::new(cx));
             cx.set_global(GlobalApiClientStore(store.clone()));
             let focus_handle = cx.focus_handle();
             let workspace_handle = workspace.weak_handle();
+            let search_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(
+                    "Filter collections, requests... (\"var:\" to search variables)",
+                    window,
+                    cx,
+                );
+                editor
+            });
             cx.new(|cx| {
                 let store_subscription = cx.subscribe(
                     &store,
                     |_this: &mut ApiClientPanel,
                      _store: Entity<ApiClientStore>,
                      _event: &ApiClientStoreEvent,
+                     cx: &mut Context<ApiClientPanel>| {
+                        cx.notify();
+                    },
+                );
+                let search_subscription = cx.subscribe(
+                    &search_editor,
+                    |_this: &mut ApiClientPanel,
+                     _editor: Entity<Editor>,
+                     _event: &EditorEvent,
                      cx: &mut Context<ApiClientPanel>| {
                         cx.notify();
                     },
@@ -280,7 +429,9 @@ impl ApiClientPanel {
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     drag_target: None,
-                    _subscriptions: vec![store_subscription],
+                    search_editor,
+                    active_method_filters: HashSet::new(),
+                    _subscriptions: vec![store_subscription, search_subscription],
                 }
             })
         })
@@ -296,7 +447,64 @@ impl ApiClientPanel {
     fn navigable_entities(&self, cx: &Context<Self>) -> Vec<SelectedEntity> {
         let store = self.store.read(cx);
         let nodes = build_tree(&store.collections, &store.folders, &store.requests);
+        let query = self.search_query_text(cx);
+        let nodes = if self.variable_search_query(&query).is_some() {
+            Vec::new()
+        } else {
+            filter_tree(nodes, &query.to_lowercase(), &self.active_method_filters)
+        };
         flatten_navigable_entities(&nodes, &self.expanded_collections, &self.expanded_folders)
+    }
+
+    fn search_query_text(&self, cx: &App) -> String {
+        self.search_editor.read(cx).text(cx)
+    }
+
+    /// Returns the remaining text to search variables by when `query` opts
+    /// into variable-search mode via the `var:` prefix, `None` otherwise.
+    fn variable_search_query<'a>(&self, query: &'a str) -> Option<&'a str> {
+        query
+            .trim_start()
+            .strip_prefix(VARIABLE_SEARCH_PREFIX)
+            .map(|rest| rest.trim())
+    }
+
+    fn toggle_method_filter(&mut self, method: &str, cx: &mut Context<Self>) {
+        if !self.active_method_filters.remove(method) {
+            self.active_method_filters.insert(method.to_string());
+        }
+        cx.notify();
+    }
+
+    fn render_method_filter_chip(
+        &self,
+        method: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let is_active = self.active_method_filters.contains(method);
+        let color = RequestView::method_color_for_label(method);
+        let tint = color.color(cx);
+        div()
+            .id(SharedString::from(format!(
+                "api-client-method-filter-{method}"
+            )))
+            .debug_selector(move || format!("api-client-method-filter-{method}"))
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .when(is_active, |el| el.bg(tint.opacity(0.16)))
+            .when(!is_active, |el| {
+                el.hover(|el| el.bg(cx.theme().colors().element_hover))
+            })
+            .child(
+                Label::new(method)
+                    .size(LabelSize::XSmall)
+                    .color(if is_active { color } else { Color::Muted }),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.toggle_method_filter(method, cx);
+            }))
     }
 
     fn toggle_folder_expanded(&mut self, id: FolderId, cx: &mut Context<Self>) {
@@ -1945,8 +2153,27 @@ impl Render for ApiClientPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let is_empty = store.collections.is_empty();
-        let nodes = build_tree(&store.collections, &store.folders, &store.requests);
-        let tree_elements = self.render_tree_nodes(nodes, 0, cx);
+        let query = self.search_query_text(cx);
+        let query_lowercase = query.to_lowercase();
+        let variable_query = self.variable_search_query(&query).map(str::to_string);
+        let filter_active = !query.trim().is_empty() || !self.active_method_filters.is_empty();
+
+        let (tree_elements, variable_results, no_filter_matches) = if let Some(variable_query) =
+            variable_query.as_deref()
+        {
+            let results = search_variables(store, &variable_query.to_lowercase());
+            let no_matches = results.is_empty();
+            (Vec::new(), Some(results), no_matches)
+        } else {
+            let nodes = build_tree(&store.collections, &store.folders, &store.requests);
+            let filtered_nodes = filter_tree(nodes, &query_lowercase, &self.active_method_filters);
+            let no_matches = filter_active && !is_empty && tree_has_no_requests(&filtered_nodes);
+            (
+                self.render_tree_nodes(filtered_nodes, 0, cx),
+                None,
+                no_matches,
+            )
+        };
         let environment_switcher = self.render_environment_switcher(cx);
 
         v_flex()
@@ -2019,6 +2246,41 @@ impl Render for ApiClientPanel {
                     ),
             )
             .child(
+                v_flex()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .bg(cx.theme().colors().editor_background)
+                            .child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(div().flex_1().child(self.search_editor.clone())),
+                    )
+                    .when(variable_query.is_none(), |el| {
+                        el.child(
+                            h_flex().flex_wrap().gap_1().children(
+                                METHOD_FILTER_CHIPS
+                                    .iter()
+                                    .map(|method| self.render_method_filter_chip(method, cx)),
+                            ),
+                        )
+                    }),
+            )
+            .child(
                 div()
                     .id("api-client-tree")
                     .flex_1()
@@ -2046,7 +2308,42 @@ impl Render for ApiClientPanel {
                                 ),
                         )
                     })
+                    .when(no_filter_matches, |tree| {
+                        tree.child(
+                            v_flex()
+                                .id("api-client-tree-no-results")
+                                .debug_selector(|| "api-client-tree-no-results".to_string())
+                                .p_2()
+                                .gap_1()
+                                .child(
+                                    Label::new(format!("No results for \"{}\"", query.trim()))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .children(tree_elements)
+                    .children(variable_results.map(|results| {
+                        v_flex()
+                            .id("api-client-variable-results")
+                            .debug_selector(|| "api-client-variable-results".to_string())
+                            .p_1()
+                            .gap_0p5()
+                            .children(results.into_iter().map(|result| {
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .px_1()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .child(Label::new(result.key).size(LabelSize::Small))
+                                    .child(
+                                        Label::new(result.scope)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                            }))
+                    }))
                     .custom_scrollbars(
                         Scrollbars::always_visible(ScrollAxes::Both)
                             .tracked_scroll_handle(&self.tree_scroll_handle),
@@ -2176,6 +2473,14 @@ mod tests {
         cx.debug_bounds(selector)
             .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
             .center()
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -2313,6 +2618,162 @@ mod tests {
                 "clicking a request row must open its RequestView in the active pane"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn typing_in_the_search_box_filters_the_tree_to_matching_requests(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let users_request = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "List users".into(), None, cx)
+        });
+        let orders_request = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "List orders".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection_id}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{users_request}").leak())
+                .is_some(),
+            "both requests must be visible before any filter is typed"
+        );
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{orders_request}").leak())
+                .is_some()
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.search_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("orders");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{orders_request}").leak())
+                .is_some(),
+            "the matching request must still render after filtering"
+        );
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{users_request}").leak())
+                .is_none(),
+            "a non-matching request must be filtered out of the rendered tree"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_method_filter_chip_only_shows_requests_with_that_method(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let get_request = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get thing".into(), None, cx)
+        });
+        let post_request = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Post thing".into(), None, cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.update_request(post_request, cx, |request| {
+                request.method = api_client::HttpMethod::Post;
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection_id}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let post_chip = debug_center(&mut cx, "api-client-method-filter-POST");
+        cx.simulate_click(post_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{post_request}").leak())
+                .is_some(),
+            "the POST request must still render once the POST chip is active"
+        );
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-{get_request}").leak())
+                .is_none(),
+            "a GET request must be hidden once only the POST chip is active"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_var_prefix_switches_the_search_box_to_variable_results(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let env_id = store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.update_environment(Some(env_id), cx, |environment| {
+                environment.variables.push(api_client::Variable::new(
+                    "base_url".into(),
+                    "https://staging.example.com".into(),
+                ));
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("api-client-variable-results").is_none(),
+            "variable results must not render before the \"var:\" prefix is typed"
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.search_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("var:base");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("api-client-variable-results").is_some(),
+            "the \"var:\" prefix must switch the search box to variable results"
+        );
     }
 
     #[gpui::test]
