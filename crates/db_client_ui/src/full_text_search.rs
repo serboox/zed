@@ -60,18 +60,46 @@ pub fn is_searchable_column_type(data_type: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
-/// Builds a `SELECT * FROM table WHERE col1 LIKE '%term%' OR col2 LIKE
-/// '%term%' ... LIMIT cap` query over `table`'s searchable columns, quoting
-/// identifiers for `driver` and escaping `%`/`_`/`'` in `term` so the search
-/// term is always matched literally. Returns `None` when `table` has no
-/// searchable columns at all.
-pub fn build_search_sql(
+/// How large a window `build_search_query`'s Cassandra branch scans (as a
+/// multiple of the per-table row cap) before filtering client-side, since
+/// there's no server-side substring filter to rely on there.
+const CASSANDRA_SCAN_MULTIPLIER: usize = 25;
+
+/// Absolute ceiling on the Cassandra scan window, independent of the row
+/// cap, so a large cap can't turn one search into an unbounded table scan.
+const CASSANDRA_MAX_SCAN: usize = 2000;
+
+/// The query to run for one table, plus an optional term to additionally
+/// filter the fetched rows by in the client. `client_filter_term` is set
+/// only for drivers whose query language can't safely push a free-text
+/// filter into the query itself (see the Cassandra branch below).
+pub struct SearchQuery {
+    pub sql: String,
+    pub client_filter_term: Option<String>,
+}
+
+/// Builds the query to run against `table`'s searchable columns for `term`.
+/// Returns `None` when `table` has no searchable columns at all.
+///
+/// For most drivers this is `SELECT * FROM table WHERE col1 LIKE '%term%' OR
+/// col2 LIKE '%term%' ... LIMIT cap`, quoting identifiers for `driver` and
+/// escaping `%`/`_`/`'` in `term` so it's always matched literally.
+///
+/// Cassandra/Scylla get a different query entirely: CQL's `LIKE` only works
+/// against a column with a SASI/SAI text index, which can't be assumed to
+/// exist, and `ALLOW FILTERING` alone does not enable substring matching on
+/// an unindexed column — so pushing a `LIKE ... OR ...` clause into CQL
+/// would fail at execution for most real tables. Instead this scans a
+/// bounded window of the table with no `WHERE` clause at all (always valid
+/// CQL) and returns `client_filter_term` so the caller matches the term
+/// against the fetched rows itself.
+pub fn build_search_query(
     driver: DatabaseDriver,
     table: &str,
     columns: &[ColumnInfo],
     term: &str,
     cap: usize,
-) -> Option<String> {
+) -> Option<SearchQuery> {
     let searchable: Vec<&ColumnInfo> = columns
         .iter()
         .filter(|column| is_searchable_column_type(&column.data_type))
@@ -79,12 +107,21 @@ pub fn build_search_sql(
     if searchable.is_empty() {
         return None;
     }
+    let quoted_table = driver.quote_identifier(table);
+    if driver == DatabaseDriver::Cassandra {
+        let scan_cap = cap
+            .saturating_mul(CASSANDRA_SCAN_MULTIPLIER)
+            .min(CASSANDRA_MAX_SCAN);
+        return Some(SearchQuery {
+            sql: format!("SELECT * FROM {quoted_table} LIMIT {scan_cap} ALLOW FILTERING;"),
+            client_filter_term: Some(term.to_string()),
+        });
+    }
     let escaped_term = term
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
         .replace('\'', "''");
-    let quoted_table = driver.quote_identifier(table);
     let conditions: Vec<String> = searchable
         .iter()
         .map(|column| {
@@ -95,18 +132,53 @@ pub fn build_search_sql(
             )
         })
         .collect();
-    Some(format!(
-        "SELECT * FROM {quoted_table} WHERE {} LIMIT {cap}",
-        conditions.join(" OR ")
-    ))
+    Some(SearchQuery {
+        sql: format!(
+            "SELECT * FROM {quoted_table} WHERE {} LIMIT {cap}",
+            conditions.join(" OR ")
+        ),
+        client_filter_term: None,
+    })
+}
+
+/// Keeps only the rows where at least one of `searchable_columns` contains
+/// `term` (case-insensitive), then caps the result to `cap` rows. Used for
+/// drivers (Cassandra) whose query can't filter by the term itself.
+fn filter_rows_by_term(
+    result: &mut QueryResult,
+    term: &str,
+    searchable_columns: &[String],
+    cap: usize,
+) {
+    let term_lower = term.to_lowercase();
+    let matching_indices: Vec<usize> = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| searchable_columns.contains(name))
+        .map(|(index, _)| index)
+        .collect();
+    result.rows.retain(|row| {
+        matching_indices.iter().any(|&index| {
+            row.get(index)
+                .and_then(|value| value.as_deref())
+                .is_some_and(|value| value.to_lowercase().contains(&term_lower))
+        })
+    });
+    result.rows.truncate(cap);
 }
 
 /// One table's hits: the exact query that found them, so opening the hit in a
 /// full grid re-runs the identical filter rather than re-deriving it.
+/// `client_filter_term`/`searchable_columns` are set alongside `sql` when the
+/// hits were narrowed down client-side (see `build_search_query`), so
+/// re-opening the hit can reapply the same filter to the freshly fetched rows.
 pub struct TableSearchResult {
     pub table: String,
     pub sql: String,
     pub result: QueryResult,
+    pub client_filter_term: Option<String>,
+    pub searchable_columns: Vec<String>,
 }
 
 /// A workspace tab that searches every text-like column of every table in a
@@ -203,13 +275,23 @@ impl FullTextSearchView {
                     store.describe_table(connection_id, database.clone(), table.clone(), cx)
                 });
                 let columns = describe_task.await.log_err().unwrap_or_default();
+                let searchable_columns: Vec<String> = columns
+                    .iter()
+                    .filter(|column| is_searchable_column_type(&column.data_type))
+                    .map(|column| column.name.clone())
+                    .collect();
 
-                let sql =
-                    build_search_sql(driver, &table, &columns, &term, SEARCH_ROW_CAP_PER_TABLE);
-                let outcome = match &sql {
-                    Some(sql) => {
+                let query =
+                    build_search_query(driver, &table, &columns, &term, SEARCH_ROW_CAP_PER_TABLE);
+                let outcome = match &query {
+                    Some(query) => {
                         let query_task = store.update(cx, |store, cx| {
-                            store.execute_query(connection_id, database.clone(), sql.clone(), cx)
+                            store.execute_query(
+                                connection_id,
+                                database.clone(),
+                                query.sql.clone(),
+                                cx,
+                            )
                         });
                         Some(query_task.await)
                     }
@@ -221,10 +303,24 @@ impl FullTextSearchView {
                         return;
                     }
                     view.tables_scanned += 1;
-                    if let (Some(sql), Some(Ok(result))) = (sql, outcome)
-                        && !result.rows.is_empty()
-                    {
-                        view.results.push(TableSearchResult { table, sql, result });
+                    if let (Some(query), Some(Ok(mut result))) = (query, outcome) {
+                        if let Some(term) = &query.client_filter_term {
+                            filter_rows_by_term(
+                                &mut result,
+                                term,
+                                &searchable_columns,
+                                SEARCH_ROW_CAP_PER_TABLE,
+                            );
+                        }
+                        if !result.rows.is_empty() {
+                            view.results.push(TableSearchResult {
+                                table,
+                                sql: query.sql,
+                                result,
+                                client_filter_term: query.client_filter_term,
+                                searchable_columns,
+                            });
+                        }
                     }
                     cx.notify();
                 })
@@ -248,6 +344,8 @@ impl FullTextSearchView {
         let connection_id = self.connection_id;
         let database = self.database.clone();
         let sql = hit.sql.clone();
+        let client_filter_term = hit.client_filter_term.clone();
+        let searchable_columns = hit.searchable_columns.clone();
         let title = SharedString::from(hit.table.clone());
         let task = self.store.update(cx, |store, cx| {
             store.execute_query(connection_id, database, sql, cx)
@@ -261,7 +359,17 @@ impl FullTextSearchView {
             .spawn(cx, async move |cx| {
                 let outcome = task.await;
                 rv.update(cx, |view, cx| match outcome {
-                    Ok(result) => view.set_result(result, cx),
+                    Ok(mut result) => {
+                        if let Some(term) = &client_filter_term {
+                            filter_rows_by_term(
+                                &mut result,
+                                term,
+                                &searchable_columns,
+                                SEARCH_ROW_CAP_PER_TABLE,
+                            );
+                        }
+                        view.set_result(result, cx)
+                    }
                     Err(err) => view.set_error(format_query_error(&err), cx),
                 });
                 workspace
@@ -455,33 +563,114 @@ mod tests {
     }
 
     #[test]
-    fn build_search_sql_quotes_identifiers_and_escapes_the_term_per_driver() {
+    fn build_search_query_quotes_identifiers_and_escapes_the_term_per_driver() {
         let columns = vec![column("name", "varchar(255)"), column("age", "int")];
-        let sql = build_search_sql(DatabaseDriver::PostgreSQL, "users", &columns, "O'Brien", 20)
-            .expect("a text column exists so a query must be built");
+        let query =
+            build_search_query(DatabaseDriver::PostgreSQL, "users", &columns, "O'Brien", 20)
+                .expect("a text column exists so a query must be built");
         assert_eq!(
-            sql,
+            query.sql,
             "SELECT * FROM \"users\" WHERE \"name\" LIKE '%O''Brien%' LIMIT 20"
         );
+        assert!(query.client_filter_term.is_none());
 
-        let sql = build_search_sql(DatabaseDriver::MySQL, "users", &columns, "50%", 20)
+        let query = build_search_query(DatabaseDriver::MySQL, "users", &columns, "50%", 20)
             .expect("a text column exists so a query must be built");
         assert_eq!(
-            sql,
+            query.sql,
             "SELECT * FROM `users` WHERE `name` LIKE '%50\\%%' LIMIT 20"
         );
     }
 
     #[test]
-    fn build_search_sql_returns_none_when_no_column_is_searchable() {
+    fn build_search_query_returns_none_when_no_column_is_searchable() {
         let columns = vec![column("id", "int"), column("created_at", "timestamp")];
-        assert!(build_search_sql(DatabaseDriver::MySQL, "events", &columns, "term", 20).is_none());
+        assert!(
+            build_search_query(DatabaseDriver::MySQL, "events", &columns, "term", 20).is_none()
+        );
     }
 
     #[test]
-    fn build_search_sql_respects_the_row_cap() {
+    fn build_search_query_respects_the_row_cap() {
         let columns = vec![column("name", "text")];
-        let sql = build_search_sql(DatabaseDriver::SQLite, "items", &columns, "x", 7).unwrap();
-        assert!(sql.ends_with("LIMIT 7"));
+        let query = build_search_query(DatabaseDriver::SQLite, "items", &columns, "x", 7).unwrap();
+        assert!(query.sql.ends_with("LIMIT 7"));
+    }
+
+    // Before this fix, Cassandra reused the generic `LIKE ... OR ...` branch,
+    // which CQL rejects outright without a SASI/SAI text index on every
+    // searched column -- an index this code can't assume exists. The fix
+    // must never emit `LIKE` or `OR` for Cassandra, and must ask the caller
+    // to filter client-side instead.
+    #[test]
+    fn build_search_query_for_cassandra_never_emits_like_or_or_and_asks_for_client_filtering() {
+        let columns = vec![column("name", "text"), column("bio", "text")];
+        let query = build_search_query(DatabaseDriver::Cassandra, "users", &columns, "term", 20)
+            .expect("a text column exists so a query must be built");
+        assert!(!query.sql.contains("LIKE"));
+        assert!(!query.sql.contains(" OR "));
+        assert!(query.sql.contains("ALLOW FILTERING"));
+        assert_eq!(query.client_filter_term.as_deref(), Some("term"));
+    }
+
+    #[test]
+    fn build_search_query_for_cassandra_scans_a_bounded_window_larger_than_the_cap() {
+        let columns = vec![column("name", "text")];
+        let query =
+            build_search_query(DatabaseDriver::Cassandra, "users", &columns, "term", 20).unwrap();
+        assert_eq!(
+            query.sql,
+            "SELECT * FROM \"users\" LIMIT 500 ALLOW FILTERING;"
+        );
+    }
+
+    fn result_with_rows(columns: &[&str], rows: Vec<Vec<Option<&str>>>) -> QueryResult {
+        QueryResult {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|v| v.map(str::to_string)).collect())
+                .collect(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn filter_rows_by_term_keeps_only_rows_matching_a_searchable_column_case_insensitively() {
+        let mut result = result_with_rows(
+            &["id", "name"],
+            vec![
+                vec![Some("1"), Some("Alice")],
+                vec![Some("2"), Some("Bob")],
+                vec![Some("3"), Some("ALICIA")],
+            ],
+        );
+        filter_rows_by_term(&mut result, "alic", &["name".to_string()], 20);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Some("Alice".to_string()));
+        assert_eq!(result.rows[1][1], Some("ALICIA".to_string()));
+    }
+
+    #[test]
+    fn filter_rows_by_term_ignores_non_searchable_columns() {
+        let mut result =
+            result_with_rows(&["id", "name"], vec![vec![Some("alic-999"), Some("Bob")]]);
+        filter_rows_by_term(&mut result, "alic", &["name".to_string()], 20);
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn filter_rows_by_term_respects_the_cap() {
+        let mut result = result_with_rows(
+            &["name"],
+            vec![
+                vec![Some("match one")],
+                vec![Some("match two")],
+                vec![Some("match three")],
+            ],
+        );
+        filter_rows_by_term(&mut result, "match", &["name".to_string()], 2);
+        assert_eq!(result.rows.len(), 2);
     }
 }
