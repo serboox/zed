@@ -9134,9 +9134,8 @@ impl DatabasePanel {
                         // A continuous guide line sits under the parent's chevron and runs
                         // down the whole child block, so nesting reads at a glance.
                         let guide_color = cx.theme().colors().border_variant;
-                        let guide_left = px(
-                            TREE_ROW_BASE_INDENT + depth as f32 * TREE_ROW_INDENT_STEP + 6.,
-                        );
+                        let guide_left =
+                            px(TREE_ROW_BASE_INDENT + depth as f32 * TREE_ROW_INDENT_STEP + 6.);
                         elements.push(
                             v_flex()
                                 .child(row)
