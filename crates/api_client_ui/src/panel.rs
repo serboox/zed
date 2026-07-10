@@ -1372,6 +1372,7 @@ impl ApiClientPanel {
                         .id(ElementId::from(SharedString::from(format!(
                             "api-client-request-row-{request_id}"
                         ))))
+                        .debug_selector(move || format!("api-client-request-row-{request_id}"))
                         .w_full()
                         .pl(px(24. + depth as f32 * 16.))
                         .py_1()
@@ -1387,8 +1388,9 @@ impl ApiClientPanel {
                             cx,
                         ))
                         .child(Label::new(request.name.clone()).size(LabelSize::Small))
-                        .on_click(cx.listener(move |this, _, _window, _cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected_entity = Some(SelectedEntity::Request(request_id));
+                            this.open_request(request_id, window, cx);
                         }));
                     let menu = right_click_menu(ElementId::from(SharedString::from(format!(
                         "api-client-request-menu-{request_id}"
@@ -1677,6 +1679,51 @@ mod tests {
                 })
             },
         );
+    }
+
+    fn debug_center(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Point<Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
+            .center()
+    }
+
+    #[gpui::test]
+    async fn clicking_a_request_row_opens_its_request_view(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let row = debug_center(
+            &mut cx,
+            format!("api-client-request-row-{request_id}").leak(),
+        );
+        cx.simulate_click(row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .active_item_as::<crate::request_view::RequestView>(cx)
+                    .is_some(),
+                "clicking a request row must open its RequestView in the active pane"
+            );
+        });
     }
 
     #[gpui::test]
