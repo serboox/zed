@@ -204,6 +204,33 @@ fn content_type_header_value(content_type: RawBodyContentType) -> &'static str {
     }
 }
 
+/// A lightweight, non-blocking well-formedness check for the URL field --
+/// flags a URL that is clearly broken (no scheme and no `{{variable}}` token
+/// that could resolve into one) so the user gets a heads-up before Send
+/// rather than only after a failed round trip. Empty is not malformed: the
+/// user simply hasn't typed anything yet.
+fn url_looks_malformed(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let has_scheme = trimmed.contains("://");
+    let starts_with_variable = trimmed.starts_with("{{");
+    !has_scheme && !starts_with_variable
+}
+
+/// A lightweight, non-blocking JSON well-formedness check for the Raw body
+/// editor when its content type is JSON -- surfaces a heads-up near the
+/// editor rather than only failing after Send. Empty is not invalid: an
+/// empty JSON body is a legitimate (if unusual) request.
+fn json_body_is_invalid(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).is_err()
+}
+
 fn new_single_line_editor(
     placeholder: &'static str,
     initial_value: &str,
@@ -324,6 +351,8 @@ pub struct RequestView {
     auto_header_enabled: Vec<bool>,
     show_auto_headers: bool,
     response_fullscreen: bool,
+    url_looks_malformed: bool,
+    body_json_invalid: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -608,6 +637,8 @@ impl RequestView {
                 .collect(),
             show_auto_headers: true,
             response_fullscreen: false,
+            url_looks_malformed: false,
+            body_json_invalid: false,
             _subscriptions: Vec::new(),
         };
 
@@ -636,12 +667,19 @@ impl RequestView {
 
         this.watch_editor(this.url_editor.clone(), window, cx, |this, editor, cx| {
             let url = editor.read(cx).text(cx);
+            this.url_looks_malformed = url_looks_malformed(&url);
             let request_id = this.request_id;
             this.store.update(cx, |store, cx| {
                 store.update_request(request_id, cx, |request| request.url = url);
             });
         });
-        this.watch_editor(this.body_editor.clone(), window, cx, |this, _, cx| {
+        this.watch_editor(this.body_editor.clone(), window, cx, |this, editor, cx| {
+            if this.body_content_type == RawBodyContentType::Json {
+                let text = editor.read(cx).text(cx);
+                this.body_json_invalid = json_body_is_invalid(&text);
+            } else {
+                this.body_json_invalid = false;
+            }
             this.persist_body(cx);
         });
         this.watch_editor(
@@ -1081,6 +1119,11 @@ impl RequestView {
         self.persist_body(cx);
         self.sync_content_type_header(content_type, window, cx);
         self.sync_body_language(content_type, window, cx);
+        self.body_json_invalid = if content_type == RawBodyContentType::Json {
+            json_body_is_invalid(&self.body_editor.read(cx).text(cx))
+        } else {
+            false
+        };
         cx.notify();
     }
 
@@ -2413,6 +2456,18 @@ impl RequestView {
                             .bg(colors.background)
                             .child(self.body_editor.clone()),
                     );
+                    if self.body_json_invalid {
+                        column = column.child(
+                            div()
+                                .id("request-body-json-warning")
+                                .debug_selector(|| "request-body-json-warning".to_string())
+                                .child(
+                                    Label::new("This body is not valid JSON -- Send may fail or the server may reject it.")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning),
+                                ),
+                        );
+                    }
                 } else {
                     column = column.child(
                         Label::new("This request has no body.")
@@ -3368,6 +3423,17 @@ impl Render for RequestView {
             .w_full()
             .child(div().ml_auto().child(self.render_environment_pin(cx)));
 
+        let url_warning = self.url_looks_malformed.then(|| {
+            div()
+                .id("request-url-warning")
+                .debug_selector(|| "request-url-warning".to_string())
+                .child(
+                    Label::new("This URL has no scheme (e.g. https://) and doesn't start with a {{variable}} -- Send may fail.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                )
+        });
+
         let active_tab = self.active_tab;
         let tab_strip = h_flex()
             .gap_2()
@@ -3462,6 +3528,7 @@ impl Render for RequestView {
             .overflow_scroll()
             .track_scroll(&self.scroll_handle)
             .child(url_row)
+            .when_some(url_warning, |this, warning| this.child(warning))
             .child(environment_row)
             .child(tab_strip)
             .child(div().child(tab_body))
@@ -3726,6 +3793,100 @@ mod tests {
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.url, "https://api.example.com/users");
+        });
+    }
+
+    #[test]
+    fn url_looks_malformed_detects_missing_scheme_and_variable() {
+        assert!(!url_looks_malformed(""));
+        assert!(!url_looks_malformed("   "));
+        assert!(!url_looks_malformed("https://api.example.com/users"));
+        assert!(!url_looks_malformed("{{base_url}}/users"));
+        assert!(url_looks_malformed("api.example.com/users"));
+        assert!(url_looks_malformed("not a url"));
+    }
+
+    #[test]
+    fn json_body_is_invalid_detects_malformed_json() {
+        assert!(!json_body_is_invalid(""));
+        assert!(!json_body_is_invalid("   "));
+        assert!(!json_body_is_invalid(r#"{"a": 1}"#));
+        assert!(!json_body_is_invalid("[1, 2, 3]"));
+        assert!(json_body_is_invalid(r#"{"a": 1"#));
+        assert!(json_body_is_invalid("not json"));
+    }
+
+    #[gpui::test]
+    async fn typing_a_malformed_url_shows_an_inline_warning(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("not a url");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                view.url_looks_malformed,
+                "a schemeless, non-variable URL must be flagged as malformed"
+            );
+        });
+        debug_center(&mut cx, "request-url-warning");
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text("https://api.example.com/users", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                !view.url_looks_malformed,
+                "a well-formed URL must clear the warning"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn typing_invalid_json_in_the_body_shows_an_inline_warning(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, cx);
+            view.set_body_content_type(RawBodyContentType::Json, window, cx);
+            view.active_tab = RequestTab::Body;
+            view.body_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("{ not json");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                view.body_json_invalid,
+                "malformed JSON in a JSON-typed raw body must be flagged"
+            );
+        });
+        debug_center(&mut cx, "request-body-json-warning");
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text(r#"{"ok": true}"#, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(!view.body_json_invalid, "valid JSON must clear the warning");
         });
     }
 
