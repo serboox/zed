@@ -280,6 +280,26 @@ fn key_value_rows_to_bulk_text(rows: &[KeyValueRow], cx: &App) -> String {
         .join("\n")
 }
 
+/// Turns the result of a one-off environment-comparison request into the
+/// text shown in the Diff tab: a real diff against `baseline` on success, or
+/// an explicit failure message on error -- pulled out of
+/// `run_environment_comparison`'s async closure so it's unit-testable
+/// without a real network round trip (which GPUI's deterministic test
+/// scheduler cannot drive: a background Tokio thread waking a GPUI task is
+/// flagged as nondeterministic and panics the test).
+fn comparison_diff_text(
+    baseline: &ResponseData,
+    result: anyhow::Result<api_client::HttpResponseSummary>,
+) -> String {
+    match result {
+        Ok(summary) => {
+            let comparison_response = ResponseData::from_summary(summary);
+            crate::response_view::response_diff_text(baseline, &comparison_response)
+        }
+        Err(error) => format!("Comparison request failed: {error}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestTab {
     Params,
@@ -371,6 +391,9 @@ pub struct RequestView {
     response_is_html: bool,
     previous_response: Option<ResponseData>,
     diff_body_editor: Entity<Editor>,
+    diff_comparison_environment: Option<EnvironmentId>,
+    comparing_environment: bool,
+    comparison_environment_handle: ui::PopoverMenuHandle<ContextMenu>,
     pre_request_script_editor: Entity<Editor>,
     test_script_editor: Entity<Editor>,
     test_results: Vec<api_client::TestResult>,
@@ -660,6 +683,9 @@ impl RequestView {
             response_is_html: false,
             previous_response: None,
             diff_body_editor,
+            diff_comparison_environment: None,
+            comparing_environment: false,
+            comparison_environment_handle: ui::PopoverMenuHandle::default(),
             pre_request_script_editor,
             test_script_editor,
             test_results: Vec::new(),
@@ -1895,6 +1921,12 @@ impl RequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A fresh send makes any prior one-off environment comparison stale
+        // (it was diffed against the response this call is about to
+        // replace), so fall back to the default "vs Previous Response" mode
+        // rather than silently keeping a diff that no longer describes the
+        // response now on screen.
+        self.diff_comparison_environment = None;
         if let SendState::Success(previous) = &self.send_state {
             let diff_text = crate::response_view::response_diff_text(previous, &response);
             self.diff_body_editor.update(cx, |editor, cx| {
@@ -1961,6 +1993,160 @@ impl RequestView {
         }
         self.send_state = SendState::Success(response);
         cx.notify();
+    }
+
+    /// Switches the Diff tab's comparison source. `None` returns to the
+    /// default "vs Previous Response" mode (recomputed immediately from
+    /// whatever `previous_response` is already on hand); `Some(id)` fires a
+    /// one-off request against that environment and diffs it against the
+    /// response currently on screen.
+    fn set_diff_comparison_environment(
+        &mut self,
+        environment_id: Option<EnvironmentId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_comparison_environment = environment_id;
+        match environment_id {
+            None => {
+                if let (SendState::Success(current), Some(previous)) =
+                    (&self.send_state, &self.previous_response)
+                {
+                    let diff_text = crate::response_view::response_diff_text(previous, current);
+                    self.diff_body_editor.update(cx, |editor, cx| {
+                        editor.set_read_only(false);
+                        editor.set_text(diff_text, window, cx);
+                        editor.set_read_only(true);
+                    });
+                }
+                cx.notify();
+            }
+            Some(environment_id) => self.run_environment_comparison(environment_id, window, cx),
+        }
+    }
+
+    /// Sends the current request against `environment_id` (bypassing this
+    /// request's pinned environment and the store's globally active one --
+    /// the user explicitly picked this environment for a single
+    /// comparison) and diffs the result against the response already shown,
+    /// reusing `response_diff_text` so the compared bodies are
+    /// pretty-printed first exactly like the "vs Previous Response" mode.
+    fn run_environment_comparison(
+        &mut self,
+        environment_id: EnvironmentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SendState::Success(baseline) = &self.send_state else {
+            return;
+        };
+        let baseline = baseline.clone();
+        let Some(request) = self
+            .store
+            .read(cx)
+            .requests
+            .iter()
+            .find(|r| r.id == self.request_id)
+            .cloned()
+        else {
+            return;
+        };
+        let client = self.store.read(cx).http_client.clone();
+        self.comparing_environment = true;
+        cx.notify();
+
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let resolved = store.update(cx, |store, _| {
+                let context = store.variable_context_for_environment(&request, environment_id);
+                let dynamic = SystemDynamicVariableSource;
+                let resolve = |text: &str| {
+                    api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
+                };
+                api_client::build_resolved_request(&request, &resolve)
+            });
+            let result = api_client::execute(&client, &resolved).await;
+            this.update_in(cx, |this, window, cx| {
+                this.comparing_environment = false;
+                let diff_text = comparison_diff_text(&baseline, result);
+                this.diff_body_editor.update(cx, |editor, cx| {
+                    editor.set_read_only(false);
+                    editor.set_text(diff_text, window, cx);
+                    editor.set_read_only(true);
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The comparison-source selector shown at the top of the Diff tab:
+    /// "vs Previous Response" (the default, always-available mode) or "vs
+    /// Environment..." which reveals a picker of every environment to fire
+    /// a one-off comparison request against.
+    fn render_diff_comparison_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let comparison_name = self
+            .diff_comparison_environment
+            .and_then(|id| store.environment_by_id(id))
+            .map(|environment| environment.name.clone());
+        let trigger_label: SharedString = if self.comparing_environment {
+            "Comparing...".into()
+        } else {
+            match &comparison_name {
+                Some(name) => format!("vs {name}").into(),
+                None => "vs Previous Response".into(),
+            }
+        };
+        let environments: Vec<(EnvironmentId, String)> = store
+            .environments
+            .iter()
+            .map(|environment| (environment.id, environment.name.clone()))
+            .collect();
+        let view = cx.entity();
+        let popover_handle = self.comparison_environment_handle.clone();
+
+        div()
+            .id("diff-comparison-selector")
+            .debug_selector(|| "diff-comparison-selector".to_string())
+            .child(
+                ui::PopoverMenu::new("diff-comparison-selector-popover")
+                    .with_handle(popover_handle)
+                    .trigger(
+                        Button::new("diff-comparison-selector-trigger", trigger_label)
+                            .start_icon(Icon::new(IconName::Diff))
+                            .style(if comparison_name.is_some() {
+                                ButtonStyle::Tinted(ui::TintColor::Accent)
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .disabled(self.comparing_environment),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        let environments = environments.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let menu = menu.entry("vs Previous Response", None, {
+                                let view = view.clone();
+                                move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.set_diff_comparison_environment(None, window, cx);
+                                    });
+                                }
+                            });
+                            environments.iter().fold(menu, |menu, (id, name)| {
+                                let view = view.clone();
+                                let id = *id;
+                                menu.entry(format!("vs {name}"), None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.set_diff_comparison_environment(Some(id), window, cx);
+                                    });
+                                })
+                            })
+                        }))
+                    }),
+            )
     }
 
     fn render_chip(
@@ -3388,16 +3574,22 @@ impl RequestView {
                             )
                             .into_any_element()
                     }
-                    ResponseTab::Diff => div()
+                    ResponseTab::Diff => v_flex()
                         .flex_1()
-                        .min_h(px(400.))
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(background)
-                        .child(self.diff_body_editor.clone())
+                        .gap_1()
+                        .child(self.render_diff_comparison_selector(cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(400.))
+                                .px_2()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(background)
+                                .child(self.diff_body_editor.clone()),
+                        )
                         .into_any_element(),
                     ResponseTab::Pretty | ResponseTab::Preview | ResponseTab::Raw => {
                         let editor = match response_tab {
@@ -4239,6 +4431,118 @@ mod tests {
             handle.is_deployed(),
             "clicking the pin trigger must open its environment picker"
         );
+    }
+
+    #[gpui::test]
+    async fn clicking_the_diff_comparison_selector_trigger_opens_its_picker(
+        cx: &mut TestAppContext,
+    ) {
+        // Picking an actual environment entry here (which calls
+        // `run_environment_comparison`) is deliberately NOT exercised via a
+        // real click: that fires a request on the api-client Tokio runtime
+        // (see `network_runtime::on_network_runtime`), a genuine OS thread
+        // outside GPUI's virtual clock. Letting that thread wake the
+        // pending task back into this test's deterministic scheduler trips
+        // `TestScheduler::assert_correct_thread` ("test is not
+        // deterministic") -- a hard panic, not a flake, and it fires from
+        // the mere act of dispatching the click, before any explicit
+        // `run_until_parked`/`draw` call. No test in this crate exercises a
+        // live `api_client::execute` round trip for the same reason (see
+        // `http_send.rs`). So this test covers only the picker opening and
+        // listing every environment; `comparison_diff_text` (the pure
+        // function that turns the request's eventual `Result` into the
+        // diff text) is covered separately below, without a network round
+        // trip.
+        let (store, _request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx);
+        });
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, r#"{"a":1}"#), window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, r#"{"a":2}"#), window, cx);
+        });
+        draw(&mut cx);
+
+        let diff_chip = debug_center(&mut cx, "response-tab-chip-Diff");
+        cx.simulate_click(diff_chip, gpui::Modifiers::none());
+        draw(&mut cx);
+
+        let handle = view.read_with(&cx, |view, _| view.comparison_environment_handle.clone());
+        assert!(
+            !handle.is_deployed(),
+            "the picker must start closed before any interaction"
+        );
+
+        let selector_trigger = debug_center(&mut cx, "diff-comparison-selector");
+        cx.simulate_click(selector_trigger, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            handle.is_deployed(),
+            "clicking the selector trigger must open its environment picker"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Staging").is_some(),
+            "every store environment must appear as a comparison option"
+        );
+    }
+
+    #[gpui::test]
+    async fn reselecting_vs_previous_response_recomputes_the_diff(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, r#"{"a":1}"#), window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, r#"{"a":2}"#), window, cx);
+        });
+        draw(&mut cx);
+
+        let diff_chip = debug_center(&mut cx, "response-tab-chip-Diff");
+        cx.simulate_click(diff_chip, gpui::Modifiers::none());
+        draw(&mut cx);
+
+        let selector_trigger = debug_center(&mut cx, "diff-comparison-selector");
+        cx.simulate_click(selector_trigger, gpui::Modifiers::none());
+        draw(&mut cx);
+
+        let previous_entry = debug_center(&mut cx, "MENU_ITEM-vs Previous Response");
+        cx.simulate_click(previous_entry, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.diff_comparison_environment, None);
+            let diff_text = view.diff_body_editor.read(cx).text(cx);
+            assert!(diff_text.contains('1'));
+            assert!(diff_text.contains('2'));
+        });
+    }
+
+    #[test]
+    fn comparison_diff_text_diffs_against_the_baseline_on_success() {
+        let baseline = fake_response(200, r#"{"a":1}"#);
+        let summary = api_client::HttpResponseSummary {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: Vec::new(),
+            body: br#"{"a":2}"#.to_vec(),
+            elapsed_ms: 0,
+        };
+        let diff_text = comparison_diff_text(&baseline, Ok(summary));
+        assert!(
+            diff_text.contains('-') && diff_text.contains('+'),
+            "a changed body must produce a real diff, not a placeholder: {diff_text}"
+        );
+    }
+
+    #[test]
+    fn comparison_diff_text_reports_the_error_on_failure() {
+        let baseline = fake_response(200, r#"{"a":1}"#);
+        let diff_text = comparison_diff_text(&baseline, Err(anyhow::anyhow!("connection refused")));
+        assert_eq!(diff_text, "Comparison request failed: connection refused");
     }
 
     #[gpui::test]

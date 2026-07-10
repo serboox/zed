@@ -1114,6 +1114,27 @@ impl ApiClientStore {
         }
     }
 
+    /// Same as `variable_context_for`, but resolves against an explicitly
+    /// chosen environment instead of the request's pinned/active one --
+    /// used by the response-diff tab's "compare against another
+    /// environment" mode, where the user picks a one-off environment for a
+    /// single comparison request without changing what the request would
+    /// normally resolve against.
+    pub fn variable_context_for_environment(
+        &self,
+        request: &Request,
+        environment_id: EnvironmentId,
+    ) -> api_client::VariableContext<'_> {
+        api_client::VariableContext {
+            environment: self.environment_by_id(environment_id),
+            collection: self
+                .collections
+                .iter()
+                .find(|c| c.id == request.collection_id),
+            global: &self.global_environment,
+        }
+    }
+
     /// Adds a whole imported collection (its folders and requests included)
     /// as brand-new tree entries. Used by both the cURL-paste importer
     /// (a synthetic one-request collection) and the Postman Collection v2.1
@@ -1403,6 +1424,56 @@ mod tests {
         store.read_with(cx, |store, _| {
             let effective = store.effective_environment_for(&unpinned_request).unwrap();
             assert_eq!(effective.id, production_id);
+        });
+    }
+
+    /// The Diff tab's "vs Environment" comparison must resolve against
+    /// whichever environment the user explicitly picked for that one-off
+    /// comparison -- never silently falling back to the request's own
+    /// pinned environment or the store's globally active one, which would
+    /// make the comparison compare the wrong thing without any visible
+    /// indication of the mistake.
+    #[gpui::test]
+    fn variable_context_for_environment_ignores_the_pinned_and_active_environment(
+        cx: &mut TestAppContext,
+    ) {
+        let store = new_store(cx);
+        let staging_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let production_id = store.update(cx, |store, cx| {
+            store.create_environment("Production".into(), cx)
+        });
+        let comparison_id = store.update(cx, |store, cx| {
+            store.create_environment("Comparison".into(), cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_environment(Some(staging_id), cx, |environment| {
+                environment.variables.push(api_client::Variable::new(
+                    "base_url".into(),
+                    "https://staging.example.com".into(),
+                ));
+            });
+            store.update_environment(Some(comparison_id), cx, |environment| {
+                environment.variables.push(api_client::Variable::new(
+                    "base_url".into(),
+                    "https://comparison.example.com".into(),
+                ));
+            });
+            store.set_active_environment(Some(production_id), cx);
+        });
+
+        let collection = api_client::Collection::new("Sample".into());
+        let mut request = api_client::Request::new(collection.id, "Get users".into());
+        request.pinned_environment_id = Some(staging_id);
+
+        store.read_with(cx, |store, _| {
+            let context = store.variable_context_for_environment(&request, comparison_id);
+            assert_eq!(
+                context.environment.map(|environment| environment.id),
+                Some(comparison_id),
+                "the explicitly picked comparison environment must win over both the pinned and active environment"
+            );
         });
     }
 
