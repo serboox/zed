@@ -604,6 +604,104 @@ const MONGO_SHELL_METHODS: &[&str] = &[
     "countDocuments",
 ];
 
+// A curated set of the most frequently used Redis commands, offered as
+// completion candidates. Unlike `MONGO_SHELL_METHODS`, this is not an
+// exhaustive "supported" list -- `RedisProvider::execute_query` forwards any
+// command name straight to the `redis` crate, so an unlisted command still
+// works, it just won't be suggested.
+const REDIS_COMMANDS: &[&str] = &[
+    "GET",
+    "SET",
+    "DEL",
+    "EXISTS",
+    "EXPIRE",
+    "TTL",
+    "PERSIST",
+    "TYPE",
+    "KEYS",
+    "SCAN",
+    "INCR",
+    "DECR",
+    "APPEND",
+    "STRLEN",
+    "MGET",
+    "MSET",
+    "HGET",
+    "HSET",
+    "HGETALL",
+    "HDEL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HEXISTS",
+    "LPUSH",
+    "RPUSH",
+    "LPOP",
+    "RPOP",
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "SADD",
+    "SREM",
+    "SMEMBERS",
+    "SISMEMBER",
+    "SCARD",
+    "SUNION",
+    "SINTER",
+    "SDIFF",
+    "ZADD",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZSCORE",
+    "ZRANK",
+    "ZCARD",
+    "ZCOUNT",
+    "ZREM",
+    "RENAME",
+    "COPY",
+    "DUMP",
+    "RESTORE",
+    "OBJECT",
+    "DBSIZE",
+    "FLUSHDB",
+    "PING",
+    "ECHO",
+];
+
+/// Redis commands (`COMMAND key [args...]`) are whitespace-tokenized, not
+/// SQL, so the SQL-shaped `ParsedContext`/keyword tables above don't apply.
+/// This offers command names at the start of a statement, and known key
+/// names (from the connection's schema snapshot) right after the command.
+fn redis_completions(text_before: &str, schema: &SchemaSnapshot) -> Vec<CandidateItem> {
+    let statement = current_statement(text_before).trim_start();
+    match statement.split_once(char::is_whitespace) {
+        None => REDIS_COMMANDS
+            .iter()
+            .map(|command| CandidateItem {
+                text: (*command).to_string(),
+                kind: ItemKind::Function,
+                detail: None,
+            })
+            .collect(),
+        Some((_, after_command)) => {
+            let key_part = after_command.trim_start();
+            if key_part.contains(char::is_whitespace) {
+                // Already past the first argument -- no more suggestions.
+                return Vec::new();
+            }
+            schema
+                .tables
+                .iter()
+                .map(|(name, _)| CandidateItem {
+                    text: name.clone(),
+                    kind: ItemKind::Table,
+                    detail: None,
+                })
+                .collect()
+        }
+    }
+}
+
 /// MongoDB shell queries (`db.<collection>.<method>(...)`) are JS
 /// method-chaining, not SQL, so the SQL-shaped `ParsedContext`/keyword tables
 /// above don't apply. This offers collection names right after `db.` and
@@ -645,6 +743,9 @@ fn build_candidates(
 ) -> Vec<CandidateItem> {
     if driver == DatabaseDriver::MongoDB {
         return mongo_completions(text_before, schema);
+    }
+    if driver == DatabaseDriver::Redis {
+        return redis_completions(text_before, schema);
     }
 
     let mut items: Vec<CandidateItem> = Vec::new();
@@ -1253,6 +1354,45 @@ mod tests {
             build_candidates(&context, &schema, DatabaseDriver::MongoDB, "SELECT * FROM ")
                 .is_empty(),
             "text that isn't a `db.` shell command has nothing sensible to suggest"
+        );
+    }
+
+    // Redis commands (`GET key`, `HGETALL key`, ...) are whitespace-tokenized,
+    // not SQL; before this fix Redis connections got the exact same SQL
+    // keyword/table suggestions as every other driver, which is nonsensical
+    // outside of a `COMMAND key` shape.
+    #[test]
+    fn redis_suggests_commands_then_keys_then_nothing_further() {
+        let schema = sample_schema();
+        let context = ctx("");
+
+        let command_items = build_candidates(&context, &schema, DatabaseDriver::Redis, "");
+        assert!(
+            command_items
+                .iter()
+                .any(|i| i.text == "GET" && i.kind == ItemKind::Function),
+            "an empty statement should suggest Redis command names"
+        );
+        assert!(
+            !command_items.iter().any(|i| i.kind == ItemKind::Keyword),
+            "Redis must not get SQL keyword suggestions"
+        );
+
+        let key_items = build_candidates(&context, &schema, DatabaseDriver::Redis, "GET ");
+        assert!(
+            key_items
+                .iter()
+                .any(|i| i.text == "users" && i.kind == ItemKind::Table),
+            "typing `GET ` should suggest known key names"
+        );
+        assert!(
+            !key_items.iter().any(|i| i.kind == ItemKind::Function),
+            "command names must not be suggested once a command is already chosen"
+        );
+
+        assert!(
+            build_candidates(&context, &schema, DatabaseDriver::Redis, "GET users ").is_empty(),
+            "there is nothing sensible to suggest past a command's first argument"
         );
     }
 
