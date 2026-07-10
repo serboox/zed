@@ -7109,30 +7109,33 @@ impl DatabasePanel {
             )
             .child(self.render_selection_action_bar(cx))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .border_t_1()
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(div().flex_1().child(self.table_filter_editor.clone()))
-                    .child(
-                        IconButton::new("table-filter-regex", IconName::Regex)
-                            .icon_size(IconSize::XSmall)
-                            .toggle_state(self.table_filter_is_regex)
-                            .tooltip(Tooltip::text("Match table names by regular expression"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.table_filter_is_regex = !this.table_filter_is_regex;
-                                cx.notify();
-                            })),
-                    ),
+                div().px_2().py_1().border_t_1().child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            Icon::new(IconName::MagnifyingGlass)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1().child(self.table_filter_editor.clone()))
+                        .child(
+                            IconButton::new("table-filter-regex", IconName::Regex)
+                                .icon_size(IconSize::XSmall)
+                                .toggle_state(self.table_filter_is_regex)
+                                .tooltip(Tooltip::text("Match table names by regular expression"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.table_filter_is_regex = !this.table_filter_is_regex;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             )
     }
 
@@ -7356,12 +7359,18 @@ impl DatabasePanel {
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
+                        h_flex()
+                            .flex_1()
+                            .items_baseline()
+                            .gap_1()
+                            .overflow_hidden()
                             .child(Label::new(label).size(LabelSize::Small).single_line())
-                            .child(Label::new(driver_label).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(
+                                Label::new(driver_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
                     ),
             )
             .when_some(error_message, |el, msg| {
@@ -14609,6 +14618,87 @@ mod tests {
                 "the unselected connection A must be left untouched, got {labels:?}"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn the_connection_row_is_a_single_compact_line_not_a_stacked_label_and_caption(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "compact-row-test".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace
+            .update_in(&mut cx, |_, window, cx| {
+                cx.spawn_in(
+                    window,
+                    async move |workspace_handle, cx: &mut AsyncWindowContext| {
+                        DatabasePanel::load(workspace_handle, cx.clone()).await
+                    },
+                )
+            })
+            .await
+            .expect("DatabasePanel::load must succeed");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        let folder_id = panel.update(&mut cx, |panel, cx| {
+            let folder_id = panel
+                .store
+                .update(cx, |store, cx| {
+                    store.add_folder("reference-folder".into(), None, cx)
+                })
+                .expect("add_folder must succeed for a top-level folder");
+            panel.store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+            panel.collapsed_folders.clear();
+            panel.collapsed_connections.clear();
+            folder_id
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        // The folder row is an established single line (chevron + folder icon +
+        // label). A connection row that still stacks its driver caption under
+        // the label would be noticeably taller than this baseline; a genuinely
+        // single-line row (icon + label + inline driver caption) stays close to
+        // it, regardless of the exact pixel values the current theme/font
+        // resolves to.
+        let folder_bounds = cx
+            .debug_bounds(format!("folder-row-{folder_id}").leak())
+            .expect("expected debug bounds for the reference folder row");
+        let conn_bounds = cx
+            .debug_bounds(format!("conn-header-{connection_id}").leak())
+            .expect("expected debug bounds for conn-header");
+
+        assert!(
+            f32::from(conn_bounds.size.height) <= f32::from(folder_bounds.size.height) * 1.5,
+            "connection row height {:?} must stay close to the single-line folder row height {:?} \
+             (a two-line stacked label+caption row would be roughly 2x taller)",
+            conn_bounds.size.height,
+            folder_bounds.size.height,
+        );
     }
 
     #[gpui::test]
