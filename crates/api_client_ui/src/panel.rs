@@ -1376,8 +1376,10 @@ impl ApiClientPanel {
                 })
                 .entry("Copy as cURL", None, {
                     let panel = panel.clone();
-                    move |_window, cx| {
-                        panel.update(cx, |panel, cx| panel.copy_request_as_curl(request_id, cx));
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.copy_request_as_curl(request_id, window, cx)
+                        });
                     }
                 })
                 .separator()
@@ -1403,14 +1405,32 @@ impl ApiClientPanel {
         });
     }
 
-    fn copy_request_as_curl(&self, request_id: RequestId, cx: &mut Context<Self>) {
+    fn copy_request_as_curl(
+        &self,
+        request_id: RequestId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.read(cx);
         let Some(request) = store.requests.iter().find(|r| r.id == request_id) else {
             return;
         };
         let context = store.variable_context_for(request);
         let curl = crate::code_generator::generate_curl(request, &context);
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(curl));
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let languages = workspace.read(cx).app_state().languages.clone();
+        let language_task = languages.language_for_name("Shell Script");
+        cx.spawn_in(window, async move |_, cx| {
+            let language = language_task.await.log_err();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    crate::request_view::CurlPreviewModal::new(curl, language, window, cx)
+                });
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     /// Whether `collection_id` can move up/down among all top-level

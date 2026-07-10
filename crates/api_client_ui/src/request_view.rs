@@ -1291,7 +1291,11 @@ impl RequestView {
         });
     }
 
-    fn copy_as_curl(&self, cx: &mut Context<Self>) {
+    /// Opens a preview dialog showing the generated `curl` command with
+    /// shell syntax highlighting, so the author can look it over before
+    /// deciding whether to copy it -- rather than silently placing it on
+    /// the clipboard the instant the button is clicked.
+    fn copy_as_curl(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(request) = self
             .store
             .read(cx)
@@ -1305,7 +1309,20 @@ impl RequestView {
         let store = self.store.read(cx);
         let context = store.variable_context_for(&request);
         let curl = crate::code_generator::generate_curl(&request, &context);
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(curl));
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let languages = workspace.read(cx).app_state().languages.clone();
+        let language_task = languages.language_for_name("Shell Script");
+        cx.spawn_in(window, async move |_, cx| {
+            let language = language_task.await.log_err();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    CurlPreviewModal::new(curl, language, window, cx)
+                });
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3005,7 +3022,9 @@ impl Render for RequestView {
                     .child(
                         Button::new("request-copy-curl", "Copy as cURL")
                             .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, _window, cx| this.copy_as_curl(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.copy_as_curl(window, cx)),
+                            ),
                     ),
             )
             .child({
@@ -3129,6 +3148,91 @@ impl Render for RequestView {
                 cx,
             )
             .into_any_element()
+    }
+}
+
+/// A read-only-in-spirit preview of a generated `curl` command, shown with
+/// shell syntax highlighting so the author can look it over before deciding
+/// whether to copy it -- the "Copy" button copies whatever text is currently
+/// in the editor, so an author who tweaks the command before copying gets
+/// their edited version, not the original.
+pub(crate) struct CurlPreviewModal {
+    focus_handle: FocusHandle,
+    pub(crate) curl_editor: Entity<Editor>,
+}
+
+impl CurlPreviewModal {
+    pub(crate) fn new(
+        curl: String,
+        language: Option<Arc<language::Language>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let curl_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_text(curl, window, cx);
+            editor
+        });
+        if let Some(language) = language {
+            if let Some(buffer) = curl_editor.read(cx).buffer().read(cx).as_singleton() {
+                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+            }
+        }
+        Self {
+            focus_handle: cx.focus_handle(),
+            curl_editor,
+        }
+    }
+
+    fn copy(&self, cx: &mut Context<Self>) {
+        let text = self.curl_editor.read(cx).text(cx);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+}
+
+impl EventEmitter<gpui::DismissEvent> for CurlPreviewModal {}
+impl workspace::ModalView for CurlPreviewModal {}
+
+impl Focusable for CurlPreviewModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for CurlPreviewModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CurlPreviewModal")
+            .track_focus(&self.focus_handle)
+            .w(px(640.))
+            .p_3()
+            .gap_3()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(Label::new("Copy as cURL").size(LabelSize::Large))
+            .child(
+                div()
+                    .id("curl-preview-editor-hitbox")
+                    .max_h(px(320.))
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.curl_editor.clone()),
+            )
+            .child(
+                h_flex().justify_end().gap_2().child(
+                    Button::new("curl-preview-copy", "Copy")
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.copy(cx);
+                            cx.emit(gpui::DismissEvent);
+                        })),
+                ),
+            )
     }
 }
 
@@ -3532,10 +3636,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_copy_as_curl_puts_the_generated_command_on_the_clipboard(
+    async fn clicking_copy_as_curl_opens_a_preview_and_its_copy_button_puts_the_command_on_the_clipboard(
         cx: &mut TestAppContext,
     ) {
-        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
         store.update(&mut cx, |store, cx| {
             store.update_request(request_id, cx, |request| {
                 request.url = "https://api.example.com/ping".to_string();
@@ -3547,10 +3651,31 @@ mod tests {
         cx.simulate_click(copy_button, gpui::Modifiers::none());
         cx.run_until_parked();
 
+        assert!(
+            cx.read_from_clipboard().is_none(),
+            "clicking Copy as cURL must open a preview, not copy immediately"
+        );
+
+        let workspace = view
+            .read_with(&cx, |view, _| view.workspace.clone())
+            .upgrade()
+            .expect("the workspace should still be alive");
+        let modal = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_modal::<CurlPreviewModal>(cx)
+            })
+            .expect("Copy as cURL should open a preview modal");
+        let preview_text = modal.read_with(&cx, |modal, cx| modal.curl_editor.read(cx).text(cx));
+        assert!(preview_text.contains("curl --request GET"));
+        assert!(preview_text.contains("https://api.example.com/ping"));
+
+        modal.update_in(&mut cx, |modal, _window, cx| modal.copy(cx));
+        cx.run_until_parked();
+
         let clipboard_text = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
-            .expect("Copy as cURL should place text on the clipboard");
+            .expect("the preview's Copy button should place text on the clipboard");
         assert!(clipboard_text.contains("curl --request GET"));
         assert!(clipboard_text.contains("https://api.example.com/ping"));
     }
