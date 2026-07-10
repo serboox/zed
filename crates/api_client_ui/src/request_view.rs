@@ -226,6 +226,60 @@ struct KeyValueRow {
     enabled: bool,
 }
 
+/// Parses Postman-style Bulk Edit text, one row per line: `key: value` is an
+/// enabled row; `//key: value` is the same row disabled (commented out, not
+/// deleted -- toggling Bulk Edit off and back on preserves it); a `//` line
+/// whose remainder has no `:` is a free-form note the user left for
+/// themselves and is never sent -- it's intentionally dropped here, since the
+/// key-value row view this feeds has no place to show a bare comment.
+/// Blank lines are ignored.
+fn parse_bulk_key_value_text(text: &str) -> Vec<(String, String, bool)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (enabled, content) = match trimmed.strip_prefix("//") {
+            Some(rest) => (false, rest),
+            None => (true, trimmed),
+        };
+        let Some((key, value)) = content.split_once(':') else {
+            continue;
+        };
+        // A key that legitimately starts with `//` was escaped with a
+        // leading `\` by `key_value_rows_to_bulk_text` so it isn't mistaken
+        // for the disabled-row marker above; undo that escape here.
+        let key = key.trim().strip_prefix('\\').unwrap_or(key.trim());
+        rows.push((key.to_string(), value.trim().to_string(), enabled));
+    }
+    rows
+}
+
+/// The inverse of `parse_bulk_key_value_text`: renders each row as
+/// `key: value`, prefixed with `//` when disabled. A key that itself starts
+/// with `//` is escaped with a leading `\` so it round-trips instead of
+/// being mistaken for the disabled-row marker.
+fn key_value_rows_to_bulk_text(rows: &[KeyValueRow], cx: &App) -> String {
+    rows.iter()
+        .map(|row| {
+            let key = row.key_editor.read(cx).text(cx);
+            let key = if key.starts_with("//") {
+                format!("\\{key}")
+            } else {
+                key
+            };
+            let value = row.value_editor.read(cx).text(cx);
+            if row.enabled {
+                format!("{key}: {value}")
+            } else {
+                format!("//{key}: {value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestTab {
     Params,
@@ -274,6 +328,10 @@ pub struct RequestView {
     url_editor: Entity<Editor>,
     param_rows: Vec<KeyValueRow>,
     header_rows: Vec<KeyValueRow>,
+    params_bulk_edit: bool,
+    headers_bulk_edit: bool,
+    param_bulk_editor: Entity<Editor>,
+    header_bulk_editor: Entity<Editor>,
     body_kind: BodyKind,
     body_content_type: RawBodyContentType,
     body_editor: Entity<Editor>,
@@ -537,6 +595,17 @@ impl RequestView {
             editor
         });
 
+        let param_bulk_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_placeholder_text("key: value, one per line", window, cx);
+            editor
+        });
+        let header_bulk_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_placeholder_text("key: value, one per line", window, cx);
+            editor
+        });
+
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             request_id: request.id,
@@ -548,6 +617,10 @@ impl RequestView {
             url_editor,
             param_rows: Vec::new(),
             header_rows: Vec::new(),
+            params_bulk_edit: false,
+            headers_bulk_edit: false,
+            param_bulk_editor,
+            header_bulk_editor,
             body_kind,
             body_content_type,
             body_editor,
@@ -631,6 +704,18 @@ impl RequestView {
         if this.body_kind == BodyKind::Raw {
             this.sync_body_language(this.body_content_type, window, cx);
         }
+
+        this.watch_editor(this.param_bulk_editor.clone(), window, cx, |this, _, cx| {
+            this.persist_params_from_bulk_text(cx);
+        });
+        this.watch_editor(
+            this.header_bulk_editor.clone(),
+            window,
+            cx,
+            |this, _, cx| {
+                this.persist_headers_from_bulk_text(cx);
+            },
+        );
 
         this.watch_editor(this.url_editor.clone(), window, cx, |this, editor, cx| {
             let url = editor.read(cx).text(cx);
@@ -941,6 +1026,82 @@ impl RequestView {
         self.store.update(cx, |store, cx| {
             store.update_request(request_id, cx, |request| request.headers = headers);
         });
+    }
+
+    fn persist_params_from_bulk_text(&self, cx: &mut Context<Self>) {
+        let text = self.param_bulk_editor.read(cx).text(cx);
+        let params: Vec<QueryParam> = parse_bulk_key_value_text(&text)
+            .into_iter()
+            .map(|(key, value, enabled)| QueryParam {
+                key,
+                value,
+                enabled,
+                description: None,
+            })
+            .collect();
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| request.params = params);
+        });
+    }
+
+    fn persist_headers_from_bulk_text(&self, cx: &mut Context<Self>) {
+        let text = self.header_bulk_editor.read(cx).text(cx);
+        let headers: Vec<Header> = parse_bulk_key_value_text(&text)
+            .into_iter()
+            .map(|(key, value, enabled)| Header {
+                key,
+                value,
+                enabled,
+                description: None,
+            })
+            .collect();
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| request.headers = headers);
+        });
+    }
+
+    /// Switches the Params tab between the row-based editor and a Bulk Edit
+    /// textarea. Entering bulk mode seeds the textarea from the current
+    /// rows; leaving it parses the textarea and rebuilds the rows from it --
+    /// the store itself already reflects the bulk text at every keystroke
+    /// via `persist_params_from_bulk_text`, so `send` sees live edits even if
+    /// the user never switches back.
+    fn toggle_params_bulk_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.params_bulk_edit {
+            let text = self.param_bulk_editor.read(cx).text(cx);
+            self.param_rows.clear();
+            for (key, value, enabled) in parse_bulk_key_value_text(&text) {
+                self.push_param_row(key, value, enabled, window, cx);
+            }
+            self.persist_params(cx);
+        } else {
+            let text = key_value_rows_to_bulk_text(&self.param_rows, cx);
+            self.param_bulk_editor.update(cx, |editor, cx| {
+                editor.set_text(text, window, cx);
+            });
+        }
+        self.params_bulk_edit = !self.params_bulk_edit;
+        cx.notify();
+    }
+
+    fn toggle_headers_bulk_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.headers_bulk_edit {
+            let text = self.header_bulk_editor.read(cx).text(cx);
+            self.header_rows.clear();
+            for (key, value, enabled) in parse_bulk_key_value_text(&text) {
+                self.push_header_row(key, value, enabled, window, cx);
+            }
+            self.persist_headers(cx);
+        } else {
+            let text = key_value_rows_to_bulk_text(&self.header_rows, cx);
+            self.header_bulk_editor.update(cx, |editor, cx| {
+                editor.set_text(text, window, cx);
+            });
+        }
+        self.headers_bulk_edit = !self.headers_bulk_edit;
+        cx.notify();
     }
 
     fn persist_body(&self, cx: &mut Context<Self>) {
@@ -2158,6 +2319,50 @@ impl RequestView {
         section
     }
 
+    fn render_bulk_edit_toggle(
+        bulk_edit_active: bool,
+        toggle_id: &'static str,
+        on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(toggle_id)
+            .debug_selector(move || toggle_id.to_string())
+            .cursor_pointer()
+            .child(
+                Label::new(if bulk_edit_active {
+                    "Key-Value Edit"
+                } else {
+                    "Bulk Edit"
+                })
+                .size(LabelSize::Small)
+                .color(Color::Accent),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| on_toggle(this, window, cx)))
+            .into_any_element()
+    }
+
+    fn render_bulk_editor(
+        editor: Entity<Editor>,
+        selector_id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        div()
+            .id(selector_id)
+            .debug_selector(move || selector_id.to_string())
+            .w_full()
+            .min_h(px(160.))
+            .px_2()
+            .py_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.background)
+            .child(editor)
+            .into_any_element()
+    }
+
     fn render_key_value_rows(
         rows: &[KeyValueRow],
         add_label: &'static str,
@@ -2241,27 +2446,69 @@ impl RequestView {
 
     fn render_tab_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.active_tab {
-            RequestTab::Params => Self::render_key_value_rows(
-                &self.param_rows,
-                "Add Param",
-                Self::add_param_row,
-                Self::toggle_param_row,
-                Self::remove_param_row,
-                cx,
-            )
-            .into_any_element(),
-            RequestTab::Headers => v_flex()
-                .gap_2()
-                .child(self.render_auto_headers(cx))
-                .child(Self::render_key_value_rows(
-                    &self.header_rows,
-                    "Add Header",
-                    Self::add_header_row,
-                    Self::toggle_header_row,
-                    Self::remove_header_row,
+            RequestTab::Params => {
+                let toggle = Self::render_bulk_edit_toggle(
+                    self.params_bulk_edit,
+                    "params-bulk-edit-toggle",
+                    Self::toggle_params_bulk_edit,
                     cx,
-                ))
-                .into_any_element(),
+                );
+                let body = if self.params_bulk_edit {
+                    Self::render_bulk_editor(
+                        self.param_bulk_editor.clone(),
+                        "params-bulk-editor",
+                        cx,
+                    )
+                    .into_any_element()
+                } else {
+                    Self::render_key_value_rows(
+                        &self.param_rows,
+                        "Add Param",
+                        Self::add_param_row,
+                        Self::toggle_param_row,
+                        Self::remove_param_row,
+                        cx,
+                    )
+                    .into_any_element()
+                };
+                v_flex()
+                    .gap_2()
+                    .child(toggle)
+                    .child(body)
+                    .into_any_element()
+            }
+            RequestTab::Headers => {
+                let toggle = Self::render_bulk_edit_toggle(
+                    self.headers_bulk_edit,
+                    "headers-bulk-edit-toggle",
+                    Self::toggle_headers_bulk_edit,
+                    cx,
+                );
+                let body = if self.headers_bulk_edit {
+                    Self::render_bulk_editor(
+                        self.header_bulk_editor.clone(),
+                        "headers-bulk-editor",
+                        cx,
+                    )
+                    .into_any_element()
+                } else {
+                    Self::render_key_value_rows(
+                        &self.header_rows,
+                        "Add Header",
+                        Self::add_header_row,
+                        Self::toggle_header_row,
+                        Self::remove_header_row,
+                        cx,
+                    )
+                    .into_any_element()
+                };
+                v_flex()
+                    .gap_2()
+                    .child(self.render_auto_headers(cx))
+                    .child(toggle)
+                    .child(body)
+                    .into_any_element()
+            }
             RequestTab::Body => {
                 let body_kind = self.body_kind;
                 let content_type = self.body_content_type;
@@ -4396,6 +4643,215 @@ mod tests {
                 vec!["User-Agent".to_string()],
                 "the toggle must persist to the store so it survives across app restarts, \
                  the same way header_rows does"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_bulk_key_value_text_parses_enabled_and_disabled_rows_and_drops_pure_comments() {
+        let rows = parse_bulk_key_value_text(
+            "Accept: application/json\n\
+             //Authorization: Bearer old-token\n\
+             // just a note to self, not a header\n\
+             \n\
+             X-Custom:no-space-around-colon",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("Accept".to_string(), "application/json".to_string(), true),
+                (
+                    "Authorization".to_string(),
+                    "Bearer old-token".to_string(),
+                    false
+                ),
+                (
+                    "X-Custom".to_string(),
+                    "no-space-around-colon".to_string(),
+                    true
+                ),
+            ],
+            "the pure-comment line and the blank line must both be dropped"
+        );
+    }
+
+    #[test]
+    fn a_key_that_literally_starts_with_a_disable_marker_is_escaped_and_round_trips() {
+        // Without the `\`-escape a key of `//page` would render as
+        // `//page: 1`, which then parses back as a *disabled* `page` row --
+        // silently corrupting the key. The escape must prevent that.
+        let text = "\\//page: 1";
+        assert_eq!(
+            parse_bulk_key_value_text(text),
+            vec![("//page".to_string(), "1".to_string(), true)]
+        );
+    }
+
+    #[gpui::test]
+    async fn params_round_trip_through_bulk_edit_via_the_real_rows_and_editors(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.add_param_row(window, cx);
+            view.add_param_row(window, cx);
+            view.add_param_row(window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            let seed = [
+                ("Accept", "application/json", true),
+                ("Authorization", "Bearer old-token", false),
+                ("//page", "1", true),
+            ];
+            for (row, (key, value, enabled)) in view.param_rows.iter_mut().zip(seed) {
+                row.key_editor
+                    .update(cx, |editor, cx| editor.set_text(key, window, cx));
+                row.value_editor
+                    .update(cx, |editor, cx| editor.set_text(value, window, cx));
+                row.enabled = enabled;
+            }
+            view.persist_params(cx);
+        });
+        draw(&mut cx);
+
+        // Round-trip through the real toggle handlers -- into bulk mode
+        // (seeding the textarea from the rows) and back out (re-parsing the
+        // textarea into fresh rows) -- rather than calling the parse/render
+        // free functions directly, so a mismatch between the two is caught.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_params_bulk_edit(window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_params_bulk_edit(window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let rows: Vec<(String, String, bool)> = view
+                .param_rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.key_editor.read(cx).text(cx),
+                        row.value_editor.read(cx).text(cx),
+                        row.enabled,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("Accept".to_string(), "application/json".to_string(), true),
+                    (
+                        "Authorization".to_string(),
+                        "Bearer old-token".to_string(),
+                        false
+                    ),
+                    ("//page".to_string(), "1".to_string(), true),
+                ],
+                "key, value, and enabled state must all survive a round trip through Bulk Edit, \
+                 including a key that itself starts with the disabled-row marker"
+            );
+        });
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.params.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn entering_bulk_edit_on_headers_seeds_the_textarea_from_the_current_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.active_tab = RequestTab::Headers;
+            view.add_header_row(window, cx);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            let key_editor = view.header_rows[0].key_editor.clone();
+            let value_editor = view.header_rows[0].value_editor.clone();
+            key_editor.update(cx, |editor, cx| editor.set_text("Accept", window, cx));
+            value_editor.update(cx, |editor, cx| {
+                editor.set_text("application/json", window, cx)
+            });
+        });
+        draw(&mut cx);
+
+        let toggle = debug_center(&mut cx, "headers-bulk-edit-toggle");
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert!(view.headers_bulk_edit);
+            assert_eq!(
+                view.header_bulk_editor.read(cx).text(cx),
+                "Accept: application/json"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn typing_a_disabled_row_in_headers_bulk_edit_and_leaving_it_persists_a_disabled_header(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.active_tab = RequestTab::Headers;
+            view.toggle_headers_bulk_edit(window, cx);
+        });
+        draw(&mut cx);
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.header_bulk_editor.update(cx, |editor, cx| {
+                editor.set_text(
+                    "Accept: application/json\n//Authorization: Bearer old-token\n// just a note",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // The bulk text already commits to the store on every keystroke,
+        // before the user ever switches back to the row view.
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            let headers: Vec<(String, String, bool)> = request
+                .headers
+                .iter()
+                .map(|header| (header.key.clone(), header.value.clone(), header.enabled))
+                .collect();
+            assert_eq!(
+                headers,
+                vec![
+                    ("Accept".to_string(), "application/json".to_string(), true),
+                    (
+                        "Authorization".to_string(),
+                        "Bearer old-token".to_string(),
+                        false
+                    ),
+                ],
+                "the pure-comment line must not become a header, and the `//`-prefixed row must persist disabled"
+            );
+        });
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_headers_bulk_edit(window, cx);
+        });
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.header_rows.len(), 2);
+            assert!(view.header_rows[0].enabled);
+            assert_eq!(view.header_rows[0].key_editor.read(cx).text(cx), "Accept");
+            assert!(
+                !view.header_rows[1].enabled,
+                "switching back to the row view must restore the disabled row's checkbox state"
+            );
+            assert_eq!(
+                view.header_rows[1].key_editor.read(cx).text(cx),
+                "Authorization"
             );
         });
     }
