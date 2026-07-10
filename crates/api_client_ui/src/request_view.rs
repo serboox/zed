@@ -2,9 +2,10 @@ use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::ApiClientStore;
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{
-    ApiKeyPlacement, AuthConfig, AwsSigV4Config, EnvironmentId, Header, HistoryEntry, HttpMethod,
-    JwtAlgorithm, JwtAuthConfig, OAuth2Config, OAuth2GrantType, QueryParam, RawBodyContentType,
-    Request, RequestBody, RequestId, ResolveMode, SavedExample, SystemDynamicVariableSource,
+    ApiKeyPlacement, AuthConfig, AwsSigV4Config, DYNAMIC_VARIABLE_NAMES, EnvironmentId, Header,
+    HistoryEntry, HttpMethod, JwtAlgorithm, JwtAuthConfig, OAuth2Config, OAuth2GrantType,
+    QueryParam, RawBodyContentType, Request, RequestBody, RequestId, ResolveMode, SavedExample,
+    SystemDynamicVariableSource,
 };
 use editor::{Editor, EditorEvent, HighlightKey};
 use gpui::{
@@ -13,8 +14,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip,
-    WithScrollbar, prelude::*,
+    ContextMenu, ContextMenuEntry, DocumentationSide, Icon, IconName, IconSize, Label, LabelSize,
+    ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
@@ -318,6 +319,7 @@ pub struct RequestView {
     visualize_data: Option<serde_json::Value>,
     scroll_handle: ScrollHandle,
     environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
+    variable_picker_handle: ui::PopoverMenuHandle<ContextMenu>,
     response_fullscreen: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -589,6 +591,7 @@ impl RequestView {
             visualize_data: None,
             scroll_handle: ScrollHandle::new(),
             environment_pin_handle: ui::PopoverMenuHandle::default(),
+            variable_picker_handle: ui::PopoverMenuHandle::default(),
             response_fullscreen: false,
             _subscriptions: Vec::new(),
         };
@@ -1149,6 +1152,142 @@ impl RequestView {
             editor.set_text(formatted, window, cx);
         });
         self.persist_body(cx);
+    }
+
+    /// Inserts `text` at every current cursor/selection in `editor`,
+    /// replacing any selected text -- the same mechanic a real keystroke or
+    /// paste would produce, so a variable picker's insertion behaves exactly
+    /// like typing the token by hand.
+    fn insert_text_at_cursor(
+        editor: &Entity<Editor>,
+        text: String,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let ranges: Vec<std::ops::Range<multi_buffer::MultiBufferOffset>> = editor
+                .selections
+                .all::<multi_buffer::MultiBufferOffset>(&snapshot)
+                .into_iter()
+                .map(|selection| selection.range())
+                .collect();
+            editor.edit(ranges.into_iter().map(|range| (range, text.clone())), cx);
+        });
+    }
+
+    /// A one-line description of what `{{$name}}` actually resolves to,
+    /// matching `SystemDynamicVariableSource::resolve_dynamic`'s real
+    /// implementation in `variable_resolution.rs` -- shown as a popover
+    /// entry's documentation aside so a user can tell what a dynamic
+    /// variable does before inserting it, not just its name.
+    fn dynamic_variable_description(name: &str) -> &'static str {
+        match name {
+            "guid" | "randomUUID" => "A randomly generated v4 UUID.",
+            "timestamp" => "The current Unix timestamp, in seconds.",
+            "isoTimestamp" => "The current time as an ISO 8601 timestamp (YYYY-MM-DDTHH:MM:SSZ).",
+            "randomInt" => "A random integer between 0 and 999.",
+            "randomEmail" => "A random placeholder email address (firstname.lastname@example.com).",
+            "randomFirstName" => "A random first name.",
+            "randomLastName" => "A random last name.",
+            "randomFullName" => "A random full name.",
+            "randomWord" => "A single random placeholder (lorem ipsum-style) word.",
+            "randomWords" => "Three random placeholder (lorem ipsum-style) words.",
+            "randomIP" => "A random IPv4-shaped address.",
+            _ => "",
+        }
+    }
+
+    /// A dropdown listing every dynamic `$variable` (with a hover
+    /// description of what it actually resolves to) and every variable
+    /// visible to this request's effective environment plus the global
+    /// environment, for inserting a `{{name}}`/`{{$name}}` token into
+    /// `editor` at the cursor without having to remember exact spelling.
+    fn render_variable_picker(
+        &self,
+        editor: Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let request = store
+            .requests
+            .iter()
+            .find(|request| request.id == self.request_id)
+            .cloned();
+        let mut variable_names: Vec<String> = Vec::new();
+        if let Some(request) = &request
+            && let Some(environment) = store.effective_environment_for(request)
+        {
+            variable_names.extend(
+                environment
+                    .variables
+                    .iter()
+                    .filter(|variable| variable.enabled)
+                    .map(|variable| variable.key.clone()),
+            );
+        }
+        for variable in &store.global_environment.variables {
+            if variable.enabled && !variable_names.contains(&variable.key) {
+                variable_names.push(variable.key.clone());
+            }
+        }
+
+        div()
+            .id("request-variable-picker")
+            .debug_selector(|| "request-variable-picker".to_string())
+            .child(
+                ui::PopoverMenu::new("request-variable-picker-popover")
+                    .with_handle(self.variable_picker_handle.clone())
+                    .trigger(
+                        Button::new("request-variable-picker-trigger", "Variables")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small),
+                    )
+                    .menu(move |window, cx| {
+                        let editor = editor.clone();
+                        let variable_names = variable_names.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for name in DYNAMIC_VARIABLE_NAMES {
+                                let editor = editor.clone();
+                                let token = format!("{{{{${name}}}}}");
+                                let description = Self::dynamic_variable_description(name);
+                                menu = menu.item(
+                                    ContextMenuEntry::new(format!("${name}"))
+                                        .documentation_aside(DocumentationSide::Left, {
+                                            let description = description.to_string();
+                                            move |_cx| {
+                                                Label::new(description.clone()).into_any_element()
+                                            }
+                                        })
+                                        .handler(move |window, cx| {
+                                            Self::insert_text_at_cursor(
+                                                &editor,
+                                                token.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                );
+                            }
+                            if !variable_names.is_empty() {
+                                menu = menu.separator();
+                                for name in &variable_names {
+                                    let editor = editor.clone();
+                                    let token = format!("{{{{{name}}}}}");
+                                    menu = menu.entry(name.clone(), None, move |window, cx| {
+                                        Self::insert_text_at_cursor(
+                                            &editor,
+                                            token.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }
+                            menu
+                        }))
+                    }),
+            )
     }
 
     fn set_auth_kind(&mut self, kind: AuthKind, cx: &mut Context<Self>) {
@@ -2068,7 +2207,8 @@ impl RequestView {
                                             this.format_body(window, cx);
                                         })),
                                 ),
-                        );
+                        )
+                        .child(self.render_variable_picker(self.body_editor.clone(), cx));
                     let colors = cx.theme().colors();
                     column = column.child(type_row).child(
                         div()
@@ -3708,6 +3848,54 @@ mod tests {
             handle.is_deployed(),
             "clicking the pin trigger must open its environment picker"
         );
+    }
+
+    #[gpui::test]
+    async fn clicking_the_variable_picker_trigger_opens_its_picker(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update(&mut cx, |view, cx| {
+            view.set_body_kind(BodyKind::Raw, cx);
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let handle = view.read_with(&cx, |view, _| view.variable_picker_handle.clone());
+        assert!(
+            !handle.is_deployed(),
+            "the picker must start closed before any interaction"
+        );
+
+        let trigger = debug_center(&mut cx, "request-variable-picker");
+        cx.simulate_click(trigger, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            handle.is_deployed(),
+            "clicking the variable-picker trigger must open its picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn inserting_a_dynamic_variable_token_appends_it_to_the_body(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        let body_editor = view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_kind(BodyKind::Raw, cx);
+            view.body_editor.update(cx, |editor, cx| {
+                editor.set_text("", window, cx);
+            });
+            view.body_editor.clone()
+        });
+        view.update_in(&mut cx, |_, window, cx| {
+            RequestView::insert_text_at_cursor(&body_editor, "{{$guid}}".to_string(), window, cx);
+        });
+
+        body_editor.read_with(&cx, |editor, cx| {
+            assert!(
+                editor.text(cx).contains("{{$guid}}"),
+                "the dynamic-variable token must be inserted into the body, got: {}",
+                editor.text(cx)
+            );
+        });
     }
 
     #[gpui::test]
