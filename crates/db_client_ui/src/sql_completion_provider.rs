@@ -136,6 +136,8 @@ const POSTGRES_KEYWORDS: &[&str] = &[
     "JSONB",
     "USING",
     "CONFLICT",
+    "DO",
+    "RECURSIVE",
 ];
 const POSTGRES_FUNCTIONS: &[&str] = &[
     "COALESCE",
@@ -146,6 +148,7 @@ const POSTGRES_FUNCTIONS: &[&str] = &[
     "ARRAY_AGG",
     "TO_CHAR",
     "GENERATE_SERIES",
+    "STRING_AGG",
 ];
 
 const SQLITE_KEYWORDS: &[&str] = &[
@@ -169,6 +172,9 @@ const CLICKHOUSE_KEYWORDS: &[&str] = &[
     "MATERIALIZED",
     "TTL",
     "ARRAY",
+    "FORMAT",
+    "SETTINGS",
+    "TOTALS",
 ];
 const CLICKHOUSE_FUNCTIONS: &[&str] = &[
     "toDateTime",
@@ -178,6 +184,16 @@ const CLICKHOUSE_FUNCTIONS: &[&str] = &[
     "groupArray",
     "quantile",
     "countIf",
+    "arrayMap",
+    "arrayFilter",
+    "groupUniqArray",
+    "sumIf",
+    "avgIf",
+    "uniqExact",
+    "uniqCombined",
+    "toStartOfDay",
+    "toStartOfMonth",
+    "multiIf",
 ];
 
 // CQL overlaps heavily with CORE_KEYWORDS (SELECT/FROM/WHERE/INSERT/UPDATE/...)
@@ -1206,6 +1222,23 @@ mod tests {
         assert!(keywords_for(DatabaseDriver::Cassandra).contains(&"SELECT"));
         assert!(functions_for(DatabaseDriver::Cassandra).contains(&"TOKEN"));
         assert!(functions_for(DatabaseDriver::Cassandra).contains(&"WRITETIME"));
+    }
+
+    #[test]
+    fn clickhouse_gets_its_own_query_clauses_and_array_aggregate_functions() {
+        assert!(keywords_for(DatabaseDriver::ClickHouse).contains(&"FORMAT"));
+        assert!(keywords_for(DatabaseDriver::ClickHouse).contains(&"SETTINGS"));
+        assert!(keywords_for(DatabaseDriver::ClickHouse).contains(&"TOTALS"));
+        assert!(functions_for(DatabaseDriver::ClickHouse).contains(&"arrayMap"));
+        assert!(functions_for(DatabaseDriver::ClickHouse).contains(&"sumIf"));
+        assert!(functions_for(DatabaseDriver::ClickHouse).contains(&"multiIf"));
+    }
+
+    #[test]
+    fn postgres_gets_upsert_clauses_and_string_aggregation() {
+        assert!(keywords_for(DatabaseDriver::PostgreSQL).contains(&"DO"));
+        assert!(keywords_for(DatabaseDriver::PostgreSQL).contains(&"RECURSIVE"));
+        assert!(functions_for(DatabaseDriver::PostgreSQL).contains(&"STRING_AGG"));
     }
 
     // MongoDB shell queries are JS method-chaining, not SQL; before this fix
