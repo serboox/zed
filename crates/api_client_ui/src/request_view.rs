@@ -981,6 +981,42 @@ impl RequestView {
         cx.notify();
     }
 
+    /// Opens a text prompt to set an arbitrary HTTP method (e.g. `PURGE`,
+    /// `LOCK`, `MKCOL`) -- the data model already supports
+    /// `HttpMethod::Custom`, but the UI only offered the 7 standard chips
+    /// until now.
+    fn start_custom_method(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = match &self.method {
+            HttpMethod::Custom(name) => name.clone(),
+            _ => String::new(),
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let view = cx.entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                TextPromptModal::new(
+                    "Custom HTTP Method",
+                    "Set",
+                    "Method (e.g. PURGE, LOCK, MKCOL)",
+                    &current,
+                    Arc::new(move |name, _window, cx| {
+                        let trimmed = name.trim().to_uppercase();
+                        if trimmed.is_empty() {
+                            return;
+                        }
+                        view.update(cx, |view, cx| {
+                            view.set_method(HttpMethod::Custom(trimmed), cx);
+                        });
+                    }),
+                    window,
+                    cx,
+                )
+            });
+        });
+    }
+
     fn set_body_kind(&mut self, kind: BodyKind, cx: &mut Context<Self>) {
         self.body_kind = kind;
         self.persist_body(cx);
@@ -1213,6 +1249,9 @@ impl RequestView {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.send_state, SendState::Sending) {
+            return;
+        }
         let Some(request) = self
             .store
             .read(cx)
@@ -2314,7 +2353,18 @@ impl RequestView {
         let border_variant = cx.theme().colors().border_variant;
         let background = cx.theme().colors().background;
         match &self.send_state {
-            SendState::Idle => div().into_any_element(),
+            SendState::Idle => v_flex()
+                .id("request-response-idle-hint")
+                .debug_selector(|| "request-response-idle-hint".to_string())
+                .pt_3()
+                .border_t_1()
+                .border_color(border_variant)
+                .child(
+                    Label::new("Click Send to see the response")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
             SendState::Sending => v_flex()
                 .pt_3()
                 .border_t_1()
@@ -2720,7 +2770,38 @@ impl Render for RequestView {
                 is_options,
                 cx,
                 |this, _, _, cx| this.set_method(HttpMethod::Options, cx),
-            ));
+            ))
+            .child({
+                // Once a custom method is active, the chip shows that exact
+                // method text (e.g. "PURGE") instead of the literal word
+                // "Custom..." -- so the active method is always visible
+                // somewhere in the row, matching every other chip here.
+                let custom_label: SharedString = match &method {
+                    HttpMethod::Custom(name) => name.clone().into(),
+                    _ => "Custom...".into(),
+                };
+                let is_custom = matches!(method, HttpMethod::Custom(_));
+                div()
+                    .id("request-method-chip-custom")
+                    .debug_selector(|| "request-method-chip-custom".to_string())
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_custom, |el| el.bg(Color::Muted.color(cx).opacity(0.16)))
+                    .when(!is_custom, |el| {
+                        el.hover(|el| el.bg(cx.theme().colors().element_hover))
+                    })
+                    .child(
+                        Label::new(custom_label)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .buffer_font(cx),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.start_custom_method(window, cx)),
+                    )
+            });
 
         let url_row = h_flex()
             .w_full()
@@ -2747,11 +2828,21 @@ impl Render for RequestView {
                             .on_click(cx.listener(|this, _, _window, cx| this.copy_as_curl(cx))),
                     ),
             )
-            .child(
-                Button::new("request-send", "Send")
-                    .style(ButtonStyle::Filled)
-                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-            );
+            .child({
+                let is_sending = matches!(self.send_state, SendState::Sending);
+                div()
+                    .id("request-send-hitbox")
+                    .debug_selector(|| "request-send".to_string())
+                    .child(
+                        Button::new(
+                            "request-send-button",
+                            if is_sending { "Sending..." } else { "Send" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .disabled(is_sending)
+                        .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+                    )
+            });
 
         let active_tab = self.active_tab;
         let tab_strip = h_flex()
@@ -2974,6 +3065,77 @@ mod tests {
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.method, HttpMethod::Post);
+        });
+    }
+
+    #[gpui::test]
+    async fn setting_a_custom_method_through_the_real_modal_persists_it(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let custom_chip = debug_center(&mut cx, "request-method-chip-custom");
+        cx.simulate_click(custom_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let workspace = view
+            .read_with(&cx, |view, _| view.workspace.clone())
+            .upgrade()
+            .expect("the workspace should still be alive");
+        let modal = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_modal::<TextPromptModal>(cx)
+            })
+            .expect("the custom-method chip should open the method-prompt modal");
+        modal.update_in(&mut cx, |modal, window, cx| {
+            modal.editor.update(cx, |editor, cx| {
+                editor.set_text("purge", window, cx);
+            });
+        });
+        modal.update_in(&mut cx, |modal, window, cx| modal.confirm(window, cx));
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.method, HttpMethod::Custom("PURGE".to_string()));
+        });
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.method, HttpMethod::Custom("PURGE".to_string()));
+        });
+    }
+
+    #[gpui::test]
+    async fn the_send_button_disables_itself_while_a_request_is_in_flight(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update(&mut cx, |view, _| {
+            assert!(
+                matches!(view.send_state, SendState::Idle),
+                "must start idle"
+            );
+        });
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("request-response-idle-hint").is_some(),
+            "the idle response pane must show a hint, not render nothing"
+        );
+
+        view.update(&mut cx, |view, cx| {
+            view.send_state = SendState::Sending;
+            cx.notify();
+        });
+        draw(&mut cx);
+
+        // The button element itself keeps a stable id/debug selector across
+        // the idle/sending label change -- clicking it while disabled must
+        // not re-enter `send` (which would fire a second, duplicate request).
+        let send_button = debug_center(&mut cx, "request-send");
+        cx.simulate_click(send_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(
+                matches!(view.send_state, SendState::Sending),
+                "clicking Send while already sending must be a no-op, not restart the request"
+            );
         });
     }
 
