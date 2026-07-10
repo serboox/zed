@@ -1971,9 +1971,26 @@ fn append_sample_query(existing: &str, sample: &str) -> String {
     }
 }
 
-// A persistent .sql scratch file per connection, kept in the config dir so it
+// The console file's extension drives Zed's normal language-by-extension
+// detection, so this is what actually gives a connection's console syntax
+// highlighting. MongoDB's shell queries (`db.<collection>.<method>(...)`)
+// are JS method-chaining, not SQL, so they get the JavaScript grammar;
+// every other driver here speaks something SQL or SQL-like enough that the
+// SQL grammar highlights it reasonably.
+fn console_file_extension(driver: DatabaseDriver) -> &'static str {
+    match driver {
+        DatabaseDriver::MongoDB => "js",
+        _ => "sql",
+    }
+}
+
+// A persistent scratch file per connection, kept in the config dir so it
 // survives restarts and never needs an explicit save.
-fn connection_query_path(connection_id: ConnectionId, label: &str) -> std::path::PathBuf {
+fn connection_query_path(
+    connection_id: ConnectionId,
+    label: &str,
+    driver: DatabaseDriver,
+) -> std::path::PathBuf {
     let sanitized: String = label
         .chars()
         .map(|c| {
@@ -1989,7 +2006,10 @@ fn connection_query_path(connection_id: ConnectionId, label: &str) -> std::path:
     paths::config_dir()
         .join("db_client")
         .join("queries")
-        .join(format!("{sanitized}-{short}.sql"))
+        .join(format!(
+            "{sanitized}-{short}.{}",
+            console_file_extension(driver)
+        ))
 }
 
 /// Serializes an export bundle and writes it to `path` off the main thread.
@@ -2291,9 +2311,22 @@ fn open_sql_query_console(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let store = DatabaseStore::global(cx).map(|store| store.downgrade());
+    let store_entity = DatabaseStore::global(cx);
+    let driver = store_entity.as_ref().and_then(|store| {
+        store
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == connection_id)
+            .map(|connection| connection.config.driver)
+    });
+    let store = store_entity.map(|store| store.downgrade());
     let workspace_handle = workspace.weak_handle();
-    let path = connection_query_path(connection_id, &connection_label);
+    let path = connection_query_path(
+        connection_id,
+        &connection_label,
+        driver.unwrap_or(DatabaseDriver::MySQL),
+    );
     cx.spawn_in(window, async move |workspace, cx| {
         // Make sure the file exists before opening it (blocking fs off the main thread).
         let path_for_create = path.clone();
@@ -5624,7 +5657,12 @@ impl DatabasePanel {
             .collect();
         let console_specs: Vec<(ConnectionId, std::path::PathBuf)> = connections
             .iter()
-            .map(|config| (config.id, connection_query_path(config.id, &config.label)))
+            .map(|config| {
+                (
+                    config.id,
+                    connection_query_path(config.id, &config.label, config.driver),
+                )
+            })
             .collect();
         let secrets_task = store.update(cx, |store, cx| store.read_all_secrets(cx));
         let workspace = self.workspace.clone();
@@ -5758,13 +5796,22 @@ impl DatabasePanel {
                 .iter()
                 .map(|config| (config.id, config.label.clone()))
                 .collect();
+            let drivers: HashMap<ConnectionId, DatabaseDriver> = bundle
+                .connections
+                .iter()
+                .map(|config| (config.id, config.driver))
+                .collect();
             let console_writes: Vec<(std::path::PathBuf, String)> = bundle
                 .consoles
                 .iter()
                 .filter_map(|console| {
                     let label = labels.get(&console.connection_id)?;
+                    let driver = drivers
+                        .get(&console.connection_id)
+                        .copied()
+                        .unwrap_or(DatabaseDriver::MySQL);
                     Some((
-                        connection_query_path(console.connection_id, label),
+                        connection_query_path(console.connection_id, label, driver),
                         console.content.clone(),
                     ))
                 })
@@ -9698,6 +9745,32 @@ mod tests {
         );
     }
 
+    // Statement splitting is driver-agnostic text scanning, not a SQL parser,
+    // so a multi-command MongoDB shell script (commands separated by `;`,
+    // filters as JS object literals) must split the same way SQL scripts do.
+    #[test]
+    fn statement_runs_in_range_splits_a_multi_command_mongo_shell_script() {
+        let text =
+            "db.users.find({name: \"a;b\"});\ndb.orders.insertOne({total: 10, note: 'x;y'});";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+
+        assert_eq!(
+            runs,
+            vec![
+                super::SqlStatementRun {
+                    sql: "db.users.find({name: \"a;b\"})".to_string(),
+                    start_row: 0,
+                    end_row: 0,
+                },
+                super::SqlStatementRun {
+                    sql: "db.orders.insertOne({total: 10, note: 'x;y'})".to_string(),
+                    start_row: 1,
+                    end_row: 1,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn skip_leading_whitespace_and_comments_handles_all_cases() {
         use super::skip_leading_whitespace_and_comments as skip;
@@ -10266,7 +10339,7 @@ mod tests {
     fn console_path_round_trips_to_its_connection() {
         let target = uuid::Uuid::new_v4();
         let other = uuid::Uuid::new_v4();
-        let path = super::connection_query_path(target, "Local MySQL");
+        let path = super::connection_query_path(target, "Local MySQL", DatabaseDriver::MySQL);
 
         assert_eq!(
             super::connection_id_from_console_path(&path, &[other, target]),
@@ -10285,6 +10358,35 @@ mod tests {
         assert_eq!(
             super::connection_id_from_console_path(&path, &[other]),
             None
+        );
+    }
+
+    // MongoDB's shell syntax is JS method-chaining, not SQL; before this fix
+    // `connection_query_path` hardcoded a `.sql` extension for every driver,
+    // so a Mongo console's buffer was always highlighted (or not) as SQL.
+    #[test]
+    fn connection_query_path_gives_mongodb_a_javascript_extension() {
+        let id = uuid::Uuid::new_v4();
+
+        let mongo_path = super::connection_query_path(id, "Local Mongo", DatabaseDriver::MongoDB);
+        assert_eq!(
+            mongo_path.extension().and_then(|ext| ext.to_str()),
+            Some("js"),
+            "a MongoDB console must not be highlighted as SQL"
+        );
+
+        let sql_path = super::connection_query_path(id, "Local MySQL", DatabaseDriver::MySQL);
+        assert_eq!(
+            sql_path.extension().and_then(|ext| ext.to_str()),
+            Some("sql")
+        );
+
+        let cassandra_path =
+            super::connection_query_path(id, "Local Cassandra", DatabaseDriver::Cassandra);
+        assert_eq!(
+            cassandra_path.extension().and_then(|ext| ext.to_str()),
+            Some("sql"),
+            "CQL is close enough to SQL that the SQL grammar highlights it reasonably"
         );
     }
 
@@ -13304,7 +13406,7 @@ mod tests {
     #[test]
     fn console_path_round_trips_to_connection_id() {
         let id = db_client::ConnectionConfig::default().id;
-        let path = super::connection_query_path(id, "My Conn!!");
+        let path = super::connection_query_path(id, "My Conn!!", DatabaseDriver::MySQL);
         assert_eq!(
             super::connection_id_from_console_path(&path, &[id]),
             Some(id)
