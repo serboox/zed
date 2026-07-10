@@ -107,6 +107,9 @@ pub fn generate_alter_statements(
     driver: DatabaseDriver,
     changes: &[ColumnChange],
 ) -> Vec<String> {
+    if driver == DatabaseDriver::Cassandra {
+        return generate_cassandra_alter_statements(table, changes);
+    }
     let table_ident = driver.quote_identifier(table);
     let null_clause = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
     let mut statements = Vec::new();
@@ -175,6 +178,43 @@ pub fn generate_alter_statements(
         statements = fold_mysql_rename_modify(&table_ident, driver, changes);
     }
     statements
+}
+
+/// CQL's `ALTER TABLE` has no `COLUMN` keyword and no per-column `NULL`/`NOT
+/// NULL` clause (Cassandra has no column-level nullability constraint), and
+/// its `RENAME`/`ALTER ... TYPE` forms drop the `COLUMN`/`ALTER COLUMN`
+/// wording the generic dialect above uses — reusing that branch for
+/// Cassandra would emit statements CQL rejects outright.
+fn generate_cassandra_alter_statements(table: &str, changes: &[ColumnChange]) -> Vec<String> {
+    let table_ident = DatabaseDriver::Cassandra.quote_identifier(table);
+    changes
+        .iter()
+        .map(|change| match change {
+            ColumnChange::Add {
+                name, data_type, ..
+            } => format!(
+                "ALTER TABLE {table_ident} ADD {} {};",
+                DatabaseDriver::Cassandra.quote_identifier(name),
+                data_type
+            ),
+            ColumnChange::Drop { name } => format!(
+                "ALTER TABLE {table_ident} DROP {};",
+                DatabaseDriver::Cassandra.quote_identifier(name)
+            ),
+            ColumnChange::Rename { from, to } => format!(
+                "ALTER TABLE {table_ident} RENAME {} TO {};",
+                DatabaseDriver::Cassandra.quote_identifier(from),
+                DatabaseDriver::Cassandra.quote_identifier(to)
+            ),
+            ColumnChange::Modify {
+                name, data_type, ..
+            } => format!(
+                "ALTER TABLE {table_ident} ALTER {} TYPE {};",
+                DatabaseDriver::Cassandra.quote_identifier(name),
+                data_type
+            ),
+        })
+        .collect()
 }
 
 fn fold_mysql_rename_modify(
@@ -323,6 +363,9 @@ pub fn generate_index_statements(
     driver: DatabaseDriver,
     changes: &[IndexChange],
 ) -> Vec<String> {
+    if driver == DatabaseDriver::Cassandra {
+        return generate_cassandra_index_statements(table, changes);
+    }
     let table_ident = driver.quote_identifier(table);
     changes
         .iter()
@@ -350,6 +393,43 @@ pub fn generate_index_statements(
                 ),
                 _ => format!("DROP INDEX {};", driver.quote_identifier(name)),
             },
+        })
+        .collect()
+}
+
+/// CQL's `CREATE INDEX` has no `UNIQUE` modifier (Cassandra secondary
+/// indexes carry no uniqueness concept) and only ever indexes a single
+/// column, so a multi-column request becomes one `CREATE INDEX` per column
+/// rather than the single composite-index statement the generic SQL branch
+/// above would emit. `DROP INDEX name;` (no `ON table`) is already valid CQL
+/// and identical to the generic non-MySQL branch, so it's reused as-is.
+fn generate_cassandra_index_statements(table: &str, changes: &[IndexChange]) -> Vec<String> {
+    let table_ident = DatabaseDriver::Cassandra.quote_identifier(table);
+    changes
+        .iter()
+        .flat_map(|change| -> Vec<String> {
+            match change {
+                IndexChange::Add { name, columns, .. } => columns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, column)| {
+                        let index_name = if columns.len() == 1 {
+                            name.clone()
+                        } else {
+                            format!("{name}_{position}")
+                        };
+                        format!(
+                            "CREATE INDEX {} ON {table_ident} ({});",
+                            DatabaseDriver::Cassandra.quote_identifier(&index_name),
+                            DatabaseDriver::Cassandra.quote_identifier(column)
+                        )
+                    })
+                    .collect(),
+                IndexChange::Drop { name } => vec![format!(
+                    "DROP INDEX {};",
+                    DatabaseDriver::Cassandra.quote_identifier(name)
+                )],
+            }
         })
         .collect()
 }
@@ -1429,6 +1509,89 @@ mod tests {
             generate_index_statements("t", DatabaseDriver::SQLite, &changes),
             vec!["DROP INDEX \"idx_old\";"]
         );
+    }
+
+    #[test]
+    fn cassandra_add_column_omits_the_column_keyword_and_nullability_clause() {
+        let changes = diff_changes(&[draft(None, "email", "text", false, false)]);
+        let sql = generate_alter_statements("users", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE \"users\" ADD \"email\" text;"]);
+    }
+
+    #[test]
+    fn cassandra_drop_column_omits_the_column_keyword() {
+        let changes = diff_changes(&[draft(
+            Some(col("legacy", "int", true)),
+            "legacy",
+            "int",
+            true,
+            true,
+        )]);
+        let sql = generate_alter_statements("t", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE \"t\" DROP \"legacy\";"]);
+    }
+
+    #[test]
+    fn cassandra_rename_omits_the_column_keyword() {
+        let changes = diff_changes(&[draft(
+            Some(col("old", "int", true)),
+            "new",
+            "int",
+            true,
+            false,
+        )]);
+        let sql = generate_alter_statements("t", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE \"t\" RENAME \"old\" TO \"new\";"]);
+    }
+
+    #[test]
+    fn cassandra_modify_type_has_no_alter_column_wording_or_nullability_clause() {
+        let changes = diff_changes(&[draft(
+            Some(col("amount", "int", true)),
+            "amount",
+            "bigint",
+            false,
+            false,
+        )]);
+        let sql = generate_alter_statements("t", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE \"t\" ALTER \"amount\" TYPE bigint;"]);
+    }
+
+    #[test]
+    fn cassandra_index_has_no_unique_modifier() {
+        let changes = index_diff_changes(&[index_draft(None, "idx_email", "email", true, false)]);
+        let sql = generate_index_statements("users", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX \"idx_email\" ON \"users\" (\"email\");"]
+        );
+    }
+
+    #[test]
+    fn cassandra_composite_index_becomes_one_statement_per_column() {
+        let changes = index_diff_changes(&[index_draft(
+            None,
+            "idx_name",
+            "last_name, first_name",
+            false,
+            false,
+        )]);
+        let sql = generate_index_statements("users", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(
+            sql,
+            vec![
+                "CREATE INDEX \"idx_name_0\" ON \"users\" (\"last_name\");",
+                "CREATE INDEX \"idx_name_1\" ON \"users\" (\"first_name\");",
+            ]
+        );
+    }
+
+    #[test]
+    fn cassandra_drop_index_matches_the_generic_non_mysql_form() {
+        let changes =
+            index_diff_changes(&[index_draft(Some("idx_old"), "idx_old", "", false, true)]);
+        let sql = generate_index_statements("t", DatabaseDriver::Cassandra, &changes);
+        assert_eq!(sql, vec!["DROP INDEX \"idx_old\";"]);
     }
 
     fn fk_draft(
