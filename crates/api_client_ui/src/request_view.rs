@@ -320,6 +320,7 @@ pub struct RequestView {
     scroll_handle: ScrollHandle,
     environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
     variable_picker_handle: ui::PopoverMenuHandle<ContextMenu>,
+    method_selector_handle: ui::PopoverMenuHandle<ContextMenu>,
     auto_header_enabled: Vec<bool>,
     show_auto_headers: bool,
     response_fullscreen: bool,
@@ -594,6 +595,7 @@ impl RequestView {
             scroll_handle: ScrollHandle::new(),
             environment_pin_handle: ui::PopoverMenuHandle::default(),
             variable_picker_handle: ui::PopoverMenuHandle::default(),
+            method_selector_handle: ui::PopoverMenuHandle::default(),
             auto_header_enabled: api_client::AUTO_HEADER_DEFAULTS
                 .iter()
                 .map(|(key, _)| {
@@ -1858,9 +1860,82 @@ impl RequestView {
             )
     }
 
-    /// The row of selectable method chips at the top of the request editor,
-    /// each tinted with `method_color` so the active method is recognizable
-    /// by color alone, not just by which chip is highlighted.
+    /// A single compact dropdown for picking the HTTP method, replacing a
+    /// full row of always-visible chips -- frees a whole row of vertical
+    /// space for the URL bar, matching the near-universal
+    /// `[Method] [URL] [Send]` single-row layout most REST clients use.
+    fn render_method_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let method = self.method.clone();
+        let color = Self::method_color(&method);
+        let label: SharedString = match &method {
+            HttpMethod::Custom(name) => name.clone().into(),
+            other => other.as_str().to_string().into(),
+        };
+        let view = cx.entity();
+        let popover_handle = self.method_selector_handle.clone();
+        let tint = color.color(cx);
+
+        div()
+            .id("request-method-selector")
+            .debug_selector(|| "request-method-selector".to_string())
+            .child(
+                ui::PopoverMenu::new("request-method-selector-popover")
+                    .with_handle(popover_handle)
+                    .trigger(
+                        ui::ButtonLike::new("request-method-selector-trigger")
+                            .style(ButtonStyle::Subtle)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .rounded_md()
+                                    .bg(tint.opacity(0.16))
+                                    .child(
+                                        Label::new(label)
+                                            .size(LabelSize::Small)
+                                            .color(color)
+                                            .buffer_font(cx),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(color),
+                                    ),
+                            ),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let entry =
+                                |menu: ContextMenu, label: &'static str, method: HttpMethod| {
+                                    let view = view.clone();
+                                    menu.entry(label, None, move |_window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.set_method(method.clone(), cx)
+                                        });
+                                    })
+                                };
+                            let menu = entry(menu, "GET", HttpMethod::Get);
+                            let menu = entry(menu, "POST", HttpMethod::Post);
+                            let menu = entry(menu, "PUT", HttpMethod::Put);
+                            let menu = entry(menu, "PATCH", HttpMethod::Patch);
+                            let menu = entry(menu, "DELETE", HttpMethod::Delete);
+                            let menu = entry(menu, "HEAD", HttpMethod::Head);
+                            let menu = entry(menu, "OPTIONS", HttpMethod::Options);
+                            menu.entry("Custom...", None, {
+                                let view = view.clone();
+                                move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.start_custom_method(window, cx);
+                                    });
+                                }
+                            })
+                        }))
+                    }),
+            )
+    }
+
     fn set_pinned_environment(
         &mut self,
         environment_id: Option<EnvironmentId>,
@@ -1939,35 +2014,6 @@ impl RequestView {
                         }))
                     }),
             )
-    }
-
-    fn render_method_selector_chip(
-        label: &'static str,
-        method: HttpMethod,
-        is_selected: bool,
-        cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &gpui::ClickEvent, &mut Window, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
-        let color = Self::method_color(&method);
-        let tint = color.color(cx);
-        div()
-            .id(SharedString::from(format!("request-method-chip-{label}")))
-            .debug_selector(move || format!("request-method-chip-{label}"))
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .when(is_selected, |el| el.bg(tint.opacity(0.16)))
-            .when(!is_selected, |el| {
-                el.hover(|el| el.bg(cx.theme().colors().element_hover))
-            })
-            .child(
-                Label::new(label)
-                    .size(LabelSize::Small)
-                    .color(if is_selected { color } else { Color::Muted })
-                    .buffer_font(cx),
-            )
-            .on_click(cx.listener(on_click))
     }
 
     /// Same visual chip as `render_chip`, but with a caller-supplied `scope`
@@ -3270,104 +3316,15 @@ impl Render for RequestView {
         let border = cx.theme().colors().border;
         let background = cx.theme().colors().background;
         let editor_background = cx.theme().colors().editor_background;
-        let method = self.method.clone();
-        let is_get = matches!(method, HttpMethod::Get);
-        let is_post = matches!(method, HttpMethod::Post);
-        let is_put = matches!(method, HttpMethod::Put);
-        let is_patch = matches!(method, HttpMethod::Patch);
-        let is_delete = matches!(method, HttpMethod::Delete);
-        let is_head = matches!(method, HttpMethod::Head);
-        let is_options = matches!(method, HttpMethod::Options);
 
-        let method_row = h_flex()
-            .w_full()
-            .gap_1()
-            .child(Self::render_method_selector_chip(
-                "GET",
-                HttpMethod::Get,
-                is_get,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Get, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "POST",
-                HttpMethod::Post,
-                is_post,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Post, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "PUT",
-                HttpMethod::Put,
-                is_put,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Put, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "PATCH",
-                HttpMethod::Patch,
-                is_patch,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Patch, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "DELETE",
-                HttpMethod::Delete,
-                is_delete,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Delete, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "HEAD",
-                HttpMethod::Head,
-                is_head,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Head, cx),
-            ))
-            .child(Self::render_method_selector_chip(
-                "OPTIONS",
-                HttpMethod::Options,
-                is_options,
-                cx,
-                |this, _, _, cx| this.set_method(HttpMethod::Options, cx),
-            ))
-            .child({
-                // Once a custom method is active, the chip shows that exact
-                // method text (e.g. "PURGE") instead of the literal word
-                // "Custom..." -- so the active method is always visible
-                // somewhere in the row, matching every other chip here.
-                let custom_label: SharedString = match &method {
-                    HttpMethod::Custom(name) => name.clone().into(),
-                    _ => "Custom...".into(),
-                };
-                let is_custom = matches!(method, HttpMethod::Custom(_));
-                div()
-                    .id("request-method-chip-custom")
-                    .debug_selector(|| "request-method-chip-custom".to_string())
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(is_custom, |el| el.bg(Color::Muted.color(cx).opacity(0.16)))
-                    .when(!is_custom, |el| {
-                        el.hover(|el| el.bg(cx.theme().colors().element_hover))
-                    })
-                    .child(
-                        Label::new(custom_label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .buffer_font(cx),
-                    )
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.start_custom_method(window, cx)),
-                    )
-            })
-            .child(div().ml_auto().child(self.render_environment_pin(cx)));
-
+        // Method, URL, and Send share one row -- the near-universal REST
+        // client layout -- rather than a whole row of always-visible method
+        // chips above a separate URL row.
         let url_row = h_flex()
             .w_full()
             .gap_2()
             .items_center()
+            .child(self.render_method_selector(cx))
             .child(
                 div()
                     .flex_1()
@@ -3406,6 +3363,10 @@ impl Render for RequestView {
                         .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
             });
+
+        let environment_row = h_flex()
+            .w_full()
+            .child(div().ml_auto().child(self.render_environment_pin(cx)));
 
         let active_tab = self.active_tab;
         let tab_strip = h_flex()
@@ -3500,8 +3461,8 @@ impl Render for RequestView {
             .bg(editor_background)
             .overflow_scroll()
             .track_scroll(&self.scroll_handle)
-            .child(method_row)
             .child(url_row)
+            .child(environment_row)
             .child(tab_strip)
             .child(div().child(tab_body))
             .child(response_section)
@@ -3769,12 +3730,32 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_a_method_chip_updates_the_stored_method(cx: &mut TestAppContext) {
+    async fn clicking_the_method_selector_trigger_opens_its_picker(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let handle = view.read_with(&cx, |view, _| view.method_selector_handle.clone());
+        assert!(
+            !handle.is_deployed(),
+            "the picker must start closed before any interaction"
+        );
+
+        let trigger = debug_center(&mut cx, "request-method-selector");
+        cx.simulate_click(trigger, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            handle.is_deployed(),
+            "clicking the method selector must open its picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn setting_the_method_directly_updates_the_stored_request(cx: &mut TestAppContext) {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
         draw(&mut cx);
 
-        let post_chip = debug_center(&mut cx, "request-method-chip-POST");
-        cx.simulate_click(post_chip, gpui::Modifiers::none());
+        view.update(&mut cx, |view, cx| view.set_method(HttpMethod::Post, cx));
         cx.run_until_parked();
 
         view.read_with(&cx, |view, _| assert_eq!(view.method, HttpMethod::Post));
@@ -3789,8 +3770,9 @@ mod tests {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
         draw(&mut cx);
 
-        let custom_chip = debug_center(&mut cx, "request-method-chip-custom");
-        cx.simulate_click(custom_chip, gpui::Modifiers::none());
+        view.update_in(&mut cx, |view, window, cx| {
+            view.start_custom_method(window, cx)
+        });
         cx.run_until_parked();
 
         let workspace = view
