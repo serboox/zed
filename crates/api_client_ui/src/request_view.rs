@@ -13,8 +13,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar,
-    prelude::*,
+    ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
@@ -298,6 +298,7 @@ pub struct RequestView {
     visualize_data: Option<serde_json::Value>,
     scroll_handle: ScrollHandle,
     environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
+    response_fullscreen: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -568,6 +569,7 @@ impl RequestView {
             visualize_data: None,
             scroll_handle: ScrollHandle::new(),
             environment_pin_handle: ui::PopoverMenuHandle::default(),
+            response_fullscreen: false,
             _subscriptions: Vec::new(),
         };
 
@@ -1178,6 +1180,11 @@ impl RequestView {
     /// UI-facing counterpart to `SavedExample`, Postman's own "save as
     /// example" flow. Only available while `send_state` holds a real
     /// response; there is nothing to save from `Idle`/`Sending`/`Error`.
+    fn toggle_response_fullscreen(&mut self, cx: &mut Context<Self>) {
+        self.response_fullscreen = !self.response_fullscreen;
+        cx.notify();
+    }
+
     fn save_response_as_example(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let SendState::Success(response) = &self.send_state else {
             return;
@@ -1916,7 +1923,8 @@ impl RequestView {
                     column = column.child(type_row).child(
                         div()
                             .w_full()
-                            .min_h(px(160.))
+                            .flex_1()
+                            .min_h(px(400.))
                             .px_2()
                             .py_1p5()
                             .rounded_md()
@@ -2511,15 +2519,45 @@ impl RequestView {
                             .child(Label::new(size).size(LabelSize::Small).color(Color::Muted)),
                     )
                     .child(
-                        div()
-                            .id("request-save-example-hitbox")
-                            .debug_selector(|| "request-save-example".to_string())
+                        h_flex()
+                            .gap_1()
                             .child(
-                                Button::new("request-save-example", "Save as Example")
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_response_as_example(window, cx)
-                                    })),
+                                div()
+                                    .id("request-response-fullscreen-hitbox")
+                                    .debug_selector(|| "request-response-fullscreen".to_string())
+                                    .child(
+                                        IconButton::new(
+                                            "request-response-fullscreen",
+                                            if self.response_fullscreen {
+                                                IconName::Minimize
+                                            } else {
+                                                IconName::Maximize
+                                            },
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(Tooltip::text(if self.response_fullscreen {
+                                            "Exit fullscreen"
+                                        } else {
+                                            "View response fullscreen"
+                                        }))
+                                        .on_click(
+                                            cx.listener(|this, _, _window, cx| {
+                                                this.toggle_response_fullscreen(cx)
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("request-save-example-hitbox")
+                                    .debug_selector(|| "request-save-example".to_string())
+                                    .child(
+                                        Button::new("request-save-example", "Save as Example")
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.save_response_as_example(window, cx)
+                                            })),
+                                    ),
                             ),
                     );
 
@@ -2657,7 +2695,8 @@ impl RequestView {
                             )
                             .child(
                                 div()
-                                    .min_h(px(160.))
+                                    .flex_1()
+                                    .min_h(px(400.))
                                     .px_2()
                                     .py_1p5()
                                     .rounded_md()
@@ -2669,7 +2708,8 @@ impl RequestView {
                             .into_any_element()
                     }
                     ResponseTab::Diff => div()
-                        .min_h(px(160.))
+                        .flex_1()
+                        .min_h(px(400.))
                         .px_2()
                         .py_1p5()
                         .rounded_md()
@@ -2684,7 +2724,7 @@ impl RequestView {
                             ResponseTab::Preview => self.preview_body_editor.clone(),
                             _ => self.raw_body_editor.clone(),
                         };
-                        let mut column = v_flex().gap_1();
+                        let mut column = v_flex().gap_1().flex_1();
                         if response_tab == ResponseTab::Preview {
                             column = column.child(
                                 Label::new("Rendered as plain text -- GPUI has no sandboxed HTML renderer, so scripts and styles are stripped rather than executed.")
@@ -2695,7 +2735,8 @@ impl RequestView {
                         column
                             .child(
                                 div()
-                                    .min_h(px(160.))
+                                    .flex_1()
+                                    .min_h(px(400.))
                                     .px_2()
                                     .py_1p5()
                                     .rounded_md()
@@ -2988,8 +3029,30 @@ impl Render for RequestView {
                 },
             ));
 
-        let tab_body = self.render_tab_body(window, cx);
         let response_section = self.render_response_section(cx);
+
+        if self.response_fullscreen {
+            return v_flex()
+                .id("api-client-request-view")
+                .key_context("ApiClientRequestView")
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .p_4()
+                .gap_3()
+                .bg(editor_background)
+                .overflow_scroll()
+                .track_scroll(&self.scroll_handle)
+                .child(response_section)
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&self.scroll_handle),
+                    window,
+                    cx,
+                )
+                .into_any_element();
+        }
+
+        let tab_body = self.render_tab_body(window, cx);
 
         v_flex()
             .id("api-client-request-view")
@@ -3012,6 +3075,7 @@ impl Render for RequestView {
                 window,
                 cx,
             )
+            .into_any_element()
     }
 }
 
@@ -3537,6 +3601,55 @@ mod tests {
             let raw_text = view.raw_body_editor.read(cx).text(cx);
             assert_eq!(raw_text, r#"{"id":1}"#);
         });
+    }
+
+    #[gpui::test]
+    async fn clicking_the_fullscreen_toggle_hides_the_request_editor_and_a_second_click_restores_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, "{}"), window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("request-send").is_some(),
+            "the request editor (Send button) must be visible before entering fullscreen"
+        );
+
+        let fullscreen_button = debug_center(&mut cx, "request-response-fullscreen");
+        cx.simulate_click(fullscreen_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                view.response_fullscreen,
+                "clicking the fullscreen toggle must set response_fullscreen"
+            );
+        });
+        assert!(
+            cx.debug_bounds("request-send").is_none(),
+            "the request editor must be hidden while the response is fullscreen"
+        );
+
+        let fullscreen_button = debug_center(&mut cx, "request-response-fullscreen");
+        cx.simulate_click(fullscreen_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| {
+            assert!(
+                !view.response_fullscreen,
+                "a second click must exit fullscreen"
+            );
+        });
+        assert!(
+            cx.debug_bounds("request-send").is_some(),
+            "the request editor must reappear after exiting fullscreen"
+        );
     }
 
     #[gpui::test]
