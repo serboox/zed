@@ -1935,6 +1935,21 @@ impl ApiClientPanel {
                             row.border_b_2()
                                 .border_color(cx.theme().colors().text_accent)
                         })
+                        .when(is_selected, |row| {
+                            // Absolutely positioned so the accent never perturbs
+                            // row layout (a real border would shift every child
+                            // right by its width). Mirrors db_client_ui's
+                            // selection accent stripe.
+                            row.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(2.))
+                                    .bg(cx.theme().colors().text_accent),
+                            )
+                        })
                         .child(
                             Icon::new(if is_collapsed {
                                 IconName::ChevronRight
@@ -2034,6 +2049,17 @@ impl ApiClientPanel {
                             row.border_b_2()
                                 .border_color(cx.theme().colors().text_accent)
                         })
+                        .when(is_selected, |row| {
+                            row.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(2.))
+                                    .bg(cx.theme().colors().text_accent),
+                            )
+                        })
                         .child(
                             Icon::new(if is_collapsed {
                                 IconName::ChevronRight
@@ -2128,6 +2154,23 @@ impl ApiClientPanel {
                         .when(is_after_target, |row| {
                             row.border_b_2()
                                 .border_color(cx.theme().colors().text_accent)
+                        })
+                        .when(is_selected, |row| {
+                            row.child(
+                                div()
+                                    .id(ElementId::from(SharedString::from(format!(
+                                        "api-client-request-row-accent-{request_id}"
+                                    ))))
+                                    .debug_selector(move || {
+                                        format!("api-client-request-row-accent-{request_id}")
+                                    })
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(2.))
+                                    .bg(cx.theme().colors().text_accent),
+                            )
                         })
                         .child(RequestView::render_method_badge(
                             method_label.clone().into(),
@@ -2721,6 +2764,69 @@ mod tests {
                 "clicking a request row must open its RequestView in the active pane"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn selecting_a_request_row_paints_an_accent_stripe_spanning_its_full_height(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection_id}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(format!("api-client-request-row-accent-{request_id}").leak())
+                .is_none(),
+            "an unselected row must not paint an accent stripe"
+        );
+
+        let row_bounds = cx
+            .debug_bounds(format!("api-client-request-row-{request_id}").leak())
+            .unwrap_or_else(|| panic!("expected debug bounds for the request row"));
+        let row_point = row_bounds.center();
+        cx.simulate_click(row_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let stripe_bounds = cx
+            .debug_bounds(format!("api-client-request-row-accent-{request_id}").leak())
+            .unwrap_or_else(|| panic!("expected an accent stripe once the row is selected"));
+        let row_bounds = cx
+            .debug_bounds(format!("api-client-request-row-{request_id}").leak())
+            .unwrap_or_else(|| panic!("expected debug bounds for the request row"));
+
+        assert_eq!(
+            stripe_bounds.origin.x, row_bounds.origin.x,
+            "the accent stripe must hug the row's left edge"
+        );
+        assert_eq!(
+            stripe_bounds.size.height, row_bounds.size.height,
+            "the accent stripe must span the row's full height"
+        );
+        assert!(
+            stripe_bounds.size.width > px(0.) && stripe_bounds.size.width < px(6.),
+            "the accent stripe must be a thin sliver, not a filled row background, got width {:?}",
+            stripe_bounds.size.width
+        );
     }
 
     #[gpui::test]
