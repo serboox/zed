@@ -255,8 +255,19 @@ impl ApiClientPanel {
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, _window, cx| {
-            let store = cx.new(|cx| ApiClientStore::new(cx));
-            cx.set_global(GlobalApiClientStore(store.clone()));
+            // Reuse the single process-wide store instead of creating a fresh
+            // one per window: `App` globals are shared across every window in
+            // the process, so unconditionally overwriting it here would
+            // orphan any other open window's in-memory store from the
+            // global, letting two windows silently race to persist stale
+            // data over each other's edits to the same on-disk file.
+            let store = if let Some(existing) = cx.try_global::<GlobalApiClientStore>() {
+                existing.0.clone()
+            } else {
+                let store = cx.new(|cx| ApiClientStore::new(cx));
+                cx.set_global(GlobalApiClientStore(store.clone()));
+                store
+            };
             let focus_handle = cx.focus_handle();
             let workspace_handle = workspace.weak_handle();
             cx.new(|cx| {
