@@ -113,8 +113,25 @@ pub fn explain_sql_for_driver(driver: DatabaseDriver, sql: &str) -> String {
     match driver {
         DatabaseDriver::MySQL => format!("EXPLAIN FORMAT=TREE {sql}"),
         DatabaseDriver::SQLite => format!("EXPLAIN QUERY PLAN {sql}"),
+        DatabaseDriver::ClickHouse => format!("EXPLAIN {sql}"),
         _ => format!("EXPLAIN {sql}"),
     }
+}
+
+/// Whether `driver` has a real EXPLAIN/query-plan concept that
+/// `explain_sql_for_driver` can express as a runnable statement. CQL has no
+/// query planner at all, MongoDB's explain is a `.explain()` cursor call
+/// (nothing like `EXPLAIN <text>`), and Redis's command protocol has no
+/// query-plan concept — "Explain Query" is unavailable for all three rather
+/// than sending them a statement that can only fail.
+pub fn supports_explain_plan(driver: DatabaseDriver) -> bool {
+    matches!(
+        driver,
+        DatabaseDriver::MySQL
+            | DatabaseDriver::PostgreSQL
+            | DatabaseDriver::SQLite
+            | DatabaseDriver::ClickHouse
+    )
 }
 
 /// Flattens an EXPLAIN result into newline-joined text. Engines return the plan
@@ -578,6 +595,40 @@ mod tests {
             explain_sql_for_driver(DatabaseDriver::PostgreSQL, "SELECT 1"),
             "EXPLAIN SELECT 1"
         );
+        assert_eq!(
+            explain_sql_for_driver(DatabaseDriver::ClickHouse, "SELECT 1"),
+            "EXPLAIN SELECT 1"
+        );
+    }
+
+    // Cassandra/MongoDB/Redis have no EXPLAIN/query-plan concept expressible
+    // as a runnable statement -- before this fix, invoking "Explain Query"
+    // against one of them fell through to the generic `EXPLAIN <text>`
+    // fallback and sent a statement that could only error.
+    #[test]
+    fn only_drivers_with_a_real_query_plan_concept_support_explain() {
+        for driver in [
+            DatabaseDriver::MySQL,
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::SQLite,
+            DatabaseDriver::ClickHouse,
+        ] {
+            assert!(
+                supports_explain_plan(driver),
+                "{driver:?} should support Explain Query"
+            );
+        }
+        for driver in [
+            DatabaseDriver::Cassandra,
+            DatabaseDriver::MongoDB,
+            DatabaseDriver::Redis,
+            DatabaseDriver::Aerospike,
+        ] {
+            assert!(
+                !supports_explain_plan(driver),
+                "{driver:?} should not support Explain Query"
+            );
+        }
     }
 
     #[test]
