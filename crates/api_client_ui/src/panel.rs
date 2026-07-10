@@ -420,13 +420,20 @@ impl ApiClientPanel {
                         cx.notify();
                     },
                 );
+                // Only an actual text change can affect the filtered tree, so
+                // only re-render on `Edited` -- otherwise every cursor move,
+                // selection change, or scroll in the search box would trigger
+                // a full tree rebuild (cloning every collection/folder/
+                // request) for no visible difference.
                 let search_subscription = cx.subscribe(
                     &search_editor,
                     |_this: &mut ApiClientPanel,
                      _editor: Entity<Editor>,
-                     _event: &EditorEvent,
+                     event: &EditorEvent,
                      cx: &mut Context<ApiClientPanel>| {
-                        cx.notify();
+                        if matches!(event, EditorEvent::Edited { .. }) {
+                            cx.notify();
+                        }
                     },
                 );
                 let tree_view_state = load_tree_view_state_from_disk();
@@ -2447,7 +2454,7 @@ mod tests {
     use super::*;
     use crate::store::ApiClientStore;
     use crate::text_prompt_modal::TextPromptModal;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Action, TestAppContext, VisualTestContext};
     use project::Project;
     use workspace::Workspace;
 
@@ -2498,6 +2505,71 @@ mod tests {
                 })
             },
         );
+    }
+
+    #[gpui::test]
+    async fn moving_the_search_cursor_without_editing_does_not_trigger_a_rerender(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+        let search_editor = panel.read_with(&cx, |panel, _| panel.search_editor.clone());
+
+        search_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("abc", window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let notify_count = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let observation = cx.update(|_window, cx| {
+            let notify_count = notify_count.clone();
+            cx.observe(&panel, move |_, _| {
+                *notify_count.borrow_mut() += 1;
+            })
+        });
+
+        let editor_focus_handle =
+            search_editor.read_with(&cx, |editor, cx| editor.focus_handle(cx));
+        let window_focus_handle = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            Some(editor_focus_handle),
+            window_focus_handle,
+            "sanity: search editor must actually hold window focus"
+        );
+
+        let offset_before =
+            search_editor.read_with(&cx, |editor, _| editor.selections.newest_anchor().head());
+        cx.update(|window, cx| {
+            window.dispatch_action(editor::actions::MoveLeft.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        let offset_after =
+            search_editor.read_with(&cx, |editor, _| editor.selections.newest_anchor().head());
+        assert_ne!(
+            offset_before, offset_after,
+            "sanity check: dispatching MoveLeft must actually move the cursor"
+        );
+        assert_eq!(
+            *notify_count.borrow(),
+            0,
+            "moving the cursor without editing text must not trigger a panel re-render"
+        );
+
+        search_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("abcd", window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            *notify_count.borrow() > 0,
+            "editing the search text must trigger a panel re-render"
+        );
+        drop(observation);
     }
 
     fn debug_center(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Point<Pixels> {
