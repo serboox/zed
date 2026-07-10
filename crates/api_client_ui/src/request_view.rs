@@ -183,6 +183,16 @@ fn highlight_variable_tokens(editor: &Entity<Editor>, cx: &mut App) {
     });
 }
 
+fn language_name_for_content_type(content_type: RawBodyContentType) -> Option<&'static str> {
+    match content_type {
+        RawBodyContentType::Json => Some("JSON"),
+        RawBodyContentType::Xml => Some("XML"),
+        RawBodyContentType::Html => Some("HTML"),
+        RawBodyContentType::JavaScript => Some("JavaScript"),
+        RawBodyContentType::Text => None,
+    }
+}
+
 fn content_type_header_value(content_type: RawBodyContentType) -> &'static str {
     match content_type {
         RawBodyContentType::Json => "application/json",
@@ -600,6 +610,10 @@ impl RequestView {
                 window,
                 cx,
             );
+        }
+
+        if this.body_kind == BodyKind::Raw {
+            this.sync_body_language(this.body_content_type, window, cx);
         }
 
         this.watch_editor(this.url_editor.clone(), window, cx, |this, editor, cx| {
@@ -1048,7 +1062,41 @@ impl RequestView {
         self.body_content_type = content_type;
         self.persist_body(cx);
         self.sync_content_type_header(content_type, window, cx);
+        self.sync_body_language(content_type, window, cx);
         cx.notify();
+    }
+
+    /// Attaches the language matching `content_type` to the body editor's
+    /// buffer, so switching content types re-highlights the existing text
+    /// rather than leaving it in whatever language was attached before.
+    /// `Text` has no language (plain text is plain text).
+    fn sync_body_language(
+        &mut self,
+        content_type: RawBodyContentType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(language_name) = language_name_for_content_type(content_type) else {
+            if let Some(buffer) = self.body_editor.read(cx).buffer().read(cx).as_singleton() {
+                buffer.update(cx, |buffer, cx| buffer.set_language(None, cx));
+            }
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let languages = workspace.read(cx).app_state().languages.clone();
+        let language_task = languages.language_for_name(language_name);
+        let body_editor = self.body_editor.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let language = language_task.await.log_err();
+            body_editor.update(cx, |editor, cx| {
+                if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                    buffer.update(cx, |buffer, cx| buffer.set_language(language, cx));
+                }
+            });
+        })
+        .detach();
     }
 
     /// Ensures exactly one `Content-Type` header exists with the value
@@ -3242,6 +3290,51 @@ mod tests {
     use crate::store::ApiClientStore;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
+
+    #[test]
+    fn every_raw_body_content_type_maps_to_the_matching_language_and_header_value() {
+        assert_eq!(
+            language_name_for_content_type(RawBodyContentType::Json),
+            Some("JSON")
+        );
+        assert_eq!(
+            content_type_header_value(RawBodyContentType::Json),
+            "application/json"
+        );
+        assert_eq!(
+            language_name_for_content_type(RawBodyContentType::Xml),
+            Some("XML")
+        );
+        assert_eq!(
+            content_type_header_value(RawBodyContentType::Xml),
+            "application/xml"
+        );
+        assert_eq!(
+            language_name_for_content_type(RawBodyContentType::Html),
+            Some("HTML")
+        );
+        assert_eq!(
+            content_type_header_value(RawBodyContentType::Html),
+            "text/html"
+        );
+        assert_eq!(
+            language_name_for_content_type(RawBodyContentType::JavaScript),
+            Some("JavaScript")
+        );
+        assert_eq!(
+            content_type_header_value(RawBodyContentType::JavaScript),
+            "application/javascript"
+        );
+        assert_eq!(
+            language_name_for_content_type(RawBodyContentType::Text),
+            None,
+            "plain text has no language to attach"
+        );
+        assert_eq!(
+            content_type_header_value(RawBodyContentType::Text),
+            "text/plain"
+        );
+    }
 
     #[test]
     fn each_http_method_has_a_fixed_semantic_color_matching_its_string_label_mapping() {
