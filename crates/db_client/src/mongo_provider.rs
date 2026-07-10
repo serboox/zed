@@ -769,6 +769,57 @@ fn bson_to_cell_text(value: &Bson) -> String {
     }
 }
 
+/// Renders a single BSON value the way it would be written in a `mongosh`
+/// literal (index key directions like `1`/`-1`, string index types like
+/// `"text"`, booleans, etc.) — index specs only ever contain these simple
+/// scalar shapes, so this does not need to handle the full BSON type space.
+fn bson_shell_literal(value: &Bson) -> String {
+    match value {
+        Bson::Int32(v) => v.to_string(),
+        Bson::Int64(v) => v.to_string(),
+        Bson::Double(v) => v.to_string(),
+        Bson::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        Bson::Boolean(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Renders a BSON document as a `mongosh`-style object literal, e.g.
+/// `{ name: 1, age: -1 }`.
+fn bson_shell_document(document: &Document) -> String {
+    let fields = document
+        .iter()
+        .map(|(key, value)| format!("{key}: {}", bson_shell_literal(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{ {fields} }}")
+}
+
+/// Synthesizes the `db.<collection>.createIndex(...)` call that would
+/// recreate `index`, mirroring the key/uniqueness/name options it actually
+/// has — the closest Mongo equivalent to `SHOW CREATE TABLE` including a
+/// table's indexes.
+fn format_create_index(table: &str, index: &mongodb::IndexModel) -> String {
+    let keys = bson_shell_document(&index.keys);
+    let mut option_fields = Vec::new();
+    if let Some(options) = &index.options {
+        if options.unique == Some(true) {
+            option_fields.push("unique: true".to_string());
+        }
+        if let Some(name) = &options.name {
+            option_fields.push(format!("name: \"{}\"", name.replace('"', "\\\"")));
+        }
+    }
+    if option_fields.is_empty() {
+        format!("db.{table}.createIndex({keys});\n")
+    } else {
+        format!(
+            "db.{table}.createIndex({keys}, {{ {} }});\n",
+            option_fields.join(", ")
+        )
+    }
+}
+
 fn bson_type_name(value: &Bson) -> &'static str {
     match value {
         Bson::String(_) => "string",
@@ -1046,7 +1097,12 @@ impl DbProvider for MongoProvider {
     /// MongoDB has no `CREATE TABLE` analog. Reports a synthesized summary
     /// (sampled field list, document count) instead of fabricating fake DDL
     /// syntax — mirrors `RedisProvider::get_table_ddl`'s honesty for a
-    /// schemaless engine.
+    /// schemaless engine. The collection is implicitly created on first use,
+    /// so `createCollection` is shown for symmetry with "how would I
+    /// recreate this", not because Mongo requires it. Every collection's
+    /// automatic `_id_` index is inherent, not something the user created
+    /// (the same way `SHOW CREATE TABLE` doesn't list an implicit primary
+    /// key as a separate `CREATE INDEX`), so it is omitted here too.
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
         let columns = self.describe_table(database, table).await?;
         let coll = self.collection(database, table);
@@ -1054,6 +1110,13 @@ impl DbProvider for MongoProvider {
             .estimated_document_count()
             .await
             .context("Failed to count MongoDB documents")?;
+        let indexes = coll
+            .list_indexes()
+            .await
+            .context("Failed to list MongoDB indexes")?
+            .try_collect::<Vec<_>>()
+            .await
+            .context("Failed to read a MongoDB index definition")?;
 
         let mut summary = format!(
             "-- MongoDB collection \"{}\" is schemaless; there is no CREATE TABLE statement.\n-- {} document(s), sampled schema below:\n",
@@ -1069,6 +1132,14 @@ impl DbProvider for MongoProvider {
                 "--   {}: {}{}\n",
                 column.name, column.data_type, nullable
             ));
+        }
+        summary.push_str(&format!("\ndb.createCollection(\"{table}\");\n"));
+        for index in indexes {
+            let index_name = index.options.as_ref().and_then(|o| o.name.as_deref());
+            if index_name == Some("_id_") {
+                continue;
+            }
+            summary.push_str(&format_create_index(table, &index));
         }
         Ok(summary)
     }
@@ -1362,5 +1433,111 @@ mod tests {
                 ],
             ]
         );
+    }
+}
+
+/// Integration tests against a real MongoDB server.
+///
+/// Set MONGO_TEST_URL=mongodb://host:port before running, then use
+/// `cargo test -p db_client --ignored -- mongo` to execute.
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::connection::DatabaseDriver;
+    use uuid::Uuid;
+
+    fn test_config_from_env() -> Option<ConnectionConfig> {
+        let url = std::env::var("MONGO_TEST_URL").ok()?;
+        let url = url.strip_prefix("mongodb://")?;
+        let (host, port_str) = url.split_once(':').unwrap_or((url, "27017"));
+        let port: u16 = port_str.parse().unwrap_or(27017);
+
+        Some(ConnectionConfig {
+            id: Uuid::new_v4(),
+            label: "test".to_string(),
+            driver: DatabaseDriver::MongoDB,
+            host: host.to_string(),
+            port,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            auto_connect: false,
+            ..ConnectionConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn get_table_ddl_reconstructs_created_indexes() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection_name = "orders";
+
+        let test_result: Result<()> = async {
+            let collection = provider.collection(&database, collection_name);
+            collection
+                .insert_one(doc! { "customer_id": 1i64, "status": "open" })
+                .await
+                .context("Failed to seed a document")?;
+            collection
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { "customer_id": 1 })
+                        .build(),
+                )
+                .await
+                .context("Failed to create a plain index")?;
+            collection
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { "status": 1 })
+                        .options(
+                            mongodb::options::IndexOptions::builder()
+                                .name("status_unique_idx".to_string())
+                                .unique(true)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await
+                .context("Failed to create a unique named index")?;
+
+            let ddl = provider.get_table_ddl(&database, collection_name).await?;
+
+            assert!(
+                ddl.contains("db.createCollection(\"orders\");"),
+                "expected a createCollection call, got: {ddl}"
+            );
+            assert!(
+                ddl.contains("db.orders.createIndex({ customer_id: 1 }, { name: \"customer_id_1\" });"),
+                "expected the plain index (auto-named by the driver), got: {ddl}"
+            );
+            assert!(
+                ddl.contains(
+                    "db.orders.createIndex({ status: 1 }, { unique: true, name: \"status_unique_idx\" });"
+                ) || ddl.contains(
+                    "db.orders.createIndex({ status: 1 }, { name: \"status_unique_idx\", unique: true });"
+                ),
+                "expected the unique named index, got: {ddl}"
+            );
+            assert!(
+                !ddl.contains("createIndex({ _id: 1 }"),
+                "the implicit _id_ index must not be listed as a created index, got: {ddl}"
+            );
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
     }
 }
