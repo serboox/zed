@@ -2,9 +2,9 @@ use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::ApiClientStore;
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{
-    ApiKeyPlacement, AuthConfig, AwsSigV4Config, Header, HistoryEntry, HttpMethod, JwtAlgorithm,
-    JwtAuthConfig, OAuth2Config, OAuth2GrantType, QueryParam, RawBodyContentType, Request,
-    RequestBody, RequestId, ResolveMode, SavedExample, SystemDynamicVariableSource,
+    ApiKeyPlacement, AuthConfig, AwsSigV4Config, EnvironmentId, Header, HistoryEntry, HttpMethod,
+    JwtAlgorithm, JwtAuthConfig, OAuth2Config, OAuth2GrantType, QueryParam, RawBodyContentType,
+    Request, RequestBody, RequestId, ResolveMode, SavedExample, SystemDynamicVariableSource,
 };
 use editor::{Editor, EditorEvent, HighlightKey};
 use gpui::{
@@ -13,7 +13,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*,
+    ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar,
+    prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
@@ -30,7 +31,7 @@ fn variable_maps_for(
     std::collections::BTreeMap<String, String>,
 ) {
     let environment = store
-        .active_environment()
+        .effective_environment_for(request)
         .map(|environment| {
             environment
                 .variables
@@ -70,10 +71,11 @@ fn apply_script_variable_changes(
     cx: &mut Context<ApiClientStore>,
 ) {
     if after_environment != before_environment {
-        if let Some(active_environment_id) =
-            store.active_environment().map(|environment| environment.id)
+        if let Some(effective_environment_id) = store
+            .effective_environment_for(request)
+            .map(|environment| environment.id)
         {
-            store.update_environment(Some(active_environment_id), cx, |environment| {
+            store.update_environment(Some(effective_environment_id), cx, |environment| {
                 for (key, value) in after_environment {
                     if let Some(variable) = environment
                         .variables
@@ -295,6 +297,7 @@ pub struct RequestView {
     test_results: Vec<api_client::TestResult>,
     visualize_data: Option<serde_json::Value>,
     scroll_handle: ScrollHandle,
+    environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -564,6 +567,7 @@ impl RequestView {
             test_results: Vec::new(),
             visualize_data: None,
             scroll_handle: ScrollHandle::new(),
+            environment_pin_handle: ui::PopoverMenuHandle::default(),
             _subscriptions: Vec::new(),
         };
 
@@ -1565,6 +1569,86 @@ impl RequestView {
     /// The row of selectable method chips at the top of the request editor,
     /// each tinted with `method_color` so the active method is recognizable
     /// by color alone, not just by which chip is highlighted.
+    fn set_pinned_environment(
+        &mut self,
+        environment_id: Option<EnvironmentId>,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.set_request_pinned_environment(request_id, environment_id, cx)
+        });
+        cx.notify();
+    }
+
+    /// A compact control letting this request override the store's globally
+    /// active environment with one it's always meant to run against --
+    /// shows "Active Environment" when unpinned, or the pinned environment's
+    /// name otherwise, so it's obvious at a glance which environment this
+    /// specific request will actually resolve `{{tokens}}` against.
+    fn render_environment_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let pinned_id = store
+            .requests
+            .iter()
+            .find(|request| request.id == self.request_id)
+            .and_then(|request| request.pinned_environment_id);
+        let pinned_name = pinned_id
+            .and_then(|id| store.environment_by_id(id))
+            .map(|environment| environment.name.clone());
+        let trigger_label: SharedString = match &pinned_name {
+            Some(name) => format!("Pinned: {name}").into(),
+            None => "Active Environment".into(),
+        };
+        let environments: Vec<(EnvironmentId, String)> = store
+            .environments
+            .iter()
+            .map(|environment| (environment.id, environment.name.clone()))
+            .collect();
+        let view = cx.entity();
+        let popover_handle = self.environment_pin_handle.clone();
+
+        div()
+            .id("request-environment-pin")
+            .debug_selector(|| "request-environment-pin".to_string())
+            .child(
+                ui::PopoverMenu::new("request-environment-pin-popover")
+                    .with_handle(popover_handle)
+                    .trigger(
+                        Button::new("request-environment-pin-trigger", trigger_label)
+                            .start_icon(Icon::new(IconName::Pin))
+                            .style(if pinned_id.is_some() {
+                                ButtonStyle::Tinted(ui::TintColor::Accent)
+                            } else {
+                                ButtonStyle::Subtle
+                            }),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        let environments = environments.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let menu = menu.entry("Use Active Environment", None, {
+                                let view = view.clone();
+                                move |_window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.set_pinned_environment(None, cx);
+                                    });
+                                }
+                            });
+                            environments.iter().fold(menu, |menu, (id, name)| {
+                                let view = view.clone();
+                                let id = *id;
+                                menu.entry(name.clone(), None, move |_window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.set_pinned_environment(Some(id), cx);
+                                    });
+                                })
+                            })
+                        }))
+                    }),
+            )
+    }
+
     fn render_method_selector_chip(
         label: &'static str,
         method: HttpMethod,
@@ -2721,6 +2805,7 @@ impl Render for RequestView {
         let is_options = matches!(method, HttpMethod::Options);
 
         let method_row = h_flex()
+            .w_full()
             .gap_1()
             .child(Self::render_method_selector_chip(
                 "GET",
@@ -2801,7 +2886,8 @@ impl Render for RequestView {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.start_custom_method(window, cx)),
                     )
-            });
+            })
+            .child(div().ml_auto().child(self.render_environment_pin(cx)));
 
         let url_row = h_flex()
             .w_full()
@@ -3252,6 +3338,30 @@ mod tests {
                 other => panic!("expected AuthConfig::AwsSigV4, got {other:?}"),
             }
         });
+    }
+
+    #[gpui::test]
+    async fn clicking_the_environment_pin_trigger_opens_its_picker(cx: &mut TestAppContext) {
+        let (store, _request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx);
+        });
+        draw(&mut cx);
+
+        let handle = view.read_with(&cx, |view, _| view.environment_pin_handle.clone());
+        assert!(
+            !handle.is_deployed(),
+            "the picker must start closed before any interaction"
+        );
+
+        let pin_trigger = debug_center(&mut cx, "request-environment-pin");
+        cx.simulate_click(pin_trigger, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            handle.is_deployed(),
+            "clicking the pin trigger must open its environment picker"
+        );
     }
 
     #[gpui::test]

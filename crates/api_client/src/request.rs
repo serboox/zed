@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::collection::CollectionId;
+use crate::environment::EnvironmentId;
 use crate::folder::FolderId;
 
 pub type RequestId = Uuid;
@@ -312,6 +313,11 @@ pub struct Request {
     pub test_script: String,
     #[serde(default)]
     pub examples: Vec<SavedExample>,
+    /// Overrides the store's globally active environment for this request
+    /// alone, for a request that is always meant to run against one
+    /// particular environment regardless of what's currently active.
+    #[serde(default)]
+    pub pinned_environment_id: Option<EnvironmentId>,
 }
 
 impl Request {
@@ -333,6 +339,7 @@ impl Request {
             pre_request_script: String::new(),
             test_script: String::new(),
             examples: Vec::new(),
+            pinned_environment_id: None,
         }
     }
 }

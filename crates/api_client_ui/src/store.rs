@@ -1014,6 +1014,36 @@ impl ApiClientStore {
             .and_then(|id| self.environments.iter().find(|e| e.id == id))
     }
 
+    pub fn environment_by_id(&self, id: EnvironmentId) -> Option<&Environment> {
+        self.environments
+            .iter()
+            .find(|environment| environment.id == id)
+    }
+
+    /// The environment a request's variables actually resolve against:
+    /// its own pinned environment when it has one, falling back to
+    /// whichever environment is currently active store-wide.
+    pub fn effective_environment_for(&self, request: &Request) -> Option<&Environment> {
+        request
+            .pinned_environment_id
+            .and_then(|id| self.environment_by_id(id))
+            .or_else(|| self.active_environment())
+    }
+
+    pub fn set_request_pinned_environment(
+        &mut self,
+        request_id: RequestId,
+        environment_id: Option<EnvironmentId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.requests.iter_mut().find(|r| r.id == request_id) else {
+            return;
+        };
+        request.pinned_environment_id = environment_id;
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
     /// Mutates an environment's variable list (add/edit/remove/reorder — the
     /// caller decides via `update`), then persists. Pass `None` for the
     /// global environment.
@@ -1075,7 +1105,7 @@ impl ApiClientStore {
     /// `variable_resolution::VariableContext` documents.
     pub fn variable_context_for(&self, request: &Request) -> api_client::VariableContext<'_> {
         api_client::VariableContext {
-            environment: self.active_environment(),
+            environment: self.effective_environment_for(request),
             collection: self
                 .collections
                 .iter()
@@ -1328,6 +1358,80 @@ mod tests {
             )
         });
         assert!(!moved);
+    }
+
+    #[gpui::test]
+    fn a_request_s_pinned_environment_overrides_the_globally_active_one(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let staging_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let production_id = store.update(cx, |store, cx| {
+            store.create_environment("Production".into(), cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_environment(Some(staging_id), cx, |environment| {
+                environment.variables.push(api_client::Variable::new(
+                    "base_url".into(),
+                    "https://staging.example.com".into(),
+                ));
+            });
+            store.update_environment(Some(production_id), cx, |environment| {
+                environment.variables.push(api_client::Variable::new(
+                    "base_url".into(),
+                    "https://prod.example.com".into(),
+                ));
+            });
+            store.set_active_environment(Some(production_id), cx);
+        });
+
+        let collection = api_client::Collection::new("Sample".into());
+        let mut request = api_client::Request::new(collection.id, "Get users".into());
+        request.pinned_environment_id = Some(staging_id);
+
+        store.read_with(cx, |store, _| {
+            let effective = store.effective_environment_for(&request).unwrap();
+            assert_eq!(
+                effective.id, staging_id,
+                "a pinned environment must win over the globally active one"
+            );
+        });
+
+        // Unpinned requests keep resolving against whatever is active.
+        let mut unpinned_request = request;
+        unpinned_request.pinned_environment_id = None;
+        store.read_with(cx, |store, _| {
+            let effective = store.effective_environment_for(&unpinned_request).unwrap();
+            assert_eq!(effective.id, production_id);
+        });
+    }
+
+    #[gpui::test]
+    fn setting_a_request_s_pinned_environment_persists_it(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let env_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.set_request_pinned_environment(request_id, Some(env_id), cx);
+        });
+        store.read_with(cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.pinned_environment_id, Some(env_id));
+        });
+        store.update(cx, |store, cx| {
+            store.set_request_pinned_environment(request_id, None, cx);
+        });
+        store.read_with(cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.pinned_environment_id, None);
+        });
     }
 
     #[gpui::test]
