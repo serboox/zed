@@ -1,11 +1,13 @@
 use crate::request_view::RequestView;
-use crate::store::{ApiClientStore, ApiClientStoreEvent, GlobalApiClientStore};
+use crate::store::{
+    ApiClientStore, ApiClientStoreEvent, GlobalApiClientStore, RelativePosition, TreeItemRef,
+};
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{Collection, CollectionId, EnvironmentId, Folder, FolderId, Request, RequestId};
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollHandle,
-    Styled, Subscription, WeakEntity, Window, div,
+    AnyElement, App, AsyncWindowContext, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
+    ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window, div,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -30,6 +32,56 @@ enum SelectedEntity {
     Collection(CollectionId),
     Folder(FolderId),
     Request(RequestId),
+}
+
+/// A tree row being dragged. Only folders and requests are draggable, mirroring
+/// `TreeItemRef` -- collections are top-level containers, not reorderable
+/// items. Mirrors `db_client_ui::panel::DraggedDbItem`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraggedApiItem {
+    Folder(FolderId),
+    Request(RequestId),
+}
+
+impl DraggedApiItem {
+    fn as_tree_item_ref(self) -> TreeItemRef {
+        match self {
+            DraggedApiItem::Folder(id) => TreeItemRef::Folder(id),
+            DraggedApiItem::Request(id) => TreeItemRef::Request(id),
+        }
+    }
+}
+
+/// Where a dragged item lands. `Folder` reparents into that folder (appended
+/// as its last child); `Before*`/`After*` insert next to that sibling.
+/// Mirrors `db_client_ui::panel::DropTarget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiDropTarget {
+    Folder(FolderId),
+    BeforeFolder(FolderId),
+    AfterFolder(FolderId),
+    BeforeRequest(RequestId),
+    AfterRequest(RequestId),
+}
+
+struct DraggedApiItemPreview {
+    label: SharedString,
+    icon: IconName,
+}
+
+impl Render for DraggedApiItemPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(Icon::new(self.icon).size(IconSize::XSmall))
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
 }
 
 enum TreeNode {
@@ -144,6 +196,7 @@ pub struct ApiClientPanel {
     selected_entity: Option<SelectedEntity>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     tree_scroll_handle: ScrollHandle,
+    drag_target: Option<ApiDropTarget>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -184,6 +237,7 @@ impl ApiClientPanel {
                     selected_entity: None,
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
+                    drag_target: None,
                     _subscriptions: vec![store_subscription],
                 }
             })
@@ -207,6 +261,86 @@ impl ApiClientPanel {
         if !self.collapsed_collections.remove(&id) {
             self.collapsed_collections.insert(id);
         }
+        cx.notify();
+    }
+
+    fn drag_preview(
+        label: SharedString,
+        icon: IconName,
+        cx: &mut App,
+    ) -> Entity<DraggedApiItemPreview> {
+        cx.new(|_| DraggedApiItemPreview { label, icon })
+    }
+
+    /// Classifies a pointer's relative vertical position within a folder row
+    /// (0.0 top .. 1.0 bottom) into a drop zone: the top and bottom quarters
+    /// insert before/after the row, the middle half reparents into it.
+    /// Mirrors `db_client_ui::panel::DatabasePanel::folder_drop_zone`.
+    fn folder_drop_zone(relative_y: f32, folder_id: FolderId) -> ApiDropTarget {
+        if relative_y < 0.25 {
+            ApiDropTarget::BeforeFolder(folder_id)
+        } else if relative_y > 0.75 {
+            ApiDropTarget::AfterFolder(folder_id)
+        } else {
+            ApiDropTarget::Folder(folder_id)
+        }
+    }
+
+    /// Classifies a pointer's relative vertical position within a request row.
+    /// Requests can't contain children, so the row splits evenly into
+    /// before/after halves with no reparent-into zone. Mirrors
+    /// `db_client_ui::panel::DatabasePanel::connection_drop_zone`.
+    fn request_drop_zone(relative_y: f32, request_id: RequestId) -> ApiDropTarget {
+        if relative_y < 0.5 {
+            ApiDropTarget::BeforeRequest(request_id)
+        } else {
+            ApiDropTarget::AfterRequest(request_id)
+        }
+    }
+
+    /// Applies a drop of `item` onto `target`. `Folder` reparents (cycle and
+    /// depth are guarded by the store, appending at the end); `Before*`/
+    /// `After*` insert `item` at that exact sibling position, reparenting it
+    /// too when the anchor lives under a different parent.
+    fn handle_drop(&mut self, item: DraggedApiItem, target: ApiDropTarget, cx: &mut Context<Self>) {
+        self.drag_target = None;
+        self.store.update(cx, |store, cx| match target {
+            ApiDropTarget::Folder(id) => {
+                store.move_item_into_folder(item.as_tree_item_ref(), id, cx);
+            }
+            ApiDropTarget::BeforeFolder(anchor) => {
+                store.reposition_item(
+                    item.as_tree_item_ref(),
+                    TreeItemRef::Folder(anchor),
+                    RelativePosition::Before,
+                    cx,
+                );
+            }
+            ApiDropTarget::AfterFolder(anchor) => {
+                store.reposition_item(
+                    item.as_tree_item_ref(),
+                    TreeItemRef::Folder(anchor),
+                    RelativePosition::After,
+                    cx,
+                );
+            }
+            ApiDropTarget::BeforeRequest(anchor) => {
+                store.reposition_item(
+                    item.as_tree_item_ref(),
+                    TreeItemRef::Request(anchor),
+                    RelativePosition::Before,
+                    cx,
+                );
+            }
+            ApiDropTarget::AfterRequest(anchor) => {
+                store.reposition_item(
+                    item.as_tree_item_ref(),
+                    TreeItemRef::Request(anchor),
+                    RelativePosition::After,
+                    cx,
+                );
+            }
+        });
         cx.notify();
     }
 
@@ -1310,15 +1444,24 @@ impl ApiClientPanel {
                 TreeNode::Folder { folder, children } => {
                     let folder_id = folder.id;
                     let collection_id = folder.collection_id;
+                    let folder_name = folder.name.clone();
                     let is_collapsed = self.collapsed_folders.contains(&folder_id);
                     let is_selected =
                         self.selected_entity == Some(SelectedEntity::Folder(folder_id));
+                    let is_reparent_target =
+                        self.drag_target == Some(ApiDropTarget::Folder(folder_id));
+                    let is_before_target =
+                        self.drag_target == Some(ApiDropTarget::BeforeFolder(folder_id));
+                    let is_after_target =
+                        self.drag_target == Some(ApiDropTarget::AfterFolder(folder_id));
                     let panel = cx.entity();
                     let row = h_flex()
                         .id(ElementId::from(SharedString::from(format!(
                             "api-client-folder-row-{folder_id}"
                         ))))
+                        .debug_selector(move || format!("api-client-folder-row-{folder_id}"))
                         .w_full()
+                        .relative()
                         .pl(px(8. + depth as f32 * 16.))
                         .py_1()
                         .gap_1()
@@ -1326,6 +1469,17 @@ impl ApiClientPanel {
                             row.bg(cx.theme().colors().element_selected)
                         })
                         .hover(|row| row.bg(cx.theme().colors().element_hover))
+                        .when(is_reparent_target, |row| {
+                            row.bg(cx.theme().colors().drop_target_background)
+                        })
+                        .when(is_before_target, |row| {
+                            row.border_t_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
+                        .when(is_after_target, |row| {
+                            row.border_b_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
                         .child(
                             Icon::new(if is_collapsed {
                                 IconName::ChevronRight
@@ -1339,6 +1493,31 @@ impl ApiClientPanel {
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Folder(folder_id));
                             this.toggle_folder_collapsed(folder_id, cx);
+                        }))
+                        .on_drag(DraggedApiItem::Folder(folder_id), {
+                            let folder_name = folder_name.clone();
+                            move |_, _, _, cx| {
+                                Self::drag_preview(folder_name.clone().into(), IconName::Folder, cx)
+                            }
+                        })
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<DraggedApiItem>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                let relative_y = (event.event.position.y - event.bounds.origin.y)
+                                    / event.bounds.size.height;
+                                let new_target = Self::folder_drop_zone(relative_y, folder_id);
+                                if this.drag_target != Some(new_target) {
+                                    this.drag_target = Some(new_target);
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, item: &DraggedApiItem, _, cx| {
+                            let target =
+                                this.drag_target.unwrap_or(ApiDropTarget::Folder(folder_id));
+                            this.handle_drop(*item, target, cx);
                         }));
                     let menu = right_click_menu(ElementId::from(SharedString::from(format!(
                         "api-client-folder-menu-{folder_id}"
@@ -1363,8 +1542,13 @@ impl ApiClientPanel {
                 }
                 TreeNode::Request(request) => {
                     let request_id = request.id;
+                    let request_name = request.name.clone();
                     let is_selected =
                         self.selected_entity == Some(SelectedEntity::Request(request_id));
+                    let is_before_target =
+                        self.drag_target == Some(ApiDropTarget::BeforeRequest(request_id));
+                    let is_after_target =
+                        self.drag_target == Some(ApiDropTarget::AfterRequest(request_id));
                     let panel = cx.entity();
                     let method_label = request.method.as_str().to_string();
                     let method_color = RequestView::method_color(&request.method);
@@ -1374,6 +1558,7 @@ impl ApiClientPanel {
                         ))))
                         .debug_selector(move || format!("api-client-request-row-{request_id}"))
                         .w_full()
+                        .relative()
                         .pl(px(24. + depth as f32 * 16.))
                         .py_1()
                         .gap_2()
@@ -1382,6 +1567,14 @@ impl ApiClientPanel {
                             row.bg(cx.theme().colors().element_selected)
                         })
                         .hover(|row| row.bg(cx.theme().colors().element_hover))
+                        .when(is_before_target, |row| {
+                            row.border_t_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
+                        .when(is_after_target, |row| {
+                            row.border_b_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
                         .child(RequestView::render_method_badge(
                             method_label.clone().into(),
                             method_color,
@@ -1391,6 +1584,36 @@ impl ApiClientPanel {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected_entity = Some(SelectedEntity::Request(request_id));
                             this.open_request(request_id, window, cx);
+                        }))
+                        .on_drag(DraggedApiItem::Request(request_id), {
+                            let request_name = request_name.clone();
+                            move |_, _, _, cx| {
+                                Self::drag_preview(
+                                    request_name.clone().into(),
+                                    IconName::ArrowRight,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<DraggedApiItem>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                let relative_y = (event.event.position.y - event.bounds.origin.y)
+                                    / event.bounds.size.height;
+                                let new_target = Self::request_drop_zone(relative_y, request_id);
+                                if this.drag_target != Some(new_target) {
+                                    this.drag_target = Some(new_target);
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, item: &DraggedApiItem, _, cx| {
+                            let target = this
+                                .drag_target
+                                .unwrap_or(ApiDropTarget::AfterRequest(request_id));
+                            this.handle_drop(*item, target, cx);
                         }));
                     let menu = right_click_menu(ElementId::from(SharedString::from(format!(
                         "api-client-request-menu-{request_id}"
@@ -1722,6 +1945,80 @@ mod tests {
                     .active_item_as::<crate::request_view::RequestView>(cx)
                     .is_some(),
                 "clicking a request row must open its RequestView in the active pane"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn dragging_a_top_level_request_onto_a_folder_row_reparents_it(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let folder_id = store
+            .update(&mut cx, |store, cx| {
+                store.create_folder(collection_id, "Auth".into(), None, cx)
+            })
+            .unwrap();
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let request_source = debug_center(
+            &mut cx,
+            format!("api-client-request-row-{request_id}").leak(),
+        );
+        let folder_target =
+            debug_center(&mut cx, format!("api-client-folder-row-{folder_id}").leak());
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .find(|r| r.id == request_id)
+                    .and_then(|r| r.folder_id),
+                None,
+                "the request must start outside any folder"
+            );
+        });
+
+        cx.simulate_mouse_down(request_source, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            folder_target,
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            folder_target,
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(folder_target, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .find(|r| r.id == request_id)
+                    .and_then(|r| r.folder_id),
+                Some(folder_id),
+                "dropping the request row onto the folder row must reparent it via the real \
+                 on_drag/on_drop path, not merely by calling handle_drop directly"
             );
         });
     }

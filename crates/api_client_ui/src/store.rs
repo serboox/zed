@@ -810,6 +810,55 @@ impl ApiClientStore {
         true
     }
 
+    /// Reparents `item` to be the last child of `folder_id`, for a drop
+    /// directly onto a folder row (as opposed to `reposition_item`, which
+    /// needs a sibling to anchor against and so can't target an empty
+    /// folder). Rejects the same cases `reposition_item` does: a folder
+    /// dropped into its own subtree, exceeding `MAX_FOLDER_DEPTH`, or a
+    /// cross-collection move. Mirrors
+    /// `db_client_ui::store::DatabaseStore::move_folder`/`move_connection_to_folder`.
+    pub fn move_item_into_folder(
+        &mut self,
+        item: TreeItemRef,
+        folder_id: FolderId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if item == TreeItemRef::Folder(folder_id) {
+            return false;
+        }
+        let Some((item_collection, _)) = self.tree_item_parent(item) else {
+            return false;
+        };
+        let Some(target_collection) = self
+            .folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.collection_id)
+        else {
+            return false;
+        };
+        if item_collection != target_collection {
+            return false;
+        }
+        if let TreeItemRef::Folder(item_id) = item {
+            if folder_id == item_id || self.is_descendant_of(folder_id, item_id) {
+                return false;
+            }
+            if self.folder_depth(folder_id) + self.subtree_height(item_id) > MAX_FOLDER_DEPTH {
+                return false;
+            }
+        }
+
+        let siblings = self.combined_siblings(target_collection, Some(folder_id));
+        let order = siblings.len() as i64;
+        self.set_tree_item_order(item, Some(folder_id), order);
+
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+        true
+    }
+
     // ----- Environments -----
 
     pub fn create_environment(&mut self, name: String, cx: &mut Context<Self>) -> EnvironmentId {
