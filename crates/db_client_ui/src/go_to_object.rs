@@ -83,6 +83,25 @@ pub struct GoToObjectDelegate {
     selected_index: usize,
 }
 
+/// Returns the query text that previews up to 500 rows/documents of `table`,
+/// in `driver`'s own query language, or `None` if the driver has no
+/// SQL-queryable "top 500 rows" concept for a table-shaped entry. Redis's
+/// pseudo-table entries group keys by pattern, not a SELECT-able relation, so
+/// confirming one is a no-op rather than sending a command that can only fail.
+fn preview_query_for_object(driver: DatabaseDriver, database: &str, table: &str) -> Option<String> {
+    match driver {
+        DatabaseDriver::Redis => None,
+        DatabaseDriver::MongoDB => Some(format!("db.{table}.find().limit(500)")),
+        _ => {
+            let quoted_db = driver.quote_identifier(database);
+            let quoted_table = driver.quote_identifier(table);
+            Some(format!(
+                "SELECT * FROM {quoted_db}.{quoted_table} LIMIT 500"
+            ))
+        }
+    }
+}
+
 impl GoToObjectDelegate {
     fn icon_for(kind: SchemaObjectKind) -> IconName {
         match kind {
@@ -98,9 +117,9 @@ impl GoToObjectDelegate {
     /// to page through and are ignored on confirm.
     fn open_data(&self, object: &SchemaObjectRef, window: &mut Window, cx: &mut App) {
         let Some(table) = &object.table else { return };
-        let quoted_db = self.driver.quote_identifier(&object.database);
-        let quoted_table = self.driver.quote_identifier(table);
-        let sql = format!("SELECT * FROM {quoted_db}.{quoted_table} LIMIT 500");
+        let Some(sql) = preview_query_for_object(self.driver, &object.database, table) else {
+            return;
+        };
         let connection_id = self.connection_id;
         let database = object.database.clone();
         let title = SharedString::from(table.clone());
@@ -240,5 +259,50 @@ impl PickerDelegate for GoToObjectDelegate {
                 .start_slot(Icon::new(Self::icon_for(object.kind)))
                 .child(Label::new(object.display_label())),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sql_family_driver_gets_a_quoted_select_with_a_row_cap() {
+        assert_eq!(
+            preview_query_for_object(DatabaseDriver::MySQL, "shop", "orders"),
+            Some("SELECT * FROM `shop`.`orders` LIMIT 500".to_string())
+        );
+        assert_eq!(
+            preview_query_for_object(DatabaseDriver::PostgreSQL, "shop", "orders"),
+            Some("SELECT * FROM \"shop\".\"orders\" LIMIT 500".to_string())
+        );
+    }
+
+    #[test]
+    fn cassandra_and_clickhouse_still_get_a_select_preview() {
+        assert!(preview_query_for_object(DatabaseDriver::Cassandra, "ks", "events").is_some());
+        assert!(preview_query_for_object(DatabaseDriver::ClickHouse, "db", "events").is_some());
+    }
+
+    // Before this fix, go-to-object unconditionally built a SQL SELECT for
+    // every driver, so confirming a MongoDB collection sent invalid SQL text
+    // to a shell-command executor and failed every time.
+    #[test]
+    fn mongodb_gets_a_shell_find_with_a_matching_limit() {
+        assert_eq!(
+            preview_query_for_object(DatabaseDriver::MongoDB, "app", "users"),
+            Some("db.users.find().limit(500)".to_string())
+        );
+    }
+
+    // Redis's pseudo-table entries group keys by pattern, not a queryable
+    // relation -- before this fix, confirming one sent a garbage "SELECT..."
+    // string into Redis's whitespace-tokenized command executor.
+    #[test]
+    fn redis_has_no_preview_query_and_is_a_no_op_on_confirm() {
+        assert_eq!(
+            preview_query_for_object(DatabaseDriver::Redis, "0", "session:*"),
+            None
+        );
     }
 }
