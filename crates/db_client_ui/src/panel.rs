@@ -3402,6 +3402,15 @@ fn dump_menu_label(driver: DatabaseDriver) -> Option<&'static str> {
     }
 }
 
+/// Whether `driver` speaks a schema shape (fixed table/column layout,
+/// SQL-style `WHERE`-filterable queries, `ALTER TABLE`-able DDL) that
+/// full-text search and schema diff can work against. MongoDB's collections
+/// have neither a fixed schema nor a SQL query surface, so both features are
+/// hidden for it rather than generating a query that can only fail.
+fn supports_relational_query_features(driver: DatabaseDriver) -> bool {
+    !matches!(driver, DatabaseDriver::MongoDB)
+}
+
 /// Label for the button/tooltip that opens a new query console, tailored to
 /// the driver's actual query language — MongoDB's console takes mongo shell
 /// commands (`db.<collection>.find({...})`), not SQL.
@@ -7751,14 +7760,16 @@ impl DatabasePanel {
                                             });
                                         }
                                     })
-                                    .entry("Search Data…", None, {
-                                        let entity = entity.clone();
-                                        let db = db.clone();
-                                        move |window, cx| {
-                                            entity.update(cx, |panel, cx| {
-                                                panel.open_full_text_search(id, db.clone(), window, cx);
-                                            });
-                                        }
+                                    .when(supports_relational_query_features(driver), |menu| {
+                                        menu.entry("Search Data…", None, {
+                                            let entity = entity.clone();
+                                            let db = db.clone();
+                                            move |window, cx| {
+                                                entity.update(cx, |panel, cx| {
+                                                    panel.open_full_text_search(id, db.clone(), window, cx);
+                                                });
+                                            }
+                                        })
                                     })
                                     .separator()
                                     .entry("Copy Name", None, {
@@ -8101,21 +8112,23 @@ impl DatabasePanel {
                                                             });
                                                         }
                                                     })
-                                                    .entry("Compare Schema…", None, {
-                                                        let entity = entity.clone();
-                                                        let db = db.clone();
-                                                        let tbl = tbl.clone();
-                                                        move |window, cx| {
-                                                            entity.update(cx, |panel, cx| {
-                                                                panel.open_schema_compare_picker(
-                                                                    id,
-                                                                    db.clone(),
-                                                                    tbl.clone(),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }
+                                                    .when(supports_relational_query_features(driver), |menu| {
+                                                        menu.entry("Compare Schema…", None, {
+                                                            let entity = entity.clone();
+                                                            let db = db.clone();
+                                                            let tbl = tbl.clone();
+                                                            move |window, cx| {
+                                                                entity.update(cx, |panel, cx| {
+                                                                    panel.open_schema_compare_picker(
+                                                                        id,
+                                                                        db.clone(),
+                                                                        tbl.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
+                                                        })
                                                     })
                                                     .entry("Copy Table to…", None, {
                                                         let entity = entity.clone();
@@ -9638,6 +9651,30 @@ mod tests {
             new_query_button_label(DatabaseDriver::Aerospike),
             "Get / Put / Scan"
         );
+    }
+
+    // Before this fix, "Search Data…" and "Compare Schema…" were offered
+    // unconditionally for every driver, including MongoDB, whose collections
+    // have no fixed schema and no SQL WHERE-clause query surface -- clicking
+    // either entry could only fail. This predicate is what gates both menu
+    // entries via `.when(...)` in `render_connection_item`.
+    #[test]
+    fn relational_query_features_are_hidden_only_for_mongodb() {
+        assert!(!supports_relational_query_features(DatabaseDriver::MongoDB));
+        for driver in [
+            DatabaseDriver::MySQL,
+            DatabaseDriver::PostgreSQL,
+            DatabaseDriver::SQLite,
+            DatabaseDriver::ClickHouse,
+            DatabaseDriver::Cassandra,
+            DatabaseDriver::Redis,
+            DatabaseDriver::Aerospike,
+        ] {
+            assert!(
+                supports_relational_query_features(driver),
+                "{driver:?} should still offer Search Data…/Compare Schema…"
+            );
+        }
     }
 
     #[test]
