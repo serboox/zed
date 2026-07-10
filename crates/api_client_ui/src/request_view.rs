@@ -183,6 +183,16 @@ fn highlight_variable_tokens(editor: &Entity<Editor>, cx: &mut App) {
     });
 }
 
+fn content_type_header_value(content_type: RawBodyContentType) -> &'static str {
+    match content_type {
+        RawBodyContentType::Json => "application/json",
+        RawBodyContentType::Xml => "application/xml",
+        RawBodyContentType::Html => "text/html",
+        RawBodyContentType::JavaScript => "application/javascript",
+        RawBodyContentType::Text => "text/plain",
+    }
+}
+
 fn new_single_line_editor(
     placeholder: &'static str,
     initial_value: &str,
@@ -1029,10 +1039,49 @@ impl RequestView {
         cx.notify();
     }
 
-    fn set_body_content_type(&mut self, content_type: RawBodyContentType, cx: &mut Context<Self>) {
+    fn set_body_content_type(
+        &mut self,
+        content_type: RawBodyContentType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.body_content_type = content_type;
         self.persist_body(cx);
+        self.sync_content_type_header(content_type, window, cx);
         cx.notify();
+    }
+
+    /// Ensures exactly one `Content-Type` header exists with the value
+    /// matching `content_type`, adding it if missing or overwriting an
+    /// existing one's value -- switching the Raw body's content type is an
+    /// explicit user action, so it's reasonable to always reassert the
+    /// matching header rather than leaving a stale value from a previous
+    /// content type in place.
+    fn sync_content_type_header(
+        &mut self,
+        content_type: RawBodyContentType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = content_type_header_value(content_type);
+        let existing = self.header_rows.iter().position(|row| {
+            row.key_editor
+                .read(cx)
+                .text(cx)
+                .eq_ignore_ascii_case("Content-Type")
+        });
+        match existing {
+            Some(index) => {
+                let value_editor = self.header_rows[index].value_editor.clone();
+                value_editor.update(cx, |editor, cx| {
+                    editor.set_text(value, window, cx);
+                });
+            }
+            None => {
+                self.push_header_row("Content-Type".into(), value.into(), true, window, cx);
+            }
+        }
+        self.persist_headers(cx);
     }
 
     fn set_auth_kind(&mut self, kind: AuthKind, cx: &mut Context<Self>) {
@@ -1879,8 +1928,8 @@ impl RequestView {
                             "Text",
                             content_type == RawBodyContentType::Text,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_content_type(RawBodyContentType::Text, cx);
+                            |this, _, window, cx| {
+                                this.set_body_content_type(RawBodyContentType::Text, window, cx);
                             },
                         ))
                         .child(Self::render_chip_scoped(
@@ -1888,8 +1937,8 @@ impl RequestView {
                             "JSON",
                             content_type == RawBodyContentType::Json,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_content_type(RawBodyContentType::Json, cx);
+                            |this, _, window, cx| {
+                                this.set_body_content_type(RawBodyContentType::Json, window, cx);
                             },
                         ))
                         .child(Self::render_chip_scoped(
@@ -1897,8 +1946,8 @@ impl RequestView {
                             "XML",
                             content_type == RawBodyContentType::Xml,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_content_type(RawBodyContentType::Xml, cx);
+                            |this, _, window, cx| {
+                                this.set_body_content_type(RawBodyContentType::Xml, window, cx);
                             },
                         ))
                         .child(Self::render_chip_scoped(
@@ -1906,8 +1955,8 @@ impl RequestView {
                             "HTML",
                             content_type == RawBodyContentType::Html,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_content_type(RawBodyContentType::Html, cx);
+                            |this, _, window, cx| {
+                                this.set_body_content_type(RawBodyContentType::Html, window, cx);
                             },
                         ))
                         .child(Self::render_chip_scoped(
@@ -1915,8 +1964,12 @@ impl RequestView {
                             "JavaScript",
                             content_type == RawBodyContentType::JavaScript,
                             cx,
-                            |this, _, _, cx| {
-                                this.set_body_content_type(RawBodyContentType::JavaScript, cx);
+                            |this, _, window, cx| {
+                                this.set_body_content_type(
+                                    RawBodyContentType::JavaScript,
+                                    window,
+                                    cx,
+                                );
                             },
                         ));
                     let colors = cx.theme().colors();
@@ -3650,6 +3703,52 @@ mod tests {
             cx.debug_bounds("request-send").is_some(),
             "the request editor must reappear after exiting fullscreen"
         );
+    }
+
+    #[gpui::test]
+    async fn picking_a_raw_body_content_type_auto_sets_the_content_type_header(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update(&mut cx, |view, cx| {
+            view.set_body_kind(BodyKind::Raw, cx);
+            view.active_tab = RequestTab::Body;
+        });
+        draw(&mut cx);
+
+        let json_chip = debug_center(&mut cx, "content-type-chip-JSON");
+        cx.simulate_click(json_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let header = view
+                .header_rows
+                .iter()
+                .find(|row| row.key_editor.read(cx).text(cx) == "Content-Type")
+                .expect("the JSON chip must add a Content-Type header");
+            assert_eq!(header.value_editor.read(cx).text(cx), "application/json");
+        });
+
+        let xml_chip = debug_center(&mut cx, "content-type-chip-XML");
+        cx.simulate_click(xml_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let content_type_rows: Vec<_> = view
+                .header_rows
+                .iter()
+                .filter(|row| row.key_editor.read(cx).text(cx) == "Content-Type")
+                .collect();
+            assert_eq!(
+                content_type_rows.len(),
+                1,
+                "switching content type must update the existing header, not add a duplicate"
+            );
+            assert_eq!(
+                content_type_rows[0].value_editor.read(cx).text(cx),
+                "application/xml"
+            );
+        });
     }
 
     #[gpui::test]
