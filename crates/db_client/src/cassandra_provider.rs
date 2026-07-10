@@ -391,6 +391,44 @@ impl DbProvider for CassandraProvider {
         }
 
         ddl.push_str(";\n");
+
+        let index_cql = format!(
+            "SELECT index_name, kind, options FROM system_schema.indexes WHERE keyspace_name = '{}' AND table_name = '{}'",
+            escape_cql_string(database),
+            escape_cql_string(table)
+        );
+        let index_result = self
+            .query(&index_cql)
+            .await?
+            .into_rows_result()
+            .context("Failed to read index list result")?;
+        let index_rows: Vec<(String, String, std::collections::HashMap<String, String>)> =
+            index_result
+                .rows::<(String, String, std::collections::HashMap<String, String>)>()
+                .context("Failed to deserialize index rows")?
+                .collect::<Result<_, _>>()
+                .context("Failed to read an index row")?;
+
+        for (index_name, kind, options) in index_rows {
+            let target = options.get("target").cloned().unwrap_or_default();
+            if kind == "CUSTOM" {
+                let class_name = options.get("class_name").cloned().unwrap_or_default();
+                ddl.push_str(&format!(
+                    "CREATE CUSTOM INDEX {} ON {}.{} ({target}) USING '{class_name}';\n",
+                    quote_cql_identifier(&index_name),
+                    quote_cql_identifier(database),
+                    quote_cql_identifier(table),
+                ));
+            } else {
+                ddl.push_str(&format!(
+                    "CREATE INDEX {} ON {}.{} ({target});\n",
+                    quote_cql_identifier(&index_name),
+                    quote_cql_identifier(database),
+                    quote_cql_identifier(table),
+                ));
+            }
+        }
+
         Ok(ddl)
     }
 }
@@ -771,5 +809,68 @@ mod integration_tests {
             .expect("Failed to clean up scratch keyspace");
 
         test_result.expect("DDL reconstruction check failed");
+    }
+
+    /// A plain secondary index must be reconstructed as its own
+    /// `CREATE INDEX` statement, listed after the table it belongs to —
+    /// mirroring how CQL itself always issues them as two separate
+    /// statements, never inlined into `CREATE TABLE`.
+    #[tokio::test]
+    #[ignore]
+    async fn get_table_ddl_reconstructs_a_secondary_index_as_a_separate_statement() {
+        let config = test_config_from_env()
+            .expect("CASSANDRA_TEST_URL env var required for integration tests");
+        let provider = CassandraProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let keyspace = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let table = "t";
+
+        provider
+            .query(&format!(
+                "CREATE KEYSPACE {keyspace} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .expect("Failed to create scratch keyspace");
+
+        let test_result: Result<()> = async {
+            provider
+                .query(&format!(
+                    "CREATE TABLE {keyspace}.{table} (pk int PRIMARY KEY, status text)"
+                ))
+                .await?;
+            provider
+                .query(&format!(
+                    "CREATE INDEX status_idx ON {keyspace}.{table} (status)"
+                ))
+                .await?;
+
+            let ddl = provider.get_table_ddl(&keyspace, table).await?;
+            let create_table_end = ddl
+                .find(&format!("CREATE TABLE {keyspace}.{table} ("))
+                .expect("DDL must contain the CREATE TABLE statement");
+            let create_index_start = ddl
+                .find("CREATE INDEX")
+                .expect("DDL must contain a CREATE INDEX statement for the secondary index");
+            assert!(
+                create_index_start > create_table_end,
+                "CREATE INDEX must appear as a separate statement after CREATE TABLE, got: {ddl}"
+            );
+            assert!(
+                ddl.contains(&format!(
+                    "CREATE INDEX status_idx ON {keyspace}.{table} (status);"
+                )),
+                "expected a standalone CREATE INDEX statement for the secondary index, got: {ddl}"
+            );
+            Ok(())
+        }
+        .await;
+
+        provider
+            .query(&format!("DROP KEYSPACE {keyspace}"))
+            .await
+            .expect("Failed to clean up scratch keyspace");
+
+        test_result.expect("Secondary index DDL reconstruction check failed");
     }
 }
