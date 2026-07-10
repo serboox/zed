@@ -1,3 +1,4 @@
+use crate::request_view::RequestView;
 use crate::store::{ApiClientStore, ApiClientStoreEvent};
 use api_client::HistoryEntry;
 use gpui::{
@@ -178,11 +179,11 @@ fn render_history_row(
         .rounded_md()
         .cursor_pointer()
         .hover(|el| el.bg(colors.element_hover))
-        .child(
-            Label::new(entry.method.clone())
-                .size(LabelSize::Small)
-                .color(Color::Accent),
-        )
+        .child(RequestView::render_method_badge(
+            entry.method.clone().into(),
+            RequestView::method_color_for_label(&entry.method),
+            cx,
+        ))
         .child(
             h_flex()
                 .gap_1()

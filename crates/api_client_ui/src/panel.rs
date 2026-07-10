@@ -1,3 +1,4 @@
+use crate::request_view::RequestView;
 use crate::store::{ApiClientStore, ApiClientStoreEvent, GlobalApiClientStore};
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{Collection, CollectionId, EnvironmentId, Folder, FolderId, Request, RequestId};
@@ -1283,9 +1284,9 @@ impl ApiClientPanel {
                             } else {
                                 IconName::ChevronDown
                             })
-                            .size(IconSize::Small),
+                            .size(IconSize::XSmall),
                         )
-                        .child(Icon::new(IconName::FileTree).size(IconSize::Small))
+                        .child(Icon::new(IconName::FileTree).size(IconSize::XSmall))
                         .child(Label::new(collection.name.clone()).size(LabelSize::Small))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Collection(collection_id));
@@ -1331,9 +1332,9 @@ impl ApiClientPanel {
                             } else {
                                 IconName::ChevronDown
                             })
-                            .size(IconSize::Small),
+                            .size(IconSize::XSmall),
                         )
-                        .child(Icon::new(IconName::Folder).size(IconSize::Small))
+                        .child(Icon::new(IconName::Folder).size(IconSize::XSmall))
                         .child(Label::new(folder.name.clone()).size(LabelSize::Small))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Folder(folder_id));
@@ -1366,6 +1367,7 @@ impl ApiClientPanel {
                         self.selected_entity == Some(SelectedEntity::Request(request_id));
                     let panel = cx.entity();
                     let method_label = request.method.as_str().to_string();
+                    let method_color = RequestView::method_color(&request.method);
                     let row = h_flex()
                         .id(ElementId::from(SharedString::from(format!(
                             "api-client-request-row-{request_id}"
@@ -1373,16 +1375,17 @@ impl ApiClientPanel {
                         .w_full()
                         .pl(px(24. + depth as f32 * 16.))
                         .py_1()
-                        .gap_1()
+                        .gap_2()
+                        .items_center()
                         .when(is_selected, |row| {
                             row.bg(cx.theme().colors().element_selected)
                         })
                         .hover(|row| row.bg(cx.theme().colors().element_hover))
-                        .child(
-                            Label::new(method_label.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        )
+                        .child(RequestView::render_method_badge(
+                            method_label.clone().into(),
+                            method_color,
+                            cx,
+                        ))
                         .child(Label::new(request.name.clone()).size(LabelSize::Small))
                         .on_click(cx.listener(move |this, _, _window, _cx| {
                             this.selected_entity = Some(SelectedEntity::Request(request_id));

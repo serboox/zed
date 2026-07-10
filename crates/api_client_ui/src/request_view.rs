@@ -1476,6 +1476,85 @@ impl RequestView {
         Self::render_chip_scoped("request", label, is_selected, cx, on_click)
     }
 
+    /// The semantic accent each HTTP method reads as across the tree, the
+    /// method selector, and history -- a fixed mapping so the same verb
+    /// always carries the same color everywhere it appears.
+    pub(crate) fn method_color(method: &HttpMethod) -> Color {
+        match method {
+            HttpMethod::Get => Color::Info,
+            HttpMethod::Post => Color::Success,
+            HttpMethod::Put | HttpMethod::Patch => Color::Warning,
+            HttpMethod::Delete => Color::Error,
+            HttpMethod::Head | HttpMethod::Options | HttpMethod::Custom(_) => Color::Muted,
+        }
+    }
+
+    /// Same mapping as `method_color`, keyed by the method's display label --
+    /// for call sites (e.g. history entries) that only kept the method as a
+    /// plain string rather than a parsed `HttpMethod`.
+    pub(crate) fn method_color_for_label(label: &str) -> Color {
+        match label {
+            "GET" => Color::Info,
+            "POST" => Color::Success,
+            "PUT" | "PATCH" => Color::Warning,
+            "DELETE" => Color::Error,
+            _ => Color::Muted,
+        }
+    }
+
+    /// A compact, flat, color-coded method badge -- e.g. the small "GET" tag
+    /// shown next to a request's name in the tree and in history. Not a
+    /// button: purely a label, distinct from the selectable method chips in
+    /// `render_method_selector`.
+    pub(crate) fn render_method_badge(
+        label: SharedString,
+        color: Color,
+        cx: &App,
+    ) -> impl IntoElement {
+        div()
+            .px_1()
+            .rounded_sm()
+            .bg(color.color(cx).opacity(0.16))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .color(color)
+                    .buffer_font(cx),
+            )
+    }
+
+    /// The row of selectable method chips at the top of the request editor,
+    /// each tinted with `method_color` so the active method is recognizable
+    /// by color alone, not just by which chip is highlighted.
+    fn render_method_selector_chip(
+        label: &'static str,
+        method: HttpMethod,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &gpui::ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let color = Self::method_color(&method);
+        let tint = color.color(cx);
+        div()
+            .id(SharedString::from(format!("request-method-chip-{label}")))
+            .debug_selector(move || format!("request-method-chip-{label}"))
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_selected, |el| el.bg(tint.opacity(0.16)))
+            .when(!is_selected, |el| {
+                el.hover(|el| el.bg(cx.theme().colors().element_hover))
+            })
+            .child(
+                Label::new(label)
+                    .size(LabelSize::Small)
+                    .color(if is_selected { color } else { Color::Muted })
+                    .buffer_font(cx),
+            )
+            .on_click(cx.listener(on_click))
+    }
+
     /// Same visual chip as `render_chip`, but with a caller-supplied `scope`
     /// folded into the element id/debug selector -- needed wherever two chip
     /// strips can show the same label (e.g. the request tab strip's
@@ -2283,12 +2362,13 @@ impl RequestView {
                     .justify_between()
                     .child(
                         h_flex()
-                            .gap_4()
-                            .child(
-                                Label::new(format!("{status} {status_text}"))
-                                    .size(LabelSize::Small)
-                                    .color(status_color),
-                            )
+                            .gap_3()
+                            .items_center()
+                            .child(Self::render_method_badge(
+                                format!("{status} {status_text}").into(),
+                                status_color,
+                                cx,
+                            ))
                             .child(
                                 Label::new(format!("{elapsed_ms} ms"))
                                     .size(LabelSize::Small)
@@ -2309,7 +2389,7 @@ impl RequestView {
                             ),
                     );
 
-                let mut tab_strip = h_flex().gap_3().child(Self::render_chip_scoped(
+                let mut tab_strip = h_flex().gap_2().child(Self::render_chip_scoped(
                     "response-tab",
                     "Pretty",
                     response_tab == ResponseTab::Pretty,
@@ -2592,32 +2672,51 @@ impl Render for RequestView {
 
         let method_row = h_flex()
             .gap_1()
-            .child(Self::render_chip("GET", is_get, cx, |this, _, _, cx| {
-                this.set_method(HttpMethod::Get, cx)
-            }))
-            .child(Self::render_chip("POST", is_post, cx, |this, _, _, cx| {
-                this.set_method(HttpMethod::Post, cx)
-            }))
-            .child(Self::render_chip("PUT", is_put, cx, |this, _, _, cx| {
-                this.set_method(HttpMethod::Put, cx)
-            }))
-            .child(Self::render_chip(
+            .child(Self::render_method_selector_chip(
+                "GET",
+                HttpMethod::Get,
+                is_get,
+                cx,
+                |this, _, _, cx| this.set_method(HttpMethod::Get, cx),
+            ))
+            .child(Self::render_method_selector_chip(
+                "POST",
+                HttpMethod::Post,
+                is_post,
+                cx,
+                |this, _, _, cx| this.set_method(HttpMethod::Post, cx),
+            ))
+            .child(Self::render_method_selector_chip(
+                "PUT",
+                HttpMethod::Put,
+                is_put,
+                cx,
+                |this, _, _, cx| this.set_method(HttpMethod::Put, cx),
+            ))
+            .child(Self::render_method_selector_chip(
                 "PATCH",
+                HttpMethod::Patch,
                 is_patch,
                 cx,
                 |this, _, _, cx| this.set_method(HttpMethod::Patch, cx),
             ))
-            .child(Self::render_chip(
+            .child(Self::render_method_selector_chip(
                 "DELETE",
+                HttpMethod::Delete,
                 is_delete,
                 cx,
                 |this, _, _, cx| this.set_method(HttpMethod::Delete, cx),
             ))
-            .child(Self::render_chip("HEAD", is_head, cx, |this, _, _, cx| {
-                this.set_method(HttpMethod::Head, cx)
-            }))
-            .child(Self::render_chip(
+            .child(Self::render_method_selector_chip(
+                "HEAD",
+                HttpMethod::Head,
+                is_head,
+                cx,
+                |this, _, _, cx| this.set_method(HttpMethod::Head, cx),
+            ))
+            .child(Self::render_method_selector_chip(
                 "OPTIONS",
+                HttpMethod::Options,
                 is_options,
                 cx,
                 |this, _, _, cx| this.set_method(HttpMethod::Options, cx),
@@ -2656,7 +2755,7 @@ impl Render for RequestView {
 
         let active_tab = self.active_tab;
         let tab_strip = h_flex()
-            .gap_3()
+            .gap_2()
             .child(Self::render_chip(
                 "Params",
                 active_tab == RequestTab::Params,
@@ -2745,6 +2844,37 @@ mod tests {
     use crate::store::ApiClientStore;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
+
+    #[test]
+    fn each_http_method_has_a_fixed_semantic_color_matching_its_string_label_mapping() {
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Get),
+            RequestView::method_color_for_label("GET")
+        );
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Post),
+            RequestView::method_color_for_label("POST")
+        );
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Put),
+            RequestView::method_color_for_label("PUT")
+        );
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Patch),
+            RequestView::method_color_for_label("PATCH")
+        );
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Delete),
+            RequestView::method_color_for_label("DELETE")
+        );
+        assert_eq!(RequestView::method_color(&HttpMethod::Get), Color::Info);
+        assert_eq!(RequestView::method_color(&HttpMethod::Post), Color::Success);
+        assert_eq!(RequestView::method_color(&HttpMethod::Delete), Color::Error);
+        assert_eq!(
+            RequestView::method_color(&HttpMethod::Put),
+            RequestView::method_color(&HttpMethod::Patch)
+        );
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2836,7 +2966,7 @@ mod tests {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
         draw(&mut cx);
 
-        let post_chip = debug_center(&mut cx, "request-chip-POST");
+        let post_chip = debug_center(&mut cx, "request-method-chip-POST");
         cx.simulate_click(post_chip, gpui::Modifiers::none());
         cx.run_until_parked();
 
