@@ -1980,6 +1980,12 @@ fn append_sample_query(existing: &str, sample: &str) -> String {
 fn console_file_extension(driver: DatabaseDriver) -> &'static str {
     match driver {
         DatabaseDriver::MongoDB => "js",
+        // Redis commands (`GET key`, `HGETALL key`, ...) are whitespace
+        // tokens, not SQL syntax at all -- the SQL grammar has no keywords
+        // that match, so it would highlight (or fail to highlight) them
+        // incorrectly. Plain text is the honest choice: no grammar to
+        // misapply.
+        DatabaseDriver::Redis => "txt",
         _ => "sql",
     }
 }
@@ -3409,6 +3415,7 @@ fn new_query_button_label(driver: DatabaseDriver) -> &'static str {
     match driver {
         DatabaseDriver::MongoDB => "Queries",
         DatabaseDriver::Aerospike => "Get / Put / Scan",
+        DatabaseDriver::Redis => "Commands",
         _ => "SQL Queries",
     }
 }
@@ -9638,6 +9645,20 @@ mod tests {
             new_query_button_label(DatabaseDriver::Aerospike),
             "Get / Put / Scan"
         );
+        assert_eq!(new_query_button_label(DatabaseDriver::Redis), "Commands");
+    }
+
+    // Before this fix, every driver's console file (including Redis's) got a
+    // hardcoded `.sql` extension, so Zed's language-by-extension detection
+    // always applied the SQL grammar to Redis's whitespace-tokenized
+    // commands (`GET key`, `HGETALL key`) -- neither highlighting them
+    // correctly nor leaving them honestly unhighlighted.
+    #[test]
+    fn console_file_extension_gives_redis_plain_text_not_sql() {
+        assert_eq!(console_file_extension(DatabaseDriver::Redis), "txt");
+        assert_eq!(console_file_extension(DatabaseDriver::MongoDB), "js");
+        assert_eq!(console_file_extension(DatabaseDriver::MySQL), "sql");
+        assert_eq!(console_file_extension(DatabaseDriver::Cassandra), "sql");
     }
 
     #[test]
@@ -9764,6 +9785,35 @@ mod tests {
                 },
                 super::SqlStatementRun {
                     sql: "db.orders.insertOne({total: 10, note: 'x;y'})".to_string(),
+                    start_row: 1,
+                    end_row: 1,
+                },
+            ]
+        );
+    }
+
+    // Redis's console reuses the same `;`-delimited splitting as every other
+    // driver (see `console_file_extension`'s doc comment for why Redis
+    // doesn't get its own statement-boundary logic): a single command with
+    // no trailing `;` is correctly treated as one whole statement, and
+    // multiple commands must be `;`-terminated to run individually through
+    // the Exec/"run statement at cursor" features, exactly like SQL/Mongo
+    // scripts already are.
+    #[test]
+    fn statement_runs_in_range_splits_a_multi_command_redis_script() {
+        let text = "SET greeting \"hi;there\";\nHSET user:1 name \"a;b\"";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+
+        assert_eq!(
+            runs,
+            vec![
+                super::SqlStatementRun {
+                    sql: "SET greeting \"hi;there\"".to_string(),
+                    start_row: 0,
+                    end_row: 0,
+                },
+                super::SqlStatementRun {
+                    sql: "HSET user:1 name \"a;b\"".to_string(),
                     start_row: 1,
                     end_row: 1,
                 },
