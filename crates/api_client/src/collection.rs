@@ -16,6 +16,11 @@ pub struct Collection {
     pub description: Option<String>,
     #[serde(default)]
     pub variables: Vec<Variable>,
+    /// Position among sibling top-level collections, lowest first. Defaults
+    /// to 0 for documents written before this field existed, matching
+    /// `Folder::order`/`Request::order`'s own backward-compatible default.
+    #[serde(default)]
+    pub order: i64,
 }
 
 impl Collection {
@@ -25,6 +30,7 @@ impl Collection {
             name,
             description: None,
             variables: Vec::new(),
+            order: 0,
         }
     }
 }

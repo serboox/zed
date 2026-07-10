@@ -398,13 +398,111 @@ impl ApiClientStore {
     // ----- Collections -----
 
     pub fn create_collection(&mut self, name: String, cx: &mut Context<Self>) -> CollectionId {
-        let collection = Collection::new(name);
+        let mut collection = Collection::new(name);
+        collection.order = self.next_collection_order();
         let id = collection.id;
         self.collections.push(collection);
         cx.emit(ApiClientStoreEvent::TreeChanged);
         cx.notify();
         self.persist_collections(cx);
         id
+    }
+
+    fn next_collection_order(&self) -> i64 {
+        self.collections
+            .iter()
+            .map(|collection| collection.order)
+            .max()
+            .map_or(0, |order| order + 1)
+    }
+
+    /// Reorders `collection_id` among all top-level collections by swapping
+    /// order with the neighbor in `direction` (-1 up, +1 down). No-op at the
+    /// boundary. Mirrors `reorder_folder`/`reorder_request`, but collections
+    /// have no `parent_id` to scope siblings by -- the whole list is one
+    /// sibling group.
+    pub fn reorder_collection(
+        &mut self,
+        collection_id: CollectionId,
+        direction: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(order) = self
+            .collections
+            .iter()
+            .find(|collection| collection.id == collection_id)
+            .map(|collection| collection.order)
+        else {
+            return;
+        };
+        let mut siblings: Vec<(CollectionId, i64)> = self
+            .collections
+            .iter()
+            .map(|collection| (collection.id, collection.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings.iter().position(|(id, _)| *id == collection_id) else {
+            return;
+        };
+        let target = position as i64 + direction;
+        if target < 0 || target as usize >= siblings.len() {
+            return;
+        }
+        let (neighbor_id, neighbor_order) = siblings[target as usize];
+        for collection in self.collections.iter_mut() {
+            if collection.id == collection_id {
+                collection.order = neighbor_order;
+            } else if collection.id == neighbor_id {
+                collection.order = order;
+            }
+        }
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
+    /// Moves `collection_id` to sit immediately before/after `anchor_id`
+    /// among the top-level collections. Mirrors `reposition_item`'s
+    /// insert-among-siblings shape, but for the flat collection list rather
+    /// than folder/request `TreeItemRef`s.
+    pub fn reposition_collection(
+        &mut self,
+        collection_id: CollectionId,
+        anchor_id: CollectionId,
+        position: RelativePosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if collection_id == anchor_id {
+            return false;
+        }
+        let mut siblings: Vec<(CollectionId, i64)> = self
+            .collections
+            .iter()
+            .map(|collection| (collection.id, collection.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(item_index) = siblings.iter().position(|(id, _)| *id == collection_id) else {
+            return false;
+        };
+        let (item, _) = siblings.remove(item_index);
+        let Some(anchor_index) = siblings.iter().position(|(id, _)| *id == anchor_id) else {
+            return false;
+        };
+        let insert_at = match position {
+            RelativePosition::Before => anchor_index,
+            RelativePosition::After => anchor_index + 1,
+        };
+        siblings.insert(insert_at, (item, 0));
+
+        for (index, (id, _)) in siblings.into_iter().enumerate() {
+            if let Some(collection) = self.collections.iter_mut().find(|c| c.id == id) {
+                collection.order = index as i64;
+            }
+        }
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+        true
     }
 
     pub fn rename_collection(&mut self, id: CollectionId, name: String, cx: &mut Context<Self>) {
@@ -600,6 +698,30 @@ impl ApiClientStore {
         cx.emit(ApiClientStoreEvent::TreeChanged);
         cx.notify();
         self.persist_collections(cx);
+    }
+
+    /// Clones `id` into a new request in the same collection/folder, right
+    /// after the original in sibling order, with every field copied
+    /// (headers, body, auth, scripts) except its id and name -- mirrors how
+    /// `create_request` assigns a fresh id/order, but starts from an existing
+    /// request instead of a blank one.
+    pub fn duplicate_request(
+        &mut self,
+        id: RequestId,
+        cx: &mut Context<Self>,
+    ) -> Option<RequestId> {
+        let source = self.requests.iter().find(|r| r.id == id)?.clone();
+        let order = self.next_order_in(source.collection_id, source.folder_id);
+        let mut duplicate = source.clone();
+        duplicate.id = RequestId::new_v4();
+        duplicate.name = format!("Copy of {}", source.name);
+        duplicate.order = order;
+        let new_id = duplicate.id;
+        self.requests.push(duplicate);
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+        Some(new_id)
     }
 
     pub fn update_request(
@@ -1253,5 +1375,115 @@ mod tests {
             assert_eq!(store.requests.len(), 1);
             assert_eq!(store.requests[0].folder_id, Some(folder_id));
         });
+    }
+
+    #[gpui::test]
+    fn new_collections_are_ordered_after_existing_ones(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let first = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let second = store.update(cx, |store, cx| store.create_collection("B".into(), cx));
+        store.read_with(cx, |store, _| {
+            let first = store.collections.iter().find(|c| c.id == first).unwrap();
+            let second = store.collections.iter().find(|c| c.id == second).unwrap();
+            assert!(second.order > first.order);
+        });
+    }
+
+    #[gpui::test]
+    fn reorder_collection_swaps_with_its_neighbor(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let first = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let second = store.update(cx, |store, cx| store.create_collection("B".into(), cx));
+
+        store.update(cx, |store, cx| store.reorder_collection(second, -1, cx));
+
+        store.read_with(cx, |store, _| {
+            let first = store.collections.iter().find(|c| c.id == first).unwrap();
+            let second = store.collections.iter().find(|c| c.id == second).unwrap();
+            assert!(second.order < first.order, "B must now sort before A");
+        });
+    }
+
+    #[gpui::test]
+    fn reorder_collection_at_the_boundary_is_a_no_op(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let first = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let order_before = store.read_with(cx, |store, _| store.collections[0].order);
+
+        store.update(cx, |store, cx| store.reorder_collection(first, -1, cx));
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.collections[0].order, order_before);
+        });
+    }
+
+    #[gpui::test]
+    fn reposition_collection_moves_it_next_to_a_different_collection(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let a = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let b = store.update(cx, |store, cx| store.create_collection("B".into(), cx));
+        let c = store.update(cx, |store, cx| store.create_collection("C".into(), cx));
+
+        let moved = store.update(cx, |store, cx| {
+            store.reposition_collection(c, a, RelativePosition::Before, cx)
+        });
+        assert!(moved);
+
+        store.read_with(cx, |store, _| {
+            let mut ordered = store.collections.clone();
+            ordered.sort_by_key(|collection| collection.order);
+            let order: Vec<CollectionId> = ordered.into_iter().map(|c| c.id).collect();
+            assert_eq!(order, vec![c, a, b]);
+        });
+    }
+
+    #[gpui::test]
+    fn duplicate_request_copies_every_field_except_id_and_name(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let collection_id = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.url = "https://api.example.com/users".into();
+                request.headers.push(api_client::Header {
+                    key: "Accept".into(),
+                    value: "application/json".into(),
+                    enabled: true,
+                    description: None,
+                });
+            });
+        });
+
+        let duplicate_id = store
+            .update(cx, |store, cx| store.duplicate_request(request_id, cx))
+            .expect("duplicate_request must succeed for an existing request");
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.requests.len(), 2);
+            let original = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            let duplicate = store
+                .requests
+                .iter()
+                .find(|r| r.id == duplicate_id)
+                .unwrap();
+            assert_ne!(duplicate.id, original.id);
+            assert_eq!(duplicate.name, "Copy of Get users");
+            assert_eq!(duplicate.url, original.url);
+            assert_eq!(duplicate.headers.len(), original.headers.len());
+            assert_eq!(duplicate.headers[0].key, original.headers[0].key);
+            assert_eq!(duplicate.headers[0].value, original.headers[0].value);
+            assert_eq!(duplicate.collection_id, original.collection_id);
+            assert_eq!(duplicate.folder_id, original.folder_id);
+        });
+    }
+
+    #[gpui::test]
+    fn duplicate_request_is_none_for_an_unknown_id(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let missing = RequestId::new_v4();
+        let duplicate = store.update(cx, |store, cx| store.duplicate_request(missing, cx));
+        assert!(duplicate.is_none());
     }
 }

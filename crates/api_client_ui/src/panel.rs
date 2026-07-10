@@ -34,20 +34,23 @@ enum SelectedEntity {
     Request(RequestId),
 }
 
-/// A tree row being dragged. Only folders and requests are draggable, mirroring
-/// `TreeItemRef` -- collections are top-level containers, not reorderable
-/// items. Mirrors `db_client_ui::panel::DraggedDbItem`.
+/// A tree row being dragged. Folders and requests reparent/reorder through
+/// `TreeItemRef`; collections are a flat top-level list reordered directly
+/// through `ApiClientStore::reposition_collection` instead, since they have
+/// no parent to reparent into. Mirrors `db_client_ui::panel::DraggedDbItem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DraggedApiItem {
+    Collection(CollectionId),
     Folder(FolderId),
     Request(RequestId),
 }
 
 impl DraggedApiItem {
-    fn as_tree_item_ref(self) -> TreeItemRef {
+    fn as_tree_item_ref(self) -> Option<TreeItemRef> {
         match self {
-            DraggedApiItem::Folder(id) => TreeItemRef::Folder(id),
-            DraggedApiItem::Request(id) => TreeItemRef::Request(id),
+            DraggedApiItem::Collection(_) => None,
+            DraggedApiItem::Folder(id) => Some(TreeItemRef::Folder(id)),
+            DraggedApiItem::Request(id) => Some(TreeItemRef::Request(id)),
         }
     }
 }
@@ -62,6 +65,8 @@ enum ApiDropTarget {
     AfterFolder(FolderId),
     BeforeRequest(RequestId),
     AfterRequest(RequestId),
+    BeforeCollection(CollectionId),
+    AfterCollection(CollectionId),
 }
 
 struct DraggedApiItemPreview {
@@ -138,8 +143,10 @@ fn build_tree(
         nodes.into_iter().map(|(_, node)| node).collect()
     }
 
-    collections
-        .iter()
+    let mut ordered_collections: Vec<&Collection> = collections.iter().collect();
+    ordered_collections.sort_by_key(|collection| collection.order);
+    ordered_collections
+        .into_iter()
         .map(|collection| TreeNode::Collection {
             collection: collection.clone(),
             children: build_children(collection.id, None, folders, requests),
@@ -342,47 +349,81 @@ impl ApiClientPanel {
         }
     }
 
+    /// Classifies a pointer's relative vertical position within a collection
+    /// row. Collections are a flat top-level list -- like requests, they
+    /// split evenly into before/after halves with no reparent-into zone.
+    fn collection_drop_zone(relative_y: f32, collection_id: CollectionId) -> ApiDropTarget {
+        if relative_y < 0.5 {
+            ApiDropTarget::BeforeCollection(collection_id)
+        } else {
+            ApiDropTarget::AfterCollection(collection_id)
+        }
+    }
+
     /// Applies a drop of `item` onto `target`. `Folder` reparents (cycle and
     /// depth are guarded by the store, appending at the end); `Before*`/
     /// `After*` insert `item` at that exact sibling position, reparenting it
-    /// too when the anchor lives under a different parent.
+    /// too when the anchor lives under a different parent. `Before*Collection`/
+    /// `After*Collection` only accept a dragged `Collection` -- a folder or
+    /// request dropped onto a collection row is a no-op, since it has no
+    /// coherent meaning (collections don't nest inside each other).
     fn handle_drop(&mut self, item: DraggedApiItem, target: ApiDropTarget, cx: &mut Context<Self>) {
         self.drag_target = None;
         self.store.update(cx, |store, cx| match target {
             ApiDropTarget::Folder(id) => {
-                store.move_item_into_folder(item.as_tree_item_ref(), id, cx);
+                if let Some(item) = item.as_tree_item_ref() {
+                    store.move_item_into_folder(item, id, cx);
+                }
             }
             ApiDropTarget::BeforeFolder(anchor) => {
-                store.reposition_item(
-                    item.as_tree_item_ref(),
-                    TreeItemRef::Folder(anchor),
-                    RelativePosition::Before,
-                    cx,
-                );
+                if let Some(item) = item.as_tree_item_ref() {
+                    store.reposition_item(
+                        item,
+                        TreeItemRef::Folder(anchor),
+                        RelativePosition::Before,
+                        cx,
+                    );
+                }
             }
             ApiDropTarget::AfterFolder(anchor) => {
-                store.reposition_item(
-                    item.as_tree_item_ref(),
-                    TreeItemRef::Folder(anchor),
-                    RelativePosition::After,
-                    cx,
-                );
+                if let Some(item) = item.as_tree_item_ref() {
+                    store.reposition_item(
+                        item,
+                        TreeItemRef::Folder(anchor),
+                        RelativePosition::After,
+                        cx,
+                    );
+                }
             }
             ApiDropTarget::BeforeRequest(anchor) => {
-                store.reposition_item(
-                    item.as_tree_item_ref(),
-                    TreeItemRef::Request(anchor),
-                    RelativePosition::Before,
-                    cx,
-                );
+                if let Some(item) = item.as_tree_item_ref() {
+                    store.reposition_item(
+                        item,
+                        TreeItemRef::Request(anchor),
+                        RelativePosition::Before,
+                        cx,
+                    );
+                }
             }
             ApiDropTarget::AfterRequest(anchor) => {
-                store.reposition_item(
-                    item.as_tree_item_ref(),
-                    TreeItemRef::Request(anchor),
-                    RelativePosition::After,
-                    cx,
-                );
+                if let Some(item) = item.as_tree_item_ref() {
+                    store.reposition_item(
+                        item,
+                        TreeItemRef::Request(anchor),
+                        RelativePosition::After,
+                        cx,
+                    );
+                }
+            }
+            ApiDropTarget::BeforeCollection(anchor) => {
+                if let DraggedApiItem::Collection(id) = item {
+                    store.reposition_collection(id, anchor, RelativePosition::Before, cx);
+                }
+            }
+            ApiDropTarget::AfterCollection(anchor) => {
+                if let DraggedApiItem::Collection(id) = item {
+                    store.reposition_collection(id, anchor, RelativePosition::After, cx);
+                }
             }
         });
         cx.notify();
@@ -1093,6 +1134,12 @@ impl ApiClientPanel {
         });
     }
 
+    fn duplicate_request(&mut self, id: RequestId, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            store.duplicate_request(id, cx);
+        });
+    }
+
     fn show_context_menu(
         &mut self,
         menu: Entity<ContextMenu>,
@@ -1116,54 +1163,85 @@ impl ApiClientPanel {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<ContextMenu> {
+        let (can_move_up, can_move_down) = self.collection_move_bounds(collection_id, cx);
         ContextMenu::build(window, cx, move |menu, _, _| {
-            menu.entry("New Folder", None, {
-                let panel = panel.clone();
-                move |window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.start_new_folder(collection_id, None, window, cx)
-                    });
-                }
-            })
-            .entry("New Request", None, {
-                let panel = panel.clone();
-                move |window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.start_new_request(collection_id, None, window, cx)
-                    });
-                }
-            })
-            .entry("Edit Variables...", None, {
-                let panel = panel.clone();
-                move |window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.start_edit_collection_variables(collection_id, window, cx)
-                    });
-                }
-            })
-            .entry("Export as Postman Collection...", None, {
-                let panel = panel.clone();
-                move |window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.export_collection_as_postman(collection_id, window, cx)
-                    });
-                }
-            })
-            .separator()
-            .entry("Rename", None, {
-                let panel = panel.clone();
-                move |window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.start_rename_collection(collection_id, window, cx)
-                    });
-                }
-            })
-            .entry("Delete", None, {
-                let panel = panel.clone();
-                move |_window, cx| {
-                    panel.update(cx, |panel, cx| panel.delete_collection(collection_id, cx));
-                }
-            })
+            let menu = menu
+                .entry("New Folder", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.start_new_folder(collection_id, None, window, cx)
+                        });
+                    }
+                })
+                .entry("New Request", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.start_new_request(collection_id, None, window, cx)
+                        });
+                    }
+                })
+                .entry("Edit Variables...", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.start_edit_collection_variables(collection_id, window, cx)
+                        });
+                    }
+                })
+                .entry("Export as Postman Collection...", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.export_collection_as_postman(collection_id, window, cx)
+                        });
+                    }
+                })
+                .separator();
+            let menu = if can_move_up {
+                menu.entry("Move Up", None, {
+                    let panel = panel.clone();
+                    move |_window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.reorder_collection(collection_id, -1, cx)
+                            });
+                        });
+                    }
+                })
+            } else {
+                menu
+            };
+            let menu = if can_move_down {
+                menu.entry("Move Down", None, {
+                    let panel = panel.clone();
+                    move |_window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.store.update(cx, |store, cx| {
+                                store.reorder_collection(collection_id, 1, cx)
+                            });
+                        });
+                    }
+                })
+            } else {
+                menu
+            };
+            menu.separator()
+                .entry("Rename", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.start_rename_collection(collection_id, window, cx)
+                        });
+                    }
+                })
+                .entry("Delete", None, {
+                    let panel = panel.clone();
+                    move |_window, cx| {
+                        panel.update(cx, |panel, cx| panel.delete_collection(collection_id, cx));
+                    }
+                })
         })
     }
 
@@ -1279,6 +1357,12 @@ impl ApiClientPanel {
                 menu
             };
             menu.separator()
+                .entry("Duplicate", None, {
+                    let panel = panel.clone();
+                    move |_window, cx| {
+                        panel.update(cx, |panel, cx| panel.duplicate_request(request_id, cx));
+                    }
+                })
                 .entry("Copy as cURL", None, {
                     let panel = panel.clone();
                     move |_window, cx| {
@@ -1316,6 +1400,23 @@ impl ApiClientPanel {
         let context = store.variable_context_for(request);
         let curl = crate::code_generator::generate_curl(request, &context);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(curl));
+    }
+
+    /// Whether `collection_id` can move up/down among all top-level
+    /// collections, mirroring `folder_move_bounds`'s reasoning but scoped
+    /// to the flat collection list instead of one folder's siblings.
+    fn collection_move_bounds(&self, collection_id: CollectionId, cx: &App) -> (bool, bool) {
+        let store = self.store.read(cx);
+        let mut siblings: Vec<(CollectionId, i64)> = store
+            .collections
+            .iter()
+            .map(|collection| (collection.id, collection.order))
+            .collect();
+        siblings.sort_by_key(|(_, order)| *order);
+        let Some(position) = siblings.iter().position(|(id, _)| *id == collection_id) else {
+            return (false, false);
+        };
+        (position > 0, position + 1 < siblings.len())
     }
 
     /// Whether `folder_id` can move up/down among its sibling folders, mirroring
@@ -1440,9 +1541,14 @@ impl ApiClientPanel {
                     children,
                 } => {
                     let collection_id = collection.id;
+                    let collection_name = collection.name.clone();
                     let is_collapsed = !self.expanded_collections.contains(&collection_id);
                     let is_selected =
                         self.selected_entity == Some(SelectedEntity::Collection(collection_id));
+                    let is_before_target =
+                        self.drag_target == Some(ApiDropTarget::BeforeCollection(collection_id));
+                    let is_after_target =
+                        self.drag_target == Some(ApiDropTarget::AfterCollection(collection_id));
                     let panel = cx.entity();
                     let row = h_flex()
                         .id(ElementId::from(SharedString::from(format!(
@@ -1452,6 +1558,7 @@ impl ApiClientPanel {
                             format!("api-client-collection-row-{collection_id}")
                         })
                         .w_full()
+                        .relative()
                         .pl(px(8. + depth as f32 * 16.))
                         .py_1()
                         .gap_1()
@@ -1459,6 +1566,14 @@ impl ApiClientPanel {
                             row.bg(cx.theme().colors().element_selected)
                         })
                         .hover(|row| row.bg(cx.theme().colors().element_hover))
+                        .when(is_before_target, |row| {
+                            row.border_t_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
+                        .when(is_after_target, |row| {
+                            row.border_b_2()
+                                .border_color(cx.theme().colors().text_accent)
+                        })
                         .child(
                             Icon::new(if is_collapsed {
                                 IconName::ChevronRight
@@ -1472,6 +1587,37 @@ impl ApiClientPanel {
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.selected_entity = Some(SelectedEntity::Collection(collection_id));
                             this.toggle_collection_expanded(collection_id, cx);
+                        }))
+                        .on_drag(DraggedApiItem::Collection(collection_id), {
+                            let collection_name = collection_name.clone();
+                            move |_, _, _, cx| {
+                                Self::drag_preview(
+                                    collection_name.clone().into(),
+                                    IconName::FileTree,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<DraggedApiItem>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                let relative_y = (event.event.position.y - event.bounds.origin.y)
+                                    / event.bounds.size.height;
+                                let new_target =
+                                    Self::collection_drop_zone(relative_y, collection_id);
+                                if this.drag_target != Some(new_target) {
+                                    this.drag_target = Some(new_target);
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, item: &DraggedApiItem, _, cx| {
+                            let target = this
+                                .drag_target
+                                .unwrap_or(ApiDropTarget::AfterCollection(collection_id));
+                            this.handle_drop(*item, target, cx);
                         }));
                     let menu = right_click_menu(ElementId::from(SharedString::from(format!(
                         "api-client-collection-menu-{collection_id}"
@@ -2084,6 +2230,77 @@ mod tests {
                 Some(folder_id),
                 "dropping the request row onto the folder row must reparent it via the real \
                  on_drag/on_drop path, not merely by calling handle_drop directly"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn dragging_a_collection_row_onto_another_reorders_them(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let first = store.update(&mut cx, |store, cx| store.create_collection("A".into(), cx));
+        let second = store.update(&mut cx, |store, cx| store.create_collection("B".into(), cx));
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let first_row = debug_center(&mut cx, format!("api-client-collection-row-{first}").leak());
+        let second_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{second}").leak(),
+        );
+
+        store.read_with(&cx, |store, _| {
+            let first_order = store
+                .collections
+                .iter()
+                .find(|c| c.id == first)
+                .unwrap()
+                .order;
+            let second_order = store
+                .collections
+                .iter()
+                .find(|c| c.id == second)
+                .unwrap()
+                .order;
+            assert!(first_order < second_order, "A must start before B");
+        });
+
+        // `collection_drop_zone` maps the row's own center (relative_y == 0.5)
+        // to the "after" half (`relative_y < 0.5` is the only "before" case),
+        // so dropping A on B's center requests an "after" drop -- A must end
+        // up sorted after B.
+        cx.simulate_mouse_down(first_row, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(second_row, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_move(second_row, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(second_row, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            let first_order = store
+                .collections
+                .iter()
+                .find(|c| c.id == first)
+                .unwrap()
+                .order;
+            let second_order = store
+                .collections
+                .iter()
+                .find(|c| c.id == second)
+                .unwrap()
+                .order;
+            assert!(
+                second_order < first_order,
+                "dropping A after B must reorder them via the real on_drag/on_drop path, \
+                 not merely by calling reposition_collection directly"
             );
         });
     }
