@@ -459,14 +459,15 @@ fn is_truthy_bool(s: &str) -> bool {
     matches!(s.to_lowercase().as_str(), "1" | "true" | "t" | "yes" | "on")
 }
 
-fn bool_cell_display(value: &CellValue) -> (IconName, Color) {
+fn bool_cell_display(value: &CellValue) -> (String, Color) {
     match value {
-        CellValue::Null | CellValue::Default => (IconName::SquareMinus, Color::Muted),
+        CellValue::Null => (NULL_MARKER.to_string(), Color::Muted),
+        CellValue::Default => (DEFAULT_MARKER.to_string(), Color::Muted),
         CellValue::Text(s) => {
             if is_truthy_bool(s) {
-                (IconName::Check, Color::Success)
+                ("true".to_string(), Color::Default)
             } else {
-                (IconName::SquareMinus, Color::Muted)
+                ("false".to_string(), Color::Default)
             }
         }
     }
@@ -1024,6 +1025,12 @@ pub struct ResultView {
     result_generation: u64,
     // The generation the cached special view was built for.
     special_built_for: Option<u64>,
+    // Bumped by `begin_request` every time a new query is dispatched into this
+    // view. A caller that awaits a query's result compares the token it got
+    // back against `is_current_request` before applying that result, so an
+    // older, slower request that resolves after a newer one was dispatched
+    // loses the race instead of overwriting the newer result.
+    active_request: u64,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -1247,6 +1254,7 @@ impl ResultView {
             explain_view: None,
             result_generation: 0,
             special_built_for: None,
+            active_request: 0,
         }
     }
 
@@ -2254,6 +2262,21 @@ impl ResultView {
         cx.notify();
     }
 
+    /// Claims this view for a new in-flight request and returns a token
+    /// identifying it. A caller dispatching a query should call this once, up
+    /// front, and pass the returned token to `is_current_request` before
+    /// applying the query's result -- see the field doc on `active_request`.
+    pub fn begin_request(&mut self) -> u64 {
+        self.active_request = self.active_request.wrapping_add(1);
+        self.active_request
+    }
+
+    /// Whether `token` (from a prior `begin_request` call) is still this
+    /// view's most recent request, i.e. no newer request has superseded it.
+    pub fn is_current_request(&self, token: u64) -> bool {
+        self.active_request == token
+    }
+
     pub fn set_result(&mut self, result: QueryResult, cx: &mut Context<Self>) {
         self.result = Some(result);
         self.reset_special_view();
@@ -2338,6 +2361,11 @@ impl ResultView {
             SpecialResult::ExplainPlan => {
                 let plan_text = crate::explain_plan::plan_text_from_result(&result);
                 let roots = crate::explain_plan::parse_plan_tree(&plan_text);
+                let is_analyze = self
+                    .base_sql
+                    .as_deref()
+                    .map(crate::explain_plan::sql_requests_analyze)
+                    .unwrap_or(false);
                 let query_context = self
                     .store
                     .as_ref()
@@ -2360,7 +2388,13 @@ impl ResultView {
                         }
                     });
                 let view = cx.new(|cx| {
-                    crate::explain_plan::ExplainPlanView::new(roots, query_context, window, cx)
+                    crate::explain_plan::ExplainPlanView::new(
+                        roots,
+                        query_context,
+                        is_analyze,
+                        window,
+                        cx,
+                    )
                 });
                 self.explain_view = Some(view);
                 self.ddl_view = None;
@@ -2471,6 +2505,11 @@ impl ResultView {
         self.base_sql = Some(base_sql);
         self.fetch_target = DEFAULT_FETCH_TARGET;
         self.sort_columns.clear();
+        // Same reasoning as `set_query_result`: this is a new, unrelated
+        // query (e.g. an FK-navigation jump to a different table via
+        // `navigate_to_fk_row`), so a hidden-column index from whatever was
+        // shown before must not carry over.
+        self.hidden_columns.clear();
         self.start_fill(cx);
     }
 
@@ -2497,6 +2536,13 @@ impl ResultView {
         self.base_sql = Some(base_sql);
         self.fetch_target = DEFAULT_FETCH_TARGET;
         self.sort_columns.clear();
+        // Column-hide selections are per-result-shape, not a durable view
+        // preference: `hidden_columns` holds column *indices*, so carrying it
+        // into a new, unrelated query silently hides whatever column happens
+        // to land on the same index in the new result. `set_result` (used for
+        // same-query re-fetches, e.g. a sort-triggered refresh) intentionally
+        // leaves this alone, matching `sort_columns`'s split above.
+        self.hidden_columns.clear();
         self.loaded_rows = result.rows.len();
         self.set_result(result, cx);
     }
@@ -2543,6 +2589,14 @@ impl ResultView {
                 };
                 match task.await {
                     Ok(batch) => {
+                        // A newer fill (a re-run, a page-size change, or a query
+                        // dispatched straight into this view) may have started
+                        // and cancelled this one while the batch was in flight.
+                        // Applying it now would splice a stale batch into the
+                        // newer request's rows.
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let fetched = batch.rows.len();
                         if this
                             .update(cx, |view, cx| view.append_batch(batch, cx))
@@ -2556,6 +2610,9 @@ impl ResultView {
                         }
                     }
                     Err(err) => {
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
                         this.update(cx, |view, cx| view.set_error(format_query_error(&err), cx))
                             .ok();
                         return;
@@ -5557,14 +5614,14 @@ impl ResultView {
             return div().into_any_element();
         };
         // A flat `element_selected` fill reads as invisible against the grid's own
-        // background here; blending a visible tint into the grid's base color,
-        // mirroring the header cross-highlight's `text_accent.opacity` pattern,
-        // keeps contrast in both light and dark themes.
+        // background here; blend a strongly saturated accent tint into the grid's
+        // base color instead so the selection stays clearly visible over the zebra
+        // stripes in both light and dark themes.
         let selection_bg = cx
             .theme()
             .colors()
             .editor_background
-            .blend(cx.theme().colors().text_accent.opacity(0.14));
+            .blend(cx.theme().colors().text_accent.opacity(0.32));
         let active_cell_border = cx.theme().colors().border_focused;
         let search_match_bg = cx.theme().colors().search_match_background;
         let active_line_bg = cx.theme().colors().editor_active_line_background;
@@ -5669,11 +5726,22 @@ impl ResultView {
                     Some(cv) => cv.clone(),
                     None => CellValue::from_loaded(&self.loaded_cell_value(abs_idx, cell_idx)),
                 };
-                let (icon_name, color) = bool_cell_display(&cell_val);
-                Icon::new(icon_name)
-                    .size(IconSize::Small)
+                let (display, color) = bool_cell_display(&cell_val);
+                let label = Label::new(display.clone())
+                    .size(LabelSize::Small)
                     .color(if is_deleted { Color::Muted } else { color })
-                    .into_any_element()
+                    .single_line()
+                    .when(
+                        display == NULL_MARKER || display == DEFAULT_MARKER,
+                        |label| label.italic(),
+                    )
+                    .when(is_deleted, |label| label.strikethrough())
+                    .into_any_element();
+                Self::render_typed_cell_body(
+                    label,
+                    false,
+                    format!("CELL_TEXT-{abs_idx}-{cell_idx}"),
+                )
             } else {
                 // Show the pending value when one exists, else the loaded cell.
                 let (display, color) = match self.pending_cell_value(abs_idx, cell_idx) {
@@ -5729,7 +5797,7 @@ impl ResultView {
                     "cell-{abs_idx}-{cell_idx}"
                 ))))
                 .debug_selector(move || format!("CELL-{abs_idx}-{cell_idx}"))
-                .px_2()
+                .px_1p5()
                 .h(px(Self::GRID_ROW_H))
                 .w(width)
                 .flex_none()
@@ -6078,12 +6146,13 @@ impl ResultView {
         };
         let abs_idx = self.loaded_row_count() + added_idx;
         // See render_grid_row's identical comment: a flat element_selected fill is
-        // invisible here, so blend a visible tint into the grid's base color instead.
+        // invisible here, so blend a strongly saturated accent tint into the grid's
+        // base color instead.
         let selection_bg = cx
             .theme()
             .colors()
             .editor_background
-            .blend(cx.theme().colors().text_accent.opacity(0.14));
+            .blend(cx.theme().colors().text_accent.opacity(0.32));
         let active_cell_border = cx.theme().colors().border_focused;
         let heatmap_base = cx.theme().colors().editor_background;
         let heatmap_tint = cx.theme().colors().text_accent;
@@ -6174,11 +6243,17 @@ impl ResultView {
                     .into_any_element()
             } else if matches!(self.column_kind_at(cell_idx), CellEditorKind::Boolean) {
                 let cell_val = row.get(cell_idx).cloned().unwrap_or(CellValue::Null);
-                let (icon_name, color) = bool_cell_display(&cell_val);
-                Icon::new(icon_name)
-                    .size(IconSize::Small)
+                let (display, color) = bool_cell_display(&cell_val);
+                let label = Label::new(display)
+                    .size(LabelSize::Small)
                     .color(color)
-                    .into_any_element()
+                    .single_line()
+                    .into_any_element();
+                Self::render_typed_cell_body(
+                    label,
+                    false,
+                    format!("ADDED_CELL_TEXT-{added_idx}-{cell_idx}"),
+                )
             } else {
                 let (display, color) = match row.get(cell_idx) {
                     Some(value) => render_cell_value(value),
@@ -6212,7 +6287,7 @@ impl ResultView {
                         "added-cell-{added_idx}-{cell_idx}"
                     ))))
                     .debug_selector(move || format!("ADDED_CELL-{added_idx}-{cell_idx}"))
-                    .px_2()
+                    .px_1p5()
                     .h(px(Self::GRID_ROW_H))
                     .w(width)
                     .flex_none()
@@ -6982,7 +7057,7 @@ impl ResultView {
                         let header_inner = div()
                             .id(ElementId::from(SharedString::from(format!("col-header-{col_idx}"))))
                             .debug_selector(move || format!("COL_HEADER-{col_idx}"))
-                            .px_2()
+                            .px_1p5()
                             .h(px(Self::GRID_HEADER_H))
                             .w(width)
                             .flex_none()
@@ -6993,7 +7068,6 @@ impl ResultView {
                             .bg(header_bg)
                             .overflow_hidden()
                             .cursor_pointer()
-                            .font_weight(gpui::FontWeight::BOLD)
                             .hover(move |style| style.bg(header_cell_hover_bg))
                             .when(is_sorted, move |this| this.bg(sorted_header_bg))
                             .when(is_active_col, move |this| this.bg(active_header_bg))
@@ -9437,8 +9511,8 @@ impl ResultView {
 
     // Approximate row/header heights for enum popup positioning (px).
     // These match the py_1 + LabelSize::Small layout used throughout the grid.
-    const GRID_HEADER_H: f32 = 28.0;
-    const GRID_ROW_H: f32 = 26.0;
+    const GRID_HEADER_H: f32 = 24.0;
+    const GRID_ROW_H: f32 = 22.0;
 
     fn render_enum_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let popup = self.enum_popup.as_ref()?;
@@ -13539,8 +13613,8 @@ mod tests {
     }
 
     // Grid-audit item 7, rendering half: a boolean-looking column must classify as
-    // Boolean (and therefore render its icon, not raw "1"/"0" text) on the very
-    // first layout pass, before any describe_table metadata has loaded.
+    // Boolean (so it renders normalized "true"/"false" text, not the raw "1"/"0")
+    // on the very first layout pass, before any describe_table metadata has loaded.
     #[gpui::test]
     fn boolean_looking_column_classifies_as_boolean_before_metadata_loads(
         cx: &mut gpui::TestAppContext,
@@ -13563,6 +13637,104 @@ mod tests {
             );
             assert!(matches!(view.column_kind_at(1), CellEditorKind::Boolean));
         });
+    }
+
+    // Item 15: a Boolean value maps to plain "true"/"false" text; NULL/Default
+    // keep their dim markers rather than a per-row icon.
+    #[test]
+    fn bool_cell_display_maps_to_true_false_text() {
+        assert_eq!(
+            bool_cell_display(&CellValue::Text("1".to_string())).0,
+            "true"
+        );
+        assert_eq!(
+            bool_cell_display(&CellValue::Text("true".to_string())).0,
+            "true"
+        );
+        assert_eq!(
+            bool_cell_display(&CellValue::Text("0".to_string())).0,
+            "false"
+        );
+        assert_eq!(
+            bool_cell_display(&CellValue::Text("no".to_string())).0,
+            "false"
+        );
+        assert_eq!(bool_cell_display(&CellValue::Null).0, NULL_MARKER);
+        assert_eq!(bool_cell_display(&CellValue::Default).0, DEFAULT_MARKER);
+    }
+
+    // Item 15: a Boolean column renders its value through the shared text body
+    // (CELL_TEXT), not a per-row icon. Before the fix the Boolean branch emitted
+    // an `Icon` with no CELL_TEXT wrapper, so this bound was absent.
+    #[gpui::test]
+    fn boolean_column_renders_as_text_not_icon(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["id".to_string(), "is_active".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("1".to_string())],
+                vec![Some("2".to_string()), Some("0".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        };
+        let (_window, view, mut cx) = table_backed_result_window_with(cx, result);
+        view.update(&mut cx, |view, _| {
+            assert!(matches!(view.column_kind_at(1), CellEditorKind::Boolean));
+        });
+        let text_bounds = cx.debug_bounds("CELL_TEXT-0-1").expect(
+            "a Boolean cell must render through the shared text body (CELL_TEXT), not an icon",
+        );
+        assert!(
+            f32::from(text_bounds.size.width) > 0.0 && f32::from(text_bounds.size.height) > 0.0,
+            "the Boolean cell's text must paint a real, non-zero area, got {:?}",
+            text_bounds.size
+        );
+    }
+
+    // Item 10: the grid uses DataGrip-tight density -- 22px data rows, a 24px
+    // header, and 6px (px_1p5) horizontal cell padding.
+    #[gpui::test]
+    fn grid_density_matches_datagrip_row_and_header_heights(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = table_backed_result_window(cx);
+        let row_height = f32::from(
+            cx.debug_bounds("CELL-0-0")
+                .expect("expected a data cell to be measurable")
+                .size
+                .height,
+        );
+        assert!(
+            (row_height - 22.0).abs() <= 1.0,
+            "data rows must be ~22px tall (DataGrip density), got {row_height}px"
+        );
+        let header_height = f32::from(
+            cx.debug_bounds("COL_HEADER-0")
+                .expect("expected a header cell to be measurable")
+                .size
+                .height,
+        );
+        assert!(
+            (header_height - 24.0).abs() <= 1.0,
+            "the header row must be ~24px tall (DataGrip density), got {header_height}px"
+        );
+        // Column 1 ("name") is left-aligned text, so its inner text wrapper's left
+        // inset from the cell's left edge equals the horizontal padding.
+        let cell_left = f32::from(
+            cx.debug_bounds("CELL-0-1")
+                .expect("expected the text cell to be measurable")
+                .origin
+                .x,
+        );
+        let text_left = f32::from(
+            cx.debug_bounds("CELL_TEXT-0-1")
+                .expect("expected the text cell's inner wrapper to be measurable")
+                .origin
+                .x,
+        );
+        let left_pad = text_left - cell_left;
+        assert!(
+            (left_pad - 6.0).abs() <= 1.0,
+            "cell horizontal padding must tighten to px_1p5 (6px), got {left_pad}px"
+        );
     }
 
     // Grid-audit item 8: a numeric column's header label sits near the right edge
@@ -14733,6 +14905,73 @@ mod tests {
             view.move_column(0, 1, cx);
             assert_eq!(view.column_order, vec![1, 0]);
             assert_eq!(view.visible_columns, vec![1, 0]);
+        });
+    }
+
+    // A results tab is reused across unrelated queries (one tab per
+    // connection, per `show_result_in_pane`'s doc comment in panel.rs).
+    // Hiding a column while browsing one query's result must not silently
+    // hide a same-indexed but semantically unrelated column of the next,
+    // completely different query run in that same tab.
+    #[gpui::test]
+    fn set_query_result_clears_hidden_columns_from_a_previous_unrelated_query(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        let connection_id = uuid::Uuid::new_v4();
+        view.update(&mut cx, |view, cx| {
+            let store = cx.new(DatabaseStore::new);
+            view.hidden_columns.insert(1);
+            view.recompute_layout();
+            assert_eq!(
+                view.visible_columns,
+                vec![0],
+                "sanity check: hiding column 1 of the 2-column sample result leaves only column 0 visible"
+            );
+
+            view.set_query_result(
+                store.downgrade(),
+                connection_id,
+                "public".to_string(),
+                "SELECT * FROM some_other_table".to_string(),
+                wide_table_result(),
+                cx,
+            );
+
+            assert!(
+                view.hidden_columns.is_empty(),
+                "a brand-new, unrelated query's result must show all of its own columns, \
+                 not have columns silently hidden by a stale index left over from a \
+                 previous, different query's hidden-columns selection"
+            );
+            assert_eq!(view.visible_columns, (0..18).collect::<Vec<_>>());
+        });
+    }
+
+    // FK navigation (`navigate_to_fk_row`) reuses the same `ResultView` for an
+    // unrelated jump to a different table via `run_sql`, not `set_query_result`
+    // -- it needs the identical hidden-columns reset for the same reason.
+    #[gpui::test]
+    fn run_sql_clears_hidden_columns_from_a_previous_unrelated_query(cx: &mut gpui::TestAppContext) {
+        let (_window, view, mut cx) = table_backed_result_window(cx);
+        let connection_id = uuid::Uuid::new_v4();
+        view.update(&mut cx, |view, cx| {
+            let store = cx.new(DatabaseStore::new);
+            view.hidden_columns.insert(1);
+
+            view.run_sql(
+                store.downgrade(),
+                connection_id,
+                "public".to_string(),
+                "SELECT * FROM some_other_table".to_string(),
+                cx,
+            );
+
+            assert!(
+                view.hidden_columns.is_empty(),
+                "an FK-navigation jump to a different table must not carry over a \
+                 hidden-column index from whatever table was shown before"
+            );
         });
     }
 
