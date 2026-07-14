@@ -72,6 +72,18 @@ pub(crate) fn validate(
                 }
             }
             Err(err) => {
+                if driver == DatabaseDriver::ClickHouse
+                    && retry_after_blanking_aliased_final(
+                        dialect.as_ref(),
+                        statement_text,
+                        span.start,
+                        default_database,
+                        schema,
+                        &mut diagnostics,
+                    )
+                {
+                    continue;
+                }
                 let local_range =
                     syntax_error_range(statement_text, &err).unwrap_or(0..statement_text.len());
                 diagnostics.push(SqlDiagnostic {
@@ -110,12 +122,178 @@ fn validate_mongo_shell(text: &str) -> Vec<SqlDiagnostic> {
     diagnostics
 }
 
-/// Extracts a precise range from a `ParserError`'s message when it embeds a
-/// `Line: N, Column: M` location (most "unexpected token" errors do); falls
-/// back to `None` (the caller then flags the whole statement) for errors
-/// like an unexpected EOF, which have no specific token to point at.
-fn syntax_error_range(statement_text: &str, err: &ParserError) -> Option<Range<usize>> {
+/// ClickHouse requires `FINAL` to follow a table's alias (`FROM t AS e
+/// FINAL`), but `sqlparser`'s `ClickHouseDialect` only accepts it directly
+/// after the bare table name with no alias at all (`FROM t FINAL`) -- every
+/// aliased form is a parse error there, even though it is exactly the form
+/// ClickHouse itself requires once a query joins more than one table. Rather
+/// than let that upstream gap flag ordinary ClickHouse queries as broken,
+/// this repeatedly reparses after blanking out (with equal-length spaces, so
+/// every other token keeps its original line/column) *only* the exact
+/// `FINAL` token the parser itself just rejected -- never a blanket sweep of
+/// every `FINAL` in the statement -- and only when that token falls inside
+/// the top-level `FROM`-clause's table list, never after a `WHERE`/`GROUP
+/// BY`/etc. keyword. Both restrictions matter: a blanket sweep could turn an
+/// unrelated genuine mistake that happens to contain the word "final" (e.g.
+/// `WHERE a FINAL`, a plain syntax error) into a silently-accepted query.
+/// Returns `true` once a retry recovers a clean parse, in which case the
+/// caller must not also push the original syntax-error diagnostic.
+fn retry_after_blanking_aliased_final(
+    dialect: &dyn sqlparser::dialect::Dialect,
+    statement_text: &str,
+    statement_offset: usize,
+    default_database: Option<&str>,
+    schema: &dyn SchemaLookup,
+    out: &mut Vec<SqlDiagnostic>,
+) -> bool {
+    // Computed once against the original text: blanking never changes any
+    // other token's position, so the FROM-clause's boundaries never move
+    // between retries.
+    let Some(from_clause) = top_level_from_clause_range(statement_text) else {
+        return false;
+    };
+    let mut buffer = statement_text.as_bytes().to_vec();
+    // Bounded by how many `FINAL` tokens a statement could plausibly contain
+    // (each iteration permanently blanks one); this is just a defensive
+    // backstop -- well-formed input never comes close to it.
+    for _ in 0..16 {
+        let Ok(candidate) = std::str::from_utf8(&buffer) else {
+            return false;
+        };
+        match Parser::parse_sql(dialect, candidate) {
+            Ok(statements) => {
+                for statement in &statements {
+                    // `statement_text` (the original, unblanked text) is
+                    // passed here on purpose: blanking only overwrites
+                    // `FINAL`'s letters with spaces of the same length, so
+                    // every other token keeps the exact line/column it has
+                    // in the original, and ranges computed against the
+                    // original text are still correct for the reparsed
+                    // AST's spans.
+                    check_semantics(
+                        statement,
+                        statement_text,
+                        statement_offset,
+                        default_database,
+                        schema,
+                        out,
+                    );
+                }
+                return true;
+            }
+            Err(err) => {
+                let Some(token_range) = final_token_error_range(candidate, &err) else {
+                    return false;
+                };
+                if token_range.start < from_clause.start || token_range.end > from_clause.end {
+                    return false;
+                }
+                let Some(slice) = buffer.get_mut(token_range) else {
+                    return false;
+                };
+                slice.fill(b' ');
+            }
+        }
+    }
+    false
+}
+
+/// If `err` is specifically "found: FINAL" -- the exact wording `sqlparser`
+/// reports when it chokes on that literal keyword -- the byte range of that
+/// token in `text`, per the error's own reported line/column. Returns `None`
+/// for every other error shape, so the caller only ever blanks the one token
+/// the parser itself just rejected, never a heuristic guess.
+fn final_token_error_range(text: &str, err: &ParserError) -> Option<Range<usize>> {
     let message = err.to_string();
+    if !message.contains("found: FINAL at Line") {
+        return None;
+    }
+    let location = parser_error_location(&message)?;
+    let start = offset_for_location(text, location)?;
+    let end = start + "FINAL".len();
+    if text.get(start..end)?.eq_ignore_ascii_case("FINAL") {
+        Some(start..end)
+    } else {
+        None
+    }
+}
+
+/// Byte range of the top-level `FROM` clause's table/join list: from just
+/// after the first top-level `FROM` keyword up to whichever comes first --
+/// the next top-level clause keyword that can only follow a `FROM` clause,
+/// or the end of the statement. "Top-level" skips anything inside a quoted
+/// string/identifier, so a keyword spelled out in a string literal is never
+/// mistaken for a real clause boundary. Returns `None` when there is no
+/// top-level `FROM` at all.
+fn top_level_from_clause_range(text: &str) -> Option<Range<usize>> {
+    const CLAUSE_TERMINATORS: &[&str] = &[
+        "where",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "settings",
+        "window",
+        "qualify",
+        "union",
+        "except",
+        "intersect",
+        "into",
+        "format",
+    ];
+    let from_start = find_top_level_keyword(text, "from", 0)?;
+    let clause_start = from_start + "from".len();
+    let clause_end = CLAUSE_TERMINATORS
+        .iter()
+        .filter_map(|terminator| find_top_level_keyword(text, terminator, clause_start))
+        .min()
+        .unwrap_or(text.len());
+    Some(clause_start..clause_end)
+}
+
+/// Byte offset of the first case-insensitive, word-bounded occurrence of
+/// `keyword` in `text` at or after `from_index`, skipping any single/double/
+/// backtick-quoted span so a keyword spelled out inside a string literal or
+/// quoted identifier is never mistaken for a real one. Bytes `>= 0x80`
+/// (any non-ASCII UTF-8 byte) count as identifier bytes for the boundary
+/// check, so a match is never accepted right next to a non-ASCII character.
+fn find_top_level_keyword(text: &str, keyword: &str, from_index: usize) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let is_identifier_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
+    let mut index = from_index;
+    let mut quote: Option<u8> = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if lower[index..].starts_with(keyword) {
+            let end = index + keyword.len();
+            let before_is_boundary = index == 0 || !is_identifier_byte(bytes[index - 1]);
+            let after_is_boundary = end >= bytes.len() || !is_identifier_byte(bytes[end]);
+            if before_is_boundary && after_is_boundary {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Extracts `Line: N, Column: M` from a `ParserError`'s display message
+/// (most "unexpected token" errors embed one).
+fn parser_error_location(message: &str) -> Option<Location> {
     let line_marker = "Line: ";
     let line_start = message.find(line_marker)? + line_marker.len();
     let rest = &message[line_start..];
@@ -127,7 +305,16 @@ fn syntax_error_range(statement_text: &str, err: &ParserError) -> Option<Range<u
         .trim_end_matches(|c: char| !c.is_ascii_digit())
         .parse()
         .ok()?;
-    let start = offset_for_location(statement_text, Location { line, column })?;
+    Some(Location { line, column })
+}
+
+/// Extracts a precise range from a `ParserError`'s message when it embeds a
+/// `Line: N, Column: M` location (most "unexpected token" errors do); falls
+/// back to `None` (the caller then flags the whole statement) for errors
+/// like an unexpected EOF, which have no specific token to point at.
+fn syntax_error_range(statement_text: &str, err: &ParserError) -> Option<Range<usize>> {
+    let location = parser_error_location(&err.to_string())?;
+    let start = offset_for_location(statement_text, location)?;
     let end = statement_text[start..]
         .find(|c: char| c.is_whitespace() || ",()".contains(c))
         .map(|relative| start + relative)
@@ -378,6 +565,116 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_specific_syntax_produces_zero_diagnostics() {
+        let schema = FakeSchema::default();
+        let snippets = [
+            "SELECT * FROM t FINAL",
+            "SELECT * FROM t ARRAY JOIN arr AS a",
+            "ALTER TABLE t ADD COLUMN x Nullable(String)",
+            "CREATE TABLE t (id UInt32, name String) ENGINE = MergeTree() ORDER BY id",
+            "SELECT * FROM t WHERE x IN (SELECT y FROM t2) SETTINGS max_threads=4",
+            "SELECT topK(5)(x) FROM t",
+            "SELECT * FROM t LIMIT 5 BY category",
+            "INSERT INTO t VALUES (1, 'a')",
+            "ALTER TABLE t DROP INDEX idx",
+            "SELECT * FROM t WHERE toDate(created) = today()",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "CREATE TABLE t (id UInt32, tags Array(String)) ENGINE = MergeTree ORDER BY id",
+            "SELECT * FROM t PREWHERE id > 0 WHERE name = 'x'",
+            "OPTIMIZE TABLE t FINAL",
+        ];
+        for snippet in snippets {
+            let diagnostics = validate(snippet, DatabaseDriver::ClickHouse, None, &schema);
+            assert!(
+                diagnostics.is_empty(),
+                "expected no diagnostics for {snippet:?}, got {diagnostics:?}"
+            );
+        }
+    }
+
+    // sqlparser's ClickHouseDialect only accepts `FINAL` directly after a
+    // bare table name with no alias; real ClickHouse requires it to follow
+    // the alias whenever one is given (`FROM t AS e FINAL`), so every one of
+    // these must be recovered by `retry_after_blanking_aliased_final`
+    // instead of surfacing a false "syntax error" warning.
+    #[test]
+    fn clickhouse_final_after_an_alias_is_not_flagged_as_a_syntax_error() {
+        let schema = FakeSchema::default();
+        let snippets = [
+            "SELECT * FROM t e FINAL",
+            "SELECT * FROM t AS e FINAL",
+            "SELECT * FROM db.t AS e FINAL WHERE e.id > 0",
+            "SELECT * FROM db.t e FINAL JOIN db.t2 f FINAL ON e.id = f.id",
+        ];
+        for snippet in snippets {
+            let diagnostics = validate(snippet, DatabaseDriver::ClickHouse, None, &schema);
+            assert!(
+                diagnostics.is_empty(),
+                "expected the aliased FINAL fallback to clear {snippet:?}, got {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_final_fallback_still_checks_semantics_against_the_reparsed_statement() {
+        let schema = FakeSchema::default().and_table("db", "events", &["id", "created"]);
+        let diagnostics = validate(
+            "SELECT e.missing FROM db.events e FINAL WHERE e.id > 0",
+            DatabaseDriver::ClickHouse,
+            None,
+            &schema,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("e.missing"));
+    }
+
+    // A genuine syntax error unrelated to FINAL must still be reported, not
+    // silently swallowed by the fallback.
+    #[test]
+    fn clickhouse_genuine_syntax_error_is_still_flagged_when_it_contains_final() {
+        let schema = FakeSchema::default();
+        let diagnostics = validate(
+            "SELECT * FROM t AS e FINAL WHERE (a = 1",
+            DatabaseDriver::ClickHouse,
+            None,
+            &schema,
+        );
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    // `FINAL` used as a bare (broken) predicate in a WHERE clause must still
+    // be flagged -- the fallback must only recover the specific case of
+    // `FINAL` following a table alias in the FROM clause, never any stray
+    // `FINAL` anywhere the parser happens to choke on it.
+    #[test]
+    fn clickhouse_final_used_incorrectly_outside_the_from_clause_is_still_flagged() {
+        let schema = FakeSchema::default();
+        let diagnostics = validate(
+            "SELECT * FROM t WHERE a FINAL",
+            DatabaseDriver::ClickHouse,
+            None,
+            &schema,
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a FINAL outside the FROM clause must not be silently blanked away"
+        );
+    }
+
+    #[test]
+    fn clickhouse_array_join_and_qualified_columns_are_not_falsely_flagged() {
+        let schema = FakeSchema::default().and_table("db", "events", &["id", "tags", "created"]);
+        let diagnostics = validate(
+            "SELECT e.id FROM db.events e ARRAY JOIN e.tags AS tag WHERE e.created > today()",
+            DatabaseDriver::ClickHouse,
+            Some("db"),
+            &schema,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn broken_statement_produces_one_warning_at_the_reported_location() {
         let text = "CREATE TALBE t (a int)";
         let schema = FakeSchema::default();
@@ -487,7 +784,7 @@ mod tests {
             .is_empty()
         );
 
-        let diagnostics = validate("db.help()", DatabaseDriver::MongoDB, None, &schema);
+        let diagnostics = validate("db.eval()", DatabaseDriver::MongoDB, None, &schema);
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]

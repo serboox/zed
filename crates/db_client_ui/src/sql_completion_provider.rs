@@ -616,8 +616,22 @@ const MONGO_SHELL_METHODS: &[&str] = &[
     "updateMany",
     "deleteOne",
     "deleteMany",
+    "replaceOne",
+    "findOneAndUpdate",
+    "findOneAndDelete",
+    "findOneAndReplace",
     "aggregate",
     "countDocuments",
+    "count",
+    "distinct",
+    "bulkWrite",
+    "drop",
+    "createIndex",
+    "dropIndex",
+    "getIndexes",
+    "stats",
+    "estimatedDocumentCount",
+    "renameCollection",
 ];
 
 // A curated set of the most frequently used Redis commands, offered as

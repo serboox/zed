@@ -1,14 +1,15 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
 use mongodb::bson::{Bson, Document, doc};
-use mongodb::{Client, Collection};
+use mongodb::options::IndexOptions;
+use mongodb::{Client, Collection, IndexModel};
 
 use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
-use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
+use crate::schema::{ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind};
 
 /// Number of documents sampled per collection when inferring a pseudo-schema
 /// for `describe_table`. MongoDB collections are schemaless, so this is a
@@ -145,6 +146,89 @@ pub enum MongoStatement {
         collection: String,
         filter: Document,
     },
+    Distinct {
+        collection: String,
+        field: String,
+        filter: Document,
+    },
+    ReplaceOne {
+        collection: String,
+        filter: Document,
+        replacement: Document,
+    },
+    FindOneAndUpdate {
+        collection: String,
+        filter: Document,
+        update: Document,
+    },
+    FindOneAndDelete {
+        collection: String,
+        filter: Document,
+    },
+    FindOneAndReplace {
+        collection: String,
+        filter: Document,
+        replacement: Document,
+    },
+    BulkWrite {
+        collection: String,
+        operations: Vec<BulkWriteOp>,
+    },
+    Drop {
+        collection: String,
+    },
+    CreateIndex {
+        collection: String,
+        keys: Document,
+        options: Document,
+    },
+    DropIndex {
+        collection: String,
+        name: String,
+    },
+    GetIndexes {
+        collection: String,
+    },
+    CollectionStats {
+        collection: String,
+    },
+    EstimatedDocumentCount {
+        collection: String,
+    },
+    RenameCollection {
+        collection: String,
+        new_name: String,
+    },
+    Help,
+    DbStats,
+    GetCollectionNames,
+    ShowDatabases,
+    ShowCollections,
+}
+
+/// A single operation inside a `bulkWrite([...])` array, e.g.
+/// `{ insertOne: { document: {...} } }` or
+/// `{ updateOne: { filter: {...}, update: {...}, upsert: true } }`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BulkWriteOp {
+    InsertOne(Document),
+    UpdateOne {
+        filter: Document,
+        update: Document,
+        upsert: bool,
+    },
+    UpdateMany {
+        filter: Document,
+        update: Document,
+        upsert: bool,
+    },
+    ReplaceOne {
+        filter: Document,
+        replacement: Document,
+        upsert: bool,
+    },
+    DeleteOne(Document),
+    DeleteMany(Document),
 }
 
 impl MongoStatement {
@@ -153,18 +237,36 @@ impl MongoStatement {
             MongoStatement::Find { .. }
             | MongoStatement::FindOne { .. }
             | MongoStatement::Aggregate { .. }
-            | MongoStatement::CountDocuments { .. } => MongoOperationKind::Read,
+            | MongoStatement::CountDocuments { .. }
+            | MongoStatement::Distinct { .. }
+            | MongoStatement::GetIndexes { .. }
+            | MongoStatement::CollectionStats { .. }
+            | MongoStatement::EstimatedDocumentCount { .. }
+            | MongoStatement::Help
+            | MongoStatement::DbStats
+            | MongoStatement::GetCollectionNames
+            | MongoStatement::ShowDatabases
+            | MongoStatement::ShowCollections => MongoOperationKind::Read,
             MongoStatement::InsertOne { .. }
             | MongoStatement::InsertMany { .. }
             | MongoStatement::UpdateOne { .. }
             | MongoStatement::UpdateMany { .. }
             | MongoStatement::DeleteOne { .. }
-            | MongoStatement::DeleteMany { .. } => MongoOperationKind::Write,
+            | MongoStatement::DeleteMany { .. }
+            | MongoStatement::ReplaceOne { .. }
+            | MongoStatement::FindOneAndUpdate { .. }
+            | MongoStatement::FindOneAndDelete { .. }
+            | MongoStatement::FindOneAndReplace { .. }
+            | MongoStatement::BulkWrite { .. }
+            | MongoStatement::Drop { .. }
+            | MongoStatement::CreateIndex { .. }
+            | MongoStatement::DropIndex { .. }
+            | MongoStatement::RenameCollection { .. } => MongoOperationKind::Write,
         }
     }
 }
 
-const SUPPORTED_METHODS: &str = "find, findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, countDocuments";
+const SUPPORTED_METHODS: &str = "collection-level: find, findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, replaceOne, findOneAndUpdate, findOneAndDelete, findOneAndReplace, aggregate, countDocuments, count, distinct, bulkWrite, drop, createIndex, dropIndex, getIndexes, stats, estimatedDocumentCount, renameCollection; database-level: db.help(), db.stats(), db.getCollectionNames(), show dbs, show collections";
 
 fn unsupported_command_error(text: &str) -> anyhow::Error {
     anyhow!(
@@ -183,21 +285,67 @@ fn strip_db_prefix(text: &str) -> Option<&str> {
     text[2..].trim_start().strip_prefix('.')
 }
 
+/// Recognizes the bare shell helper phrases `show dbs`/`show databases` and
+/// `show collections`/`show tables`, which don't start with `db.` at all —
+/// unlike every other mongo shell command this parser understands.
+fn parse_shell_helper_statement(text: &str) -> Option<MongoStatement> {
+    match text.to_ascii_lowercase().as_str() {
+        "show dbs" | "show databases" => Some(MongoStatement::ShowDatabases),
+        "show collections" | "show tables" => Some(MongoStatement::ShowCollections),
+        _ => None,
+    }
+}
+
+/// Parses a database-level call like `db.help()`, `db.stats()`, or
+/// `db.getCollectionNames()` — these have no dot before their first paren,
+/// unlike `db.<collection>.<method>(...)` calls.
+fn parse_database_level_statement(rest: &str, original_text: &str) -> Result<MongoStatement> {
+    let calls = parse_call_chain(rest)?;
+    let (method, args) = calls
+        .first()
+        .ok_or_else(|| unsupported_command_error(original_text))?;
+    if calls.len() > 1 {
+        bail!(
+            "unexpected chained call after '{}(...)': database-level commands don't support chaining, found '{}'",
+            method,
+            original_text.chars().take(80).collect::<String>()
+        );
+    }
+    match method.as_str() {
+        "help" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::Help)
+        }
+        "stats" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::DbStats)
+        }
+        "getCollectionNames" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::GetCollectionNames)
+        }
+        _ => Err(unsupported_command_error(original_text)),
+    }
+}
+
 /// Parses a mongo shell command of the form `db.<collection>.<method>(<args>)`,
 /// optionally followed by chained calls like `.limit(10)`.
 pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
     let text = text.trim().trim_end_matches(';').trim();
+    if let Some(statement) = parse_shell_helper_statement(text) {
+        return Ok(statement);
+    }
+
     let rest = strip_db_prefix(text).ok_or_else(|| {
         anyhow!("expected a mongo shell command like db.<collection>.find({{...}})")
     })?;
 
     // `db.<collection>.<method>(...)` has a '.' before its first '(';
-    // database-level calls like `db.help()` or `db.stats()` don't, and are
-    // reported as unsupported rather than misparsed as a missing collection.
+    // database-level calls like `db.help()` or `db.stats()` don't.
     let paren_idx = rest.find('(');
     let dot_idx = rest.find('.');
     let Some(dot) = dot_idx.filter(|&d| paren_idx.is_none_or(|p| d < p)) else {
-        return Err(unsupported_command_error(text));
+        return parse_database_level_statement(rest, text);
     };
     let collection = rest[..dot].trim();
     if collection.is_empty()
@@ -215,6 +363,16 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
             collection
         )
     })?;
+    // Only `find(...)` supports a chained call (`.limit(n)`); every other
+    // method silently ignoring trailing chained calls would let malformed
+    // input like `db.users.drop().limit(1)` execute as if it were valid.
+    if method != "find" && calls.len() > 1 {
+        bail!(
+            "unexpected chained call after '{}(...)': only find(...) supports chaining, found '{}'",
+            method,
+            text.chars().take(80).collect::<String>()
+        );
+    }
 
     match method.as_str() {
         "find" => {
@@ -266,9 +424,89 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
             collection: collection.to_string(),
             pipeline: parse_array_of_docs_arg(args)?,
         }),
-        "countDocuments" => Ok(MongoStatement::CountDocuments {
+        "countDocuments" | "count" => Ok(MongoStatement::CountDocuments {
             collection: collection.to_string(),
             filter: parse_optional_doc_arg(args)?,
+        }),
+        "distinct" => {
+            let (field, filter) = parse_distinct_args(args)?;
+            Ok(MongoStatement::Distinct {
+                collection: collection.to_string(),
+                field,
+                filter,
+            })
+        }
+        "replaceOne" => {
+            let (filter, replacement) = parse_two_doc_args(args)?;
+            Ok(MongoStatement::ReplaceOne {
+                collection: collection.to_string(),
+                filter,
+                replacement,
+            })
+        }
+        "findOneAndUpdate" => {
+            let (filter, update) = parse_two_doc_args(args)?;
+            Ok(MongoStatement::FindOneAndUpdate {
+                collection: collection.to_string(),
+                filter,
+                update,
+            })
+        }
+        "findOneAndDelete" => Ok(MongoStatement::FindOneAndDelete {
+            collection: collection.to_string(),
+            filter: parse_optional_doc_arg(args)?,
+        }),
+        "findOneAndReplace" => {
+            let (filter, replacement) = parse_two_doc_args(args)?;
+            Ok(MongoStatement::FindOneAndReplace {
+                collection: collection.to_string(),
+                filter,
+                replacement,
+            })
+        }
+        "bulkWrite" => Ok(MongoStatement::BulkWrite {
+            collection: collection.to_string(),
+            operations: parse_bulk_write_ops(args)?,
+        }),
+        "drop" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::Drop {
+                collection: collection.to_string(),
+            })
+        }
+        "createIndex" => {
+            let (keys, options) = parse_doc_and_optional_doc_args(args)?;
+            Ok(MongoStatement::CreateIndex {
+                collection: collection.to_string(),
+                keys,
+                options,
+            })
+        }
+        "dropIndex" => Ok(MongoStatement::DropIndex {
+            collection: collection.to_string(),
+            name: parse_string_arg(args)?,
+        }),
+        "getIndexes" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::GetIndexes {
+                collection: collection.to_string(),
+            })
+        }
+        "stats" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::CollectionStats {
+                collection: collection.to_string(),
+            })
+        }
+        "estimatedDocumentCount" => {
+            expect_no_args(args)?;
+            Ok(MongoStatement::EstimatedDocumentCount {
+                collection: collection.to_string(),
+            })
+        }
+        "renameCollection" => Ok(MongoStatement::RenameCollection {
+            collection: collection.to_string(),
+            new_name: parse_string_arg(args)?,
         }),
         _ => Err(unsupported_command_error(text)),
     }
@@ -423,6 +661,155 @@ fn parse_two_doc_args(args: &str) -> Result<(Document, Document)> {
         ),
     };
     Ok((filter, update))
+}
+
+/// Parses `(<document>)` or `(<document>, <document>)`, used by
+/// `createIndex(keys, options?)` where the second argument is optional.
+fn parse_doc_and_optional_doc_args(args: &str) -> Result<(Document, Document)> {
+    let mut parser = ValueParser::new(args.trim());
+    let first = parser.parse_value()?;
+    let first_doc = match first {
+        Bson::Document(doc) => doc,
+        other => bail!(
+            "expected a document as the first argument, found {}",
+            bson_type_name(&other)
+        ),
+    };
+    parser.skip_ws();
+    let second_doc = if parser.peek() == Some(',') {
+        parser.bump();
+        let second = parser.parse_value()?;
+        match second {
+            Bson::Document(doc) => doc,
+            other => bail!(
+                "expected a document as the second argument, found {}",
+                bson_type_name(&other)
+            ),
+        }
+    } else {
+        Document::new()
+    };
+    parser.expect_end()?;
+    Ok((first_doc, second_doc))
+}
+
+/// Parses `(<field>)` or `(<field>, <filter>)`, used by `distinct(field, filter?)`.
+fn parse_distinct_args(args: &str) -> Result<(String, Document)> {
+    let mut parser = ValueParser::new(args.trim());
+    let field = match parser.parse_value()? {
+        Bson::String(s) => s,
+        other => bail!(
+            "expected a field name string as the first argument, found {}",
+            bson_type_name(&other)
+        ),
+    };
+    parser.skip_ws();
+    let filter = if parser.peek() == Some(',') {
+        parser.bump();
+        match parser.parse_value()? {
+            Bson::Document(doc) => doc,
+            other => bail!(
+                "expected a filter document as the second argument, found {}",
+                bson_type_name(&other)
+            ),
+        }
+    } else {
+        Document::new()
+    };
+    parser.expect_end()?;
+    Ok((field, filter))
+}
+
+/// Parses a single bare string argument, used by `dropIndex("name")` and
+/// `renameCollection("newName")`.
+fn parse_string_arg(args: &str) -> Result<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        bail!("this method requires a string argument");
+    }
+    let mut parser = ValueParser::new(trimmed);
+    let value = parser.parse_value()?;
+    parser.expect_end()?;
+    match value {
+        Bson::String(s) => Ok(s),
+        other => bail!("expected a string argument, found {}", bson_type_name(&other)),
+    }
+}
+
+/// Verifies a no-argument method (e.g. `drop()`, `stats()`) was actually
+/// called with no arguments.
+fn expect_no_args(args: &str) -> Result<()> {
+    if args.trim().is_empty() {
+        Ok(())
+    } else {
+        bail!("this method does not take any arguments, found '{}'", args);
+    }
+}
+
+/// Parses each element of a `bulkWrite([...])` array — a document with
+/// exactly one top-level key naming the operation, e.g.
+/// `{ insertOne: { document: {...} } }`.
+fn parse_bulk_write_ops(args: &str) -> Result<Vec<BulkWriteOp>> {
+    parse_array_of_docs_arg(args)?
+        .into_iter()
+        .map(parse_bulk_write_op)
+        .collect()
+}
+
+fn parse_bulk_write_op(document: Document) -> Result<BulkWriteOp> {
+    let mut fields = document.into_iter();
+    let (op_name, op_value) = fields
+        .next()
+        .ok_or_else(|| anyhow!("each bulkWrite operation must have exactly one key naming the operation"))?;
+    if fields.next().is_some() {
+        bail!(
+            "each bulkWrite operation must have exactly one key naming the operation, found extra keys alongside '{}'",
+            op_name
+        );
+    }
+    let op_doc = match op_value {
+        Bson::Document(doc) => doc,
+        other => bail!(
+            "expected an operation document for '{}', found {}",
+            op_name,
+            bson_type_name(&other)
+        ),
+    };
+    let get_document = |field: &str| -> Result<Document> {
+        op_doc
+            .get_document(field)
+            .map(Document::clone)
+            .map_err(|_| anyhow!("'{}' bulkWrite operation requires a '{}' field", op_name, field))
+    };
+    match op_name.as_str() {
+        "insertOne" => Ok(BulkWriteOp::InsertOne(get_document("document")?)),
+        "updateOne" | "updateMany" => {
+            let filter = get_document("filter")?;
+            let update = get_document("update")?;
+            let upsert = op_doc.get_bool("upsert").unwrap_or(false);
+            if op_name == "updateOne" {
+                Ok(BulkWriteOp::UpdateOne {
+                    filter,
+                    update,
+                    upsert,
+                })
+            } else {
+                Ok(BulkWriteOp::UpdateMany {
+                    filter,
+                    update,
+                    upsert,
+                })
+            }
+        }
+        "replaceOne" => Ok(BulkWriteOp::ReplaceOne {
+            filter: get_document("filter")?,
+            replacement: get_document("replacement")?,
+            upsert: op_doc.get_bool("upsert").unwrap_or(false),
+        }),
+        "deleteOne" => Ok(BulkWriteOp::DeleteOne(get_document("filter")?)),
+        "deleteMany" => Ok(BulkWriteOp::DeleteMany(get_document("filter")?)),
+        other => bail!("unsupported bulkWrite operation '{}'", other),
+    }
 }
 
 /// Looks for a chained `.limit(<n>)` call, used by `find(...).limit(10)`.
@@ -756,6 +1143,33 @@ fn documents_to_query_result(documents: Vec<Document>) -> QueryResult {
     }
 }
 
+/// Maps the recognized keys of a `createIndex(keys, options)` options
+/// document (`unique`, `name`, `sparse`, `expireAfterSeconds`,
+/// `partialFilterExpression`) onto the driver's `IndexOptions`. Other keys
+/// are ignored rather than rejected, since mongosh accepts several
+/// rarely-used index options this parser doesn't model.
+fn build_index_options(options: &Document) -> Result<IndexOptions> {
+    let expire_after_seconds = options
+        .get_i64("expireAfterSeconds")
+        .ok()
+        .or_else(|| options.get_i32("expireAfterSeconds").ok().map(i64::from));
+    let expire_after = expire_after_seconds
+        .map(|seconds| -> Result<Duration> {
+            let seconds: u64 = seconds
+                .try_into()
+                .map_err(|_| anyhow!("expireAfterSeconds must not be negative, got {seconds}"))?;
+            Ok(Duration::from_secs(seconds))
+        })
+        .transpose()?;
+    Ok(IndexOptions::builder()
+        .unique(options.get_bool("unique").ok())
+        .name(options.get_str("name").ok().map(str::to_string))
+        .sparse(options.get_bool("sparse").ok())
+        .partial_filter_expression(options.get_document("partialFilterExpression").ok().cloned())
+        .expire_after(expire_after)
+        .build())
+}
+
 fn bson_to_cell_text(value: &Bson) -> String {
     match value {
         Bson::String(s) => s.clone(),
@@ -929,6 +1343,44 @@ impl DbProvider for MongoProvider {
             .collect())
     }
 
+    // Includes the implicit `_id_` index (unlike `get_table_ddl`, which
+    // omits it since it isn't something a user would `createIndex` again --
+    // same reasoning MySQL/Postgres use for listing a PRIMARY KEY index here
+    // but leaving it out of a "how would I recreate this" DDL summary).
+    async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
+        let coll = self.collection(database, table);
+        let indexes = coll
+            .list_indexes()
+            .await
+            .context("Failed to list MongoDB indexes")?
+            .try_collect::<Vec<_>>()
+            .await
+            .context("Failed to read a MongoDB index definition")?;
+
+        Ok(indexes
+            .into_iter()
+            .map(|index| {
+                let name = index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.name.clone())
+                    .unwrap_or_default();
+                let columns: Vec<String> = index.keys.iter().map(|(key, _)| key.clone()).collect();
+                let unique = index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.unique)
+                    .unwrap_or(false);
+                IndexInfo {
+                    name,
+                    columns,
+                    unique,
+                    index_type: "btree".to_string(),
+                }
+            })
+            .collect())
+    }
+
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let statement = parse_mongo_shell_statement(sql)?;
@@ -1082,6 +1534,311 @@ impl DbProvider for MongoProvider {
                 QueryResult {
                     columns: vec!["count".to_string()],
                     rows: vec![vec![Some(count.to_string())]],
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::Distinct {
+                collection,
+                field,
+                filter,
+            } => {
+                let coll = self.collection(database, &collection);
+                let values = coll
+                    .distinct(&field, filter)
+                    .await
+                    .context("MongoDB distinct failed")?;
+                QueryResult {
+                    columns: vec!["distinct".to_string()],
+                    rows: values
+                        .iter()
+                        .map(|value| vec![Some(bson_to_cell_text(value))])
+                        .collect(),
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::ReplaceOne {
+                collection,
+                filter,
+                replacement,
+            } => {
+                let coll = self.collection(database, &collection);
+                let outcome = coll
+                    .replace_one(filter, replacement)
+                    .await
+                    .context("MongoDB replaceOne failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: outcome.modified_count,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::FindOneAndUpdate {
+                collection,
+                filter,
+                update,
+            } => {
+                let coll = self.collection(database, &collection);
+                let document = coll
+                    .find_one_and_update(filter, update)
+                    .await
+                    .context("MongoDB findOneAndUpdate failed")?;
+                documents_to_query_result(document.into_iter().collect())
+            }
+            MongoStatement::FindOneAndDelete { collection, filter } => {
+                let coll = self.collection(database, &collection);
+                let document = coll
+                    .find_one_and_delete(filter)
+                    .await
+                    .context("MongoDB findOneAndDelete failed")?;
+                documents_to_query_result(document.into_iter().collect())
+            }
+            MongoStatement::FindOneAndReplace {
+                collection,
+                filter,
+                replacement,
+            } => {
+                let coll = self.collection(database, &collection);
+                let document = coll
+                    .find_one_and_replace(filter, replacement)
+                    .await
+                    .context("MongoDB findOneAndReplace failed")?;
+                documents_to_query_result(document.into_iter().collect())
+            }
+            MongoStatement::BulkWrite {
+                collection,
+                operations,
+            } => {
+                let coll = self.collection(database, &collection);
+                let mut rows_affected = 0u64;
+                let total_operations = operations.len();
+                // The driver's native `Client::bulk_write` requires MongoDB
+                // 8.0+ (this repo's integration stack runs mongo:7.0, and
+                // older servers are common), so bulkWrite executes each
+                // operation sequentially through the same per-op calls used
+                // above rather than the native bulk command. Because of
+                // this, a failure partway through has already durably
+                // applied every operation before it — the error names how
+                // many succeeded and how many rows they affected so a
+                // partial bulkWrite is never silently invisible.
+                for (index, operation) in operations.into_iter().enumerate() {
+                    let outcome: Result<u64> = async {
+                        Ok(match operation {
+                            BulkWriteOp::InsertOne(document) => {
+                                coll.insert_one(document).await?;
+                                1
+                            }
+                            BulkWriteOp::UpdateOne {
+                                filter,
+                                update,
+                                upsert,
+                            } => {
+                                let result = coll.update_one(filter, update).upsert(upsert).await?;
+                                result.modified_count + result.upserted_id.is_some() as u64
+                            }
+                            BulkWriteOp::UpdateMany {
+                                filter,
+                                update,
+                                upsert,
+                            } => {
+                                let result =
+                                    coll.update_many(filter, update).upsert(upsert).await?;
+                                result.modified_count + result.upserted_id.is_some() as u64
+                            }
+                            BulkWriteOp::ReplaceOne {
+                                filter,
+                                replacement,
+                                upsert,
+                            } => {
+                                let result =
+                                    coll.replace_one(filter, replacement).upsert(upsert).await?;
+                                result.modified_count + result.upserted_id.is_some() as u64
+                            }
+                            BulkWriteOp::DeleteOne(filter) => coll.delete_one(filter).await?.deleted_count,
+                            BulkWriteOp::DeleteMany(filter) => {
+                                coll.delete_many(filter).await?.deleted_count
+                            }
+                        })
+                    }
+                    .await;
+                    let already_affected = rows_affected;
+                    let affected_by_this_operation = outcome.with_context(|| {
+                        format!(
+                            "MongoDB bulkWrite operation {} of {total_operations} failed; {already_affected} row(s) were already affected by the preceding operations in this batch",
+                            index + 1
+                        )
+                    })?;
+                    rows_affected += affected_by_this_operation;
+                }
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::Drop { collection } => {
+                let coll = self.collection(database, &collection);
+                coll.drop().await.context("MongoDB drop failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: 1,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::CreateIndex {
+                collection,
+                keys,
+                options,
+            } => {
+                let coll = self.collection(database, &collection);
+                let model = IndexModel::builder()
+                    .keys(keys)
+                    .options(build_index_options(&options)?)
+                    .build();
+                coll.create_index(model)
+                    .await
+                    .context("MongoDB createIndex failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: 1,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::DropIndex { collection, name } => {
+                let coll = self.collection(database, &collection);
+                coll.drop_index(&name)
+                    .await
+                    .context("MongoDB dropIndex failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: 1,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::GetIndexes { collection } => {
+                let coll = self.collection(database, &collection);
+                let indexes = coll
+                    .list_indexes()
+                    .await
+                    .context("MongoDB getIndexes failed")?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .context("Failed to read a MongoDB index definition")?;
+                let rows = indexes
+                    .into_iter()
+                    .map(|index| {
+                        let name = index
+                            .options
+                            .as_ref()
+                            .and_then(|options| options.name.clone())
+                            .unwrap_or_default();
+                        let key_columns = index
+                            .keys
+                            .iter()
+                            .map(|(key, _)| key.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let unique = index
+                            .options
+                            .as_ref()
+                            .and_then(|options| options.unique)
+                            .unwrap_or(false);
+                        vec![Some(name), Some(key_columns), Some(unique.to_string())]
+                    })
+                    .collect();
+                QueryResult {
+                    columns: vec![
+                        "name".to_string(),
+                        "columns".to_string(),
+                        "unique".to_string(),
+                    ],
+                    rows,
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::CollectionStats { collection } => {
+                let stats = self
+                    .client
+                    .database(database)
+                    .run_command(doc! { "collStats": collection })
+                    .await
+                    .context("MongoDB collStats failed")?;
+                documents_to_query_result(vec![stats])
+            }
+            MongoStatement::EstimatedDocumentCount { collection } => {
+                let coll = self.collection(database, &collection);
+                let count = coll
+                    .estimated_document_count()
+                    .await
+                    .context("MongoDB estimatedDocumentCount failed")?;
+                QueryResult {
+                    columns: vec!["count".to_string()],
+                    rows: vec![vec![Some(count.to_string())]],
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::RenameCollection {
+                collection,
+                new_name,
+            } => {
+                self.client
+                    .database("admin")
+                    .run_command(doc! {
+                        "renameCollection": format!("{database}.{collection}"),
+                        "to": format!("{database}.{new_name}"),
+                    })
+                    .await
+                    .context("MongoDB renameCollection failed")?;
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: 1,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::Help => QueryResult {
+                columns: vec!["supported commands".to_string()],
+                rows: vec![vec![Some(SUPPORTED_METHODS.to_string())]],
+                rows_affected: 0,
+                execution_time_ms: 0,
+            },
+            MongoStatement::DbStats => {
+                let stats = self
+                    .client
+                    .database(database)
+                    .run_command(doc! { "dbStats": 1 })
+                    .await
+                    .context("MongoDB dbStats failed")?;
+                documents_to_query_result(vec![stats])
+            }
+            MongoStatement::GetCollectionNames | MongoStatement::ShowCollections => {
+                let tables = self
+                    .list_tables(database)
+                    .await
+                    .context("MongoDB getCollectionNames failed")?;
+                QueryResult {
+                    columns: vec!["name".to_string()],
+                    rows: tables.into_iter().map(|t| vec![Some(t.name)]).collect(),
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                }
+            }
+            MongoStatement::ShowDatabases => {
+                let databases = self
+                    .list_databases()
+                    .await
+                    .context("MongoDB show dbs failed")?;
+                QueryResult {
+                    columns: vec!["name".to_string()],
+                    rows: databases.into_iter().map(|d| vec![Some(d.name)]).collect(),
                     rows_affected: 0,
                     execution_time_ms: 0,
                 }
@@ -1393,17 +2150,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_a_database_level_command_with_a_clear_unsupported_error() {
-        let error = parse_mongo_shell_statement("db.help()").unwrap_err();
+    fn parse_rejects_an_unrecognized_database_level_command_with_a_clear_unsupported_error() {
+        let error = parse_mongo_shell_statement("db.eval()").unwrap_err();
         let message = error.to_string();
         assert!(message.contains("Unsupported mongo shell command"));
-        assert!(message.contains("db.help()"));
+        assert!(message.contains("db.eval()"));
         assert!(message.contains("countDocuments"));
     }
 
     #[test]
     fn parse_rejects_an_unrecognized_method_on_a_collection() {
-        let error = parse_mongo_shell_statement("db.users.drop()").unwrap_err();
+        let error = parse_mongo_shell_statement("db.users.mapReduce()").unwrap_err();
         let message = error.to_string();
         assert!(message.contains("Unsupported mongo shell command"));
     }
@@ -1412,6 +2169,354 @@ mod tests {
     fn parse_rejects_text_that_does_not_start_with_db() {
         let error = parse_mongo_shell_statement("SELECT * FROM users").unwrap_err();
         assert!(error.to_string().contains("expected a mongo shell command"));
+    }
+
+    #[test]
+    fn parse_db_help_is_recognized_as_a_read() {
+        let statement = parse_mongo_shell_statement("db.help()").unwrap();
+        assert_eq!(statement, MongoStatement::Help);
+        assert_eq!(statement.kind(), MongoOperationKind::Read);
+    }
+
+    #[test]
+    fn parse_db_stats_is_recognized() {
+        let statement = parse_mongo_shell_statement("db.stats()").unwrap();
+        assert_eq!(statement, MongoStatement::DbStats);
+    }
+
+    #[test]
+    fn parse_db_get_collection_names_is_recognized() {
+        let statement = parse_mongo_shell_statement("db.getCollectionNames()").unwrap();
+        assert_eq!(statement, MongoStatement::GetCollectionNames);
+    }
+
+    #[test]
+    fn parse_db_help_rejects_arguments() {
+        let error = parse_mongo_shell_statement("db.help(1)").unwrap_err();
+        assert!(error.to_string().contains("does not take any arguments"));
+    }
+
+    #[test]
+    fn parse_rejects_a_chained_call_after_a_non_find_method() {
+        let error = parse_mongo_shell_statement("db.users.drop().limit(1)").unwrap_err();
+        assert!(error.to_string().contains("unexpected chained call"));
+    }
+
+    #[test]
+    fn parse_rejects_a_chained_call_after_a_database_level_command() {
+        let error = parse_mongo_shell_statement("db.stats().limit(1)").unwrap_err();
+        assert!(error.to_string().contains("unexpected chained call"));
+    }
+
+    #[test]
+    fn parse_show_dbs_and_show_databases_are_recognized() {
+        assert_eq!(
+            parse_mongo_shell_statement("show dbs").unwrap(),
+            MongoStatement::ShowDatabases
+        );
+        assert_eq!(
+            parse_mongo_shell_statement("show databases").unwrap(),
+            MongoStatement::ShowDatabases
+        );
+        assert_eq!(
+            parse_mongo_shell_statement("show dbs").unwrap().kind(),
+            MongoOperationKind::Read
+        );
+    }
+
+    #[test]
+    fn parse_show_collections_and_show_tables_are_recognized() {
+        assert_eq!(
+            parse_mongo_shell_statement("show collections").unwrap(),
+            MongoStatement::ShowCollections
+        );
+        assert_eq!(
+            parse_mongo_shell_statement("show tables").unwrap(),
+            MongoStatement::ShowCollections
+        );
+    }
+
+    #[test]
+    fn parse_distinct_extracts_field_and_optional_filter() {
+        let without_filter = parse_mongo_shell_statement("db.users.distinct(\"status\")").unwrap();
+        assert_eq!(
+            without_filter,
+            MongoStatement::Distinct {
+                collection: "users".to_string(),
+                field: "status".to_string(),
+                filter: Document::new(),
+            }
+        );
+        assert_eq!(without_filter.kind(), MongoOperationKind::Read);
+
+        let with_filter =
+            parse_mongo_shell_statement("db.users.distinct('status', {active: true})").unwrap();
+        assert_eq!(
+            with_filter,
+            MongoStatement::Distinct {
+                collection: "users".to_string(),
+                field: "status".to_string(),
+                filter: doc! { "active": true },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_replace_one_extracts_filter_and_replacement() {
+        let statement =
+            parse_mongo_shell_statement("db.users.replaceOne({name: 'Ada'}, {name: 'Ada L.'})")
+                .unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::ReplaceOne {
+                collection: "users".to_string(),
+                filter: doc! { "name": "Ada" },
+                replacement: doc! { "name": "Ada L." },
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Write);
+    }
+
+    #[test]
+    fn parse_find_one_and_update_delete_and_replace_variants() {
+        let update = parse_mongo_shell_statement(
+            "db.users.findOneAndUpdate({name: 'Ada'}, {$set: {active: false}})",
+        )
+        .unwrap();
+        assert_eq!(
+            update,
+            MongoStatement::FindOneAndUpdate {
+                collection: "users".to_string(),
+                filter: doc! { "name": "Ada" },
+                update: doc! { "$set": { "active": false } },
+            }
+        );
+
+        let delete = parse_mongo_shell_statement("db.users.findOneAndDelete({name: 'Ada'})")
+            .unwrap();
+        assert_eq!(
+            delete,
+            MongoStatement::FindOneAndDelete {
+                collection: "users".to_string(),
+                filter: doc! { "name": "Ada" },
+            }
+        );
+
+        let replace = parse_mongo_shell_statement(
+            "db.users.findOneAndReplace({name: 'Ada'}, {name: 'Ada L.'})",
+        )
+        .unwrap();
+        assert_eq!(
+            replace,
+            MongoStatement::FindOneAndReplace {
+                collection: "users".to_string(),
+                filter: doc! { "name": "Ada" },
+                replacement: doc! { "name": "Ada L." },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bulk_write_supports_every_operation_kind() {
+        let statement = parse_mongo_shell_statement(
+            "db.users.bulkWrite([\
+                { insertOne: { document: { name: 'Ada' } } }, \
+                { updateOne: { filter: { name: 'Ada' }, update: { $set: { active: true } }, upsert: true } }, \
+                { updateMany: { filter: { active: true }, update: { $set: { flag: 1 } } } }, \
+                { replaceOne: { filter: { name: 'Ada' }, replacement: { name: 'Ada L.' } } }, \
+                { deleteOne: { filter: { name: 'Ada' } } }, \
+                { deleteMany: { filter: { active: false } } }\
+            ])",
+        )
+        .unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::BulkWrite {
+                collection: "users".to_string(),
+                operations: vec![
+                    BulkWriteOp::InsertOne(doc! { "name": "Ada" }),
+                    BulkWriteOp::UpdateOne {
+                        filter: doc! { "name": "Ada" },
+                        update: doc! { "$set": { "active": true } },
+                        upsert: true,
+                    },
+                    BulkWriteOp::UpdateMany {
+                        filter: doc! { "active": true },
+                        update: doc! { "$set": { "flag": 1i64 } },
+                        upsert: false,
+                    },
+                    BulkWriteOp::ReplaceOne {
+                        filter: doc! { "name": "Ada" },
+                        replacement: doc! { "name": "Ada L." },
+                        upsert: false,
+                    },
+                    BulkWriteOp::DeleteOne(doc! { "name": "Ada" }),
+                    BulkWriteOp::DeleteMany(doc! { "active": false }),
+                ],
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Write);
+    }
+
+    #[test]
+    fn parse_bulk_write_rejects_an_operation_with_more_than_one_key() {
+        let error = parse_mongo_shell_statement(
+            "db.users.bulkWrite([{ insertOne: { document: {} }, deleteOne: { filter: {} } }])",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exactly one key naming the operation")
+        );
+    }
+
+    #[test]
+    fn parse_bulk_write_rejects_an_unsupported_operation_name() {
+        let error =
+            parse_mongo_shell_statement("db.users.bulkWrite([{ renameOp: { filter: {} } }])")
+                .unwrap_err();
+        assert!(error.to_string().contains("unsupported bulkWrite operation"));
+    }
+
+    #[test]
+    fn parse_drop_takes_no_arguments() {
+        let statement = parse_mongo_shell_statement("db.users.drop()").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::Drop {
+                collection: "users".to_string(),
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Write);
+
+        let error = parse_mongo_shell_statement("db.users.drop(1)").unwrap_err();
+        assert!(error.to_string().contains("does not take any arguments"));
+    }
+
+    #[test]
+    fn parse_create_index_extracts_keys_and_optional_options() {
+        let without_options =
+            parse_mongo_shell_statement("db.users.createIndex({email: 1})").unwrap();
+        assert_eq!(
+            without_options,
+            MongoStatement::CreateIndex {
+                collection: "users".to_string(),
+                keys: doc! { "email": 1i64 },
+                options: Document::new(),
+            }
+        );
+        assert_eq!(without_options.kind(), MongoOperationKind::Write);
+
+        let with_options = parse_mongo_shell_statement(
+            "db.users.createIndex({email: 1}, {unique: true, name: 'email_idx'})",
+        )
+        .unwrap();
+        assert_eq!(
+            with_options,
+            MongoStatement::CreateIndex {
+                collection: "users".to_string(),
+                keys: doc! { "email": 1i64 },
+                options: doc! { "unique": true, "name": "email_idx" },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_drop_index_takes_a_bare_string_name() {
+        let statement = parse_mongo_shell_statement("db.users.dropIndex(\"email_idx\")").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::DropIndex {
+                collection: "users".to_string(),
+                name: "email_idx".to_string(),
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Write);
+    }
+
+    #[test]
+    fn parse_get_indexes_and_stats_and_estimated_document_count_take_no_arguments() {
+        assert_eq!(
+            parse_mongo_shell_statement("db.users.getIndexes()").unwrap(),
+            MongoStatement::GetIndexes {
+                collection: "users".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_mongo_shell_statement("db.users.stats()").unwrap(),
+            MongoStatement::CollectionStats {
+                collection: "users".to_string(),
+            }
+        );
+        let estimated = parse_mongo_shell_statement("db.users.estimatedDocumentCount()").unwrap();
+        assert_eq!(
+            estimated,
+            MongoStatement::EstimatedDocumentCount {
+                collection: "users".to_string(),
+            }
+        );
+        assert_eq!(estimated.kind(), MongoOperationKind::Read);
+    }
+
+    #[test]
+    fn parse_count_is_an_alias_for_count_documents() {
+        let statement = parse_mongo_shell_statement("db.users.count({active: true})").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::CountDocuments {
+                collection: "users".to_string(),
+                filter: doc! { "active": true },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rename_collection_takes_a_bare_string_new_name() {
+        let statement =
+            parse_mongo_shell_statement("db.users.renameCollection(\"people\")").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::RenameCollection {
+                collection: "users".to_string(),
+                new_name: "people".to_string(),
+            }
+        );
+        assert_eq!(statement.kind(), MongoOperationKind::Write);
+    }
+
+    #[test]
+    fn parse_drop_index_rejects_a_non_string_argument() {
+        let error = parse_mongo_shell_statement("db.users.dropIndex(1)").unwrap_err();
+        assert!(error.to_string().contains("expected a string argument"));
+    }
+
+    #[test]
+    fn build_index_options_maps_recognized_keys_only() {
+        let options = build_index_options(&doc! {
+            "unique": true,
+            "name": "email_idx",
+            "sparse": true,
+            "expireAfterSeconds": 3600i64,
+            "partialFilterExpression": { "deleted": false },
+            "ignoredOption": "ignored",
+        })
+        .unwrap();
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(options.name, Some("email_idx".to_string()));
+        assert_eq!(options.sparse, Some(true));
+        assert_eq!(options.expire_after, Some(Duration::from_secs(3600)));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "deleted": false })
+        );
+    }
+
+    #[test]
+    fn build_index_options_rejects_a_negative_expire_after_seconds() {
+        let error =
+            build_index_options(&doc! { "expireAfterSeconds": -1i64 }).unwrap_err();
+        assert!(error.to_string().contains("must not be negative"));
     }
 
     #[test]
@@ -1528,6 +2633,697 @@ mod integration_tests {
                 !ddl.contains("createIndex({ _id: 1 }"),
                 "the implicit _id_ index must not be listed as a created index, got: {ddl}"
             );
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_ping() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        provider.ping().await.expect("Ping failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_databases_and_collections_finds_scratch_data() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection_name = "widgets";
+
+        let test_result: Result<()> = async {
+            provider
+                .collection(&database, collection_name)
+                .insert_one(doc! { "name": "bolt" })
+                .await
+                .context("Failed to seed a document")?;
+
+            let databases = provider.list_databases().await?;
+            assert!(databases.iter().any(|d| d.name == database));
+
+            let tables = provider.list_tables(&database).await?;
+            assert!(tables.iter().any(|t| t.name == collection_name));
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_update_and_delete_document_lifecycle() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "accounts";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!(r#"db.{collection}.insertOne({{ id: 1, balance: 100 }})"#),
+                )
+                .await?;
+            let after_insert = provider
+                .execute_query(
+                    &database,
+                    &format!(r#"db.{collection}.findOne({{ id: 1 }})"#),
+                )
+                .await?;
+            let balance_col = after_insert
+                .columns
+                .iter()
+                .position(|c| c == "balance")
+                .expect("balance column must be present");
+            assert_eq!(after_insert.rows[0][balance_col].as_deref(), Some("100"));
+
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        r#"db.{collection}.updateOne({{ id: 1 }}, {{ $set: {{ balance: 250 }} }})"#
+                    ),
+                )
+                .await?;
+            let after_update = provider
+                .execute_query(
+                    &database,
+                    &format!(r#"db.{collection}.findOne({{ id: 1 }})"#),
+                )
+                .await?;
+            let balance_col = after_update
+                .columns
+                .iter()
+                .position(|c| c == "balance")
+                .expect("balance column must be present");
+            assert_eq!(after_update.rows[0][balance_col].as_deref(), Some("250"));
+
+            provider
+                .execute_query(
+                    &database,
+                    &format!(r#"db.{collection}.deleteOne({{ id: 1 }})"#),
+                )
+                .await?;
+            let after_delete = provider
+                .execute_query(
+                    &database,
+                    &format!(r#"db.{collection}.findOne({{ id: 1 }})"#),
+                )
+                .await?;
+            assert!(
+                after_delete.rows.is_empty(),
+                "document should be gone after deleteOne"
+            );
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    /// The shell-statement parser behind `execute_query` doesn't expose
+    /// `updateOne`'s `{ upsert: true }` option, so this drives the
+    /// underlying driver collection directly -- same pattern the DDL test
+    /// above uses for `create_index`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_upsert_via_update_options() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection_name = "counters";
+
+        let test_result: Result<()> = async {
+            let collection = provider.collection(&database, collection_name);
+            let upsert_options = mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build();
+
+            collection
+                .update_one(doc! { "name": "clicks" }, doc! { "$inc": { "hits": 1 } })
+                .with_options(upsert_options.clone())
+                .await
+                .context("Failed first upsert (insert path)")?;
+            collection
+                .update_one(doc! { "name": "clicks" }, doc! { "$inc": { "hits": 1 } })
+                .with_options(upsert_options)
+                .await
+                .context("Failed second upsert (update path)")?;
+
+            let count = collection
+                .count_documents(doc! { "name": "clicks" })
+                .await
+                .context("Failed to count documents")?;
+            assert_eq!(count, 1, "upsert must not create a duplicate document");
+
+            let document = collection
+                .find_one(doc! { "name": "clicks" })
+                .await
+                .context("Failed to find the counter")?
+                .expect("counter document must exist");
+            assert_eq!(
+                document.get_i32("hits").ok(),
+                Some(2),
+                "the second upsert must have taken the update branch, not re-inserted at 1"
+            );
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_and_query_a_view() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let source = "items";
+        let view = "pricey_items";
+
+        let test_result: Result<()> = async {
+            provider
+                .collection(&database, source)
+                .insert_many([doc! { "price": 150 }, doc! { "price": 50 }])
+                .await
+                .context("Failed to seed source collection")?;
+
+            provider
+                .client
+                .database(&database)
+                .run_command(doc! {
+                    "create": view,
+                    "viewOn": source,
+                    "pipeline": [doc! { "$match": { "price": { "$gt": 100 } } }],
+                })
+                .await
+                .context("Failed to create view")?;
+
+            let result = provider
+                .execute_query(&database, &format!("db.{view}.find({{}})"))
+                .await?;
+            assert_eq!(
+                result.rows.len(),
+                1,
+                "the view must only show the filtered document"
+            );
+
+            provider
+                .client
+                .database(&database)
+                .run_command(doc! { "drop": view })
+                .await
+                .context("Failed to drop view")?;
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_indexes_finds_created_indexes() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection_name = "orders";
+
+        let test_result: Result<()> = async {
+            let collection = provider.collection(&database, collection_name);
+            collection
+                .insert_one(doc! { "customer_id": 1i64, "status": "open" })
+                .await
+                .context("Failed to seed a document")?;
+            collection
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { "customer_id": 1 })
+                        .build(),
+                )
+                .await
+                .context("Failed to create a plain index")?;
+            collection
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { "status": 1 })
+                        .options(
+                            mongodb::options::IndexOptions::builder()
+                                .name("status_unique_idx".to_string())
+                                .unique(true)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await
+                .context("Failed to create a unique named index")?;
+
+            let indexes = provider.list_indexes(&database, collection_name).await?;
+            assert_eq!(
+                indexes.len(),
+                3,
+                "expected the implicit _id_ index plus the two created ones, got {indexes:?}"
+            );
+
+            let id_index = indexes
+                .iter()
+                .find(|index| index.name == "_id_")
+                .unwrap_or_else(|| panic!("expected the implicit _id_ index among {indexes:?}"));
+            assert_eq!(id_index.columns, vec!["_id".to_string()]);
+
+            let plain_index = indexes
+                .iter()
+                .find(|index| index.name == "customer_id_1")
+                .unwrap_or_else(|| panic!("expected the auto-named plain index among {indexes:?}"));
+            assert_eq!(plain_index.columns, vec!["customer_id".to_string()]);
+            assert!(!plain_index.unique);
+
+            let unique_index = indexes
+                .iter()
+                .find(|index| index.name == "status_unique_idx")
+                .unwrap_or_else(|| panic!("expected the unique named index among {indexes:?}"));
+            assert_eq!(unique_index.columns, vec!["status".to_string()]);
+            assert!(unique_index.unique);
+
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_distinct_replace_one_and_find_one_and_x_execute_via_the_shell_parser() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "users";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.insertMany([{{name: 'Ada', status: 'active'}}, {{name: 'Grace', status: 'active'}}, {{name: 'Hopper', status: 'retired'}}])"
+                    ),
+                )
+                .await
+                .context("Failed to seed documents")?;
+
+            let distinct = provider
+                .execute_query(&database, &format!("db.{collection}.distinct('status')"))
+                .await?;
+            assert_eq!(distinct.columns, vec!["distinct".to_string()]);
+            let mut distinct_values: Vec<String> = distinct
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next().flatten().unwrap_or_default())
+                .collect();
+            distinct_values.sort();
+            assert_eq!(distinct_values, vec!["active".to_string(), "retired".to_string()]);
+
+            let replace = provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.replaceOne({{name: 'Hopper'}}, {{name: 'Hopper', status: 'active'}})"
+                    ),
+                )
+                .await?;
+            assert_eq!(replace.rows_affected, 1);
+
+            let found_and_updated = provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.findOneAndUpdate({{name: 'Ada'}}, {{$set: {{status: 'inactive'}}}})"
+                    ),
+                )
+                .await?;
+            assert_eq!(found_and_updated.rows.len(), 1);
+
+            let after_update = provider
+                .collection(&database, collection)
+                .find_one(doc! { "name": "Ada" })
+                .await?
+                .expect("expected the Ada document to still exist");
+            assert_eq!(after_update.get_str("status"), Ok("inactive"));
+
+            let found_and_deleted = provider
+                .execute_query(
+                    &database,
+                    &format!("db.{collection}.findOneAndDelete({{name: 'Grace'}})"),
+                )
+                .await?;
+            assert_eq!(found_and_deleted.rows.len(), 1);
+            assert!(
+                provider
+                    .collection(&database, collection)
+                    .find_one(doc! { "name": "Grace" })
+                    .await?
+                    .is_none(),
+                "expected Grace to have been deleted"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_bulk_write_executes_every_operation_kind_sequentially() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "widgets";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.insertMany([{{name: 'bolt', qty: 1}}, {{name: 'nut', qty: 1}}, {{name: 'washer', qty: 1}}])"
+                    ),
+                )
+                .await
+                .context("Failed to seed documents")?;
+
+            let result = provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.bulkWrite([\
+                            {{ insertOne: {{ document: {{ name: 'screw', qty: 1 }} }} }}, \
+                            {{ updateOne: {{ filter: {{ name: 'bolt' }}, update: {{ $set: {{ qty: 5 }} }} }} }}, \
+                            {{ updateMany: {{ filter: {{ qty: 1 }}, update: {{ $set: {{ tagged: true }} }} }} }}, \
+                            {{ deleteOne: {{ filter: {{ name: 'washer' }} }} }}, \
+                            {{ replaceOne: {{ filter: {{ name: 'nut' }}, replacement: {{ name: 'nut', qty: 9 }} }} }}, \
+                            {{ updateOne: {{ filter: {{ name: 'does-not-exist' }}, update: {{ $set: {{ qty: 1 }} }}, upsert: true }} }}\
+                        ])"
+                    ),
+                )
+                .await?;
+            // insertOne (1) + updateOne on bolt (1) + updateMany over the 3
+            // qty:1 docs at that point: nut, washer, screw (3) + deleteOne
+            // (1) + replaceOne (1) + upserting updateOne, which modifies 0
+            // existing documents (0) = 7.
+            assert_eq!(result.rows_affected, 7);
+
+            let coll = provider.collection(&database, collection);
+            assert_eq!(
+                coll.find_one(doc! { "name": "bolt" }).await?.and_then(|d| d.get_i32("qty").ok()),
+                Some(5)
+            );
+            assert!(coll.find_one(doc! { "name": "washer" }).await?.is_none());
+            assert_eq!(
+                coll.find_one(doc! { "name": "nut" }).await?.and_then(|d| d.get_i32("qty").ok()),
+                Some(9)
+            );
+            assert!(coll.find_one(doc! { "name": "screw" }).await?.is_some());
+            assert!(
+                coll.find_one(doc! { "name": "does-not-exist" }).await?.is_some(),
+                "expected the upsert to have inserted a new document"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_drop_create_index_drop_index_and_get_indexes_execute_via_the_shell_parser() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "accounts";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!("db.{collection}.insertOne({{email: 'ada@example.com'}})"),
+                )
+                .await
+                .context("Failed to seed a document")?;
+
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.createIndex({{email: 1}}, {{unique: true, name: 'email_idx'}})"
+                    ),
+                )
+                .await?;
+
+            let indexes = provider
+                .execute_query(&database, &format!("db.{collection}.getIndexes()"))
+                .await?;
+            assert!(
+                indexes
+                    .rows
+                    .iter()
+                    .any(|row| row.first() == Some(&Some("email_idx".to_string()))),
+                "expected the created index among {:?}",
+                indexes.rows
+            );
+
+            provider
+                .execute_query(&database, &format!("db.{collection}.dropIndex('email_idx')"))
+                .await?;
+            let indexes_after_drop = provider
+                .execute_query(&database, &format!("db.{collection}.getIndexes()"))
+                .await?;
+            assert!(
+                !indexes_after_drop
+                    .rows
+                    .iter()
+                    .any(|row| row.first() == Some(&Some("email_idx".to_string()))),
+                "expected the dropped index to be gone, got {:?}",
+                indexes_after_drop.rows
+            );
+
+            let dropped = provider
+                .execute_query(&database, &format!("db.{collection}.drop()"))
+                .await?;
+            assert_eq!(dropped.rows_affected, 1);
+            let remaining_collections = provider.list_tables(&database).await?;
+            assert!(
+                !remaining_collections.iter().any(|t| t.name == collection),
+                "expected the collection to have been dropped"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_estimated_count_and_rename_collection_execute_via_the_shell_parser() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "orders";
+        let renamed_collection = "purchase_orders";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(
+                    &database,
+                    &format!(
+                        "db.{collection}.insertMany([{{status: 'open'}}, {{status: 'open'}}, {{status: 'closed'}}])"
+                    ),
+                )
+                .await
+                .context("Failed to seed documents")?;
+
+            let count = provider
+                .execute_query(&database, &format!("db.{collection}.count({{status: 'open'}})"))
+                .await?;
+            assert_eq!(count.rows, vec![vec![Some("2".to_string())]]);
+
+            let estimated = provider
+                .execute_query(&database, &format!("db.{collection}.estimatedDocumentCount()"))
+                .await?;
+            assert_eq!(estimated.rows, vec![vec![Some("3".to_string())]]);
+
+            provider
+                .execute_query(
+                    &database,
+                    &format!("db.{collection}.renameCollection('{renamed_collection}')"),
+                )
+                .await?;
+            let tables = provider.list_tables(&database).await?;
+            assert!(tables.iter().any(|t| t.name == renamed_collection));
+            assert!(!tables.iter().any(|t| t.name == collection));
+
+            Ok(())
+        }
+        .await;
+
+        provider
+            .client
+            .database(&database)
+            .drop()
+            .await
+            .expect("Failed to drop scratch database");
+        test_result.expect("Test assertions failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_help_stats_and_show_helpers_execute_via_the_shell_parser() {
+        let config =
+            test_config_from_env().expect("MONGO_TEST_URL env var required for integration tests");
+        let provider = MongoProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let database = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let collection = "orders";
+
+        let test_result: Result<()> = async {
+            provider
+                .execute_query(&database, &format!("db.{collection}.insertOne({{status: 'open'}})"))
+                .await
+                .context("Failed to seed a document")?;
+
+            let help = provider.execute_query(&database, "db.help()").await?;
+            assert!(!help.rows.is_empty());
+
+            let collection_stats = provider
+                .execute_query(&database, &format!("db.{collection}.stats()"))
+                .await?;
+            assert!(!collection_stats.columns.is_empty());
+
+            let db_stats = provider.execute_query(&database, "db.stats()").await?;
+            assert!(!db_stats.columns.is_empty());
+
+            let get_collection_names = provider
+                .execute_query(&database, "db.getCollectionNames()")
+                .await?;
+            assert!(
+                get_collection_names
+                    .rows
+                    .iter()
+                    .any(|row| row.first() == Some(&Some(collection.to_string())))
+            );
+
+            let show_collections = provider.execute_query(&database, "show collections").await?;
+            assert!(
+                show_collections
+                    .rows
+                    .iter()
+                    .any(|row| row.first() == Some(&Some(collection.to_string())))
+            );
+
+            let show_dbs = provider.execute_query(&database, "show dbs").await?;
+            assert!(
+                show_dbs
+                    .rows
+                    .iter()
+                    .any(|row| row.first() == Some(&Some(database.clone())))
+            );
+
             Ok(())
         }
         .await;
