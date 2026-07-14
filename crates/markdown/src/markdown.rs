@@ -1,7 +1,10 @@
+mod github_style;
 pub mod html;
 mod mermaid;
 pub mod parser;
 mod path_range;
+
+pub use github_style::{github_page_background, github_style};
 
 use base64::Engine as _;
 use futures::FutureExt as _;
@@ -31,12 +34,13 @@ use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
-    StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point, quad,
+    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DefiniteLength,
+    DispatchPhase, Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
+    Hitbox, Hsla, Image, ImageFormat, ImageSource, KeyContext, Length, MouseButton,
+    MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful,
+    StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
+    TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point,
+    quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -106,9 +110,30 @@ pub struct MarkdownStyle {
     pub block_quote_kind_colors: BlockQuoteKindColors,
     pub syntax: Arc<SyntaxTheme>,
     pub selection_background_color: Hsla,
+    /// A secondary, lower-contrast border color, used e.g. for code block borders.
+    pub secondary_border_color: Hsla,
+    /// A muted panel background, used for table zebra-striping and metadata key columns.
+    pub muted_panel_background: Hsla,
+    /// A muted text color, used e.g. for metadata key labels.
+    pub muted_text_color: Hsla,
+    /// A raw background color for code-adjacent chrome (scrollbar tracks, code block buttons).
+    pub code_surface_color: Hsla,
+    /// The color used for bold/strong text.
+    pub strong_text_color: Hsla,
+    /// The background color of table header rows.
+    pub table_header_background: Hsla,
     pub heading: StyleRefinement,
     pub heading_level_styles: Option<HeadingLevelStyles>,
     pub heading_border_color: Option<Hsla>,
+    /// Which heading levels (h1..h6, indexed 0..6) draw `heading_border_color`
+    /// as a border-bottom when it is set. Defaults to h1/h2/h3 to preserve
+    /// every existing consumer's look; GitHub's own convention only
+    /// underlines h1/h2, so the GitHub-style preview overrides this.
+    pub heading_border_levels: [bool; 6],
+    /// Overrides the line-height paragraphs and list items use, in place of
+    /// the hardcoded `rems(1.3)` default. Leaves each block's own margin
+    /// untouched, unlike `height_is_multiple_of_line_height` below.
+    pub paragraph_line_height: Option<DefiniteLength>,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
@@ -131,9 +156,17 @@ impl Default for MarkdownStyle {
             block_quote_kind_colors: Default::default(),
             syntax: Arc::new(SyntaxTheme::default()),
             selection_background_color: Default::default(),
+            secondary_border_color: Default::default(),
+            muted_panel_background: Default::default(),
+            muted_text_color: Default::default(),
+            code_surface_color: Default::default(),
+            strong_text_color: Default::default(),
+            table_header_background: Default::default(),
             heading: Default::default(),
             heading_level_styles: None,
             heading_border_color: None,
+            heading_border_levels: [true, true, true, false, false, false],
+            paragraph_line_height: None,
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
@@ -219,6 +252,12 @@ impl MarkdownStyle {
             selection_background_color: colors.element_selection_background,
             rule_color: colors.border,
             block_quote_border_color: colors.border,
+            secondary_border_color: colors.border_variant,
+            muted_panel_background: colors.panel_background,
+            muted_text_color: colors.text_muted,
+            code_surface_color: colors.editor_background,
+            strong_text_color: colors.text,
+            table_header_background: colors.title_bar_background,
             block_quote_kind_colors: {
                 let status = cx.theme().status();
                 BlockQuoteKindColors {
@@ -1443,7 +1482,11 @@ impl MarkdownElement {
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
+            el.mb_2().line_height(
+                self.style
+                    .paragraph_line_height
+                    .unwrap_or_else(|| rems(1.3).into()),
+            )
         });
 
         paragraph = match align {
@@ -1479,6 +1522,7 @@ impl MarkdownElement {
             level,
             self.style.heading_level_styles.as_ref(),
             self.style.heading_border_color,
+            self.style.heading_border_levels,
         );
 
         heading = match align {
@@ -1561,7 +1605,6 @@ impl MarkdownElement {
         source: &str,
         metadata_block: &ParsedMetadataBlock,
         markdown_end: usize,
-        cx: &App,
     ) {
         let content_range = &metadata_block.content_range;
         if let Some(rows) = metadata_block.rows.as_deref() {
@@ -1572,7 +1615,7 @@ impl MarkdownElement {
                     .w_full()
                     .mb_2()
                     .border_1()
-                    .border_color(cx.theme().colors().border)
+                    .border_color(self.style.rule_color)
                     .rounded_sm()
                     .overflow_hidden(),
                 content_range,
@@ -1590,7 +1633,6 @@ impl MarkdownElement {
                         row_index,
                         is_key: true,
                     },
-                    cx,
                 );
                 self.push_metadata_cell(
                     builder,
@@ -1602,7 +1644,6 @@ impl MarkdownElement {
                         row_index,
                         is_key: false,
                     },
-                    cx,
                 );
             }
 
@@ -1629,7 +1670,6 @@ impl MarkdownElement {
         block_range: &Range<usize>,
         markdown_end: usize,
         cell_style: MetadataCellStyle,
-        cx: &App,
     ) {
         builder.push_div(
             div()
@@ -1638,11 +1678,11 @@ impl MarkdownElement {
                 .min_w_0()
                 .px_2()
                 .py_1()
-                .border_color(cx.theme().colors().border)
+                .border_color(self.style.rule_color)
                 .when(cell_style.row_index > 0, |this| this.border_t_1())
                 .when(!cell_style.is_key, |this| this.border_l_1())
                 .when(cell_style.is_key, |this| {
-                    this.bg(cx.theme().colors().panel_background)
+                    this.bg(self.style.muted_panel_background)
                 }),
             block_range,
             markdown_end,
@@ -1650,7 +1690,7 @@ impl MarkdownElement {
 
         let text_style = if cell_style.is_key {
             TextStyleRefinement {
-                color: Some(cx.theme().colors().text_muted),
+                color: Some(self.style.muted_text_color),
                 font_weight: Some(FontWeight::SEMIBOLD),
                 ..Default::default()
             }
@@ -1673,7 +1713,11 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1().gap_1().line_height(
+                        self.style
+                            .paragraph_line_height
+                            .unwrap_or_else(|| rems(1.3).into()),
+                    )
                 })
                 .h_flex()
                 .items_start()
@@ -2123,8 +2167,8 @@ impl Element for MarkdownElement {
                     if self.show_root_block_markers {
                         builder.pop_root_block(
                             active_root_block == Some(*root_block_index),
-                            cx.theme().colors().border,
-                            cx.theme().colors().border_variant,
+                            self.style.rule_color,
+                            self.style.secondary_border_color,
                         );
                     }
                 }
@@ -2264,7 +2308,7 @@ impl Element for MarkdownElement {
                                             .tracked_scroll_handle(scroll_handle)
                                             .with_track_along(
                                                 ScrollAxes::Horizontal,
-                                                cx.theme().colors().editor_background,
+                                                self.style.code_surface_color,
                                             )
                                             .notify_content();
 
@@ -2282,7 +2326,7 @@ impl Element for MarkdownElement {
                                         parent_container = parent_container
                                             .rounded_md()
                                             .border_1()
-                                            .border_color(cx.theme().colors().border_variant);
+                                            .border_color(self.style.secondary_border_color);
                                     }
 
                                     parent_container.style().refine(&self.style.code_block);
@@ -2369,7 +2413,7 @@ impl Element for MarkdownElement {
                         }),
                         MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
                             font_weight: Some(FontWeight::BOLD),
-                            color: Some(cx.theme().colors().text),
+                            color: Some(self.style.strong_text_color),
                             ..Default::default()
                         }),
                         MarkdownTag::Strikethrough => {
@@ -2433,7 +2477,6 @@ impl Element for MarkdownElement {
                                     &parsed_markdown.source,
                                     metadata_block,
                                     markdown_end,
-                                    cx,
                                 );
                                 rendered_metadata_block = true;
                             }
@@ -2456,7 +2499,7 @@ impl Element for MarkdownElement {
                                     .w_full()
                                     .mb_2()
                                     .border(px(1.5))
-                                    .border_color(cx.theme().colors().border)
+                                    .border_color(self.style.rule_color)
                                     .rounded_sm()
                                     .overflow_hidden(),
                                 range,
@@ -2488,14 +2531,14 @@ impl Element for MarkdownElement {
                                 .h_full()
                                 .when(col_index > 0, |this| this.border_l_1())
                                 .when(row_index > 0, |this| this.border_t_1())
-                                .border_color(cx.theme().colors().border)
+                                .border_color(self.style.rule_color)
                                 .px_1()
                                 .py_0p5()
                                 .when(is_header, |this| {
-                                    this.bg(cx.theme().colors().title_bar_background)
+                                    this.bg(self.style.table_header_background)
                                 })
                                 .when(!is_header && row_index % 2 == 1, |this| {
-                                    this.bg(cx.theme().colors().panel_background)
+                                    this.bg(self.style.muted_panel_background)
                                 });
 
                             cell_div = match alignment {
@@ -2576,7 +2619,7 @@ impl Element for MarkdownElement {
                                 let button_row = h_flex()
                                     .gap_0p5()
                                     .absolute()
-                                    .bg(cx.theme().colors().editor_background)
+                                    .bg(self.style.code_surface_color)
                                     .when_else(
                                         use_hover,
                                         |this| {
@@ -2865,6 +2908,7 @@ fn apply_heading_style(
     level: pulldown_cmark::HeadingLevel,
     custom_styles: Option<&HeadingLevelStyles>,
     border_color: Option<Hsla>,
+    border_levels: [bool; 6],
 ) -> Div {
     heading = match level {
         pulldown_cmark::HeadingLevel::H1 => heading.text_3xl(),
@@ -2880,13 +2924,16 @@ fn apply_heading_style(
         _ => heading.mt_6(),
     };
 
+    let level_index = match level {
+        pulldown_cmark::HeadingLevel::H1 => 0,
+        pulldown_cmark::HeadingLevel::H2 => 1,
+        pulldown_cmark::HeadingLevel::H3 => 2,
+        pulldown_cmark::HeadingLevel::H4 => 3,
+        pulldown_cmark::HeadingLevel::H5 => 4,
+        pulldown_cmark::HeadingLevel::H6 => 5,
+    };
     if let Some(border_color) = border_color
-        && matches!(
-            level,
-            pulldown_cmark::HeadingLevel::H1
-                | pulldown_cmark::HeadingLevel::H2
-                | pulldown_cmark::HeadingLevel::H3
-        )
+        && border_levels[level_index]
     {
         heading = heading.pb_1().border_b_1().border_color(border_color);
     }
@@ -3369,7 +3416,11 @@ impl MarkdownElementBuilder {
 
         if let Some(Some(language)) = self.code_block_stack.last() {
             let mut offset = 0;
-            for (range, highlight_id) in language.highlight_text(&Rope::from(text), 0..text.len()) {
+            for (range, highlight_id) in language.highlight_text_with_theme(
+                &Rope::from(text),
+                0..text.len(),
+                &self.syntax_theme,
+            ) {
                 if range.start > offset {
                     self.pending_line
                         .runs

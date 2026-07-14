@@ -193,7 +193,11 @@ impl MarkdownElement {
         if let Some(caption) = &table.caption {
             builder.push_div(
                 div().when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_2().line_height(rems(1.3))
+                    el.mb_2().line_height(
+                        self.style
+                            .paragraph_line_height
+                            .unwrap_or_else(|| rems(1.3).into()),
+                    )
                 }),
                 &table.source_range,
                 markdown_end,
