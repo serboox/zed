@@ -414,6 +414,48 @@ pub fn show_link_definition(
     // (which would otherwise leave `symbol_range` empty).
     hovered_link_state.last_trigger_point = trigger_point.clone();
 
+    // Optimistic link candidate (e.g. a SQL entity): resolve it synchronously
+    // and underline immediately, before spawning the async resolution task
+    // below. `link_candidate_range` is a fast, syntax-only check; it must NOT
+    // run inside that task, because a mouse-move re-triggers this function and
+    // drops (cancels) the in-flight task before it finishes -- which made the
+    // underline appear only intermittently while moving the pointer onto a
+    // token. Providers that do not implement it (the default) return None and
+    // fall through to the async path unchanged.
+    if let TriggerPoint::Text(_) = &trigger_point
+        && let Some(provider) = provider.as_ref()
+        // An explicit URL under the cursor is a higher-confidence target than
+        // the heuristic SQL-entity candidate: defer to the async pipeline below
+        // so the URL stays clickable, instead of underlining a fragment of it.
+        && !cursor_is_on_url(&buffer, anchor, cx)
+        && let Some(candidate) = provider.link_candidate_range(&buffer, anchor, cx)
+        && let Some(candidate_range) = snapshot
+            .buffer_snapshot()
+            .buffer_anchor_range_to_anchor_range(candidate)
+    {
+        editor.clear_highlights(HighlightKey::HoveredLinkState, cx);
+        hovered_link_state.preferred_kind = preferred_kind;
+        hovered_link_state.links = Vec::new();
+        hovered_link_state.task = None;
+        hovered_link_state.symbol_range = Some(RangeInEditor::Text(candidate_range.clone()));
+        let style = HighlightStyle {
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                ..UnderlineStyle::default()
+            }),
+            color: Some(cx.theme().colors().link_text_hover),
+            ..HighlightStyle::default()
+        };
+        editor.highlight_text(
+            HighlightKey::HoveredLinkState,
+            vec![candidate_range],
+            style,
+            cx,
+        );
+        editor.hovered_link_state = Some(hovered_link_state);
+        return;
+    }
+
     hovered_link_state.task = Some(cx.spawn_in(window, async move |this, cx| {
         async move {
             // LSP document links take priority: the server explicitly
@@ -479,37 +521,12 @@ pub fn show_link_definition(
                         links.push(HoverLink::File(file_target));
                     }
 
-                    // Optimistic link candidate (e.g. a SQL entity): underline
-                    // immediately from a synchronous, syntax-only check and let
-                    // the target resolve on click. This skips the possibly slow
-                    // definitions fetch on hover.
-                    let mut has_lazy_candidate = false;
-                    if links.is_empty()
-                        && symbol_range.is_none()
-                        && let Some(provider) = provider.as_ref()
-                    {
-                        let candidate =
-                            cx.update(|_, cx| provider.link_candidate_range(&buffer, anchor, cx))?;
-                        if let Some(candidate) = candidate {
-                            let snapshot = this
-                                .read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
-                            if let Some(range) =
-                                snapshot.buffer_anchor_range_to_anchor_range(candidate)
-                            {
-                                symbol_range = Some(RangeInEditor::Text(range));
-                                has_lazy_candidate = true;
-                            }
-                        }
-                    }
-
-                    // Always also collect LSP definitions so that cmd-click
-                    // reveals every applicable target (e.g. a position that
-                    // carries both a document link and a definition). Skipped
-                    // when an optimistic candidate already underlined the range;
-                    // that target is resolved lazily on click instead.
-                    if !has_lazy_candidate
-                        && let Some(provider) = provider
-                    {
+                    // Collect LSP definitions so cmd-click reveals every
+                    // applicable target (e.g. a position that carries both a
+                    // document link and a definition). The optimistic SQL-entity
+                    // candidate is resolved synchronously before this task is
+                    // spawned, so it never reaches this point.
+                    if let Some(provider) = provider {
                         let task = cx.update(|_, cx| {
                             provider.definitions(&buffer, anchor, preferred_kind, cx)
                         })?;
@@ -664,11 +681,28 @@ pub(crate) fn find_url(
     position: text::Anchor,
     cx: &AsyncWindowContext,
 ) -> Option<(Range<text::Anchor>, String)> {
-    const LIMIT: usize = 2048;
-
     let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
-
     let offset = position.to_offset(&snapshot);
+    find_url_in_buffer_snapshot(&snapshot, offset)
+}
+
+// True when the cursor sits on a URL. Lets the synchronous hover path defer to
+// the async link pipeline instead of shadowing the URL with a heuristic
+// candidate underline.
+fn cursor_is_on_url(buffer: &Entity<language::Buffer>, anchor: text::Anchor, cx: &App) -> bool {
+    let snapshot = buffer.read(cx).snapshot();
+    let offset = anchor.to_offset(&snapshot);
+    find_url_in_buffer_snapshot(&snapshot, offset).is_some()
+}
+
+// Scans the whitespace-delimited token containing `offset` for a URL. Split out
+// of `find_url` so the synchronous hover path can reuse it from a buffer
+// snapshot alone, with no async context.
+pub(crate) fn find_url_in_buffer_snapshot(
+    snapshot: &language::BufferSnapshot,
+    offset: usize,
+) -> Option<(Range<text::Anchor>, String)> {
+    const LIMIT: usize = 2048;
     let mut token_start = offset;
     let mut token_end = offset;
     let mut found_start = false;
@@ -1491,6 +1525,146 @@ mod tests {
             HighlightKey::HoveredLinkState,
             indoc! {"
                 let variable = 1;
+            "},
+        );
+    }
+
+    // The optimistic underline must be applied SYNCHRONOUSLY on the hover event,
+    // not from a spawned task: a fast pointer sweep re-triggers show_link_definition
+    // and cancels the in-flight task, so an async candidate underline appeared only
+    // intermittently. This exercises a multi-step sweep and asserts the underline is
+    // present WITHOUT pumping the executor. Fails pre-fix (candidate computed inside
+    // the cancellable task, so nothing is underlined until the task runs).
+    #[gpui::test]
+    async fn optimistic_underline_is_applied_synchronously_across_a_sweep(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx =
+            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+        cx.set_state(indoc! {"
+            let vˇariable = 1;
+        "});
+        let word_coord = cx
+            .editor(|editor, _, cx| editor.pixel_position_of_cursor(cx))
+            .unwrap();
+
+        cx.update_editor(|editor, _window, _cx| {
+            editor.set_semantics_provider(Some(
+                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
+            ));
+        });
+        cx.run_until_parked();
+
+        // First hover: the underline appears through the real hover pipeline.
+        cx.simulate_mouse_move(word_coord, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                let «variable» = 1;
+            "},
+        );
+
+        // ...and it was applied SYNCHRONOUSLY: no pending (cancellable) resolution
+        // task remains. The pre-fix code computed the candidate inside a spawned
+        // task that a subsequent mouse-move cancels -- the source of the
+        // intermittent underline. (The test executor drains that task eagerly, so
+        // the presence of the task, not the highlight, is what discriminates the
+        // fix from the pre-fix async behavior.)
+        let has_pending_task = cx.editor(|editor, _, _| {
+            editor
+                .hovered_link_state
+                .as_ref()
+                .is_some_and(|state| state.task.is_some())
+        });
+        assert!(
+            !has_pending_task,
+            "optimistic underline must be applied synchronously, leaving no pending resolution task"
+        );
+
+        // Second hover on the same held modifier (a continued sweep) keeps the
+        // underline -- no cancellation gap between consecutive moves.
+        cx.simulate_mouse_move(word_coord, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                let «variable» = 1;
+            "},
+        );
+
+        // Releasing the modifier clears it.
+        cx.simulate_modifiers_change(Modifiers::none());
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                let variable = 1;
+            "},
+        );
+    }
+
+    // A URL under the cursor must win over the optimistic SQL-entity candidate:
+    // the synchronous underline path defers to the async link pipeline so the
+    // full URL becomes the clickable link, instead of underlining a fragment
+    // (e.g. "https") as a bare column. Fails pre-fix (the candidate is applied
+    // synchronously and short-circuits URL detection).
+    #[gpui::test]
+    async fn url_under_cursor_is_not_shadowed_by_optimistic_candidate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx =
+            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+        cx.set_state(indoc! {"
+            https://exaˇmple.com
+        "});
+        let url_coord = cx
+            .editor(|editor, _, cx| editor.pixel_position_of_cursor(cx))
+            .unwrap();
+
+        cx.update_editor(|editor, _window, _cx| {
+            editor.set_semantics_provider(Some(
+                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
+            ));
+        });
+        cx.run_until_parked();
+
+        // Hover the URL with the modifier held. The candidate provider matches
+        // the bare word under the cursor, but a URL is present, so the
+        // synchronous candidate must be skipped and the async pipeline spawned.
+        cx.simulate_mouse_move(url_coord, None, Modifiers::secondary_key());
+        let deferred_to_async_pipeline = cx.editor(|editor, _, _| {
+            editor
+                .hovered_link_state
+                .as_ref()
+                .is_some_and(|state| state.task.is_some())
+        });
+        assert!(
+            deferred_to_async_pipeline,
+            "a URL under the cursor must defer to the async link pipeline, not be shadowed by the synchronous SQL-entity candidate"
+        );
+
+        // Once the pipeline resolves, the whole URL -- not just a fragment -- is
+        // underlined as the clickable link.
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                «https://example.com»
+            "},
+        );
+
+        // Releasing the modifier clears the link highlight.
+        cx.simulate_modifiers_change(Modifiers::none());
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                https://example.com
             "},
         );
     }
