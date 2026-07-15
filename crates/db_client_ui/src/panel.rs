@@ -1108,6 +1108,30 @@ fn word_before(text: &str, bytes: &[u8], offset: usize) -> Option<String> {
     Some(text[index..word_end].to_ascii_lowercase())
 }
 
+/// Resolves the database a bare (unqualified) table/column reference should
+/// navigate against. `expanded_databases` is a `HashMap`, whose key order is
+/// randomized per-process, so `.keys().next()` must never be used directly --
+/// doing so makes navigation targets flip between sessions. Once a config
+/// database is absent or empty, prefer the server-ordered database list, and
+/// only fall back to a sorted (therefore stable) key when neither is
+/// available.
+fn default_database(conn: &ActiveConnection) -> Option<String> {
+    conn.config
+        .database
+        .clone()
+        .filter(|database| !database.is_empty())
+        .or_else(|| {
+            conn.databases
+                .as_ref()
+                .and_then(|databases| databases.first().map(|database| database.name.clone()))
+                .or_else(|| {
+                    let mut names: Vec<&String> = conn.expanded_databases.keys().collect();
+                    names.sort();
+                    names.first().map(|name| (*name).clone())
+                })
+        })
+}
+
 impl SemanticsProvider for DbSemanticsProvider {
     fn hover(
         &self,
@@ -1244,12 +1268,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                         .connections
                         .iter()
                         .find(|c| c.config.id == self.connection_id)?;
-                    let db = database_opt.clone().or_else(|| {
-                        conn.config
-                            .database
-                            .clone()
-                            .or_else(|| conn.expanded_databases.keys().next().cloned())
-                    })?;
+                    let db = database_opt.clone().or_else(|| default_database(conn))?;
                     Some((db, table_name.clone()))
                 })
                 .ok()
@@ -1303,13 +1322,10 @@ impl SemanticsProvider for DbSemanticsProvider {
                                     .connections
                                     .iter()
                                     .find(|c| c.config.id == self.connection_id)?;
-                                insert_context.database.clone().or_else(|| {
-                                    conn.config
-                                        .database
-                                        .clone()
-                                        .filter(|database| !database.is_empty())
-                                        .or_else(|| conn.expanded_databases.keys().next().cloned())
-                                })
+                                insert_context
+                                    .database
+                                    .clone()
+                                    .or_else(|| default_database(conn))
                             })
                             .ok()
                             .flatten();
@@ -1353,13 +1369,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                                     .connections
                                     .iter()
                                     .find(|c| c.config.id == self.connection_id)?;
-                                schema.clone().or_else(|| {
-                                    conn.config
-                                        .database
-                                        .clone()
-                                        .filter(|database| !database.is_empty())
-                                        .or_else(|| conn.expanded_databases.keys().next().cloned())
-                                })
+                                schema.clone().or_else(|| default_database(conn))
                             })
                             .ok()
                             .flatten();
@@ -1406,12 +1416,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                         .connections
                         .iter()
                         .find(|c| c.config.id == self.connection_id)?;
-                    let default_database = conn
-                        .config
-                        .database
-                        .clone()
-                        .filter(|database| !database.is_empty())
-                        .or_else(|| conn.expanded_databases.keys().next().cloned());
+                    let default_database = default_database(conn);
                     let resolve_database =
                         |schema: Option<String>| schema.or_else(|| default_database.clone());
 
@@ -1476,12 +1481,7 @@ impl SemanticsProvider for DbSemanticsProvider {
                         .connections
                         .iter()
                         .find(|c| c.config.id == self.connection_id)?;
-                    let db = database_opt.clone().or_else(|| {
-                        conn.config
-                            .database
-                            .clone()
-                            .or_else(|| conn.expanded_databases.keys().next().cloned())
-                    })?;
+                    let db = database_opt.clone().or_else(|| default_database(conn))?;
                     Some((db, table_name.clone()))
                 })
                 .ok()
@@ -1577,12 +1577,7 @@ impl DbSemanticsProvider {
                     .connections
                     .iter()
                     .find(|c| c.config.id == self.connection_id)?;
-                let default_database = conn
-                    .config
-                    .database
-                    .clone()
-                    .filter(|database| !database.is_empty())
-                    .or_else(|| conn.expanded_databases.keys().next().cloned());
+                let default_database = default_database(conn);
                 let (target, range) = crate::sql_binder::resolve_navigation_at(
                     text,
                     conn.config.driver,
@@ -1636,12 +1631,7 @@ impl DbSemanticsProvider {
                     .connections
                     .iter()
                     .find(|c| c.config.id == self.connection_id)?;
-                let default_database = conn
-                    .config
-                    .database
-                    .clone()
-                    .filter(|database| !database.is_empty())
-                    .or_else(|| conn.expanded_databases.keys().next().cloned());
+                let default_database = default_database(conn);
                 crate::sql_binder::resolve_navigation_at(
                     text,
                     conn.config.driver,
@@ -2491,12 +2481,7 @@ async fn run_sql_validation(
             .connections
             .iter()
             .find(|c| c.config.id == connection_id)?;
-        let default_database = conn
-            .config
-            .database
-            .clone()
-            .filter(|database| !database.is_empty())
-            .or_else(|| conn.expanded_databases.keys().next().cloned());
+        let default_database = default_database(conn);
         Some(crate::sql_validator::validate(
             &text,
             conn.config.driver,
@@ -11224,6 +11209,95 @@ mod tests {
             table_triggers: std::collections::HashMap::new(),
             in_transaction: false,
         }
+    }
+
+    #[test]
+    fn default_database_is_deterministic_regardless_of_hashmap_insertion_order() {
+        let mut first_insertion_order = connection_in("test", None, 0);
+        first_insertion_order
+            .expanded_databases
+            .insert("zebra".into(), Vec::new());
+        first_insertion_order
+            .expanded_databases
+            .insert("apple".into(), Vec::new());
+        first_insertion_order
+            .expanded_databases
+            .insert("mango".into(), Vec::new());
+
+        let mut reverse_insertion_order = connection_in("test", None, 0);
+        reverse_insertion_order
+            .expanded_databases
+            .insert("mango".into(), Vec::new());
+        reverse_insertion_order
+            .expanded_databases
+            .insert("apple".into(), Vec::new());
+        reverse_insertion_order
+            .expanded_databases
+            .insert("zebra".into(), Vec::new());
+
+        assert_eq!(
+            super::default_database(&first_insertion_order),
+            Some("apple".to_string()),
+            "with no config database and no server-ordered list, the lowest sorted key wins"
+        );
+        assert_eq!(
+            super::default_database(&first_insertion_order),
+            super::default_database(&reverse_insertion_order),
+            "insertion order into the expanded_databases HashMap must not change the resolved default"
+        );
+    }
+
+    #[test]
+    fn default_database_prefers_explicit_config_database() {
+        let mut conn = connection_in("test", None, 0);
+        conn.config.database = Some("shop".to_string());
+        conn.expanded_databases
+            .insert("apple".into(), Vec::new());
+
+        assert_eq!(
+            super::default_database(&conn),
+            Some("shop".to_string()),
+            "an explicit, non-empty config database must always win"
+        );
+    }
+
+    #[test]
+    fn default_database_falls_back_past_empty_config_database() {
+        let mut conn = connection_in("test", None, 0);
+        conn.config.database = Some(String::new());
+        conn.expanded_databases
+            .insert("zebra".into(), Vec::new());
+        conn.expanded_databases
+            .insert("apple".into(), Vec::new());
+
+        assert_eq!(
+            super::default_database(&conn),
+            Some("apple".to_string()),
+            "an empty config database is treated as absent"
+        );
+    }
+
+    #[test]
+    fn default_database_prefers_server_ordered_list_over_sorted_keys() {
+        let mut conn = connection_in("test", None, 0);
+        conn.databases = Some(vec![
+            db_client::DatabaseInfo {
+                name: "zebra".to_string(),
+            },
+            db_client::DatabaseInfo {
+                name: "apple".to_string(),
+            },
+        ]);
+        conn.expanded_databases
+            .insert("apple".into(), Vec::new());
+        conn.expanded_databases
+            .insert("mango".into(), Vec::new());
+
+        assert_eq!(
+            super::default_database(&conn),
+            Some("zebra".to_string()),
+            "the server-ordered database list must win over a sorted expanded_databases key"
+        );
     }
 
     #[test]
