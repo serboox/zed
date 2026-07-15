@@ -32,12 +32,13 @@ use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
     schema::ColumnInfo,
 };
-use editor::{Editor, EditorEvent, GotoDefinitionKind, SemanticsProvider, ToOffset};
+use editor::{Editor, EditorEvent, GotoDefinitionKind, HighlightKey, SemanticsProvider, ToOffset};
 use futures::future::Shared;
 use gpui::{
     AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
-    DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render,
+    DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    PromptLevel, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
     Window, anchored, deferred, div, px,
 };
@@ -2205,6 +2206,7 @@ fn install_db_editor_features(
     };
 
     let env_color = connection_env_color(&store, connection_id, cx);
+    let driver = connection_driver(&store, connection_id, cx);
     let validation_store = store.clone();
     editor.update(cx, |editor, cx| {
         if editor.addon::<DbQueryEditorAddon>().is_none() {
@@ -2218,7 +2220,120 @@ fn install_db_editor_features(
             workspace,
         })));
     });
-    install_sql_validation(editor, validation_store, connection_id, cx);
+    install_sql_validation(editor.clone(), validation_store, connection_id, cx);
+    if let Some(driver) = driver
+        && crate::sql_ast::dialect_for_driver(driver).is_some()
+    {
+        install_sql_highlighting(editor, driver, cx);
+    }
+}
+
+/// Resolves the driver for a console connection from the in-memory store.
+fn connection_driver(
+    store: &WeakEntity<DatabaseStore>,
+    connection_id: ConnectionId,
+    cx: &App,
+) -> Option<DatabaseDriver> {
+    store.upgrade().and_then(|store_entity| {
+        store_entity
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|c| c.config.id == connection_id)
+            .map(|c| c.config.driver)
+    })
+}
+
+/// When true, SQL-dialect consoles are colored by our own resilient
+/// per-statement tokenizer instead of tree-sitter. This is the only in-process
+/// way to keep coloring correct after a malformed region (e.g. a pasted
+/// PHP-interpolated string), which otherwise makes tree-sitter paint the rest
+/// of the buffer as one string. Flip to `false` to fall back to tree-sitter.
+const SQL_CONSOLE_CUSTOM_HIGHLIGHT: bool = true;
+
+const DB_SQL_HIGHLIGHT_KEYS: [HighlightKey; 9] = [
+    HighlightKey::DbSqlKeyword,
+    HighlightKey::DbSqlDataType,
+    HighlightKey::DbSqlFunction,
+    HighlightKey::DbSqlString,
+    HighlightKey::DbSqlNumber,
+    HighlightKey::DbSqlComment,
+    HighlightKey::DbSqlOperator,
+    HighlightKey::DbSqlIdentifier,
+    HighlightKey::DbSqlVariable,
+];
+
+/// Re-colors `editor` from our resilient tokenizer on open and after every
+/// edit. Whole-buffer re-tokenization is cheap (a linear scan) at console
+/// sizes; per-statement incremental re-tokenization is a possible future
+/// optimization if very large buffers ever prove slow.
+fn install_sql_highlighting(editor: Entity<Editor>, driver: DatabaseDriver, cx: &mut App) {
+    if !SQL_CONSOLE_CUSTOM_HIGHLIGHT {
+        return;
+    }
+    apply_sql_highlights(&editor, driver, cx);
+    cx.subscribe(&editor, move |editor, event, cx| {
+        if matches!(event, EditorEvent::BufferEdited) {
+            apply_sql_highlights(&editor, driver, cx);
+        }
+    })
+    .detach();
+}
+
+fn apply_sql_highlights(editor: &Entity<Editor>, driver: DatabaseDriver, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        let text = editor.text(cx);
+        let tokens = crate::sql_highlight::highlight_tokens(&text, driver);
+        for key in DB_SQL_HIGHLIGHT_KEYS {
+            editor.clear_highlights(key, cx);
+        }
+        if tokens.is_empty() {
+            return;
+        }
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let syntax = cx.theme().syntax().clone();
+        let default_text = cx.theme().colors().text;
+
+        let mut ranges_by_kind: HashMap<crate::sql_highlight::SqlTokenKind, Vec<_>> =
+            HashMap::default();
+        for token in tokens {
+            let range = snapshot.anchor_before(editor::MultiBufferOffset(token.range.start))
+                ..snapshot.anchor_after(editor::MultiBufferOffset(token.range.end));
+            ranges_by_kind.entry(token.kind).or_default().push(range);
+        }
+        for (kind, ranges) in ranges_by_kind {
+            let (key, style) = sql_highlight_style(kind, &syntax, default_text);
+            editor.highlight_text(key, ranges, style, cx);
+        }
+    });
+}
+
+fn sql_highlight_style(
+    kind: crate::sql_highlight::SqlTokenKind,
+    syntax: &theme::SyntaxTheme,
+    default_text: gpui::Hsla,
+) -> (HighlightKey, HighlightStyle) {
+    use crate::sql_highlight::SqlTokenKind;
+    let (key, capture) = match kind {
+        SqlTokenKind::Keyword => (HighlightKey::DbSqlKeyword, Some("keyword")),
+        SqlTokenKind::DataType => (HighlightKey::DbSqlDataType, Some("type")),
+        SqlTokenKind::Function => (HighlightKey::DbSqlFunction, Some("function")),
+        SqlTokenKind::String => (HighlightKey::DbSqlString, Some("string")),
+        SqlTokenKind::Number => (HighlightKey::DbSqlNumber, Some("number")),
+        SqlTokenKind::Comment => (HighlightKey::DbSqlComment, Some("comment")),
+        SqlTokenKind::Operator => (HighlightKey::DbSqlOperator, Some("operator")),
+        SqlTokenKind::Variable => (HighlightKey::DbSqlVariable, Some("variable")),
+        SqlTokenKind::Identifier => (HighlightKey::DbSqlIdentifier, None),
+    };
+    let mut style = capture
+        .and_then(|name| syntax.style_for_name(name))
+        .unwrap_or_default();
+    // Force an explicit color on every token so tree-sitter's string-bleed on
+    // malformed input is masked on every glyph, not just recognized captures.
+    if style.color.is_none() {
+        style.color = Some(default_text);
+    }
+    (key, style)
 }
 
 /// A stable synthetic language-server id for diagnostics produced by the SQL
@@ -5128,6 +5243,11 @@ impl DatabasePanel {
                                 })));
                                 ed
                             });
+                            if let Some(driver) = connection_driver(&store, connection_id, cx)
+                                && crate::sql_ast::dialect_for_driver(driver).is_some()
+                            {
+                                install_sql_highlighting(editor.clone(), driver, cx);
+                            }
                             workspace.add_item_to_active_pane(
                                 Box::new(editor),
                                 None,
@@ -14323,6 +14443,99 @@ mod tests {
             editor.read_with(cx, |editor, _| editor.semantics_provider().is_some()),
             "console editor must carry the DbSemanticsProvider so Ctrl+click resolves DDL"
         );
+    }
+
+    // End-to-end guard for the resilient console highlighting: a statement with
+    // an unclosed quote must not bleed string coloring across the statements
+    // that follow it. Drives the real install entry point and asserts on the
+    // highlight ranges actually applied to the editor (the observable proxy for
+    // painted color), not on internal tokenizer state. Fails pre-fix: a naive
+    // whole-buffer tokenize paints everything after the stray quote as one
+    // string, so `users` lands inside a string highlight instead of being an
+    // identifier.
+    #[gpui::test]
+    async fn console_highlighting_survives_an_unclosed_quote(cx: &mut TestAppContext) {
+        let mut config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        config.driver = db_client::DatabaseDriver::MySQL;
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let text = "SELECT 1;\nSELECT 'oops FROM t;\nSELECT id FROM users;";
+        let editor = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            })
+        });
+
+        cx.update(|_window, cx| {
+            install_db_editor_features(
+                editor.clone(),
+                store.downgrade(),
+                workspace.downgrade(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Paste the malformed SQL after install so highlighting is driven by the
+        // real BufferEdited subscription a user's edit goes through, not by the
+        // one-shot apply on open.
+        editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let identifiers: Vec<String> = editor
+                .text_highlights(HighlightKey::DbSqlIdentifier, cx)
+                .map(|(_, ranges)| {
+                    ranges
+                        .iter()
+                        .map(|range| snapshot.text_for_range(range.clone()).collect::<String>())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                identifiers.iter().any(|token| token == "users"),
+                "the final statement's `users` must be an identifier highlight, not swallowed \
+                 by the unclosed quote; got identifiers: {identifiers:?}"
+            );
+            let strings: Vec<String> = editor
+                .text_highlights(HighlightKey::DbSqlString, cx)
+                .map(|(_, ranges)| {
+                    ranges
+                        .iter()
+                        .map(|range| snapshot.text_for_range(range.clone()).collect::<String>())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                strings.iter().all(|token| !token.contains("users")),
+                "no string highlight may bleed across the following statements; got strings: {strings:?}"
+            );
+        });
     }
 
     // The validator runs debounced off buffer edits, never on the edit itself,

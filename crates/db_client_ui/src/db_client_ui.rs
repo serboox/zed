@@ -22,15 +22,17 @@ mod sql_ast;
 mod sql_binder;
 mod sql_completion_provider;
 pub mod sql_exec;
+mod sql_highlight;
 mod sql_validator;
 mod store;
 mod table_copy;
 mod widgets;
 
 pub use panel::{
-    DatabasePanel, execute_current_sql_query_to_file, explain_current_sql_query,
-    format_current_sql_query, new_query_for_active_connection, open_new_sql_query,
-    run_current_sql_query, run_sql_file, save_run_configuration, toggle_inline_results,
+    DatabasePanel, execute_current_sql_query_to_file, explain_analyze_current_sql_query,
+    explain_current_sql_query, format_current_sql_query, new_query_for_active_connection,
+    open_new_sql_query, run_current_sql_query, run_sql_file, save_run_configuration,
+    toggle_inline_results,
 };
 pub use sql_exec::ExecStatusIndicator;
 pub use store::{CliQueryOutput, DatabaseStore, GlobalDatabaseStore};

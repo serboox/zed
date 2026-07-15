@@ -63,7 +63,10 @@ pub(crate) fn statement_spans(text: &str) -> Vec<Range<usize>> {
                 b'\'' => state = ScanState::SingleQuoted,
                 b'"' => state = ScanState::DoubleQuoted,
                 b'`' => state = ScanState::Backtick,
-                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                b'#' => state = ScanState::LineComment,
+                b'-' if bytes.get(index + 1) == Some(&b'-')
+                    && bytes.get(index + 2).is_none_or(|&b| b <= b' ') =>
+                {
                     state = ScanState::LineComment;
                     index += 1;
                 }
@@ -112,7 +115,29 @@ pub(crate) fn statement_spans(text: &str) -> Vec<Range<usize>> {
     }
 
     if start < bytes.len() {
-        spans.push(start..bytes.len());
+        if matches!(
+            state,
+            ScanState::SingleQuoted | ScanState::DoubleQuoted | ScanState::Backtick
+        ) {
+            // Unterminated quote: the scanner never returned to Normal, so any
+            // ';' it swallowed after `start` may really be a statement
+            // boundary. Re-split the tail on ';' so one malformed statement
+            // cannot merge every following statement into a single blob.
+            let mut sub_start = start;
+            let mut sub_index = start;
+            while sub_index < bytes.len() {
+                if bytes[sub_index] == b';' {
+                    spans.push(sub_start..sub_index);
+                    sub_start = sub_index + 1;
+                }
+                sub_index += 1;
+            }
+            if sub_start < bytes.len() {
+                spans.push(sub_start..bytes.len());
+            }
+        } else {
+            spans.push(start..bytes.len());
+        }
     }
     spans
 }
@@ -271,6 +296,33 @@ mod tests {
         let spans = statement_spans(text);
         assert_eq!(spans.len(), 2);
         assert_eq!(&text[spans[1].clone()], " SELECT 2");
+    }
+
+    #[test]
+    fn statement_spans_ignores_semicolon_inside_hash_line_comment() {
+        let text = "SELECT 1 # trailing ; comment\nFROM t;";
+        let spans = statement_spans(text);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn statement_spans_double_dash_without_trailing_space_is_not_a_comment() {
+        // MySQL requires whitespace after `--`; `1--2` is arithmetic, not a
+        // comment, so the following ';' still terminates the statement.
+        let text = "SELECT 1--2; SELECT 3;";
+        let spans = statement_spans(text);
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[test]
+    fn statement_spans_recovers_boundary_after_unterminated_quote() {
+        // An unterminated single quote must not swallow every following
+        // statement into one blob; a trailing well-formed statement keeps its
+        // own span. (Fails pre-recovery: yields a single span.)
+        let text = "SELECT 'oops; SELECT 1;";
+        let spans = statement_spans(text);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&text[spans[1].clone()], " SELECT 1");
     }
 
     #[test]
