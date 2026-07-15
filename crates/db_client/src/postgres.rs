@@ -11,7 +11,7 @@ use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind,
     QueryResult, SequenceInfo, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
-use crate::{MAX_RESULT_ROWS, cap_cell};
+use crate::MAX_RESULT_ROWS;
 
 pub struct PostgresProvider {
     pool: PgPool,
@@ -250,7 +250,7 @@ impl DbProvider for PostgresProvider {
                         .collect();
                 }
                 let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| Self::extract_cell(&row, index).map(cap_cell))
+                    .map(|index| Self::extract_cell(&row, index))
                     .collect();
                 result_rows.push(decoded);
 
@@ -336,7 +336,7 @@ impl DbProvider for PostgresProvider {
                 sink.write_columns(&columns)?;
             }
             let decoded: Vec<Option<String>> = (0..columns.len())
-                .map(|index| Self::extract_cell(&row, index).map(cap_cell))
+                .map(|index| Self::extract_cell(&row, index))
                 .collect();
             sink.write_row(&decoded)?;
             row_count += 1;

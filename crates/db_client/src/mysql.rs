@@ -7,8 +7,7 @@ use sqlx::{Column as _, Row as _};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-pub use crate::{MAX_CELL_BYTES, is_cell_possibly_truncated};
-use crate::{MAX_RESULT_ROWS, cap_cell};
+use crate::MAX_RESULT_ROWS;
 
 use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
@@ -606,7 +605,6 @@ impl DbProvider for MySqlProvider {
                                     .flatten()
                                     .map(bytes_to_string)
                             })
-                            .map(cap_cell)
                     })
                     .collect();
                 result_rows.push(decoded);
@@ -730,7 +728,6 @@ impl DbProvider for MySqlProvider {
                                 .flatten()
                                 .map(bytes_to_string)
                         })
-                        .map(cap_cell)
                 })
                 .collect();
             sink.write_row(&decoded)?;
@@ -1831,13 +1828,12 @@ mod integration_tests {
 
     // Verifies the streaming decode bounds memory: an unbounded SELECT over a
     // very large table must stop at the hard row cap instead of pulling the
-    // whole table, and every cell must respect the byte cap. This is the
-    // regression guard for the "app freezes / OS offers to kill it on a big
-    // query" report.
+    // whole table. This is the regression guard for the "app freezes / OS
+    // offers to kill it on a big query" report.
     #[tokio::test]
     #[ignore]
     async fn test_unbounded_select_is_bounded() {
-        use crate::{MAX_CELL_BYTES, MAX_RESULT_ROWS};
+        use crate::MAX_RESULT_ROWS;
         let config =
             test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
         let provider = MySqlProvider::connect(&config)
@@ -1853,15 +1849,6 @@ mod integration_tests {
             "unbounded SELECT must stop at the hard row cap, got {} rows",
             result.rows.len()
         );
-        for row in &result.rows {
-            for cell in row.iter().flatten() {
-                assert!(
-                    cell.len() <= MAX_CELL_BYTES + 4,
-                    "cell exceeded the byte cap: {} bytes",
-                    cell.len()
-                );
-            }
-        }
     }
 
     #[tokio::test]

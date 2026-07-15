@@ -4095,10 +4095,9 @@ impl ResultView {
     }
 
     // Checks whether a single row can be safely targeted by a PK-based WHERE
-    // clause: a table connection exists, the primary key is loaded and non-empty,
-    // every key column is present in the result, and no key value was truncated
-    // (a truncated key would match the wrong row). Returns the user-facing note
-    // on failure, reusing the wording shown elsewhere.
+    // clause: a table connection exists, the primary key is loaded and
+    // non-empty, and every key column is present in the result. Returns the
+    // user-facing note on failure, reusing the wording shown elsewhere.
     fn can_persist_row(&self, abs_idx: usize) -> Result<(), String> {
         if self.table_name.is_none() || self.store.is_none() {
             return Err("Edit kept in grid: no table connection to write to.".to_string());
@@ -4115,21 +4114,13 @@ impl ResultView {
                     .to_string(),
             );
         }
-        let Some(row) = result.rows.get(abs_idx) else {
+        if result.rows.get(abs_idx).is_none() {
             return Err("Edit kept in grid: row is no longer in the result.".to_string());
-        };
+        }
         for key in key_columns {
-            let Some(value_idx) = result.columns.iter().position(|col| col == key) else {
+            if !result.columns.iter().any(|col| col == key) {
                 return Err(
                     "Edit kept in grid: key column is not in the result; not written.".to_string(),
-                );
-            };
-            if let Some(text) = row.get(value_idx).and_then(|cell| cell.as_deref())
-                && db_client::is_cell_possibly_truncated(text)
-            {
-                return Err(
-                    "Edit kept in grid: key value was truncated, so it cannot safely target the row."
-                        .to_string(),
                 );
             }
         }
@@ -10012,7 +10003,7 @@ fn is_sql_number(text: &str) -> bool {
 
 // Builds an `UPDATE table SET col = value WHERE <key predicate>` statement. Pure
 // and side-effect free so it can be unit tested. The caller must ensure the key
-// predicate uniquely identifies the row and that no key value was truncated.
+// predicate uniquely identifies the row.
 fn build_update_sql(
     quote: char,
     table: &str,
@@ -10042,8 +10033,8 @@ fn build_update_sql(
 
 // Builds the (column, value) pairs of a PK-based WHERE predicate for one row.
 // Pure and testable. Returns Err with a human note when the row cannot be safely
-// targeted: a missing key column or a truncated key value (which would match the
-// wrong row). The caller must already have rejected an empty primary key.
+// targeted: a missing key column. The caller must already have rejected an
+// empty primary key.
 fn build_key_predicate(
     columns: &[String],
     primary_key_columns: &[String],
@@ -10057,14 +10048,6 @@ fn build_key_predicate(
             );
         };
         let value = row.get(value_idx).and_then(|cell| cell.clone());
-        if let Some(text) = value.as_deref()
-            && db_client::is_cell_possibly_truncated(text)
-        {
-            return Err(
-                "Edit kept in grid: key value was truncated, so it cannot safely target the row."
-                    .to_string(),
-            );
-        }
         key_predicate.push((key.clone(), value));
     }
     Ok(key_predicate)
@@ -10072,10 +10055,9 @@ fn build_key_predicate(
 
 // Turns the pending-edit buffer into one UPDATE per changed cell. Pure and
 // testable. Returns Err with a human note for the first cell that cannot be
-// safely targeted (no primary key, a missing key column, or a truncated key
-// value), so the caller can surface it and keep the buffer intact. `edits` are
-// `((absolute row, column), new value)` and should be pre-sorted for a stable
-// statement order.
+// safely targeted (no primary key or a missing key column), so the caller can
+// surface it and keep the buffer intact. `edits` are `((absolute row,
+// column), new value)` and should be pre-sorted for a stable statement order.
 fn build_pending_updates(
     quote: char,
     table: &str,
@@ -10111,7 +10093,7 @@ fn build_pending_updates(
 
 // Builds a `DELETE FROM table WHERE <key predicate>` statement. Pure and side
 // effect free. The caller must ensure the key predicate uniquely identifies the
-// row and that no key value was truncated.
+// row.
 fn build_delete_sql(quote: char, table: &str, key_columns: &[(String, Option<String>)]) -> String {
     let predicate: Vec<String> = key_columns
         .iter()
@@ -10870,24 +10852,6 @@ mod tests {
     }
 
     #[test]
-    fn build_pending_updates_rejects_truncated_key() {
-        // A truncated key value (ends with the ellipsis marker and is at least the
-        // cap in length) cannot safely target a single row.
-        let truncated = format!("{}…", "x".repeat(db_client::MAX_CELL_BYTES));
-        assert!(db_client::is_cell_possibly_truncated(&truncated));
-
-        let columns = vec!["id".to_string(), "name".to_string()];
-        let rows = vec![vec![Some(truncated), Some("a".to_string())]];
-        let primary_key_columns = vec!["id".to_string()];
-        let edits = vec![((0usize, 1usize), CellValue::Text("x".to_string()))];
-
-        let err =
-            build_pending_updates('`', "users", &columns, &primary_key_columns, &rows, &edits)
-                .expect_err("a truncated key value must be rejected");
-        assert!(err.contains("truncated"));
-    }
-
-    #[test]
     fn build_insert_sql_quotes_columns_and_emits_value_literals() {
         let columns = vec!["id".to_string(), "name".to_string()];
         let sql = build_insert_sql(
@@ -10999,13 +10963,6 @@ mod tests {
         let err = build_key_predicate(&["name".to_string()], &["id".to_string()], &row)
             .expect_err("a missing key column must be rejected");
         assert!(err.contains("key column is not in the result"));
-
-        // A truncated key value is rejected.
-        let truncated = format!("{}…", "x".repeat(db_client::MAX_CELL_BYTES));
-        let row = vec![Some(truncated), Some("a".to_string())];
-        let err = build_key_predicate(&columns, &["id".to_string()], &row)
-            .expect_err("a truncated key value must be rejected");
-        assert!(err.contains("truncated"));
     }
 
     #[test]

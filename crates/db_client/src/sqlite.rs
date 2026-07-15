@@ -12,7 +12,7 @@ use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
     TriggerInfo,
 };
-use crate::{MAX_RESULT_ROWS, cap_cell};
+use crate::MAX_RESULT_ROWS;
 
 pub struct SqliteProvider {
     pool: SqlitePool,
@@ -289,7 +289,6 @@ impl DbProvider for SqliteProvider {
                             .or_else(|| row.try_get::<i32, _>(index).ok().map(|v| v.to_string()))
                             .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
                             .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
-                            .map(cap_cell)
                     })
                     .collect();
                 result_rows.push(decoded);

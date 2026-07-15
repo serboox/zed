@@ -10,7 +10,7 @@ use scylla::value::CqlValue;
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
 use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
-use crate::{MAX_RESULT_ROWS, QUERY_TIMEOUT, cap_cell};
+use crate::{MAX_RESULT_ROWS, QUERY_TIMEOUT};
 
 // The scylla driver has no built-in overall bound on `SessionBuilder::build`:
 // a TCP-level refused/unreachable host fails fast via the OS, but a host that
@@ -265,7 +265,7 @@ impl DbProvider for CassandraProvider {
             rows.push(
                 row.columns
                     .into_iter()
-                    .map(|cell| cell.as_ref().map(cql_value_to_cell_text).map(cap_cell))
+                    .map(|cell| cell.as_ref().map(cql_value_to_cell_text))
                     .collect(),
             );
             if rows.len() >= MAX_RESULT_ROWS {

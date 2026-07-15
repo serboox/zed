@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
 use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
-use crate::{MAX_RESULT_ROWS, cap_cell};
+use crate::MAX_RESULT_ROWS;
 
 pub struct ClickHouseProvider {
     client: reqwest::Client,
@@ -341,8 +341,8 @@ impl DbProvider for ClickHouseProvider {
                     row.into_iter()
                         .map(|val| match val {
                             serde_json::Value::Null => None,
-                            serde_json::Value::String(s) => Some(cap_cell(s)),
-                            other => Some(cap_cell(other.to_string())),
+                            serde_json::Value::String(s) => Some(s),
+                            other => Some(other.to_string()),
                         })
                         .collect()
                 })
