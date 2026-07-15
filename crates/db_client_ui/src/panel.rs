@@ -9,8 +9,8 @@ use crate::ddl_source::DdlSourceView;
 use crate::driver_icon::brand_icon;
 use crate::erd_diagram::{ErdColumn, ErdRelationship, ErdTable, ErdView};
 use crate::explain_plan::{
-    ExplainPlanView, PlanNode, explain_sql_for_driver, parse_plan_tree, plan_text_from_result,
-    supports_explain_plan,
+    ExplainPlanView, PlanNode, explain_analyze_sql_for_driver, explain_sql_for_driver,
+    parse_plan_tree, plan_text_from_result, supports_explain_analyze, supports_explain_plan,
 };
 use crate::full_text_search::FullTextSearchView;
 use crate::go_to_object::GoToObjectPalette;
@@ -1636,44 +1636,113 @@ impl DbSemanticsProvider {
 }
 
 // Byte offsets of every top-level `;` in `text` -- i.e. semicolons that are
-// NOT inside a `'...'` or `"..."` string literal. Both SQL's doubled-quote
-// escape (`''`/`""`) and a backslash escape are honored, so a `;` embedded in
-// a value (e.g. a PHP-serialized string like `a:9:{i:60;i:1;...}`) is never
-// mistaken for a statement boundary. Comments are not tracked here (only
-// `skip_leading_whitespace_and_comments` handles those, at the very start of
-// a statement) -- a `;` inside a `-- ...`/`/* ... */` comment mid-statement
-// is a rare enough case to leave as a known gap. Operating on bytes is safe:
-// the characters checked (`'`, `"`, `;`, `\`) are all ASCII, so they can
-// never appear as part of a multi-byte UTF-8 continuation sequence.
+// NOT inside a string literal, a quoted identifier, or a comment. This is a
+// small SQL tokenizer (not a parser): it walks the text tracking which
+// construct it is inside so a `;` that is part of a value, an identifier, or a
+// comment is never mistaken for a statement boundary. Recognized constructs:
+//   * `'...'` / `"..."` string literals, honoring both the SQL doubled-quote
+//     escape (`''`/`""`) and a backslash escape (`\'`), so a `;` embedded in a
+//     value (e.g. a PHP-serialized string like `a:9:{i:60;i:1;...}`) does not
+//     split.
+//   * `` `...` `` quoted identifiers, honoring the doubled-backtick escape
+//     (`` `` ``); there is no backslash escape inside backtick identifiers.
+//   * `--` and `#` line comments (skipped to end of line) and `/* ... */`
+//     block comments (skipped to the matching `*/`). MySQL block comments do
+//     not nest, and `/*! ... */` conditional comments share the same
+//     delimiters, so both skip identically here.
+// The `--` case follows MySQL's rule that the second dash must be followed by
+// whitespace, a control char, or end-of-input, so an operator like `5--3`
+// stays an expression. This is deliberately stricter than
+// `skip_leading_whitespace_and_comments`, which treats a leading `--`
+// unconditionally; that helper only runs at the very start of a statement,
+// where a `--` can never be a subtraction operator.
+// Operating on bytes is safe: every delimiter checked (`'`, `"`, `;`, `` ` ``,
+// `\`, `-`, `#`, `/`, `*`, `\n`) is ASCII, so it can never appear as part of a
+// multi-byte UTF-8 continuation sequence.
 fn unquoted_semicolon_offsets(text: &str) -> Vec<usize> {
+    enum State {
+        Normal,
+        // Inside a `'`- or `"`-quoted string; holds the closing quote byte.
+        String(u8),
+        Identifier,
+        LineComment,
+        BlockComment,
+    }
     let bytes = text.as_bytes();
     let mut offsets = Vec::new();
-    let mut quote: Option<u8> = None;
+    let mut state = State::Normal;
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
-        match quote {
-            Some(q) => {
+        match state {
+            State::Normal => match byte {
+                b'\'' | b'"' => {
+                    state = State::String(byte);
+                    index += 1;
+                }
+                b'`' => {
+                    state = State::Identifier;
+                    index += 1;
+                }
+                b'#' => {
+                    state = State::LineComment;
+                    index += 1;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-')
+                    && bytes.get(index + 2).is_none_or(|&b| b <= b' ') =>
+                {
+                    state = State::LineComment;
+                    index += 2;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    state = State::BlockComment;
+                    index += 2;
+                }
+                b';' => {
+                    offsets.push(index);
+                    index += 1;
+                }
+                _ => index += 1,
+            },
+            State::String(quote) => {
                 if byte == b'\\' && index + 1 < bytes.len() {
                     index += 2;
-                    continue;
-                }
-                if byte == q {
-                    if bytes.get(index + 1) == Some(&q) {
+                } else if byte == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
                         index += 2;
-                        continue;
+                    } else {
+                        state = State::Normal;
+                        index += 1;
                     }
-                    quote = None;
+                } else {
+                    index += 1;
+                }
+            }
+            State::Identifier => {
+                if byte == b'`' {
+                    if bytes.get(index + 1) == Some(&b'`') {
+                        index += 2;
+                    } else {
+                        state = State::Normal;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Normal;
                 }
                 index += 1;
             }
-            None => {
-                if byte == b'\'' || byte == b'"' {
-                    quote = Some(byte);
-                } else if byte == b';' {
-                    offsets.push(index);
+            State::BlockComment => {
+                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    state = State::Normal;
+                    index += 2;
+                } else {
+                    index += 1;
                 }
-                index += 1;
             }
         }
     }
@@ -2975,25 +3044,33 @@ pub fn toggle_inline_results(
     controller.update(cx, |controller, cx| controller.toggle(cx));
 }
 
-pub fn explain_current_sql_query(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
+enum ExplainTarget {
+    /// The focused item is not a SQL console — the keybinding should
+    /// propagate to whatever default handler would otherwise run.
+    NotApplicable,
+    /// A console is focused but there is no statement to explain (empty
+    /// cursor line, or no resolvable connection) — do nothing, silently.
+    Empty,
+    Ready(
+        Entity<DatabasePanel>,
+        ConnectionId,
+        String,
+        DatabaseDriver,
+        String,
+    ),
+}
+
+fn resolve_explain_target(workspace: &mut Workspace, cx: &mut Context<Workspace>) -> ExplainTarget {
     let Some(panel) = workspace.panel::<DatabasePanel>(cx) else {
-        cx.propagate();
-        return;
+        return ExplainTarget::NotApplicable;
     };
     let store = panel.read(cx).store.clone();
     let active_item = workspace.active_item(cx);
-    let editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
-    let Some(editor) = editor else {
-        cx.propagate();
-        return;
+    let Some(editor) = active_item.and_then(|item| item.act_as::<Editor>(cx)) else {
+        return ExplainTarget::NotApplicable;
     };
     let Some(connection_id) = console_connection_for_editor(&editor, &store, cx) else {
-        cx.propagate();
-        return;
+        return ExplainTarget::NotApplicable;
     };
 
     let statement = editor.update(cx, |editor, cx| {
@@ -3019,7 +3096,7 @@ pub fn explain_current_sql_query(
     });
     let sql = statement.trim().trim_end_matches(';').trim().to_string();
     if sql.is_empty() {
-        return;
+        return ExplainTarget::Empty;
     }
 
     let resolved = {
@@ -3038,14 +3115,56 @@ pub fn explain_current_sql_query(
             })
     };
     let Some((id, database, driver)) = resolved else {
-        return;
+        return ExplainTarget::Empty;
+    };
+    ExplainTarget::Ready(panel, id, database, driver, sql)
+}
+
+pub fn explain_current_sql_query(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let (panel, id, database, driver, sql) = match resolve_explain_target(workspace, cx) {
+        ExplainTarget::NotApplicable => {
+            cx.propagate();
+            return;
+        }
+        ExplainTarget::Empty => return,
+        ExplainTarget::Ready(panel, id, database, driver, sql) => {
+            (panel, id, database, driver, sql)
+        }
     };
     if !supports_explain_plan(driver) {
         cx.propagate();
         return;
     }
     panel.update(cx, |panel, cx| {
-        panel.open_explain_plan(id, database, driver, sql, window, cx);
+        panel.open_explain_plan(id, database, driver, sql, false, window, cx);
+    });
+}
+
+pub fn explain_analyze_current_sql_query(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let (panel, id, database, driver, sql) = match resolve_explain_target(workspace, cx) {
+        ExplainTarget::NotApplicable => {
+            cx.propagate();
+            return;
+        }
+        ExplainTarget::Empty => return,
+        ExplainTarget::Ready(panel, id, database, driver, sql) => {
+            (panel, id, database, driver, sql)
+        }
+    };
+    if !supports_explain_analyze(driver) {
+        cx.propagate();
+        return;
+    }
+    panel.update(cx, |panel, cx| {
+        panel.open_explain_plan(id, database, driver, sql, true, window, cx);
     });
 }
 
@@ -3217,9 +3336,15 @@ fn run_sql_from_editor(
                     })
                 })
             });
-            result_view.update(cx, |view, cx| {
+            // Claims this run as the result view's current request. A slower,
+            // already-superseded run (e.g. the user re-ran the query before an
+            // earlier attempt came back) checks this token against the view's
+            // latest one before writing its result, so an out-of-order
+            // completion cannot overwrite a newer result with a stale one.
+            let request_token = result_view.update(cx, |view, cx| {
                 view.clear_table_context();
                 view.set_loading(cx);
+                view.begin_request()
             });
 
             // Auto-connect if the database is not connected (covers both a fresh
@@ -3233,14 +3358,17 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
-                    let message = format!(
-                        "Could not connect to '{conn_label}': {}",
-                        format_query_error(&err)
-                    );
-                    if let Some(inline_view) = &inline_view {
-                        inline_view.update(cx, |view, cx| view.set_error(message.clone(), cx));
+                    if result_view.read_with(cx, |view, _| view.is_current_request(request_token))
+                    {
+                        let message = format!(
+                            "Could not connect to '{conn_label}': {}",
+                            format_query_error(&err)
+                        );
+                        if let Some(inline_view) = &inline_view {
+                            inline_view.update(cx, |view, cx| view.set_error(message.clone(), cx));
+                        }
+                        result_view.update(cx, |view, cx| view.set_error(message, cx));
                     }
-                    result_view.update(cx, |view, cx| view.set_error(message, cx));
                     return anyhow::Ok(());
                 }
                 connected = true;
@@ -3251,6 +3379,8 @@ fn run_sql_from_editor(
                 store.execute_query(conn_id, db_name.clone(), sql.clone(), cx)
             });
             let result = task.await;
+            let is_current =
+                result_view.read_with(cx, |view, _| view.is_current_request(request_token));
             match result {
                 Ok(result) => {
                     editor.update(cx, |editor, cx| {
@@ -3259,6 +3389,11 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
+                    if !is_current {
+                        // A newer run has already taken over this result view;
+                        // applying this stale result would overwrite it.
+                        return anyhow::Ok(());
+                    }
                     if let Some(inline_view) = &inline_view {
                         inline_view.update(cx, |view, cx| view.set_result(&result, cx));
                     }
@@ -3288,6 +3423,9 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
+                    if !is_current {
+                        return anyhow::Ok(());
+                    }
                     if let Some(inline_view) = &inline_view {
                         inline_view
                             .update(cx, |view, cx| view.set_error(format_query_error(&err), cx));
@@ -3451,6 +3589,7 @@ struct SelectedTreeNode {
     connection_id: ConnectionId,
     database: String,
     table: Option<String>,
+    column: Option<String>,
 }
 
 /// What is being dragged in the connection tree. Folders and connections are the
@@ -4353,6 +4492,7 @@ impl DatabasePanel {
             None => entities[0],
         };
         self.selected_entity = Some(next);
+        self.selected_tree_node = None;
         cx.notify();
     }
 
@@ -4375,6 +4515,7 @@ impl DatabasePanel {
             None => *entities.last().expect("checked non-empty above"),
         };
         self.selected_entity = Some(previous);
+        self.selected_tree_node = None;
         cx.notify();
     }
 
@@ -4386,12 +4527,14 @@ impl DatabasePanel {
     ) {
         let entities = self.navigable_entities(cx);
         self.selected_entity = entities.into_iter().next();
+        self.selected_tree_node = None;
         cx.notify();
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
         let entities = self.navigable_entities(cx);
         self.selected_entity = entities.into_iter().next_back();
+        self.selected_tree_node = None;
         cx.notify();
     }
 
@@ -4786,7 +4929,7 @@ impl DatabasePanel {
             .min_w_full()
             .items_center()
             .gap_1()
-            .py_1()
+            .py_0p5()
             .pr_2()
             .pl(tree_indent(depth))
             .rounded_sm()
@@ -4805,20 +4948,6 @@ impl DatabasePanel {
             .when(is_after_target, |el| {
                 el.border_b_2()
                     .border_color(cx.theme().colors().text_accent)
-            })
-            .when(is_selected, |el| {
-                // Absolutely positioned so the accent never perturbs row layout
-                // (a real border would shift every child right by its width,
-                // which previously broke a fixed-offset click test).
-                el.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(2.))
-                        .bg(cx.theme().colors().text_accent),
-                )
             })
             .child(
                 h_flex()
@@ -4864,6 +4993,7 @@ impl DatabasePanel {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_entity = Some(SelectedEntity::Folder(folder_id));
+                this.selected_tree_node = None;
                 this.toggle_folder_collapsed(folder_id, cx);
             }))
             .on_drag(DraggedDbItem::Folder(folder_id), {
@@ -5973,10 +6103,16 @@ impl DatabasePanel {
         database: String,
         driver: DatabaseDriver,
         sql: String,
+        is_analyze: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let explain_sql = explain_sql_for_driver(driver, &sql);
+        let explain_sql = if is_analyze {
+            explain_analyze_sql_for_driver(driver, &sql)
+                .unwrap_or_else(|| explain_sql_for_driver(driver, &sql))
+        } else {
+            explain_sql_for_driver(driver, &sql)
+        };
         let store = self.store.clone();
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_this, cx| {
@@ -6002,7 +6138,9 @@ impl DatabasePanel {
                         driver,
                         sql,
                     };
-                    let view = cx.new(|cx| ExplainPlanView::new(roots, Some(context), window, cx));
+                    let view = cx.new(|cx| {
+                        ExplainPlanView::new(roots, Some(context), is_analyze, window, cx)
+                    });
                     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
                 })
                 .log_err();
@@ -7152,40 +7290,21 @@ impl DatabasePanel {
         v_flex()
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
+                    .debug_selector(|| "db-explorer-title-row".to_string())
                     .px_2()
                     .py_1()
-                    .child(Label::new("Database Explorer").size(LabelSize::Small))
+                    .child(Label::new("Database Explorer").size(LabelSize::Small)),
+            )
+            .child(
+                h_flex()
+                    .debug_selector(|| "db-explorer-icon-row".to_string())
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .pb_1()
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                IconButton::new("expand-all", IconName::ChevronUpDown)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Expand all"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.expand_all(cx);
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("collapse-all", IconName::ChevronDownUp)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Collapse all"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.collapse_all(cx);
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("open-ddl-source", IconName::FileCode)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Open SQL schema file"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_ddl_source(window, cx);
-                                    })),
-                            )
+                        div()
+                            .debug_selector(|| "db-explorer-add-connection".to_string())
                             .child(
                                 IconButton::new("add-connection", IconName::Plus)
                                     .icon_size(IconSize::Small)
@@ -7194,6 +7313,34 @@ impl DatabasePanel {
                                         this.open_add_connection_modal(window, cx);
                                     })),
                             ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "db-explorer-expand-all".to_string())
+                            .child(
+                                IconButton::new("expand-all", IconName::ChevronUpDown)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Expand all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.expand_all(cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("collapse-all", IconName::ChevronDownUp)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Collapse all"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.collapse_all(cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new("open-ddl-source", IconName::FileCode)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open SQL schema file"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_ddl_source(window, cx);
+                            })),
                     ),
             )
             .child(self.render_selection_action_bar(cx))
@@ -7226,6 +7373,16 @@ impl DatabasePanel {
                         ),
                 ),
             )
+    }
+
+    /// The connection tree row shows the selection fill only when it is the
+    /// click-selected entity. The active query-target connection is instead
+    /// distinguished by a bold label, never by this fill, so that at most one
+    /// tree row is filled at any depth. The active flag is deliberately excluded
+    /// (hence the leading underscore): do not fold it back in, or a child
+    /// selection under the active connection would leave two rows filled at once.
+    fn connection_row_shows_selection_fill(_is_active: bool, is_selected: bool) -> bool {
+        is_selected
     }
 
     fn render_connection_item(
@@ -7268,7 +7425,9 @@ impl DatabasePanel {
             }
         };
         let is_connected = matches!(conn.status, ConnectionStatus::Connected);
+        let in_transaction = conn.in_transaction;
         let is_server_objects_expanded = self.server_objects_expanded.contains(&id);
+        let selected_node = self.selected_tree_node.clone();
         let server_users = self.server_users.get(&id).cloned();
         let error_message = if let ConnectionStatus::Error(ref msg) = conn.status {
             Some(msg.clone())
@@ -7323,28 +7482,14 @@ impl DatabasePanel {
                     .gap_1()
                     .pr_2()
                     .pl(indent)
-                    .py_1()
+                    .py_0p5()
                     .rounded_sm()
                     .relative()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .when(is_active || is_selected, |el| {
-                        el.bg(cx.theme().colors().element_selected)
-                    })
-                    .when(is_active || is_selected, |el| {
-                        // Absolutely positioned so the accent never perturbs row
-                        // layout (a real border would shift every child right by
-                        // its width, which previously broke a fixed-offset click
-                        // test that clicks the row at a hardcoded x-offset).
-                        el.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(2.))
-                                .bg(cx.theme().colors().text_accent),
-                        )
-                    })
+                    .when(
+                        Self::connection_row_shows_selection_fill(is_active, is_selected),
+                        |el| el.bg(cx.theme().colors().element_selected),
+                    )
                     .when(is_before_target, |el| {
                         el.border_t_2().border_color(cx.theme().colors().text_accent)
                     })
@@ -7354,6 +7499,7 @@ impl DatabasePanel {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_entity = Some(SelectedEntity::Connection(id));
+                        this.selected_tree_node = None;
                         if is_connected {
                             this.store.update(cx, |store, cx| {
                                 store.set_active_connection(id, cx);
@@ -7453,13 +7599,42 @@ impl DatabasePanel {
                             .items_baseline()
                             .gap_1()
                             .overflow_hidden()
-                            .child(Label::new(label).size(LabelSize::Small).single_line())
+                            .child(
+                                Label::new(label)
+                                    .size(LabelSize::Small)
+                                    .weight(if is_active {
+                                        gpui::FontWeight::BOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .single_line(),
+                            )
                             .child(
                                 Label::new(driver_label)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
                                     .single_line(),
-                            ),
+                            )
+                            .when(in_transaction, |el| {
+                                el.child(
+                                    div()
+                                        .id(ElementId::from(SharedString::from(format!(
+                                            "conn-transaction-badge-{}",
+                                            id
+                                        ))))
+                                        .debug_selector(|| format!("conn-transaction-badge-{id}"))
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(cx.theme().status().warning_background)
+                                        .child(
+                                            Label::new("Transaction Open")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning)
+                                                .single_line(),
+                                        ),
+                                )
+                            }),
                     ),
             )
             .when_some(error_message, |el, msg| {
@@ -7491,7 +7666,7 @@ impl DatabasePanel {
                                 .gap_1()
                                 .pl(tree_indent(depth + 1))
                                 .pr_2()
-                                .py_1()
+                                .py_0p5()
                                 .cursor_pointer()
                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -7518,7 +7693,7 @@ impl DatabasePanel {
                                     .gap_1()
                                     .pl(tree_indent(depth + 2))
                                     .pr_2()
-                                    .py_1()
+                                    .py_0p5()
                                     .child(Icon::new(IconName::Person).size(IconSize::XSmall).color(Color::Muted))
                                     .child(
                                         Label::new(format!(
@@ -7538,7 +7713,7 @@ impl DatabasePanel {
                                         .gap_1()
                                         .pl(tree_indent(depth + 3))
                                         .pr_2()
-                                        .py_1()
+                                        .py_0p5()
                                         .child(Label::new(name).size(LabelSize::XSmall).single_line())
                                         .child(
                                             Label::new(format!("@{host}"))
@@ -7557,6 +7732,12 @@ impl DatabasePanel {
                     let is_db_expanded = expanded_database_set.contains(&db_name);
                     let db_tables = expanded_databases.get(&db_name).cloned();
                     let db_name_for_click = db_name.clone();
+                    let db_selected = selected_node.as_ref().is_some_and(|node| {
+                        node.connection_id == id
+                            && node.database == db_name
+                            && node.table.is_none()
+                            && node.column.is_none()
+                    });
 
                     let db_row = div()
                         .id(ElementId::from(SharedString::from(format!("db-row-{}-{}", id, db_name))))
@@ -7570,8 +7751,13 @@ impl DatabasePanel {
                         .gap_1()
                         .pl(tree_indent(depth + 1))
                         .pr_2()
-                        .py_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .relative()
                         .cursor_pointer()
+                        .when(db_selected, |el| {
+                            el.bg(cx.theme().colors().element_selected)
+                        })
                         .hover(|s| s.bg(cx.theme().colors().element_hover))
                         .on_click(cx.listener({
                             let db_name = db_name_for_click;
@@ -7580,7 +7766,10 @@ impl DatabasePanel {
                                     connection_id: id,
                                     database: db_name.clone(),
                                     table: None,
+                                    column: None,
                                 });
+                                this.selected_entity = None;
+                                cx.notify();
                                 if event.modifiers().control && event.click_count() == 1 {
                                     this.open_database_ddl(id, db_name.clone(), window, cx);
                                 } else if !event.modifiers().control {
@@ -7604,7 +7793,7 @@ impl DatabasePanel {
                         .child(
                             Icon::new(IconName::DatabaseZap)
                                 .size(IconSize::XSmall)
-                                .color(Color::Accent),
+                                .color(Color::Default),
                         )
                         .child(Label::new(db_name.clone()).size(LabelSize::Small));
 
@@ -7850,17 +8039,38 @@ impl DatabasePanel {
                                     let is_idx_expanded = indexes_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
                                     let is_fk_expanded = fks_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
                                     let is_trig_expanded = triggers_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
+                                    let is_view = matches!(table.kind, db_client::TableKind::View);
+                                    let table_selected = selected_node.as_ref().is_some_and(|node| {
+                                        node.connection_id == id
+                                            && node.database == db_for_table
+                                            && node.table.as_deref() == Some(table_name.as_str())
+                                            && node.column.is_none()
+                                    });
+                                    let tbl_actions_group: SharedString =
+                                        format!("tbl-actions-{}-{}-{}", id, db_for_table, table_name).into();
 
                                     let table_row = div()
                                         .id(ElementId::from(SharedString::from(format!("tbl-row-{}-{}-{}", id, db_for_table, table_name))))
+                                        .debug_selector({
+                                            let db = db_for_table.clone();
+                                            let tbl = table_name.clone();
+                                            move || format!("tbl-row-{}-{}-{}", id, db, tbl)
+                                        })
+                                        .group(tbl_actions_group.clone())
                                         .flex()
                                         .flex_row()
                                         .items_center()
                                         .gap_1()
                                         .pl(tree_indent(depth + 2))
                                         .pr_2()
-                                        .py_1()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .relative()
                                         .cursor_pointer()
+                                        .when(table_selected, |el| {
+                                            el.bg(cx.theme().colors().element_selected)
+                                        })
+                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
                                         .on_click(cx.listener({
                                             let db = db_for_table.clone();
                                             let tbl = table_name.clone();
@@ -7870,7 +8080,10 @@ impl DatabasePanel {
                                                     connection_id: id,
                                                     database: db.clone(),
                                                     table: Some(tbl.clone()),
+                                                    column: None,
                                                 });
+                                                this.selected_entity = None;
+                                                cx.notify();
                                                 if event.modifiers().control && event.click_count() == 1 {
                                                     let ddl_task = this.store.update(cx, |store, cx| {
                                                         store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
@@ -7905,108 +8118,129 @@ impl DatabasePanel {
                                             .color(Color::Muted),
                                         )
                                         .child(
-                                            Icon::new(IconName::Server)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
+                                            Icon::new(if is_view {
+                                                IconName::Eye
+                                            } else {
+                                                IconName::Reader
+                                            })
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
                                         )
                                         .child(
                                             div()
                                                 .id(ElementId::from(SharedString::from(format!("tbl-label-{}-{}-{}", id, db_for_table, table_name))))
+                                                .debug_selector({
+                                                    let db = db_for_table.clone();
+                                                    let tbl = table_name.clone();
+                                                    move || format!("tbl-label-{}-{}-{}", id, db, tbl)
+                                                })
+                                                .flex_1()
+                                                .min_w_0()
                                                 .child(HighlightedLabel::new(table_name.clone(), highlight_indices).size(LabelSize::Small).single_line())
                                                 .tooltip(Tooltip::text("Ctrl+click to view DDL")),
                                         )
                                         .child(
-                                            IconButton::new(
-                                                SharedString::from(format!("view-data-{}-{}-{}", id, db_for_table, table_name)),
-                                                IconName::PlayFilled,
-                                            )
-                                            .icon_size(IconSize::XSmall)
-                                            .tooltip(Tooltip::text("View Table Data"))
-                                            .on_click(cx.listener({
-                                                let db = db_for_table.clone();
-                                                let tbl = table_name.clone();
-                                                move |this, _, window, cx| {
-                                                    let sql = format!(
-                                                        "SELECT * FROM {} LIMIT 500",
-                                                        driver.quote_identifier(&tbl)
-                                                    );
-                                                    let store_weak = this.store.downgrade();
-                                                    let task = this.store.update(cx, |store, cx| {
-                                                        store.execute_query(id, db.clone(), sql, cx)
-                                                    });
-                                                    let title = SharedString::from(tbl.as_str());
-                                                    let workspace = this.workspace.clone();
-                                                    let env_color = connection_env_color(&store_weak, id, cx);
-                                                    let result_view = cx.new(|cx| {
-                                                        ResultView::new(title, cx)
-                                                            .with_table_context(store_weak, id, db.clone(), tbl.clone(), window, cx)
-                                                            .with_workspace(workspace.clone())
-                                                            .with_env_color(env_color)
-                                                    });
-                                                    let rv = result_view.clone();
-                                                    cx.spawn_in(window, async move |_, cx| {
-                                                        let outcome = task.await;
-                                                        rv.update(cx, |view, cx| match outcome {
-                                                            Ok(r) => view.set_result(r, cx),
-                                                            Err(e) => view.set_error(format_query_error(&e), cx),
-                                                        });
-                                                        workspace.update_in(cx, |ws, window, cx| {
-                                                            ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
-                                                        }).log_err();
-                                                        anyhow::Ok(())
-                                                    })
-                                                    .detach_and_log_err(cx);
-                                                }
-                                            })),
-                                        )
-                                        .child(
-                                            IconButton::new(
-                                                SharedString::from(format!("ddl-{}-{}-{}", id, db_for_table, table_name)),
-                                                IconName::Code,
-                                            )
-                                            .icon_size(IconSize::XSmall)
-                                            .tooltip(Tooltip::text("Script as CREATE"))
-                                            .on_click(cx.listener({
-                                                let db = db_for_table.clone();
-                                                let tbl = table_name.clone();
-                                                let workspace = self.workspace.clone();
-                                                move |this, _, window, cx| {
-                                                    let ddl_task = this.store.update(cx, |store, cx| {
-                                                        store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
-                                                    });
-                                                    let tbl_title = tbl.clone();
-                                                    let ws = workspace.clone();
-                                                    cx.spawn_in(window, async move |this, cx| {
-                                                        let ddl = ddl_task.await?;
-                                                        this.update_in(cx, |panel, window, cx| {
-                                                            Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
-                                                            let _ = tbl_title;
-                                                        }).log_err();
-                                                        anyhow::Ok(())
-                                                    })
-                                                    .detach_and_log_err(cx);
-                                                }
-                                            })),
-                                        )
-                                        .child(
-                                            IconButton::new(
-                                                SharedString::from(format!("insert-{}-{}-{}", id, db_for_table, table_name)),
-                                                IconName::TextSnippet,
-                                            )
-                                            .icon_size(IconSize::XSmall)
-                                            .tooltip(Tooltip::text("Script as INSERT / UPDATE / DELETE"))
-                                            .on_click(cx.listener({
-                                                let tbl = table_name.clone();
-                                                let cols = table_columns.clone().unwrap_or_default();
-                                                let workspace = self.workspace.clone();
-                                                move |this, _, window, cx| {
-                                                    let insert = Self::generate_insert_template(&tbl, driver, &cols);
-                                                    let update = Self::generate_update_template(&tbl, driver, &cols);
-                                                    let delete = Self::generate_delete_template(&tbl, driver, &cols);
-                                                    let sql = format!("{}\n\n{}\n\n{}", insert, update, delete);
-                                                    Self::open_sql_query_with_text(workspace.clone(), this.store.downgrade(), id, sql, window, cx);
-                                                }
-                                            })),
+                                            h_flex()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .right_1()
+                                                .items_center()
+                                                .gap_0p5()
+                                                .visible_on_hover(tbl_actions_group)
+                                                .child(
+                                                    IconButton::new(
+                                                        SharedString::from(format!("view-data-{}-{}-{}", id, db_for_table, table_name)),
+                                                        IconName::PlayFilled,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(Tooltip::text("View Table Data"))
+                                                    .on_click(cx.listener({
+                                                        let db = db_for_table.clone();
+                                                        let tbl = table_name.clone();
+                                                        move |this, _, window, cx| {
+                                                            let sql = format!(
+                                                                "SELECT * FROM {} LIMIT 500",
+                                                                driver.quote_identifier(&tbl)
+                                                            );
+                                                            let store_weak = this.store.downgrade();
+                                                            let task = this.store.update(cx, |store, cx| {
+                                                                store.execute_query(id, db.clone(), sql, cx)
+                                                            });
+                                                            let title = SharedString::from(tbl.as_str());
+                                                            let workspace = this.workspace.clone();
+                                                            let env_color = connection_env_color(&store_weak, id, cx);
+                                                            let result_view = cx.new(|cx| {
+                                                                ResultView::new(title, cx)
+                                                                    .with_table_context(store_weak, id, db.clone(), tbl.clone(), window, cx)
+                                                                    .with_workspace(workspace.clone())
+                                                                    .with_env_color(env_color)
+                                                            });
+                                                            let rv = result_view.clone();
+                                                            cx.spawn_in(window, async move |_, cx| {
+                                                                let outcome = task.await;
+                                                                rv.update(cx, |view, cx| match outcome {
+                                                                    Ok(r) => view.set_result(r, cx),
+                                                                    Err(e) => view.set_error(format_query_error(&e), cx),
+                                                                });
+                                                                workspace.update_in(cx, |ws, window, cx| {
+                                                                    ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                                }).log_err();
+                                                                anyhow::Ok(())
+                                                            })
+                                                            .detach_and_log_err(cx);
+                                                        }
+                                                    })),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        SharedString::from(format!("ddl-{}-{}-{}", id, db_for_table, table_name)),
+                                                        IconName::Code,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(Tooltip::text("Script as CREATE"))
+                                                    .on_click(cx.listener({
+                                                        let db = db_for_table.clone();
+                                                        let tbl = table_name.clone();
+                                                        let workspace = self.workspace.clone();
+                                                        move |this, _, window, cx| {
+                                                            let ddl_task = this.store.update(cx, |store, cx| {
+                                                                store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
+                                                            });
+                                                            let tbl_title = tbl.clone();
+                                                            let ws = workspace.clone();
+                                                            cx.spawn_in(window, async move |this, cx| {
+                                                                let ddl = ddl_task.await?;
+                                                                this.update_in(cx, |panel, window, cx| {
+                                                                    Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
+                                                                    let _ = tbl_title;
+                                                                }).log_err();
+                                                                anyhow::Ok(())
+                                                            })
+                                                            .detach_and_log_err(cx);
+                                                        }
+                                                    })),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        SharedString::from(format!("insert-{}-{}-{}", id, db_for_table, table_name)),
+                                                        IconName::TextSnippet,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(Tooltip::text("Script as INSERT / UPDATE / DELETE"))
+                                                    .on_click(cx.listener({
+                                                        let tbl = table_name.clone();
+                                                        let cols = table_columns.clone().unwrap_or_default();
+                                                        let workspace = self.workspace.clone();
+                                                        move |this, _, window, cx| {
+                                                            let insert = Self::generate_insert_template(&tbl, driver, &cols);
+                                                            let update = Self::generate_update_template(&tbl, driver, &cols);
+                                                            let delete = Self::generate_delete_template(&tbl, driver, &cols);
+                                                            let sql = format!("{}\n\n{}\n\n{}", insert, update, delete);
+                                                            Self::open_sql_query_with_text(workspace.clone(), this.store.downgrade(), id, sql, window, cx);
+                                                        }
+                                                    })),
+                                                )
                                         );
 
                                     let ctx_menu = {
@@ -8466,17 +8700,51 @@ impl DatabasePanel {
                                         .when(is_table_expanded, |el| {
                                             el.when_some(table_columns, |el, columns| {
                                                 let fk_columns = fk_columns.clone();
-                                                el.children(columns.into_iter().map(move |col| {
+                                                el.children(columns.into_iter().map(|col| {
                                                     let is_fk = fk_columns.contains(&col.name);
                                                     let overlays = Self::column_overlay_icons(&col, is_fk);
+                                                    let col_name = col.name.clone();
+                                                    let col_selected = selected_node.as_ref().is_some_and(|node| {
+                                                        node.connection_id == id
+                                                            && node.database == db_for_table
+                                                            && node.table.as_deref() == Some(table_name.as_str())
+                                                            && node.column.as_deref() == Some(col_name.as_str())
+                                                    });
                                                     div()
+                                                        .id(ElementId::from(SharedString::from(format!("col-row-{}-{}-{}-{}", id, db_for_table, table_name, col_name))))
+                                                        .debug_selector({
+                                                            let db = db_for_table.clone();
+                                                            let tbl = table_name.clone();
+                                                            let col = col_name.clone();
+                                                            move || format!("col-row-{}-{}-{}-{}", id, db, tbl, col)
+                                                        })
                                                         .flex()
                                                         .flex_row()
                                                         .items_center()
                                                         .gap_1()
                                                         .pl(tree_indent(depth + 3))
                                                         .pr_2()
-                                                        .py_1()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .cursor_pointer()
+                                                        .when(col_selected, |el| {
+                                                            el.bg(cx.theme().colors().element_selected)
+                                                        })
+                                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                                        .on_click(cx.listener({
+                                                            let db = db_for_table.clone();
+                                                            let tbl = table_name.clone();
+                                                            move |this, _, _, cx| {
+                                                                this.selected_tree_node = Some(SelectedTreeNode {
+                                                                    connection_id: id,
+                                                                    database: db.clone(),
+                                                                    table: Some(tbl.clone()),
+                                                                    column: Some(col_name.clone()),
+                                                                });
+                                                                this.selected_entity = None;
+                                                                cx.notify();
+                                                            }
+                                                        }))
                                                         .child(
                                                             Label::new(col.name)
                                                                 .size(LabelSize::XSmall),
@@ -10013,6 +10281,145 @@ mod tests {
         assert_eq!(third.start_row, 3);
     }
 
+    // Reproduces the real 840-line console file shape: an earlier statement
+    // carries a `-- ...` line comment holding a single unbalanced `"`. The
+    // pre-fix scanner treated that `"` as the start of a string literal that
+    // never closed, swallowing every following `;` and merging the rest of the
+    // file into one blob -- so the cursor on the final `SHOW CREATE TABLE`
+    // resolved to a giant merged statement. Drive it through the real
+    // run-at-cursor resolution path.
+    #[test]
+    fn cursor_resolves_final_statement_despite_unbalanced_quote_in_a_line_comment() {
+        let text = "SELECT\n  id,\n  last_updated_unixtimestamp, -- using as start_timestamp = \". $this->startTimestamp for quotes_charts\n  name\nFROM ec_fmedia.quotes;\n\nSELECT * FROM ec_fmedia.quotes_pair_attr LIMIT 10;\n\nSHOW CREATE TABLE ec_fmedia.quotes_pair_attr;\n";
+        let final_start = text
+            .find("SHOW CREATE TABLE")
+            .expect("final statement present");
+        let cursor = final_start + "SHOW CREATE".len();
+
+        let run = run_at_cursor(text, cursor).expect("expected a statement run");
+        assert_eq!(
+            run.sql,
+            "SHOW CREATE TABLE ec_fmedia.quotes_pair_attr",
+            "cursor on the final statement must resolve to exactly that statement, \
+             not a blob merged across the unbalanced-quote line comment"
+        );
+    }
+
+    #[test]
+    fn hash_line_comment_semicolon_does_not_split() {
+        let text = "SELECT 1 # note ; still comment\n+ 1;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT 1 # note ; still comment\n+ 1");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn block_comment_semicolon_does_not_split() {
+        let text = "SELECT 1 /* a ; b ; c */ + 1;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT 1 /* a ; b ; c */ + 1");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn semicolon_inside_backtick_identifier_does_not_split() {
+        let text = "CREATE TABLE `weird;name` (id INT);\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "CREATE TABLE `weird;name` (id INT)");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn semicolon_inside_backslash_escaped_single_quote_does_not_split() {
+        let text = "SELECT '\\';' AS a;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT '\\';' AS a");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    // The PHP-interpolated escaped-quote pattern seen in a real console file.
+    #[test]
+    fn php_style_escaped_quote_pattern_splits_correctly() {
+        let text = "SELECT x FROM t WHERE x = '\\'' AND y = 'z';\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT x FROM t WHERE x = '\\'' AND y = 'z'");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn doubled_quote_string_escape_protects_embedded_semicolons() {
+        let text = "SELECT 'a;b''c;d';\nSELECT \"e;f\"\"g;h\";";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT 'a;b''c;d'");
+        assert_eq!(runs[1].sql, "SELECT \"e;f\"\"g;h\"");
+    }
+
+    #[test]
+    fn doubled_backtick_identifier_escape_protects_embedded_semicolon() {
+        let text = "SELECT * FROM `we``ird;name`;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT * FROM `we``ird;name`");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn comment_introducers_inside_a_string_are_literal() {
+        let text = "SELECT '-- x; /* y ; */ z';\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT '-- x; /* y ; */ z'");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn unterminated_string_or_block_comment_does_not_over_split() {
+        // A dangling quote or unclosed comment must not panic, and must not
+        // expose the semicolons it swallows as false statement boundaries.
+        let unterminated_string = "SELECT 'oops ; no close\nSELECT 2";
+        let runs =
+            super::statement_runs_in_range(unterminated_string, 0..unterminated_string.len());
+        assert_eq!(runs.len(), 1, "runs: {runs:?}");
+
+        let unterminated_block = "SELECT 1 /* oops ; no close\nSELECT 2";
+        let runs =
+            super::statement_runs_in_range(unterminated_block, 0..unterminated_block.len());
+        assert_eq!(runs.len(), 1, "runs: {runs:?}");
+    }
+
+    // The project's PMM-prefix convention: a leading `-- name: ... :many`
+    // comment before a statement is skipped as leading comment, and the
+    // statement after it runs unchanged.
+    #[test]
+    fn leading_pmm_name_comment_is_skipped_and_statement_runs() {
+        let text = "-- name: CountRows :one\nSELECT COUNT(*) FROM t;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT COUNT(*) FROM t");
+        assert_eq!(runs[1].sql, "SELECT 2");
+
+        let cursor = text.find("COUNT(*)").expect("count present") + 2;
+        let run = run_at_cursor(text, cursor).expect("statement run at cursor");
+        assert_eq!(run.sql, "SELECT COUNT(*) FROM t");
+    }
+
+    // MySQL treats `--` as a comment only when followed by whitespace/control;
+    // `5--3` stays an expression, so a `;` after it must still split.
+    #[test]
+    fn double_dash_without_trailing_space_is_not_a_comment() {
+        let text = "SELECT 5--3;\nSELECT 2;";
+        let runs = super::statement_runs_in_range(text, 0..text.len());
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert_eq!(runs[0].sql, "SELECT 5--3");
+        assert_eq!(runs[1].sql, "SELECT 2");
+    }
+
     #[test]
     fn table_reference_at_offset_resolves_schema_qualified_table() {
         let text = "SELECT * FROM public.users WHERE id = 1";
@@ -10591,6 +10998,7 @@ mod tests {
             table_indexes: std::collections::HashMap::new(),
             table_fks: std::collections::HashMap::new(),
             table_triggers: std::collections::HashMap::new(),
+            in_transaction: false,
         }
     }
 
@@ -11120,6 +11528,459 @@ mod tests {
                 .any(|cell| cell.as_deref() == Some("1")),
             "the results table must contain the query output, got rows {:?}",
             result.rows
+        );
+    }
+
+    // Regression test for the reported bug where running a query showed the
+    // output of a completely different, unrelated query. Reproduces the real
+    // interaction end-to-end: Ctrl+Enter runs a slow query that is held open
+    // by a gate the test controls (standing in for a query that simply takes
+    // a while -- e.g. one delayed by the connection's own health-check/
+    // reconnect logic), then Ctrl+Enter runs a second, independent query on
+    // the same connection before the first one resolves. The two queries are
+    // forced to resolve out of dispatch order; the result tab must keep
+    // showing the second (most recently run) query's output even after the
+    // first query's stale result finally arrives.
+    #[gpui::test]
+    async fn ctrl_enter_does_not_let_a_stale_query_overwrite_a_newer_result(
+        cx: &mut TestAppContext,
+    ) {
+        struct GatedMockProvider {
+            // Taken and awaited by the one call whose SQL text matches
+            // `gated_marker`, so the test controls exactly when it resolves.
+            gated_marker: &'static str,
+            gate: std::sync::Mutex<Option<smol::channel::Receiver<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl db_client::DbProvider for GatedMockProvider {
+            async fn ping(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn list_databases(&self) -> anyhow::Result<Vec<db_client::DatabaseInfo>> {
+                Ok(Vec::new())
+            }
+            async fn list_tables(
+                &self,
+                _database: &str,
+            ) -> anyhow::Result<Vec<db_client::TableInfo>> {
+                Ok(Vec::new())
+            }
+            async fn describe_table(
+                &self,
+                _database: &str,
+                _table: &str,
+            ) -> anyhow::Result<Vec<db_client::ColumnInfo>> {
+                Ok(Vec::new())
+            }
+            async fn execute_query(
+                &self,
+                _database: &str,
+                sql: &str,
+            ) -> anyhow::Result<db_client::schema::QueryResult> {
+                if sql.contains(self.gated_marker) {
+                    // Take the receiver (and drop the std Mutex guard) before
+                    // awaiting it -- a std::sync::MutexGuard is not Send, and
+                    // an `if let` condition's temporary guard would otherwise
+                    // stay alive across the whole block, including the
+                    // `.await` below, which this future (spawned via
+                    // `cx.spawn`) must remain Send through.
+                    let gate = self
+                        .gate
+                        .lock()
+                        .expect("gate mutex should not be poisoned")
+                        .take();
+                    if let Some(gate) = gate {
+                        gate.recv().await.ok();
+                    }
+                }
+                Ok(db_client::schema::QueryResult {
+                    columns: vec!["marker".to_string()],
+                    rows: vec![vec![Some(sql.to_string())]],
+                    rows_affected: 1,
+                    execution_time_ms: 0,
+                })
+            }
+            async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let config = db_client::ConnectionConfig {
+            label: "race-e2e".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        cx.update(|cx| {
+            let mut default_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("load default-linux keymap");
+            for binding in &mut default_bindings {
+                binding.set_meta(settings::KeybindSource::Default.meta());
+            }
+            cx.bind_keys(default_bindings);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(cx, |workspace, _window, _cx| {
+            workspace.register_action(
+                |workspace, _: &zed_actions::database_panel::RunQuery, window, cx| {
+                    run_current_sql_query(workspace, window, cx);
+                },
+            );
+        });
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let (gate_tx, gate_rx) = smol::channel::bounded::<()>(1);
+        let provider = std::sync::Arc::new(GatedMockProvider {
+            gated_marker: "slow_first",
+            gate: std::sync::Mutex::new(Some(gate_rx)),
+        });
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider, cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local("SELECT 'slow_first'", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor.set_show_runnables(true, cx);
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        // Dispatches the slow query; it parks on `gate_rx` inside the mock
+        // provider instead of resolving, standing in for a real query that
+        // is simply taking a while.
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("SELECT 'fast_second'", window, cx);
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        // Dispatches a second, independent query against the same connection
+        // -- and thus the same reused result tab -- while the first is still
+        // pending on the gate.
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+
+        let pane = terminal_panel
+            .read_with(cx, |panel, _| panel.pane())
+            .expect("terminal panel must have a pane");
+        let read_result = |cx: &mut VisualTestContext| {
+            pane.read_with(cx, |pane, cx| {
+                pane.items_of_type::<crate::result_view::ResultView>()
+                    .next()
+                    .and_then(|view| view.read(cx).result.clone())
+            })
+        };
+
+        let after_second_dispatch =
+            read_result(cx).expect("the second query must have already produced a result");
+        assert!(
+            after_second_dispatch
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.as_deref() == Some("SELECT 'fast_second'")),
+            "the result tab must show the second (most recently run) query's \
+             output before the first query's stale result arrives, got {:?}",
+            after_second_dispatch.rows
+        );
+
+        // Let the slow first query finally resolve. Its result must be
+        // discarded rather than overwrite the second query's result -- this is
+        // the assertion that fails without the fix.
+        gate_tx.send(()).await.expect("test gate should still be open");
+        cx.run_until_parked();
+
+        let after_stale_completion =
+            read_result(cx).expect("the result tab must still show a result");
+        assert!(
+            after_stale_completion
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.as_deref() == Some("SELECT 'fast_second'")),
+            "a stale, late-arriving result from an already-superseded query must \
+             not overwrite the current result; got {:?}",
+            after_stale_completion.rows
+        );
+    }
+
+    // Reproduces the real reported interaction end-to-end: Ctrl+Enter runs
+    // `START TRANSACTION` against a MySQL connection, and the connection tree
+    // row must show a visible "Transaction Open" badge until `COMMIT` runs.
+    // Rendering is forced (`window.draw`) and the badge's presence is read
+    // back through `debug_bounds`, not through internal state alone, so a
+    // regression that leaves `in_transaction` true in the model but never
+    // renders the badge (or vice versa) would still fail this test.
+    #[gpui::test]
+    async fn ctrl_enter_shows_transaction_open_badge_until_commit(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "tx-e2e".to_string(),
+            driver: db_client::DatabaseDriver::MySQL,
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        cx.update(|cx| {
+            let mut default_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .expect("load default-linux keymap");
+            for binding in &mut default_bindings {
+                binding.set_meta(settings::KeybindSource::Default.meta());
+            }
+            cx.bind_keys(default_bindings);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, _window, _cx| {
+            workspace.register_action(
+                |workspace, _: &zed_actions::database_panel::RunQuery, window, cx| {
+                    run_current_sql_query(workspace, window, cx);
+                },
+            );
+        });
+
+        let store = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let terminal_panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let _ = terminal_panel;
+
+        store.update(&mut cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(format!("conn-transaction-badge-{connection_id}").leak())
+                .is_none(),
+            "no transaction is open yet, the badge must not be rendered"
+        );
+
+        let editor = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local("START TRANSACTION", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor.set_show_runnables(true, cx);
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            store.read_with(&cx, |store, _| store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == connection_id)
+                .map(|c| c.in_transaction)
+                .unwrap_or(false)),
+            "START TRANSACTION must mark the connection as being inside a transaction"
+        );
+        assert!(
+            cx.debug_bounds(format!("conn-transaction-badge-{connection_id}").leak())
+                .is_some(),
+            "the connection tree row must render a visible transaction-open badge"
+        );
+
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("COMMIT", window, cx);
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !store.read_with(&cx, |store, _| store
+                .connections()
+                .iter()
+                .find(|c| c.config.id == connection_id)
+                .map(|c| c.in_transaction)
+                .unwrap_or(false)),
+            "COMMIT must close the transaction"
+        );
+        assert!(
+            cx.debug_bounds(format!("conn-transaction-badge-{connection_id}").leak())
+                .is_none(),
+            "the transaction-open badge must disappear once the transaction is committed"
         );
     }
 
@@ -12108,6 +12969,7 @@ mod tests {
                 connection_id,
                 database: "public".to_string(),
                 table: Some("users".to_string()),
+                column: None,
             });
             panel.quick_doc_for_selection(window, cx);
         });
@@ -14274,6 +15136,316 @@ mod tests {
         (panel, visual_cx)
     }
 
+    // Fills a connected panel's tree with one database ("shop"), one table
+    // ("orders") and one column ("id"), all expanded, so the db/table/column
+    // rows are laid out and clickable in a headless test.
+    fn seed_expanded_tree(
+        panel: &Entity<DatabasePanel>,
+        connection_id: ConnectionId,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update(cx, |panel, cx| {
+            panel.store.update(cx, |store, _| {
+                if let Some(conn) = store
+                    .connections
+                    .iter_mut()
+                    .find(|c| c.config.id == connection_id)
+                {
+                    conn.databases = Some(vec![db_client::DatabaseInfo {
+                        name: "shop".to_string(),
+                    }]);
+                    conn.expanded_database_set.insert("shop".to_string());
+                    conn.expanded_databases.insert(
+                        "shop".to_string(),
+                        vec![db_client::TableInfo {
+                            name: "orders".to_string(),
+                            kind: db_client::TableKind::Table,
+                        }],
+                    );
+                    conn.expanded_table_set
+                        .insert(("shop".to_string(), "orders".to_string()));
+                    conn.expanded_tables.insert(
+                        ("shop".to_string(), "orders".to_string()),
+                        vec![db_client::schema::ColumnInfo {
+                            name: "id".to_string(),
+                            data_type: "int".to_string(),
+                            is_nullable: false,
+                            column_key: Some("PRI".to_string()),
+                            default_value: None,
+                            extra: String::new(),
+                        }],
+                    );
+                }
+            });
+            panel.collapsed_connections.clear();
+        });
+        cx.run_until_parked();
+    }
+
+    fn focus_and_draw(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // Real clicks through the event pipeline must keep exactly one tree row
+    // selected: choosing a database moves the single selection onto it and
+    // clears the connection selection.
+    #[gpui::test]
+    async fn clicking_a_database_row_moves_selection_off_the_connection(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "tree-select".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        seed_expanded_tree(&panel, connection_id, &mut cx);
+        focus_and_draw(&workspace, &mut cx);
+
+        let conn_bounds = cx
+            .debug_bounds(format!("conn-header-{connection_id}").leak())
+            .expect("expected debug bounds for conn-header");
+        let conn_point = gpui::Point {
+            x: conn_bounds.origin.x + px(20.),
+            y: conn_bounds.center().y,
+        };
+        cx.simulate_click(conn_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity,
+                Some(SelectedEntity::Connection(connection_id)),
+                "clicking the connection row selects it"
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let db_point = debug_center(&mut cx, format!("db-row-{connection_id}-shop").leak());
+        cx.simulate_click(db_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.selected_entity, None,
+                "selecting a database row must deselect the connection so only one row fills"
+            );
+            let node = panel
+                .selected_tree_node
+                .as_ref()
+                .expect("a database row click must set the tree-node selection");
+            assert_eq!(node.connection_id, connection_id);
+            assert_eq!(node.database, "shop");
+            assert!(
+                node.table.is_none() && node.column.is_none(),
+                "a database selection carries neither a table nor a column"
+            );
+        });
+    }
+
+    // A column row is a first-class selectable node: clicking it records the
+    // column so exactly the column row (not its parent table) fills.
+    #[gpui::test]
+    async fn clicking_a_column_row_selects_that_column(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "col-select".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        seed_expanded_tree(&panel, connection_id, &mut cx);
+        focus_and_draw(&workspace, &mut cx);
+
+        let col_point = debug_center(
+            &mut cx,
+            format!("col-row-{connection_id}-shop-orders-id").leak(),
+        );
+        cx.simulate_click(col_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _| {
+            let node = panel
+                .selected_tree_node
+                .as_ref()
+                .expect("clicking a column row must set the tree-node selection");
+            assert_eq!(node.database, "shop");
+            assert_eq!(node.table.as_deref(), Some("orders"));
+            assert_eq!(
+                node.column.as_deref(),
+                Some("id"),
+                "the column click must record the column identity"
+            );
+        });
+    }
+
+    // The three per-row action buttons are hover-only and out of the row's
+    // layout flow, so the table name label extends to the row's right edge
+    // instead of being pushed left (and truncated) by always-visible buttons.
+    #[gpui::test]
+    async fn table_row_reclaims_full_width_from_hover_only_actions(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "tbl-width".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        seed_expanded_tree(&panel, connection_id, &mut cx);
+        focus_and_draw(&workspace, &mut cx);
+
+        let row_bounds = cx
+            .debug_bounds(format!("tbl-row-{connection_id}-shop-orders").leak())
+            .expect("expected debug bounds for the table row");
+        let label_bounds = cx
+            .debug_bounds(format!("tbl-label-{connection_id}-shop-orders").leak())
+            .expect("expected debug bounds for the table label");
+
+        let row_right = row_bounds.origin.x + row_bounds.size.width;
+        let label_right = label_bounds.origin.x + label_bounds.size.width;
+        assert!(
+            f32::from(row_right - label_right) < 30.0,
+            "the table name label must extend to the row's right edge (gap was {:?}); \
+             always-visible in-flow action buttons would push it left by their combined width",
+            row_right - label_right,
+        );
+    }
+
+    // Keyboard navigation must uphold the same single-selection invariant as the
+    // pointer: after a db/table/column is selected by click, moving with the
+    // arrow keys selects a folder/connection and clears the tree-node fill so
+    // only one row stays highlighted (no stale double-fill).
+    #[gpui::test]
+    async fn keyboard_navigation_clears_the_tree_node_selection(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "kbd-select".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        seed_expanded_tree(&panel, connection_id, &mut cx);
+        focus_and_draw(&workspace, &mut cx);
+
+        let db_point = debug_center(&mut cx, format!("db-row-{connection_id}-shop").leak());
+        cx.simulate_click(db_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.selected_tree_node.is_some(),
+                "the database row click must set the tree-node selection"
+            );
+        });
+
+        cx.dispatch_action(menu::SelectNext);
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                panel.selected_entity.is_some(),
+                "SelectNext must move the selection onto a folder/connection row"
+            );
+            assert!(
+                panel.selected_tree_node.is_none(),
+                "keyboard navigation must clear the tree-node fill so only one row stays selected"
+            );
+        });
+    }
+
+    // Selecting a child row under the active connection must not leave the
+    // connection row filled too: the active connection is the query target
+    // (shown by a bold label), but the selection fill follows the click-
+    // selected entity only, so at most one tree row is filled at any depth.
+    // The assertions feed the real post-click state into the same predicate the
+    // render uses for the connection-row fill, since the painted fill itself is
+    // not observable through the test harness.
+    #[gpui::test]
+    async fn selecting_a_child_leaves_only_the_active_connection_unfilled(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "one-fill".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        seed_expanded_tree(&panel, connection_id, &mut cx);
+        focus_and_draw(&workspace, &mut cx);
+
+        let conn_point = debug_center(&mut cx, format!("conn-header-{connection_id}").leak());
+        cx.simulate_click(conn_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let is_active = panel.store.read(cx).active_connection_id() == Some(connection_id);
+            let is_selected =
+                panel.selected_entity == Some(SelectedEntity::Connection(connection_id));
+            assert!(
+                is_active,
+                "clicking a connected connection makes it the active query target"
+            );
+            assert!(
+                DatabasePanel::connection_row_shows_selection_fill(is_active, is_selected),
+                "the connection row fills while it is the selected entity"
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let db_point = debug_center(&mut cx, format!("db-row-{connection_id}-shop").leak());
+        cx.simulate_click(db_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let is_active = panel.store.read(cx).active_connection_id() == Some(connection_id);
+            let is_selected =
+                panel.selected_entity == Some(SelectedEntity::Connection(connection_id));
+            assert!(
+                is_active,
+                "the connection stays the active query target after selecting its child"
+            );
+            assert!(
+                !is_selected,
+                "selecting a child clears the connection selection"
+            );
+            assert!(
+                !DatabasePanel::connection_row_shows_selection_fill(is_active, is_selected),
+                "an active-but-unselected connection must not stay filled; \
+                 only the selected child row fills"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn quick_doc_populates_title_from_table(cx: &mut TestAppContext) {
         let config = db_client::ConnectionConfig {
@@ -14943,6 +16115,87 @@ mod tests {
              (a two-line stacked label+caption row would be roughly 2x taller)",
             conn_bounds.size.height,
             folder_bounds.size.height,
+        );
+    }
+
+    #[gpui::test]
+    async fn database_explorer_title_and_icon_toolbar_are_on_separate_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "toolbar-layout-test".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let title_bounds = cx
+            .debug_bounds("db-explorer-title-row")
+            .expect("expected debug bounds for the title row");
+        let icon_row_bounds = cx
+            .debug_bounds("db-explorer-icon-row")
+            .expect("expected debug bounds for the icon toolbar row");
+
+        assert!(
+            icon_row_bounds.origin.y >= title_bounds.origin.y + title_bounds.size.height,
+            "the icon toolbar row {:?} must start at or below the bottom edge of the title row {:?} \
+             (a single combined row would place them at the same y origin)",
+            icon_row_bounds,
+            title_bounds,
+        );
+        assert_eq!(
+            icon_row_bounds.origin.x, title_bounds.origin.x,
+            "the icon toolbar row must be left-aligned under the title, not indented or offset"
+        );
+    }
+
+    #[gpui::test]
+    async fn add_connection_is_the_leading_icon_in_the_explorer_toolbar(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "toolbar-order-test".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let (panel, mut cx) = load_connected_panel(cx, config).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("workspace handle must be live");
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let add_connection_bounds = cx
+            .debug_bounds("db-explorer-add-connection")
+            .expect("expected debug bounds for the add-connection icon");
+        let expand_all_bounds = cx
+            .debug_bounds("db-explorer-expand-all")
+            .expect("expected debug bounds for the expand-all icon");
+
+        assert!(
+            add_connection_bounds.origin.x < expand_all_bounds.origin.x,
+            "Add Connection {:?} must be the leading icon in the toolbar, before Expand All {:?}",
+            add_connection_bounds,
+            expand_all_bounds,
         );
     }
 
