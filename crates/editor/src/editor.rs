@@ -11217,6 +11217,22 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>>;
 
+    /// Fast, synchronous check for cmd/ctrl+hover: is `position` over a
+    /// navigable symbol whose target is resolved lazily on click? Returns the
+    /// symbol's range to underline. Implementing this opts into an optimistic
+    /// underline that appears without first resolving (or fetching) the
+    /// definition target; the target is then resolved on click through the
+    /// normal go-to-definition path. Default: no optimistic underline.
+    fn link_candidate_range(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Range<text::Anchor>> {
+        let _ = (buffer, position, cx);
+        None
+    }
+
     fn range_for_rename(
         &self,
         buffer: &Entity<Buffer>,

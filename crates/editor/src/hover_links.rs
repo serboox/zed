@@ -479,10 +479,37 @@ pub fn show_link_definition(
                         links.push(HoverLink::File(file_target));
                     }
 
+                    // Optimistic link candidate (e.g. a SQL entity): underline
+                    // immediately from a synchronous, syntax-only check and let
+                    // the target resolve on click. This skips the possibly slow
+                    // definitions fetch on hover.
+                    let mut has_lazy_candidate = false;
+                    if links.is_empty()
+                        && symbol_range.is_none()
+                        && let Some(provider) = provider.as_ref()
+                    {
+                        let candidate =
+                            cx.update(|_, cx| provider.link_candidate_range(&buffer, anchor, cx))?;
+                        if let Some(candidate) = candidate {
+                            let snapshot = this
+                                .read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                            if let Some(range) =
+                                snapshot.buffer_anchor_range_to_anchor_range(candidate)
+                            {
+                                symbol_range = Some(RangeInEditor::Text(range));
+                                has_lazy_candidate = true;
+                            }
+                        }
+                    }
+
                     // Always also collect LSP definitions so that cmd-click
                     // reveals every applicable target (e.g. a position that
-                    // carries both a document link and a definition).
-                    if let Some(provider) = provider {
+                    // carries both a document link and a definition). Skipped
+                    // when an optimistic candidate already underlined the range;
+                    // that target is resolved lazily on click instead.
+                    if !has_lazy_candidate
+                        && let Some(provider) = provider
+                    {
                         let task = cx.update(|_, cx| {
                             provider.definitions(&buffer, anchor, preferred_kind, cx)
                         })?;
@@ -506,7 +533,7 @@ pub fn show_link_definition(
                         }
                     }
 
-                    if links.is_empty() {
+                    if links.is_empty() && symbol_range.is_none() {
                         None
                     } else {
                         Some((symbol_range, links))
@@ -1257,6 +1284,215 @@ mod tests {
             struct «Aˇ»;
             let variable = A;
         "});
+    }
+
+    // A semantics provider that resolves NO definitions but reports the word
+    // under the cursor as a link candidate. It exercises the optimistic-underline
+    // path in `show_link_definition`: an entity must underline on cmd/ctrl+hover
+    // from `link_candidate_range` alone, before (and without) any definition
+    // target being resolved. Mirrors how `DbSemanticsProvider` underlines a SQL
+    // entity whose schema/DDL has not been cached yet.
+    struct CandidateOnlyProvider;
+
+    impl crate::SemanticsProvider for CandidateOnlyProvider {
+        fn hover(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _position: text::Anchor,
+            _cx: &mut App,
+        ) -> Option<Task<Option<Vec<project::Hover>>>> {
+            None
+        }
+
+        fn inline_values(
+            &self,
+            _buffer_handle: Entity<language::Buffer>,
+            _range: std::ops::Range<text::Anchor>,
+            _cx: &mut App,
+        ) -> Option<Task<anyhow::Result<Vec<project::InlayHint>>>> {
+            None
+        }
+
+        fn applicable_inlay_chunks(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _ranges: &[std::ops::Range<text::Anchor>],
+            _cx: &mut App,
+        ) -> Vec<std::ops::Range<language::BufferRow>> {
+            Vec::new()
+        }
+
+        fn invalidate_inlay_hints(
+            &self,
+            _for_buffers: &collections::HashSet<text::BufferId>,
+            _cx: &mut App,
+        ) {
+        }
+
+        fn inlay_hints(
+            &self,
+            _invalidate: project::InvalidationStrategy,
+            _buffer: Entity<language::Buffer>,
+            _ranges: Vec<std::ops::Range<text::Anchor>>,
+            _known_chunks: Option<(
+                clock::Global,
+                collections::HashSet<std::ops::Range<language::BufferRow>>,
+            )>,
+            _cx: &mut App,
+        ) -> Option<
+            collections::HashMap<
+                std::ops::Range<language::BufferRow>,
+                Task<anyhow::Result<project::lsp_store::CacheInlayHints>>,
+            >,
+        > {
+            None
+        }
+
+        fn semantic_tokens(
+            &self,
+            _buffer: Entity<language::Buffer>,
+            _refresh: Option<project::lsp_store::RefreshForServer>,
+            _cx: &mut App,
+        ) -> Option<
+            futures::future::Shared<
+                Task<
+                    std::result::Result<
+                        project::lsp_store::BufferSemanticTokens,
+                        Arc<anyhow::Error>,
+                    >,
+                >,
+            >,
+        > {
+            None
+        }
+
+        fn supports_inlay_hints(&self, _buffer: &Entity<language::Buffer>, _cx: &mut App) -> bool {
+            false
+        }
+
+        fn supports_semantic_tokens(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _cx: &mut App,
+        ) -> bool {
+            false
+        }
+
+        fn document_highlights(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _position: text::Anchor,
+            _cx: &mut App,
+        ) -> Option<Task<anyhow::Result<Vec<project::DocumentHighlight>>>> {
+            None
+        }
+
+        fn definitions(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _position: text::Anchor,
+            _kind: GotoDefinitionKind,
+            _cx: &mut App,
+        ) -> Option<Task<anyhow::Result<Option<Vec<LocationLink>>>>> {
+            None
+        }
+
+        fn link_candidate_range(
+            &self,
+            buffer: &Entity<language::Buffer>,
+            position: text::Anchor,
+            cx: &mut App,
+        ) -> Option<std::ops::Range<text::Anchor>> {
+            let snapshot = buffer.read(cx).snapshot();
+            let offset = snapshot.offset_for_anchor(&position);
+            let text = snapshot.text();
+            let bytes = text.as_bytes();
+            let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+            let on_word = offset < bytes.len() && is_word(bytes[offset]);
+            let after_word = offset > 0 && is_word(bytes[offset - 1]);
+            if !on_word && !after_word {
+                return None;
+            }
+            let mut start = offset;
+            while start > 0 && is_word(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut end = offset;
+            while end < bytes.len() && is_word(bytes[end]) {
+                end += 1;
+            }
+            if start == end {
+                return None;
+            }
+            Some(snapshot.anchor_before(start)..snapshot.anchor_after(end))
+        }
+
+        fn range_for_rename(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _position: text::Anchor,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Option<std::ops::Range<text::Anchor>>>> {
+            Task::ready(Ok(None))
+        }
+
+        fn perform_rename(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _position: text::Anchor,
+            _new_name: String,
+            _cx: &mut App,
+        ) -> Option<Task<anyhow::Result<project::ProjectTransaction>>> {
+            None
+        }
+    }
+
+    // End-to-end proof of the optimistic cmd/ctrl+hover underline: with a
+    // provider that resolves NO definition target (and no LSP definition
+    // capability at all), hovering a word must still underline it, driven purely
+    // by `link_candidate_range`. Fails pre-fix: `show_link_definition` only
+    // underlined once a definition resolved, so the word stayed un-underlined.
+    #[gpui::test]
+    async fn optimistic_link_candidate_underlines_without_resolved_definition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx =
+            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+        cx.set_state(indoc! {"
+            let vˇariable = 1;
+        "});
+        let screen_coord = cx.editor(|editor, _, cx| editor.pixel_position_of_cursor(cx));
+
+        cx.update_editor(|editor, _window, _cx| {
+            editor.set_semantics_provider(Some(
+                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
+            ));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_mouse_move(screen_coord.unwrap(), None, Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        // The whole word is underlined even though `definitions` returned nothing.
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                let «variable» = 1;
+            "},
+        );
+
+        // Releasing the modifier clears the optimistic underline.
+        cx.simulate_modifiers_change(Modifiers::none());
+        cx.run_until_parked();
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+                let variable = 1;
+            "},
+        );
     }
 
     #[gpui::test]

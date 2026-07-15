@@ -5561,11 +5561,9 @@ impl EditorElement {
                 ) {
                     window
                         .set_cursor_style(CursorStyle::DragCopy, &layout.position_map.text_hitbox);
-                } else if editor
-                    .hovered_link_state
-                    .as_ref()
-                    .is_some_and(|hovered_link_state| !hovered_link_state.links.is_empty())
-                {
+                } else if editor.hovered_link_state.as_ref().is_some_and(|hovered_link_state| {
+                    !hovered_link_state.links.is_empty() || hovered_link_state.symbol_range.is_some()
+                }) {
                     window.set_cursor_style(
                         CursorStyle::PointingHand,
                         &layout.position_map.text_hitbox,

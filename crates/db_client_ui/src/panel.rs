@@ -619,6 +619,17 @@ fn column_reference_at_offset(text: &str, offset: usize) -> Option<SqlColumnRefe
         None => (None, word.to_string(), start),
     };
 
+    // A bare reserved word like `SELECT`/`FROM`/`WHERE` is never a column the
+    // user wants to navigate; mirror the table scanner's keyword guard so
+    // Ctrl+hover does not underline a keyword that has no click target.
+    if qualifier.is_none()
+        && crate::sql_completion_provider::CORE_KEYWORDS
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(&column))
+    {
+        return None;
+    }
+
     if offset < column_start {
         return None;
     }
@@ -1492,6 +1503,26 @@ impl SemanticsProvider for DbSemanticsProvider {
         None
     }
 
+    fn link_candidate_range(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: Anchor,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<Anchor>> {
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = snapshot.offset_for_anchor(&position);
+        let text = snapshot.text();
+        let range = self.candidate_entity_range(&text, offset, cx)?;
+        // Only underline when the cursor is on the entity token itself. The
+        // scanners resolve the statement's entity from any position inside the
+        // statement, so without this guard whitespace and keywords would also
+        // underline.
+        if !range.contains(&offset) {
+            return None;
+        }
+        Some(snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+    }
+
     fn range_for_rename(
         &self,
         _buffer: &Entity<Buffer>,
@@ -1584,6 +1615,61 @@ impl DbSemanticsProvider {
             })
             .ok()
             .flatten()
+    }
+
+    /// Byte range of the SQL entity token at `offset`, identified purely from
+    /// the statement text. Unlike `ast_definition_target`/`definitions`, it
+    /// requires neither a resolvable database name nor any cached schema and
+    /// never fetches DDL: it only reports that the position sits on a navigable
+    /// entity so the editor can underline it on hover, leaving the target to be
+    /// resolved lazily on click.
+    fn candidate_entity_range(
+        &self,
+        text: &str,
+        offset: usize,
+        cx: &App,
+    ) -> Option<std::ops::Range<usize>> {
+        let ast_range = self
+            .store
+            .read_with(cx, |store, _| {
+                let conn = store
+                    .connections
+                    .iter()
+                    .find(|c| c.config.id == self.connection_id)?;
+                let default_database = conn
+                    .config
+                    .database
+                    .clone()
+                    .filter(|database| !database.is_empty())
+                    .or_else(|| conn.expanded_databases.keys().next().cloned());
+                crate::sql_binder::resolve_navigation_at(
+                    text,
+                    conn.config.driver,
+                    offset,
+                    default_database.as_deref(),
+                    conn,
+                )
+                .map(|(_, range)| range)
+            })
+            .ok()
+            .flatten();
+        if let Some(range) = ast_range {
+            return Some(range);
+        }
+
+        if let Some(reference) = statement_table_reference_at_offset(text, offset) {
+            return Some(reference.start..reference.end);
+        }
+        if let Some(reference) = database_reference_at_offset(text, offset) {
+            return Some(reference.start..reference.end);
+        }
+        if let Some(reference) = column_reference_at_offset(text, offset) {
+            return Some(reference.start..reference.end);
+        }
+        if let Some(reference) = table_reference_at_offset(text, offset) {
+            return Some(reference.start..reference.end);
+        }
+        None
     }
 
     fn spawn_ddl_navigation(
@@ -10923,6 +11009,24 @@ mod tests {
     }
 
     #[test]
+    fn column_reference_at_offset_rejects_bare_reserved_keywords() {
+        let text = "SELECT id FROM users WHERE active = 1";
+        for keyword in ["SELECT", "FROM", "WHERE"] {
+            let offset = text.find(keyword).expect("keyword in sql") + 1;
+            assert_eq!(
+                super::column_reference_at_offset(text, offset),
+                None,
+                "bare keyword `{keyword}` must not be a column candidate"
+            );
+        }
+        // A real bare column is still resolved.
+        assert!(
+            super::column_reference_at_offset(text, text.find("id").expect("id in sql") + 1)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn select_table_reference_resolves_multiline_schema_qualified_table() {
         let text = "SELECT *\n  FROM public.users\nWHERE id = 1";
 
@@ -14382,6 +14486,101 @@ mod tests {
             database_ddl.as_deref(),
             Some("DATABASE_DDL"),
             "Ctrl+click on a database token must resolve the database DDL"
+        );
+    }
+
+    fn link_candidate_text(
+        provider: &DbSemanticsProvider,
+        buffer: &Entity<Buffer>,
+        offset: usize,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        let anchor = buffer.read_with(cx, |buffer, _| buffer.snapshot().anchor_before(offset));
+        let range = cx.update(|_, cx| provider.link_candidate_range(buffer, anchor, cx))?;
+        let text = buffer.read_with(cx, |buffer, _| buffer.text());
+        let (start, end) = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            (
+                snapshot.offset_for_anchor(&range.start),
+                snapshot.offset_for_anchor(&range.end),
+            )
+        });
+        text.get(start..end).map(str::to_string)
+    }
+
+    // `link_candidate_range` must underline any syntactically-recognized entity
+    // on Ctrl+hover WITHOUT a cached schema (the DDL target loads lazily on
+    // click). Fails before the fix: the trait default returned `None`, so no
+    // entity underlined until its schema/DDL had been resolved.
+    #[gpui::test]
+    async fn link_candidate_range_identifies_entities_without_cached_schema(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = db_client::ConnectionConfig {
+            label: "candidate".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        config.driver = db_client::DatabaseDriver::MySQL;
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        // Connected, but schema is deliberately NOT expanded: no cached
+        // databases/tables. link_candidate_range must still recognize entities.
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let provider = DbSemanticsProvider {
+            connection_id,
+            store: store.downgrade(),
+            workspace: workspace.downgrade(),
+        };
+
+        let cases: [(&str, &str, &str); 4] = [
+            ("SELECT * FROM users WHERE id = 1", "users", "unqualified table"),
+            ("SELECT * FROM app_db.orders", "orders", "qualified table part"),
+            ("SHOW CREATE DATABASE app_db", "app_db", "database reference"),
+            ("SELECT o.total FROM orders o", "total", "alias-qualified column"),
+        ];
+        for (sql, token, description) in cases {
+            let buffer = cx.new(|cx| Buffer::local(sql, cx));
+            let offset = sql.find(token).expect("token present") + 1;
+            assert_eq!(
+                link_candidate_text(&provider, &buffer, offset, cx).as_deref(),
+                Some(token),
+                "{description} must be an underline candidate without a cached schema"
+            );
+        }
+
+        // A keyword / whitespace position is not a navigable entity.
+        let sql = "SELECT * FROM users";
+        let buffer = cx.new(|cx| Buffer::local(sql, cx));
+        let whitespace_offset = sql.find("SELECT").expect("keyword") + "SELECT".len();
+        assert_eq!(
+            link_candidate_text(&provider, &buffer, whitespace_offset, cx),
+            None,
+            "whitespace between tokens must not underline"
+        );
+
+        // A reserved keyword under the cursor is not a navigable entity: it
+        // would otherwise underline with a pointing hand but have no target.
+        let keyword_offset = sql.find("SELECT").expect("keyword") + 1;
+        assert_eq!(
+            link_candidate_text(&provider, &buffer, keyword_offset, cx),
+            None,
+            "a bare reserved keyword must not underline as an entity"
         );
     }
 
