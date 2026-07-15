@@ -758,6 +758,15 @@ fn detect_special_result(sql: Option<&str>, columns: &[String]) -> SpecialResult
     if let Some(sql) = sql {
         let upper = sql_effective_start(sql).to_ascii_uppercase();
         if upper.starts_with("EXPLAIN") {
+            // A tree-shaped plan (EXPLAIN FORMAT=TREE, EXPLAIN ANALYZE,
+            // PostgreSQL's text plan, ...) comes back as a single column of
+            // indented lines. A plain tabular EXPLAIN (MySQL's default) returns
+            // many columns; flattening those cells into a plan tree yields a
+            // meaningless one-value-per-line list, so show it as a normal grid.
+            // `columns` is only empty before a result exists.
+            if columns.len() > 1 {
+                return SpecialResult::None;
+            }
             return SpecialResult::ExplainPlan;
         }
         if upper.starts_with("SHOW CREATE") {
@@ -12112,6 +12121,39 @@ mod tests {
         assert_eq!(
             detect_special_result(None, &create_columns),
             SpecialResult::Ddl
+        );
+
+        // A plain tabular EXPLAIN (MySQL's default: many columns) is not a tree
+        // plan. Flattening its columns would render a meaningless
+        // one-value-per-line list, so it must fall back to the normal grid.
+        let mysql_explain_columns: Vec<String> = [
+            "id",
+            "select_type",
+            "table",
+            "type",
+            "possible_keys",
+            "key",
+            "key_len",
+            "ref",
+            "rows",
+            "filtered",
+            "Extra",
+        ]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+        assert_eq!(
+            detect_special_result(Some("EXPLAIN SELECT * FROM t"), &mysql_explain_columns),
+            SpecialResult::None
+        );
+
+        // A tree-shaped EXPLAIN still comes back as a single plan column.
+        assert_eq!(
+            detect_special_result(
+                Some("EXPLAIN FORMAT=TREE SELECT * FROM t"),
+                &["EXPLAIN".to_string()],
+            ),
+            SpecialResult::ExplainPlan
         );
     }
 
