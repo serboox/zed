@@ -2026,12 +2026,13 @@ impl DatabaseStore {
         table: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<String>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        if conn.provider.is_none()
-            && let Some(ddl) = self.cached_table_ddl(id, &database, &table)
-        {
+        }
+        // Serve the cache on a hit even while connected -- staleness is
+        // handled by the explicit refresh path (which clears `ddl_cache`),
+        // not by re-fetching on every navigation.
+        if let Some(ddl) = self.cached_table_ddl(id, &database, &table) {
             return Task::ready(Ok(ddl));
         }
         cx.spawn(async move |this, cx| {
@@ -2070,14 +2071,16 @@ impl DatabaseStore {
         database: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<String>> {
-        let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
+        if !self.connections.iter().any(|c| c.config.id == id) {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
-        };
-        if conn.provider.is_none()
-            && let Some(ddl) = self
-                .ddl_cache
-                .get(&id)
-                .and_then(|c| c.databases.get(&database).cloned())
+        }
+        // Serve the cache on a hit even while connected -- staleness is
+        // handled by the explicit refresh path (which clears `ddl_cache`),
+        // not by re-fetching on every navigation.
+        if let Some(ddl) = self
+            .ddl_cache
+            .get(&id)
+            .and_then(|c| c.databases.get(&database).cloned())
         {
             return Task::ready(Ok(ddl));
         }
@@ -3333,6 +3336,112 @@ mod tests {
         assert_eq!(
             db_cached.await.expect("cached while offline"),
             "CREATE DATABASE `shop`"
+        );
+    }
+
+    /// A DDL provider that returns a different string on every live fetch (by
+    /// stamping a call counter into the DDL text), so a test can tell a cache
+    /// hit apart from a live re-fetch: if `get_table_ddl`/`get_database_ddl`
+    /// on the store ever returned a *second* live fetch, the returned string
+    /// would change; a cache hit returns the exact string from the first
+    /// fetch.
+    #[derive(Default)]
+    struct CountingDdlMockProvider {
+        table_ddl_calls: Mutex<usize>,
+        database_ddl_calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DbProvider for CountingDdlMockProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, table: &str) -> Result<String> {
+            let mut calls = self.table_ddl_calls.lock().expect("table ddl calls lock");
+            *calls += 1;
+            Ok(format!("CREATE TABLE `{table}` (id INT) /* call {calls} */"))
+        }
+        async fn get_database_ddl(&self, database: &str) -> Result<String> {
+            let mut calls = self
+                .database_ddl_calls
+                .lock()
+                .expect("database ddl calls lock");
+            *calls += 1;
+            Ok(format!("CREATE DATABASE `{database}` /* call {calls} */"))
+        }
+    }
+
+    #[gpui::test]
+    async fn ddl_cache_serves_while_connected(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        let provider = Arc::new(CountingDdlMockProvider::default());
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider.clone(), cx);
+        });
+
+        let table_first = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        let table_first = table_first.await.expect("connected fetch");
+        let db_first = store.update(cx, |store, cx| {
+            store.get_database_ddl(id, "shop".into(), cx)
+        });
+        let db_first = db_first.await.expect("connected fetch");
+
+        // Still connected: a second lookup for the same table/database must
+        // be served from `ddl_cache` and must not perform another live fetch.
+        let table_second = store.update(cx, |store, cx| {
+            store.get_table_ddl(id, "shop".into(), "users".into(), cx)
+        });
+        assert_eq!(
+            table_second.await.expect("cached while connected"),
+            table_first,
+            "a cached DDL lookup while connected must not trigger a live re-fetch"
+        );
+        let db_second = store.update(cx, |store, cx| {
+            store.get_database_ddl(id, "shop".into(), cx)
+        });
+        assert_eq!(
+            db_second.await.expect("cached while connected"),
+            db_first,
+            "a cached DDL lookup while connected must not trigger a live re-fetch"
+        );
+
+        assert_eq!(
+            *provider.table_ddl_calls.lock().expect("table ddl calls lock"),
+            1,
+            "get_table_ddl must hit the live provider exactly once"
+        );
+        assert_eq!(
+            *provider
+                .database_ddl_calls
+                .lock()
+                .expect("database ddl calls lock"),
+            1,
+            "get_database_ddl must hit the live provider exactly once"
         );
     }
 
