@@ -7585,7 +7585,6 @@ impl DatabasePanel {
         let connection_folder = conn.config.folder_id;
         let drag_label: SharedString = conn.config.label.clone().into();
         let label = conn.config.label.clone();
-        let driver_label = conn.config.driver.to_string();
         let driver = conn.config.driver;
 
         let status_color = match &conn.status {
@@ -7667,7 +7666,7 @@ impl DatabasePanel {
                     .flex_row()
                     .min_w_full()
                     .items_center()
-                    .gap_1()
+                    .gap_0p5()
                     .pr_2()
                     .pl(indent)
                     .py_0p5()
@@ -7750,7 +7749,7 @@ impl DatabasePanel {
                     )
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap_0p5()
                             .items_center()
                             .when_some(
                                 env_color.as_deref().and_then(parse_env_color),
@@ -7795,12 +7794,6 @@ impl DatabasePanel {
                                     } else {
                                         gpui::FontWeight::NORMAL
                                     })
-                                    .single_line(),
-                            )
-                            .child(
-                                Label::new(driver_label)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
                                     .single_line(),
                             )
                             .when(in_transaction, |el| {
@@ -8967,7 +8960,7 @@ impl DatabasePanel {
                                                                 .gap_1()
                                                                 .pl(tree_indent(depth + 3))
                                                                 .pr_2()
-                                                                .py_1()
+                                                                .py_0p5()
                                                                 .cursor_pointer()
                                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -8994,7 +8987,7 @@ impl DatabasePanel {
                                                                     .items_center()
                                                                     .pl(tree_indent(depth + 4))
                                                                     .pr_2()
-                                                                    .py_1()
+                                                                    .py_0p5()
                                                                     .child(Icon::new(IconName::Hash).size(IconSize::XSmall).color(Color::Muted))
                                                                     .child(Label::new(idx.name).size(LabelSize::XSmall))
                                                                     .child(Label::new(format!("({})", idx.columns.join(", "))).size(LabelSize::XSmall).color(Color::Muted))
@@ -9020,7 +9013,7 @@ impl DatabasePanel {
                                                                 .gap_1()
                                                                 .pl(tree_indent(depth + 3))
                                                                 .pr_2()
-                                                                .py_1()
+                                                                .py_0p5()
                                                                 .cursor_pointer()
                                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9047,7 +9040,7 @@ impl DatabasePanel {
                                                                     .items_center()
                                                                     .pl(tree_indent(depth + 4))
                                                                     .pr_2()
-                                                                    .py_1()
+                                                                    .py_0p5()
                                                                     .child(Icon::new(IconName::Link).size(IconSize::XSmall).color(Color::Muted))
                                                                     .child(Label::new(fk.from_column).size(LabelSize::XSmall))
                                                                     .child(Label::new(format!("→ {}.{}", fk.to_table, fk.to_column)).size(LabelSize::XSmall).color(Color::Muted))
@@ -9070,7 +9063,7 @@ impl DatabasePanel {
                                                                 .gap_1()
                                                                 .pl(tree_indent(depth + 3))
                                                                 .pr_2()
-                                                                .py_1()
+                                                                .py_0p5()
                                                                 .cursor_pointer()
                                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9109,7 +9102,7 @@ impl DatabasePanel {
                                                                     .items_center()
                                                                     .pl(tree_indent(depth + 4))
                                                                     .pr_2()
-                                                                    .py_1()
+                                                                    .py_0p5()
                                                                     .cursor_pointer()
                                                                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                                     .on_click(move |_, window, cx| {
@@ -9147,7 +9140,7 @@ impl DatabasePanel {
                                                 .gap_1()
                                                 .pl(tree_indent(depth + 2))
                                                 .pr_2()
-                                                .py_1()
+                                                .py_0p5()
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9174,7 +9167,7 @@ impl DatabasePanel {
                                                     .items_center()
                                                     .pl(tree_indent(depth + 3))
                                                     .pr_2()
-                                                    .py_1()
+                                                    .py_0p5()
                                                     .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Muted))
                                                     .child(Label::new(view_name.clone()).size(LabelSize::Small).single_line());
 
@@ -9305,7 +9298,7 @@ impl DatabasePanel {
                                                 .gap_1()
                                                 .pl(tree_indent(depth + 2))
                                                 .pr_2()
-                                                .py_1()
+                                                .py_0p5()
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9343,7 +9336,7 @@ impl DatabasePanel {
                                                     .items_center()
                                                     .pl(tree_indent(depth + 3))
                                                     .pr_2()
-                                                    .py_1()
+                                                    .py_0p5()
                                                     .cursor_pointer()
                                                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                     .on_click(move |_, window, cx| {
@@ -9386,7 +9379,7 @@ impl DatabasePanel {
                                                 .gap_1()
                                                 .pl(tree_indent(depth + 2))
                                                 .pr_2()
-                                                .py_1()
+                                                .py_0p5()
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9413,7 +9406,7 @@ impl DatabasePanel {
                                                     .items_center()
                                                     .pl(tree_indent(depth + 3))
                                                     .pr_2()
-                                                    .py_1()
+                                                    .py_0p5()
                                                     .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
                                                     .child(Label::new(seq.name).size(LabelSize::Small))
                                                     .when_some(seq.current_value, |el, value| {
@@ -9446,7 +9439,7 @@ impl DatabasePanel {
                                                 .gap_1()
                                                 .pl(tree_indent(depth + 2))
                                                 .pr_2()
-                                                .py_1()
+                                                .py_0p5()
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -9484,7 +9477,7 @@ impl DatabasePanel {
                                                     .items_center()
                                                     .pl(tree_indent(depth + 3))
                                                     .pr_2()
-                                                    .py_1()
+                                                    .py_0p5()
                                                     .cursor_pointer()
                                                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                                                     .on_click(move |_, window, cx| {
