@@ -38,9 +38,8 @@ use gpui::{
     AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
     DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    PromptLevel, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    Window, anchored, deferred, div, px,
+    PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, WeakEntity, Window, anchored, deferred, div, px,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -58,8 +57,8 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use ui::{
     CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
-    Indicator, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
-    right_click_menu,
+    Indicator, Label, LabelSize, PopoverMenu, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use util::TryFutureExt as _;
@@ -3544,8 +3543,7 @@ fn run_sql_from_editor(
                             cx.notify();
                         }
                     });
-                    if result_view.read_with(cx, |view, _| view.is_current_request(request_token))
-                    {
+                    if result_view.read_with(cx, |view, _| view.is_current_request(request_token)) {
                         let message = format!(
                             "Could not connect to '{conn_label}': {}",
                             format_query_error(&err)
@@ -7246,12 +7244,7 @@ impl DatabasePanel {
         (position > 0, position + 1 < siblings.len())
     }
 
-    /// The single action bar for whichever connection is currently selected
-    /// in the tree (`self.selected_entity`), replacing the ten action icons
-    /// that used to be duplicated on every connection row. Always rendered
-    /// (so the layout doesn't jump on every click); every button disables
-    /// itself when nothing selectable is selected.
-    fn render_selection_action_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_overflow_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let selected = self.selected_connection(cx);
         let has_selection = selected.is_some();
         let id = selected.as_ref().map(|conn| conn.config.id);
@@ -7264,220 +7257,168 @@ impl DatabasePanel {
             .as_ref()
             .and_then(|conn| conn.config.database.clone())
             .unwrap_or_default();
-        let config_for_edit = selected.as_ref().map(|conn| conn.config.clone());
         let dump_label = driver.and_then(dump_menu_label);
         let (can_move_up, can_move_down) = id
             .map(|id| self.selected_connection_move_bounds(id, cx))
             .unwrap_or((false, false));
+        let panel = cx.entity();
 
-        // `IconButton`'s own debug selector defaults to `"ICON-{icon:?}"`
-        // (see `IconButton::new`), which is not unique enough for tests to
-        // target a specific action here — each button is wrapped in a plain
-        // div carrying an explicit, stable selector instead.
-        let label_for_exec = label.clone();
-        let database_for_exec = database.clone();
-        h_flex()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_t_1()
-            .bg(cx.theme().colors().editor_background)
+        div()
+            .debug_selector(|| "db-explorer-overflow".to_string())
             .child(
-                div()
-                    .debug_selector(|| "selection-new-query".to_string())
-                    .child(
-                        IconButton::new("selection-new-query", IconName::File)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection)
-                            .tooltip(Tooltip::text(
-                                driver.map_or("SQL Queries", new_query_button_label),
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let (Some(id), Some(label)) = (id, label.clone()) else {
-                                    return;
-                                };
-                                if driver == Some(DatabaseDriver::Aerospike) {
-                                    this.open_new_aerospike_view(
-                                        id,
-                                        label,
-                                        database.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                    return;
+                PopoverMenu::new("db-explorer-overflow-menu")
+                    .menu(move |window, cx| {
+                        let panel = panel.clone();
+                        let label = label.clone();
+                        let database = database.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.entry("Expand all", None, {
+                                let panel = panel.clone();
+                                move |_, cx| {
+                                    panel.update(cx, |panel, cx| panel.expand_all(cx));
                                 }
-                                this.workspace
-                                    .update(cx, |workspace, cx| {
-                                        open_new_sql_query(workspace, id, label, window, cx);
+                            })
+                            .entry("Collapse all", None, {
+                                let panel = panel.clone();
+                                move |_, cx| {
+                                    panel.update(cx, |panel, cx| panel.collapse_all(cx));
+                                }
+                            })
+                            .entry("Open SQL schema file", None, {
+                                let panel = panel.clone();
+                                move |window, cx| {
+                                    panel.update(cx, |panel, cx| panel.open_ddl_source(window, cx));
+                                }
+                            })
+                            .when(has_selection, |menu| {
+                                menu.separator()
+                                    .when(driver != Some(DatabaseDriver::Aerospike), |menu| {
+                                        menu.entry("Exec", None, {
+                                            let panel = panel.clone();
+                                            let label = label.clone();
+                                            let database = database.clone();
+                                            move |window, cx| {
+                                                let (Some(id), Some(label)) = (id, label.clone())
+                                                else {
+                                                    return;
+                                                };
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.open_exec_dialog(
+                                                        id,
+                                                        database.clone(),
+                                                        label.into(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        })
                                     })
-                                    .log_err();
-                            })),
-                    ),
-            )
-            .child(
-                div().debug_selector(|| "selection-exec".to_string()).child(
-                    IconButton::new("selection-exec", IconName::Terminal)
-                        .icon_size(IconSize::XSmall)
-                        .disabled(!has_selection || driver == Some(DatabaseDriver::Aerospike))
-                        .tooltip(Tooltip::text(
-                            "Exec — run a heavy or multi-statement script, separate from \
-                             the SQL Queries console",
-                        ))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let (Some(id), Some(label)) = (id, label_for_exec.clone()) else {
-                                return;
-                            };
-                            this.open_exec_dialog(
-                                id,
-                                database_for_exec.clone(),
-                                label.into(),
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-connect".to_string())
-                    .child(
-                        IconButton::new("selection-connect", IconName::PlayFilled)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection || is_connected)
-                            .tooltip(Tooltip::text("Connect"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.connect(id, cx).detach_and_log_err(cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-refresh".to_string())
-                    .child(
-                        IconButton::new("selection-refresh", IconName::RefreshTitle)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection || !is_connected)
-                            .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-disconnect".to_string())
-                    .child(
-                        IconButton::new("selection-disconnect", IconName::Disconnected)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection || !is_connected)
-                            .tooltip(Tooltip::text("Disconnect"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.disconnect(id, cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-move-up".to_string())
-                    .child(
-                        IconButton::new("selection-move-up", IconName::ChevronUp)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!can_move_up)
-                            .tooltip(Tooltip::text("Move Up"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.reorder_connection(id, -1, cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-move-down".to_string())
-                    .child(
-                        IconButton::new("selection-move-down", IconName::ChevronDown)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!can_move_down)
-                            .tooltip(Tooltip::text("Move Down"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.reorder_connection(id, 1, cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div().debug_selector(|| "selection-edit".to_string()).child(
-                    IconButton::new("selection-edit", IconName::Pencil)
-                        .icon_size(IconSize::XSmall)
-                        .disabled(!has_selection)
-                        .tooltip(Tooltip::text("Edit Connection"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Some(config) = config_for_edit.clone() else {
-                                return;
-                            };
-                            this.open_edit_connection_modal(config, window, cx);
-                        })),
-                ),
-            )
-            .child(
-                div().debug_selector(|| "selection-dump".to_string()).child(
-                    IconButton::new("selection-dump", IconName::Download)
-                        .icon_size(IconSize::XSmall)
-                        .disabled(!has_selection || dump_label.is_none())
-                        .tooltip(Tooltip::text(dump_label.unwrap_or("Export with dump tool")))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Some(id) = id else { return };
-                            this.open_dump_dialog(id, Vec::new(), Vec::new(), window, cx);
-                        })),
-                ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-duplicate".to_string())
-                    .child(
-                        IconButton::new("selection-duplicate", IconName::Copy)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection)
-                            .tooltip(Tooltip::text("Duplicate Connection"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.duplicate_connection(id, cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "selection-delete".to_string())
-                    .child(
-                        IconButton::new("selection-delete", IconName::Trash)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(!has_selection)
-                            .tooltip(Tooltip::text("Remove Connection"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(id) = id else { return };
-                                this.store.update(cx, |store, cx| {
-                                    store.remove_connection(id, cx);
-                                });
-                            })),
+                                    .when(is_connected, |menu| {
+                                        menu.entry("Disconnect", None, {
+                                            let panel = panel.clone();
+                                            move |_, cx| {
+                                                let Some(id) = id else { return };
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.store.update(cx, |store, cx| {
+                                                        store.disconnect(id, cx)
+                                                    });
+                                                });
+                                            }
+                                        })
+                                    })
+                                    .when(can_move_up, |menu| {
+                                        menu.entry("Move Up", None, {
+                                            let panel = panel.clone();
+                                            move |_, cx| {
+                                                let Some(id) = id else { return };
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.store.update(cx, |store, cx| {
+                                                        store.reorder_connection(id, -1, cx)
+                                                    });
+                                                });
+                                            }
+                                        })
+                                    })
+                                    .when(can_move_down, |menu| {
+                                        menu.entry("Move Down", None, {
+                                            let panel = panel.clone();
+                                            move |_, cx| {
+                                                let Some(id) = id else { return };
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.store.update(cx, |store, cx| {
+                                                        store.reorder_connection(id, 1, cx)
+                                                    });
+                                                });
+                                            }
+                                        })
+                                    })
+                                    .entry("Duplicate Connection", None, {
+                                        let panel = panel.clone();
+                                        move |_, cx| {
+                                            let Some(id) = id else { return };
+                                            panel.update(cx, |panel, cx| {
+                                                panel.store.update(cx, |store, cx| {
+                                                    store.duplicate_connection(id, cx)
+                                                });
+                                            });
+                                        }
+                                    })
+                                    .when_some(dump_label, |menu, dump_label| {
+                                        menu.entry(dump_label, None, {
+                                            let panel = panel.clone();
+                                            move |window, cx| {
+                                                let Some(id) = id else { return };
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.open_dump_dialog(
+                                                        id,
+                                                        Vec::new(),
+                                                        Vec::new(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        })
+                                    })
+                                    .separator()
+                                    .entry("Remove Connection", None, {
+                                        let panel = panel.clone();
+                                        move |_, cx| {
+                                            let Some(id) = id else { return };
+                                            panel.update(cx, |panel, cx| {
+                                                panel.store.update(cx, |store, cx| {
+                                                    store.remove_connection(id, cx)
+                                                });
+                                            });
+                                        }
+                                    })
+                            })
+                        }))
+                    })
+                    .trigger_with_tooltip(
+                        IconButton::new("db-explorer-overflow", IconName::Ellipsis)
+                            .icon_size(IconSize::Small),
+                        Tooltip::text("More actions"),
                     ),
             )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let selected = self.selected_connection(cx);
+        let has_selection = selected.is_some();
+        let id = selected.as_ref().map(|conn| conn.config.id);
+        let is_connected = selected
+            .as_ref()
+            .is_some_and(|conn| matches!(conn.status, ConnectionStatus::Connected));
+        let driver = selected.as_ref().map(|conn| conn.config.driver);
+        let config_for_edit = selected.as_ref().map(|conn| conn.config.clone());
+        let label_for_new_query = selected.as_ref().map(|conn| conn.config.label.clone());
+        let database_for_new_query = selected
+            .as_ref()
+            .and_then(|conn| conn.config.database.clone())
+            .unwrap_or_default();
+
         v_flex()
             .child(
                 div()
@@ -7507,34 +7448,90 @@ impl DatabasePanel {
                     )
                     .child(
                         div()
-                            .debug_selector(|| "db-explorer-expand-all".to_string())
+                            .debug_selector(|| "selection-connect".to_string())
                             .child(
-                                IconButton::new("expand-all", IconName::ChevronUpDown)
+                                IconButton::new("selection-connect", IconName::PlayFilled)
                                     .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Expand all"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.expand_all(cx);
+                                    .disabled(!has_selection || is_connected)
+                                    .tooltip(Tooltip::text("Connect"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(id) = id else { return };
+                                        this.store.update(cx, |store, cx| {
+                                            store.connect(id, cx).detach_and_log_err(cx);
+                                        });
                                     })),
                             ),
                     )
                     .child(
-                        IconButton::new("collapse-all", IconName::ChevronDownUp)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Collapse all"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.collapse_all(cx);
-                            })),
+                        div()
+                            .debug_selector(|| "selection-refresh".to_string())
+                            .child(
+                                IconButton::new("selection-refresh", IconName::RefreshTitle)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(!has_selection || !is_connected)
+                                    .tooltip(Tooltip::text("Refresh"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(id) = id else { return };
+                                        this.store.update(cx, |store, cx| {
+                                            store
+                                                .refresh_schema_cache(id, cx)
+                                                .detach_and_log_err(cx);
+                                        });
+                                    })),
+                            ),
                     )
                     .child(
-                        IconButton::new("open-ddl-source", IconName::FileCode)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Open SQL schema file"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_ddl_source(window, cx);
-                            })),
-                    ),
+                        div()
+                            .debug_selector(|| "selection-new-query".to_string())
+                            .child(
+                                IconButton::new("selection-new-query", IconName::File)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(!has_selection)
+                                    .tooltip(Tooltip::text(
+                                        driver.map_or("SQL Queries", new_query_button_label),
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let (Some(id), Some(label)) =
+                                            (id, label_for_new_query.clone())
+                                        else {
+                                            return;
+                                        };
+                                        if driver == Some(DatabaseDriver::Aerospike) {
+                                            this.open_new_aerospike_view(
+                                                id,
+                                                label,
+                                                database_for_new_query.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                            return;
+                                        }
+                                        this.workspace
+                                            .update(cx, |workspace, cx| {
+                                                open_new_sql_query(
+                                                    workspace, id, label, window, cx,
+                                                );
+                                            })
+                                            .log_err();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div().debug_selector(|| "selection-edit".to_string()).child(
+                            IconButton::new("selection-edit", IconName::Pencil)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_selection)
+                                .tooltip(Tooltip::text("Edit Connection"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let Some(config) = config_for_edit.clone() else {
+                                        return;
+                                    };
+                                    this.open_edit_connection_modal(config, window, cx);
+                                })),
+                        ),
+                    )
+                    .child(self.render_overflow_menu(cx)),
             )
-            .child(self.render_selection_action_bar(cx))
             .child(
                 div().px_2().py_1().border_t_1().child(
                     h_flex()
@@ -10489,8 +10486,7 @@ mod tests {
 
         let run = run_at_cursor(text, cursor).expect("expected a statement run");
         assert_eq!(
-            run.sql,
-            "SHOW CREATE TABLE ec_fmedia.quotes_pair_attr",
+            run.sql, "SHOW CREATE TABLE ec_fmedia.quotes_pair_attr",
             "cursor on the final statement must resolve to exactly that statement, \
              not a blob merged across the unbalanced-quote line comment"
         );
@@ -10579,8 +10575,7 @@ mod tests {
         assert_eq!(runs.len(), 1, "runs: {runs:?}");
 
         let unterminated_block = "SELECT 1 /* oops ; no close\nSELECT 2";
-        let runs =
-            super::statement_runs_in_range(unterminated_block, 0..unterminated_block.len());
+        let runs = super::statement_runs_in_range(unterminated_block, 0..unterminated_block.len());
         assert_eq!(runs.len(), 1, "runs: {runs:?}");
     }
 
@@ -11251,8 +11246,7 @@ mod tests {
     fn default_database_prefers_explicit_config_database() {
         let mut conn = connection_in("test", None, 0);
         conn.config.database = Some("shop".to_string());
-        conn.expanded_databases
-            .insert("apple".into(), Vec::new());
+        conn.expanded_databases.insert("apple".into(), Vec::new());
 
         assert_eq!(
             super::default_database(&conn),
@@ -11265,10 +11259,8 @@ mod tests {
     fn default_database_falls_back_past_empty_config_database() {
         let mut conn = connection_in("test", None, 0);
         conn.config.database = Some(String::new());
-        conn.expanded_databases
-            .insert("zebra".into(), Vec::new());
-        conn.expanded_databases
-            .insert("apple".into(), Vec::new());
+        conn.expanded_databases.insert("zebra".into(), Vec::new());
+        conn.expanded_databases.insert("apple".into(), Vec::new());
 
         assert_eq!(
             super::default_database(&conn),
@@ -11288,10 +11280,8 @@ mod tests {
                 name: "apple".to_string(),
             },
         ]);
-        conn.expanded_databases
-            .insert("apple".into(), Vec::new());
-        conn.expanded_databases
-            .insert("mango".into(), Vec::new());
+        conn.expanded_databases.insert("apple".into(), Vec::new());
+        conn.expanded_databases.insert("mango".into(), Vec::new());
 
         assert_eq!(
             super::default_database(&conn),
@@ -12070,7 +12060,10 @@ mod tests {
         // Let the slow first query finally resolve. Its result must be
         // discarded rather than overwrite the second query's result -- this is
         // the assertion that fails without the fix.
-        gate_tx.send(()).await.expect("test gate should still be open");
+        gate_tx
+            .send(())
+            .await
+            .expect("test gate should still be open");
         cx.run_until_parked();
 
         let after_stale_completion =
@@ -14623,10 +14616,26 @@ mod tests {
         };
 
         let cases: [(&str, &str, &str); 4] = [
-            ("SELECT * FROM users WHERE id = 1", "users", "unqualified table"),
-            ("SELECT * FROM app_db.orders", "orders", "qualified table part"),
-            ("SHOW CREATE DATABASE app_db", "app_db", "database reference"),
-            ("SELECT o.total FROM orders o", "total", "alias-qualified column"),
+            (
+                "SELECT * FROM users WHERE id = 1",
+                "users",
+                "unqualified table",
+            ),
+            (
+                "SELECT * FROM app_db.orders",
+                "orders",
+                "qualified table part",
+            ),
+            (
+                "SHOW CREATE DATABASE app_db",
+                "app_db",
+                "database reference",
+            ),
+            (
+                "SELECT o.total FROM orders o",
+                "total",
+                "alias-qualified column",
+            ),
         ];
         for (sql, token, description) in cases {
             let buffer = cx.new(|cx| Buffer::local(sql, cx));
@@ -14963,6 +14972,23 @@ mod tests {
         cx.debug_bounds(selector)
             .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
             .center()
+    }
+
+    // Drives a real click on the toolbar overflow trigger, then a real click on
+    // the named menu entry, going through the same PopoverMenu -> ContextMenu
+    // path a user's clicks take rather than calling the action handler directly.
+    fn open_overflow_menu_and_click(cx: &mut VisualTestContext, menu_item: &'static str) {
+        let overflow = debug_center(cx, "db-explorer-overflow");
+        cx.simulate_click(overflow, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let item = debug_center(cx, menu_item);
+        cx.simulate_click(item, gpui::Modifiers::none());
+        cx.run_until_parked();
     }
 
     // Autonomously verifies the Ctrl+Enter precedence without a live database,
@@ -16381,17 +16407,34 @@ mod tests {
         // task on the shared Tokio runtime (see `runtime.rs`) that outlives
         // this test's teardown against an unreachable default host/port,
         // which aborts the process. Duplicate exercises the same
-        // disabled-until-selected wiring synchronously.
-        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
-        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
+        // unavailable-until-selected wiring synchronously.
+        let overflow_button = debug_center(&mut cx, "db-explorer-overflow");
+        cx.simulate_click(overflow_button, gpui::Modifiers::none());
         cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Duplicate Connection").is_none(),
+            "the Duplicate Connection entry must be absent from the overflow menu \
+             while no connection is selected"
+        );
         panel.read_with(&cx, |panel, cx| {
             let count = panel.store.read(cx).connections().len();
             assert_eq!(
                 count, 1,
-                "the Duplicate button must do nothing while no connection is selected"
+                "no duplication must happen while no connection is selected"
             );
         });
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
 
         let conn_bounds = cx
             .debug_bounds(format!("conn-header-{connection_id}").leak())
@@ -16403,9 +16446,7 @@ mod tests {
         cx.simulate_click(conn_row, gpui::Modifiers::none());
         cx.run_until_parked();
 
-        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
-        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
-        cx.run_until_parked();
+        open_overflow_menu_and_click(&mut cx, "MENU_ITEM-Duplicate Connection");
         panel.read_with(&cx, |panel, cx| {
             let labels: Vec<String> = panel
                 .store
@@ -16500,9 +16541,7 @@ mod tests {
         // this test's teardown against an unreachable default host/port,
         // which aborts the process. Duplicate exercises the same
         // selected-connection targeting synchronously.
-        let duplicate_button = debug_center(&mut cx, "selection-duplicate");
-        cx.simulate_click(duplicate_button, gpui::Modifiers::none());
-        cx.run_until_parked();
+        open_overflow_menu_and_click(&mut cx, "MENU_ITEM-Duplicate Connection");
 
         panel.read_with(&cx, |panel, cx| {
             let labels: Vec<String> = panel
@@ -16673,15 +16712,15 @@ mod tests {
         let add_connection_bounds = cx
             .debug_bounds("db-explorer-add-connection")
             .expect("expected debug bounds for the add-connection icon");
-        let expand_all_bounds = cx
-            .debug_bounds("db-explorer-expand-all")
-            .expect("expected debug bounds for the expand-all icon");
+        let connect_bounds = cx
+            .debug_bounds("selection-connect")
+            .expect("expected debug bounds for the connect icon");
 
         assert!(
-            add_connection_bounds.origin.x < expand_all_bounds.origin.x,
-            "Add Connection {:?} must be the leading icon in the toolbar, before Expand All {:?}",
+            add_connection_bounds.origin.x < connect_bounds.origin.x,
+            "Add Connection {:?} must be the leading icon in the toolbar, before Connect {:?}",
             add_connection_bounds,
-            expand_all_bounds,
+            connect_bounds,
         );
     }
 
@@ -16727,16 +16766,14 @@ mod tests {
             );
         });
 
-        let exec_button = debug_center(&mut cx, "selection-exec");
-        cx.simulate_click(exec_button, gpui::Modifiers::none());
-        cx.run_until_parked();
+        open_overflow_menu_and_click(&mut cx, "MENU_ITEM-Exec");
 
         workspace.update(&mut cx, |workspace, cx| {
             assert!(
                 workspace
                     .active_modal::<crate::sql_exec::ExecDialog>(cx)
                     .is_some(),
-                "clicking the Exec button must open the ExecDialog modal"
+                "clicking the Exec menu entry must open the ExecDialog modal"
             );
         });
     }
