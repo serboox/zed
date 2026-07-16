@@ -619,6 +619,14 @@
     },
   },
   {
+    "context": "Editor && extension == html",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k v": "html::OpenPreviewToTheSide",
+      "ctrl-shift-v": "html::OpenPreview",
+    },
+  },
+  {
     "context": "Editor && mode == full",
     "bindings": {
       "ctrl-shift-o": "outline::Toggle",

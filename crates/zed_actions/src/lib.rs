@@ -943,6 +943,20 @@ pub mod preview {
             ]
         );
     }
+
+    pub mod html {
+        use gpui::actions;
+
+        actions!(
+            html,
+            [
+                /// Opens an HTML preview for the current file.
+                OpenPreview,
+                /// Opens an HTML preview in a split pane.
+                OpenPreviewToTheSide,
+            ]
+        );
+    }
 }
 
 pub mod agents_sidebar {

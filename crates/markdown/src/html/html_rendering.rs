@@ -138,6 +138,17 @@ impl MarkdownElement {
             ParsedHtmlElement::Image(image) => {
                 self.render_html_image(image, builder);
             }
+            ParsedHtmlElement::HorizontalRule(_) => {
+                builder.push_div(
+                    div()
+                        .border_b_1()
+                        .my_2()
+                        .border_color(self.style.rule_color),
+                    &source_range,
+                    markdown_end,
+                );
+                builder.pop_div();
+            }
         }
     }
 

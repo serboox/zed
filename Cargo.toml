@@ -104,6 +104,7 @@ members = [
     "crates/gpui_web",
     "crates/gpui_wgpu",
     "crates/gpui_windows",
+    "crates/html_preview",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
@@ -366,6 +367,7 @@ gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 gpui_tokio = { path = "crates/gpui_tokio" }
 gpui_util = { path = "crates/gpui_util" }
+html_preview = { path = "crates/html_preview" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }

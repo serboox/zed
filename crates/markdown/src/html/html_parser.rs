@@ -26,6 +26,7 @@ pub(crate) enum ParsedHtmlElement {
     BlockQuote(ParsedHtmlBlockQuote),
     Paragraph(ParsedHtmlParagraph),
     Image(HtmlImage),
+    HorizontalRule(Range<usize>),
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,7 @@ impl ParsedHtmlElement {
                 HtmlParagraphChunk::Image(image) => image.source_range.clone(),
             },
             Self::Image(image) => image.source_range.clone(),
+            Self::HorizontalRule(source_range) => source_range.clone(),
         })
     }
 }
@@ -335,6 +337,8 @@ fn parse_html_node(
                 if let Some(table) = extract_html_table(node, source_range) {
                     elements.push(ParsedHtmlElement::Table(table));
                 }
+            } else if name.local == local_name!("hr") {
+                elements.push(ParsedHtmlElement::HorizontalRule(source_range));
             } else {
                 consume_children(source_range, node, elements, context);
             }

@@ -661,6 +661,14 @@
     },
   },
   {
+    "context": "Editor && extension == html",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-k v": "html::OpenPreviewToTheSide",
+      "cmd-shift-v": "html::OpenPreview",
+    },
+  },
+  {
     "context": "Editor && mode == full",
     "use_key_equivalents": true,
     "bindings": {
