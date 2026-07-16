@@ -14,7 +14,8 @@ use text::PointUtf16;
 use workspace::OpenInTerminal;
 use zed_actions::agent::AddSelectionToThread;
 use zed_actions::preview::{
-    markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
+    html::OpenPreview as OpenHtmlPreview, markdown::OpenPreview as OpenMarkdownPreview,
+    svg::OpenPreview as OpenSvgPreview,
 };
 
 #[derive(Debug)]
@@ -243,6 +244,19 @@ pub fn deploy_context_menu(
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             });
 
+        let is_html = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).file())
+            .is_some_and(|file| {
+                std::path::Path::new(file.file_name(cx))
+                    .extension()
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm")
+                    })
+            });
+
         ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
             let builder = menu
                 .on_blur_subscription(Subscription::new(|| {}))
@@ -296,6 +310,9 @@ pub fn deploy_context_menu(
                 })
                 .when(is_svg, |builder| {
                     builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                })
+                .when(is_html, |builder| {
+                    builder.action("Open HTML Preview", Box::new(OpenHtmlPreview))
                 })
                 .action_disabled_when(
                     !has_reveal_target,
