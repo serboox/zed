@@ -276,6 +276,136 @@ fn unsupported_command_error(text: &str) -> anyhow::Error {
     )
 }
 
+/// (method, description) rows shown by `db.help()`, rendered as a two-column
+/// grid. Database-level entries first, then collection-level methods callable
+/// as `db.<collection>.<method>(...)` or `db.getCollection("<name>").<method>(...)`.
+const HELP_ENTRIES: &[(&str, &str)] = &[
+    ("show dbs", "List all databases on the server."),
+    (
+        "show collections",
+        "List all collections in the current database.",
+    ),
+    ("db.help()", "Show this list of supported commands."),
+    ("db.stats()", "Storage statistics for the current database."),
+    (
+        "db.getCollectionNames()",
+        "List all collection names in the current database.",
+    ),
+    (
+        "db.getCollection(\"<name>\")",
+        "Reference a collection by name (needed for names with dots or special characters), then chain a collection method.",
+    ),
+    (
+        "db.<collection>.find(<query>).limit(<n>)",
+        "Select documents matching the query; chain .limit(n) to cap the rows returned.",
+    ),
+    (
+        "db.<collection>.findOne(<query>)",
+        "Return the first document matching the query.",
+    ),
+    (
+        "db.<collection>.countDocuments(<query>)",
+        "Count documents matching the query.",
+    ),
+    (
+        "db.<collection>.estimatedDocumentCount()",
+        "Fast approximate count of all documents.",
+    ),
+    (
+        "db.<collection>.count(<query>)",
+        "Count documents matching the query.",
+    ),
+    (
+        "db.<collection>.distinct(<field>, <query>)",
+        "Distinct values of a field across matching documents.",
+    ),
+    (
+        "db.<collection>.aggregate([<pipeline>])",
+        "Run an aggregation pipeline.",
+    ),
+    ("db.<collection>.insertOne(<doc>)", "Insert one document."),
+    (
+        "db.<collection>.insertMany([<docs>])",
+        "Insert multiple documents.",
+    ),
+    (
+        "db.<collection>.updateOne(<filter>, <update>)",
+        "Update the first matching document.",
+    ),
+    (
+        "db.<collection>.updateMany(<filter>, <update>)",
+        "Update all matching documents.",
+    ),
+    (
+        "db.<collection>.replaceOne(<filter>, <doc>)",
+        "Replace the first matching document.",
+    ),
+    (
+        "db.<collection>.deleteOne(<filter>)",
+        "Delete the first matching document.",
+    ),
+    (
+        "db.<collection>.deleteMany(<filter>)",
+        "Delete all matching documents.",
+    ),
+    (
+        "db.<collection>.findOneAndUpdate(<filter>, <update>)",
+        "Atomically update and return one document.",
+    ),
+    (
+        "db.<collection>.findOneAndReplace(<filter>, <doc>)",
+        "Atomically replace and return one document.",
+    ),
+    (
+        "db.<collection>.findOneAndDelete(<filter>)",
+        "Atomically delete and return one document.",
+    ),
+    (
+        "db.<collection>.bulkWrite([<ops>])",
+        "Run multiple write operations in one call.",
+    ),
+    ("db.<collection>.drop()", "Drop the collection."),
+    (
+        "db.<collection>.createIndex(<keys>, <options>)",
+        "Create an index on the collection.",
+    ),
+    (
+        "db.<collection>.dropIndex(<index>)",
+        "Drop an index by name or key specification.",
+    ),
+    (
+        "db.<collection>.getIndexes()",
+        "List the collection's indexes.",
+    ),
+    (
+        "db.<collection>.stats()",
+        "Storage statistics for the collection.",
+    ),
+    (
+        "db.<collection>.renameCollection(\"<new>\")",
+        "Rename the collection.",
+    ),
+];
+
+/// Builds the `db.help()` result: a `Method`/`Description` grid over
+/// `HELP_ENTRIES`. Pure (no server round-trip) so it is unit-testable.
+fn help_query_result() -> QueryResult {
+    QueryResult {
+        columns: vec!["Method".to_string(), "Description".to_string()],
+        rows: HELP_ENTRIES
+            .iter()
+            .map(|(method, description)| {
+                vec![
+                    Some((*method).to_string()),
+                    Some((*description).to_string()),
+                ]
+            })
+            .collect(),
+        rows_affected: 0,
+        execution_time_ms: 0,
+    }
+}
+
 /// Strips a case-insensitive `db.` prefix, mongo shell's fixed handle for the
 /// current database (e.g. `db.users.find(...)`).
 fn strip_db_prefix(text: &str) -> Option<&str> {
@@ -1864,12 +1994,7 @@ impl DbProvider for MongoProvider {
                     execution_time_ms: 0,
                 }
             }
-            MongoStatement::Help => QueryResult {
-                columns: vec!["supported commands".to_string()],
-                rows: vec![vec![Some(SUPPORTED_METHODS.to_string())]],
-                rows_affected: 0,
-                execution_time_ms: 0,
-            },
+            MongoStatement::Help => help_query_result(),
             MongoStatement::DbStats => {
                 let stats = self
                     .client
@@ -2308,6 +2433,31 @@ mod tests {
     fn parse_db_help_rejects_arguments() {
         let error = parse_mongo_shell_statement("db.help(1)").unwrap_err();
         assert!(error.to_string().contains("does not take any arguments"));
+    }
+
+    #[test]
+    fn db_help_result_is_a_method_description_grid() {
+        let result = help_query_result();
+        assert_eq!(
+            result.columns,
+            vec!["Method".to_string(), "Description".to_string()]
+        );
+        assert!(
+            result.rows.len() > 1,
+            "db.help() must list multiple commands as rows"
+        );
+        assert!(
+            result.rows.iter().all(|row| row.len() == 2),
+            "every help row must have a method and a description cell"
+        );
+        let methods: String = result
+            .rows
+            .iter()
+            .filter_map(|row| row.first().cloned().flatten())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(methods.contains("countDocuments"));
+        assert!(methods.contains("getCollection"));
     }
 
     #[test]
