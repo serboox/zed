@@ -32,7 +32,9 @@ use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
     schema::ColumnInfo,
 };
-use editor::{Editor, EditorEvent, GotoDefinitionKind, HighlightKey, SemanticsProvider, ToOffset};
+use editor::{
+    Editor, EditorEvent, GotoDefinitionKind, HighlightKey, SemanticsProvider, ToOffset, ToPoint,
+};
 use futures::future::Shared;
 use gpui::{
     AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
@@ -152,8 +154,23 @@ enum QueryExecutionStatus {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct QueryExecutionMarker {
+    // Identifies the run this marker belongs to. A completion updates the marker
+    // with the matching id, so a slow run that finished after the user edited
+    // and re-ran the statement cannot overwrite the newer run's marker.
+    id: usize,
+    // Anchored span of the statement this indicator belongs to. Anchors shift
+    // with edits, so the indicator follows the statement when text above it is
+    // added or removed.
+    range: Range<editor::Anchor>,
+    // Statement text captured when the marker was created. If a later edit
+    // changes the text inside `range`, the query was mutated and the marker is
+    // dropped. Edits outside `range` leave this untouched.
+    text: String,
+    // Buffer row the indicator paints on, derived from `range.start` and
+    // refreshed on every edit. Cached because the gutter render callback has no
+    // buffer snapshot to resolve the anchor itself.
     row: u32,
     status: QueryExecutionStatus,
 }
@@ -161,6 +178,7 @@ struct QueryExecutionMarker {
 struct DbQueryEditorAddon {
     connection_id: ConnectionId,
     query_markers: Vec<QueryExecutionMarker>,
+    next_marker_id: usize,
     inline_results: Option<Entity<crate::inline_results::InlineResultsController>>,
 }
 
@@ -196,6 +214,7 @@ impl DbQueryEditorAddon {
         Self {
             connection_id,
             query_markers: Vec::new(),
+            next_marker_id: 0,
             inline_results: None,
         }
     }
@@ -204,17 +223,78 @@ impl DbQueryEditorAddon {
         self.query_markers.clear();
     }
 
-    fn mark_query(&mut self, row: u32, status: QueryExecutionStatus) {
+    // Adds a marker for the statement spanning `range`, or updates the existing
+    // marker that overlaps it (a re-run of the same statement replaces its
+    // marker instead of duplicating it). Always issues a fresh id so the caller
+    // can target this exact run when it completes, and an earlier run that is
+    // still in flight can no longer match the marker it once owned. Returns the
+    // new marker id.
+    fn mark_query(
+        &mut self,
+        range: Range<editor::Anchor>,
+        text: String,
+        status: QueryExecutionStatus,
+        snapshot: &editor::MultiBufferSnapshot,
+    ) -> usize {
+        let start = range.start.to_offset(snapshot);
+        let end = range.end.to_offset(snapshot);
+        let row = range.start.to_point(snapshot).row;
+        let id = self.next_marker_id;
+        self.next_marker_id += 1;
         if let Some(marker) = self
             .query_markers
             .iter_mut()
-            .find(|marker| marker.row == row)
+            .find(|marker| Self::ranges_overlap(&marker.range, start, end, snapshot))
         {
+            marker.id = id;
+            marker.range = range;
+            marker.text = text;
+            marker.row = row;
             marker.status = status;
         } else {
-            self.query_markers
-                .push(QueryExecutionMarker { row, status });
+            self.query_markers.push(QueryExecutionMarker {
+                id,
+                range,
+                text,
+                row,
+                status,
+            });
         }
+        id
+    }
+
+    // Updates the status of the marker created by run `id` without creating one.
+    // If that marker was dropped because its statement was edited, or replaced
+    // by a newer run, this is a no-op, so a finished run cannot resurrect or
+    // overwrite the indicator of a query the user has already changed or re-run.
+    fn set_query_status(&mut self, id: usize, status: QueryExecutionStatus) {
+        if let Some(marker) = self.query_markers.iter_mut().find(|marker| marker.id == id) {
+            marker.status = status;
+        }
+    }
+
+    // Drops markers whose statement text changed (the query was edited) and
+    // refreshes the cached row of the survivors from their shifted anchors.
+    fn refresh_markers(&mut self, snapshot: &editor::MultiBufferSnapshot) {
+        self.query_markers.retain_mut(|marker| {
+            let current_text = snapshot
+                .text_for_range(marker.range.clone())
+                .collect::<String>();
+            if current_text != marker.text {
+                return false;
+            }
+            marker.row = marker.range.start.to_point(snapshot).row;
+            true
+        });
+    }
+
+    fn ranges_overlap(
+        range: &Range<editor::Anchor>,
+        start: editor::MultiBufferOffset,
+        end: editor::MultiBufferOffset,
+        snapshot: &editor::MultiBufferSnapshot,
+    ) -> bool {
+        range.start.to_offset(snapshot) <= end && start <= range.end.to_offset(snapshot)
     }
 
     #[cfg(test)]
@@ -2296,11 +2376,37 @@ fn install_db_editor_features(
         })));
     });
     install_sql_validation(editor.clone(), validation_store, connection_id, cx);
+    install_query_marker_invalidation(editor.clone(), cx);
     if let Some(driver) = driver
         && crate::sql_ast::dialect_for_driver(driver).is_some()
     {
         install_sql_highlighting(editor, driver, cx);
     }
+}
+
+// Keeps the per-statement status indicators consistent with the text. On every
+// edit it drops the marker of a statement that was edited and re-aligns the
+// cached rows of the survivors, which the anchors have already shifted.
+fn install_query_marker_invalidation(editor: Entity<Editor>, cx: &mut App) {
+    cx.subscribe(&editor, move |editor, event, cx| {
+        if !matches!(event, EditorEvent::BufferEdited) {
+            return;
+        }
+        editor.update(cx, |editor, cx| {
+            let has_markers = editor
+                .addon::<DbQueryEditorAddon>()
+                .is_some_and(|addon| !addon.query_markers.is_empty());
+            if !has_markers {
+                return;
+            }
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                addon.refresh_markers(&snapshot);
+                cx.notify();
+            }
+        });
+    })
+    .detach();
 }
 
 /// Resolves the driver for a console connection from the in-memory store.
@@ -3507,19 +3613,35 @@ fn run_sql_from_editor(
     cx.spawn_in(window, async move |_workspace, cx| {
         let mut connected = connected;
         for statement in statements {
-            let inline_view = editor.update(cx, |editor, cx| {
+            let (inline_view, marker_id) = editor.update(cx, |editor, cx| {
                 let controller = editor
                     .addon::<DbQueryEditorAddon>()
                     .and_then(|addon| addon.inline_results.clone());
-                if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
-                    addon.mark_query(statement.start_row, QueryExecutionStatus::Running);
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let start = snapshot.anchor_before(language::Point::new(statement.start_row, 0));
+                let end_column = snapshot.line_len(multi_buffer::MultiBufferRow(statement.end_row));
+                let end =
+                    snapshot.anchor_after(language::Point::new(statement.end_row, end_column));
+                let statement_range = start..end;
+                let statement_text = snapshot
+                    .text_for_range(statement_range.clone())
+                    .collect::<String>();
+                let marker_id = editor.addon_mut::<DbQueryEditorAddon>().map(|addon| {
+                    let id = addon.mark_query(
+                        statement_range,
+                        statement_text,
+                        QueryExecutionStatus::Running,
+                        &snapshot,
+                    );
                     cx.notify();
-                }
-                controller.and_then(|controller| {
+                    id
+                });
+                let inline_view = controller.and_then(|controller| {
                     controller.update(cx, |controller, cx| {
                         controller.begin_statement(statement.start_row, statement.end_row, cx)
                     })
-                })
+                });
+                (inline_view, marker_id)
             });
             // Claims this run as the result view's current request. A slower,
             // already-superseded run (e.g. the user re-ran the query before an
@@ -3538,8 +3660,10 @@ fn run_sql_from_editor(
                 let connect = store.update(cx, |store, cx| store.connect(conn_id, cx));
                 if let Err(err) = connect.await {
                     editor.update(cx, |editor, cx| {
-                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
-                            addon.mark_query(statement.start_row, QueryExecutionStatus::Error);
+                        if let Some((id, addon)) =
+                            marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
+                        {
+                            addon.set_query_status(id, QueryExecutionStatus::Error);
                             cx.notify();
                         }
                     });
@@ -3568,8 +3692,10 @@ fn run_sql_from_editor(
             match result {
                 Ok(result) => {
                     editor.update(cx, |editor, cx| {
-                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
-                            addon.mark_query(statement.start_row, QueryExecutionStatus::Success);
+                        if let Some((id, addon)) =
+                            marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
+                        {
+                            addon.set_query_status(id, QueryExecutionStatus::Success);
                             cx.notify();
                         }
                     });
@@ -3602,8 +3728,10 @@ fn run_sql_from_editor(
                 }
                 Err(err) => {
                     editor.update(cx, |editor, cx| {
-                        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
-                            addon.mark_query(statement.start_row, QueryExecutionStatus::Error);
+                        if let Some((id, addon)) =
+                            marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
+                        {
+                            addon.set_query_status(id, QueryExecutionStatus::Error);
                             cx.notify();
                         }
                     });
@@ -11771,16 +11899,16 @@ mod tests {
         let markers = editor.read_with(cx, |editor, _| {
             editor
                 .addon::<DbQueryEditorAddon>()
-                .map(|addon| addon.query_markers().to_vec())
+                .map(|addon| {
+                    addon
+                        .query_markers()
+                        .iter()
+                        .map(|marker| (marker.row, marker.status))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default()
         });
-        assert_eq!(
-            markers,
-            vec![QueryExecutionMarker {
-                row: 0,
-                status: QueryExecutionStatus::Success,
-            }]
-        );
+        assert_eq!(markers, vec![(0, QueryExecutionStatus::Success)]);
 
         let pane = terminal_panel
             .read_with(cx, |panel, _| panel.pane())
@@ -12395,24 +12523,21 @@ mod tests {
         let markers = editor.read_with(cx, |editor, _| {
             editor
                 .addon::<DbQueryEditorAddon>()
-                .map(|addon| addon.query_markers().to_vec())
+                .map(|addon| {
+                    addon
+                        .query_markers()
+                        .iter()
+                        .map(|marker| (marker.row, marker.status))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default()
         });
         assert_eq!(
             markers,
             vec![
-                QueryExecutionMarker {
-                    row: 0,
-                    status: QueryExecutionStatus::Success,
-                },
-                QueryExecutionMarker {
-                    row: 1,
-                    status: QueryExecutionStatus::Success,
-                },
-                QueryExecutionMarker {
-                    row: 2,
-                    status: QueryExecutionStatus::Success,
-                },
+                (0, QueryExecutionStatus::Success),
+                (1, QueryExecutionStatus::Success),
+                (2, QueryExecutionStatus::Success),
             ]
         );
     }
@@ -12968,16 +13093,16 @@ mod tests {
         let markers = editor.read_with(cx, |editor, _| {
             editor
                 .addon::<DbQueryEditorAddon>()
-                .map(|addon| addon.query_markers().to_vec())
+                .map(|addon| {
+                    addon
+                        .query_markers()
+                        .iter()
+                        .map(|marker| (marker.row, marker.status))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default()
         });
-        assert_eq!(
-            markers,
-            vec![QueryExecutionMarker {
-                row: 0,
-                status: QueryExecutionStatus::Error,
-            }]
-        );
+        assert_eq!(markers, vec![(0, QueryExecutionStatus::Error)]);
 
         let pane = terminal_panel
             .read_with(cx, |panel, _| panel.pane())
@@ -14949,6 +15074,267 @@ mod tests {
                 .addon::<DbQueryEditorAddon>()
                 .is_none()),
             "the reinstall hook must not attach the console addon to a non-console editor"
+        );
+    }
+
+    // Builds a focused console editor with the production marker-invalidation
+    // subscription installed, and puts a Running marker on `statement_row`. The
+    // marker is set up directly; the behavior under test is driven afterwards by
+    // real edits that flow through the same BufferEdited subscription.
+    async fn open_marker_test_console(
+        cx: &mut TestAppContext,
+        text: &str,
+        statement_row: u32,
+    ) -> (Entity<Editor>, VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual_cx;
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(uuid::Uuid::new_v4()));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.update(|_window, cx| {
+            install_query_marker_invalidation(editor.clone(), cx);
+        });
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = snapshot.anchor_before(language::Point::new(statement_row, 0));
+            let end_column = snapshot.line_len(multi_buffer::MultiBufferRow(statement_row));
+            let end = snapshot.anchor_after(language::Point::new(statement_row, end_column));
+            let range = start..end;
+            let statement_text = snapshot.text_for_range(range.clone()).collect::<String>();
+            if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+                addon.mark_query(
+                    range,
+                    statement_text,
+                    QueryExecutionStatus::Running,
+                    &snapshot,
+                );
+            }
+        });
+        cx.run_until_parked();
+        (editor, visual_cx)
+    }
+
+    fn first_marker(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(u32, QueryExecutionStatus)> {
+        editor.read_with(cx, |editor, _| {
+            editor.addon::<DbQueryEditorAddon>().and_then(|addon| {
+                addon
+                    .query_markers()
+                    .first()
+                    .map(|marker| (marker.row, marker.status))
+            })
+        })
+    }
+
+    // A running query's indicator must follow its statement when the text above
+    // it grows, instead of staying pinned to the row it started on.
+    #[gpui::test]
+    async fn query_marker_follows_statement_when_a_line_is_inserted_above(cx: &mut TestAppContext) {
+        let (editor, mut cx) =
+            open_marker_test_console(cx, "SELECT 1\nSELECT 2\nSELECT 3", 1).await;
+        let cx = &mut cx;
+
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((1, QueryExecutionStatus::Running)),
+            "the marker starts on its statement's row"
+        );
+
+        // A real buffer edit inserting a whole line at the top -- the same
+        // BufferEdited event a user's newline produces, handled by the
+        // production invalidation subscription.
+        editor.update(cx, |editor, cx| {
+            editor.edit(
+                [(
+                    editor::MultiBufferOffset(0)..editor::MultiBufferOffset(0),
+                    "-- inserted\n",
+                )],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((2, QueryExecutionStatus::Running)),
+            "the indicator must move down with its statement, not stay on the old row"
+        );
+    }
+
+    // Editing the marked statement itself means the query changed, so its
+    // indicator must disappear.
+    #[gpui::test]
+    async fn query_marker_is_removed_when_its_statement_is_edited(cx: &mut TestAppContext) {
+        let (editor, mut cx) =
+            open_marker_test_console(cx, "SELECT 1\nSELECT 2\nSELECT 3", 1).await;
+        let cx = &mut cx;
+
+        // Put the cursor at the end of the marked statement and type a real
+        // character into it.
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let point = language::Point::new(1, snapshot.line_len(multi_buffer::MultiBufferRow(1)));
+            let offset = point.to_offset(&snapshot);
+            editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([offset..offset]);
+            });
+        });
+        cx.simulate_input("0");
+        cx.run_until_parked();
+
+        assert_eq!(
+            first_marker(&editor, cx),
+            None,
+            "editing the statement's text must remove its indicator"
+        );
+    }
+
+    // An edit on an unrelated line must leave the marked statement's indicator
+    // exactly where it is.
+    #[gpui::test]
+    async fn query_marker_survives_an_edit_on_another_line(cx: &mut TestAppContext) {
+        let (editor, mut cx) =
+            open_marker_test_console(cx, "SELECT 1\nSELECT 2\nSELECT 3", 1).await;
+        let cx = &mut cx;
+
+        // Type a real character at the end of the last statement, well below the
+        // marked one.
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let point = language::Point::new(2, snapshot.line_len(multi_buffer::MultiBufferRow(2)));
+            let offset = point.to_offset(&snapshot);
+            editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([offset..offset]);
+            });
+        });
+        cx.simulate_input("0");
+        cx.run_until_parked();
+
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((1, QueryExecutionStatus::Running)),
+            "an edit on an unrelated line must not move or remove the indicator"
+        );
+    }
+
+    fn first_marker_id(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Option<usize> {
+        editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .and_then(|addon| addon.query_markers().first().map(|marker| marker.id))
+        })
+    }
+
+    fn mark_statement_running(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        statement_row: u32,
+    ) -> usize {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = snapshot.anchor_before(language::Point::new(statement_row, 0));
+            let end_column = snapshot.line_len(multi_buffer::MultiBufferRow(statement_row));
+            let end = snapshot.anchor_after(language::Point::new(statement_row, end_column));
+            let range = start..end;
+            let text = snapshot.text_for_range(range.clone()).collect::<String>();
+            editor
+                .addon_mut::<DbQueryEditorAddon>()
+                .expect("console editor has the db addon")
+                .mark_query(range, text, QueryExecutionStatus::Running, &snapshot)
+        })
+    }
+
+    fn set_status(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        id: usize,
+        status: QueryExecutionStatus,
+    ) {
+        editor.update(cx, |editor, _cx| {
+            editor
+                .addon_mut::<DbQueryEditorAddon>()
+                .expect("console editor has the db addon")
+                .set_query_status(id, status);
+        });
+    }
+
+    // A slow run that finishes after the user edited its statement and re-ran it
+    // must not overwrite the newer run's indicator. The re-run owns a fresh
+    // marker id, so the stale completion targets an id that no longer exists.
+    #[gpui::test]
+    async fn stale_completion_does_not_overwrite_a_rerun_marker(cx: &mut TestAppContext) {
+        let (editor, mut cx) =
+            open_marker_test_console(cx, "SELECT 1\nSELECT 2\nSELECT 3", 1).await;
+        let cx = &mut cx;
+
+        let run_a = first_marker_id(&editor, cx).expect("run A left a marker");
+
+        // The user edits inside the running statement; the real BufferEdited path
+        // drops run A's marker because the query text changed.
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let point = language::Point::new(1, snapshot.line_len(multi_buffer::MultiBufferRow(1)));
+            let offset = point.to_offset(&snapshot);
+            editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([offset..offset]);
+            });
+        });
+        cx.simulate_input("0");
+        cx.run_until_parked();
+        assert_eq!(
+            first_marker(&editor, cx),
+            None,
+            "editing the statement drops run A's marker"
+        );
+
+        // The user re-runs the edited statement, creating run B's fresh marker.
+        let run_b = mark_statement_running(&editor, cx, 1);
+        cx.run_until_parked();
+        assert_ne!(run_a, run_b, "the re-run must get a fresh marker id");
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((1, QueryExecutionStatus::Running)),
+            "run B shows a running indicator"
+        );
+
+        // Run A finally completes and reports success against its own (old) id.
+        set_status(&editor, cx, run_a, QueryExecutionStatus::Success);
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((1, QueryExecutionStatus::Running)),
+            "a stale completion must not overwrite the re-run's marker"
+        );
+
+        // Run B's own completion still updates its marker.
+        set_status(&editor, cx, run_b, QueryExecutionStatus::Success);
+        assert_eq!(
+            first_marker(&editor, cx),
+            Some((1, QueryExecutionStatus::Success)),
+            "run B's own completion updates its marker"
         );
     }
 
