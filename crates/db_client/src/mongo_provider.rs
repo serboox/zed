@@ -340,6 +340,10 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
         anyhow!("expected a mongo shell command like db.<collection>.find({{...}})")
     })?;
 
+    if let Some(statement) = parse_get_collection_statement(rest, text)? {
+        return Ok(statement);
+    }
+
     // `db.<collection>.<method>(...)` has a '.' before its first '(';
     // database-level calls like `db.help()` or `db.stats()` don't.
     let paren_idx = rest.find('(');
@@ -357,6 +361,46 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
     }
 
     let calls = parse_call_chain(rest[dot + 1..].trim())?;
+    build_collection_statement(collection, &calls, text)
+}
+
+/// Parses the `db.getCollection("<name>").<method>(...)` form. Returns `None`
+/// when `rest` is not a `getCollection(...)` call, so the caller falls back to
+/// the plain `db.<collection>.<method>` and database-level paths. A quoted name
+/// may contain dots or other characters that the plain path rejects, which is
+/// the only way to reference such a collection.
+fn parse_get_collection_statement(
+    rest: &str,
+    original_text: &str,
+) -> Result<Option<MongoStatement>> {
+    let rest = rest.trim();
+    // Match `getCollection(` but not `getCollectionNames(`, which stays a
+    // database-level command.
+    let is_get_collection = rest
+        .strip_prefix("getCollection")
+        .is_some_and(|after| after.trim_start().starts_with('('));
+    if !is_get_collection {
+        return Ok(None);
+    }
+
+    let calls = parse_call_chain(rest)?;
+    let (get_collection_call, method_calls) = calls
+        .split_first()
+        .ok_or_else(|| unsupported_command_error(original_text))?;
+    let collection = parse_string_arg(&get_collection_call.1)
+        .context("getCollection(...) takes a single collection-name string")?;
+    build_collection_statement(&collection, method_calls, original_text).map(Some)
+}
+
+/// Dispatches a collection method call (`find`, `countDocuments`, `insertOne`,
+/// …) to a `MongoStatement`. `calls[0]` is the method itself; any later calls
+/// are chained (only `find` accepts them). Shared by the plain
+/// `db.<collection>.<method>` path and the `db.getCollection("<name>")` path.
+fn build_collection_statement(
+    collection: &str,
+    calls: &[(String, String)],
+    original_text: &str,
+) -> Result<MongoStatement> {
     let (method, args) = calls.first().ok_or_else(|| {
         anyhow!(
             "expected a method call like db.{}.find({{...}})",
@@ -370,7 +414,7 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
         bail!(
             "unexpected chained call after '{}(...)': only find(...) supports chaining, found '{}'",
             method,
-            text.chars().take(80).collect::<String>()
+            original_text.chars().take(80).collect::<String>()
         );
     }
 
@@ -508,7 +552,7 @@ pub fn parse_mongo_shell_statement(text: &str) -> Result<MongoStatement> {
             collection: collection.to_string(),
             new_name: parse_string_arg(args)?,
         }),
-        _ => Err(unsupported_command_error(text)),
+        _ => Err(unsupported_command_error(original_text)),
     }
 }
 
@@ -732,7 +776,10 @@ fn parse_string_arg(args: &str) -> Result<String> {
     parser.expect_end()?;
     match value {
         Bson::String(s) => Ok(s),
-        other => bail!("expected a string argument, found {}", bson_type_name(&other)),
+        other => bail!(
+            "expected a string argument, found {}",
+            bson_type_name(&other)
+        ),
     }
 }
 
@@ -758,9 +805,9 @@ fn parse_bulk_write_ops(args: &str) -> Result<Vec<BulkWriteOp>> {
 
 fn parse_bulk_write_op(document: Document) -> Result<BulkWriteOp> {
     let mut fields = document.into_iter();
-    let (op_name, op_value) = fields
-        .next()
-        .ok_or_else(|| anyhow!("each bulkWrite operation must have exactly one key naming the operation"))?;
+    let (op_name, op_value) = fields.next().ok_or_else(|| {
+        anyhow!("each bulkWrite operation must have exactly one key naming the operation")
+    })?;
     if fields.next().is_some() {
         bail!(
             "each bulkWrite operation must have exactly one key naming the operation, found extra keys alongside '{}'",
@@ -779,7 +826,13 @@ fn parse_bulk_write_op(document: Document) -> Result<BulkWriteOp> {
         op_doc
             .get_document(field)
             .map(Document::clone)
-            .map_err(|_| anyhow!("'{}' bulkWrite operation requires a '{}' field", op_name, field))
+            .map_err(|_| {
+                anyhow!(
+                    "'{}' bulkWrite operation requires a '{}' field",
+                    op_name,
+                    field
+                )
+            })
     };
     match op_name.as_str() {
         "insertOne" => Ok(BulkWriteOp::InsertOne(get_document("document")?)),
@@ -1165,7 +1218,12 @@ fn build_index_options(options: &Document) -> Result<IndexOptions> {
         .unique(options.get_bool("unique").ok())
         .name(options.get_str("name").ok().map(str::to_string))
         .sparse(options.get_bool("sparse").ok())
-        .partial_filter_expression(options.get_document("partialFilterExpression").ok().cloned())
+        .partial_filter_expression(
+            options
+                .get_document("partialFilterExpression")
+                .ok()
+                .cloned(),
+        )
         .expire_after(expire_after)
         .build())
 }
@@ -1656,7 +1714,9 @@ impl DbProvider for MongoProvider {
                                     coll.replace_one(filter, replacement).upsert(upsert).await?;
                                 result.modified_count + result.upserted_id.is_some() as u64
                             }
-                            BulkWriteOp::DeleteOne(filter) => coll.delete_one(filter).await?.deleted_count,
+                            BulkWriteOp::DeleteOne(filter) => {
+                                coll.delete_one(filter).await?.deleted_count
+                            }
                             BulkWriteOp::DeleteMany(filter) => {
                                 coll.delete_many(filter).await?.deleted_count
                             }
@@ -2191,6 +2251,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_get_collection_supports_collection_methods() {
+        let statement =
+            parse_mongo_shell_statement("db.getCollection(\"users\").countDocuments()").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::CountDocuments {
+                collection: "users".to_string(),
+                filter: Document::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_get_collection_allows_a_dotted_collection_name() {
+        let statement =
+            parse_mongo_shell_statement("db.getCollection(\"Entities.Logos.v3\").find({})")
+                .unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::Find {
+                collection: "Entities.Logos.v3".to_string(),
+                filter: Document::new(),
+                limit: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_get_collection_find_supports_limit_chaining() {
+        let statement =
+            parse_mongo_shell_statement("db.getCollection('x').find({a: 1}).limit(5)").unwrap();
+        assert_eq!(
+            statement,
+            MongoStatement::Find {
+                collection: "x".to_string(),
+                filter: doc! { "a": 1i64 },
+                limit: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_get_collection_without_a_method_is_rejected() {
+        let error = parse_mongo_shell_statement("db.getCollection(\"x\")").unwrap_err();
+        assert!(error.to_string().contains("expected a method call"));
+    }
+
+    #[test]
+    fn parse_get_collection_names_stays_a_database_level_command() {
+        let statement = parse_mongo_shell_statement("db.getCollectionNames()").unwrap();
+        assert_eq!(statement, MongoStatement::GetCollectionNames);
+    }
+
+    #[test]
     fn parse_db_help_rejects_arguments() {
         let error = parse_mongo_shell_statement("db.help(1)").unwrap_err();
         assert!(error.to_string().contains("does not take any arguments"));
@@ -2292,8 +2406,8 @@ mod tests {
             }
         );
 
-        let delete = parse_mongo_shell_statement("db.users.findOneAndDelete({name: 'Ada'})")
-            .unwrap();
+        let delete =
+            parse_mongo_shell_statement("db.users.findOneAndDelete({name: 'Ada'})").unwrap();
         assert_eq!(
             delete,
             MongoStatement::FindOneAndDelete {
@@ -2376,7 +2490,11 @@ mod tests {
         let error =
             parse_mongo_shell_statement("db.users.bulkWrite([{ renameOp: { filter: {} } }])")
                 .unwrap_err();
-        assert!(error.to_string().contains("unsupported bulkWrite operation"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported bulkWrite operation")
+        );
     }
 
     #[test]
@@ -2514,8 +2632,7 @@ mod tests {
 
     #[test]
     fn build_index_options_rejects_a_negative_expire_after_seconds() {
-        let error =
-            build_index_options(&doc! { "expireAfterSeconds": -1i64 }).unwrap_err();
+        let error = build_index_options(&doc! { "expireAfterSeconds": -1i64 }).unwrap_err();
         assert!(error.to_string().contains("must not be negative"));
     }
 
@@ -3283,7 +3400,10 @@ mod integration_tests {
 
         let test_result: Result<()> = async {
             provider
-                .execute_query(&database, &format!("db.{collection}.insertOne({{status: 'open'}})"))
+                .execute_query(
+                    &database,
+                    &format!("db.{collection}.insertOne({{status: 'open'}})"),
+                )
                 .await
                 .context("Failed to seed a document")?;
 
@@ -3308,7 +3428,9 @@ mod integration_tests {
                     .any(|row| row.first() == Some(&Some(collection.to_string())))
             );
 
-            let show_collections = provider.execute_query(&database, "show collections").await?;
+            let show_collections = provider
+                .execute_query(&database, "show collections")
+                .await?;
             assert!(
                 show_collections
                     .rows
