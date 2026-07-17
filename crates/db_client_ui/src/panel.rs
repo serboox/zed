@@ -3613,7 +3613,7 @@ fn run_sql_from_editor(
     cx.spawn_in(window, async move |_workspace, cx| {
         let mut connected = connected;
         for statement in statements {
-            let (inline_view, marker_id) = editor.update(cx, |editor, cx| {
+            let (controller, marker_id) = editor.update(cx, |editor, cx| {
                 let controller = editor
                     .addon::<DbQueryEditorAddon>()
                     .and_then(|addon| addon.inline_results.clone());
@@ -3636,12 +3636,16 @@ fn run_sql_from_editor(
                     cx.notify();
                     id
                 });
-                let inline_view = controller.and_then(|controller| {
-                    controller.update(cx, |controller, cx| {
-                        controller.begin_statement(statement.start_row, statement.end_row, cx)
-                    })
-                });
-                (inline_view, marker_id)
+                (controller, marker_id)
+            });
+            // Create the inline result block only after the editor lease above
+            // has been released. `begin_statement` re-enters `editor.update` to
+            // insert its block, so calling it inside the closure would lease the
+            // same editor twice and panic.
+            let inline_view = controller.and_then(|controller| {
+                controller.update(cx, |controller, cx| {
+                    controller.begin_statement(statement.start_row, statement.end_row, cx)
+                })
             });
             // Claims this run as the result view's current request. A slower,
             // already-superseded run (e.g. the user re-ran the query before an
@@ -11937,6 +11941,178 @@ mod tests {
                 .any(|cell| cell.as_deref() == Some("1")),
             "the results table must contain the query output, got rows {:?}",
             result.rows
+        );
+    }
+
+    // Regression test for the crash when running a statement with inline-results
+    // mode enabled. The run flow created the inline block by calling
+    // `begin_statement` inside its own `editor.update` closure, and
+    // `begin_statement` re-enters `editor.update` to insert the block -- leasing
+    // the same editor twice, which panics with "cannot update editor::Editor
+    // while it is already being updated". With inline mode off the block is never
+    // created, which is why the default path never crashed. Reaching the marker
+    // assertion below (instead of panicking during run_until_parked) proves the
+    // block creation now happens after the outer lease is released.
+    #[gpui::test]
+    async fn running_a_query_with_inline_results_enabled_does_not_panic(cx: &mut TestAppContext) {
+        let config = db_client::ConnectionConfig {
+            label: "inline-crash".to_string(),
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-enter",
+                zed_actions::database_panel::RunQuery,
+                Some("Editor && mode == full"),
+            )]);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(cx, |workspace, _window, _cx| {
+            workspace.register_action(
+                |workspace, _: &zed_actions::database_panel::RunQuery, window, cx| {
+                    run_current_sql_query(workspace, window, cx);
+                },
+            );
+        });
+
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(DatabaseStore::new);
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: ScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        let _terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| {
+                language::Buffer::local(
+                    "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z');",
+                    cx,
+                )
+            });
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        // Turn on inline-results mode for the focused console -- the state that
+        // triggers the re-entrant block creation on the next run.
+        workspace.update_in(cx, |workspace, window, cx| {
+            toggle_inline_results(workspace, window, cx);
+        });
+        cx.run_until_parked();
+        let inline_engaged = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .is_some_and(|addon| addon.inline_results.is_some())
+        });
+        assert!(
+            inline_engaged,
+            "inline results mode must be engaged so the crash path is exercised"
+        );
+
+        // Refocus (toggling may move focus) and run.
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+
+        let markers = editor.read_with(cx, |editor, _| {
+            editor
+                .addon::<DbQueryEditorAddon>()
+                .map(|addon| {
+                    addon
+                        .query_markers()
+                        .iter()
+                        .map(|marker| (marker.row, marker.status))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            markers,
+            vec![(0, QueryExecutionStatus::Success)],
+            "with inline results enabled the query must run to completion instead of panicking"
         );
     }
 
