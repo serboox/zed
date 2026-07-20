@@ -76,9 +76,10 @@ use debugger::{
 pub use environment::ProjectEnvironment;
 
 use futures::{
-    StreamExt,
+    FutureExt, StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
     future::try_join_all,
+    select_biased,
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
@@ -169,6 +170,9 @@ pub use lsp_store::{
 };
 pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
+// Bounds how long a physical rename waits on `workspace/willRenameFiles` before
+// proceeding without it, so a slow language server can't stall the file move.
+const RENAME_LSP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalProjectFlags {
@@ -2624,7 +2628,7 @@ impl Project {
                 };
                 (root_path.join(old_path.as_std_path()), new_abs_path)
             };
-            let transaction = LspStore::will_rename_entry(
+            let mut will_rename_entry = LspStore::will_rename_entry(
                 lsp_store.clone(),
                 worktree_id,
                 &old_abs_path,
@@ -2632,7 +2636,17 @@ impl Project {
                 is_dir,
                 cx.clone(),
             )
-            .await;
+            .fuse();
+            let mut rename_lsp_timeout = cx.background_executor().timer(RENAME_LSP_TIMEOUT).fuse();
+            // Don't let a slow language server block the physical rename: if it
+            // doesn't answer within the timeout, move the file now without its
+            // edits. The pending willRenameFiles response is dropped rather than
+            // applied late, which would risk writing stale paths back through a
+            // second rename event.
+            let transaction = select_biased! {
+                transaction = will_rename_entry => transaction,
+                _ = rename_lsp_timeout => ProjectTransaction::default(),
+            };
 
             let entry = worktree_store
                 .update(cx, |worktree_store, cx| {
