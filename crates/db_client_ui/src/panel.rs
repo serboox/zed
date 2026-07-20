@@ -7550,6 +7550,8 @@ impl DatabasePanel {
             .as_ref()
             .and_then(|conn| conn.config.database.clone())
             .unwrap_or_default();
+        let label_for_exec = selected.as_ref().map(|conn| conn.config.label.clone());
+        let database_for_exec = database_for_new_query.clone();
 
         v_flex()
             .child(
@@ -7647,6 +7649,31 @@ impl DatabasePanel {
                                             .log_err();
                                     })),
                             ),
+                    )
+                    .child(
+                        div().debug_selector(|| "selection-exec".to_string()).child(
+                            IconButton::new("selection-exec", IconName::Terminal)
+                                .icon_size(IconSize::Small)
+                                .disabled(
+                                    !has_selection || driver == Some(DatabaseDriver::Aerospike),
+                                )
+                                .tooltip(Tooltip::text(
+                                    "Exec — run a heavy or multi-statement script",
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let (Some(id), Some(label)) = (id, label_for_exec.clone())
+                                    else {
+                                        return;
+                                    };
+                                    this.open_exec_dialog(
+                                        id,
+                                        database_for_exec.clone(),
+                                        label.into(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
                     )
                     .child(
                         div().debug_selector(|| "selection-edit".to_string()).child(
