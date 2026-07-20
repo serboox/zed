@@ -61,9 +61,10 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    CommonAnimationExt, ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind,
+    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -165,6 +166,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    pending_expansions: HashSet<ProjectEntryId>,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -278,6 +280,7 @@ struct EntryDetails {
     is_marked: bool,
     is_editing: bool,
     is_processing: bool,
+    is_expanding: bool,
     is_cut: bool,
     sticky: Option<StickyDetails>,
     filename_text_color: Color,
@@ -866,6 +869,7 @@ impl ProjectPanel {
                 },
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
+                pending_expansions: HashSet::default(),
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1563,17 +1567,37 @@ impl ProjectPanel {
         if let Some(worktree_id) = self.project.read(cx).worktree_id_for_entry(entry_id, cx)
             && let Some(expanded_dir_ids) = self.state.expanded_dir_ids.get_mut(&worktree_id)
         {
-            self.project.update(cx, |project, cx| {
+            let expansion_task = self.project.update(cx, |project, cx| {
                 match expanded_dir_ids.binary_search(&entry_id) {
                     Ok(ix) => {
                         expanded_dir_ids.remove(ix);
+                        None
                     }
                     Err(ix) => {
-                        project.expand_entry(worktree_id, entry_id, cx);
+                        let task = project.expand_entry(worktree_id, entry_id, cx);
                         expanded_dir_ids.insert(ix, entry_id);
+                        task
                     }
                 }
             });
+            // Directory expansion resolves asynchronously (background scanner or SSH RPC), so
+            // the task must be awaited outside `project.update` to avoid re-borrowing `self.project`.
+            if let Some(task) = expansion_task {
+                self.pending_expansions.insert(entry_id);
+                cx.spawn_in(window, async move |this, cx| {
+                    task.await.log_err();
+                    // Only clear the spinner here. The expanded children render
+                    // via the existing WorktreeUpdatedEntries subscription;
+                    // re-running update_visible_entries with a fresh selection
+                    // argument would move the user's selection.
+                    this.update_in(cx, |this, _window, cx| {
+                        this.pending_expansions.remove(&entry_id);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             self.update_visible_entries(Some((worktree_id, entry_id)), false, false, window, cx);
             window.focus(&self.focus_handle, cx);
             cx.notify();
@@ -6005,7 +6029,17 @@ impl ProjectPanel {
                             )
                         },
                     )
-                    .child(if let Some(icon) = &icon {
+                    .child(if details.is_expanding && kind.is_dir() {
+                        h_flex().size(IconSize::default().rems()).child(
+                            Icon::new(IconName::ArrowCircle)
+                                .color(Color::Muted)
+                                .size(IconSize::Small)
+                                .with_keyed_rotate_animation(
+                                    ("project-panel-expanding-icon", entry_id.to_proto()),
+                                    2,
+                                ),
+                        )
+                    } else if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
                         {
@@ -6439,6 +6473,7 @@ impl ProjectPanel {
             is_marked,
             is_editing: false,
             is_processing: false,
+            is_expanding: is_expanded && self.pending_expansions.contains(&entry.id),
             is_cut,
             sticky,
             filename_text_color,
