@@ -382,3 +382,29 @@ async fn trash_undo_redo(cx: &mut gpui::TestAppContext) {
     cx.redo().await;
     cx.assert_fs_state_is(&[]);
 }
+
+#[gpui::test]
+async fn trash_many_files_undo_redo(cx: &mut gpui::TestAppContext) {
+    const FILE_COUNT: usize = 80;
+    let mut files = serde_json::Map::new();
+    for index in 0..FILE_COUNT {
+        files.insert(format!("file{index}.txt"), Value::String(String::new()));
+    }
+    let mut cx = TestContext::new_with_tree(cx, Value::Object(files)).await;
+
+    let names: Vec<String> = (0..FILE_COUNT)
+        .map(|index| format!("file{index}.txt"))
+        .collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    // Trashing the whole selection at once must record every change in a single
+    // undo batch, so one undo restores all files and one redo trashes them again.
+    cx.trash(&name_refs).await;
+    cx.assert_fs_state_is(&[]);
+
+    cx.undo().await;
+    cx.assert_fs_state_is(&name_refs);
+
+    cx.redo().await;
+    cx.assert_fs_state_is(&[]);
+}

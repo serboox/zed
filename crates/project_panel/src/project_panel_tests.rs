@@ -6967,6 +6967,58 @@ async fn test_delete_all_files_and_directories(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_delete_many_files_concurrently(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+
+    const FILE_COUNT: usize = 150;
+    let mut files = serde_json::Map::new();
+    for index in 0..FILE_COUNT {
+        files.insert(
+            format!("file{index}.txt"),
+            serde_json::Value::String(String::new()),
+        );
+    }
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", serde_json::Value::Object(files))
+        .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    for index in 0..FILE_COUNT {
+        select_path_with_mark(&panel, &format!("root/file{index}.txt"), cx);
+    }
+
+    submit_deletion(&panel, cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..5, cx),
+        &["v root  <== selected"],
+        "All files should be gone from the visible tree after a bulk delete"
+    );
+
+    project.read_with(cx, |project, cx| {
+        let worktree = project.worktree_for_id(worktree_id, cx).unwrap();
+        assert_eq!(
+            worktree.read(cx).entry_count(),
+            1,
+            "Only the root entry should remain in the worktree after deleting all files"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_nested_selection_deletion(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 

@@ -2649,17 +2649,31 @@ impl ProjectPanel {
                     return anyhow::Ok(());
                 }
 
-                let mut changes = Vec::new();
+                // Create every delete task in a single update so the
+                // filesystem operations and their worktree rescans run
+                // concurrently. Awaiting each delete before starting the next
+                // serialized the whole batch and froze the UI for large
+                // selections.
+                let delete_tasks = panel.update(cx, |panel, cx| {
+                    panel.project.update(cx, |project, cx| {
+                        file_paths
+                            .into_iter()
+                            .map(|(entry_id, worktree_id, _)| {
+                                project
+                                    .delete_entry(entry_id, trash, cx)
+                                    .map(|task| (worktree_id, task))
+                                    .context("no such entry")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })??;
 
-                for (entry_id, worktree_id, _) in file_paths {
-                    let trashed_entry = panel
-                        .update(cx, |panel, cx| {
-                            panel
-                                .project
-                                .update(cx, |project, cx| project.delete_entry(entry_id, trash, cx))
-                                .context("no such entry")
-                        })??
-                        .await?;
+                let (worktree_ids, tasks): (Vec<_>, Vec<_>) = delete_tasks.into_iter().unzip();
+                let results = futures::future::join_all(tasks).await;
+
+                let mut changes = Vec::new();
+                for (worktree_id, result) in worktree_ids.into_iter().zip(results) {
+                    let trashed_entry = result?;
 
                     // Keep track of trashed change so that we can then record
                     // all of the changes at once, such that undoing and redoing
