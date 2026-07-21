@@ -30,7 +30,7 @@ use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, Folder, FolderId, ProcedureKind, QueryResult,
-    schema::ColumnInfo,
+    schema::{ColumnInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo, SequenceInfo, TriggerInfo},
 };
 use editor::{
     Editor, EditorEvent, GotoDefinitionKind, HighlightKey, SemanticsProvider, ToOffset, ToPoint,
@@ -39,9 +39,10 @@ use futures::future::Shared;
 use gpui::{
     AnyElement, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent,
     DragMoveEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, WeakEntity, Window, anchored, deferred, div, px,
+    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    Window, anchored, deferred, div, px, uniform_list,
 };
 use language::{Anchor, Buffer, BufferId, BufferRow};
 use multi_buffer::MultiBuffer;
@@ -89,6 +90,223 @@ const TREE_ROW_INDENT_STEP: f32 = 12.;
 
 fn tree_indent(level: usize) -> Pixels {
     px(TREE_ROW_BASE_INDENT + level as f32 * TREE_ROW_INDENT_STEP)
+}
+
+/// One visible row of the flattened Database Explorer tree. `build_visible_rows`
+/// walks the currently-expanded tree once and produces these in paint order;
+/// `render_row` turns a single descriptor into an element on demand, so
+/// `uniform_list` only ever builds the rows in the visible range instead of the
+/// whole (potentially enormous) expanded tree every frame.
+enum DbTreeRow {
+    Folder {
+        folder: Folder,
+        depth: usize,
+        is_collapsed: bool,
+    },
+    Connection {
+        id: ConnectionId,
+        label: String,
+        driver: DatabaseDriver,
+        status: ConnectionStatus,
+        in_transaction: bool,
+        env_color: Option<String>,
+        folder_id: Option<FolderId>,
+        depth: usize,
+    },
+    ConnectionError {
+        id: ConnectionId,
+        message: String,
+    },
+    ServerObjectsToggle {
+        id: ConnectionId,
+        depth: usize,
+        expanded: bool,
+    },
+    ServerUsersHeader {
+        count: usize,
+        depth: usize,
+    },
+    ServerUser {
+        name: String,
+        host: String,
+        depth: usize,
+    },
+    Database {
+        id: ConnectionId,
+        driver: DatabaseDriver,
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Table {
+        id: ConnectionId,
+        driver: DatabaseDriver,
+        database: String,
+        name: String,
+        is_view: bool,
+        highlight_indices: Vec<usize>,
+        columns: Arc<[ColumnInfo]>,
+        depth: usize,
+        expanded: bool,
+    },
+    Column {
+        id: ConnectionId,
+        database: String,
+        table: String,
+        column: ColumnInfo,
+        is_fk: bool,
+        depth: usize,
+    },
+    IndexGroup {
+        id: ConnectionId,
+        database: String,
+        table: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Index {
+        index: IndexInfo,
+        depth: usize,
+    },
+    FkGroup {
+        id: ConnectionId,
+        database: String,
+        table: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Fk {
+        fk: FkInfo,
+        depth: usize,
+    },
+    TriggerGroup {
+        id: ConnectionId,
+        database: String,
+        table: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Trigger {
+        id: ConnectionId,
+        database: String,
+        table: String,
+        trigger: TriggerInfo,
+        depth: usize,
+    },
+    ViewsGroup {
+        id: ConnectionId,
+        database: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    View {
+        id: ConnectionId,
+        database: String,
+        name: String,
+        index: usize,
+        depth: usize,
+    },
+    ProceduresGroup {
+        id: ConnectionId,
+        database: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Procedure {
+        id: ConnectionId,
+        database: String,
+        procedure: ProcedureInfo,
+        depth: usize,
+    },
+    SequencesGroup {
+        id: ConnectionId,
+        database: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Sequence {
+        sequence: SequenceInfo,
+        depth: usize,
+    },
+    EventsGroup {
+        id: ConnectionId,
+        database: String,
+        count: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    Event {
+        id: ConnectionId,
+        database: String,
+        event: EventInfo,
+        depth: usize,
+    },
+}
+
+// Total tree rows the panel actually built (via `render_row`) across all draw
+// passes. Tests reset it, force a redraw, and assert only the on-screen window
+// was built — proof that `uniform_list` virtualizes instead of building every
+// expanded row every frame.
+#[cfg(test)]
+pub(crate) static RENDERED_TREE_ROW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Coarse width estimate for a flattened tree row, in character-ish units.
+/// `uniform_list` measures a single item to decide the horizontal scroll
+/// extent, so the panel points it at the widest row via this metric; without
+/// it the extent would follow only the first row and deep or long rows below
+/// could never be scrolled into view. Indentation and the row's primary label
+/// dominate real width, so both feed the estimate; exact pixels are measured
+/// later by the list itself.
+fn row_width_metric(row: &DbTreeRow) -> usize {
+    let (depth, text_len) = match row {
+        DbTreeRow::Folder { folder, depth, .. } => (*depth, folder.name.chars().count()),
+        DbTreeRow::Connection { label, depth, .. } => (*depth, label.chars().count()),
+        DbTreeRow::ConnectionError { message, .. } => (0, message.chars().count()),
+        DbTreeRow::ServerObjectsToggle { depth, .. } => (*depth, "Server Objects".len()),
+        DbTreeRow::ServerUsersHeader { depth, .. } => (*depth, "Users".len()),
+        DbTreeRow::ServerUser {
+            name, host, depth, ..
+        } => (*depth, name.chars().count() + host.chars().count() + 1),
+        DbTreeRow::Database { name, depth, .. } => (*depth, name.chars().count()),
+        DbTreeRow::Table { name, depth, .. } => (*depth, name.chars().count()),
+        DbTreeRow::Column { column, depth, .. } => (
+            *depth,
+            column.name.chars().count() + column.data_type.chars().count(),
+        ),
+        DbTreeRow::IndexGroup { depth, .. } => (*depth, "Indexes".len()),
+        DbTreeRow::Index { index, depth } => (*depth, index.name.chars().count()),
+        DbTreeRow::FkGroup { depth, .. } => (*depth, "Foreign Keys".len()),
+        DbTreeRow::Fk { fk, depth } => (*depth, fk.name.chars().count()),
+        DbTreeRow::TriggerGroup { depth, .. } => (*depth, "Triggers".len()),
+        DbTreeRow::Trigger { trigger, depth, .. } => (*depth, trigger.name.chars().count()),
+        DbTreeRow::ViewsGroup { depth, .. } => (*depth, "Views".len()),
+        DbTreeRow::View { name, depth, .. } => (*depth, name.chars().count()),
+        DbTreeRow::ProceduresGroup { depth, .. } => (*depth, "Procedures".len()),
+        DbTreeRow::Procedure {
+            procedure, depth, ..
+        } => (*depth, procedure.name.chars().count()),
+        DbTreeRow::SequencesGroup { depth, .. } => (*depth, "Sequences".len()),
+        DbTreeRow::Sequence { sequence, depth } => (*depth, sequence.name.chars().count()),
+        DbTreeRow::EventsGroup { depth, .. } => (*depth, "Events".len()),
+        DbTreeRow::Event { event, depth, .. } => (*depth, event.name.chars().count()),
+    };
+    depth * 2 + text_len
+}
+
+/// The table-name filter in effect while flattening the tree. A table row is
+/// emitted only when `DatabasePanel::table_filter_match` returns highlight
+/// indices for its name.
+struct TableFilter<'a> {
+    raw: &'a str,
+    regex: Option<&'a regex::Regex>,
+    is_regex: bool,
 }
 
 fn parse_env_color(s: &str) -> Option<gpui::Rgba> {
@@ -3811,7 +4029,7 @@ pub struct DatabasePanel {
     dump: DumpUiState,
     export: ExportUiState,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
-    tree_scroll_handle: ScrollHandle,
+    tree_scroll_handle: UniformListScrollHandle,
     // True until the first `DatabaseStoreEvent` after load carries the
     // disk-loaded folders/connections. There's nothing to restore no
     // persisted collapse state was found, so as soon as real ids exist,
@@ -4715,7 +4933,7 @@ impl DatabasePanel {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     initial_collapse_pending,
                     position: dock_position_from_str(restored.dock_position.as_deref()),
                     pending_tree_state_serialization: Task::ready(None),
@@ -7782,64 +8000,12 @@ impl DatabasePanel {
         is_selected
     }
 
-    fn render_connection_item(
-        &self,
-        conn: ActiveConnection,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let id = conn.config.id;
-        let is_collapsed = self.collapsed_connections.contains(&id);
-        let indent = tree_indent(depth);
-        let connection_folder = conn.config.folder_id;
-        let drag_label: SharedString = conn.config.label.clone().into();
-        let label = conn.config.label.clone();
-        let driver = conn.config.driver;
-
-        let status_color = match &conn.status {
-            ConnectionStatus::Connected => Color::Success,
-            ConnectionStatus::Connecting => Color::Modified,
-            ConnectionStatus::Disconnected => Color::Muted,
-            ConnectionStatus::Error(_) => Color::Error,
-        };
-        // Shape (not just color) must carry connection state so it reads under
-        // color-vision deficiency: a colored dot alone was indistinguishable
-        // between states for a deuteranopic viewer.
-        let status_indicator = match &conn.status {
-            ConnectionStatus::Connected => {
-                Indicator::icon(Icon::new(IconName::Check)).color(status_color)
-            }
-            ConnectionStatus::Connecting => {
-                Indicator::icon(Icon::new(IconName::LoadCircle).with_rotate_animation(2))
-                    .color(status_color)
-            }
-            ConnectionStatus::Disconnected => {
-                Indicator::icon(Icon::new(IconName::Dash)).color(status_color)
-            }
-            ConnectionStatus::Error(_) => {
-                Indicator::icon(Icon::new(IconName::XCircleFilled)).color(status_color)
-            }
-        };
-        let is_connected = matches!(conn.status, ConnectionStatus::Connected);
-        let in_transaction = conn.in_transaction;
-        let is_server_objects_expanded = self.server_objects_expanded.contains(&id);
-        let selected_node = self.selected_tree_node.clone();
-        let server_users = self.server_users.get(&id).cloned();
-        let error_message = if let ConnectionStatus::Error(ref msg) = conn.status {
-            Some(msg.clone())
-        } else {
-            None
-        };
-
-        let is_active = self.store.read(cx).active_connection_id() == Some(id);
-        let is_selected = self.selected_entity == Some(SelectedEntity::Connection(id));
-        let is_before_target = self.drag_target == Some(DropTarget::BeforeConnection(id));
-        let is_after_target = self.drag_target == Some(DropTarget::AfterConnection(id));
-        let databases = conn.databases.clone();
-        let expanded_databases = conn.expanded_databases.clone();
-        let expanded_database_set = conn.expanded_database_set.clone();
-        let expanded_tables = conn.expanded_tables.clone();
-        let expanded_table_set = conn.expanded_table_set;
+    /// Walks the currently-expanded tree once and produces one `DbTreeRow` per
+    /// visible row, in the exact paint order the old nested renderer used. This
+    /// is O(visible rows) data shuffling with no element construction; the
+    /// elements themselves are built lazily by `render_row` for the visible
+    /// range only.
+    fn build_visible_rows(&self, cx: &Context<Self>) -> Vec<DbTreeRow> {
         let table_filter_raw = self.table_filter_editor.read(cx).text(cx);
         let filter_is_regex = self.table_filter_is_regex;
         let filter_regex = if filter_is_regex && !table_filter_raw.is_empty() {
@@ -7847,29 +8013,417 @@ impl DatabasePanel {
         } else {
             None
         };
-        let entity = cx.entity();
-        let env_color = conn.config.env_color.clone();
-        let db_views = conn.db_views.clone();
-        let db_procedures = conn.db_procedures.clone();
-        let db_sequences = conn.db_sequences.clone();
-        let db_events = conn.db_events.clone();
-        let table_indexes = conn.table_indexes.clone();
-        let table_fks = conn.table_fks.clone();
-        let table_triggers = conn.table_triggers;
-        let views_expanded = self.views_expanded.clone();
-        let procedures_expanded = self.procedures_expanded.clone();
-        let sequences_expanded = self.sequences_expanded.clone();
-        let events_expanded = self.events_expanded.clone();
-        let indexes_expanded = self.table_indexes_expanded.clone();
-        let fks_expanded = self.table_fks_expanded.clone();
-        let triggers_expanded = self.table_triggers_expanded.clone();
+        let filter = TableFilter {
+            raw: &table_filter_raw,
+            regex: filter_regex.as_ref(),
+            is_regex: filter_is_regex,
+        };
 
-        div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .id(ElementId::from(SharedString::from(format!("conn-header-{}", id))))
+        let store = self.store.read(cx);
+        let connections = store.connections();
+        let nodes = build_folder_tree(store.folders(), connections, None, 1);
+
+        let mut rows = Vec::new();
+        self.append_tree_nodes(&nodes, connections, 0, &filter, &mut rows);
+        rows
+    }
+
+    fn append_tree_nodes(
+        &self,
+        nodes: &[TreeNode],
+        connections: &[ActiveConnection],
+        depth: usize,
+        filter: &TableFilter,
+        rows: &mut Vec<DbTreeRow>,
+    ) {
+        for node in nodes {
+            match node {
+                TreeNode::Folder { folder, children } => {
+                    let is_collapsed = self.collapsed_folders.contains(&folder.id);
+                    rows.push(DbTreeRow::Folder {
+                        folder: folder.clone(),
+                        depth,
+                        is_collapsed,
+                    });
+                    if !is_collapsed && !children.is_empty() {
+                        self.append_tree_nodes(children, connections, depth + 1, filter, rows);
+                    }
+                }
+                TreeNode::Connection { index } => {
+                    if let Some(conn) = connections.get(*index) {
+                        self.append_connection_rows(conn, depth, filter, rows);
+                    }
+                }
+            }
+        }
+    }
+
+    fn append_connection_rows(
+        &self,
+        conn: &ActiveConnection,
+        depth: usize,
+        filter: &TableFilter,
+        rows: &mut Vec<DbTreeRow>,
+    ) {
+        let id = conn.config.id;
+        let is_collapsed = self.collapsed_connections.contains(&id);
+        let is_connected = matches!(conn.status, ConnectionStatus::Connected);
+
+        rows.push(DbTreeRow::Connection {
+            id,
+            label: conn.config.label.clone(),
+            driver: conn.config.driver,
+            status: conn.status.clone(),
+            in_transaction: conn.in_transaction,
+            env_color: conn.config.env_color.clone(),
+            folder_id: conn.config.folder_id,
+            depth,
+        });
+
+        if let ConnectionStatus::Error(message) = &conn.status {
+            rows.push(DbTreeRow::ConnectionError {
+                id,
+                message: message.clone(),
+            });
+        }
+
+        if is_connected && !is_collapsed {
+            let expanded = self.server_objects_expanded.contains(&id);
+            rows.push(DbTreeRow::ServerObjectsToggle {
+                id,
+                depth: depth + 1,
+                expanded,
+            });
+            if expanded {
+                let users = self.server_users.get(&id);
+                rows.push(DbTreeRow::ServerUsersHeader {
+                    count: users.map_or(0, |u| u.len()),
+                    depth: depth + 2,
+                });
+                if let Some(users) = users {
+                    for (name, host) in users {
+                        rows.push(DbTreeRow::ServerUser {
+                            name: name.clone(),
+                            host: host.clone(),
+                            depth: depth + 3,
+                        });
+                    }
+                }
+            }
+        }
+
+        if is_collapsed {
+            return;
+        }
+        let Some(databases) = &conn.databases else {
+            return;
+        };
+
+        for db in databases {
+            let db_name = &db.name;
+            let db_expanded = conn.expanded_database_set.contains(db_name);
+            rows.push(DbTreeRow::Database {
+                id,
+                driver: conn.config.driver,
+                name: db_name.clone(),
+                depth: depth + 1,
+                expanded: db_expanded,
+            });
+            if !db_expanded {
+                continue;
+            }
+
+            if let Some(tables) = conn.expanded_databases.get(db_name) {
+                for table in tables {
+                    let Some(highlight_indices) = Self::table_filter_match(
+                        &table.name,
+                        filter.raw,
+                        filter.regex,
+                        filter.is_regex,
+                    ) else {
+                        continue;
+                    };
+                    let tbl_key = (db_name.clone(), table.name.clone());
+                    let table_expanded = conn.expanded_table_set.contains(&tbl_key);
+                    let columns: Vec<ColumnInfo> = conn
+                        .expanded_tables
+                        .get(&tbl_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let idx_data = conn
+                        .table_indexes
+                        .get(&tbl_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let fk_data = conn.table_fks.get(&tbl_key).cloned().unwrap_or_default();
+                    let trig_data = conn
+                        .table_triggers
+                        .get(&tbl_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_view = matches!(table.kind, db_client::TableKind::View);
+                    let columns_arc: Arc<[ColumnInfo]> = Arc::from(columns);
+
+                    rows.push(DbTreeRow::Table {
+                        id,
+                        driver: conn.config.driver,
+                        database: db_name.clone(),
+                        name: table.name.clone(),
+                        is_view,
+                        highlight_indices,
+                        columns: columns_arc.clone(),
+                        depth: depth + 2,
+                        expanded: table_expanded,
+                    });
+                    if !table_expanded {
+                        continue;
+                    }
+
+                    let fk_columns: HashSet<String> =
+                        fk_data.iter().map(|fk| fk.from_column.clone()).collect();
+                    for column in columns_arc.iter() {
+                        let is_fk = fk_columns.contains(&column.name);
+                        rows.push(DbTreeRow::Column {
+                            id,
+                            database: db_name.clone(),
+                            table: table.name.clone(),
+                            column: column.clone(),
+                            is_fk,
+                            depth: depth + 3,
+                        });
+                    }
+                    if !idx_data.is_empty() {
+                        let expanded = self.table_indexes_expanded.contains(&(
+                            id,
+                            db_name.clone(),
+                            table.name.clone(),
+                        ));
+                        rows.push(DbTreeRow::IndexGroup {
+                            id,
+                            database: db_name.clone(),
+                            table: table.name.clone(),
+                            count: idx_data.len(),
+                            depth: depth + 3,
+                            expanded,
+                        });
+                        if expanded {
+                            for index in idx_data {
+                                rows.push(DbTreeRow::Index {
+                                    index,
+                                    depth: depth + 4,
+                                });
+                            }
+                        }
+                    }
+                    if !fk_data.is_empty() {
+                        let expanded = self.table_fks_expanded.contains(&(
+                            id,
+                            db_name.clone(),
+                            table.name.clone(),
+                        ));
+                        rows.push(DbTreeRow::FkGroup {
+                            id,
+                            database: db_name.clone(),
+                            table: table.name.clone(),
+                            count: fk_data.len(),
+                            depth: depth + 3,
+                            expanded,
+                        });
+                        if expanded {
+                            for fk in fk_data {
+                                rows.push(DbTreeRow::Fk {
+                                    fk,
+                                    depth: depth + 4,
+                                });
+                            }
+                        }
+                    }
+                    if !trig_data.is_empty() {
+                        let expanded = self.table_triggers_expanded.contains(&(
+                            id,
+                            db_name.clone(),
+                            table.name.clone(),
+                        ));
+                        rows.push(DbTreeRow::TriggerGroup {
+                            id,
+                            database: db_name.clone(),
+                            table: table.name.clone(),
+                            count: trig_data.len(),
+                            depth: depth + 3,
+                            expanded,
+                        });
+                        if expanded {
+                            for trigger in trig_data {
+                                rows.push(DbTreeRow::Trigger {
+                                    id,
+                                    database: db_name.clone(),
+                                    table: table.name.clone(),
+                                    trigger,
+                                    depth: depth + 4,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(view_names) = conn.db_views.get(db_name)
+                && !view_names.is_empty()
+            {
+                let expanded = self.views_expanded.contains(&(id, db_name.clone()));
+                rows.push(DbTreeRow::ViewsGroup {
+                    id,
+                    database: db_name.clone(),
+                    count: view_names.len(),
+                    depth: depth + 2,
+                    expanded,
+                });
+                if expanded {
+                    for (index, name) in view_names.iter().enumerate() {
+                        rows.push(DbTreeRow::View {
+                            id,
+                            database: db_name.clone(),
+                            name: name.clone(),
+                            index,
+                            depth: depth + 3,
+                        });
+                    }
+                }
+            }
+
+            if let Some(procedures) = conn.db_procedures.get(db_name)
+                && !procedures.is_empty()
+            {
+                let expanded = self.procedures_expanded.contains(&(id, db_name.clone()));
+                rows.push(DbTreeRow::ProceduresGroup {
+                    id,
+                    database: db_name.clone(),
+                    count: procedures.len(),
+                    depth: depth + 2,
+                    expanded,
+                });
+                if expanded {
+                    for procedure in procedures {
+                        rows.push(DbTreeRow::Procedure {
+                            id,
+                            database: db_name.clone(),
+                            procedure: procedure.clone(),
+                            depth: depth + 3,
+                        });
+                    }
+                }
+            }
+
+            if let Some(sequences) = conn.db_sequences.get(db_name)
+                && !sequences.is_empty()
+            {
+                let expanded = self.sequences_expanded.contains(&(id, db_name.clone()));
+                rows.push(DbTreeRow::SequencesGroup {
+                    id,
+                    database: db_name.clone(),
+                    count: sequences.len(),
+                    depth: depth + 2,
+                    expanded,
+                });
+                if expanded {
+                    for sequence in sequences {
+                        rows.push(DbTreeRow::Sequence {
+                            sequence: sequence.clone(),
+                            depth: depth + 3,
+                        });
+                    }
+                }
+            }
+
+            if let Some(events) = conn.db_events.get(db_name)
+                && !events.is_empty()
+            {
+                let expanded = self.events_expanded.contains(&(id, db_name.clone()));
+                rows.push(DbTreeRow::EventsGroup {
+                    id,
+                    database: db_name.clone(),
+                    count: events.len(),
+                    depth: depth + 2,
+                    expanded,
+                });
+                if expanded {
+                    for event in events {
+                        rows.push(DbTreeRow::Event {
+                            id,
+                            database: db_name.clone(),
+                            event: event.clone(),
+                            depth: depth + 3,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the element for a single flattened tree row on demand. Called by
+    /// the `uniform_list` processor for the visible range only, so the cost per
+    /// frame is bounded by the number of rows actually on screen.
+    // The per-kind bodies are lifted from the former per-connection renderer,
+    // where each captured binding was reused across many descendant rows. Here
+    // every row is built in isolation, so some of those clones are a single
+    // last use; keeping them preserves the lifted code verbatim and they are
+    // cheap (Arc bumps and short strings).
+    #[allow(clippy::redundant_clone)]
+    fn render_row(&self, row: &DbTreeRow, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(test)]
+        RENDERED_TREE_ROW_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match row {
+            DbTreeRow::Folder {
+                folder,
+                depth,
+                is_collapsed,
+            } => self.render_folder_row(folder, *depth, *is_collapsed, cx),
+
+            DbTreeRow::Connection {
+                id,
+                label,
+                driver,
+                status,
+                in_transaction,
+                env_color,
+                folder_id,
+                depth,
+            } => {
+                let id = *id;
+                let driver = *driver;
+                let depth = *depth;
+                let in_transaction = *in_transaction;
+                let connection_folder = *folder_id;
+                let label = label.clone();
+                let env_color = env_color.clone();
+                let indent = tree_indent(depth);
+                let is_collapsed = self.collapsed_connections.contains(&id);
+                let is_connected = matches!(status, ConnectionStatus::Connected);
+                let is_active = self.store.read(cx).active_connection_id() == Some(id);
+                let is_selected = self.selected_entity == Some(SelectedEntity::Connection(id));
+                let is_before_target = self.drag_target == Some(DropTarget::BeforeConnection(id));
+                let is_after_target = self.drag_target == Some(DropTarget::AfterConnection(id));
+                let drag_label: SharedString = label.clone().into();
+                let status_indicator = match status {
+                    ConnectionStatus::Connected => {
+                        Indicator::icon(Icon::new(IconName::Check)).color(Color::Success)
+                    }
+                    ConnectionStatus::Connecting => {
+                        Indicator::icon(Icon::new(IconName::LoadCircle).with_rotate_animation(2))
+                            .color(Color::Modified)
+                    }
+                    ConnectionStatus::Disconnected => {
+                        Indicator::icon(Icon::new(IconName::Dash)).color(Color::Muted)
+                    }
+                    ConnectionStatus::Error(_) => {
+                        Indicator::icon(Icon::new(IconName::XCircleFilled)).color(Color::Error)
+                    }
+                };
+                let header_row = div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "conn-header-{}",
+                        id
+                    ))))
                     .debug_selector(|| format!("conn-header-{}", id))
                     .flex()
                     .flex_row()
@@ -7887,10 +8441,12 @@ impl DatabasePanel {
                         |el| el.bg(cx.theme().colors().element_selected),
                     )
                     .when(is_before_target, |el| {
-                        el.border_t_2().border_color(cx.theme().colors().text_accent)
+                        el.border_t_2()
+                            .border_color(cx.theme().colors().text_accent)
                     })
                     .when(is_after_target, |el| {
-                        el.border_b_2().border_color(cx.theme().colors().text_accent)
+                        el.border_b_2()
+                            .border_color(cx.theme().colors().text_accent)
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -7906,18 +8462,20 @@ impl DatabasePanel {
                     .on_drag(DraggedDbItem::Connection(id), move |_, _, _, cx| {
                         Self::drag_preview(drag_label.clone(), IconName::DatabaseZap, cx)
                     })
-                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let relative_y = (event.event.position.y - event.bounds.origin.y)
-                            / event.bounds.size.height;
-                        let new_target = Self::connection_drop_zone(relative_y, id);
-                        if this.drag_target != Some(new_target) {
-                            this.drag_target = Some(new_target);
-                            cx.notify();
-                        }
-                    }))
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedDbItem>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let relative_y = (event.event.position.y - event.bounds.origin.y)
+                                / event.bounds.size.height;
+                            let new_target = Self::connection_drop_zone(relative_y, id);
+                            if this.drag_target != Some(new_target) {
+                                this.drag_target = Some(new_target);
+                                cx.notify();
+                            }
+                        },
+                    ))
                     .on_drop(cx.listener(move |this, item: &DraggedDbItem, _, cx| {
                         let fallback = match connection_folder {
                             Some(folder_id) => DropTarget::Folder(folder_id),
@@ -7963,13 +8521,7 @@ impl DatabasePanel {
                             .when_some(
                                 env_color.as_deref().and_then(parse_env_color),
                                 |el, color| {
-                                    el.child(
-                                        div()
-                                            .w(px(8.))
-                                            .h(px(8.))
-                                            .rounded_full()
-                                            .bg(color),
-                                    )
+                                    el.child(div().w(px(8.)).h(px(8.)).rounded_full().bg(color))
                                 },
                             )
                             .child(
@@ -8025,179 +8577,218 @@ impl DatabasePanel {
                                         ),
                                 )
                             }),
-                    ),
-            )
-            .when_some(error_message, |el, msg| {
-                el.child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .px_4()
-                        .py_1()
-                        .child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::XSmall)
-                                .color(Color::Error),
-                        )
-                        .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error)),
-                )
-            })
-            .when(is_connected && !is_collapsed, |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(ElementId::from(SharedString::from(format!("server-objects-{}", id))))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .pl(tree_indent(depth + 1))
-                                .pr_2()
-                                .py_0p5()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_server_objects(id, cx);
-                                }))
-                                .child(
-                                    Icon::new(if is_server_objects_expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    })
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                                )
-                                .child(Icon::new(IconName::Server).size(IconSize::XSmall).color(Color::Muted))
-                                .child(Label::new("Server Objects").size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                        .when(is_server_objects_expanded, |el| {
-                            el.child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .pl(tree_indent(depth + 2))
-                                    .pr_2()
-                                    .py_0p5()
-                                    .child(Icon::new(IconName::Person).size(IconSize::XSmall).color(Color::Muted))
-                                    .child(
-                                        Label::new(format!(
-                                            "Users ({})",
-                                            server_users.as_ref().map_or(0, |u| u.len())
-                                        ))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    ),
-                            )
-                            .when_some(server_users, |el, users| {
-                                el.children(users.into_iter().map(|(name, host)| {
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_1()
-                                        .pl(tree_indent(depth + 3))
-                                        .pr_2()
-                                        .py_0p5()
-                                        .child(Label::new(name).size(LabelSize::XSmall).single_line())
-                                        .child(
-                                            Label::new(format!("@{host}"))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                                .single_line(),
-                                        )
-                                }))
-                            })
-                        }),
-                )
-            })
-            .when(!is_collapsed, |el| el.when_some(databases, |el, dbs| {
-                el.children(dbs.into_iter().map(|db| {
-                    let db_name = db.name;
-                    let is_db_expanded = expanded_database_set.contains(&db_name);
-                    let db_tables = expanded_databases.get(&db_name).cloned();
-                    let db_name_for_click = db_name.clone();
-                    let db_selected = selected_node.as_ref().is_some_and(|node| {
-                        node.connection_id == id
-                            && node.database == db_name
-                            && node.table.is_none()
-                            && node.column.is_none()
-                    });
+                    );
+                header_row.into_any_element()
+            }
 
-                    let db_row = div()
-                        .id(ElementId::from(SharedString::from(format!("db-row-{}-{}", id, db_name))))
-                        .debug_selector({
-                            let db_name = db_name.clone();
-                            move || format!("db-row-{}-{}", id, db_name)
+            DbTreeRow::ConnectionError { id, message } => {
+                let id = *id;
+                let message = message.clone();
+                h_flex()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "conn-error-{id}"
+                    ))))
+                    .gap_1()
+                    .items_center()
+                    .px_4()
+                    .py_0p5()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(message.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .single_line(),
+                        ),
+                    )
+                    .tooltip(Tooltip::text(message))
+                    .into_any_element()
+            }
+
+            DbTreeRow::ServerObjectsToggle {
+                id,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "server-objects-{}",
+                        id
+                    ))))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_server_objects(id, cx);
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
                         })
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .pl(tree_indent(depth + 1))
-                        .pr_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .relative()
-                        .cursor_pointer()
-                        .when(db_selected, |el| {
-                            el.bg(cx.theme().colors().element_selected)
-                        })
-                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                        .on_click(cx.listener({
-                            let db_name = db_name_for_click;
-                            move |this, event: &ClickEvent, window, cx| {
-                                this.selected_tree_node = Some(SelectedTreeNode {
-                                    connection_id: id,
-                                    database: db_name.clone(),
-                                    table: None,
-                                    column: None,
-                                });
-                                this.selected_entity = None;
-                                cx.notify();
-                                if event.modifiers().control && event.click_count() == 1 {
-                                    this.open_database_ddl(id, db_name.clone(), window, cx);
-                                } else if !event.modifiers().control {
-                                    this.store.update(cx, |store, cx| {
-                                        store
-                                            .toggle_database_expanded(id, db_name.clone(), cx)
-                                            .detach_and_log_err(cx);
-                                    });
-                                }
-                            }
-                        }))
-                        .child(
-                            Icon::new(if is_db_expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Server)
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
-                        )
-                        .child(
-                            Icon::new(IconName::DatabaseZap)
-                                .size(IconSize::XSmall)
-                                .color(Color::Default),
-                        )
-                        .child(Label::new(db_name.clone()).size(LabelSize::Small));
+                    )
+                    .child(
+                        Label::new("Server Objects")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
 
-                    let db_ctx_menu = {
-                        let entity = entity.clone();
-                        let db = db_name.clone();
-                        let workspace = self.workspace.clone();
-                        move |window: &mut Window, cx: &mut App| {
-                            ContextMenu::build(window, cx, {
-                                let entity = entity.clone();
-                                let db = db.clone();
-                                let workspace = workspace.clone();
-                                move |menu, _, _| {
-                                    menu
+            DbTreeRow::ServerUsersHeader { count, depth } => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .pl(tree_indent(*depth))
+                .pr_2()
+                .py_0p5()
+                .child(
+                    Icon::new(IconName::Person)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("Users ({})", count))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+
+            DbTreeRow::ServerUser { name, host, depth } => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .pl(tree_indent(*depth))
+                .pr_2()
+                .py_0p5()
+                .child(
+                    Label::new(name.clone())
+                        .size(LabelSize::XSmall)
+                        .single_line(),
+                )
+                .child(
+                    Label::new(format!("@{host}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
+                )
+                .into_any_element(),
+
+            DbTreeRow::Database {
+                id,
+                driver,
+                name,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let driver = *driver;
+                let depth = *depth;
+                let is_db_expanded = *expanded;
+                let db_name = name.clone();
+                let entity = cx.entity();
+                let selected_node = self.selected_tree_node.clone();
+                let db_name_for_click = db_name.clone();
+                let db_selected = selected_node.as_ref().is_some_and(|node| {
+                    node.connection_id == id
+                        && node.database == db_name
+                        && node.table.is_none()
+                        && node.column.is_none()
+                });
+                let db_row = div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "db-row-{}-{}",
+                        id, db_name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        move || format!("db-row-{}-{}", id, db_name)
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .relative()
+                    .cursor_pointer()
+                    .when(db_selected, |el| {
+                        el.bg(cx.theme().colors().element_selected)
+                    })
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener({
+                        let db_name = db_name_for_click;
+                        move |this, event: &ClickEvent, window, cx| {
+                            this.selected_tree_node = Some(SelectedTreeNode {
+                                connection_id: id,
+                                database: db_name.clone(),
+                                table: None,
+                                column: None,
+                            });
+                            this.selected_entity = None;
+                            cx.notify();
+                            if event.modifiers().control && event.click_count() == 1 {
+                                this.open_database_ddl(id, db_name.clone(), window, cx);
+                            } else if !event.modifiers().control {
+                                this.store.update(cx, |store, cx| {
+                                    store
+                                        .toggle_database_expanded(id, db_name.clone(), cx)
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }
+                    }))
+                    .child(
+                        Icon::new(if is_db_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::DatabaseZap)
+                            .size(IconSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .child(Label::new(db_name.clone()).size(LabelSize::Small));
+                let db_ctx_menu = {
+                    let entity = entity.clone();
+                    let db = db_name.clone();
+                    let workspace = self.workspace.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        ContextMenu::build(window, cx, {
+                            let entity = entity.clone();
+                            let db = db.clone();
+                            let workspace = workspace.clone();
+                            move |menu, _, _| {
+                                menu
                                     .entry(new_query_button_label(driver), None, {
                                         let entity = entity.clone();
                                         let db = db.clone();
@@ -8389,265 +8980,314 @@ impl DatabasePanel {
                                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(db.clone()));
                                         }
                                     })
-                                }
-                            })
-                        }
-                    };
+                            }
+                        })
+                    }
+                };
+                right_click_menu(SharedString::from(format!("db-ctx-{}-{}", id, db_name)))
+                    .trigger(move |_, _, _| db_row)
+                    .menu(db_ctx_menu)
+                    .into_any_element()
+            }
 
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            right_click_menu(SharedString::from(format!("db-ctx-{}-{}", id, db_name)))
-                                .trigger(move |_, _, _| db_row)
-                                .menu(db_ctx_menu),
-                        )
-                        .when(is_db_expanded, |el| {
-                            el.when_some(db_tables, |el, tables| {
-                                el.children(tables.into_iter().filter_map(|table| {
-                                    let table_name = table.name;
-                                    let highlight_indices = match Self::table_filter_match(
-                                        &table_name,
-                                        &table_filter_raw,
-                                        filter_regex.as_ref(),
-                                        filter_is_regex,
-                                    ) {
-                                        Some(indices) => indices,
-                                        None => return None,
-                                    };
-                                    let tbl_key = (db_name.clone(), table_name.clone());
-                                    let is_table_expanded = expanded_table_set.contains(&tbl_key);
-                                    let table_columns = expanded_tables.get(&tbl_key).cloned();
-                                    let db_for_table = db_name.clone();
-                                    let table_idx_data = table_indexes.get(&tbl_key).cloned().unwrap_or_default();
-                                    let table_fk_data = table_fks.get(&tbl_key).cloned().unwrap_or_default();
-                                    let fk_columns: HashSet<String> = table_fk_data
-                                        .iter()
-                                        .map(|fk| fk.from_column.clone())
-                                        .collect();
-                                    let table_trig_data = table_triggers.get(&tbl_key).cloned().unwrap_or_default();
-                                    let is_idx_expanded = indexes_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
-                                    let is_fk_expanded = fks_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
-                                    let is_trig_expanded = triggers_expanded.contains(&(id, db_for_table.clone(), table_name.clone()));
-                                    let is_view = matches!(table.kind, db_client::TableKind::View);
-                                    let table_selected = selected_node.as_ref().is_some_and(|node| {
-                                        node.connection_id == id
-                                            && node.database == db_for_table
-                                            && node.table.as_deref() == Some(table_name.as_str())
-                                            && node.column.is_none()
-                                    });
-                                    let tbl_actions_group: SharedString =
-                                        format!("tbl-actions-{}-{}-{}", id, db_for_table, table_name).into();
-
-                                    let table_row = div()
-                                        .id(ElementId::from(SharedString::from(format!("tbl-row-{}-{}-{}", id, db_for_table, table_name))))
-                                        .debug_selector({
-                                            let db = db_for_table.clone();
-                                            let tbl = table_name.clone();
-                                            move || format!("tbl-row-{}-{}-{}", id, db, tbl)
-                                        })
-                                        .group(tbl_actions_group.clone())
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_1()
-                                        .pl(tree_indent(depth + 2))
-                                        .pr_2()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .relative()
-                                        .cursor_pointer()
-                                        .when(table_selected, |el| {
-                                            el.bg(cx.theme().colors().element_selected)
-                                        })
-                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                        .on_click(cx.listener({
-                                            let db = db_for_table.clone();
-                                            let tbl = table_name.clone();
-                                            let workspace = self.workspace.clone();
-                                            move |this, event: &ClickEvent, window, cx| {
-                                                this.selected_tree_node = Some(SelectedTreeNode {
-                                                    connection_id: id,
-                                                    database: db.clone(),
-                                                    table: Some(tbl.clone()),
-                                                    column: None,
-                                                });
-                                                this.selected_entity = None;
-                                                cx.notify();
-                                                if event.modifiers().control && event.click_count() == 1 {
-                                                    let ddl_task = this.store.update(cx, |store, cx| {
-                                                        store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
-                                                    });
-                                                    let ws = workspace.clone();
-                                                    cx.spawn_in(window, async move |this, cx| {
-                                                        let ddl = ddl_task.await?;
-                                                        this.update_in(cx, |panel, window, cx| {
-                                                            Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
-                                                        }).log_err();
-                                                        anyhow::Ok(())
-                                                    })
-                                                    .detach_and_log_err(cx);
-                                                } else if !event.modifiers().control {
-                                                    this.store.update(cx, |store, cx| {
-                                                        store
-                                                            .toggle_table_expanded(
-                                                                id, db.clone(), tbl.clone(), cx,
-                                                            )
-                                                            .detach_and_log_err(cx);
-                                                    });
-                                                }
-                                            }
-                                        }))
-                                        .child(
-                                            Icon::new(if is_table_expanded {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Icon::new(if is_view {
-                                                IconName::Eye
-                                            } else {
-                                                IconName::Reader
-                                            })
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(ElementId::from(SharedString::from(format!("tbl-label-{}-{}-{}", id, db_for_table, table_name))))
-                                                .debug_selector({
-                                                    let db = db_for_table.clone();
-                                                    let tbl = table_name.clone();
-                                                    move || format!("tbl-label-{}-{}-{}", id, db, tbl)
-                                                })
-                                                .flex_1()
-                                                .min_w_0()
-                                                .child(HighlightedLabel::new(table_name.clone(), highlight_indices).size(LabelSize::Small).single_line())
-                                                .tooltip(Tooltip::text("Ctrl+click to view DDL")),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .absolute()
-                                                .top_0()
-                                                .bottom_0()
-                                                .right_1()
-                                                .items_center()
-                                                .gap_0p5()
-                                                .visible_on_hover(tbl_actions_group)
-                                                .child(
-                                                    IconButton::new(
-                                                        SharedString::from(format!("view-data-{}-{}-{}", id, db_for_table, table_name)),
-                                                        IconName::PlayFilled,
-                                                    )
-                                                    .icon_size(IconSize::XSmall)
-                                                    .tooltip(Tooltip::text("View Table Data"))
-                                                    .on_click(cx.listener({
-                                                        let db = db_for_table.clone();
-                                                        let tbl = table_name.clone();
-                                                        move |this, _, window, cx| {
-                                                            let sql = format!(
-                                                                "SELECT * FROM {} LIMIT 500",
-                                                                driver.quote_identifier(&tbl)
-                                                            );
-                                                            let store_weak = this.store.downgrade();
-                                                            let task = this.store.update(cx, |store, cx| {
-                                                                store.execute_query(id, db.clone(), sql, cx)
-                                                            });
-                                                            let title = SharedString::from(tbl.as_str());
-                                                            let workspace = this.workspace.clone();
-                                                            let env_color = connection_env_color(&store_weak, id, cx);
-                                                            let result_view = cx.new(|cx| {
-                                                                ResultView::new(title, cx)
-                                                                    .with_table_context(store_weak, id, db.clone(), tbl.clone(), window, cx)
-                                                                    .with_workspace(workspace.clone())
-                                                                    .with_env_color(env_color)
-                                                            });
-                                                            let rv = result_view.clone();
-                                                            cx.spawn_in(window, async move |_, cx| {
-                                                                let outcome = task.await;
-                                                                rv.update(cx, |view, cx| match outcome {
-                                                                    Ok(r) => view.set_result(r, cx),
-                                                                    Err(e) => view.set_error(format_query_error(&e), cx),
-                                                                });
-                                                                workspace.update_in(cx, |ws, window, cx| {
-                                                                    ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
-                                                                }).log_err();
-                                                                anyhow::Ok(())
-                                                            })
-                                                            .detach_and_log_err(cx);
-                                                        }
-                                                    })),
-                                                )
-                                                .child(
-                                                    IconButton::new(
-                                                        SharedString::from(format!("ddl-{}-{}-{}", id, db_for_table, table_name)),
-                                                        IconName::Code,
-                                                    )
-                                                    .icon_size(IconSize::XSmall)
-                                                    .tooltip(Tooltip::text("Script as CREATE"))
-                                                    .on_click(cx.listener({
-                                                        let db = db_for_table.clone();
-                                                        let tbl = table_name.clone();
-                                                        let workspace = self.workspace.clone();
-                                                        move |this, _, window, cx| {
-                                                            let ddl_task = this.store.update(cx, |store, cx| {
-                                                                store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
-                                                            });
-                                                            let tbl_title = tbl.clone();
-                                                            let ws = workspace.clone();
-                                                            cx.spawn_in(window, async move |this, cx| {
-                                                                let ddl = ddl_task.await?;
-                                                                this.update_in(cx, |panel, window, cx| {
-                                                                    Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
-                                                                    let _ = tbl_title;
-                                                                }).log_err();
-                                                                anyhow::Ok(())
-                                                            })
-                                                            .detach_and_log_err(cx);
-                                                        }
-                                                    })),
-                                                )
-                                                .child(
-                                                    IconButton::new(
-                                                        SharedString::from(format!("insert-{}-{}-{}", id, db_for_table, table_name)),
-                                                        IconName::TextSnippet,
-                                                    )
-                                                    .icon_size(IconSize::XSmall)
-                                                    .tooltip(Tooltip::text("Script as INSERT / UPDATE / DELETE"))
-                                                    .on_click(cx.listener({
-                                                        let tbl = table_name.clone();
-                                                        let cols = table_columns.clone().unwrap_or_default();
-                                                        let workspace = self.workspace.clone();
-                                                        move |this, _, window, cx| {
-                                                            let insert = Self::generate_insert_template(&tbl, driver, &cols);
-                                                            let update = Self::generate_update_template(&tbl, driver, &cols);
-                                                            let delete = Self::generate_delete_template(&tbl, driver, &cols);
-                                                            let sql = format!("{}\n\n{}\n\n{}", insert, update, delete);
-                                                            Self::open_sql_query_with_text(workspace.clone(), this.store.downgrade(), id, sql, window, cx);
-                                                        }
-                                                    })),
-                                                )
+            DbTreeRow::Table {
+                id,
+                driver,
+                database,
+                name,
+                is_view,
+                highlight_indices,
+                columns,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let driver = *driver;
+                let depth = *depth;
+                let is_view = *is_view;
+                let is_table_expanded = *expanded;
+                let db_for_table = database.clone();
+                let table_name = name.clone();
+                let highlight_indices = highlight_indices.clone();
+                let table_columns: Option<Vec<ColumnInfo>> = Some(columns.to_vec());
+                let entity = cx.entity();
+                let selected_node = self.selected_tree_node.clone();
+                let tbl_actions_group: SharedString =
+                    format!("tbl-actions-{}-{}-{}", id, db_for_table, table_name).into();
+                let table_selected = selected_node.as_ref().is_some_and(|node| {
+                    node.connection_id == id
+                        && node.database == db_for_table
+                        && node.table.as_deref() == Some(table_name.as_str())
+                        && node.column.is_none()
+                });
+                let table_row = div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "tbl-row-{}-{}-{}",
+                        id, db_for_table, table_name
+                    ))))
+                    .debug_selector({
+                        let db = db_for_table.clone();
+                        let tbl = table_name.clone();
+                        move || format!("tbl-row-{}-{}-{}", id, db, tbl)
+                    })
+                    .group(tbl_actions_group.clone())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .relative()
+                    .cursor_pointer()
+                    .when(table_selected, |el| {
+                        el.bg(cx.theme().colors().element_selected)
+                    })
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener({
+                        let db = db_for_table.clone();
+                        let tbl = table_name.clone();
+                        let workspace = self.workspace.clone();
+                        move |this, event: &ClickEvent, window, cx| {
+                            this.selected_tree_node = Some(SelectedTreeNode {
+                                connection_id: id,
+                                database: db.clone(),
+                                table: Some(tbl.clone()),
+                                column: None,
+                            });
+                            this.selected_entity = None;
+                            cx.notify();
+                            if event.modifiers().control && event.click_count() == 1 {
+                                let ddl_task = this.store.update(cx, |store, cx| {
+                                    store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
+                                });
+                                let ws = workspace.clone();
+                                cx.spawn_in(window, async move |this, cx| {
+                                    let ddl = ddl_task.await?;
+                                    this.update_in(cx, |panel, window, cx| {
+                                        Self::open_sql_query_with_text(
+                                            ws.clone(),
+                                            panel.store.downgrade(),
+                                            id,
+                                            ddl,
+                                            window,
+                                            cx,
                                         );
-
-                                    let ctx_menu = {
-                                        let entity = entity.clone();
-                                        let db = db_for_table.clone();
-                                        let tbl = table_name.clone();
-                                        let workspace = self.workspace.clone();
-                                        let cols = table_columns.clone().unwrap_or_default();
-                                        move |window: &mut Window, cx: &mut App| {
-                                            ContextMenu::build(window, cx, {
-                                                let entity = entity.clone();
-                                                let db = db.clone();
-                                                let tbl = tbl.clone();
-                                                let workspace = workspace.clone();
-                                                let cols = cols.clone();
-                                                move |menu, _, _| {
-                                                    menu
+                                    })
+                                    .log_err();
+                                    anyhow::Ok(())
+                                })
+                                .detach_and_log_err(cx);
+                            } else if !event.modifiers().control {
+                                this.store.update(cx, |store, cx| {
+                                    store
+                                        .toggle_table_expanded(id, db.clone(), tbl.clone(), cx)
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }
+                    }))
+                    .child(
+                        Icon::new(if is_table_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(if is_view {
+                            IconName::Eye
+                        } else {
+                            IconName::Reader
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::from(SharedString::from(format!(
+                                "tbl-label-{}-{}-{}",
+                                id, db_for_table, table_name
+                            ))))
+                            .debug_selector({
+                                let db = db_for_table.clone();
+                                let tbl = table_name.clone();
+                                move || format!("tbl-label-{}-{}-{}", id, db, tbl)
+                            })
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                HighlightedLabel::new(table_name.clone(), highlight_indices)
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            )
+                            .tooltip(Tooltip::text("Ctrl+click to view DDL")),
+                    )
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_1()
+                            .items_center()
+                            .gap_0p5()
+                            .visible_on_hover(tbl_actions_group)
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!(
+                                        "view-data-{}-{}-{}",
+                                        id, db_for_table, table_name
+                                    )),
+                                    IconName::PlayFilled,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("View Table Data"))
+                                .on_click(cx.listener({
+                                    let db = db_for_table.clone();
+                                    let tbl = table_name.clone();
+                                    move |this, _, window, cx| {
+                                        let sql = format!(
+                                            "SELECT * FROM {} LIMIT 500",
+                                            driver.quote_identifier(&tbl)
+                                        );
+                                        let store_weak = this.store.downgrade();
+                                        let task = this.store.update(cx, |store, cx| {
+                                            store.execute_query(id, db.clone(), sql, cx)
+                                        });
+                                        let title = SharedString::from(tbl.as_str());
+                                        let workspace = this.workspace.clone();
+                                        let env_color = connection_env_color(&store_weak, id, cx);
+                                        let result_view = cx.new(|cx| {
+                                            ResultView::new(title, cx)
+                                                .with_table_context(
+                                                    store_weak,
+                                                    id,
+                                                    db.clone(),
+                                                    tbl.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                                .with_workspace(workspace.clone())
+                                                .with_env_color(env_color)
+                                        });
+                                        let rv = result_view.clone();
+                                        cx.spawn_in(window, async move |_, cx| {
+                                            let outcome = task.await;
+                                            rv.update(cx, |view, cx| match outcome {
+                                                Ok(r) => view.set_result(r, cx),
+                                                Err(e) => {
+                                                    view.set_error(format_query_error(&e), cx)
+                                                }
+                                            });
+                                            workspace
+                                                .update_in(cx, |ws, window, cx| {
+                                                    ws.add_item_to_active_pane(
+                                                        Box::new(result_view),
+                                                        None,
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                            anyhow::Ok(())
+                                        })
+                                        .detach_and_log_err(cx);
+                                    }
+                                })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!(
+                                        "ddl-{}-{}-{}",
+                                        id, db_for_table, table_name
+                                    )),
+                                    IconName::Code,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Script as CREATE"))
+                                .on_click(cx.listener({
+                                    let db = db_for_table.clone();
+                                    let tbl = table_name.clone();
+                                    let workspace = self.workspace.clone();
+                                    move |this, _, window, cx| {
+                                        let ddl_task = this.store.update(cx, |store, cx| {
+                                            store.get_table_ddl(id, db.clone(), tbl.clone(), cx)
+                                        });
+                                        let tbl_title = tbl.clone();
+                                        let ws = workspace.clone();
+                                        cx.spawn_in(window, async move |this, cx| {
+                                            let ddl = ddl_task.await?;
+                                            this.update_in(cx, |panel, window, cx| {
+                                                Self::open_sql_query_with_text(
+                                                    ws.clone(),
+                                                    panel.store.downgrade(),
+                                                    id,
+                                                    ddl,
+                                                    window,
+                                                    cx,
+                                                );
+                                                let _ = tbl_title;
+                                            })
+                                            .log_err();
+                                            anyhow::Ok(())
+                                        })
+                                        .detach_and_log_err(cx);
+                                    }
+                                })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!(
+                                        "insert-{}-{}-{}",
+                                        id, db_for_table, table_name
+                                    )),
+                                    IconName::TextSnippet,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Script as INSERT / UPDATE / DELETE"))
+                                .on_click(cx.listener({
+                                    let tbl = table_name.clone();
+                                    let cols = table_columns.clone().unwrap_or_default();
+                                    let workspace = self.workspace.clone();
+                                    move |this, _, window, cx| {
+                                        let insert =
+                                            Self::generate_insert_template(&tbl, driver, &cols);
+                                        let update =
+                                            Self::generate_update_template(&tbl, driver, &cols);
+                                        let delete =
+                                            Self::generate_delete_template(&tbl, driver, &cols);
+                                        let sql = format!("{}\n\n{}\n\n{}", insert, update, delete);
+                                        Self::open_sql_query_with_text(
+                                            workspace.clone(),
+                                            this.store.downgrade(),
+                                            id,
+                                            sql,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                })),
+                            ),
+                    );
+                let ctx_menu = {
+                    let entity = entity.clone();
+                    let db = db_for_table.clone();
+                    let tbl = table_name.clone();
+                    let workspace = self.workspace.clone();
+                    let cols = table_columns.clone().unwrap_or_default();
+                    move |window: &mut Window, cx: &mut App| {
+                        ContextMenu::build(window, cx, {
+                            let entity = entity.clone();
+                            let db = db.clone();
+                            let tbl = tbl.clone();
+                            let workspace = workspace.clone();
+                            let cols = cols.clone();
+                            move |menu, _, _| {
+                                menu
                                                     .entry("View Table Data", None, {
                                                         let entity = entity.clone();
                                                         let db = db.clone();
@@ -9074,640 +9714,933 @@ impl DatabasePanel {
                                                             });
                                                         }
                                                     })
-                                                }
-                                            })
-                                        }
-                                    };
-
-                                    Some(div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            right_click_menu(SharedString::from(format!("tbl-ctx-{}-{}-{}", id, db_for_table, table_name)))
-                                                .trigger(move |_, _, _| table_row)
-                                                .menu(ctx_menu),
-                                        )
-                                        .when(is_table_expanded, |el| {
-                                            el.when_some(table_columns, |el, columns| {
-                                                let fk_columns = fk_columns.clone();
-                                                el.children(columns.into_iter().map(|col| {
-                                                    let is_fk = fk_columns.contains(&col.name);
-                                                    let overlays = Self::column_overlay_icons(&col, is_fk);
-                                                    let col_name = col.name.clone();
-                                                    let col_selected = selected_node.as_ref().is_some_and(|node| {
-                                                        node.connection_id == id
-                                                            && node.database == db_for_table
-                                                            && node.table.as_deref() == Some(table_name.as_str())
-                                                            && node.column.as_deref() == Some(col_name.as_str())
-                                                    });
-                                                    div()
-                                                        .id(ElementId::from(SharedString::from(format!("col-row-{}-{}-{}-{}", id, db_for_table, table_name, col_name))))
-                                                        .debug_selector({
-                                                            let db = db_for_table.clone();
-                                                            let tbl = table_name.clone();
-                                                            let col = col_name.clone();
-                                                            move || format!("col-row-{}-{}-{}-{}", id, db, tbl, col)
-                                                        })
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .pl(tree_indent(depth + 3))
-                                                        .pr_2()
-                                                        .py_0p5()
-                                                        .rounded_sm()
-                                                        .cursor_pointer()
-                                                        .when(col_selected, |el| {
-                                                            el.bg(cx.theme().colors().element_selected)
-                                                        })
-                                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                        .on_click(cx.listener({
-                                                            let db = db_for_table.clone();
-                                                            let tbl = table_name.clone();
-                                                            move |this, _, _, cx| {
-                                                                this.selected_tree_node = Some(SelectedTreeNode {
-                                                                    connection_id: id,
-                                                                    database: db.clone(),
-                                                                    table: Some(tbl.clone()),
-                                                                    column: Some(col_name.clone()),
-                                                                });
-                                                                this.selected_entity = None;
-                                                                cx.notify();
-                                                            }
-                                                        }))
-                                                        .child(
-                                                            Label::new(col.name)
-                                                                .size(LabelSize::XSmall),
-                                                        )
-                                                        .child(
-                                                            Label::new(col.data_type)
-                                                                .size(LabelSize::XSmall)
-                                                                .color(Color::Muted),
-                                                        )
-                                                        .children(overlays.into_iter().map(
-                                                            |(icon, color)| {
-                                                                Icon::new(icon)
-                                                                    .size(IconSize::XSmall)
-                                                                    .color(color)
-                                                            },
-                                                        ))
-                                                }))
-                                            })
-                                            .when(!table_idx_data.is_empty(), |el| {
-                                                let idx_key = (id, db_for_table.clone(), table_name.clone());
-                                                el.child(
-                                                    div()
-                                                        .id(ElementId::from(SharedString::from(format!("idx-group-row-{}-{}-{}", id, db_for_table, table_name))))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .child(
-                                                            div()
-                                                                .id(ElementId::from(SharedString::from(format!("idx-group-{}-{}-{}", id, db_for_table, table_name))))
-                                                                .flex()
-                                                                .flex_row()
-                                                                .items_center()
-                                                                .gap_1()
-                                                                .pl(tree_indent(depth + 3))
-                                                                .pr_2()
-                                                                .py_0p5()
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    if this.table_indexes_expanded.contains(&idx_key) {
-                                                                        this.table_indexes_expanded.remove(&idx_key);
-                                                                    } else {
-                                                                        this.table_indexes_expanded.insert(idx_key.clone());
-                                                                    }
-                                                                    this.serialize_tree_state(cx);
-                                                                    cx.notify();
-                                                                }))
-                                                                .child(
-                                                                    Icon::new(if is_idx_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                                        .size(IconSize::XSmall)
-                                                                        .color(Color::Muted),
-                                                                )
-                                                                .child(Icon::new(IconName::Hash).size(IconSize::XSmall).color(Color::Muted))
-                                                                .child(Label::new(format!("Indexes ({})", table_idx_data.len())).size(LabelSize::XSmall).color(Color::Muted)),
-                                                        )
-                                                        .when(is_idx_expanded, |el| {
-                                                            el.children(table_idx_data.into_iter().map(|idx| {
-                                                                h_flex()
-                                                                    .gap_1()
-                                                                    .items_center()
-                                                                    .pl(tree_indent(depth + 4))
-                                                                    .pr_2()
-                                                                    .py_0p5()
-                                                                    .child(Icon::new(IconName::Hash).size(IconSize::XSmall).color(Color::Muted))
-                                                                    .child(Label::new(idx.name).size(LabelSize::XSmall))
-                                                                    .child(Label::new(format!("({})", idx.columns.join(", "))).size(LabelSize::XSmall).color(Color::Muted))
-                                                                    .when(idx.unique, |el| {
-                                                                        el.child(Label::new("UNIQUE").size(LabelSize::XSmall).color(Color::Accent))
-                                                                    })
-                                                            }))
-                                                        }),
-                                                )
-                                            })
-                                            .when(!table_fk_data.is_empty(), |el| {
-                                                let fk_key = (id, db_for_table.clone(), table_name.clone());
-                                                el.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .child(
-                                                            div()
-                                                                .id(ElementId::from(SharedString::from(format!("fk-group-{}-{}-{}", id, db_for_table, table_name))))
-                                                                .flex()
-                                                                .flex_row()
-                                                                .items_center()
-                                                                .gap_1()
-                                                                .pl(tree_indent(depth + 3))
-                                                                .pr_2()
-                                                                .py_0p5()
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    if this.table_fks_expanded.contains(&fk_key) {
-                                                                        this.table_fks_expanded.remove(&fk_key);
-                                                                    } else {
-                                                                        this.table_fks_expanded.insert(fk_key.clone());
-                                                                    }
-                                                                    this.serialize_tree_state(cx);
-                                                                    cx.notify();
-                                                                }))
-                                                                .child(
-                                                                    Icon::new(if is_fk_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                                        .size(IconSize::XSmall)
-                                                                        .color(Color::Muted),
-                                                                )
-                                                                .child(Icon::new(IconName::Link).size(IconSize::XSmall).color(Color::Muted))
-                                                                .child(Label::new(format!("Foreign Keys ({})", table_fk_data.len())).size(LabelSize::XSmall).color(Color::Muted)),
-                                                        )
-                                                        .when(is_fk_expanded, |el| {
-                                                            el.children(table_fk_data.into_iter().map(|fk| {
-                                                                h_flex()
-                                                                    .gap_1()
-                                                                    .items_center()
-                                                                    .pl(tree_indent(depth + 4))
-                                                                    .pr_2()
-                                                                    .py_0p5()
-                                                                    .child(Icon::new(IconName::Link).size(IconSize::XSmall).color(Color::Muted))
-                                                                    .child(Label::new(fk.from_column).size(LabelSize::XSmall))
-                                                                    .child(Label::new(format!("→ {}.{}", fk.to_table, fk.to_column)).size(LabelSize::XSmall).color(Color::Muted))
-                                                            }))
-                                                        }),
-                                                )
-                                            })
-                                            .when(!table_trig_data.is_empty(), |el| {
-                                                let trig_key = (id, db_for_table.clone(), table_name.clone());
-                                                el.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .child(
-                                                            div()
-                                                                .id(ElementId::from(SharedString::from(format!("trig-group-{}-{}-{}", id, db_for_table, table_name))))
-                                                                .flex()
-                                                                .flex_row()
-                                                                .items_center()
-                                                                .gap_1()
-                                                                .pl(tree_indent(depth + 3))
-                                                                .pr_2()
-                                                                .py_0p5()
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    if this.table_triggers_expanded.contains(&trig_key) {
-                                                                        this.table_triggers_expanded.remove(&trig_key);
-                                                                    } else {
-                                                                        this.table_triggers_expanded.insert(trig_key.clone());
-                                                                    }
-                                                                    this.serialize_tree_state(cx);
-                                                                    cx.notify();
-                                                                }))
-                                                                .child(
-                                                                    Icon::new(if is_trig_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                                        .size(IconSize::XSmall)
-                                                                        .color(Color::Muted),
-                                                                )
-                                                                .child(Icon::new(IconName::BoltFilled).size(IconSize::XSmall).color(Color::Muted))
-                                                                .child(Label::new(format!("Triggers ({})", table_trig_data.len())).size(LabelSize::XSmall).color(Color::Muted)),
-                                                        )
-                                                        .when(is_trig_expanded, |el| {
-                                                            el.children(table_trig_data.into_iter().map(|t| {
-                                                                let entity = entity.clone();
-                                                                let workspace = self.workspace.clone();
-                                                                let source = t.definition.clone().unwrap_or_else(|| {
-                                                                    format!("-- source unavailable for {}", t.name)
-                                                                });
-                                                                h_flex()
-                                                                    .id(ElementId::from(SharedString::from(format!("trigger-{}-{}-{}-{}", id, db_for_table, table_name, t.name))))
-                                                                    .debug_selector({
-                                                                        let db = db_for_table.clone();
-                                                                        let tbl = table_name.clone();
-                                                                        let name = t.name.clone();
-                                                                        move || format!("trigger-{}-{}-{}-{}", id, db, tbl, name)
-                                                                    })
-                                                                    .gap_1()
-                                                                    .items_center()
-                                                                    .pl(tree_indent(depth + 4))
-                                                                    .pr_2()
-                                                                    .py_0p5()
-                                                                    .cursor_pointer()
-                                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                                    .on_click(move |_, window, cx| {
-                                                                        let source = source.clone();
-                                                                        entity.update(cx, |panel, cx| {
-                                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
-                                                                        });
-                                                                    })
-                                                                    .child(Icon::new(IconName::BoltFilled).size(IconSize::XSmall).color(Color::Muted))
-                                                                    .child(Label::new(t.name).size(LabelSize::XSmall))
-                                                                    .child(Label::new(format!("{} {}", t.timing, t.event)).size(LabelSize::XSmall).color(Color::Muted))
-                                                            }))
-                                                        }),
-                                                )
-                                            })
-                                        }))
-                                }))
-                            })
-                            .when_some(db_views.get(&db_name).cloned(), |el, view_names| {
-                                if view_names.is_empty() {
-                                    return el;
-                                }
-                                let views_key = (id, db_name.clone());
-                                let is_views_expanded = views_expanded.contains(&views_key);
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .id(ElementId::from(SharedString::from(format!("views-group-{}-{}", id, db_name))))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1()
-                                                .pl(tree_indent(depth + 2))
-                                                .pr_2()
-                                                .py_0p5()
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.views_expanded.contains(&views_key) {
-                                                        this.views_expanded.remove(&views_key);
-                                                    } else {
-                                                        this.views_expanded.insert(views_key.clone());
-                                                    }
-                                                    this.serialize_tree_state(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    Icon::new(if is_views_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                        .size(IconSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Muted))
-                                                .child(Label::new(format!("Views ({})", view_names.len())).size(LabelSize::Small).color(Color::Muted)),
-                                        )
-                                        .when(is_views_expanded, |el| {
-                                            el.children(view_names.into_iter().enumerate().map(|(vi, view_name)| {
-                                                let view_row = h_flex()
-                                                    .gap_1()
-                                                    .items_center()
-                                                    .pl(tree_indent(depth + 3))
-                                                    .pr_2()
-                                                    .py_0p5()
-                                                    .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Muted))
-                                                    .child(Label::new(view_name.clone()).size(LabelSize::Small).single_line());
-
-                                                let view_ctx_menu = {
-                                                    let entity = entity.clone();
-                                                    let db = db_name.clone();
-                                                    let vw = view_name;
-                                                    let workspace = self.workspace.clone();
-                                                    move |window: &mut Window, cx: &mut App| {
-                                                        ContextMenu::build(window, cx, {
-                                                            let entity = entity.clone();
-                                                            let db = db.clone();
-                                                            let vw = vw.clone();
-                                                            let workspace = workspace.clone();
-                                                            move |menu, _, _| {
-                                                                menu
-                                                                .entry("Script as CREATE", None, {
-                                                                    let entity = entity.clone();
-                                                                    let db = db.clone();
-                                                                    let vw = vw.clone();
-                                                                    let workspace = workspace.clone();
-                                                                    move |window, cx| {
-                                                                        entity.update(cx, |panel, cx| {
-                                                                            let ddl_task = panel.store.update(cx, |store, cx| {
-                                                                                store.get_table_ddl(id, db.clone(), vw.clone(), cx)
-                                                                            });
-                                                                            let ws = workspace.clone();
-                                                                            cx.spawn_in(window, async move |this, cx| {
-                                                                                let ddl = ddl_task.await?;
-                                                                                this.update_in(cx, |panel, window, cx| {
-                                                                                    Self::open_sql_query_with_text(ws.clone(), panel.store.downgrade(), id, ddl, window, cx);
-                                                                                }).log_err();
-                                                                                anyhow::Ok(())
-                                                                            })
-                                                                            .detach_and_log_err(cx);
-                                                                        });
-                                                                    }
-                                                                })
-                                                                .entry("Copy DDL to Clipboard", None, {
-                                                                    let entity = entity.clone();
-                                                                    let db = db.clone();
-                                                                    let vw = vw.clone();
-                                                                    move |window, cx| {
-                                                                        entity.update(cx, |panel, cx| {
-                                                                            let ddl_task = panel.store.update(cx, |store, cx| {
-                                                                                store.get_table_ddl(id, db.clone(), vw.clone(), cx)
-                                                                            });
-                                                                            cx.spawn_in(window, async move |_, cx| {
-                                                                                let ddl = ddl_task.await?;
-                                                                                cx.update(|_window, cx| {
-                                                                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl));
-                                                                                })?;
-                                                                                anyhow::Ok(())
-                                                                            })
-                                                                            .detach_and_log_err(cx);
-                                                                        });
-                                                                    }
-                                                                })
-                                                                .entry("View Data", None, {
-                                                                    let entity = entity.clone();
-                                                                    let db = db.clone();
-                                                                    let vw = vw.clone();
-                                                                    let workspace = workspace.clone();
-                                                                    move |window, cx| {
-                                                                        entity.update(cx, |panel, cx| {
-                                                                            let sql = format!(
-                                                                                "SELECT * FROM `{}`.`{}` LIMIT 500",
-                                                                                db, vw
-                                                                            );
-                                                                            let task = panel.store.update(cx, |store, cx| {
-                                                                                store.execute_query(id, db.clone(), sql, cx)
-                                                                            });
-                                                                            let title = SharedString::from(vw.as_str());
-                                                                            let ws = workspace.clone();
-                                                                            let store_weak = panel.store.downgrade();
-                                                                            let env_color = connection_env_color(&store_weak, id, cx);
-                                                                            let result_view = cx.new(|cx| {
-                                                                                ResultView::new(title, cx).with_env_color(env_color)
-                                                                            });
-                                                                            let rv = result_view.clone();
-                                                                            cx.spawn_in(window, async move |_, cx| {
-                                                                                let outcome = task.await;
-                                                                                rv.update(cx, |view, cx| match outcome {
-                                                                                    Ok(r) => view.set_result(r, cx),
-                                                                                    Err(e) => view.set_error(format_query_error(&e), cx),
-                                                                                });
-                                                                                ws.update_in(cx, |ws, window, cx| {
-                                                                                    ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
-                                                                                }).log_err();
-                                                                                anyhow::Ok(())
-                                                                            })
-                                                                            .detach_and_log_err(cx);
-                                                                        });
-                                                                    }
-                                                                })
-                                                            }
-                                                        })
-                                                    }
-                                                };
-
-                                                right_click_menu(SharedString::from(format!("view-ctx-{}-{}-{}", id, db_name, vi)))
-                                                    .trigger(move |_, _, _| view_row)
-                                                    .menu(view_ctx_menu)
-                                            }))
-                                        }),
-                                )
-                            })
-                            .when_some(db_procedures.get(&db_name).cloned(), |el, procedures| {
-                                if procedures.is_empty() {
-                                    return el;
-                                }
-                                let procedures_key = (id, db_name.clone());
-                                let is_procedures_expanded = procedures_expanded.contains(&procedures_key);
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .id(ElementId::from(SharedString::from(format!("procedures-group-{}-{}", id, db_name))))
-                                                .debug_selector({
-                                                    let db_name = db_name.clone();
-                                                    move || format!("procedures-group-{}-{}", id, db_name)
-                                                })
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1()
-                                                .pl(tree_indent(depth + 2))
-                                                .pr_2()
-                                                .py_0p5()
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.procedures_expanded.contains(&procedures_key) {
-                                                        this.procedures_expanded.remove(&procedures_key);
-                                                    } else {
-                                                        this.procedures_expanded.insert(procedures_key.clone());
-                                                    }
-                                                    this.serialize_tree_state(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    Icon::new(if is_procedures_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                        .size(IconSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(Icon::new(IconName::Code).size(IconSize::XSmall).color(Color::Muted))
-                                                .child(Label::new(format!("Routines ({})", procedures.len())).size(LabelSize::Small).color(Color::Muted)),
-                                        )
-                                        .when(is_procedures_expanded, |el| {
-                                            el.children(procedures.into_iter().map(|procedure| {
-                                                let entity = entity.clone();
-                                                let workspace = self.workspace.clone();
-                                                let source = procedure.definition.clone().unwrap_or_else(|| {
-                                                    format!("-- source unavailable for {}", procedure.name)
-                                                });
-                                                h_flex()
-                                                    .id(ElementId::from(SharedString::from(format!("procedure-{}-{}-{}", id, db_name, procedure.name))))
-                                                    .debug_selector({
-                                                        let db_name = db_name.clone();
-                                                        let name = procedure.name.clone();
-                                                        move || format!("procedure-{}-{}-{}", id, db_name, name)
-                                                    })
-                                                    .gap_1()
-                                                    .items_center()
-                                                    .pl(tree_indent(depth + 3))
-                                                    .pr_2()
-                                                    .py_0p5()
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                    .on_click(move |_, window, cx| {
-                                                        let source = source.clone();
-                                                        entity.update(cx, |panel, cx| {
-                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
-                                                        });
-                                                    })
-                                                    .child(Icon::new(IconName::Code).size(IconSize::XSmall).color(Color::Muted))
-                                                    .child(Label::new(procedure.name).size(LabelSize::Small))
-                                                    .child(Label::new(match procedure.kind {
-                                                        db_client::schema::ProcedureKind::Function => "FUNCTION",
-                                                        db_client::schema::ProcedureKind::Procedure => "PROCEDURE",
-                                                    }).size(LabelSize::XSmall).color(Color::Muted))
-                                                    .into_any_element()
-                                            }))
-                                        }),
-                                )
-                            })
-                            .when_some(db_sequences.get(&db_name).cloned(), |el, sequences| {
-                                if sequences.is_empty() {
-                                    return el;
-                                }
-                                let sequences_key = (id, db_name.clone());
-                                let is_sequences_expanded = sequences_expanded.contains(&sequences_key);
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .id(ElementId::from(SharedString::from(format!("sequences-group-{}-{}", id, db_name))))
-                                                .debug_selector({
-                                                    let db_name = db_name.clone();
-                                                    move || format!("sequences-group-{}-{}", id, db_name)
-                                                })
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1()
-                                                .pl(tree_indent(depth + 2))
-                                                .pr_2()
-                                                .py_0p5()
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.sequences_expanded.contains(&sequences_key) {
-                                                        this.sequences_expanded.remove(&sequences_key);
-                                                    } else {
-                                                        this.sequences_expanded.insert(sequences_key.clone());
-                                                    }
-                                                    this.serialize_tree_state(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    Icon::new(if is_sequences_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                        .size(IconSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
-                                                .child(Label::new(format!("Sequences ({})", sequences.len())).size(LabelSize::Small).color(Color::Muted)),
-                                        )
-                                        .when(is_sequences_expanded, |el| {
-                                            el.children(sequences.into_iter().map(|seq| {
-                                                h_flex()
-                                                    .gap_1()
-                                                    .items_center()
-                                                    .pl(tree_indent(depth + 3))
-                                                    .pr_2()
-                                                    .py_0p5()
-                                                    .child(Icon::new(IconName::SquareDot).size(IconSize::XSmall).color(Color::Muted))
-                                                    .child(Label::new(seq.name).size(LabelSize::Small))
-                                                    .when_some(seq.current_value, |el, value| {
-                                                        el.child(Label::new(format!("current: {value}")).size(LabelSize::XSmall).color(Color::Muted))
-                                                    })
-                                            }))
-                                        }),
-                                )
-                            })
-                            .when_some(db_events.get(&db_name).cloned(), |el, events| {
-                                if events.is_empty() {
-                                    return el;
-                                }
-                                let events_key = (id, db_name.clone());
-                                let is_events_expanded = events_expanded.contains(&events_key);
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .id(ElementId::from(SharedString::from(format!("events-group-{}-{}", id, db_name))))
-                                                .debug_selector({
-                                                    let db_name = db_name.clone();
-                                                    move || format!("events-group-{}-{}", id, db_name)
-                                                })
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1()
-                                                .pl(tree_indent(depth + 2))
-                                                .pr_2()
-                                                .py_0p5()
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.events_expanded.contains(&events_key) {
-                                                        this.events_expanded.remove(&events_key);
-                                                    } else {
-                                                        this.events_expanded.insert(events_key.clone());
-                                                    }
-                                                    this.serialize_tree_state(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    Icon::new(if is_events_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                        .size(IconSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Muted))
-                                                .child(Label::new(format!("Events ({})", events.len())).size(LabelSize::Small).color(Color::Muted)),
-                                        )
-                                        .when(is_events_expanded, |el| {
-                                            el.children(events.into_iter().map(|event| {
-                                                let entity = entity.clone();
-                                                let workspace = self.workspace.clone();
-                                                let source = event.definition.clone().unwrap_or_else(|| {
-                                                    format!("-- source unavailable for {}", event.name)
-                                                });
-                                                h_flex()
-                                                    .id(ElementId::from(SharedString::from(format!("event-{}-{}-{}", id, db_name, event.name))))
-                                                    .debug_selector({
-                                                        let db_name = db_name.clone();
-                                                        let name = event.name.clone();
-                                                        move || format!("event-{}-{}-{}", id, db_name, name)
-                                                    })
-                                                    .gap_1()
-                                                    .items_center()
-                                                    .pl(tree_indent(depth + 3))
-                                                    .pr_2()
-                                                    .py_0p5()
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                                    .on_click(move |_, window, cx| {
-                                                        let source = source.clone();
-                                                        entity.update(cx, |panel, cx| {
-                                                            Self::open_sql_query_with_text(workspace.clone(), panel.store.downgrade(), id, source, window, cx);
-                                                        });
-                                                    })
-                                                    .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Muted))
-                                                    .child(Label::new(event.name).size(LabelSize::Small))
-                                                    .when_some(event.status, |el, status| {
-                                                        el.child(Label::new(status).size(LabelSize::XSmall).color(Color::Muted))
-                                                    })
-                                                    .into_any_element()
-                                            }))
-                                        }),
-                                )
-                            })
+                            }
                         })
-                }))
-            }))
+                    }
+                };
+                right_click_menu(SharedString::from(format!(
+                    "tbl-ctx-{}-{}-{}",
+                    id, db_for_table, table_name
+                )))
+                .trigger(move |_, _, _| table_row)
+                .menu(ctx_menu)
+                .into_any_element()
+            }
+
+            DbTreeRow::Column {
+                id,
+                database,
+                table,
+                column,
+                is_fk,
+                depth,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let is_fk = *is_fk;
+                let db_for_table = database.clone();
+                let table_name = table.clone();
+                let col = column.clone();
+                let col_name = col.name.clone();
+                let overlays = Self::column_overlay_icons(&col, is_fk);
+                let col_selected = self.selected_tree_node.as_ref().is_some_and(|node| {
+                    node.connection_id == id
+                        && node.database == db_for_table
+                        && node.table.as_deref() == Some(table_name.as_str())
+                        && node.column.as_deref() == Some(col_name.as_str())
+                });
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "col-row-{}-{}-{}-{}",
+                        id, db_for_table, table_name, col_name
+                    ))))
+                    .debug_selector({
+                        let db = db_for_table.clone();
+                        let tbl = table_name.clone();
+                        let col = col_name.clone();
+                        move || format!("col-row-{}-{}-{}-{}", id, db, tbl, col)
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(col_selected, |el| {
+                        el.bg(cx.theme().colors().element_selected)
+                    })
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener({
+                        let db = db_for_table.clone();
+                        let tbl = table_name.clone();
+                        move |this, _, _, cx| {
+                            this.selected_tree_node = Some(SelectedTreeNode {
+                                connection_id: id,
+                                database: db.clone(),
+                                table: Some(tbl.clone()),
+                                column: Some(col_name.clone()),
+                            });
+                            this.selected_entity = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(Label::new(col.name).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(col.data_type)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(
+                        overlays.into_iter().map(|(icon, color)| {
+                            Icon::new(icon).size(IconSize::XSmall).color(color)
+                        }),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::IndexGroup {
+                id,
+                database,
+                table,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_for_table = database.clone();
+                let table_name = table.clone();
+                let idx_key = (id, db_for_table.clone(), table_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "idx-group-{}-{}-{}",
+                        id, db_for_table, table_name
+                    ))))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.table_indexes_expanded.contains(&idx_key) {
+                            this.table_indexes_expanded.remove(&idx_key);
+                        } else {
+                            this.table_indexes_expanded.insert(idx_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Hash)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Indexes ({})", count))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Index { index, depth } => {
+                let index = index.clone();
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(*depth))
+                    .pr_2()
+                    .py_0p5()
+                    .child(
+                        Icon::new(IconName::Hash)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(index.name).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(format!("({})", index.columns.join(", ")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when(index.unique, |el| {
+                        el.child(
+                            Label::new("UNIQUE")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                    })
+                    .into_any_element()
+            }
+
+            DbTreeRow::FkGroup {
+                id,
+                database,
+                table,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_for_table = database.clone();
+                let table_name = table.clone();
+                let fk_key = (id, db_for_table.clone(), table_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "fk-group-{}-{}-{}",
+                        id, db_for_table, table_name
+                    ))))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.table_fks_expanded.contains(&fk_key) {
+                            this.table_fks_expanded.remove(&fk_key);
+                        } else {
+                            this.table_fks_expanded.insert(fk_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Link)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Foreign Keys ({})", count))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Fk { fk, depth } => {
+                let fk = fk.clone();
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(*depth))
+                    .pr_2()
+                    .py_0p5()
+                    .child(
+                        Icon::new(IconName::Link)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(fk.from_column).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(format!("→ {}.{}", fk.to_table, fk.to_column))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::TriggerGroup {
+                id,
+                database,
+                table,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_for_table = database.clone();
+                let table_name = table.clone();
+                let trig_key = (id, db_for_table.clone(), table_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "trig-group-{}-{}-{}",
+                        id, db_for_table, table_name
+                    ))))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.table_triggers_expanded.contains(&trig_key) {
+                            this.table_triggers_expanded.remove(&trig_key);
+                        } else {
+                            this.table_triggers_expanded.insert(trig_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::BoltFilled)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Triggers ({})", count))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Trigger {
+                id,
+                database,
+                table,
+                trigger,
+                depth,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let db_for_table = database.clone();
+                let table_name = table.clone();
+                let t = trigger.clone();
+                let entity = cx.entity();
+                let workspace = self.workspace.clone();
+                let source = t
+                    .definition
+                    .clone()
+                    .unwrap_or_else(|| format!("-- source unavailable for {}", t.name));
+                h_flex()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "trigger-{}-{}-{}-{}",
+                        id, db_for_table, table_name, t.name
+                    ))))
+                    .debug_selector({
+                        let db = db_for_table.clone();
+                        let tbl = table_name.clone();
+                        let name = t.name.clone();
+                        move || format!("trigger-{}-{}-{}-{}", id, db, tbl, name)
+                    })
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(move |_, window, cx| {
+                        let source = source.clone();
+                        entity.update(cx, |panel, cx| {
+                            Self::open_sql_query_with_text(
+                                workspace.clone(),
+                                panel.store.downgrade(),
+                                id,
+                                source,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .child(
+                        Icon::new(IconName::BoltFilled)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(t.name).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(format!("{} {}", t.timing, t.event))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::ViewsGroup {
+                id,
+                database,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_name = database.clone();
+                let views_key = (id, db_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "views-group-{}-{}",
+                        id, db_name
+                    ))))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.views_expanded.contains(&views_key) {
+                            this.views_expanded.remove(&views_key);
+                        } else {
+                            this.views_expanded.insert(views_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Eye)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Views ({})", count))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::View {
+                id,
+                database,
+                name,
+                index,
+                depth,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let vi = *index;
+                let db_name = database.clone();
+                let view_name = name.clone();
+                let entity = cx.entity();
+                let view_row = h_flex()
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .child(
+                        Icon::new(IconName::Eye)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(view_name.clone())
+                            .size(LabelSize::Small)
+                            .single_line(),
+                    );
+                let view_ctx_menu = {
+                    let entity = entity.clone();
+                    let db = db_name.clone();
+                    let vw = view_name;
+                    let workspace = self.workspace.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        ContextMenu::build(window, cx, {
+                            let entity = entity.clone();
+                            let db = db.clone();
+                            let vw = vw.clone();
+                            let workspace = workspace.clone();
+                            move |menu, _, _| {
+                                menu.entry("Script as CREATE", None, {
+                                    let entity = entity.clone();
+                                    let db = db.clone();
+                                    let vw = vw.clone();
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        entity.update(cx, |panel, cx| {
+                                            let ddl_task = panel.store.update(cx, |store, cx| {
+                                                store.get_table_ddl(id, db.clone(), vw.clone(), cx)
+                                            });
+                                            let ws = workspace.clone();
+                                            cx.spawn_in(window, async move |this, cx| {
+                                                let ddl = ddl_task.await?;
+                                                this.update_in(cx, |panel, window, cx| {
+                                                    Self::open_sql_query_with_text(
+                                                        ws.clone(),
+                                                        panel.store.downgrade(),
+                                                        id,
+                                                        ddl,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                                anyhow::Ok(())
+                                            })
+                                            .detach_and_log_err(cx);
+                                        });
+                                    }
+                                })
+                                .entry("Copy DDL to Clipboard", None, {
+                                    let entity = entity.clone();
+                                    let db = db.clone();
+                                    let vw = vw.clone();
+                                    move |window, cx| {
+                                        entity.update(cx, |panel, cx| {
+                                            let ddl_task = panel.store.update(cx, |store, cx| {
+                                                store.get_table_ddl(id, db.clone(), vw.clone(), cx)
+                                            });
+                                            cx.spawn_in(window, async move |_, cx| {
+                                                let ddl = ddl_task.await?;
+                                                cx.update(|_window, cx| {
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(ddl),
+                                                    );
+                                                })?;
+                                                anyhow::Ok(())
+                                            })
+                                            .detach_and_log_err(cx);
+                                        });
+                                    }
+                                })
+                                .entry("View Data", None, {
+                                    let entity = entity.clone();
+                                    let db = db.clone();
+                                    let vw = vw.clone();
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        entity.update(cx, |panel, cx| {
+                                            let sql = format!(
+                                                "SELECT * FROM `{}`.`{}` LIMIT 500",
+                                                db, vw
+                                            );
+                                            let task = panel.store.update(cx, |store, cx| {
+                                                store.execute_query(id, db.clone(), sql, cx)
+                                            });
+                                            let title = SharedString::from(vw.as_str());
+                                            let ws = workspace.clone();
+                                            let store_weak = panel.store.downgrade();
+                                            let env_color =
+                                                connection_env_color(&store_weak, id, cx);
+                                            let result_view = cx.new(|cx| {
+                                                ResultView::new(title, cx).with_env_color(env_color)
+                                            });
+                                            let rv = result_view.clone();
+                                            cx.spawn_in(window, async move |_, cx| {
+                                                let outcome = task.await;
+                                                rv.update(cx, |view, cx| match outcome {
+                                                    Ok(r) => view.set_result(r, cx),
+                                                    Err(e) => {
+                                                        view.set_error(format_query_error(&e), cx)
+                                                    }
+                                                });
+                                                ws.update_in(cx, |ws, window, cx| {
+                                                    ws.add_item_to_active_pane(
+                                                        Box::new(result_view),
+                                                        None,
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                                anyhow::Ok(())
+                                            })
+                                            .detach_and_log_err(cx);
+                                        });
+                                    }
+                                })
+                            }
+                        })
+                    }
+                };
+                right_click_menu(SharedString::from(format!(
+                    "view-ctx-{}-{}-{}",
+                    id, db_name, vi
+                )))
+                .trigger(move |_, _, _| view_row)
+                .menu(view_ctx_menu)
+                .into_any_element()
+            }
+
+            DbTreeRow::ProceduresGroup {
+                id,
+                database,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_name = database.clone();
+                let procedures_key = (id, db_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "procedures-group-{}-{}",
+                        id, db_name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        move || format!("procedures-group-{}-{}", id, db_name)
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.procedures_expanded.contains(&procedures_key) {
+                            this.procedures_expanded.remove(&procedures_key);
+                        } else {
+                            this.procedures_expanded.insert(procedures_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Code)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Routines ({})", count))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Procedure {
+                id,
+                database,
+                procedure,
+                depth,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let db_name = database.clone();
+                let procedure = procedure.clone();
+                let entity = cx.entity();
+                let workspace = self.workspace.clone();
+                let source = procedure
+                    .definition
+                    .clone()
+                    .unwrap_or_else(|| format!("-- source unavailable for {}", procedure.name));
+                h_flex()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "procedure-{}-{}-{}",
+                        id, db_name, procedure.name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        let name = procedure.name.clone();
+                        move || format!("procedure-{}-{}-{}", id, db_name, name)
+                    })
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(move |_, window, cx| {
+                        let source = source.clone();
+                        entity.update(cx, |panel, cx| {
+                            Self::open_sql_query_with_text(
+                                workspace.clone(),
+                                panel.store.downgrade(),
+                                id,
+                                source,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .child(
+                        Icon::new(IconName::Code)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(procedure.name).size(LabelSize::Small))
+                    .child(
+                        Label::new(match procedure.kind {
+                            ProcedureKind::Function => "FUNCTION",
+                            ProcedureKind::Procedure => "PROCEDURE",
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::SequencesGroup {
+                id,
+                database,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_name = database.clone();
+                let sequences_key = (id, db_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "sequences-group-{}-{}",
+                        id, db_name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        move || format!("sequences-group-{}-{}", id, db_name)
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.sequences_expanded.contains(&sequences_key) {
+                            this.sequences_expanded.remove(&sequences_key);
+                        } else {
+                            this.sequences_expanded.insert(sequences_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::SquareDot)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Sequences ({})", count))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Sequence { sequence, depth } => {
+                let seq = sequence.clone();
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(*depth))
+                    .pr_2()
+                    .py_0p5()
+                    .child(
+                        Icon::new(IconName::SquareDot)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(seq.name).size(LabelSize::Small))
+                    .when_some(seq.current_value, |el, value| {
+                        el.child(
+                            Label::new(format!("current: {value}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .into_any_element()
+            }
+
+            DbTreeRow::EventsGroup {
+                id,
+                database,
+                count,
+                depth,
+                expanded,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let expanded = *expanded;
+                let count = *count;
+                let db_name = database.clone();
+                let events_key = (id, db_name.clone());
+                div()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "events-group-{}-{}",
+                        id, db_name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        move || format!("events-group-{}-{}", id, db_name)
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.events_expanded.contains(&events_key) {
+                            this.events_expanded.remove(&events_key);
+                        } else {
+                            this.events_expanded.insert(events_key.clone());
+                        }
+                        this.serialize_tree_state(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Events ({})", count))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+
+            DbTreeRow::Event {
+                id,
+                database,
+                event,
+                depth,
+            } => {
+                let id = *id;
+                let depth = *depth;
+                let db_name = database.clone();
+                let event = event.clone();
+                let entity = cx.entity();
+                let workspace = self.workspace.clone();
+                let source = event
+                    .definition
+                    .clone()
+                    .unwrap_or_else(|| format!("-- source unavailable for {}", event.name));
+                h_flex()
+                    .id(ElementId::from(SharedString::from(format!(
+                        "event-{}-{}-{}",
+                        id, db_name, event.name
+                    ))))
+                    .debug_selector({
+                        let db_name = db_name.clone();
+                        let name = event.name.clone();
+                        move || format!("event-{}-{}-{}", id, db_name, name)
+                    })
+                    .gap_1()
+                    .items_center()
+                    .pl(tree_indent(depth))
+                    .pr_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(move |_, window, cx| {
+                        let source = source.clone();
+                        entity.update(cx, |panel, cx| {
+                            Self::open_sql_query_with_text(
+                                workspace.clone(),
+                                panel.store.downgrade(),
+                                id,
+                                source,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(event.name).size(LabelSize::Small))
+                    .when_some(event.status, |el, status| {
+                        el.child(
+                            Label::new(status)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -9799,81 +10732,44 @@ impl DatabasePanel {
 }
 
 impl DatabasePanel {
-    /// Recursively renders folder and connection rows, indenting by `depth`.
-    /// Collapsed folders skip their children.
-    fn render_tree_nodes(
-        &self,
-        nodes: Vec<TreeNode>,
-        connections: &[ActiveConnection],
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut elements = Vec::new();
-        for node in nodes {
-            match node {
-                TreeNode::Folder { folder, children } => {
-                    let is_collapsed = self.collapsed_folders.contains(&folder.id);
-                    let row = self.render_folder_row(&folder, depth, is_collapsed, cx);
-                    if is_collapsed || children.is_empty() {
-                        elements.push(row);
-                    } else {
-                        let child_elements =
-                            self.render_tree_nodes(children, connections, depth + 1, cx);
-                        // A continuous guide line sits under the parent's chevron and runs
-                        // down the whole child block, so nesting reads at a glance.
-                        let guide_color = cx.theme().colors().border_variant;
-                        let guide_left =
-                            px(TREE_ROW_BASE_INDENT + depth as f32 * TREE_ROW_INDENT_STEP + 6.);
-                        elements.push(
-                            v_flex()
-                                .child(row)
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .left(guide_left)
-                                                .top_0()
-                                                .bottom_0()
-                                                .w(px(1.))
-                                                .bg(guide_color),
-                                        )
-                                        .child(v_flex().children(child_elements)),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                }
-                TreeNode::Connection { index } => {
-                    if let Some(conn) = connections.get(index) {
-                        elements.push(
-                            self.render_connection_item(conn.clone(), depth, cx)
-                                .into_any_element(),
-                        );
-                    }
-                }
-            }
-        }
-        elements
-    }
-
-    /// Right-click target covering the tree and the empty space below it, so a
-    /// click on blank panel space offers New Folder / New Connection at the top
-    /// level, and a drop there moves the item out of any folder.
-    fn render_tree_background(
-        &self,
-        tree_elements: Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// Renders the tree body: a virtualized `uniform_list` of the flattened,
+    /// currently-expanded rows plus a blank filler below them. `uniform_list`
+    /// builds only the rows in the visible range each frame (see `render_row`),
+    /// so the per-frame cost stays bounded no matter how large the expanded
+    /// tree is. The blank filler is a sibling of the list, not a wrapper around
+    /// the rows: it carries the top-level right-click menu, the "no
+    /// connections" empty state, and the top-level drop target. Keeping the
+    /// menu off the rows means each row's own right-click menu is never
+    /// shadowed — `right_click_menu` registers a global bubble-phase handler,
+    /// so a parent menu wrapping the rows would intercept their right-clicks
+    /// before the row menus could open.
+    fn render_tree_background(&self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let is_top_level_target = self.drag_target == Some(DropTarget::TopLevel);
-        let show_empty_state = tree_elements.is_empty();
-        // The blank-area menu lives on a filler below the rows (and fills the whole
-        // panel when there are no rows). Keeping it off the rows means each row's own
-        // right-click menu is never shadowed: `right_click_menu` registers a global
-        // bubble-phase handler, so a parent menu wrapping the rows would intercept
-        // their right-clicks before the row menus could open.
+        let rows = self.build_visible_rows(cx);
+        let row_count = rows.len();
+        let widest_index = rows
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, row)| row_width_metric(row))
+            .map(|(index, _)| index);
+        let show_empty_state = row_count == 0;
+
+        let rows_list = uniform_list(
+            "db-tree-rows",
+            row_count,
+            cx.processor(|this, range: Range<usize>, _window, cx| {
+                let rows = this.build_visible_rows(cx);
+                range
+                    .filter_map(|index| rows.get(index).map(|row| this.render_row(row, cx)))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .with_width_from_item(widest_index)
+        .track_scroll(&self.tree_scroll_handle);
+
         let background_menu = right_click_menu(ElementId::from("db-tree-background-menu"))
             .trigger(move |_, _, _| {
                 v_flex()
@@ -9904,13 +10800,10 @@ impl DatabasePanel {
             })
             .menu(move |window, cx| new_items_context_menu(entity.clone(), window, cx));
 
-        v_flex()
-            .id("db-tree-background")
-            .debug_selector(|| "DB-TREE-BACKGROUND".into())
-            .items_start()
-            .flex_shrink_0()
-            .min_w_full()
-            .min_h_full()
+        let blank_area = div()
+            .id("db-tree-blank-area")
+            .flex_grow_1()
+            .w_full()
             .when(is_top_level_target, |el| {
                 el.bg(cx.theme().colors().drop_target_background)
             })
@@ -9927,8 +10820,14 @@ impl DatabasePanel {
             .on_drop(cx.listener(|this, item: &DraggedDbItem, _, cx| {
                 this.handle_drop(*item, DropTarget::TopLevel, cx);
             }))
-            .children(tree_elements)
-            .child(div().flex_1().w_full().child(background_menu))
+            .child(background_menu);
+
+        v_flex()
+            .id("db-tree-background")
+            .debug_selector(|| "DB-TREE-BACKGROUND".into())
+            .size_full()
+            .child(rows_list)
+            .child(blank_area)
             .into_any_element()
     }
 
@@ -10136,12 +11035,7 @@ fn new_items_context_menu(
 
 impl Render for DatabasePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let connections: Vec<ActiveConnection> =
-            self.store.read(cx).connections().iter().cloned().collect();
-        let folders: Vec<Folder> = self.store.read(cx).folders().to_vec();
-        let nodes = build_folder_tree(&folders, &connections, None, 1);
-        let tree_elements = self.render_tree_nodes(nodes, &connections, 0, cx);
-        let tree_background = self.render_tree_background(tree_elements, cx);
+        let tree_background = self.render_tree_background(cx);
 
         v_flex()
             .key_context("DatabasePanel")
@@ -10191,11 +11085,8 @@ impl Render for DatabasePanel {
                     .debug_selector(|| "DB-TREE-SCROLL".into())
                     .flex()
                     .flex_col()
-                    .items_start()
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.tree_scroll_handle)
                     .child(tree_background)
                     .custom_scrollbars(
                         Scrollbars::always_visible(ScrollAxes::Both)
@@ -11925,7 +12816,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -12112,7 +13003,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -12353,7 +13244,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -12550,7 +13441,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -12719,7 +13610,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -12906,7 +13797,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -13044,7 +13935,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -13156,7 +14047,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -13279,7 +14170,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -13445,7 +14336,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -13628,7 +14519,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -13712,7 +14603,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -13974,7 +14865,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14059,7 +14950,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14169,7 +15060,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14402,7 +15293,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14526,7 +15417,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14644,7 +15535,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -14747,7 +15638,7 @@ mod tests {
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
-                tree_scroll_handle: ScrollHandle::new(),
+                tree_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: Vec::new(),
             });
             workspace.add_panel(panel.clone(), window, cx);
@@ -16028,7 +16919,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -16058,15 +16949,10 @@ mod tests {
 
     // Proves the tree can actually scroll: with far more connection rows than
     // fit in the test window, a real layout+paint pass must leave the scroll
-    // handle with a nonzero max offset. `Scrollbars::tracked_scroll_handle`
-    // marks the handle as manually-added, which makes `custom_scrollbars`
-    // SKIP its own internal `.track_scroll()`/`.overflow_scroll()` wiring
-    // (see `ScrollbarState::handle_to_track`) -- the caller supplying its own
-    // handle is responsible for wiring the div itself. Without an explicit
-    // `.overflow_scroll().track_scroll(&handle)` call, the scroll handle's
-    // `scroll_offset` is never set, `clamp_scroll_position` never runs, and
-    // `max_offset`/`bounds` never update from their zero-initialized state --
-    // regardless of how much taller the actual content is.
+    // handle with a nonzero max offset on its `base_handle`. The `uniform_list`
+    // owns the scroll wiring via `.track_scroll(&tree_scroll_handle)`, and
+    // `custom_scrollbars(...tracked_scroll_handle(...))` reads the same handle,
+    // so the offset only becomes readable after a genuine layout+paint pass.
     #[gpui::test]
     async fn database_explorer_tree_scrolls_when_content_overflows_the_viewport(
         cx: &mut TestAppContext,
@@ -16125,7 +17011,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -16167,7 +17053,15 @@ mod tests {
             })
             .expect("DatabasePanel must be in the left dock");
 
-        let max_offset_y = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().y);
+        let max_offset_y = panel.read_with(cx, |panel, _| {
+            panel
+                .tree_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .max_offset()
+                .y
+        });
         assert!(
             max_offset_y > px(0.),
             "tree has 80 connection rows, far more than fit in the test window, so the scroll \
@@ -16181,7 +17075,15 @@ mod tests {
         // asserts "no row is dramatically wider than the viewport" rather than
         // "zero scroll capacity", distinguishing it from the >100px overflow a
         // genuinely long label produces in the sibling test above.
-        let max_offset_x = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().x);
+        let max_offset_x = panel.read_with(cx, |panel, _| {
+            panel
+                .tree_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .max_offset()
+                .x
+        });
         assert!(
             max_offset_x < px(100.),
             "short connection labels should need at most a small amount of horizontal scroll \
@@ -16194,27 +17096,11 @@ mod tests {
     // nonzero horizontal scroll range -- this is the counterpart to the
     // vertical-overflow test above, checking the `x` axis instead of `y`.
     //
-    // Root cause (previously an unfixed bug, now fixed): `db-panel-scroll` had
-    // no `align-items` override, so as either a block container (no `.flex()`
-    // at all) or a flex container it defaulted to stretching its single child
-    // to the viewport's exact width; `db-tree-background` (a `v_flex()`) had
-    // the same default-stretch problem for each row. Stretch bypasses
-    // content-based measurement entirely, so a row's true (potentially wider)
-    // content size never had a chance to propagate up regardless of what any
-    // individual child's width was set to -- explaining why even a
-    // `flex_none` child with an explicit, definite `.w(px(2000.))` still
-    // measured at exactly the viewport width. The fix: give `db-panel-scroll`
-    // an explicit `.flex().flex_col().items_start()` and `db-tree-background`
-    // an `.items_start()` too, so each level measures its child by content
-    // instead of stretching it. Their pre-existing `.min_w_full()` (and
-    // `.min_h_full()`) still act as a floor, so short rows keep filling the
-    // panel's width for a full-width hover/selection highlight; only rows
-    // that genuinely need more get to overflow and become scrollable.
-    // `db-tree-background` also needs `.flex_shrink_0()` -- without it,
-    // `db-panel-scroll` becoming a flex column made its single child a
-    // main-axis flex item, and the default `flex-shrink: 1` silently crushed
-    // it back down to the viewport *height*, breaking the vertical-overflow
-    // test above; `flex_shrink_0()` stops that regression.
+    // Horizontal scroll comes from `uniform_list`'s
+    // `ListHorizontalSizingBehavior::Unconstrained`: the list measures one item
+    // to size its horizontal content. `render_tree_background` points it at the
+    // widest row via `with_width_from_item(row_width_metric)`, so a long label
+    // anywhere in the tree -- not only the first row -- extends the scroll range.
     #[gpui::test]
     async fn database_explorer_tree_scrolls_horizontally_when_a_label_overflows_the_viewport(
         cx: &mut TestAppContext,
@@ -16273,7 +17159,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
@@ -16311,11 +17197,220 @@ mod tests {
             })
             .expect("DatabasePanel must be in the left dock");
 
-        let max_offset_x = panel.read_with(cx, |panel, _| panel.tree_scroll_handle.max_offset().x);
+        let max_offset_x = panel.read_with(cx, |panel, _| {
+            panel
+                .tree_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .max_offset()
+                .x
+        });
         assert!(
             max_offset_x > px(0.),
             "the connection label is far wider than the panel, so the scroll handle must report \
              a nonzero horizontal max offset; got {max_offset_x:?}"
+        );
+    }
+
+    // Builds a DatabasePanel with `connection_count` top-level connections, docks
+    // and focuses it, then forces one real layout+paint pass so the scroll handle
+    // reflects measured content. Shared by the virtualization and scroll-stability
+    // tests below.
+    fn build_tree_panel_with_connections(
+        workspace: &Entity<Workspace>,
+        connection_count: usize,
+        cx: &mut VisualTestContext,
+    ) {
+        let store = workspace.update_in(cx, |workspace, window, cx| {
+            let store = cx.new(|cx| DatabaseStore::new(cx));
+            let focus_handle = cx.focus_handle();
+            let workspace_handle = workspace.weak_handle();
+            let table_filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let panel = cx.new(|cx| {
+                let sub = cx.subscribe(
+                    &store,
+                    |_: &mut DatabasePanel,
+                     _: Entity<DatabaseStore>,
+                     _: &DatabaseStoreEvent,
+                     cx: &mut Context<DatabasePanel>| {
+                        cx.notify();
+                    },
+                );
+                DatabasePanel {
+                    focus_handle,
+                    store: store.clone(),
+                    workspace: workspace_handle,
+                    history_expanded: false,
+                    table_filter_editor,
+                    collapsed_folders: HashSet::default(),
+                    collapsed_connections: HashSet::default(),
+                    editing_folder: None,
+                    drag_target: None,
+                    views_expanded: HashSet::default(),
+                    procedures_expanded: HashSet::default(),
+                    sequences_expanded: HashSet::default(),
+                    events_expanded: HashSet::default(),
+                    table_indexes_expanded: HashSet::default(),
+                    table_fks_expanded: HashSet::default(),
+                    table_triggers_expanded: HashSet::default(),
+                    server_objects_expanded: HashSet::default(),
+                    server_users: HashMap::default(),
+                    table_filter_is_regex: false,
+                    selected_tree_node: None,
+                    selected_entity: None,
+                    initial_collapse_pending: false,
+                    pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
+                    dump: DumpUiState::default(),
+                    export: ExportUiState::default(),
+                    context_menu: None,
+                    tree_scroll_handle: UniformListScrollHandle::new(),
+                    _subscriptions: vec![sub],
+                }
+            });
+            workspace.add_panel(panel, window, cx);
+            store
+        });
+
+        store.update(cx, |store, cx| {
+            for i in 0..connection_count {
+                store.add_connection(
+                    db_client::ConnectionConfig {
+                        label: format!("connection-{i}"),
+                        auto_connect: false,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // Autonomous perf guard: a large expanded tree must virtualize -- only the
+    // on-screen window of rows may be built per draw, not every row. The
+    // `RENDERED_TREE_ROW_COUNT` counter lives inside `render_row`, so it counts
+    // exactly the rows whose elements were actually constructed. This makes the
+    // test a genuine differentiator: the pre-virtualization renderer built every
+    // visible-tree row every frame, so `built` would be at least `total` and this
+    // bound would fail; `uniform_list` keeps it to the on-screen window plus the
+    // single item measured for horizontal sizing. If this regresses, scrolling a
+    // large tree is O(total_rows) per frame -- the original lag.
+    #[gpui::test]
+    async fn database_explorer_tree_virtualizes_a_large_tree(cx: &mut TestAppContext) {
+        use std::sync::atomic::Ordering;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let total = 1500usize;
+        build_tree_panel_with_connections(&workspace, total, cx);
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.left_dock().read(cx).panel::<DatabasePanel>()
+            })
+            .expect("DatabasePanel must be in the left dock");
+
+        // Row-descriptor parity: the flattener emits exactly one row per top-level
+        // connection when nothing is expanded.
+        let flattened = panel.update(cx, |panel, cx| panel.build_visible_rows(cx).len());
+        assert_eq!(
+            flattened, total,
+            "build_visible_rows must emit exactly one row per top-level connection"
+        );
+
+        RENDERED_TREE_ROW_COUNT.store(0, Ordering::Relaxed);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let built = RENDERED_TREE_ROW_COUNT.load(Ordering::Relaxed);
+        eprintln!("TREE VIRTUALIZATION CHECK: built {built} rows out of {total}");
+        assert!(built > 0, "no tree rows were built -- the draw did not run");
+        assert!(
+            built < 500,
+            "tree is NOT virtualizing: built {built} of {total} rows in a single draw -- \
+             scrolling is O(total_rows) per frame"
+        );
+    }
+
+    // Regression guard for the tree "bouncing" back to the top: a re-render (a
+    // store event, a selection change) must not reset the scroll position. The
+    // offset lives on the persistent `UniformListScrollHandle`, so scrolling down
+    // and then forcing a fresh draw must leave the panel scrolled.
+    #[gpui::test]
+    async fn database_explorer_tree_scroll_offset_survives_a_re_render(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        build_tree_panel_with_connections(&workspace, 400, cx);
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.left_dock().read(cx).panel::<DatabasePanel>()
+            })
+            .expect("DatabasePanel must be in the left dock");
+
+        panel.update(cx, |panel, _| {
+            panel
+                .tree_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(gpui::point(px(0.), px(-150.)));
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        // Re-render as a store event would (this is what used to bounce the tree
+        // back to the top).
+        panel.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let offset_y = panel.read_with(cx, |panel, _| {
+            panel.tree_scroll_handle.0.borrow().base_handle.offset().y
+        });
+        assert!(
+            offset_y < px(0.),
+            "the tree scroll offset must survive a re-render instead of bouncing back to the \
+             top; got {offset_y:?}"
         );
     }
 
@@ -18043,7 +19138,7 @@ mod tests {
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
-                    tree_scroll_handle: ScrollHandle::new(),
+                    tree_scroll_handle: UniformListScrollHandle::new(),
                     _subscriptions: vec![sub],
                 }
             });
