@@ -1929,7 +1929,18 @@ impl LocalWorktree {
         entry_id: ProjectEntryId,
         cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
-        let path = self.entry_for_id(entry_id)?.path.clone();
+        let entry = self.entry_for_id(entry_id)?;
+        // A fully-scanned local directory already has its children in the
+        // snapshot, and the fs watcher keeps them current (scanned dirs stay in
+        // `scanned_dirs`, so `should_scan_directory` keeps watching them).
+        // Revealing such a directory needs no rescan, so skip the scanner
+        // round-trip that otherwise makes expansion wait on the background
+        // scanner. External/symlinked and not-yet-scanned dirs still go through
+        // the scanner.
+        if entry.kind == EntryKind::Dir && !entry.is_external {
+            return Some(Task::ready(Ok(())));
+        }
+        let path = entry.path.clone();
         let mut refresh = self.refresh_entries_for_paths(vec![path]);
         Some(cx.background_spawn(async move {
             refresh.next().await;

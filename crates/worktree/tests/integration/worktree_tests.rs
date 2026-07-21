@@ -1617,6 +1617,74 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_expand_already_scanned_dir_does_no_fs_work(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+
+    let mut big_dir = serde_json::Map::new();
+    for index in 0..20 {
+        big_dir.insert(
+            format!("file_{index}.txt"),
+            json!(format!("content {index}")),
+        );
+    }
+    fs.insert_tree(
+        "/root",
+        json!({
+            "root_file.txt": "",
+            "big_dir": serde_json::Value::Object(big_dir),
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    // A plain non-ignored directory is scanned eagerly at open time, so its
+    // children are already in the snapshot and its kind is `Dir`.
+    let entry_id = tree.read_with(cx, |tree, _| {
+        let entry = tree.entry_for_path(rel_path("big_dir")).unwrap();
+        assert_eq!(entry.kind, EntryKind::Dir);
+        assert!(!entry.is_external);
+        entry.id
+    });
+
+    // Expanding it must be an instant reveal: no scanner round-trip, and no
+    // filesystem work at all.
+    let prev_read_dir_count = fs.read_dir_call_count();
+    let prev_metadata_count = fs.metadata_call_count();
+
+    let expand = tree
+        .update(cx, |tree, cx| tree.expand_entry(entry_id, cx))
+        .expect("expand_entry should return a task for a directory entry");
+    expand.await.unwrap();
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        fs.read_dir_call_count() - prev_read_dir_count,
+        0,
+        "expanding an already-scanned directory must not read any directory"
+    );
+    assert_eq!(
+        fs.metadata_call_count() - prev_metadata_count,
+        0,
+        "expanding an already-scanned directory must not stat the filesystem"
+    );
+}
+
+#[gpui::test]
 async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.background_executor.clone());
