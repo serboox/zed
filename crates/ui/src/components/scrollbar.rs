@@ -910,24 +910,38 @@ struct ScrollbarElement<T: ScrollableHandle> {
 }
 
 impl<T: ScrollableHandle> ScrollbarElement<T> {
-    // This scrollbar is a normal child of the div it decorates (see
-    // `render_scrollbar`), so GPUI's own `overflow_scroll` paint-time offset
-    // shifts it exactly like any other child of that scrollable content.
-    // Counter that shift so the thumb stays pinned to the viewport
-    // regardless of scroll position on either axis -- the same compensation
-    // `UniformListDecoration::compute` already applies for list-based
-    // scrollbars, which sit outside the normal child flow.
+    // Counter GPUI's paint-time `overflow_scroll` shift so the thumb stays
+    // pinned to the viewport regardless of scroll position -- but ONLY when
+    // this scrollbar's wrapper is the element GPUI actually scrolls. A real
+    // `gpui::ScrollHandle` is the only handle that drives a `div`'s
+    // `overflow_scroll` via `track_scroll`; there the scrollbar is a child of
+    // that div and moves with the offset, so the shift must be countered.
     //
-    // This must be read fresh on every `prepaint`/`paint` call rather than
-    // captured once in `Render::render`: a fast scroll can fire several
-    // offset updates on the scrolled content's own element (applied
-    // immediately by GPUI, no entity notify needed) before this entity's
-    // `render` runs again, so a value cached at render time lags behind the
-    // content it's supposed to track -- the visible symptom was the
-    // scrollbar's own track jumping to the wrong position on every such
-    // frame ("shaking") whenever the user scrolled quickly.
+    // Every other handle scrolls its own content while the scrollbar wrapper
+    // stays put: `uniform_list`/`ListState` scroll their items internally, and
+    // the terminal / memory views paint the scrollbar as a decoration over a
+    // non-scrolling container. Countering a shift that never happens would
+    // drift the track with the offset and make a thumb drag feed back on itself
+    // (`compute_click_offset` subtracts this same shifted track origin from the
+    // cursor) -- the visible "bounce". `shifts_scrollbar_with_scroll` tells the
+    // two cases apart.
+    //
+    // When compensation applies it must be read fresh on every
+    // `prepaint`/`paint` call rather than captured once in `Render::render`: a
+    // fast scroll can fire several offset updates on the scrolled content's own
+    // element (applied immediately by GPUI, no entity notify needed) before
+    // this entity's `render` runs again, so a value cached at render time lags
+    // behind the content it's supposed to track -- the visible symptom was the
+    // scrollbar's own track jumping to the wrong position on every such frame
+    // ("shaking") whenever the user scrolled quickly.
     fn origin(&self, cx: &App) -> Point<Pixels> {
-        -self.state.read(cx).scroll_handle().offset()
+        let state = self.state.read(cx);
+        let handle = state.scroll_handle();
+        if handle.shifts_scrollbar_with_scroll() {
+            -handle.offset()
+        } else {
+            Point::default()
+        }
     }
 }
 
@@ -1005,6 +1019,10 @@ impl ScrollableHandle for ScrollHandle {
     fn viewport(&self) -> Bounds<Pixels> {
         self.bounds()
     }
+
+    fn shifts_scrollbar_with_scroll(&self) -> bool {
+        true
+    }
 }
 
 pub trait ScrollableHandle: 'static + Any + Sized + Clone {
@@ -1014,6 +1032,20 @@ pub trait ScrollableHandle: 'static + Any + Sized + Clone {
     fn viewport(&self) -> Bounds<Pixels>;
     fn drag_started(&self) {}
     fn drag_ended(&self) {}
+
+    /// Whether GPUI's `overflow_scroll` shifts this scrollbar element itself at
+    /// paint time, so `ScrollbarElement::origin` must counter that shift to keep
+    /// the thumb pinned to the viewport. Only a real `gpui::ScrollHandle` drives
+    /// a `div`'s `overflow_scroll` (via `track_scroll`), making the scrollbar a
+    /// shifted child -- so only `ScrollHandle` overrides this to `true`. Every
+    /// other handle scrolls its own content (`uniform_list` / `ListState`) or
+    /// paints the scrollbar as a decoration over a non-scrolling container
+    /// (terminal, memory view); the scrollbar never moves, and countering a
+    /// shift that never happens drifts the track and makes a thumb drag feed
+    /// back on itself (the "bounce"). Hence the default is `false`.
+    fn shifts_scrollbar_with_scroll(&self) -> bool {
+        false
+    }
 
     fn scrollable_along(&self, axis: ScrollbarAxis) -> bool {
         self.max_offset().along(axis) > Pixels::ZERO
@@ -1582,7 +1614,7 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use gpui::{TestAppContext, div, point, size};
+    use gpui::{Modifiers, TestAppContext, div, point, size, uniform_list};
 
     use super::*;
 
@@ -1865,5 +1897,129 @@ mod tests {
                 "an always-visible scrollbar must remain visible after a scroll, not just at rest"
             );
         });
+    }
+
+    // A list-backed panel (db_client / project_panel / git_panel /
+    // outline_panel) does NOT scroll its wrapper: the wrapper stays put and the
+    // inner `uniform_list` scrolls its own items via its own `track_scroll`
+    // handle. The scrollbar is therefore never shifted by `overflow_scroll`.
+    // There is deliberately NO `.overflow_scroll()` / `.track_scroll()` on the
+    // wrapper here -- that absence is the whole point of the scenario.
+    struct UniformListDragFrame {
+        handle: UniformListScrollHandle,
+        state: Option<Entity<ScrollbarState<UniformListScrollHandle>>>,
+        row_count: usize,
+    }
+
+    impl Render for UniformListDragFrame {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let parent_id = cx.entity_id();
+            let state = self.state.get_or_insert_with(|| {
+                cx.new(|cx| {
+                    ScrollbarState::new_from_config(
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.handle),
+                        parent_id,
+                        cx,
+                    )
+                })
+            });
+            let wrapper = cx.new(|_| ScrollbarStateWrapper(state.clone()));
+            let handle = self.handle.clone();
+            let row_count = self.row_count;
+
+            div()
+                .id("frame")
+                .w(px(400.))
+                .h(px(300.))
+                .child(render_scrollbar(
+                    wrapper,
+                    div().id("content").size_full().child(
+                        uniform_list("rows", row_count, move |range, _window, _cx| {
+                            range
+                                .map(|i| div().h(px(20.)).child(format!("row {i}")))
+                                .collect::<Vec<_>>()
+                        })
+                        .w_full()
+                        .h(px(300.))
+                        .track_scroll(&handle),
+                    ),
+                    cx,
+                ))
+        }
+    }
+
+    // Real thumb-drag simulation for the non-scrolling-wrapper +
+    // `UniformListScrollHandle` case (the Database Explorer tree). Dragging the
+    // thumb straight down must scroll monotonically downward. Before the fix
+    // `ScrollbarElement::origin` returned `-offset` even though this wrapper
+    // never applies that offset, so every redraw shifted the track by the
+    // offset and the NEXT drag frame's `compute_click_offset` (which subtracts
+    // `track_bounds.origin`) fed back on itself: the recorded offsets
+    // alternated between ~0 and ~-max on successive frames -- the visible
+    // "bounce". The fix makes `origin` a no-op for list handles so the track
+    // stays put and the drag maps monotonically.
+    #[gpui::test]
+    fn uniform_list_thumb_drag_scrolls_monotonically_without_bouncing(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let handle = UniformListScrollHandle::new();
+        let view = cx.add_window(|_window, _cx| UniformListDragFrame {
+            handle: handle.clone(),
+            state: None,
+            row_count: 500,
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
+
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        // Two draws: the first lets the inner `uniform_list` establish its
+        // scroll extent (viewport + max_offset) on the shared handle; the
+        // second lets the scrollbar prepaint a real thumb against it.
+        draw(cx);
+        draw(cx);
+
+        let thumb_center = view
+            .update(cx, |frame, _window, cx| {
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    state
+                        .thumb_for_axis(ScrollbarAxis::Vertical)
+                        .map(|t| t.thumb_bounds.center())
+                })
+            })
+            .unwrap()
+            .expect("vertical thumb should exist before the drag");
+
+        cx.simulate_mouse_down(thumb_center, MouseButton::Left, Modifiers::none());
+        draw(cx);
+
+        let mut offsets = Vec::new();
+        for step in 1..=6 {
+            let position = point(thumb_center.x, thumb_center.y + px(20. * step as f32));
+            cx.simulate_mouse_move(position, Some(MouseButton::Left), Modifiers::none());
+            draw(cx);
+            offsets.push(handle.offset().y);
+        }
+        cx.simulate_mouse_up(thumb_center, MouseButton::Left, Modifiers::none());
+
+        for pair in offsets.windows(2) {
+            assert!(
+                pair[1] < pair[0],
+                "dragging the thumb straight down must scroll monotonically downward -- each \
+                 offset strictly more negative than the last; a reversal is the bounce. \
+                 Recorded offsets: {:?}",
+                offsets
+            );
+        }
+        assert!(
+            *offsets.last().unwrap() < offsets[0],
+            "the final scroll offset must be further down than the first: {:?}",
+            offsets
+        );
     }
 }
