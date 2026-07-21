@@ -48,7 +48,13 @@ use x11rb::{
 };
 
 use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use std::path::PathBuf;
 use strum::IntoEnumIterator;
+
+use crate::linux::{
+    clipboard_item_from_paths, parse_gnome_copied_files, parse_uri_list,
+    serialize_gnome_copied_files, serialize_uri_list,
+};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -78,7 +84,8 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
+        GNOME_COPIED_FILES: b"x-special/gnome-copied-files",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -1019,6 +1026,33 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    pub(crate) fn set_files(
+        &self,
+        paths: &[PathBuf],
+        text: Option<String>,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        let mut data = vec![
+            ClipboardData {
+                bytes: serialize_gnome_copied_files(paths, false).into_bytes(),
+                format: self.inner.atoms.GNOME_COPIED_FILES,
+            },
+            ClipboardData {
+                bytes: serialize_uri_list(paths).into_bytes(),
+                format: self.inner.atoms.URI_LIST,
+            },
+        ];
+        // A plain-text fallback so text editors can paste the paths as text.
+        if let Some(text) = text {
+            data.push(ClipboardData {
+                bytes: text.into_bytes(),
+                format: self.inner.atoms.UTF8_STRING,
+            });
+        }
+        self.inner.write(data, selection, wait)
+    }
+
     pub(crate) fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
         let image_entries = ImageFormat::iter()
             .map(|format| (self.image_format_atom(format), format))
@@ -1033,18 +1067,50 @@ impl Clipboard {
             self.inner.atoms.TEXT_MIME_UNKNOWN,
         ];
 
-        // image formats first, as they are more specific, and read will return the first
-        // format that the contents can be converted to
-        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+        // File targets first, then images (more specific than text), then text.
+        // `read` returns the first format the contents can be converted to; when
+        // the owner does not support a format it is simply skipped, so listing
+        // these extra targets is a no-op for plain text or image contents.
+        let mut format_atoms =
+            Vec::with_capacity(2 + image_entries.len() + text_format_atoms.len());
+        format_atoms.push(self.inner.atoms.GNOME_COPIED_FILES);
+        format_atoms.push(self.inner.atoms.URI_LIST);
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
-        let result = self.inner.read(&format_atoms, selection)?;
+        let mut result = self.inner.read(&format_atoms, selection)?;
 
         log::trace!(
             "read clipboard as format {:?}",
             self.inner.atom_name(result.format)
         );
+
+        if result.format == self.inner.atoms.GNOME_COPIED_FILES {
+            if let Some((_is_cut, paths)) = parse_gnome_copied_files(&result.bytes)
+                && !paths.is_empty()
+            {
+                return Ok(clipboard_item_from_paths(paths));
+            }
+        } else if result.format == self.inner.atoms.URI_LIST {
+            let paths = parse_uri_list(&result.bytes);
+            if !paths.is_empty() {
+                return Ok(clipboard_item_from_paths(paths));
+            }
+        }
+
+        // The owner's first supported target was a file target that yielded no
+        // usable paths. Re-read excluding the file targets so an empty or
+        // malformed file selection still falls back to image/text rather than
+        // returning the raw uri-list bytes as plain text.
+        if result.format == self.inner.atoms.GNOME_COPIED_FILES
+            || result.format == self.inner.atoms.URI_LIST
+        {
+            let mut fallback_atoms =
+                Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+            fallback_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
+            fallback_atoms.extend_from_slice(text_format_atoms);
+            result = self.inner.read(&fallback_atoms, selection)?;
+        }
 
         for (format_atom, image_format) in image_entries {
             if result.format == format_atom {

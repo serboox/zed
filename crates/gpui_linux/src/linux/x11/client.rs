@@ -1731,26 +1731,42 @@ impl LinuxClient for X11Client {
 
     fn write_to_primary(&self, item: gpui::ClipboardItem) {
         let state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
+        let write_result = if let Some(paths) = crate::linux::external_paths(&item) {
+            state.clipboard.set_files(
+                paths,
+                item.text(),
+                clipboard::ClipboardKind::Primary,
+                clipboard::WaitConfig::None,
+            )
+        } else {
+            state.clipboard.set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
                 clipboard::ClipboardKind::Primary,
                 clipboard::WaitConfig::None,
             )
+        };
+        write_result
             .context("X11 Failed to write to clipboard (primary)")
             .log_with_level(log::Level::Debug);
     }
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
         let mut state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
+        let write_result = if let Some(paths) = crate::linux::external_paths(&item) {
+            state.clipboard.set_files(
+                paths,
+                item.text(),
+                clipboard::ClipboardKind::Clipboard,
+                clipboard::WaitConfig::None,
+            )
+        } else {
+            state.clipboard.set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
             )
+        };
+        write_result
             .context("X11: Failed to write to clipboard (clipboard)")
             .log_with_level(log::Level::Debug);
         state.clipboard_item.replace(item);

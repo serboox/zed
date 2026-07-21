@@ -151,6 +151,10 @@ pub struct ProjectPanel {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
     clipboard: Option<ClipboardEntry>,
+    // Absolute paths last written to the system clipboard by our own copy/cut.
+    // Used to tell an internal copy/cut (which must honor cut-as-move) apart
+    // from a genuinely external file copy pasted in as new files.
+    system_clipboard_paths: Option<BTreeSet<PathBuf>>,
     _dragged_entry_destination: Option<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
@@ -846,6 +850,7 @@ impl ProjectPanel {
                 context_menu: None,
                 filename_editor,
                 clipboard: None,
+                system_clipboard_paths: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
                 diagnostics: Default::default(),
@@ -3296,7 +3301,12 @@ impl ProjectPanel {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
+        // Only treat the clipboard as an external file drop when it did not
+        // originate from this panel's own copy/cut. Otherwise fall through to
+        // the internal clipboard path below, which preserves cut-as-move.
+        if let Some(external_paths) = self.external_paths_from_system_clipboard(cx)
+            && !self.system_clipboard_is_own_paths(external_paths.paths())
+        {
             let target_entry_id = self
                 .selection
                 .map(|s| s.entry_id)
@@ -4057,26 +4067,38 @@ impl ProjectPanel {
         Some(worktree.absolutize(&root_entry.path))
     }
 
-    fn write_entries_to_system_clipboard(&self, entries: &BTreeSet<SelectedEntry>, cx: &mut App) {
+    fn write_entries_to_system_clipboard(
+        &mut self,
+        entries: &BTreeSet<SelectedEntry>,
+        cx: &mut App,
+    ) {
         let project = self.project.read(cx);
-        let paths: Vec<String> = entries
+        let paths: Vec<PathBuf> = entries
             .iter()
             .filter_map(|entry| {
                 let worktree = project.worktree_for_id(entry.worktree_id, cx)?;
                 let worktree = worktree.read(cx);
                 let worktree_entry = worktree.entry_for_id(entry.entry_id)?;
-                Some(
-                    worktree
-                        .abs_path()
-                        .join(worktree_entry.path.as_std_path())
-                        .to_string_lossy()
-                        .to_string(),
-                )
+                Some(worktree.abs_path().join(worktree_entry.path.as_std_path()))
             })
             .collect();
-        if !paths.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+        if paths.is_empty() {
+            self.system_clipboard_paths = None;
+            return;
         }
+        let text = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.system_clipboard_paths = Some(paths.iter().cloned().collect());
+        let clipboard_item = ClipboardItem {
+            entries: vec![
+                GpuiClipboardEntry::ExternalPaths(ExternalPaths(paths.into_iter().collect())),
+                GpuiClipboardEntry::from(text),
+            ],
+        };
+        cx.write_to_clipboard(clipboard_item);
     }
 
     fn external_paths_from_system_clipboard(&self, cx: &App) -> Option<ExternalPaths> {
@@ -4089,6 +4111,19 @@ impl ProjectPanel {
             }
         }
         None
+    }
+
+    /// True when the given system-clipboard paths are exactly what this panel
+    /// last wrote via its own copy/cut. Copying files also writes them to the
+    /// system clipboard as `ExternalPaths`, so this distinguishes an internal
+    /// copy/cut (which must honor cut-as-move and live entry-id resolution)
+    /// from a genuinely external file copy pasted in as new files.
+    fn system_clipboard_is_own_paths(&self, paths: &[PathBuf]) -> bool {
+        self.clipboard.is_some()
+            && self
+                .system_clipboard_paths
+                .as_ref()
+                .is_some_and(|own| *own == paths.iter().cloned().collect::<BTreeSet<PathBuf>>())
     }
 
     fn has_pasteable_content(&self, cx: &App) -> bool {

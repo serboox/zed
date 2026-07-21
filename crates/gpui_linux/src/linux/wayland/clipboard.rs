@@ -11,8 +11,10 @@ use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
-    WaylandClientStatePtr,
+    GNOME_COPIED_FILES_MIME_TYPE, WaylandClientStatePtr, clipboard_item_from_paths, external_paths,
+    parse_gnome_copied_files, parse_uri_list,
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
+    serialize_gnome_copied_files, serialize_uri_list,
 };
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 
@@ -136,6 +138,25 @@ impl<T: ReceiveData> DataOffer<T> {
         }
         None
     }
+
+    fn read_files(&self, connection: &Connection) -> Option<ClipboardItem> {
+        if self.has_mime_type(GNOME_COPIED_FILES_MIME_TYPE)
+            && let Some(bytes) = self.read_bytes(connection, GNOME_COPIED_FILES_MIME_TYPE)
+            && let Some((_is_cut, paths)) = parse_gnome_copied_files(&bytes)
+            && !paths.is_empty()
+        {
+            return Some(clipboard_item_from_paths(paths));
+        }
+        if self.has_mime_type(FILE_LIST_MIME_TYPE)
+            && let Some(bytes) = self.read_bytes(connection, FILE_LIST_MIME_TYPE)
+        {
+            let paths = parse_uri_list(&bytes);
+            if !paths.is_empty() {
+                return Some(clipboard_item_from_paths(paths));
+            }
+        }
+        None
+    }
 }
 
 impl Clipboard {
@@ -180,19 +201,15 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_internal(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = contents_bytes_for_mime(self.contents.as_ref(), &mime_type) {
+            self.send_internal(fd, bytes);
         }
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
-            .primary_contents
-            .as_ref()
-            .and_then(|contents| contents.text())
-        {
-            self.send_internal(fd, text.as_bytes().to_owned());
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = contents_bytes_for_mime(self.primary_contents.as_ref(), &mime_type) {
+            self.send_internal(fd, bytes);
         }
     }
 
@@ -207,7 +224,8 @@ impl Clipboard {
         }
 
         let item = offer
-            .read_text(&self.connection)
+            .read_files(&self.connection)
+            .or_else(|| offer.read_text(&self.connection))
             .or_else(|| offer.read_image(&self.connection))?;
 
         self.cached_read = Some(item.clone());
@@ -225,7 +243,8 @@ impl Clipboard {
         }
 
         let item = offer
-            .read_text(&self.connection)
+            .read_files(&self.connection)
+            .or_else(|| offer.read_text(&self.connection))
             .or_else(|| offer.read_image(&self.connection))?;
 
         self.cached_primary_read = Some(item.clone());
@@ -260,4 +279,17 @@ impl Clipboard {
             )
             .unwrap();
     }
+}
+
+fn contents_bytes_for_mime(contents: Option<&ClipboardItem>, mime_type: &str) -> Option<Vec<u8>> {
+    let contents = contents?;
+    if mime_type == GNOME_COPIED_FILES_MIME_TYPE {
+        let paths = external_paths(contents)?;
+        return Some(serialize_gnome_copied_files(paths, false).into_bytes());
+    }
+    if mime_type == FILE_LIST_MIME_TYPE {
+        let paths = external_paths(contents)?;
+        return Some(serialize_uri_list(paths).into_bytes());
+    }
+    contents.text().map(String::into_bytes)
 }

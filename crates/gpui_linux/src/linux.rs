@@ -1,3 +1,5 @@
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod clipboard_files;
 mod dispatcher;
 mod headless;
 mod keyboard;
@@ -12,6 +14,8 @@ mod x11;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod xdg_desktop_portal;
 
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) use clipboard_files::*;
 pub use dispatcher::*;
 pub(crate) use headless::*;
 pub(crate) use keyboard::*;
