@@ -17,6 +17,7 @@ pub mod path_link;
 mod persistence;
 pub mod searchable;
 pub mod security_modal;
+pub mod session_restore_indicator;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
@@ -1409,6 +1410,13 @@ pub struct Workspace {
     scheduled_tasks: Vec<Task<()>>,
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
+    /// Number of in-flight session restores (deserializing the saved
+    /// editors/panels). A counter, not a bool, so overlapping restores for the
+    /// same workspace keep the "Restoring session" indicator up until the last
+    /// one finishes -- otherwise the first to complete would hide it while
+    /// another is still running. A restoring window must not be mistaken for an
+    /// empty first-run window.
+    session_restore_count: usize,
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
@@ -1863,6 +1871,7 @@ impl Workspace {
             scheduled_tasks: Vec::new(),
             last_open_dock_positions: Vec::new(),
             removing: false,
+            session_restore_count: 0,
             sidebar_focus_handle: None,
             multi_workspace,
             active_workspace_id: None,
@@ -8058,6 +8067,11 @@ impl Workspace {
         self.zoomed.as_ref()
     }
 
+    /// True while a saved session is still being restored into this workspace.
+    pub fn is_restoring_session(&self) -> bool {
+        self.session_restore_count > 0
+    }
+
     pub fn activate_next_window(&mut self, cx: &mut Context<Self>) {
         let Some(current_window_id) = cx.active_window().map(|a| a.window_id()) else {
             return;
@@ -8432,7 +8446,21 @@ fn open_items(
         let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
 
         if let Some(restored_items) = restored_items {
-            let restored_items = restored_items.await?;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.session_restore_count += 1;
+                    cx.notify();
+                })
+                .ok();
+            let restored_items = restored_items.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.session_restore_count =
+                        workspace.session_restore_count.saturating_sub(1);
+                    cx.notify();
+                })
+                .ok();
+            let restored_items = restored_items?;
 
             let restored_project_paths = restored_items
                 .iter()
