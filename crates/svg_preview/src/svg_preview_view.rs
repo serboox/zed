@@ -9,7 +9,9 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
+use theme::{Theme, ThemeRegistry};
 use ui::{Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
@@ -18,11 +20,55 @@ use crate::{OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
 const MIN_SVG_ZOOM: f32 = 0.1;
 const MAX_SVG_ZOOM: f32 = 10.0;
 
+const ONE_LIGHT_THEME: &str = "One Light";
+const ONE_DARK_THEME: &str = "One Dark";
+
+/// Per-view backdrop theme for a preview. It affects only the chrome of this
+/// single view, never the global application theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewerThemeMode {
+    #[default]
+    Match,
+    Light,
+    Dark,
+}
+
+impl ViewerThemeMode {
+    fn next(self) -> Self {
+        match self {
+            ViewerThemeMode::Match => ViewerThemeMode::Light,
+            ViewerThemeMode::Light => ViewerThemeMode::Dark,
+            ViewerThemeMode::Dark => ViewerThemeMode::Match,
+        }
+    }
+
+    fn resolve(self, cx: &App) -> Arc<Theme> {
+        let name = match self {
+            ViewerThemeMode::Match => return cx.theme().clone(),
+            ViewerThemeMode::Light => ONE_LIGHT_THEME,
+            ViewerThemeMode::Dark => ONE_DARK_THEME,
+        };
+        ThemeRegistry::global(cx)
+            .get(name)
+            .log_err()
+            .unwrap_or_else(|| cx.theme().clone())
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            ViewerThemeMode::Match => "Backdrop theme: follow global (click for One Light)",
+            ViewerThemeMode::Light => "Backdrop theme: One Light (click for One Dark)",
+            ViewerThemeMode::Dark => "Backdrop theme: One Dark (click to follow global)",
+        }
+    }
+}
+
 pub struct SvgPreviewView {
     focus_handle: FocusHandle,
     buffer: Option<Entity<Buffer>>,
     current_svg: Option<Result<Arc<RenderImage>, SharedString>>,
     zoom_level: f32,
+    theme_mode: ViewerThemeMode,
     _refresh: Task<()>,
     _buffer_subscription: Option<Subscription>,
     _workspace_subscription: Option<Subscription>,
@@ -64,6 +110,7 @@ impl SvgPreviewView {
                 buffer,
                 current_svg: None,
                 zoom_level: 1.0,
+                theme_mode: ViewerThemeMode::default(),
                 _buffer_subscription: subscription,
                 _workspace_subscription: workspace_subscription,
                 _refresh: Task::ready(()),
@@ -165,6 +212,15 @@ impl SvgPreviewView {
 
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.set_zoom(self.zoom_level / 1.2, cx);
+    }
+
+    fn resolved_theme(&self, cx: &App) -> Arc<Theme> {
+        self.theme_mode.resolve(cx)
+    }
+
+    fn cycle_theme_mode(&mut self, cx: &mut Context<Self>) {
+        self.theme_mode = self.theme_mode.next();
+        cx.notify();
     }
 
     fn set_current(
@@ -324,13 +380,19 @@ impl Render for SvgPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let zoom = self.zoom_level;
         let has_image = matches!(self.current_svg, Some(Ok(_)));
+        let theme = self.resolved_theme(cx);
+        let colors = theme.colors();
+        let editor_background = colors.editor_background;
+        let border = colors.border;
+        let elevated_surface_background = colors.elevated_surface_background;
+        let theme_tooltip = self.theme_mode.tooltip();
         v_flex()
             .id("SvgPreview")
             .key_context("SvgPreview")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .relative()
-            .bg(cx.theme().colors().editor_background)
+            .bg(editor_background)
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .child(
                 div()
@@ -368,8 +430,14 @@ impl Render for SvgPreviewView {
                         .p_1()
                         .rounded_md()
                         .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .bg(cx.theme().colors().elevated_surface_background)
+                        .border_color(border)
+                        .bg(elevated_surface_background)
+                        .child(
+                            IconButton::new("svg-theme-toggle", IconName::Screen)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(theme_tooltip))
+                                .on_click(cx.listener(|this, _, _, cx| this.cycle_theme_mode(cx))),
+                        )
                         .child(
                             IconButton::new("svg-zoom-out", IconName::Dash)
                                 .icon_size(IconSize::Small)
@@ -420,4 +488,60 @@ impl Item for SvgPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, hsla};
+
+    #[test]
+    fn test_viewer_theme_mode_cycles() {
+        assert_eq!(ViewerThemeMode::Match.next(), ViewerThemeMode::Light);
+        assert_eq!(ViewerThemeMode::Light.next(), ViewerThemeMode::Dark);
+        assert_eq!(ViewerThemeMode::Dark.next(), ViewerThemeMode::Match);
+    }
+
+    #[gpui::test]
+    fn test_viewer_theme_mode_resolves_named_backdrop(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+
+            let base_theme = ViewerThemeMode::Match.resolve(cx);
+            let base_background = base_theme.colors().editor_background;
+            let dark_background = hsla(0.62, 0.25, 0.12, 1.0);
+            let light_background = hsla(0.10, 0.30, 0.94, 1.0);
+
+            let mut dark = (*base_theme).clone();
+            dark.name = ONE_DARK_THEME.into();
+            dark.styles.colors.editor_background = dark_background;
+            let mut light = (*base_theme).clone();
+            light.name = ONE_LIGHT_THEME.into();
+            light.styles.colors.editor_background = light_background;
+            ThemeRegistry::global(cx).insert_themes([dark, light]);
+
+            assert_ne!(dark_background, light_background);
+            assert_ne!(dark_background, base_background);
+            assert_ne!(light_background, base_background);
+
+            assert_eq!(
+                ViewerThemeMode::Match
+                    .resolve(cx)
+                    .colors()
+                    .editor_background,
+                base_background
+            );
+            assert_eq!(
+                ViewerThemeMode::Dark.resolve(cx).colors().editor_background,
+                dark_background
+            );
+            assert_eq!(
+                ViewerThemeMode::Light
+                    .resolve(cx)
+                    .colors()
+                    .editor_background,
+                light_background
+            );
+        });
+    }
 }
