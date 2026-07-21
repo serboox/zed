@@ -3759,6 +3759,7 @@ fn run_sql_from_editor(
 pub struct DatabasePanel {
     focus_handle: FocusHandle,
     store: Entity<DatabaseStore>,
+    position: DockPosition,
     workspace: WeakEntity<Workspace>,
     history_expanded: bool,
     table_filter_editor: Entity<Editor>,
@@ -3824,6 +3825,24 @@ struct SerializedDatabasePanel {
     table_triggers_expanded: HashSet<(ConnectionId, String, String)>,
     #[serde(default)]
     server_objects_expanded: HashSet<ConnectionId>,
+    #[serde(default)]
+    dock_position: Option<String>,
+}
+
+fn dock_position_to_str(position: DockPosition) -> &'static str {
+    match position {
+        DockPosition::Left => "left",
+        DockPosition::Right => "right",
+        DockPosition::Bottom => "bottom",
+    }
+}
+
+fn dock_position_from_str(value: Option<&str>) -> DockPosition {
+    match value {
+        Some("right") => DockPosition::Right,
+        Some("bottom") => DockPosition::Bottom,
+        _ => DockPosition::Left,
+    }
 }
 
 /// Background native-dump state owned by the panel: the visible task list for the
@@ -4669,6 +4688,7 @@ impl DatabasePanel {
                     context_menu: None,
                     tree_scroll_handle: ScrollHandle::new(),
                     initial_collapse_pending,
+                    position: dock_position_from_str(restored.dock_position.as_deref()),
                     pending_tree_state_serialization: Task::ready(None),
                     _subscriptions: vec![
                         store_subscription,
@@ -4719,6 +4739,7 @@ impl DatabasePanel {
             table_fks_expanded: self.table_fks_expanded.clone(),
             table_triggers_expanded: self.table_triggers_expanded.clone(),
             server_objects_expanded: self.server_objects_expanded.clone(),
+            dock_position: Some(dock_position_to_str(self.position).to_string()),
         };
         let kvp = KeyValueStore::global(cx);
         self.pending_tree_state_serialization = cx.background_spawn(
@@ -10193,19 +10214,22 @@ impl Panel for DatabasePanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Left
+        self.position
     }
 
-    fn position_is_valid(&self, _position: DockPosition) -> bool {
-        true
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
     fn set_position(
         &mut self,
-        _position: DockPosition,
+        position: DockPosition,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        self.position = position;
+        self.serialize_tree_state(cx);
+        cx.notify();
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
@@ -11868,6 +11892,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12054,6 +12079,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12294,6 +12320,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12490,6 +12517,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12658,6 +12686,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12844,6 +12873,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -12981,6 +13011,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -13092,6 +13123,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -13214,6 +13246,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -13379,6 +13412,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -13561,6 +13595,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -13644,6 +13679,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -13905,6 +13941,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -13989,6 +14026,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -14098,6 +14136,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -14330,6 +14369,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -14453,6 +14493,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -14570,6 +14611,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -14672,6 +14714,7 @@ mod tests {
                 selected_entity: None,
                 initial_collapse_pending: false,
                 pending_tree_state_serialization: Task::ready(None),
+                position: DockPosition::Left,
                 dump: DumpUiState::default(),
                 export: ExportUiState::default(),
                 context_menu: None,
@@ -15781,6 +15824,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -15877,6 +15921,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -16024,6 +16069,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
@@ -17793,6 +17839,7 @@ mod tests {
                     selected_entity: None,
                     initial_collapse_pending: false,
                     pending_tree_state_serialization: Task::ready(None),
+                    position: DockPosition::Left,
                     dump: DumpUiState::default(),
                     export: ExportUiState::default(),
                     context_menu: None,
