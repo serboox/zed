@@ -4990,7 +4990,61 @@ impl BackgroundScanner {
             ignore_stack.repo_root = Some(job.abs_path.clone());
         }
 
-        for child_abs_path in child_paths {
+        // Fetch child metadata concurrently. Statting thousands of children
+        // one at a time pins a single core and starves the shared executor;
+        // gathering them in one batch turns N sequential syscalls into one
+        // concurrent round. Symlink targets are canonicalized in the same
+        // batch. Only children the sequential pass would stat are fetched, so
+        // the resulting entry set is unchanged, and `.gitignore`/`.git` (moved
+        // to the front by `swap_to_front`) still have their ignore-stack
+        // effects applied in order in the sequential pass below, before any
+        // sibling's ignore status is computed.
+        // Bound the in-flight stat/canonicalize jobs so a directory with tens of
+        // thousands of children doesn't flood the shared background executor.
+        // `buffered` preserves order, so the sequential pass below still sees
+        // children in `child_paths` order, keeping the ignore-stack sequencing.
+        const MAX_CONCURRENT_CHILD_STATS: usize = 64;
+        // Precompute owned inputs so the buffered futures borrow neither `self`
+        // nor `child_paths`: `buffered` needs Send + 'static futures, unlike
+        // `join_all`. `is_path_excluded` is evaluated synchronously here.
+        let fs = self.fs.clone();
+        let is_external = job.is_external;
+        let stat_inputs: Vec<(PathBuf, bool)> = child_paths
+            .iter()
+            .map(|child_abs_path| {
+                let should_stat = child_abs_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| RelPath::unix(name).ok())
+                    .is_some_and(|name| !self.settings.is_path_excluded(&job.path.join(name)));
+                (child_abs_path.clone(), should_stat)
+            })
+            .collect();
+        let gathered_child_metadata: Vec<_> = stream::iter(stat_inputs.into_iter().map(
+            |(child_abs_path, should_stat)| {
+                let fs = fs.clone();
+                async move {
+                    if !should_stat {
+                        return (None, None);
+                    }
+                    let metadata = fs.metadata(&child_abs_path).await;
+                    let symlink_canonical_path = match &metadata {
+                        Ok(Some(metadata)) if !is_external && metadata.is_symlink => {
+                            Some(fs.canonicalize(&child_abs_path).await)
+                        }
+                        _ => None,
+                    };
+                    (Some(metadata), symlink_canonical_path)
+                }
+            },
+        ))
+        .buffered(MAX_CONCURRENT_CHILD_STATS)
+        .collect()
+        .await;
+
+        for (child_abs_path, (child_metadata_result, symlink_canonical_path)) in
+            child_paths.into_iter().zip(gathered_child_metadata)
+        {
             let child_abs_path: Arc<Path> = child_abs_path.into();
             let child_name = child_abs_path.file_name().unwrap();
             let Some(child_path) = child_name
@@ -5045,10 +5099,10 @@ impl BackgroundScanner {
                 continue;
             }
 
-            let child_metadata = match self.fs.metadata(&child_abs_path).await {
-                Ok(Some(metadata)) => metadata,
-                Ok(None) => continue,
-                Err(err) => {
+            let child_metadata = match child_metadata_result {
+                Some(Ok(Some(metadata))) => metadata,
+                Some(Ok(None)) | None => continue,
+                Some(Err(err)) => {
                     log::error!("error processing {:?}: {err:#}", child_abs_path.display());
                     continue;
                 }
@@ -5065,12 +5119,13 @@ impl BackgroundScanner {
             if job.is_external {
                 child_entry.is_external = true;
             } else if child_metadata.is_symlink {
-                let canonical_path = match self.fs.canonicalize(&child_abs_path).await {
-                    Ok(path) => path,
-                    Err(err) => {
+                let canonical_path = match symlink_canonical_path {
+                    Some(Ok(path)) => path,
+                    Some(Err(err)) => {
                         log::error!("error reading target of symlink {child_abs_path:?}: {err:#}",);
                         continue;
                     }
+                    None => continue,
                 };
 
                 // lazily canonicalize the root path in order to determine if

@@ -171,6 +171,12 @@ pub struct ProjectPanel {
     undo_manager: UndoManager,
     state: State,
     pending_expansions: HashSet<ProjectEntryId>,
+    // Coalesces background refresh triggers (worktree/git events). A burst of
+    // such events delivered in one effect cycle rebuilds the visible entries
+    // once instead of once per event.
+    pending_visible_entries_refresh: bool,
+    #[cfg(test)]
+    update_visible_entries_run_count: usize,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -667,8 +673,7 @@ impl ProjectPanel {
                     GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
                     | GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_) => {
-                        this.update_visible_entries(None, false, false, window, cx);
-                        cx.notify();
+                        this.schedule_visible_entries_refresh(window, cx);
                     }
                     _ => {}
                 },
@@ -728,14 +733,12 @@ impl ProjectPanel {
                     }
                     project::Event::WorktreeRemoved(id) => {
                         this.state.expanded_dir_ids.remove(id);
-                        this.update_visible_entries(None, false, false, window, cx);
-                        cx.notify();
+                        this.schedule_visible_entries_refresh(window, cx);
                     }
                     project::Event::WorktreeUpdatedEntries(_, _)
                     | project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
-                        this.update_visible_entries(None, false, false, window, cx);
-                        cx.notify();
+                        this.schedule_visible_entries_refresh(window, cx);
                     }
                     project::Event::ExpandedAllForEntry(worktree_id, entry_id) => {
                         this.synchronously_expand_all_directories(
@@ -875,6 +878,9 @@ impl ProjectPanel {
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
                 pending_expansions: HashSet::default(),
+                pending_visible_entries_refresh: false,
+                #[cfg(test)]
+                update_visible_entries_run_count: 0,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -4218,6 +4224,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(test)]
+        {
+            self.update_visible_entries_run_count += 1;
+        }
         let now = Instant::now();
         let settings = ProjectPanelSettings::get_global(cx);
         let auto_collapse_dirs = settings.auto_fold_dirs;
@@ -4531,6 +4541,28 @@ impl ProjectPanel {
                 || self.update_visible_entries_task.focus_filename_editor,
             autoscroll: autoscroll || self.update_visible_entries_task.autoscroll,
         };
+    }
+
+    /// Requests a full rebuild of the visible entries in response to a
+    /// background event (worktree entries changed, git statuses changed, etc.).
+    /// Triggers delivered in the same effect cycle are collapsed into a single
+    /// rebuild: the first schedules a foreground task, and while that task is
+    /// pending, further triggers are dropped. The task reads the latest project
+    /// state when it runs, so no needed refresh is lost.
+    fn schedule_visible_entries_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_visible_entries_refresh {
+            return;
+        }
+        self.pending_visible_entries_refresh = true;
+        cx.spawn_in(window, async move |this, cx| {
+            this.update_in(cx, |this, window, cx| {
+                this.pending_visible_entries_refresh = false;
+                this.update_visible_entries(None, false, false, window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn expand_entry(
@@ -7679,3 +7711,62 @@ fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)>
 #[cfg(test)]
 mod project_panel_tests;
 mod tests;
+
+#[cfg(test)]
+mod refresh_coalescing_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[gpui::test]
+    async fn coalesces_background_refresh_events(cx: &mut gpui::TestAppContext) {
+        crate::project_panel_tests::init_test(cx);
+
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "a": { "b": "" } })).await;
+        let project = project::Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, ProjectPanel::new);
+        cx.run_until_parked();
+
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        // Settle any refresh triggered by the initial scan, then take a
+        // baseline of how many times the visible entries have been rebuilt.
+        cx.run_until_parked();
+        let baseline = panel.read_with(cx, |panel, _| panel.update_visible_entries_run_count);
+
+        // Publish a worktree-entries update and a git statuses update, as a
+        // folder expand does. The spawned coalescing task is only polled during
+        // `run_until_parked`, so both events land while one refresh is pending
+        // and must collapse into a single rebuild.
+        project.update(cx, |_, cx| {
+            let changes: worktree::UpdatedEntriesSet = Arc::from(Vec::new());
+            cx.emit(project::Event::WorktreeUpdatedEntries(worktree_id, changes));
+        });
+        git_store.update(cx, |_, cx| {
+            cx.emit(project::git_store::GitStoreEvent::RepositoryUpdated(
+                project::git_store::RepositoryId(0),
+                project::git_store::RepositoryEvent::StatusesChanged,
+                false,
+            ));
+        });
+        cx.run_until_parked();
+
+        let rebuilds =
+            panel.read_with(cx, |panel, _| panel.update_visible_entries_run_count) - baseline;
+        assert_eq!(
+            rebuilds, 1,
+            "two background refresh events in one cycle should trigger exactly one rebuild"
+        );
+    }
+}
