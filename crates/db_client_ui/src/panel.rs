@@ -2444,49 +2444,78 @@ const DB_SQL_HIGHLIGHT_KEYS: [HighlightKey; 9] = [
     HighlightKey::DbSqlVariable,
 ];
 
-/// Re-colors `editor` from our resilient tokenizer on open and after every
-/// edit. Whole-buffer re-tokenization is cheap (a linear scan) at console
-/// sizes; per-statement incremental re-tokenization is a possible future
-/// optimization if very large buffers ever prove slow.
+const SQL_HIGHLIGHT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Above this buffer size the resilient tokenizer is skipped. Re-coloring a
+/// large paste (e.g. a multi-row INSERT) rebuilds thousands of highlight
+/// anchors that the editor then intersects on every render frame, which stalls
+/// typing and scrolling; tree-sitter still provides baseline coloring past this
+/// point.
+const SQL_HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
+
+/// Re-colors `editor` from our resilient tokenizer on open and, debounced,
+/// after edits. Whole-buffer re-tokenization is a linear scan, but building the
+/// per-token anchors and highlight ranges is not free at large sizes, so edits
+/// coalesce through a timer and buffers past `SQL_HIGHLIGHT_MAX_BYTES` fall back
+/// to tree-sitter.
 fn install_sql_highlighting(editor: Entity<Editor>, driver: DatabaseDriver, cx: &mut App) {
     if !SQL_CONSOLE_CUSTOM_HIGHLIGHT {
         return;
     }
     apply_sql_highlights(&editor, driver, cx);
+    let pending_highlight: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
     cx.subscribe(&editor, move |editor, event, cx| {
-        if matches!(event, EditorEvent::BufferEdited) {
-            apply_sql_highlights(&editor, driver, cx);
+        if !matches!(event, EditorEvent::BufferEdited) {
+            return;
         }
+        let task = cx.spawn(async move |cx| {
+            cx.background_executor().timer(SQL_HIGHLIGHT_DEBOUNCE).await;
+            editor.update(cx, |editor, cx| {
+                apply_sql_highlights_inner(editor, driver, cx);
+            });
+        });
+        *pending_highlight.borrow_mut() = Some(task);
     })
     .detach();
 }
 
 fn apply_sql_highlights(editor: &Entity<Editor>, driver: DatabaseDriver, cx: &mut App) {
     editor.update(cx, |editor, cx| {
-        let text = editor.text(cx);
-        let tokens = crate::sql_highlight::highlight_tokens(&text, driver);
-        for key in DB_SQL_HIGHLIGHT_KEYS {
-            editor.clear_highlights(key, cx);
-        }
-        if tokens.is_empty() {
-            return;
-        }
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let syntax = cx.theme().syntax().clone();
-        let default_text = cx.theme().colors().text;
-
-        let mut ranges_by_kind: HashMap<crate::sql_highlight::SqlTokenKind, Vec<_>> =
-            HashMap::default();
-        for token in tokens {
-            let range = snapshot.anchor_before(editor::MultiBufferOffset(token.range.start))
-                ..snapshot.anchor_after(editor::MultiBufferOffset(token.range.end));
-            ranges_by_kind.entry(token.kind).or_default().push(range);
-        }
-        for (kind, ranges) in ranges_by_kind {
-            let (key, style) = sql_highlight_style(kind, &syntax, default_text);
-            editor.highlight_text(key, ranges, style, cx);
-        }
+        apply_sql_highlights_inner(editor, driver, cx);
     });
+}
+
+fn apply_sql_highlights_inner(
+    editor: &mut Editor,
+    driver: DatabaseDriver,
+    cx: &mut Context<Editor>,
+) {
+    for key in DB_SQL_HIGHLIGHT_KEYS {
+        editor.clear_highlights(key, cx);
+    }
+    let text = editor.text(cx);
+    if text.len() > SQL_HIGHLIGHT_MAX_BYTES {
+        return;
+    }
+    let tokens = crate::sql_highlight::highlight_tokens(&text, driver);
+    if tokens.is_empty() {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let syntax = cx.theme().syntax().clone();
+    let default_text = cx.theme().colors().text;
+
+    let mut ranges_by_kind: HashMap<crate::sql_highlight::SqlTokenKind, Vec<_>> =
+        HashMap::default();
+    for token in tokens {
+        let range = snapshot.anchor_before(editor::MultiBufferOffset(token.range.start))
+            ..snapshot.anchor_after(editor::MultiBufferOffset(token.range.end));
+        ranges_by_kind.entry(token.kind).or_default().push(range);
+    }
+    for (kind, ranges) in ranges_by_kind {
+        let (key, style) = sql_highlight_style(kind, &syntax, default_text);
+        editor.highlight_text(key, ranges, style, cx);
+    }
 }
 
 fn sql_highlight_style(
@@ -15148,8 +15177,10 @@ mod tests {
 
         // Paste the malformed SQL after install so highlighting is driven by the
         // real BufferEdited subscription a user's edit goes through, not by the
-        // one-shot apply on open.
+        // one-shot apply on open. The subscription is debounced, so wait out the
+        // timer the way the running app does before reading the highlights.
         editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        cx.executor().advance_clock(SQL_HIGHLIGHT_DEBOUNCE);
         cx.run_until_parked();
 
         editor.update(cx, |editor, cx| {
@@ -15262,6 +15293,175 @@ mod tests {
                 .len()),
             1,
             "an unknown table in a cached database must surface as a buffer diagnostic"
+        );
+    }
+
+    // A large paste (e.g. a multi-row INSERT) must not be custom-highlighted:
+    // re-tokenizing the whole buffer and rebuilding thousands of highlight
+    // anchors on every edit and render frame is what stalls the editor. Past
+    // SQL_HIGHLIGHT_MAX_BYTES we fall back to tree-sitter, so a small buffer
+    // still gets keyword highlights while an oversized one gets none.
+    #[gpui::test]
+    async fn sql_highlighting_skips_oversized_buffers(cx: &mut TestAppContext) {
+        let mut config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            auto_connect: false,
+            database: Some("db".to_string()),
+            ..Default::default()
+        };
+        config.driver = db_client::DatabaseDriver::MySQL;
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let small = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("SELECT 1", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            })
+        });
+
+        let big_text = "SELECT 1;\n".repeat(SQL_HIGHLIGHT_MAX_BYTES / 10 + 1000);
+        assert!(big_text.len() > SQL_HIGHLIGHT_MAX_BYTES);
+        let big = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local(big_text, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            })
+        });
+
+        cx.update(|_window, cx| {
+            install_db_editor_features(small.clone(), store.downgrade(), workspace.downgrade(), cx);
+            install_db_editor_features(big.clone(), store.downgrade(), workspace.downgrade(), cx);
+        });
+        cx.executor().advance_clock(SQL_HIGHLIGHT_DEBOUNCE);
+        cx.run_until_parked();
+
+        let small_keywords = small.update(cx, |editor, cx| {
+            editor
+                .text_highlights(HighlightKey::DbSqlKeyword, cx)
+                .map(|(_, ranges)| ranges.len())
+                .unwrap_or(0)
+        });
+        let big_keywords = big.update(cx, |editor, cx| {
+            editor
+                .text_highlights(HighlightKey::DbSqlKeyword, cx)
+                .map(|(_, ranges)| ranges.len())
+                .unwrap_or(0)
+        });
+
+        assert!(
+            small_keywords > 0,
+            "a small console must still get custom keyword highlights"
+        );
+        assert_eq!(
+            big_keywords, 0,
+            "a buffer past SQL_HIGHLIGHT_MAX_BYTES must fall back to tree-sitter (no custom highlights)"
+        );
+    }
+
+    // Highlighting runs debounced off edits, never synchronously on the edit
+    // itself, so a large paste does not re-tokenize the whole buffer on the very
+    // keystroke that produced it.
+    #[gpui::test]
+    async fn sql_highlighting_debounces_edits(cx: &mut TestAppContext) {
+        let mut config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            auto_connect: false,
+            database: Some("db".to_string()),
+            ..Default::default()
+        };
+        config.driver = db_client::DatabaseDriver::MySQL;
+        let connection_id = config.id;
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.update_in(cx, |_workspace, window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("12345", cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            })
+        });
+
+        cx.update(|_window, cx| {
+            install_db_editor_features(
+                editor.clone(),
+                store.downgrade(),
+                workspace.downgrade(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let keyword_count = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.update(cx, |editor, cx| {
+                editor
+                    .text_highlights(HighlightKey::DbSqlKeyword, cx)
+                    .map(|(_, ranges)| ranges.len())
+                    .unwrap_or(0)
+            })
+        };
+
+        assert_eq!(
+            keyword_count(&editor, cx),
+            0,
+            "the initial buffer has no SQL keyword to highlight"
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("SELECT 12345", window, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            keyword_count(&editor, cx),
+            0,
+            "highlighting must wait out the debounce, not run on the edit itself"
+        );
+
+        cx.executor().advance_clock(SQL_HIGHLIGHT_DEBOUNCE);
+        cx.run_until_parked();
+
+        assert!(
+            keyword_count(&editor, cx) > 0,
+            "after the debounce elapses the new keyword is highlighted"
         );
     }
 
