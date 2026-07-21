@@ -715,6 +715,36 @@ impl Render for ImageView {
 
                 container
             })
+            .child(
+                h_flex()
+                    .absolute()
+                    .bottom_2()
+                    .right_2()
+                    .gap_1()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().elevated_surface_background)
+                    .child(
+                        IconButton::new("image-zoom-out", IconName::Dash)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Zoom out"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.zoom_out(&ZoomOut, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("image-zoom-in", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Zoom in"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.zoom_in(&ZoomIn, window, cx)
+                                }),
+                            ),
+                    ),
+            )
     }
 }
 

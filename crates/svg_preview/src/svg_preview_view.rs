@@ -3,21 +3,26 @@ use std::sync::Arc;
 
 use file_icons::FileIcons;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    RenderImage, Styled, Subscription, Task, WeakEntity, Window, div, img,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task,
+    WeakEntity, Window, div, img, px,
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
 use crate::{OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
 
+const MIN_SVG_ZOOM: f32 = 0.1;
+const MAX_SVG_ZOOM: f32 = 10.0;
+
 pub struct SvgPreviewView {
     focus_handle: FocusHandle,
     buffer: Option<Entity<Buffer>>,
     current_svg: Option<Result<Arc<RenderImage>, SharedString>>,
+    zoom_level: f32,
     _refresh: Task<()>,
     _buffer_subscription: Option<Subscription>,
     _workspace_subscription: Option<Subscription>,
@@ -58,6 +63,7 @@ impl SvgPreviewView {
                 focus_handle: cx.focus_handle(),
                 buffer,
                 current_svg: None,
+                zoom_level: 1.0,
                 _buffer_subscription: subscription,
                 _workspace_subscription: workspace_subscription,
                 _refresh: Task::ready(()),
@@ -122,6 +128,43 @@ impl SvgPreviewView {
             })
             .ok();
         });
+    }
+
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !(event.modifiers.control || event.modifiers.platform) {
+            return;
+        }
+        let delta: f32 = match event.delta {
+            ScrollDelta::Pixels(pixels) => pixels.y.into(),
+            ScrollDelta::Lines(lines) => lines.y * 20.0,
+        };
+        if delta == 0.0 {
+            return;
+        }
+        let factor = if delta > 0.0 {
+            1.0 + delta.abs() * 0.01
+        } else {
+            1.0 / (1.0 + delta.abs() * 0.01)
+        };
+        self.set_zoom(self.zoom_level * factor, cx);
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.zoom_level = zoom.clamp(MIN_SVG_ZOOM, MAX_SVG_ZOOM);
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom_level * 1.2, cx);
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom_level / 1.2, cx);
     }
 
     fn set_current(
@@ -279,28 +322,67 @@ impl SvgPreviewView {
 
 impl Render for SvgPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let zoom = self.zoom_level;
+        let has_image = matches!(self.current_svg, Some(Ok(_)));
         v_flex()
             .id("SvgPreview")
             .key_context("SvgPreview")
             .track_focus(&self.focus_handle(cx))
             .size_full()
+            .relative()
             .bg(cx.theme().colors().editor_background)
-            .flex()
-            .justify_center()
-            .items_center()
-            .map(|this| match self.current_svg.clone() {
-                Some(Ok(image)) => {
-                    this.child(img(image).max_w_full().max_h_full().with_fallback(|| {
-                        h_flex()
-                            .p_4()
-                            .gap_2()
-                            .child(Icon::new(IconName::Warning))
-                            .child("Failed to load SVG image")
-                            .into_any_element()
-                    }))
-                }
-                Some(Err(e)) => this.child(div().p_4().child(e).into_any_element()),
-                None => this.child(div().p_4().child("No SVG file selected")),
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+            .child(
+                div()
+                    .id("svg-scroll")
+                    .size_full()
+                    .overflow_scroll()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .map(|this| match self.current_svg.clone() {
+                        Some(Ok(image)) => {
+                            let image_size = image.size(0);
+                            let width = px(image_size.width.0 as f32 * zoom);
+                            let height = px(image_size.height.0 as f32 * zoom);
+                            this.child(img(image).w(width).h(height).with_fallback(|| {
+                                h_flex()
+                                    .p_4()
+                                    .gap_2()
+                                    .child(Icon::new(IconName::Warning))
+                                    .child("Failed to load SVG image")
+                                    .into_any_element()
+                            }))
+                        }
+                        Some(Err(e)) => this.child(div().p_4().child(e).into_any_element()),
+                        None => this.child(div().p_4().child("No SVG file selected")),
+                    }),
+            )
+            .when(has_image, |this| {
+                this.child(
+                    h_flex()
+                        .absolute()
+                        .bottom_2()
+                        .right_2()
+                        .gap_1()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().elevated_surface_background)
+                        .child(
+                            IconButton::new("svg-zoom-out", IconName::Dash)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Zoom out"))
+                                .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
+                        )
+                        .child(
+                            IconButton::new("svg-zoom-in", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Zoom in"))
+                                .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
+                        ),
+                )
             })
     }
 }
