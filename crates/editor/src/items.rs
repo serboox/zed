@@ -731,6 +731,14 @@ impl Item for Editor {
             .map(Icon::from_path)
     }
 
+    fn tab_background_color(&self, _: &App) -> Option<gpui::Hsla> {
+        // A tinted editor body (a production database console) carries its
+        // env color here so the tab washes the same color. Low opacity keeps
+        // it a hint rather than a solid fill; the tab's own state background
+        // still shows through.
+        self.background_tint.map(|tint| tint.opacity(0.12))
+    }
+
     fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> AnyElement {
         let label_color = if ItemSettings::get_global(cx).git_status {
             self.buffer()

@@ -10208,6 +10208,10 @@ impl Item for ResultView {
         };
         Some(Icon::new(icon))
     }
+
+    fn tab_background_color(&self, _cx: &App) -> Option<gpui::Hsla> {
+        self.env_accent.map(|accent| accent.opacity(0.12))
+    }
 }
 
 impl Focusable for ResultView {

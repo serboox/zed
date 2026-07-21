@@ -38984,3 +38984,28 @@ fn test_apply_background_tint_blends_low_opacity_tint() {
     assert_ne!(tinted, background);
     assert_eq!(tinted, background.blend(tint.opacity(0.05)));
 }
+
+#[gpui::test]
+fn test_tab_background_color_reflects_background_tint(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    _ = editor.update(cx, |editor, _window, cx| {
+        assert_eq!(
+            editor.tab_background_color(cx),
+            None,
+            "an editor with no background tint must not tint its tab"
+        );
+        let env = Hsla {
+            h: 0.0,
+            s: 0.8,
+            l: 0.5,
+            a: 1.0,
+        };
+        editor.set_background_tint(Some(env), cx);
+        assert_eq!(
+            editor.tab_background_color(cx),
+            Some(env.opacity(0.12)),
+            "a production console's env tint must carry to its tab so it matches the body"
+        );
+    });
+}

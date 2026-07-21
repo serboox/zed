@@ -12,8 +12,8 @@ use client::{Client, proto};
 use futures::channel::mpsc;
 use gpui::{
     Action, AnyElement, AnyEntity, AnyView, App, AppContext, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Font, Pixels, Point, Render, SharedString, Task, TaskExt,
-    WeakEntity, Window,
+    EventEmitter, FocusHandle, Focusable, Font, Hsla, Pixels, Point, Render, SharedString, Task,
+    TaskExt, WeakEntity, Window,
 };
 use language::Capability;
 pub use language::HighlightedText;
@@ -192,6 +192,14 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        None
+    }
+
+    /// Background tint for this item's tab, blended over the tab background.
+    /// Used to flag a high-risk connection (for example a production database
+    /// console) so the tab matches the tinted editor body. `None` leaves the
+    /// tab with its default theme background.
+    fn tab_background_color(&self, _cx: &App) -> Option<Hsla> {
         None
     }
 
@@ -486,6 +494,7 @@ pub trait ItemHandle: 'static + Send {
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
+    fn tab_background_color(&self, cx: &App) -> Option<Hsla>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent>;
     fn telemetry_event_text(&self, cx: &App) -> Option<&'static str>;
@@ -640,6 +649,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon> {
         self.read(cx).tab_icon(window, cx)
+    }
+
+    fn tab_background_color(&self, cx: &App) -> Option<Hsla> {
+        self.read(cx).tab_background_color(cx)
     }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {

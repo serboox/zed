@@ -37,6 +37,7 @@ pub struct Tab {
     close_side: TabCloseSide,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+    bg_tint: Option<gpui::Hsla>,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -52,6 +53,7 @@ impl Tab {
             close_side: TabCloseSide::End,
             start_slot: None,
             end_slot: None,
+            bg_tint: None,
             children: SmallVec::new(),
         }
     }
@@ -73,6 +75,14 @@ impl Tab {
 
     pub fn end_slot<E: IntoElement>(mut self, element: impl Into<Option<E>>) -> Self {
         self.end_slot = element.into().map(IntoElement::into_any_element);
+        self
+    }
+
+    /// Blends a tint over the tab's background. Used to flag the tab's item
+    /// (for example a production database console) with its env color so the
+    /// tab matches the tinted editor body.
+    pub fn bg_tint(mut self, tint: Option<gpui::Hsla>) -> Self {
+        self.bg_tint = tint;
         self
     }
 
@@ -123,6 +133,8 @@ impl RenderOnce for Tab {
                 cx.theme().colors().element_active,
             ),
         };
+
+        let tab_bg = self.bg_tint.map_or(tab_bg, |tint| tab_bg.blend(tint));
 
         let (start_slot, end_slot) = {
             let start_slot = h_flex()
