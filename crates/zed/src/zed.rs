@@ -67,9 +67,9 @@ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
-    BaseKeymap, DEFAULT_KEYMAP_PATH, DefaultOpenBehavior, InvalidSettingsError, KeybindSource,
-    KeymapFile, KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings,
-    SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
+    BaseKeymap, DEFAULT_KEYMAP_PATH, InvalidSettingsError, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings, SettingsFile,
+    SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
 use sidebar::Sidebar;
@@ -970,12 +970,7 @@ fn register_actions(
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
+                action.create_new_window,
                 window,
                 cx,
             );
@@ -991,7 +986,7 @@ fn register_actions(
                     multiple: true,
                     prompt: None,
                 },
-                true,
+                Some(true),
                 window,
                 cx,
             );
@@ -1239,6 +1234,14 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 db_client_ui::explain_current_sql_query(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::database_panel::ExplainAnalyzeQuery,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                db_client_ui::explain_analyze_current_sql_query(workspace, window, cx);
             },
         )
         .register_action(

@@ -436,6 +436,9 @@ pub enum DefaultOpenBehavior {
     /// Open projects in a new window.
     #[strum(serialize = "Open a New Window")]
     NewWindow,
+    /// Ask each time whether to open in a new window or the current one.
+    #[strum(serialize = "Ask Each Time")]
+    Ask,
 }
 
 #[derive(

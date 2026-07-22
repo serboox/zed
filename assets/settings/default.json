@@ -113,12 +113,13 @@
   // Markdown preview settings
   "markdown_preview": {
     // Whether to limit the width of the rendered markdown content. When
-    // enabled, content is constrained to `max_width` and centered
-    // horizontally within the preview pane.
+    // enabled, content fills the preview pane up to `max_width` and is
+    // centered once the pane grows past it.
     "limit_content_width": true,
     // The maximum width, in pixels, of the rendered markdown content when
-    // limit_content_width is enabled.
-    "max_width": 800,
+    // limit_content_width is enabled. Acts as a ceiling for very wide
+    // windows; narrower panes are unaffected and fill the available width.
+    "max_width": 1800,
   },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //
@@ -167,11 +168,13 @@
   "cli_default_open_behavior": "existing_window",
   // The default behavior when opening projects from the UI.
   //
-  // May take 2 values:
+  // May take 3 values:
   //  1. Open projects as a new workspace in the current Zed window's sidebar
   //         "default_open_behavior": "existing_window"
   //  2. Open projects in a new window
   //         "default_open_behavior": "new_window"
+  //  3. Ask each time whether to open in a new window or the current one
+  //         "default_open_behavior": "ask"
   "default_open_behavior": "existing_window",
   // Whether to attempt to restore previous file's state when opening it again.
   // The state is stored per pane.

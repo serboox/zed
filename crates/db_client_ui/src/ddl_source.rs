@@ -357,7 +357,7 @@ impl Render for DdlSourceView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().child(self.path_editor.clone()))
+                    .child(crate::widgets::text_field(&self.path_editor, cx).flex_1())
                     .child(
                         Button::new("load-ddl", "Load")
                             .style(ButtonStyle::Filled)

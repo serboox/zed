@@ -60,6 +60,49 @@ pub fn is_searchable_column_type(data_type: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Whether ClickHouse's `LIKE` accepts a column of `data_type` at all.
+///
+/// The generic blocklist above assumes MySQL/Postgres-style type names
+/// (`int`, `bigint`, `float`, ...), which don't match ClickHouse's own
+/// naming (`UInt32`/`Int64`/`Float64` don't share the `int`/`float`
+/// prefixes) and can't enumerate ClickHouse's composite types (`Array`,
+/// `Map`, `Tuple`, `Enum8`/`Enum16`, `IPv4`, `IPv6`, ...) -- every one of
+/// which raises `ILLEGAL_TYPE_OF_ARGUMENT` if pushed into `LIKE` (verified
+/// against a live ClickHouse 24.10 instance). Rather than chase an
+/// ever-growing non-text blocklist, this checks the inverse: whether the
+/// type resolves down to a text type at all, unwrapping the `Nullable(...)`
+/// and `LowCardinality(...)` wrappers ClickHouse allows around any base
+/// type (including around each other, e.g. `LowCardinality(Nullable(String))`).
+fn is_searchable_clickhouse_column_type(data_type: &str) -> bool {
+    let mut remaining = data_type.trim().to_ascii_lowercase();
+    loop {
+        // Only unwrap when the wrapper's own closing paren is actually
+        // present -- a malformed type string like `Nullable(String` (no
+        // closing paren) must not be treated as if it unwrapped to `string`,
+        // it must fall through to the non-text default below instead.
+        let unwrapped = remaining
+            .strip_prefix("nullable(")
+            .or_else(|| remaining.strip_prefix("lowcardinality("))
+            .and_then(|inner| inner.strip_suffix(')'));
+        match unwrapped {
+            Some(inner) => remaining = inner.to_string(),
+            None => break,
+        }
+    }
+    remaining == "string" || remaining.starts_with("fixedstring(")
+}
+
+/// Whether `data_type` is worth `LIKE`-searching for `driver`, dispatching to
+/// the ClickHouse-specific allowlist above where the generic blocklist
+/// doesn't fit (see `is_searchable_clickhouse_column_type`).
+fn is_searchable_for_driver(driver: DatabaseDriver, data_type: &str) -> bool {
+    if driver == DatabaseDriver::ClickHouse {
+        is_searchable_clickhouse_column_type(data_type)
+    } else {
+        is_searchable_column_type(data_type)
+    }
+}
+
 /// How large a window `build_search_query`'s Cassandra branch scans (as a
 /// multiple of the per-table row cap) before filtering client-side, since
 /// there's no server-side substring filter to rely on there.
@@ -102,7 +145,7 @@ pub fn build_search_query(
 ) -> Option<SearchQuery> {
     let searchable: Vec<&ColumnInfo> = columns
         .iter()
-        .filter(|column| is_searchable_column_type(&column.data_type))
+        .filter(|column| is_searchable_for_driver(driver, &column.data_type))
         .collect();
     if searchable.is_empty() {
         return None;
@@ -277,7 +320,7 @@ impl FullTextSearchView {
                 let columns = describe_task.await.log_err().unwrap_or_default();
                 let searchable_columns: Vec<String> = columns
                     .iter()
-                    .filter(|column| is_searchable_column_type(&column.data_type))
+                    .filter(|column| is_searchable_for_driver(driver, &column.data_type))
                     .map(|column| column.name.clone())
                     .collect();
 
@@ -476,10 +519,9 @@ impl Render for FullTextSearchView {
                             .color(Color::Muted),
                     )
                     .child(
-                        div()
+                        crate::widgets::text_field(&self.term_editor, cx)
                             .flex_1()
-                            .debug_selector(|| "SEARCH_TERM_EDITOR".to_string())
-                            .child(self.term_editor.clone()),
+                            .debug_selector(|| "SEARCH_TERM_EDITOR".to_string()),
                     )
                     .child(
                         Button::new("full-text-search-run", "Search")
@@ -560,6 +602,84 @@ mod tests {
         assert!(!is_searchable_column_type("blob"));
         assert!(!is_searchable_column_type("varbinary(16)"));
         assert!(!is_searchable_column_type(""));
+    }
+
+    // Before this fix, ClickHouse fell through to the generic blocklist,
+    // which excludes types by an MySQL/Postgres-style `int`/`float`/...
+    // prefix that ClickHouse's own type names (`UInt32`, `Enum8`, ...)
+    // don't share, and has no entry at all for ClickHouse's composite types.
+    // Verified against a live ClickHouse 24.10 instance: `LIKE` against any
+    // of these raises `ILLEGAL_TYPE_OF_ARGUMENT`, including the plain
+    // `UInt32` id column nearly every ClickHouse table has.
+    #[test]
+    fn clickhouse_column_type_allowlist_accepts_only_text_shaped_types() {
+        assert!(is_searchable_clickhouse_column_type("String"));
+        assert!(is_searchable_clickhouse_column_type("FixedString(10)"));
+        assert!(is_searchable_clickhouse_column_type("Nullable(String)"));
+        assert!(is_searchable_clickhouse_column_type(
+            "LowCardinality(String)"
+        ));
+        assert!(is_searchable_clickhouse_column_type(
+            "LowCardinality(Nullable(String))"
+        ));
+        assert!(is_searchable_clickhouse_column_type(
+            "Nullable(FixedString(5))"
+        ));
+
+        assert!(!is_searchable_clickhouse_column_type("UInt32"));
+        assert!(!is_searchable_clickhouse_column_type("Int64"));
+        assert!(!is_searchable_clickhouse_column_type("Nullable(UInt32)"));
+        assert!(!is_searchable_clickhouse_column_type("Array(String)"));
+        assert!(!is_searchable_clickhouse_column_type("Map(String, String)"));
+        assert!(!is_searchable_clickhouse_column_type(
+            "Tuple(String, UInt32)"
+        ));
+        assert!(!is_searchable_clickhouse_column_type(
+            "Enum8('active' = 1, 'inactive' = 2)"
+        ));
+        assert!(!is_searchable_clickhouse_column_type("IPv4"));
+        assert!(!is_searchable_clickhouse_column_type("IPv6"));
+        assert!(!is_searchable_clickhouse_column_type("DateTime"));
+        assert!(!is_searchable_clickhouse_column_type("UUID"));
+    }
+
+    // A malformed type string with an unclosed wrapper must never be
+    // classified as searchable just because stripping the prefix alone
+    // happens to leave a string equal to `string` -- the wrapper's own
+    // closing paren must also be present before the layer is peeled off.
+    #[test]
+    fn clickhouse_column_type_allowlist_rejects_a_malformed_unclosed_wrapper() {
+        assert!(!is_searchable_clickhouse_column_type("Nullable(String"));
+        assert!(!is_searchable_clickhouse_column_type(
+            "LowCardinality(String"
+        ));
+        assert!(!is_searchable_clickhouse_column_type("Nullable(String))"));
+    }
+
+    #[test]
+    fn build_search_query_for_clickhouse_only_searches_text_shaped_columns() {
+        let columns = vec![
+            column("id", "UInt32"),
+            column("amount", "Nullable(UInt32)"),
+            column("tags", "Array(String)"),
+            column("name", "String"),
+            column("note", "Nullable(String)"),
+        ];
+        let query = build_search_query(DatabaseDriver::ClickHouse, "events", &columns, "x", 20)
+            .expect("String/Nullable(String) columns exist so a query must be built");
+        assert!(query.sql.contains("\"name\" LIKE"));
+        assert!(query.sql.contains("\"note\" LIKE"));
+        assert!(!query.sql.contains("\"id\""));
+        assert!(!query.sql.contains("\"amount\""));
+        assert!(!query.sql.contains("\"tags\""));
+    }
+
+    #[test]
+    fn build_search_query_for_clickhouse_returns_none_when_only_non_text_columns_exist() {
+        let columns = vec![column("id", "UInt32"), column("created", "DateTime")];
+        assert!(
+            build_search_query(DatabaseDriver::ClickHouse, "events", &columns, "x", 20).is_none()
+        );
     }
 
     #[test]

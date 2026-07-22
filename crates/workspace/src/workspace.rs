@@ -670,7 +670,7 @@ impl From<WorkspaceId> for i64 {
 fn prompt_and_open_paths(
     app_state: Arc<AppState>,
     options: PathPromptOptions,
-    create_new_window: bool,
+    create_new_window: Option<bool>,
     cx: &mut App,
 ) {
     if let Some(workspace_window) =
@@ -725,11 +725,50 @@ fn prompt_and_open_paths(
     }
 }
 
+/// Resolves whether a just-picked path should open in the current window or
+/// a new one. An explicit `create_new_window` wins; otherwise this falls
+/// back to `default_open_behavior`, prompting the user when that setting is
+/// `Ask`. Defaults to the current window if there's no `MultiWorkspace`
+/// handle to prompt through (the window closed, or downcast failed).
+async fn resolve_create_new_window(
+    create_new_window: Option<bool>,
+    multi_workspace_handle: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut AsyncWindowContext,
+) -> bool {
+    if let Some(create_new_window) = create_new_window {
+        return create_new_window;
+    }
+    let behavior = cx
+        .update(|_, cx| WorkspaceSettings::get_global(cx).default_open_behavior)
+        .unwrap_or_default();
+    match behavior {
+        DefaultOpenBehavior::NewWindow => true,
+        DefaultOpenBehavior::ExistingWindow => false,
+        DefaultOpenBehavior::Ask => {
+            let Some(handle) = multi_workspace_handle else {
+                return false;
+            };
+            let Ok(answer) = handle.update(cx, |_, window, cx| {
+                window.prompt(
+                    PromptLevel::Info,
+                    "Open project in a new window or this one?",
+                    None,
+                    &["This Window", "New Window"],
+                    cx,
+                )
+            }) else {
+                return false;
+            };
+            answer.await.log_err() == Some(1)
+        }
+    }
+}
+
 pub fn prompt_for_open_path_and_open(
     workspace: &mut Workspace,
     app_state: Arc<AppState>,
     options: PathPromptOptions,
-    create_new_window: bool,
+    create_new_window: Option<bool>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -744,6 +783,8 @@ pub fn prompt_for_open_path_and_open(
         let Some(paths) = paths.await.log_err().flatten() else {
             return;
         };
+        let create_new_window =
+            resolve_create_new_window(create_new_window, multi_workspace_handle, cx).await;
         if !create_new_window {
             if let Some(handle) = multi_workspace_handle {
                 if let Some(task) = handle
@@ -787,12 +828,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
+                action.create_new_window,
                 cx,
             );
         })
@@ -807,7 +843,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                true,
+                Some(true),
                 cx,
             );
         });

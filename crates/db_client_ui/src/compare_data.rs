@@ -430,7 +430,7 @@ impl Render for CompareDataView {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(div().w(px(100.)).child(self.tolerance_editor.clone()))
+            .child(crate::widgets::text_field(&self.tolerance_editor, cx).w(px(100.)))
             .when(self.tolerance_invalid, |el| {
                 el.child(
                     h_flex()

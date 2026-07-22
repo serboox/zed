@@ -1030,6 +1030,39 @@ impl Language {
         text: &'a Rope,
         range: Range<usize>,
     ) -> Vec<(Range<usize>, HighlightId)> {
+        let Some(grammar) = &self.grammar else {
+            return Vec::new();
+        };
+        self.highlight_text_with_map(text, range, grammar.highlight_map())
+    }
+
+    /// Like [`Language::highlight_text`], but resolves highlights against `theme` instead of
+    /// against the shared, app-theme-derived highlight map on this language's grammar. Useful
+    /// for renderers (e.g. the markdown preview) that need syntax colors independent of
+    /// whichever theme the rest of the app is currently using.
+    pub fn highlight_text_with_theme<'a>(
+        self: &'a Arc<Self>,
+        text: &'a Rope,
+        range: Range<usize>,
+        theme: &SyntaxTheme,
+    ) -> Vec<(Range<usize>, HighlightId)> {
+        let Some(grammar) = &self.grammar else {
+            return Vec::new();
+        };
+        let highlight_map = grammar
+            .highlights_config
+            .as_ref()
+            .map(|config| build_highlight_map(config.query.capture_names(), theme))
+            .unwrap_or_default();
+        self.highlight_text_with_map(text, range, highlight_map)
+    }
+
+    fn highlight_text_with_map<'a>(
+        self: &'a Arc<Self>,
+        text: &'a Rope,
+        range: Range<usize>,
+        highlight_map: HighlightMap,
+    ) -> Vec<(Range<usize>, HighlightId)> {
         let mut result = Vec::new();
         if let Some(grammar) = &self.grammar {
             let tree = parse_text(grammar, text, None);
@@ -1040,11 +1073,14 @@ impl Language {
                         .as_ref()
                         .map(|config| &config.query)
                 });
-            let highlight_maps = vec![grammar.highlight_map()];
             let mut offset = 0;
-            for chunk in
-                BufferChunks::new(text, range, Some((captures, highlight_maps)), false, None)
-            {
+            for chunk in BufferChunks::new(
+                text,
+                range,
+                Some((captures, vec![highlight_map])),
+                false,
+                None,
+            ) {
                 let end_offset = offset + chunk.text.len();
                 if let Some(highlight_id) = chunk.syntax_highlight_id {
                     result.push((offset..end_offset, highlight_id));

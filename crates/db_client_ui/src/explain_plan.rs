@@ -134,6 +134,34 @@ pub fn supports_explain_plan(driver: DatabaseDriver) -> bool {
     )
 }
 
+/// Returns the EXPLAIN ANALYZE statement for drivers that actually run the
+/// query and report real execution statistics, or `None` otherwise. Verified
+/// against each engine's docs: MySQL and PostgreSQL both support `EXPLAIN
+/// ANALYZE`. ClickHouse's EXPLAIN never executes the query (no ANALYZE
+/// variant exists), and SQLite's EXPLAIN QUERY PLAN is estimate-only.
+pub fn explain_analyze_sql_for_driver(driver: DatabaseDriver, sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';');
+    match driver {
+        DatabaseDriver::MySQL | DatabaseDriver::PostgreSQL => {
+            Some(format!("EXPLAIN ANALYZE {sql}"))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `driver` supports [`explain_analyze_sql_for_driver`].
+pub fn supports_explain_analyze(driver: DatabaseDriver) -> bool {
+    matches!(driver, DatabaseDriver::MySQL | DatabaseDriver::PostgreSQL)
+}
+
+/// Whether `sql` is itself an `EXPLAIN ANALYZE` statement a user typed
+/// directly into a console, so an inline-detected plan result can still show
+/// the "Analyze" title even without a driver-level `ExplainQueryContext`.
+pub fn sql_requests_analyze(sql: &str) -> bool {
+    let upper = sql.trim_start().to_uppercase();
+    upper.starts_with("EXPLAIN") && upper.contains("ANALYZE")
+}
+
 /// Flattens an EXPLAIN result into newline-joined text. Engines return the plan
 /// as one row per line (often a single column), so every non-null cell of every
 /// row becomes a line, preserving its leading indentation.
@@ -158,6 +186,21 @@ pub fn native_explain_sql_for_driver(driver: DatabaseDriver, sql: &str) -> Strin
         DatabaseDriver::MySQL => format!("EXPLAIN FORMAT=JSON {trimmed}"),
         DatabaseDriver::PostgreSQL => format!("EXPLAIN (FORMAT JSON) {trimmed}"),
         _ => explain_sql_for_driver(driver, sql),
+    }
+}
+
+/// The native-format counterpart of [`explain_analyze_sql_for_driver`], for
+/// "Copy Native Format" on an analyzed plan. PostgreSQL exposes a distinct
+/// `FORMAT JSON` that still runs the query (`ANALYZE, FORMAT JSON`). MySQL's
+/// `EXPLAIN ANALYZE` only supports the TREE format — there is no JSON
+/// variant to fall back to — so its native format is the same tree text the
+/// view already parsed.
+pub fn native_explain_analyze_sql_for_driver(driver: DatabaseDriver, sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';');
+    match driver {
+        DatabaseDriver::PostgreSQL => Some(format!("EXPLAIN (ANALYZE, FORMAT JSON) {trimmed}")),
+        DatabaseDriver::MySQL => Some(format!("EXPLAIN ANALYZE {trimmed}")),
+        _ => None,
     }
 }
 
@@ -197,7 +240,63 @@ fn extract_cost_upper_bound(text: &str) -> Option<f64> {
     let rest = &text[start..];
     let end = rest.find([' ', ')']).unwrap_or(rest.len());
     let segment = &rest[..end];
-    segment.rsplit("..").next().unwrap_or(segment).parse().ok()
+    parse_finite_metric(segment.rsplit("..").next().unwrap_or(segment))
+}
+
+fn extract_actual_time_upper_bound(text: &str) -> Option<f64> {
+    let start = text.find("actual time=")? + "actual time=".len();
+    let rest = &text[start..];
+    let end = rest.find([' ', ')']).unwrap_or(rest.len());
+    let segment = &rest[..end];
+    parse_finite_metric(segment.rsplit("..").next().unwrap_or(segment))
+}
+
+// `f64::parse` accepts "inf"/"nan", so a malformed plan line (e.g.
+// `cost=0.00..inf`) would otherwise yield a non-finite metric that turns the
+// heat ratio into `inf/inf == NaN` and poisons the color/opacity math. Reject
+// non-finite values here so both the heat tint and the flame-width weight only
+// ever see real numbers.
+fn parse_finite_metric(segment: &str) -> Option<f64> {
+    segment
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+/// A node's heat metric for cost coloring: the measured execution time
+/// (`actual time=A..B`) when the plan was run with ANALYZE, else the estimated
+/// cost upper bound (`cost=X..Y`). `None` when the engine reports neither.
+fn plan_node_heat(text: &str) -> Option<f64> {
+    extract_actual_time_upper_bound(text)
+        .or_else(|| extract_cost_upper_bound(text))
+        .filter(|value| *value > 0.0)
+}
+
+/// The largest heat metric across the whole plan forest, used to normalize each
+/// node's tint. `None` when no node reports a cost/time metric.
+fn max_plan_heat(roots: &[PlanNode]) -> Option<f64> {
+    fn walk(node: &PlanNode, max: &mut Option<f64>) {
+        if let Some(value) = plan_node_heat(&node.text) {
+            *max = Some(max.map_or(value, |current: f64| current.max(value)));
+        }
+        for child in &node.children {
+            walk(child, max);
+        }
+    }
+    let mut max = None;
+    for root in roots {
+        walk(root, &mut max);
+    }
+    max
+}
+
+/// Normalized 0.0..=1.0 heat for one node given the forest maximum, so the
+/// hottest node maps to 1.0 and a node without a metric maps to 0.0.
+fn heat_fraction(text: &str, max: Option<f64>) -> f32 {
+    match (plan_node_heat(text), max) {
+        (Some(value), Some(max)) if max > 0.0 => (value / max).clamp(0.0, 1.0) as f32,
+        _ => 0.0,
+    }
 }
 
 /// Lays the plan tree out as nested flame spans: each level's siblings split
@@ -240,10 +339,6 @@ enum PlanViewMode {
     Flame,
 }
 
-pub enum ExplainPlanEvent {
-    Dismissed,
-}
-
 /// The live connection a plan was fetched from, kept only so "Copy Native
 /// Format" can re-run the query with the driver's machine-readable EXPLAIN
 /// syntax. Absent when a plan is rendered from a result with no live
@@ -264,12 +359,15 @@ pub struct ExplainPlanView {
     collapsed: HashSet<usize>,
     mode: PlanViewMode,
     query_context: Option<ExplainQueryContext>,
+    is_analyze: bool,
+    selected_row: Option<usize>,
 }
 
 impl ExplainPlanView {
     pub fn new(
         roots: Vec<PlanNode>,
         query_context: Option<ExplainQueryContext>,
+        is_analyze: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -279,6 +377,8 @@ impl ExplainPlanView {
             collapsed: HashSet::new(),
             mode: PlanViewMode::Tree,
             query_context,
+            is_analyze,
+            selected_row: None,
         }
     }
 
@@ -294,7 +394,12 @@ impl ExplainPlanView {
         let Some(context) = self.query_context.as_ref() else {
             return;
         };
-        let native_sql = native_explain_sql_for_driver(context.driver, &context.sql);
+        let native_sql = if self.is_analyze {
+            native_explain_analyze_sql_for_driver(context.driver, &context.sql)
+                .unwrap_or_else(|| native_explain_sql_for_driver(context.driver, &context.sql))
+        } else {
+            native_explain_sql_for_driver(context.driver, &context.sql)
+        };
         let store = context.store.clone();
         let connection_id = context.connection_id;
         let database = context.database.clone();
@@ -356,9 +461,12 @@ impl ExplainPlanView {
         }
         cx.notify();
     }
-}
 
-impl EventEmitter<ExplainPlanEvent> for ExplainPlanView {}
+    fn select_row(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.selected_row = Some(id);
+        cx.notify();
+    }
+}
 
 impl EventEmitter<DismissEvent> for ExplainPlanView {}
 
@@ -366,7 +474,11 @@ impl Item for ExplainPlanView {
     type Event = DismissEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Query Plan".into()
+        if self.is_analyze {
+            "Query Plan (Analyze)".into()
+        } else {
+            "Query Plan".into()
+        }
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -387,6 +499,10 @@ impl Focusable for ExplainPlanView {
 impl ExplainPlanView {
     fn render_tree_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.render_rows();
+        let heat = cx.theme().status().error;
+        let hover_bg = cx.theme().colors().element_hover;
+        let selected_bg = cx.theme().colors().element_selected;
+        let max_heat = max_plan_heat(&self.roots);
         let mut row_elements = Vec::with_capacity(rows.len());
         for (id, depth, text, has_children) in rows {
             let collapsed = self.collapsed.contains(&id);
@@ -409,12 +525,26 @@ impl ExplainPlanView {
             } else {
                 depth as f32 * 16.0 + 20.0
             };
+            let is_selected = self.selected_row == Some(id);
+            // Translucent red proportional to cost so it composites over the
+            // panel background; a zero-cost row stays fully transparent.
+            let heat_bg = heat.opacity(0.35 * heat_fraction(&text, max_heat));
             row_elements.push(
                 h_flex()
+                    .id(("plan-row", id))
+                    .debug_selector(move || format!("plan-row-{id}"))
+                    .w_full()
                     .pl(px(indent))
                     .gap_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_selected, |row| row.bg(selected_bg))
+                    .when(!is_selected, |row| {
+                        row.bg(heat_bg).hover(|row| row.bg(hover_bg))
+                    })
                     .children(caret)
-                    .child(Label::new(text).size(LabelSize::Small)),
+                    .child(Label::new(text).size(LabelSize::Small))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_row(id, cx))),
             );
         }
         v_flex()
@@ -429,7 +559,9 @@ impl ExplainPlanView {
         let spans = flame_layout(&self.roots);
         let depth_count = spans.iter().map(|span| span.depth + 1).max().unwrap_or(0);
         let base = cx.theme().colors().editor_background;
-        let accent = cx.theme().colors().text_accent;
+        let border = cx.theme().colors().border;
+        let heat = cx.theme().status().error;
+        let max_heat = max_plan_heat(&self.roots);
 
         let mut container = div()
             .id("plan-flame-view")
@@ -438,7 +570,9 @@ impl ExplainPlanView {
             .w_full()
             .h(px(depth_count as f32 * ROW_HEIGHT));
         for (index, span) in spans.iter().enumerate() {
-            let opacity = 0.15 + 0.5 * (span.depth as f32 * 0.15).min(1.0);
+            // Opaque box tinted red by cost; even the coldest node keeps a faint
+            // tint so its outline stays legible.
+            let alpha = 0.12 + 0.55 * heat_fraction(&span.text, max_heat);
             container = container.child(
                 div()
                     .id(("flame-span", index))
@@ -450,9 +584,10 @@ impl ExplainPlanView {
                     .h(px(ROW_HEIGHT - 2.0))
                     .overflow_hidden()
                     .border_1()
-                    .border_color(base)
-                    .bg(base.blend(accent.opacity(opacity)))
+                    .border_color(border)
+                    .bg(base.blend(heat.opacity(alpha)))
                     .px_1()
+                    .tooltip(Tooltip::text(span.text.clone()))
                     .child(Label::new(span.text.clone()).size(LabelSize::XSmall)),
             );
         }
@@ -468,7 +603,14 @@ impl Render for ExplainPlanView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
         let toolbar = h_flex()
+            .id("explain-plan-toolbar")
+            .debug_selector(|| "EXPLAIN_PLAN_TOOLBAR".to_string())
+            .w_full()
+            .px_2()
+            .py_1()
             .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(
                 div()
                     .id("plan-mode-tree-hitbox")
@@ -529,15 +671,9 @@ impl Render for ExplainPlanView {
         v_flex()
             .key_context("ExplainPlan")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
+            .debug_selector(|| "EXPLAIN_PLAN_ROOT".to_string())
             .size_full()
-            .p_3()
-            .gap_2()
-            .child(crate::widgets::dialog_header(
-                "Query Plan",
-                "close-explain",
-                cx.listener(|_, _, _, cx| cx.emit(ExplainPlanEvent::Dismissed)),
-            ))
+            .bg(cx.theme().colors().editor_background)
             .child(toolbar)
             .child(body)
     }
@@ -647,6 +783,60 @@ mod tests {
             native_explain_sql_for_driver(DatabaseDriver::SQLite, "SELECT 1"),
             "EXPLAIN QUERY PLAN SELECT 1"
         );
+    }
+
+    #[test]
+    fn explain_analyze_sql_is_only_offered_for_engines_that_actually_run_the_query() {
+        assert_eq!(
+            explain_analyze_sql_for_driver(DatabaseDriver::MySQL, "SELECT 1;"),
+            Some("EXPLAIN ANALYZE SELECT 1".to_string())
+        );
+        assert_eq!(
+            explain_analyze_sql_for_driver(DatabaseDriver::PostgreSQL, "SELECT 1"),
+            Some("EXPLAIN ANALYZE SELECT 1".to_string())
+        );
+        // ClickHouse's EXPLAIN never executes the query (no ANALYZE variant),
+        // and SQLite's EXPLAIN QUERY PLAN is estimate-only.
+        assert_eq!(
+            explain_analyze_sql_for_driver(DatabaseDriver::ClickHouse, "SELECT 1"),
+            None
+        );
+        assert_eq!(
+            explain_analyze_sql_for_driver(DatabaseDriver::SQLite, "SELECT 1"),
+            None
+        );
+
+        assert!(supports_explain_analyze(DatabaseDriver::MySQL));
+        assert!(supports_explain_analyze(DatabaseDriver::PostgreSQL));
+        assert!(!supports_explain_analyze(DatabaseDriver::ClickHouse));
+        assert!(!supports_explain_analyze(DatabaseDriver::SQLite));
+    }
+
+    #[test]
+    fn native_explain_analyze_sql_falls_back_to_tree_text_where_no_json_variant_exists() {
+        // PostgreSQL has a distinct FORMAT JSON that still runs the query.
+        assert_eq!(
+            native_explain_analyze_sql_for_driver(DatabaseDriver::PostgreSQL, "SELECT 1;"),
+            Some("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1".to_string())
+        );
+        // MySQL's EXPLAIN ANALYZE only supports the TREE format.
+        assert_eq!(
+            native_explain_analyze_sql_for_driver(DatabaseDriver::MySQL, "SELECT 1"),
+            Some("EXPLAIN ANALYZE SELECT 1".to_string())
+        );
+        assert_eq!(
+            native_explain_analyze_sql_for_driver(DatabaseDriver::ClickHouse, "SELECT 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_requests_analyze_detects_the_keyword_after_explain() {
+        assert!(sql_requests_analyze("EXPLAIN ANALYZE SELECT 1"));
+        assert!(sql_requests_analyze("  explain analyze select 1"));
+        assert!(sql_requests_analyze("EXPLAIN FORMAT=TREE ANALYZE SELECT 1"));
+        assert!(!sql_requests_analyze("EXPLAIN SELECT 1"));
+        assert!(!sql_requests_analyze("SELECT 1"));
     }
 
     #[test]
@@ -784,8 +974,8 @@ mod tests {
     fn toggling_to_flame_view_renders_proportional_spans(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let store = cx.new(DatabaseStore::new);
-        let window =
-            cx.add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, window, cx));
+        let window = cx
+            .add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, false, window, cx));
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         let _ = store;
 
@@ -836,8 +1026,8 @@ mod tests {
     #[gpui::test]
     fn toggling_back_to_tree_view_still_works(cx: &mut gpui::TestAppContext) {
         init_test(cx);
-        let window =
-            cx.add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, window, cx));
+        let window = cx
+            .add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, false, window, cx));
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
 
         cx.update(|window, cx| {
@@ -906,6 +1096,7 @@ mod tests {
                     driver: DatabaseDriver::PostgreSQL,
                     sql: "SELECT 1;".to_string(),
                 }),
+                false,
                 window,
                 cx,
             )
@@ -934,5 +1125,194 @@ mod tests {
             .and_then(|item| item.text())
             .expect("the native plan text should be on the clipboard");
         assert!(clipboard.contains(r#""Node Type": "Seq Scan""#));
+    }
+
+    #[gpui::test]
+    async fn analyze_view_labels_its_tab_and_copies_the_analyze_native_format(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let config = db_client::ConnectionConfig {
+            label: "explain".to_string(),
+            database: Some("scratch".to_string()),
+            driver: DatabaseDriver::MySQL,
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let provider = std::sync::Arc::new(ExplainMockProvider::new());
+
+        let store = cx.new(DatabaseStore::new);
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider.clone(), cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            ExplainPlanView::new(
+                sample_roots(),
+                Some(ExplainQueryContext {
+                    store: store.clone(),
+                    connection_id,
+                    database: "scratch".to_string(),
+                    driver: DatabaseDriver::MySQL,
+                    sql: "SELECT 1;".to_string(),
+                }),
+                true,
+                window,
+                cx,
+            )
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let tab_title = window
+            .read_with(&cx, |view, cx| view.tab_content_text(0, cx))
+            .expect("view should still be alive");
+        assert_eq!(tab_title.as_ref(), "Query Plan (Analyze)");
+
+        let target = cx
+            .debug_bounds("plan-copy-native")
+            .map(|bounds| bounds.center())
+            .expect("copy-native button should render");
+        cx.simulate_click(target, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.queries.lock().unwrap().as_slice(),
+            ["EXPLAIN ANALYZE SELECT 1".to_string()],
+            "Copy Native Format must re-run the query with MySQL's analyze-tree statement"
+        );
+    }
+
+    #[test]
+    fn plan_node_heat_prefers_actual_time_over_estimated_cost() {
+        let text =
+            "-> Seq Scan on t  (cost=0.00..12.50 rows=5) (actual time=0.100..3.250 rows=5 loops=1)";
+        assert_eq!(plan_node_heat(text), Some(3.25));
+    }
+
+    #[test]
+    fn plan_node_heat_falls_back_to_cost_upper_bound() {
+        let text = "Seq Scan on t  (cost=0.00..42.00 rows=5 width=8)";
+        assert_eq!(plan_node_heat(text), Some(42.0));
+    }
+
+    #[test]
+    fn plan_node_heat_is_none_without_metrics() {
+        assert_eq!(plan_node_heat("SCAN t"), None);
+    }
+
+    #[test]
+    fn heat_metrics_reject_non_finite_values() {
+        // `f64::parse` accepts "inf", so without a guard these lines would
+        // yield Some(inf); inf/inf then turns the normalized fraction into NaN
+        // and corrupts the opacity/blend color math.
+        let inf_cost = "Seq Scan (cost=0.00..inf rows=1)";
+        let inf_time = "Seq Scan (actual time=0.001..inf rows=1 loops=1)";
+        assert_eq!(plan_node_heat(inf_cost), None);
+        assert_eq!(plan_node_heat(inf_time), None);
+
+        let roots = vec![PlanNode {
+            text: inf_cost.to_string(),
+            children: Vec::new(),
+        }];
+        let max = max_plan_heat(&roots);
+        assert_eq!(max, None);
+        let fraction = heat_fraction(inf_cost, max);
+        assert!(
+            fraction.is_finite(),
+            "a non-finite metric must not leak a NaN heat fraction into the color math"
+        );
+        assert_eq!(fraction, 0.0);
+    }
+
+    #[test]
+    fn heat_fraction_normalizes_against_the_forest_maximum() {
+        let roots = vec![PlanNode {
+            text: "Root (cost=0.00..100.00)".to_string(),
+            children: vec![PlanNode {
+                text: "Child (cost=0.00..25.00)".to_string(),
+                children: Vec::new(),
+            }],
+        }];
+        let max = max_plan_heat(&roots);
+        assert_eq!(max, Some(100.0));
+        assert!((heat_fraction("Root (cost=0.00..100.00)", max) - 1.0).abs() < 1e-6);
+        assert!((heat_fraction("Child (cost=0.00..25.00)", max) - 0.25).abs() < 1e-6);
+        assert!(heat_fraction("no metric", max).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn plan_renders_as_a_flat_panel_without_a_dialog_header(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let window = cx
+            .add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, false, window, cx));
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let root = cx
+            .debug_bounds("EXPLAIN_PLAN_ROOT")
+            .expect("the plan panel root should render");
+        let toolbar = cx
+            .debug_bounds("EXPLAIN_PLAN_TOOLBAR")
+            .expect("the toolbar should render");
+        // The toolbar is the panel's first child: with the dialog header gone,
+        // no large title/close row sits above it, so it starts flush with the
+        // panel top (only a hairline border may separate them).
+        let offset = f32::from(toolbar.origin.y) - f32::from(root.origin.y);
+        assert!(
+            offset < 8.0,
+            "toolbar should sit flush at the panel top, got offset {offset}"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_tree_row_selects_it(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let window = cx
+            .add_window(|window, cx| ExplainPlanView::new(sample_roots(), None, false, window, cx));
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            window
+                .read_with(&cx, |view, _| view.selected_row)
+                .expect("view should be alive"),
+            None,
+            "no row is selected before any interaction"
+        );
+
+        // Child A is the second row (id 1) and is a leaf, so its center lands on
+        // the row body rather than on a disclosure caret.
+        let target = cx
+            .debug_bounds("plan-row-1")
+            .map(|bounds| bounds.center())
+            .expect("the second plan row should render");
+        cx.simulate_click(target, gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            window
+                .read_with(&cx, |view, _| view.selected_row)
+                .expect("view should be alive"),
+            Some(1),
+            "clicking a plan row must select it"
+        );
     }
 }

@@ -7,7 +7,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="$repo_root/target/release-fast/zed"
-icon="$repo_root/crates/zed/resources/app-icon-dev.png"
+icon="$repo_root/crates/zed/resources/app-icon-personal@2x.png"
 
 if [[ ! -x "$binary" ]]; then
   echo "error: $binary not found. Run 'mise run build:fast' (or run:fast) first." >&2

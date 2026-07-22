@@ -2,6 +2,7 @@
 **/*.proptest-regressions
 **/cargo-target
 **/target
+/bin
 .webrtc-sys/
 **/venv
 **/.direnv
@@ -17,6 +18,8 @@
 .netrc
 *.pyc
 .pytest_cache
+.remote-build/
+mise.local.toml
 .swiftpm
 .swiftpm/config/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata

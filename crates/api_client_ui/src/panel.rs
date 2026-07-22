@@ -3587,4 +3587,59 @@ mod tests {
         assert_eq!(reimported.variables.len(), 1);
         assert_eq!(reimported.variables[0].key, "base_url");
     }
+
+    // Reproduces the reported crash: clicking a tree request row whose body
+    // is `Raw` (the shape Postman-imported requests have) used to panic with
+    // "cannot read workspace::Workspace while it is already being updated",
+    // because `RequestView::new` synced its body language synchronously
+    // while still nested inside the `workspace.update(...)` call that
+    // constructs it. A request with a `None` body (like a freshly created
+    // blank one) never hit this path, which is why it went unnoticed until a
+    // real Raw-bodied request -- e.g. imported from Postman -- was opened.
+    #[gpui::test]
+    async fn clicking_a_raw_body_request_row_opens_it_without_panicking(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Imported".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.body = api_client::RequestBody::Raw {
+                    content_type: api_client::RawBodyContentType::Json,
+                    text: "{}".into(),
+                };
+            });
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.expanded_collections.insert(collection_id);
+            cx.notify();
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        draw(&mut cx);
+
+        let row = debug_center(
+            &mut cx,
+            format!("api-client-request-row-{request_id}").leak(),
+        );
+        cx.simulate_click(row, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let opened_a_request_tab = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .any(|item| item.tab_content_text(0, cx) == "Get users")
+        });
+        assert!(
+            opened_a_request_tab,
+            "clicking a Raw-body request row must open it as a tab instead of crashing"
+        );
+    }
 }

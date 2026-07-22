@@ -873,4 +873,211 @@ mod integration_tests {
 
         test_result.expect("Secondary index DDL reconstruction check failed");
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_materialized_view_round_trip() {
+        let config = test_config_from_env()
+            .expect("CASSANDRA_TEST_URL env var required for integration tests");
+        let provider = CassandraProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let keyspace = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let table = "scores";
+        let view = "scores_by_status";
+
+        provider
+            .query(&format!(
+                "CREATE KEYSPACE {keyspace} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .expect("Failed to create scratch keyspace");
+
+        let test_result: Result<()> = async {
+            provider
+                .query(&format!(
+                    "CREATE TABLE {keyspace}.{table} (id int PRIMARY KEY, status text, points int)"
+                ))
+                .await?;
+            provider
+                .query(&format!(
+                    "CREATE MATERIALIZED VIEW {keyspace}.{view} AS \
+                     SELECT * FROM {keyspace}.{table} \
+                     WHERE status IS NOT NULL AND id IS NOT NULL \
+                     PRIMARY KEY (status, id)"
+                ))
+                .await?;
+
+            provider
+                .execute_query(
+                    &keyspace,
+                    &format!("INSERT INTO {table} (id, status, points) VALUES (1, 'active', 42)"),
+                )
+                .await?;
+
+            let result = provider
+                .execute_query(
+                    &keyspace,
+                    &format!("SELECT id, points FROM {view} WHERE status = 'active'"),
+                )
+                .await?;
+            assert_eq!(
+                result.rows.len(),
+                1,
+                "the materialized view must reflect the base table row"
+            );
+            assert_eq!(result.rows[0][0].as_deref(), Some("1"));
+            assert_eq!(result.rows[0][1].as_deref(), Some("42"));
+
+            provider
+                .query(&format!("DROP MATERIALIZED VIEW {keyspace}.{view}"))
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        provider
+            .query(&format!("DROP KEYSPACE {keyspace}"))
+            .await
+            .expect("Failed to clean up scratch keyspace");
+
+        test_result.expect("Materialized view round trip failed");
+    }
+
+    /// CQL's `UPDATE` is a "write path" statement like `INSERT` -- it creates
+    /// the row if the partition key doesn't exist yet, it does not require
+    /// an existing row to update. Proves that upsert behavior directly,
+    /// rather than assuming it.
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_upserts_a_row_that_does_not_exist_yet() {
+        let config = test_config_from_env()
+            .expect("CASSANDRA_TEST_URL env var required for integration tests");
+        let provider = CassandraProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let keyspace = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let table = "counters";
+
+        provider
+            .query(&format!(
+                "CREATE KEYSPACE {keyspace} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .expect("Failed to create scratch keyspace");
+
+        let test_result: Result<()> = async {
+            provider
+                .query(&format!(
+                    "CREATE TABLE {keyspace}.{table} (name text PRIMARY KEY, hits int)"
+                ))
+                .await?;
+
+            provider
+                .execute_query(
+                    &keyspace,
+                    &format!("UPDATE {table} SET hits = 1 WHERE name = 'clicks'"),
+                )
+                .await?;
+            let after_first = provider
+                .execute_query(
+                    &keyspace,
+                    &format!("SELECT hits FROM {table} WHERE name = 'clicks'"),
+                )
+                .await?;
+            assert_eq!(
+                after_first.rows[0][0].as_deref(),
+                Some("1"),
+                "UPDATE on a nonexistent partition key must upsert a new row"
+            );
+
+            provider
+                .execute_query(
+                    &keyspace,
+                    &format!("UPDATE {table} SET hits = 2 WHERE name = 'clicks'"),
+                )
+                .await?;
+            let after_second = provider
+                .execute_query(
+                    &keyspace,
+                    &format!("SELECT hits FROM {table} WHERE name = 'clicks'"),
+                )
+                .await?;
+            assert_eq!(
+                after_second.rows.len(),
+                1,
+                "must still be a single row, not a duplicate"
+            );
+            assert_eq!(after_second.rows[0][0].as_deref(), Some("2"));
+            Ok(())
+        }
+        .await;
+
+        provider
+            .query(&format!("DROP KEYSPACE {keyspace}"))
+            .await
+            .expect("Failed to clean up scratch keyspace");
+
+        test_result.expect("Update-upserts-a-row check failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_row() {
+        let config = test_config_from_env()
+            .expect("CASSANDRA_TEST_URL env var required for integration tests");
+        let provider = CassandraProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let keyspace = format!("zdbt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let table = "sessions";
+
+        provider
+            .query(&format!(
+                "CREATE KEYSPACE {keyspace} WITH REPLICATION = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ))
+            .await
+            .expect("Failed to create scratch keyspace");
+
+        let test_result: Result<()> = async {
+            provider
+                .query(&format!(
+                    "CREATE TABLE {keyspace}.{table} (id text PRIMARY KEY, active boolean)"
+                ))
+                .await?;
+            provider
+                .execute_query(
+                    &keyspace,
+                    &format!("INSERT INTO {table} (id, active) VALUES ('s1', true)"),
+                )
+                .await?;
+            let before = provider
+                .execute_query(
+                    &keyspace,
+                    &format!("SELECT id FROM {table} WHERE id = 's1'"),
+                )
+                .await?;
+            assert_eq!(before.rows.len(), 1);
+
+            provider
+                .execute_query(&keyspace, &format!("DELETE FROM {table} WHERE id = 's1'"))
+                .await?;
+            let after = provider
+                .execute_query(
+                    &keyspace,
+                    &format!("SELECT id FROM {table} WHERE id = 's1'"),
+                )
+                .await?;
+            assert!(after.rows.is_empty(), "row should be gone after DELETE");
+            Ok(())
+        }
+        .await;
+
+        provider
+            .query(&format!("DROP KEYSPACE {keyspace}"))
+            .await
+            .expect("Failed to clean up scratch keyspace");
+
+        test_result.expect("Delete row check failed");
+    }
 }

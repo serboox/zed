@@ -57,6 +57,12 @@ const ZOOM_STEP: f32 = 0.25;
 // Line-based wheel deltas carry small magnitudes; scale them up to feel like pixel scrolls.
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.005;
+// Fit-to-viewport only ever zooms OUT to frame a large graph; it never enlarges
+// a small schema past 1.0 into oversized boxes.
+const MAX_FIT_ZOOM: f32 = 1.0;
+// Bounded retries for the one-shot on-open fit while the scroll container has
+// not been measured yet, so a zero-size viewport can never animate forever.
+const MAX_FIT_ATTEMPTS: u8 = 30;
 
 // Base (zoom = 1.0) pixel sizes for everything inside a box. Zoom multiplies
 // each of these by the same factor so the diagram scales like an image: text,
@@ -69,6 +75,16 @@ const ROW_GAP: f32 = 4.0;
 const ICON_PX: f32 = 12.0;
 const LINE_STROKE: f32 = 1.5;
 const ARROW_SIZE: f32 = 8.0;
+// Perpendicular half-spread of a crow's-foot toe / "one" bar, as a fraction of
+// the marker size. 0.75 is exactly representable in f32, so marker geometry is
+// bit-stable and unit-testable with exact equality.
+const MARKER_SPREAD: f32 = 0.75;
+// Graph-paper dot grid painted behind the diagram.
+const GRID_SPACING: f32 = 24.0;
+const GRID_DOT: f32 = 1.5;
+// Upper bound on dots painted per frame; past this the grid is skipped so a huge
+// zoomed-out canvas can never stall a frame drawing millions of quads.
+const MAX_GRID_DOTS: i64 = 20_000;
 
 fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
@@ -171,27 +187,83 @@ pub fn elbow_route(
     ]
 }
 
-/// Triangle points for an arrowhead whose tip sits at `to`, pointing along
-/// the direction from `from` to `to`. Coincident points (a zero-length final
-/// segment) degenerate to a zero-size triangle at `to` rather than dividing
-/// by zero, since a relationship route should never realistically produce
-/// this but a defensive caller still deserves a valid (if invisible) result.
-pub fn arrowhead_triangle(from: (f32, f32), to: (f32, f32), size: f32) -> [(f32, f32); 3] {
+/// Crow's-foot ("many") marker for a relationship's foreign-key end. `to` is the
+/// point on the entity edge where the three toes spread; the apex sits `size`
+/// back along the line toward `from`. Returns `[apex, toe_left, toe_center,
+/// toe_right]` -- painting a segment from `apex` to each toe draws the foot.
+/// A zero-length segment degenerates to every point at `to` rather than dividing
+/// by zero.
+pub fn crows_foot(from: (f32, f32), to: (f32, f32), size: f32) -> [(f32, f32); 4] {
     let dx = to.0 - from.0;
     let dy = to.1 - from.1;
     let len = (dx * dx + dy * dy).sqrt();
     if len < f32::EPSILON {
-        return [to, to, to];
+        return [to, to, to, to];
     }
     let ux = dx / len;
     let uy = dy / len;
     let perp_x = -uy;
     let perp_y = ux;
-    let back = (to.0 - ux * size, to.1 - uy * size);
-    let half = size * 0.5;
-    let left = (back.0 + perp_x * half, back.1 + perp_y * half);
-    let right = (back.0 - perp_x * half, back.1 - perp_y * half);
-    [to, left, right]
+    let apex = (to.0 - ux * size, to.1 - uy * size);
+    let half = size * MARKER_SPREAD;
+    let toe_left = (to.0 + perp_x * half, to.1 + perp_y * half);
+    let toe_right = (to.0 - perp_x * half, to.1 - perp_y * half);
+    [apex, toe_left, to, toe_right]
+}
+
+/// "One" bar marker for a relationship's referenced end: a short tick drawn
+/// perpendicular to the line, `size` back from the entity edge `to`. Returns the
+/// bar's two endpoints. Degenerates to `[to, to]` for a zero-length segment.
+pub fn one_bar(from: (f32, f32), to: (f32, f32), size: f32) -> [(f32, f32); 2] {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < f32::EPSILON {
+        return [to, to];
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let perp_x = -uy;
+    let perp_y = ux;
+    let center = (to.0 - ux * size, to.1 - uy * size);
+    let half = size * MARKER_SPREAD;
+    [
+        (center.0 + perp_x * half, center.1 + perp_y * half),
+        (center.0 - perp_x * half, center.1 - perp_y * half),
+    ]
+}
+
+/// Orient an end marker: return `(neighbor, anchor)` for one end of a route,
+/// where `anchor` is the endpoint the marker sits on and `neighbor` is the
+/// nearest waypoint distinct from it (scanning inward). Returns `None` only when
+/// every waypoint coincides (a fully degenerate route). A straight vertical or
+/// horizontal route collapses its elbow onto the anchor, making the immediate
+/// neighbor a duplicate; skipping to the first distinct point keeps the marker
+/// correctly pointed instead of degenerating to an invisible zero-length mark.
+fn marker_direction(points: &[(f32, f32)], from_start: bool) -> Option<((f32, f32), (f32, f32))> {
+    if from_start {
+        let anchor = *points.first()?;
+        let neighbor = points.iter().copied().find(|point| *point != anchor)?;
+        Some((neighbor, anchor))
+    } else {
+        let anchor = *points.last()?;
+        let neighbor = points
+            .iter()
+            .rev()
+            .copied()
+            .find(|point| *point != anchor)?;
+        Some((neighbor, anchor))
+    }
+}
+
+/// Split a possibly schema-qualified table name into `(schema, table)`.
+/// `"public.users"` -> `(Some("public"), "users")`; `"users"` -> `(None, "users")`.
+/// A trailing or leading dot leaves the whole string as the table name.
+fn split_qualified_name(name: &str) -> (Option<&str>, &str) {
+    match name.rsplit_once('.') {
+        Some((schema, table)) if !schema.is_empty() && !table.is_empty() => (Some(schema), table),
+        _ => (None, name),
+    }
 }
 
 fn escape_mermaid_type(data_type: &str) -> String {
@@ -337,13 +409,6 @@ pub fn to_svg(tables: &[ErdTable], relationships: &[ErdRelationship]) -> String 
             continue;
         };
         let waypoints = elbow_route(from_box, to_box);
-        let Some(tail) = waypoints.get(waypoints.len().saturating_sub(2)) else {
-            continue;
-        };
-        let Some(tip) = waypoints.last() else {
-            continue;
-        };
-        let arrow = arrowhead_triangle(*tail, *tip, ARROW_SIZE);
         let points = waypoints
             .iter()
             .map(|(x, y)| format!("{x},{y}"))
@@ -352,10 +417,25 @@ pub fn to_svg(tables: &[ErdTable], relationships: &[ErdRelationship]) -> String 
         out.push_str(&format!(
             "<polyline points=\"{points}\" fill=\"none\" stroke=\"{SVG_LINE}\" stroke-width=\"{LINE_STROKE}\"/>\n"
         ));
-        out.push_str(&format!(
-            "<polygon points=\"{},{} {},{} {},{}\" fill=\"{SVG_LINE}\"/>\n",
-            arrow[0].0, arrow[0].1, arrow[1].0, arrow[1].1, arrow[2].0, arrow[2].1
-        ));
+        // Crow's-foot ("many") at the FK end (route start); "one" bar at the
+        // referenced end (route end). Orient from the nearest distinct waypoint
+        // so a straight vertical/horizontal route still gets visible markers.
+        if let Some((many_from, many_to)) = marker_direction(&waypoints, true) {
+            let foot = crows_foot(many_from, many_to, ARROW_SIZE);
+            for toe in &foot[1..] {
+                out.push_str(&format!(
+                    "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{SVG_LINE}\" stroke-width=\"{LINE_STROKE}\"/>\n",
+                    foot[0].0, foot[0].1, toe.0, toe.1
+                ));
+            }
+        }
+        if let Some((one_from, one_to)) = marker_direction(&waypoints, false) {
+            let bar = one_bar(one_from, one_to, ARROW_SIZE);
+            out.push_str(&format!(
+                "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{SVG_LINE}\" stroke-width=\"{LINE_STROKE}\"/>\n",
+                bar[0].0, bar[0].1, bar[1].0, bar[1].1
+            ));
+        }
     }
 
     for table in tables {
@@ -424,6 +504,15 @@ struct PlacedTable {
     origin_y: f32,
 }
 
+/// Unscaled (zoom = 1.0) paint geometry for one relationship: the elbow-routed
+/// connector plus its crow's-foot ("many", FK side) and bar ("one", referenced
+/// side) end markers.
+struct RelationshipGeometry {
+    waypoints: Vec<(f32, f32)>,
+    crows_foot: [(f32, f32); 4],
+    one_bar: [(f32, f32); 2],
+}
+
 pub struct ErdView {
     focus_handle: FocusHandle,
     title: SharedString,
@@ -439,6 +528,11 @@ pub struct ErdView {
     // (mouse position, scroll offset) captured at the start of a click-drag pan;
     // `None` means the canvas is idle (not currently being dragged).
     pan_origin: Option<(Point<gpui::Pixels>, Point<gpui::Pixels>)>,
+    // One-shot: frame the whole graph on first render, once the scroll container
+    // has been measured. Cleared by the fit itself or by any manual zoom/pan so
+    // user interaction is never overridden by a late auto-fit.
+    pending_fit: bool,
+    fit_attempts: u8,
 }
 
 impl ErdView {
@@ -480,6 +574,8 @@ impl ErdView {
             scroll_handle: ScrollHandle::new(),
             zoom: 1.0,
             pan_origin: None,
+            pending_fit: true,
+            fit_attempts: 0,
         }
     }
 
@@ -496,21 +592,55 @@ impl ErdView {
     }
 
     fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.pending_fit = false;
         self.zoom = clamp_zoom(self.zoom + ZOOM_STEP);
         cx.notify();
     }
 
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.pending_fit = false;
         self.zoom = clamp_zoom(self.zoom - ZOOM_STEP);
         cx.notify();
     }
 
     fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.pending_fit = false;
         self.zoom = 1.0;
         cx.notify();
     }
 
+    /// Zoom and scroll so the whole graph is framed within `viewport`. Only ever
+    /// zooms out (capped at `MAX_FIT_ZOOM`) and resets the scroll to the origin so
+    /// the framed graph starts at the top-left. A degenerate viewport is a no-op.
+    fn apply_fit(&mut self, viewport: gpui::Size<gpui::Pixels>) {
+        let viewport_width: f32 = viewport.width.into();
+        let viewport_height: f32 = viewport.height.into();
+        if viewport_width <= 0.0 || viewport_height <= 0.0 {
+            return;
+        }
+        let fit = (viewport_width / self.total_width)
+            .min(viewport_height / self.total_height)
+            .min(MAX_FIT_ZOOM);
+        self.zoom = clamp_zoom(fit);
+        self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
+    }
+
+    fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
+        let viewport = self.scroll_handle.bounds().size;
+        if viewport.width > px(0.0) && viewport.height > px(0.0) {
+            self.apply_fit(viewport);
+            self.pending_fit = false;
+        } else {
+            // The container has not been measured yet; defer to the on-render
+            // fit path, which retries once bounds are known.
+            self.pending_fit = true;
+            self.fit_attempts = 0;
+        }
+        cx.notify();
+    }
+
     fn begin_pan(&mut self, mouse_position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.pending_fit = false;
         self.pan_origin = Some((mouse_position, self.scroll_handle.offset()));
         cx.notify();
     }
@@ -544,6 +674,7 @@ impl ErdView {
         } else {
             1.0 / (1.0 + delta_y.abs() * WHEEL_ZOOM_SENSITIVITY)
         };
+        self.pending_fit = false;
         self.zoom = clamp_zoom(self.zoom * factor);
         true
     }
@@ -565,21 +696,27 @@ impl ErdView {
         })
     }
 
-    /// Unscaled elbow-routed waypoints and arrowhead triangle for every
+    /// Unscaled elbow-routed waypoints plus crow's-foot/bar end markers for every
     /// relationship whose both endpoints are placed tables. Kept as its own
     /// method (rather than inlined in `render`) so it is directly callable
     /// and assertable from tests without a full paint pass.
-    fn relationship_paths(&self) -> Vec<(Vec<(f32, f32)>, [(f32, f32); 3])> {
+    fn relationship_paths(&self) -> Vec<RelationshipGeometry> {
         self.relationships
             .iter()
             .filter_map(|relationship| {
                 let from_box = self.table_box(&relationship.from_table)?;
                 let to_box = self.table_box(&relationship.to_table)?;
                 let waypoints = elbow_route(from_box, to_box);
-                let tail = *waypoints.get(waypoints.len().checked_sub(2)?)?;
-                let tip = *waypoints.last()?;
-                let arrow = arrowhead_triangle(tail, tip, ARROW_SIZE);
-                Some((waypoints, arrow))
+                // Route runs FK side (start, "many") -> referenced side (end, "one").
+                let (many_from, many_to) = marker_direction(&waypoints, true)?;
+                let (one_from, one_to) = marker_direction(&waypoints, false)?;
+                let crows_foot = crows_foot(many_from, many_to, ARROW_SIZE);
+                let one_bar = one_bar(one_from, one_to, ARROW_SIZE);
+                Some(RelationshipGeometry {
+                    waypoints,
+                    crows_foot,
+                    one_bar,
+                })
             })
             .collect()
     }
@@ -598,6 +735,14 @@ impl ErdView {
         let header_font = px(scaled(HEADER_FONT, zoom));
         let column_font = px(scaled(COLUMN_FONT, zoom));
         let icon_size = IconSize::Custom(rems_from_px(scaled(ICON_PX, zoom)));
+        // A fixed-width leading gutter on every row (header, columns, overflow)
+        // so key rows (icon) and non-key rows (no icon) start their text at the
+        // same x, and names line up under the table title.
+        let gutter_width = px(scaled(ICON_PX, zoom));
+        // Accent tint gives the title strip clear separation from the body:
+        // element_background vs elevated_surface_background are nearly identical.
+        let header_bg = colors.text_accent.opacity(0.12);
+        let (schema, table_name) = split_qualified_name(&placed.table.name);
         let (box_x, box_y, box_w, _box_h) = scaled_box(
             placed.origin_x,
             placed.origin_y,
@@ -620,17 +765,34 @@ impl ErdView {
                     .h(px(scaled(HEADER_HEIGHT, zoom)))
                     .w_full()
                     .px(cell_padding)
+                    .gap(row_gap)
                     .items_center()
-                    .bg(colors.element_background)
+                    .bg(header_bg)
                     .border_b_1()
                     .border_color(colors.border)
+                    .child(
+                        h_flex().w(gutter_width).flex_none().items_center().child(
+                            Icon::new(IconName::ListTree)
+                                .size(icon_size)
+                                .color(Color::Custom(colors.text_accent)),
+                        ),
+                    )
+                    .when_some(schema, |header, schema| {
+                        header.child(
+                            div()
+                                .text_size(column_font)
+                                .text_color(colors.text_muted)
+                                .truncate()
+                                .child(format!("{schema}.")),
+                        )
+                    })
                     .child(
                         div()
                             .text_size(header_font)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(colors.text)
                             .truncate()
-                            .child(placed.table.name.clone()),
+                            .child(table_name.to_string()),
                     ),
             );
         for column in placed.table.columns.iter().take(visible) {
@@ -641,6 +803,19 @@ impl ErdView {
             } else {
                 None
             };
+            let mut gutter = h_flex().w(gutter_width).flex_none().items_center();
+            if let Some(color) = key_color {
+                gutter = gutter.child(
+                    Icon::new(if column.is_primary_key {
+                        IconName::StarFilled
+                    } else {
+                        IconName::Link
+                    })
+                    .size(icon_size)
+                    .color(Color::Custom(color)),
+                );
+            }
+            let column_name = column.name.clone();
             box_element = box_element.child(
                 h_flex()
                     .h(px(scaled(ROW_HEIGHT, zoom)))
@@ -648,23 +823,17 @@ impl ErdView {
                     .px(cell_padding)
                     .gap(row_gap)
                     .items_center()
-                    .when_some(key_color, |row, color| {
-                        row.child(
-                            Icon::new(if column.is_primary_key {
-                                IconName::StarFilled
-                            } else {
-                                IconName::Link
-                            })
-                            .size(icon_size)
-                            .color(Color::Custom(color)),
-                        )
-                    })
+                    .child(gutter)
                     .child(
                         div()
+                            .debug_selector({
+                                let name = column_name.clone();
+                                move || format!("ERD_COL_NAME::{name}")
+                            })
                             .text_size(column_font)
                             .text_color(colors.text)
                             .truncate()
-                            .child(column.name.clone()),
+                            .child(column_name),
                     )
                     .child(
                         div()
@@ -682,7 +851,9 @@ impl ErdView {
                     .h(px(scaled(ROW_HEIGHT, zoom)))
                     .w_full()
                     .px(cell_padding)
+                    .gap(row_gap)
                     .items_center()
+                    .child(h_flex().w(gutter_width).flex_none())
                     .child(
                         div()
                             .text_size(column_font)
@@ -721,23 +892,40 @@ impl Item for ErdView {
 
 impl Render for ErdView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One-shot: frame the whole graph on open. The scroll container's size is
+        // only known after it has been painted once, so on the first frame we ask
+        // for another frame and fit once bounds are available.
+        if self.pending_fit {
+            let viewport = self.scroll_handle.bounds().size;
+            if viewport.width > px(0.0) && viewport.height > px(0.0) {
+                self.apply_fit(viewport);
+                self.pending_fit = false;
+            } else if self.fit_attempts < MAX_FIT_ATTEMPTS {
+                self.fit_attempts += 1;
+                window.request_animation_frame();
+            } else {
+                self.pending_fit = false;
+            }
+        }
+
         let colors = cx.theme().colors();
         let line_color: Hsla = colors.border_variant;
+        let dot_color: Hsla = colors.border_variant.opacity(0.55);
         let zoom = self.zoom;
 
         let mut routes: Vec<Vec<gpui::Point<gpui::Pixels>>> = Vec::new();
-        let mut arrowheads: Vec<[gpui::Point<gpui::Pixels>; 3]> = Vec::new();
-        for (waypoints, arrow) in self.relationship_paths() {
-            routes.push(
-                waypoints
-                    .iter()
-                    .map(|(x, y)| point(px(scaled(*x, zoom)), px(scaled(*y, zoom))))
-                    .collect(),
-            );
-            arrowheads.push(arrow.map(|(x, y)| point(px(scaled(x, zoom)), px(scaled(y, zoom)))));
+        let mut crows_feet: Vec<[gpui::Point<gpui::Pixels>; 4]> = Vec::new();
+        let mut one_bars: Vec<[gpui::Point<gpui::Pixels>; 2]> = Vec::new();
+        let scale_point = |(x, y): (f32, f32)| point(px(scaled(x, zoom)), px(scaled(y, zoom)));
+        for geometry in self.relationship_paths() {
+            routes.push(geometry.waypoints.iter().map(|p| scale_point(*p)).collect());
+            crows_feet.push(geometry.crows_foot.map(scale_point));
+            one_bars.push(geometry.one_bar.map(scale_point));
         }
 
         let stroke_width = px(scaled(LINE_STROKE, zoom));
+        let grid_spacing = scaled(GRID_SPACING, zoom).max(4.0);
+        let dot_size = px(scaled(GRID_DOT, zoom).max(1.0));
 
         let mut surface = div()
             .relative()
@@ -746,7 +934,26 @@ impl Render for ErdView {
             .child(
                 canvas(
                     move |_, _, _| {},
-                    move |_bounds, _, window, _| {
+                    move |bounds, _, window, _| {
+                        // Graph-paper dot grid behind everything else.
+                        let width: f32 = bounds.size.width.into();
+                        let height: f32 = bounds.size.height.into();
+                        let columns = (width / grid_spacing).ceil().max(0.0) as i64;
+                        let rows = (height / grid_spacing).ceil().max(0.0) as i64;
+                        if (columns + 1).saturating_mul(rows + 1) <= MAX_GRID_DOTS {
+                            for row in 0..=rows {
+                                for column in 0..=columns {
+                                    let origin = point(
+                                        bounds.origin.x + px(column as f32 * grid_spacing),
+                                        bounds.origin.y + px(row as f32 * grid_spacing),
+                                    );
+                                    window.paint_quad(gpui::fill(
+                                        gpui::Bounds::new(origin, gpui::size(dot_size, dot_size)),
+                                        dot_color,
+                                    ));
+                                }
+                            }
+                        }
                         for route in &routes {
                             let Some((first, rest)) = route.split_first() else {
                                 continue;
@@ -760,12 +967,22 @@ impl Render for ErdView {
                                 window.paint_path(path, line_color);
                             }
                         }
-                        for triangle in &arrowheads {
-                            let mut builder = gpui::PathBuilder::fill();
-                            builder.move_to(triangle[0]);
-                            builder.line_to(triangle[1]);
-                            builder.line_to(triangle[2]);
-                            builder.close();
+                        // Crow's foot ("many"): three toes fanning from the apex.
+                        for foot in &crows_feet {
+                            for toe in foot.iter().skip(1) {
+                                let mut builder = gpui::PathBuilder::stroke(stroke_width);
+                                builder.move_to(foot[0]);
+                                builder.line_to(*toe);
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, line_color);
+                                }
+                            }
+                        }
+                        // "One" bar: a single perpendicular tick.
+                        for bar in &one_bars {
+                            let mut builder = gpui::PathBuilder::stroke(stroke_width);
+                            builder.move_to(bar[0]);
+                            builder.line_to(bar[1]);
                             if let Ok(path) = builder.build() {
                                 window.paint_path(path, line_color);
                             }
@@ -818,6 +1035,12 @@ impl Render for ErdView {
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Zoom in"))
                             .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
+                    )
+                    .child(
+                        IconButton::new("erd-zoom-fit", IconName::Maximize)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Zoom to fit the whole diagram"))
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_to_fit(cx))),
                     )
                     .child(
                         Button::new("erd-copy-mermaid", "Copy Mermaid")
@@ -1006,8 +1229,8 @@ mod tests {
             "relationship should render as a polyline"
         );
         assert!(
-            svg.contains("<polygon"),
-            "relationship should render an arrowhead polygon"
+            svg.contains("<line"),
+            "relationship endpoints should render crow's-foot / bar line marks"
         );
     }
 
@@ -1029,6 +1252,96 @@ mod tests {
         );
         assert!(svg.contains("a&lt;b&gt;&amp;&quot;c&quot;"));
         assert!(svg.contains("x&amp;y"));
+    }
+
+    // Column type strings observed against a live ClickHouse 24.10 instance
+    // (`system.columns.type`): nested wrapper types (`Nullable`,
+    // `LowCardinality`), composite types (`Array`, `Map`), and an `Enum8`
+    // with embedded quotes and a comma -- exactly the punctuation the
+    // Mermaid/DOT/SVG renderers below must not choke on. ClickHouse has no
+    // foreign-key concept and `list_foreign_keys` is unimplemented for it
+    // (falls back to `DbProvider`'s empty default), so a real ClickHouse ERD
+    // always carries zero relationships -- this never passes any, matching
+    // that.
+    fn clickhouse_sample() -> Vec<ErdTable> {
+        vec![ErdTable {
+            name: "events".into(),
+            columns: vec![
+                ErdColumn {
+                    name: "id".into(),
+                    data_type: "UInt32".into(),
+                    is_primary_key: true,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "amount".into(),
+                    data_type: "Nullable(UInt32)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "tags".into(),
+                    data_type: "Array(String)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "attrs".into(),
+                    data_type: "Map(String, String)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "status".into(),
+                    data_type: "Enum8('active' = 1, 'inactive' = 2)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "label".into(),
+                    data_type: "LowCardinality(String)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "price".into(),
+                    data_type: "Decimal(10, 2)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+            ],
+        }]
+    }
+
+    #[test]
+    fn clickhouse_column_types_with_no_relationships_render_without_panicking_or_implying_fks() {
+        let tables = clickhouse_sample();
+        let relationships = Vec::new();
+
+        let mermaid = to_mermaid(&tables, &relationships);
+        assert!(mermaid.contains("    events {\n"));
+        assert!(
+            !mermaid.contains(" FK"),
+            "ClickHouse has no FK concept -- nothing should be marked FK: {mermaid}"
+        );
+        assert!(mermaid.contains("UInt32 id PK"));
+
+        let dot = to_dot(&tables, &relationships);
+        assert!(dot.contains("\"events\""));
+        assert!(!dot.contains("FK "));
+
+        let svg = to_svg(&tables, &relationships);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains(">events<"));
+        assert!(
+            !svg.contains("<polyline"),
+            "no relationships means no relationship lines"
+        );
+        assert!(
+            !svg.contains(">FK </text>"),
+            "ClickHouse has no FK concept to mark"
+        );
     }
 
     #[test]
@@ -1228,6 +1541,12 @@ mod tests {
             .update(&mut cx, |frame, _, _| frame.view.clone())
             .unwrap();
 
+        // Lock off the one-shot on-open fit so the drag runs at 100% zoom with
+        // the full 2D scroll range; an auto-fit to 400x300 would zoom this
+        // 30-table graph down until the horizontal range disappears.
+        erd.update(&mut cx, |view, cx| view.reset_zoom(cx));
+        draw_erd_frame(&mut cx);
+
         let scroll_bounds = cx
             .debug_bounds("ERD_SCROLL")
             .expect("scroll container should have painted bounds");
@@ -1289,6 +1608,12 @@ mod tests {
         let erd = window
             .update(&mut cx, |frame, _, _| frame.view.clone())
             .unwrap();
+
+        // Lock off the one-shot on-open fit so this test measures scroll
+        // stability at a fixed 100% zoom, not a late auto-fit that would reset
+        // the zoom and scroll offset mid-test.
+        erd.update(&mut cx, |view, cx| view.reset_zoom(cx));
+        draw_erd_frame(&mut cx);
 
         let bounds_initial = cx
             .debug_bounds("ERD_SCROLL")
@@ -1402,30 +1727,66 @@ mod tests {
     }
 
     #[test]
-    fn arrowhead_triangle_points_back_from_the_tip_along_the_line_direction() {
-        let triangle = arrowhead_triangle((0.0, 0.0), (10.0, 0.0), 6.0);
+    fn crows_foot_spreads_three_toes_at_the_anchor_with_the_apex_back_along_the_line() {
+        // Line runs left -> right, marker anchored at (10, 0).
+        let foot = crows_foot((0.0, 0.0), (10.0, 0.0), 8.0);
+        // [apex, toe_left, toe_center, toe_right]
+        assert_eq!(foot[0], (2.0, 0.0), "apex sits `size` back along the line");
         assert_eq!(
-            triangle[0],
+            foot[2],
             (10.0, 0.0),
-            "tip sits exactly at the target point"
+            "center toe sits exactly on the anchor"
         );
-        assert_eq!(triangle[1], (4.0, 3.0));
-        assert_eq!(triangle[2], (4.0, -3.0));
+        // Toes spread perpendicular by +/- size * MARKER_SPREAD = 6.0.
+        assert_eq!(foot[1], (10.0, 6.0));
+        assert_eq!(foot[3], (10.0, -6.0));
     }
 
     #[test]
-    fn arrowhead_triangle_handles_coincident_points_without_panicking() {
-        let triangle = arrowhead_triangle((5.0, 5.0), (5.0, 5.0), 6.0);
-        assert_eq!(triangle, [(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)]);
+    fn crows_foot_handles_coincident_points_without_panicking() {
+        let foot = crows_foot((5.0, 5.0), (5.0, 5.0), 8.0);
+        assert_eq!(foot, [(5.0, 5.0); 4]);
     }
 
-    // Real end-to-end proof that relationship lines route around box edges
-    // with a trailing arrowhead, not a straight center-to-center diagonal
-    // through both tables' contents -- calls the exact method `render` uses
-    // to build what it paints, the closest achievable proxy since individual
-    // painted path segments have no `debug_selector` to assert on directly.
+    #[test]
+    fn one_bar_draws_a_perpendicular_tick_back_from_the_anchor() {
+        let bar = one_bar((0.0, 0.0), (10.0, 0.0), 8.0);
+        // Center sits `size` back at (2, 0); bar spans +/- size * MARKER_SPREAD.
+        assert_eq!(bar[0], (2.0, 6.0));
+        assert_eq!(bar[1], (2.0, -6.0));
+    }
+
+    #[test]
+    fn one_bar_handles_coincident_points_without_panicking() {
+        let bar = one_bar((5.0, 5.0), (5.0, 5.0), 8.0);
+        assert_eq!(bar, [(5.0, 5.0), (5.0, 5.0)]);
+    }
+
+    #[test]
+    fn split_qualified_name_separates_schema_from_table() {
+        assert_eq!(
+            split_qualified_name("public.users"),
+            (Some("public"), "users")
+        );
+        assert_eq!(split_qualified_name("users"), (None, "users"));
+        // A leading/trailing dot is not a qualifier: keep the whole string.
+        assert_eq!(split_qualified_name(".users"), (None, ".users"));
+        assert_eq!(split_qualified_name("users."), (None, "users."));
+        // Nested qualifier splits at the last dot.
+        assert_eq!(
+            split_qualified_name("db.public.users"),
+            (Some("db.public"), "users")
+        );
+    }
+
+    // Real end-to-end proof that relationship lines route around box edges and
+    // carry crow's-foot ("many", FK side) and bar ("one", referenced side) end
+    // markers, not a straight center-to-center diagonal through both tables'
+    // contents -- calls the exact method `render` uses to build what it paints,
+    // the closest achievable proxy since individual painted path segments have
+    // no `debug_selector` to assert on directly.
     #[gpui::test]
-    fn relationship_paths_route_around_box_edges_with_an_arrowhead_at_the_target(
+    fn relationship_paths_mark_the_fk_side_with_a_crows_foot_and_the_referenced_side_with_a_bar(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
@@ -1441,28 +1802,108 @@ mod tests {
         view.update(cx, |view, _, _| {
             let paths = view.relationship_paths();
             assert_eq!(paths.len(), 1, "expected exactly one relationship path");
-            let (waypoints, arrow) = &paths[0];
+            let geometry = &paths[0];
+            let waypoints = &geometry.waypoints;
 
             let from_box = view.table_box("orders").expect("orders should be placed");
             let to_box = view.table_box("users").expect("users should be placed");
             let from_center = (from_box.0 + from_box.2 / 2.0, from_box.1 + from_box.3 / 2.0);
             let to_center = (to_box.0 + to_box.2 / 2.0, to_box.1 + to_box.3 / 2.0);
-            let expected_start = edge_anchor(from_box, to_center);
-            let expected_end = edge_anchor(to_box, from_center);
+            // orders holds the FK (many side, route start); users is referenced
+            // (one side, route end).
+            let expected_many = edge_anchor(from_box, to_center);
+            let expected_one = edge_anchor(to_box, from_center);
 
             assert_eq!(
-                waypoints[0], expected_start,
-                "route must start at the source box's edge, not its center"
+                waypoints[0], expected_many,
+                "route must start at the FK box's edge, not its center"
             );
             assert_eq!(
                 *waypoints.last().unwrap(),
-                expected_end,
-                "route must end at the target box's edge, not its center"
+                expected_one,
+                "route must end at the referenced box's edge, not its center"
             );
+            // Crow's-foot center toe sits on the FK-side anchor (route start).
             assert_eq!(
-                arrow[0],
-                *waypoints.last().unwrap(),
-                "arrowhead tip must sit exactly at the route's target anchor"
+                geometry.crows_foot[2], waypoints[0],
+                "crow's-foot center toe must sit exactly at the FK-side anchor"
+            );
+            // The "one" bar is a tick set back from the referenced anchor, so its
+            // midpoint is offset from that anchor (never drawn on top of it).
+            let bar_mid = (
+                (geometry.one_bar[0].0 + geometry.one_bar[1].0) / 2.0,
+                (geometry.one_bar[0].1 + geometry.one_bar[1].1) / 2.0,
+            );
+            assert_ne!(
+                bar_mid, expected_one,
+                "the one-bar must sit back from the referenced anchor, not on it"
+            );
+        })
+        .expect("window should build");
+    }
+
+    // A relationship between two tables stacked in the SAME grid column produces
+    // a straight vertical route whose elbow collapses onto the endpoints, so the
+    // immediate route neighbors are duplicates of the anchors. The end markers
+    // must still be oriented from the nearest DISTINCT waypoint and render with
+    // real extent -- not degenerate to invisible zero-length marks.
+    #[gpui::test]
+    fn vertical_same_column_relationship_still_gets_visible_end_markers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        // With 3 columns/row, table indices 0 and 3 both land in column 0 (rows
+        // 0 and 1), so a relationship between them routes straight down.
+        let mut tables = many_tables(4);
+        tables[3].columns.push(ErdColumn {
+            name: "top_id".into(),
+            data_type: "bigint".into(),
+            is_primary_key: false,
+            is_foreign_key: true,
+        });
+        let relationships = vec![ErdRelationship {
+            from_table: "table_3".into(),
+            from_column: "top_id".into(),
+            to_table: "table_0".into(),
+            to_column: "id".into(),
+        }];
+        let view = cx.add_window(|window, cx| {
+            ErdView::new(tables, relationships, "Diagram: test", window, cx)
+        });
+        view.update(cx, |view, _, _| {
+            let paths = view.relationship_paths();
+            assert_eq!(
+                paths.len(),
+                1,
+                "the same-column relationship must be routed"
+            );
+            let geometry = &paths[0];
+            // Precondition: the route really is degenerate at both ends -- the
+            // exact shape that used to erase the markers.
+            assert_eq!(
+                geometry.waypoints[0], geometry.waypoints[1],
+                "a same-column vertical route starts with a zero-length segment"
+            );
+            let last = geometry.waypoints.len() - 1;
+            assert_eq!(
+                geometry.waypoints[last],
+                geometry.waypoints[last - 1],
+                "a same-column vertical route ends with a zero-length segment"
+            );
+            // The crow's-foot must have real extent (apex distinct from anchor).
+            assert_ne!(
+                geometry.crows_foot[0], geometry.crows_foot[2],
+                "crow's-foot apex must sit back from the anchor, not collapse onto it"
+            );
+            // The one-bar must span a real width (its two ends differ).
+            assert_ne!(
+                geometry.one_bar[0], geometry.one_bar[1],
+                "the one-bar must span a real width, not collapse to a point"
             );
         })
         .expect("window should build");
@@ -1592,6 +2033,12 @@ mod tests {
             .update(&mut cx, |frame, _, _| frame.view.clone())
             .unwrap();
 
+        // Lock off the one-shot on-open fit so this test measures scroll
+        // stability at a fixed 100% zoom, not a late auto-fit that would reset
+        // the zoom and scroll offset mid-test.
+        erd.update(&mut cx, |view, cx| view.reset_zoom(cx));
+        draw_erd_frame(&mut cx);
+
         let bounds_initial = cx
             .debug_bounds("ERD_SCROLL")
             .expect("scroll container should have painted bounds");
@@ -1644,6 +2091,149 @@ mod tests {
             max_offset_after_h_scroll, max_offset_initial,
             "max_offset must not change just because the current horizontal scroll position \
              changed"
+        );
+    }
+
+    // `apply_fit` on a graph far larger than the viewport must zoom OUT (below
+    // 1.0), frame the whole graph (or hit the min-zoom floor), and reset the
+    // scroll to the origin. Directly exercises the fit math with an explicit
+    // viewport, independent of paint timing.
+    #[gpui::test]
+    fn apply_fit_zooms_out_so_a_large_graph_fits_the_viewport(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(30);
+        let view = cx
+            .add_window(|window, cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+        view.update(cx, |view, _window, _cx| {
+            assert_eq!(view.zoom, 1.0, "a fresh view starts at 100% zoom");
+            let total_width = view.total_width;
+            let total_height = view.total_height;
+
+            view.apply_fit(gpui::size(px(400.), px(300.)));
+
+            assert!(
+                view.zoom < 1.0,
+                "a 30-table graph must be zoomed out to fit a 400x300 viewport, got {}",
+                view.zoom
+            );
+            // Either the whole graph now fits the viewport, or we bottomed out at
+            // the minimum zoom (still the best achievable frame).
+            let fits =
+                total_width * view.zoom <= 400.0 + 0.5 && total_height * view.zoom <= 300.0 + 0.5;
+            assert!(
+                fits || view.zoom == MIN_ZOOM,
+                "fit must frame the whole graph or clamp to the min zoom; zoom={}",
+                view.zoom
+            );
+            assert_eq!(
+                view.scroll_handle.offset(),
+                point(px(0.), px(0.)),
+                "fit resets the scroll so the framed graph starts at the top-left"
+            );
+        })
+        .expect("window should build");
+    }
+
+    // Fit-on-open: after the scroll container has been measured, the one-shot
+    // fit fires by itself (no toolbar click) and leaves a large schema zoomed
+    // out. Pumps frames until the one-shot flag is consumed.
+    #[gpui::test]
+    fn opening_a_large_diagram_fits_it_to_the_viewport_automatically(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = many_tables(30);
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let erd = window
+            .update(&mut cx, |frame, _, _| frame.view.clone())
+            .unwrap();
+
+        assert!(
+            erd.read_with(&cx, |view, _| view.pending_fit),
+            "a freshly opened diagram arms the one-shot fit"
+        );
+
+        // First frame measures the container; the next consumes the fit.
+        for _ in 0..MAX_FIT_ATTEMPTS {
+            draw_erd_frame(&mut cx);
+            if !erd.read_with(&cx, |view, _| view.pending_fit) {
+                break;
+            }
+        }
+
+        let (pending, zoom) = erd.read_with(&cx, |view, _| (view.pending_fit, view.zoom));
+        assert!(
+            !pending,
+            "the one-shot fit must be consumed once the container is measured"
+        );
+        assert!(
+            zoom < 1.0,
+            "a 30-table schema must be auto-fitted (zoomed out) on open, got {zoom}"
+        );
+    }
+
+    // Every column row (key and non-key alike) reserves a fixed leading gutter,
+    // so a non-key column's name starts at the same x as a primary-key column's
+    // name. Without the gutter, the non-key name shifts left under the missing
+    // icon. Drives a real paint and compares the two names' painted origins.
+    #[gpui::test]
+    fn every_column_row_reserves_a_leading_gutter_so_names_align(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let tables = vec![ErdTable {
+            name: "account".into(),
+            columns: vec![
+                ErdColumn {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    is_primary_key: true,
+                    is_foreign_key: false,
+                },
+                ErdColumn {
+                    name: "email".into(),
+                    data_type: "varchar(255)".into(),
+                    is_primary_key: false,
+                    is_foreign_key: false,
+                },
+            ],
+        }];
+        let window = cx.add_window(|window, cx| {
+            let erd = cx.new(|cx| ErdView::new(tables, Vec::new(), "Diagram: test", window, cx));
+            ErdViewFrame { view: erd }
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_erd_frame(&mut cx);
+
+        let key_name = cx
+            .debug_bounds("ERD_COL_NAME::id")
+            .expect("the primary-key column name should paint");
+        let plain_name = cx
+            .debug_bounds("ERD_COL_NAME::email")
+            .expect("the non-key column name should paint");
+
+        assert_eq!(
+            key_name.origin.x, plain_name.origin.x,
+            "a non-key column name must align with a key column name via the fixed leading \
+             gutter; key at {:?}, non-key at {:?}",
+            key_name.origin, plain_name.origin
         );
     }
 }

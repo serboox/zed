@@ -1178,15 +1178,16 @@ pub enum LineIndicatorFormat {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
 pub struct MarkdownPreviewSettingsContent {
     /// Whether to limit the width of the rendered markdown content. When
-    /// enabled, content is constrained to `max_width` and centered
-    /// horizontally within the preview pane, for optimal readability.
+    /// enabled, content fills the preview pane up to `max_width` and is
+    /// centered once the pane grows past it.
     ///
     /// Default: true
     pub limit_content_width: Option<bool>,
     /// The maximum width, in pixels, of the rendered markdown content when
-    /// `limit_content_width` is enabled.
+    /// `limit_content_width` is enabled. Acts as a ceiling for very wide
+    /// windows; narrower panes fill the available width unaffected.
     ///
-    /// Default: 800
+    /// Default: 1800
     pub max_width: Option<f32>,
 }
 

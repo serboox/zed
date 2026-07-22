@@ -8,7 +8,7 @@ use agent_settings::AgentSettings;
 use git::Clone as GitClone;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
+    ParentElement, PromptLevel, Render, Styled, Task, TaskExt, Window, actions,
 };
 use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
@@ -16,6 +16,7 @@ use menu::{SelectNext, SelectPrevious};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
+use std::path::PathBuf;
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
 use zed_actions::{
@@ -307,23 +308,57 @@ impl WelcomePage {
 
                 if is_local {
                     let paths = workspace.paths.paths().to_vec();
-                    let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
-                        DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
-                        DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
-                    };
-                    self.workspace
-                        .update(cx, |workspace, cx| {
-                            workspace
-                                .open_workspace_for_paths(open_mode, paths, window, cx)
-                                .detach_and_log_err(cx);
-                        })
-                        .log_err();
+                    match WorkspaceSettings::get_global(cx).default_open_behavior {
+                        DefaultOpenBehavior::ExistingWindow => {
+                            self.open_recent_project_paths(OpenMode::Activate, paths, window, cx);
+                        }
+                        DefaultOpenBehavior::NewWindow => {
+                            self.open_recent_project_paths(OpenMode::NewWindow, paths, window, cx);
+                        }
+                        DefaultOpenBehavior::Ask => {
+                            let answer = window.prompt(
+                                PromptLevel::Info,
+                                "Open project in a new window or this one?",
+                                None,
+                                &["This Window", "New Window"],
+                                cx,
+                            );
+                            cx.spawn_in(window, async move |this, cx| {
+                                let open_mode = if answer.await.log_err() == Some(1) {
+                                    OpenMode::NewWindow
+                                } else {
+                                    OpenMode::Activate
+                                };
+                                this.update_in(cx, |this, window, cx| {
+                                    this.open_recent_project_paths(open_mode, paths, window, cx);
+                                })
+                                .ok();
+                            })
+                            .detach();
+                        }
+                    }
                 } else {
                     use zed_actions::OpenRecent;
                     window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
                 }
             }
         }
+    }
+
+    fn open_recent_project_paths(
+        &mut self,
+        open_mode: OpenMode,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_workspace_for_paths(open_mode, paths, window, cx)
+                    .detach_and_log_err(cx);
+            })
+            .log_err();
     }
 
     fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {

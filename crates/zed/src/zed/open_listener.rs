@@ -727,9 +727,7 @@ async fn handle_list_connections(responses: &dyn CliResponseSink, cx: &mut Async
         .into_iter()
         .map(|(id, label, driver)| DbConnectionSummary { id, label, driver })
         .collect();
-    responses
-        .send(CliResponse::Connections { items })
-        .log_err();
+    responses.send(CliResponse::Connections { items }).log_err();
     responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 

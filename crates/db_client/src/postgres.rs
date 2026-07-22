@@ -666,6 +666,7 @@ mod connect_options_tests {
 mod integration_tests {
     use super::PostgresProvider;
     use crate::provider::DbProvider;
+    use crate::schema::ProcedureKind;
     use crate::{ConnectionConfig, DatabaseDriver};
     use uuid::Uuid;
 
@@ -725,5 +726,673 @@ mod integration_tests {
             result.rows[0][1], None,
             "a NULL integer column must decode to None, not Some(\"0\")"
         );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_ping() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        provider.ping().await.expect("Ping failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_databases_finds_public_schema() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let schemas = provider
+            .list_databases()
+            .await
+            .expect("Failed to list schemas");
+        assert!(schemas.iter().any(|s| s.name == "public"));
+    }
+
+    /// Runs `body` against a fresh scratch schema (Postgres's rough
+    /// equivalent of a MySQL scratch database within one physical database),
+    /// dropping it afterward with CASCADE regardless of the outcome.
+    async fn with_scratch_schema<'p, F, Fut, T>(provider: &'p PostgresProvider, body: F) -> T
+    where
+        F: FnOnce(&'p PostgresProvider, String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let schema = format!("zdbt_{}", Uuid::new_v4().simple());
+        provider
+            .execute_query("public", &format!("CREATE SCHEMA \"{schema}\""))
+            .await
+            .expect("Failed to create scratch schema");
+
+        let result = body(provider, schema.clone()).await;
+
+        provider
+            .execute_query("public", &format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("Failed to clean up scratch schema");
+
+        result
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_alter_and_drop_table() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".widgets (id INT PRIMARY KEY, name TEXT NOT NULL)"
+                    ),
+                )
+                .await
+                .expect("Failed to create table");
+
+            let columns_before = provider
+                .describe_table(&schema, "widgets")
+                .await
+                .expect("Failed to describe table");
+            assert_eq!(columns_before.len(), 2);
+
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("ALTER TABLE \"{schema}\".widgets ADD COLUMN weight INT"),
+                )
+                .await
+                .expect("Failed to alter table");
+            let columns_after = provider
+                .describe_table(&schema, "widgets")
+                .await
+                .expect("Failed to describe table after ALTER");
+            assert_eq!(columns_after.len(), 3);
+            assert!(columns_after.iter().any(|c| c.name == "weight"));
+
+            provider
+                .drop_table(&schema, "widgets")
+                .await
+                .expect("Failed to drop table");
+            let tables = provider
+                .list_tables(&schema)
+                .await
+                .expect("Failed to list tables");
+            assert!(!tables.iter().any(|t| t.name == "widgets"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_and_drop_index() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".indexed_widgets (id INT PRIMARY KEY, sku TEXT NOT NULL)"
+                    ),
+                )
+                .await
+                .expect("Failed to create table");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE UNIQUE INDEX sku_idx ON \"{schema}\".indexed_widgets (sku)"
+                    ),
+                )
+                .await
+                .expect("Failed to create index");
+
+            let indexes = provider
+                .list_indexes(&schema, "indexed_widgets")
+                .await
+                .expect("Failed to list indexes");
+            let sku_index = indexes
+                .iter()
+                .find(|i| i.name == "sku_idx")
+                .expect("sku_idx should be listed");
+            assert!(sku_index.unique, "sku_idx was created as UNIQUE");
+
+            provider
+                .execute_query(&schema, &format!("DROP INDEX \"{schema}\".sku_idx"))
+                .await
+                .expect("Failed to drop index");
+            let indexes_after = provider
+                .list_indexes(&schema, "indexed_widgets")
+                .await
+                .expect("Failed to list indexes after drop");
+            assert!(!indexes_after.iter().any(|i| i.name == "sku_idx"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_query_and_drop_a_view() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("CREATE TABLE \"{schema}\".items (id INT PRIMARY KEY, price INT NOT NULL)"),
+                )
+                .await
+                .expect("Failed to create table");
+            provider
+                .execute_query(&schema, &format!("INSERT INTO \"{schema}\".items VALUES (1, 150)"))
+                .await
+                .expect("Failed to insert row");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE VIEW \"{schema}\".pricey_items AS SELECT * FROM \"{schema}\".items WHERE price > 100"
+                    ),
+                )
+                .await
+                .expect("Failed to create view");
+
+            let result = provider
+                .execute_query(&schema, &format!("SELECT id, price FROM \"{schema}\".pricey_items"))
+                .await
+                .expect("Failed to query the view");
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0].as_deref(), Some("1"));
+
+            provider
+                .execute_query(&schema, &format!("DROP VIEW \"{schema}\".pricey_items"))
+                .await
+                .expect("Failed to drop view");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_update_and_delete_row_lifecycle() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".accounts (id INT PRIMARY KEY, balance INT NOT NULL)"
+                    ),
+                )
+                .await
+                .expect("Failed to create table");
+
+            provider
+                .execute_query(&schema, &format!("INSERT INTO \"{schema}\".accounts VALUES (1, 100)"))
+                .await
+                .expect("Failed to insert row");
+            let after_insert = provider
+                .execute_query(&schema, &format!("SELECT balance FROM \"{schema}\".accounts WHERE id = 1"))
+                .await
+                .expect("Failed to select after insert");
+            assert_eq!(after_insert.rows[0][0].as_deref(), Some("100"));
+
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("UPDATE \"{schema}\".accounts SET balance = 250 WHERE id = 1"),
+                )
+                .await
+                .expect("Failed to update row");
+            let after_update = provider
+                .execute_query(&schema, &format!("SELECT balance FROM \"{schema}\".accounts WHERE id = 1"))
+                .await
+                .expect("Failed to select after update");
+            assert_eq!(after_update.rows[0][0].as_deref(), Some("250"));
+
+            provider
+                .execute_query(&schema, &format!("DELETE FROM \"{schema}\".accounts WHERE id = 1"))
+                .await
+                .expect("Failed to delete row");
+            let after_delete = provider
+                .execute_query(&schema, &format!("SELECT balance FROM \"{schema}\".accounts WHERE id = 1"))
+                .await
+                .expect("Failed to select after delete");
+            assert!(after_delete.rows.is_empty(), "row should be gone after DELETE");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_upsert_via_on_conflict_do_update() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".counters (name TEXT PRIMARY KEY, hits INT NOT NULL)"
+                    ),
+                )
+                .await
+                .expect("Failed to create table");
+
+            let upsert_sql = format!(
+                "INSERT INTO \"{schema}\".counters (name, hits) VALUES ('clicks', 1) \
+                 ON CONFLICT (name) DO UPDATE SET hits = \"{schema}\".counters.hits + 1"
+            );
+            provider
+                .execute_query(&schema, &upsert_sql)
+                .await
+                .expect("Failed first upsert (insert path)");
+            provider
+                .execute_query(&schema, &upsert_sql)
+                .await
+                .expect("Failed second upsert (update path)");
+
+            let result = provider
+                .execute_query(&schema, &format!("SELECT hits FROM \"{schema}\".counters WHERE name = 'clicks'"))
+                .await
+                .expect("Failed to select counter");
+            assert_eq!(result.rows.len(), 1, "upsert must not create a duplicate row");
+            assert_eq!(
+                result.rows[0][0].as_deref(),
+                Some("2"),
+                "the second upsert must have taken the UPDATE branch, not re-inserted at 1"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_foreign_keys_finds_a_declared_fk() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(&schema, &format!("CREATE TABLE \"{schema}\".authors (id INT PRIMARY KEY)"))
+                .await
+                .expect("Failed to create authors table");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".posts (\
+                             id INT PRIMARY KEY, \
+                             author_id INT NOT NULL, \
+                             CONSTRAINT fk_posts_author FOREIGN KEY (author_id) REFERENCES \"{schema}\".authors (id)\
+                         )"
+                    ),
+                )
+                .await
+                .expect("Failed to create posts table");
+
+            let fks = provider
+                .list_foreign_keys(&schema, "posts")
+                .await
+                .expect("Failed to list foreign keys");
+            assert_eq!(fks.len(), 1);
+            assert_eq!(fks[0].name, "fk_posts_author");
+            assert_eq!(fks[0].from_column, "author_id");
+            assert_eq!(fks[0].to_table, "authors");
+            assert_eq!(fks[0].to_column, "id");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_check_constraints_finds_a_declared_check() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TABLE \"{schema}\".products (\
+                             id INT PRIMARY KEY, \
+                             price INT NOT NULL, \
+                             CONSTRAINT chk_price_positive CHECK (price > 0)\
+                         )"
+                    ),
+                )
+                .await
+                .expect("Failed to create products table");
+
+            // Postgres's `information_schema.check_constraints` also reports
+            // an implicit not-null-derived entry per NOT NULL column (here:
+            // `id` via the primary key, and `price`), alongside the real
+            // named constraint -- so this asserts the named one is present
+            // rather than asserting the total count is exactly one.
+            let checks = provider
+                .list_check_constraints(&schema, "products")
+                .await
+                .expect("Failed to list check constraints");
+            let chk_price_positive = checks
+                .iter()
+                .find(|check| check.name == "chk_price_positive")
+                .unwrap_or_else(|| panic!("expected chk_price_positive among {checks:?}"));
+            assert!(
+                chk_price_positive.expression.contains("price"),
+                "expected the check expression to reference `price`, got {}",
+                chk_price_positive.expression
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_procedures_finds_a_created_procedure_and_function() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE PROCEDURE \"{schema}\".greet(who TEXT) \
+                         LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'Hello, %', who; END; $$"
+                    ),
+                )
+                .await
+                .expect("Failed to create procedure");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE FUNCTION \"{schema}\".double_it(n INT) RETURNS INT \
+                         LANGUAGE plpgsql AS $$ BEGIN RETURN n * 2; END; $$"
+                    ),
+                )
+                .await
+                .expect("Failed to create function");
+
+            let procedures = provider
+                .list_procedures(&schema)
+                .await
+                .expect("Failed to list procedures");
+            let names: Vec<&str> = procedures.iter().map(|p| p.name.as_str()).collect();
+            assert!(names.contains(&"greet"), "expected `greet` among {names:?}");
+            assert!(
+                names.contains(&"double_it"),
+                "expected `double_it` among {names:?}"
+            );
+            let greet = procedures.iter().find(|p| p.name == "greet").unwrap();
+            assert_eq!(greet.kind, ProcedureKind::Procedure);
+            let double_it = procedures.iter().find(|p| p.name == "double_it").unwrap();
+            assert_eq!(double_it.kind, ProcedureKind::Function);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_triggers_finds_a_created_trigger() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("CREATE TABLE \"{schema}\".widgets (id INT PRIMARY KEY, name TEXT)"),
+                )
+                .await
+                .expect("Failed to create widgets table");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE FUNCTION \"{schema}\".widgets_trigger_fn() RETURNS TRIGGER \
+                         LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$"
+                    ),
+                )
+                .await
+                .expect("Failed to create trigger function");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!(
+                        "CREATE TRIGGER widgets_after_insert AFTER INSERT ON \"{schema}\".widgets \
+                         FOR EACH ROW EXECUTE FUNCTION \"{schema}\".widgets_trigger_fn()"
+                    ),
+                )
+                .await
+                .expect("Failed to create trigger");
+
+            let triggers = provider
+                .list_triggers(&schema, "widgets")
+                .await
+                .expect("Failed to list triggers");
+            assert_eq!(triggers.len(), 1);
+            assert_eq!(triggers[0].name, "widgets_after_insert");
+            assert_eq!(triggers[0].event, "INSERT");
+            assert_eq!(triggers[0].timing, "AFTER");
+            assert_eq!(triggers[0].table_name, "widgets");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_sequences_finds_a_created_sequence() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(&schema, &format!("CREATE SEQUENCE \"{schema}\".order_ids"))
+                .await
+                .expect("Failed to create sequence");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("SELECT nextval('\"{schema}\".order_ids')"),
+                )
+                .await
+                .expect("Failed to advance sequence");
+
+            let sequences = provider
+                .list_sequences(&schema)
+                .await
+                .expect("Failed to list sequences");
+            assert_eq!(sequences.len(), 1);
+            assert_eq!(sequences[0].name, "order_ids");
+            assert_eq!(sequences[0].current_value, Some(1));
+            assert_eq!(sequences[0].increment, Some(1));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_users_finds_the_connected_root_user() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        let users = provider.list_users().await.expect("Failed to list users");
+        assert!(
+            users.iter().any(|user| user.name == "root"),
+            "expected the connected root user among {:?}",
+            users.iter().map(|u| &u.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_truncate_table_removes_rows_but_keeps_the_table() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("CREATE TABLE \"{schema}\".crumbs (id INT PRIMARY KEY)"),
+                )
+                .await
+                .expect("Failed to create table");
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("INSERT INTO \"{schema}\".crumbs (id) VALUES (1), (2), (3)"),
+                )
+                .await
+                .expect("Failed to insert rows");
+
+            provider
+                .truncate_table(&schema, "crumbs")
+                .await
+                .expect("Failed to truncate table");
+
+            let tables = provider
+                .list_tables(&schema)
+                .await
+                .expect("Failed to list tables");
+            assert!(
+                tables.iter().any(|t| t.name == "crumbs"),
+                "truncate must not drop the table itself"
+            );
+            let remaining = provider
+                .execute_query(&schema, &format!("SELECT id FROM \"{schema}\".crumbs"))
+                .await
+                .expect("Failed to select from truncated table");
+            assert!(
+                remaining.rows.is_empty(),
+                "truncate must remove every row, got {:?}",
+                remaining.rows
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_table_changes_the_visible_name() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("CREATE TABLE \"{schema}\".old_name (id INT PRIMARY KEY)"),
+                )
+                .await
+                .expect("Failed to create table");
+
+            provider
+                .rename_table(&schema, "old_name", "new_name")
+                .await
+                .expect("Failed to rename table");
+
+            let tables = provider
+                .list_tables(&schema)
+                .await
+                .expect("Failed to list tables");
+            let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+            assert!(
+                !names.contains(&"old_name"),
+                "the old name must no longer be listed, got {names:?}"
+            );
+            assert!(
+                names.contains(&"new_name"),
+                "the new name must be listed, got {names:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_drop_table_via_provider_method_removes_it() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, |provider, schema| async move {
+            provider
+                .execute_query(
+                    &schema,
+                    &format!("CREATE TABLE \"{schema}\".throwaway (id INT PRIMARY KEY)"),
+                )
+                .await
+                .expect("Failed to create table");
+
+            provider
+                .drop_table(&schema, "throwaway")
+                .await
+                .expect("Failed to drop table via provider method");
+
+            let tables = provider
+                .list_tables(&schema)
+                .await
+                .expect("Failed to list tables");
+            assert!(
+                !tables.iter().any(|t| t.name == "throwaway"),
+                "drop_table must remove the table"
+            );
+        })
+        .await;
     }
 }

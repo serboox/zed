@@ -21,7 +21,7 @@ fn init_test(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
+async fn test_sidebar_stays_enabled_regardless_of_agent_settings(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     let project = Project::test(fs, [], cx).await;
@@ -40,59 +40,26 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
 
     cx.update(|_window, cx| {
         DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
-    });
-    cx.run_until_parked();
-
-    multi_workspace.read_with(cx, |mw, cx| {
-        assert!(
-            !mw.sidebar_open(),
-            "Sidebar should be closed when disable_ai is true"
-        );
-        assert!(
-            !mw.multi_workspace_enabled(cx),
-            "Multi-workspace should be disabled when disable_ai is true"
-        );
-    });
-
-    multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.toggle_sidebar(window, cx);
-    });
-    multi_workspace.read_with(cx, |mw, _cx| {
-        assert!(
-            !mw.sidebar_open(),
-            "Sidebar should remain closed when toggled with disable_ai true"
-        );
-    });
-
-    cx.update(|_window, cx| {
-        DisableAiSettings::override_global(DisableAiSettings { disable_ai: false }, cx);
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.enabled = false;
+        AgentSettings::override_global(settings, cx);
     });
     cx.run_until_parked();
 
     multi_workspace.read_with(cx, |mw, cx| {
         assert!(
             mw.multi_workspace_enabled(cx),
-            "Multi-workspace should be enabled after re-enabling AI"
+            "Multi-workspace must stay enabled even when the agent/AI is disabled"
         );
-        assert!(
-            !mw.sidebar_open(),
-            "Sidebar should still be closed after re-enabling AI (not auto-opened)"
-        );
-    });
-
-    multi_workspace.update_in(cx, |mw, window, cx| {
-        mw.toggle_sidebar(window, cx);
-    });
-    multi_workspace.read_with(cx, |mw, _cx| {
         assert!(
             mw.sidebar_open(),
-            "Sidebar should open when toggled after re-enabling AI"
+            "The sidebar must not be force-closed by agent/AI settings"
         );
     });
 }
 
 #[gpui::test]
-async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppContext) {
+async fn test_multi_workspace_does_not_collapse_when_agent_is_disabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
@@ -121,10 +88,12 @@ async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppC
     cx.run_until_parked();
 
     multi_workspace.read_with(cx, |multi_workspace, cx| {
-        assert!(!multi_workspace.multi_workspace_enabled(cx));
-        assert!(!multi_workspace.sidebar_open());
-        assert_eq!(multi_workspace.workspaces().count(), 1);
-        assert!(multi_workspace.project_group_keys().is_empty());
+        assert!(multi_workspace.multi_workspace_enabled(cx));
+        assert_eq!(
+            multi_workspace.workspaces().count(),
+            2,
+            "disabling the agent must not collapse already-open projects"
+        );
     });
 }
 

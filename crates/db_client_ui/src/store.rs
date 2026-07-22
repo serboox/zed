@@ -256,6 +256,11 @@ pub struct ActiveConnection {
     pub table_triggers: HashMap<(String, String), Vec<TriggerInfo>>,
     pub expanded_database_set: HashSet<String>,
     pub expanded_table_set: HashSet<(String, String)>,
+    /// Set while a manually-opened `START TRANSACTION`/`BEGIN` has not yet
+    /// been closed by `COMMIT`/`ROLLBACK`. Only meaningful for drivers whose
+    /// provider holds a single persistent connection per `ActiveConnection`
+    /// (MySQL, PostgreSQL) -- see [`transaction_boundary`].
+    pub in_transaction: bool,
 }
 
 impl ActiveConnection {
@@ -276,7 +281,35 @@ impl ActiveConnection {
             table_triggers: HashMap::new(),
             expanded_database_set: HashSet::new(),
             expanded_table_set: HashSet::new(),
+            in_transaction: false,
         }
+    }
+}
+
+/// Classifies whether `sql` opens or closes a transaction for `driver`, so the
+/// console can show a visible "transaction open" indicator. Scoped to MySQL
+/// and PostgreSQL: both providers hold a single-connection pool per
+/// `ActiveConnection` (`max_connections(1)`), so every statement sent through
+/// [`DatabaseStore::execute_query`] genuinely runs on the same underlying
+/// connection and standard `START TRANSACTION`/`BEGIN` ... `COMMIT`/
+/// `ROLLBACK` semantics apply. Other drivers either have no such multi-
+/// statement ACID transaction model (Redis, Aerospike, MongoDB without an
+/// explicit session) or execute each statement over a fresh HTTP request
+/// (ClickHouse), so a badge there would be misleading.
+fn transaction_boundary(driver: DatabaseDriver, sql: &str) -> Option<bool> {
+    if !matches!(driver, DatabaseDriver::MySQL | DatabaseDriver::PostgreSQL) {
+        return None;
+    }
+    let trimmed_upper = sql.trim().to_uppercase();
+    if trimmed_upper.starts_with("START TRANSACTION")
+        || trimmed_upper == "BEGIN"
+        || trimmed_upper.starts_with("BEGIN ")
+    {
+        Some(true)
+    } else if trimmed_upper.starts_with("COMMIT") || trimmed_upper.starts_with("ROLLBACK") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1929,6 +1962,7 @@ impl DatabaseStore {
         if conn.config.read_only && crate::db_agent_tools::requires_confirmation(&sql) {
             return Task::ready(Err(read_only_error(&conn.config.label)));
         }
+        let driver = conn.config.driver;
 
         self.record_query_history(sql.clone(), cx);
 
@@ -1936,7 +1970,20 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            provider.execute_query(&database, &sql).await
+            let result = provider.execute_query(&database, &sql).await;
+            if result.is_ok()
+                && let Some(opens_transaction) = transaction_boundary(driver, &sql)
+            {
+                this.update(cx, |store, cx| {
+                    if let Some(conn) = store.connections.iter_mut().find(|c| c.config.id == id) {
+                        conn.in_transaction = opens_transaction;
+                        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            result
         })
     }
 

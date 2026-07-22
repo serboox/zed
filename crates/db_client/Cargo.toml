@@ -33,4 +33,5 @@ tempfile.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+libc.workspace = true

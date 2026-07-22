@@ -582,3 +582,206 @@ mod tests {
         assert_eq!(urlencoding_encode(""), "");
     }
 }
+
+/// Integration tests against a real Redis server.
+///
+/// Set REDIS_TEST_URL=redis://host:port before running, then use
+/// `cargo test -p db_client -- --include-ignored` to execute.
+#[cfg(test)]
+mod integration_tests {
+    use super::RedisProvider;
+    use crate::provider::DbProvider;
+    use crate::{ConnectionConfig, DatabaseDriver};
+    use uuid::Uuid;
+
+    fn test_config_from_env() -> Option<ConnectionConfig> {
+        let url = std::env::var("REDIS_TEST_URL").ok()?;
+        let url = url.strip_prefix("redis://")?;
+        let (host, port_str) = url.split_once(':').unwrap_or((url, "6379"));
+        let port: u16 = port_str.parse().unwrap_or(6379);
+
+        Some(ConnectionConfig {
+            id: Uuid::new_v4(),
+            label: "test".to_string(),
+            driver: DatabaseDriver::Redis,
+            host: host.to_string(),
+            port,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            auto_connect: false,
+            ..ConnectionConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_ping() {
+        let config =
+            test_config_from_env().expect("REDIS_TEST_URL env var required for integration tests");
+        let provider = RedisProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        provider.ping().await.expect("Ping failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_set_get_and_del_string_key_lifecycle() {
+        let config =
+            test_config_from_env().expect("REDIS_TEST_URL env var required for integration tests");
+        let provider = RedisProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let key = format!("zdbt:{}", Uuid::new_v4().simple());
+
+        provider
+            .execute_query("", &format!("SET {key} hello"))
+            .await
+            .expect("Failed to SET");
+        let after_set = provider
+            .execute_query("", &format!("GET {key}"))
+            .await
+            .expect("Failed to GET");
+        assert_eq!(after_set.rows[0][0].as_deref(), Some("hello"));
+
+        provider
+            .execute_query("", &format!("DEL {key}"))
+            .await
+            .expect("Failed to DEL");
+        let after_del = provider
+            .execute_query("", &format!("GET {key}"))
+            .await
+            .expect("Failed to GET after DEL");
+        assert!(
+            after_del.rows.is_empty() || after_del.rows[0][0].is_none(),
+            "key must be gone after DEL"
+        );
+    }
+
+    /// `SET` on an existing key always overwrites it -- Redis has no
+    /// separate insert-vs-update path, so this is the closest thing to
+    /// Redis's "upsert" and is worth proving explicitly rather than assuming.
+    #[tokio::test]
+    #[ignore]
+    async fn test_set_upserts_an_existing_key() {
+        let config =
+            test_config_from_env().expect("REDIS_TEST_URL env var required for integration tests");
+        let provider = RedisProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let key = format!("zdbt:{}", Uuid::new_v4().simple());
+
+        provider
+            .execute_query("", &format!("SET {key} 1"))
+            .await
+            .expect("Failed first SET (insert path)");
+        provider
+            .execute_query("", &format!("SET {key} 2"))
+            .await
+            .expect("Failed second SET (overwrite path)");
+
+        let result = provider
+            .execute_query("", &format!("GET {key}"))
+            .await
+            .expect("Failed to GET");
+        assert_eq!(result.rows[0][0].as_deref(), Some("2"));
+
+        provider
+            .execute_query("", &format!("DEL {key}"))
+            .await
+            .expect("Failed to clean up scratch key");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_hash_field_crud() {
+        let config =
+            test_config_from_env().expect("REDIS_TEST_URL env var required for integration tests");
+        let provider = RedisProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let key = format!("zdbt:{}", Uuid::new_v4().simple());
+
+        provider
+            .execute_query("", &format!("HSET {key} name bolt qty 10"))
+            .await
+            .expect("Failed to HSET");
+        let after_hset = provider
+            .execute_query("", &format!("HGETALL {key}"))
+            .await
+            .expect("Failed to HGETALL");
+        assert!(
+            after_hset
+                .rows
+                .iter()
+                .any(|r| r[0].as_deref() == Some("name") && r[1].as_deref() == Some("bolt")),
+            "HGETALL rows are shaped [field, value]: {:?}",
+            after_hset.rows
+        );
+
+        provider
+            .execute_query("", &format!("HSET {key} qty 20"))
+            .await
+            .expect("Failed to update hash field");
+        let updated = provider
+            .execute_query("", &format!("HGET {key} qty"))
+            .await
+            .expect("Failed to HGET");
+        assert_eq!(updated.rows[0][0].as_deref(), Some("20"));
+
+        provider
+            .execute_query("", &format!("HDEL {key} qty"))
+            .await
+            .expect("Failed to HDEL");
+        let after_hdel = provider
+            .execute_query("", &format!("HGET {key} qty"))
+            .await
+            .expect("Failed to HGET after HDEL");
+        assert!(
+            after_hdel.rows.is_empty() || after_hdel.rows[0][0].is_none(),
+            "field must be gone after HDEL"
+        );
+
+        provider
+            .execute_query("", &format!("DEL {key}"))
+            .await
+            .expect("Failed to clean up scratch key");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_execute_query_targets_the_selected_database_index() {
+        let config =
+            test_config_from_env().expect("REDIS_TEST_URL env var required for integration tests");
+        let provider = RedisProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let key = format!("zdbt:{}", Uuid::new_v4().simple());
+
+        provider
+            .execute_query("db1", &format!("SET {key} in-db-one"))
+            .await
+            .expect("Failed to SET in db1");
+
+        let from_db0 = provider
+            .execute_query("db0", &format!("GET {key}"))
+            .await
+            .expect("Failed to GET from db0");
+        assert!(
+            from_db0.rows.is_empty() || from_db0.rows[0][0].is_none(),
+            "a key set in db1 must not be visible from db0"
+        );
+
+        let from_db1 = provider
+            .execute_query("db1", &format!("GET {key}"))
+            .await
+            .expect("Failed to GET from db1");
+        assert_eq!(from_db1.rows[0][0].as_deref(), Some("in-db-one"));
+
+        provider
+            .execute_query("db1", &format!("DEL {key}"))
+            .await
+            .expect("Failed to clean up scratch key");
+    }
+}

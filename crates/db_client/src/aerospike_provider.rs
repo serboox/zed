@@ -424,3 +424,166 @@ mod tests {
         assert_eq!(value_type_name(&Value::List(Vec::new())), "list");
     }
 }
+
+/// Integration tests against a real Aerospike server.
+///
+/// Set AEROSPIKE_TEST_URL=aerospike://host:port before running, then use
+/// `cargo test -p db_client -- --include-ignored` to execute.
+#[cfg(test)]
+mod integration_tests {
+    use super::AerospikeProvider;
+    use crate::provider::DbProvider;
+    use crate::{ConnectionConfig, DatabaseDriver};
+    use uuid::Uuid;
+
+    fn test_config_from_env() -> Option<ConnectionConfig> {
+        let url = std::env::var("AEROSPIKE_TEST_URL").ok()?;
+        let url = url.strip_prefix("aerospike://")?;
+        let (host, port_str) = url.split_once(':').unwrap_or((url, "3000"));
+        let port: u16 = port_str.parse().unwrap_or(3000);
+
+        Some(ConnectionConfig {
+            id: Uuid::new_v4(),
+            label: "test".to_string(),
+            driver: DatabaseDriver::Aerospike,
+            host: host.to_string(),
+            port,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            auto_connect: false,
+            ..ConnectionConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_ping() {
+        let config = test_config_from_env()
+            .expect("AEROSPIKE_TEST_URL env var required for integration tests");
+        let provider = AerospikeProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        provider.ping().await.expect("Ping failed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_databases_finds_the_test_db_namespace() {
+        let config = test_config_from_env()
+            .expect("AEROSPIKE_TEST_URL env var required for integration tests");
+        let provider = AerospikeProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let namespaces = provider
+            .list_databases()
+            .await
+            .expect("Failed to list namespaces");
+        assert!(
+            namespaces.iter().any(|d| d.name == "test_db"),
+            "the compose stack's aerospike namespace is `test_db`, expected it in the listing"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_put_get_and_scan_record_lifecycle() {
+        let config = test_config_from_env()
+            .expect("AEROSPIKE_TEST_URL env var required for integration tests");
+        let provider = AerospikeProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let set = format!("zdbt_{}", Uuid::new_v4().simple());
+        let key = "widget-1";
+
+        provider
+            .put_record(
+                "test_db",
+                &set,
+                key,
+                &[
+                    ("name".to_string(), "bolt".to_string()),
+                    ("qty".to_string(), "10".to_string()),
+                ],
+            )
+            .await
+            .expect("Failed to put record");
+
+        let record = provider
+            .get_record("test_db", &set, key)
+            .await
+            .expect("Failed to get record")
+            .expect("record should exist after put");
+        assert!(
+            record
+                .iter()
+                .any(|(name, value)| name == "name" && value == "bolt")
+        );
+
+        let scan = provider
+            .scan_records("test_db", &set, 10)
+            .await
+            .expect("Failed to scan records");
+        assert_eq!(
+            scan.rows.len(),
+            1,
+            "scan should find exactly the one record just written"
+        );
+    }
+
+    /// `put_record`'s own doc comment says it "creates the record if it does
+    /// not already exist" -- i.e. Aerospike's Put is inherently an upsert.
+    /// Verified directly rather than assumed from the comment.
+    #[tokio::test]
+    #[ignore]
+    async fn test_put_record_upserts_an_existing_key() {
+        let config = test_config_from_env()
+            .expect("AEROSPIKE_TEST_URL env var required for integration tests");
+        let provider = AerospikeProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+        let set = format!("zdbt_{}", Uuid::new_v4().simple());
+        let key = "counter";
+
+        provider
+            .put_record(
+                "test_db",
+                &set,
+                key,
+                &[("hits".to_string(), "1".to_string())],
+            )
+            .await
+            .expect("Failed first put (insert path)");
+        provider
+            .put_record(
+                "test_db",
+                &set,
+                key,
+                &[("hits".to_string(), "2".to_string())],
+            )
+            .await
+            .expect("Failed second put (overwrite path)");
+
+        let record = provider
+            .get_record("test_db", &set, key)
+            .await
+            .expect("Failed to get record")
+            .expect("record should exist");
+        assert!(
+            record
+                .iter()
+                .any(|(name, value)| name == "hits" && value == "2"),
+            "the second put must have overwritten hits, not left it at 1: {record:?}"
+        );
+
+        let scan = provider
+            .scan_records("test_db", &set, 10)
+            .await
+            .expect("Failed to scan records");
+        assert_eq!(
+            scan.rows.len(),
+            1,
+            "upsert must not create a duplicate record"
+        );
+    }
+}

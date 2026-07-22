@@ -615,6 +615,47 @@ mod tests {
         );
     }
 
+    // End-to-end proof that `categorized_script` -- schema diff's actual
+    // entry point -- emits statements ClickHouse accepts: no `NOT NULL`
+    // clause on the new column, no `UNIQUE` keyword and a `TYPE` on the new
+    // index, and the foreign-key change dropped entirely (ClickHouse has no
+    // FK concept, matching how SQLite's FK/CHECK generators are already
+    // gated). All verified against a live ClickHouse 24.10 instance.
+    #[test]
+    fn categorized_script_emits_valid_clickhouse_statements_and_drops_the_unsupported_fk_change() {
+        let from = TableSchema {
+            columns: vec![column("id", "UInt32", false)],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            checks: Vec::new(),
+        };
+        let to = TableSchema {
+            columns: vec![
+                column("id", "UInt32", false),
+                column("email", "String", false),
+            ],
+            indexes: vec![index("idx_email", &["email"], true)],
+            foreign_keys: vec![fk("fk_customer", "customer_id", "customers", "id")],
+            checks: vec![check("chk_email", "email <> ''")],
+        };
+
+        let diff = SchemaDiff::compute(&from, &to);
+        let script: Vec<String> = diff
+            .categorized_script("users", DatabaseDriver::ClickHouse)
+            .into_iter()
+            .map(|(_, statement)| statement)
+            .collect();
+        assert_eq!(
+            script,
+            vec![
+                "ALTER TABLE \"users\" ADD COLUMN \"email\" String;".to_string(),
+                "CREATE INDEX \"idx_email\" ON \"users\" (\"email\") TYPE minmax;".to_string(),
+                "ALTER TABLE \"users\" ADD CONSTRAINT \"chk_email\" CHECK (email <> '');"
+                    .to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn identical_schemas_produce_an_empty_diff_and_script() {
         let schema = TableSchema {

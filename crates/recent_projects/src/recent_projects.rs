@@ -396,7 +396,9 @@ pub fn init(cx: &mut App) {
                     DefaultOpenBehavior::ExistingWindow => {
                         window.window_handle().downcast::<MultiWorkspace>()
                     }
-                    DefaultOpenBehavior::NewWindow => None,
+                    // Not prompted for this WSL-specific flow -- falls back to
+                    // opening a new window, same as `NewWindow`.
+                    DefaultOpenBehavior::NewWindow | DefaultOpenBehavior::Ask => None,
                 };
             let open_options = OpenOptions {
                 requesting_window,

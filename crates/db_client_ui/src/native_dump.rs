@@ -13,7 +13,7 @@ use gpui::{
 use ui::{Button, ButtonStyle, Checkbox, Divider, Icon, IconName, Label, LabelSize, prelude::*};
 use workspace::ModalView;
 
-use crate::widgets::{dialog_header, popup_surface};
+use crate::widgets::{dialog_header, popup_surface, text_field};
 
 /// Invoked when the dump dialog is confirmed, so the owning panel can spawn the
 /// run without this dialog depending on the panel type.
@@ -528,17 +528,7 @@ impl NativeDumpDialog {
                     .w(px(150.))
                     .child(Label::new(label).size(LabelSize::Small)),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().colors().editor_background)
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(editor.clone()),
-            )
+            .child(text_field(editor, cx).flex_1())
     }
 }
 
@@ -565,14 +555,15 @@ impl Render for NativeDumpDialog {
             .zip(self.option_enabled.iter())
             .map(|((index, option), enabled)| {
                 h_flex()
-                    .gap_2()
-                    .items_center()
+                    .debug_selector(move || format!("DUMP_OPTION_{index}"))
                     .child(
-                        Checkbox::new(("dump-option", index), (*enabled).into()).on_click(
-                            cx.listener(move |this, _, _window, cx| this.toggle_option(index, cx)),
-                        ),
+                        Checkbox::new(("dump-option", index), (*enabled).into())
+                            .label(option.label)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_option(index, cx)
+                            })),
                     )
-                    .child(Label::new(option.label).size(LabelSize::Small))
             })
             .collect::<Vec<_>>();
 
@@ -641,23 +632,29 @@ impl Render for NativeDumpDialog {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("dump-run", "Run")
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let request = this.build_request(cx);
-                                if let Some(callback) = this.on_run.clone() {
-                                    callback(request.clone(), window, cx);
-                                }
-                                cx.emit(NativeDumpEvent::Run(request));
-                                cx.emit(DismissEvent);
-                            })),
+                        div()
+                            .debug_selector(|| "DUMP_CANCEL_BTN".to_string())
+                            .child(Button::new("dump-cancel", "Cancel").on_click(cx.listener(
+                                |_, _, _, cx| {
+                                    cx.emit(NativeDumpEvent::Dismissed);
+                                    cx.emit(DismissEvent);
+                                },
+                            ))),
                     )
-                    .child(Button::new("dump-cancel", "Cancel").on_click(cx.listener(
-                        |_, _, _, cx| {
-                            cx.emit(NativeDumpEvent::Dismissed);
-                            cx.emit(DismissEvent);
-                        },
-                    ))),
+                    .child(
+                        div().debug_selector(|| "DUMP_RUN_BTN".to_string()).child(
+                            Button::new("dump-run", "Run")
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let request = this.build_request(cx);
+                                    if let Some(callback) = this.on_run.clone() {
+                                        callback(request.clone(), window, cx);
+                                    }
+                                    cx.emit(NativeDumpEvent::Run(request));
+                                    cx.emit(DismissEvent);
+                                })),
+                        ),
+                    ),
             )
     }
 }
@@ -926,5 +923,75 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].databases, vec!["shop".to_string()]);
         assert_eq!(captured[0].executable, "mysqldump");
+    }
+
+    #[gpui::test]
+    async fn clicking_an_option_label_toggles_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| {
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+
+        let before = window
+            .read_with(cx, |view, cx| view.command_preview(cx))
+            .unwrap();
+        assert!(
+            before.contains("--add-drop-table"),
+            "the first option defaults on: {before}"
+        );
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let bounds = cx
+            .debug_bounds("DUMP_OPTION_0")
+            .expect("the first dump option row should be rendered");
+        // Click well to the right of the 20px checkbox box, over the label
+        // text. This only toggles the option when the label is part of the
+        // control's hit target rather than a detached sibling.
+        let target = gpui::point(bounds.left() + px(100.), bounds.center().y);
+        cx.simulate_click(target, gpui::Modifiers::none());
+
+        let after = window
+            .read_with(cx, |view, cx| view.command_preview(cx))
+            .unwrap();
+        assert!(
+            !after.contains("--add-drop-table"),
+            "clicking the option's label must toggle it off: {after}"
+        );
+    }
+
+    #[gpui::test]
+    async fn cancel_button_precedes_the_primary_run_button(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| {
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let cancel = cx
+            .debug_bounds("DUMP_CANCEL_BTN")
+            .expect("the Cancel button should be rendered");
+        let run = cx
+            .debug_bounds("DUMP_RUN_BTN")
+            .expect("the Run button should be rendered");
+        assert!(
+            cancel.left() < run.left(),
+            "the primary Run button must sit to the right of Cancel: cancel_left={:?} run_left={:?}",
+            cancel.left(),
+            run.left()
+        );
     }
 }

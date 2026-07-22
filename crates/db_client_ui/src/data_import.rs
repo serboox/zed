@@ -462,7 +462,12 @@ impl ImportDataView {
             .trigger(
                 Button::new("import-charset-trigger", current)
                     .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small),
+                    .label_size(LabelSize::Small)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             )
             .menu(move |window, cx| {
                 let view = view.clone();
@@ -505,7 +510,12 @@ impl ImportDataView {
                     .trigger(
                         Button::new(("map-trigger", target_index), current_label)
                             .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small),
+                            .label_size(LabelSize::Small)
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     )
                     .menu(move |window, cx| {
                         let headers = headers.clone();
@@ -576,7 +586,11 @@ impl Render for ImportDataView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().child(self.path_editor.clone()))
+                    .child(
+                        crate::widgets::text_field(&self.path_editor, cx)
+                            .flex_1()
+                            .debug_selector(|| "IMPORT_PATH_FIELD".to_string()),
+                    )
                     .child(
                         ui::Button::new("load-file", "Load").on_click(
                             cx.listener(|view, _, window, cx| view.load_file(window, cx)),
@@ -587,23 +601,23 @@ impl Render for ImportDataView {
                 h_flex()
                     .gap_4()
                     .child(
-                        Checkbox::new("has-header", has_header.into()).on_click(cx.listener(
-                            |view, _, _, cx| {
+                        Checkbox::new("has-header", has_header.into())
+                            .label("First row is header")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 view.has_header = !view.has_header;
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     )
-                    .child(Label::new("First row is header").size(LabelSize::Small))
                     .child(
-                        Checkbox::new("null-empty", null_on_empty.into()).on_click(cx.listener(
-                            |view, _, _, cx| {
+                        Checkbox::new("null-empty", null_on_empty.into())
+                            .label("Insert empty as NULL")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 view.null_on_empty = !view.null_on_empty;
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     )
-                    .child(Label::new("Insert empty as NULL").size(LabelSize::Small))
                     .child(
                         Label::new("Charset")
                             .size(LabelSize::Small)
@@ -615,27 +629,22 @@ impl Render for ImportDataView {
                 h_flex()
                     .gap_4()
                     .child(
-                        Checkbox::new("continue-on-error", continue_on_error.into()).on_click(
-                            cx.listener(|view, _, _, cx| {
+                        Checkbox::new("continue-on-error", continue_on_error.into())
+                            .label("Continue on error, write failures to file")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 view.continue_on_error = !view.continue_on_error;
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     )
                     .child(
-                        Label::new("Continue on error, write failures to file")
-                            .size(LabelSize::Small),
-                    )
-                    .child(
-                        Checkbox::new("disable-indexes", disable_indexes.into()).on_click(
-                            cx.listener(|view, _, _, cx| {
+                        Checkbox::new("disable-indexes", disable_indexes.into())
+                            .label("Disable indexes/triggers during load")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 view.disable_indexes = !view.disable_indexes;
                                 cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        Label::new("Disable indexes/triggers during load").size(LabelSize::Small),
+                            })),
                     ),
             )
             .child(Divider::horizontal())
@@ -1049,5 +1058,30 @@ mod tests {
         assert_eq!(parsed.rows, vec![vec!["1".to_string(), "Тест".to_string()]]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn path_field_carries_bordered_chrome_padding(cx: &mut gpui::TestAppContext) {
+        let (window, _store, _connection_id) = test_import_view(
+            cx,
+            RecordingProvider {
+                log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_containing: None,
+            },
+        );
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let field = cx
+            .debug_bounds("IMPORT_PATH_FIELD")
+            .expect("the import path field should be rendered");
+        // A bare editor lays out at ~23px; the shared bordered chrome adds
+        // vertical padding (py_1) plus a 1px border on each edge, taking the
+        // field to ~33px. 28px sits between the two so the assertion fails if
+        // the chrome is dropped and the editor renders undecorated.
+        assert!(
+            field.size.height > px(28.),
+            "the bordered field chrome must wrap the editor in padding: {:?}",
+            field.size.height
+        );
     }
 }

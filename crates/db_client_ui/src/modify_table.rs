@@ -100,8 +100,12 @@ fn diff_changes(drafts: &[DraftSnapshot]) -> Vec<ColumnChange> {
 
 /// Renders the ALTER statements for the given changes. MySQL collapses
 /// rename+type into a single `CHANGE COLUMN`; other drivers use the standard
-/// `RENAME COLUMN` / `ALTER COLUMN` forms (best effort for SQLite/ClickHouse,
-/// which support a subset).
+/// `RENAME COLUMN` / `ALTER COLUMN` forms (best effort for SQLite, which
+/// supports a subset). ClickHouse reuses this same `ADD`/`DROP`/`RENAME
+/// COLUMN` and `ALTER COLUMN ... TYPE` wording -- verified against a live
+/// ClickHouse 24.10 instance -- but never takes a `NULL`/`NOT NULL` clause:
+/// nullability lives in the type itself (`Nullable(T)`), so `supports_null_clause`
+/// suppresses it for ClickHouse alone.
 pub fn generate_alter_statements(
     table: &str,
     driver: DatabaseDriver,
@@ -111,6 +115,7 @@ pub fn generate_alter_statements(
         return generate_cassandra_alter_statements(table, changes);
     }
     let table_ident = driver.quote_identifier(table);
+    let supports_null_clause = driver != DatabaseDriver::ClickHouse;
     let null_clause = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
     let mut statements = Vec::new();
     for change in changes {
@@ -120,12 +125,20 @@ pub fn generate_alter_statements(
                 data_type,
                 nullable,
             } => {
-                statements.push(format!(
-                    "ALTER TABLE {table_ident} ADD COLUMN {} {} {};",
-                    driver.quote_identifier(name),
-                    data_type,
-                    null_clause(*nullable)
-                ));
+                statements.push(if supports_null_clause {
+                    format!(
+                        "ALTER TABLE {table_ident} ADD COLUMN {} {} {};",
+                        driver.quote_identifier(name),
+                        data_type,
+                        null_clause(*nullable)
+                    )
+                } else {
+                    format!(
+                        "ALTER TABLE {table_ident} ADD COLUMN {} {};",
+                        driver.quote_identifier(name),
+                        data_type
+                    )
+                });
             }
             ColumnChange::Drop { name } => {
                 statements.push(format!(
@@ -152,6 +165,11 @@ pub fn generate_alter_statements(
                     driver.quote_identifier(name),
                     data_type,
                     null_clause(*nullable)
+                )),
+                DatabaseDriver::ClickHouse => statements.push(format!(
+                    "ALTER TABLE {table_ident} ALTER COLUMN {} TYPE {};",
+                    driver.quote_identifier(name),
+                    data_type
                 )),
                 _ => {
                     statements.push(format!(
@@ -366,6 +384,9 @@ pub fn generate_index_statements(
     if driver == DatabaseDriver::Cassandra {
         return generate_cassandra_index_statements(table, changes);
     }
+    if driver == DatabaseDriver::ClickHouse {
+        return generate_clickhouse_index_statements(table, changes);
+    }
     let table_ident = driver.quote_identifier(table);
     changes
         .iter()
@@ -434,6 +455,41 @@ fn generate_cassandra_index_statements(table: &str, changes: &[IndexChange]) -> 
         .collect()
 }
 
+/// ClickHouse secondary indexes are data-skipping indexes, not uniqueness
+/// constraints, so `CREATE UNIQUE INDEX` isn't a thing there -- it's rejected
+/// outright (`CREATE UNIQUE INDEX is not supported`, verified against a live
+/// ClickHouse 24.10 instance) -- and `CREATE INDEX` requires an explicit
+/// `TYPE`, unlike the generic branch above which supplies neither. `minmax`
+/// is used as the type since it accepts any orderable column and `IndexInfo`
+/// carries no ClickHouse-specific index-type hint to pick a narrower one
+/// from. Its `DROP INDEX` form is `ALTER TABLE ... DROP INDEX name`, matching
+/// MySQL's `ALTER TABLE ... DROP INDEX` rather than the generic non-MySQL
+/// `DROP INDEX name;` form, which ClickHouse's parser rejects for wanting an
+/// `ON table` clause it doesn't otherwise accept in that position.
+fn generate_clickhouse_index_statements(table: &str, changes: &[IndexChange]) -> Vec<String> {
+    let table_ident = DatabaseDriver::ClickHouse.quote_identifier(table);
+    changes
+        .iter()
+        .map(|change| match change {
+            IndexChange::Add { name, columns, .. } => {
+                let cols = columns
+                    .iter()
+                    .map(|c| DatabaseDriver::ClickHouse.quote_identifier(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "CREATE INDEX {} ON {table_ident} ({cols}) TYPE minmax;",
+                    DatabaseDriver::ClickHouse.quote_identifier(name)
+                )
+            }
+            IndexChange::Drop { name } => format!(
+                "ALTER TABLE {table_ident} DROP INDEX {};",
+                DatabaseDriver::ClickHouse.quote_identifier(name)
+            ),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct FkDraftSnapshot {
     original_name: Option<String>,
@@ -475,12 +531,16 @@ fn fk_diff_changes(drafts: &[FkDraftSnapshot]) -> Vec<ForeignKeyChange> {
 // SQLite can only declare foreign keys at table-creation time; adding or
 // dropping one on an existing table would require recreating the table,
 // which is out of scope here, so it emits no statements for SQLite.
+// ClickHouse has no foreign-key concept at all: `ADD CONSTRAINT ... FOREIGN
+// KEY` is a syntax error there (verified against a live ClickHouse 24.10
+// instance -- its `ADD CONSTRAINT` only accepts `CHECK`/`ASSUME`), so it also
+// emits no statements.
 pub fn generate_foreign_key_statements(
     table: &str,
     driver: DatabaseDriver,
     changes: &[ForeignKeyChange],
 ) -> Vec<String> {
-    if driver == DatabaseDriver::SQLite {
+    if matches!(driver, DatabaseDriver::SQLite | DatabaseDriver::ClickHouse) {
         return Vec::new();
     }
     let table_ident = driver.quote_identifier(table);
@@ -1008,8 +1068,8 @@ impl ModifyTableView {
             .items_center()
             .py_0p5()
             .when(dropped, |row| row.opacity(0.5))
-            .child(div().w(px(160.)).child(draft.name.clone()))
-            .child(div().w(px(140.)).child(draft.data_type.clone()))
+            .child(crate::widgets::text_field(&draft.name, cx).w(px(160.)))
+            .child(crate::widgets::text_field(&draft.data_type, cx).w(px(140.)))
             .child(
                 Checkbox::new(("nullable", index), nullable.into())
                     .label("Nullable")
@@ -1052,8 +1112,8 @@ impl ModifyTableView {
             .items_center()
             .py_0p5()
             .when(dropped, |row| row.opacity(0.5))
-            .child(div().w(px(160.)).child(draft.name.clone()))
-            .child(div().w(px(220.)).child(draft.columns.clone()))
+            .child(crate::widgets::text_field(&draft.name, cx).w(px(160.)))
+            .child(crate::widgets::text_field(&draft.columns, cx).w(px(220.)))
             .child(
                 Checkbox::new(("index-unique", index), unique.into())
                     .label("Unique")
@@ -1095,11 +1155,11 @@ impl ModifyTableView {
             .items_center()
             .py_0p5()
             .when(dropped, |row| row.opacity(0.5))
-            .child(div().w(px(120.)).child(draft.name.clone()))
-            .child(div().w(px(100.)).child(draft.from_column.clone()))
+            .child(crate::widgets::text_field(&draft.name, cx).w(px(120.)))
+            .child(crate::widgets::text_field(&draft.from_column, cx).w(px(100.)))
             .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
-            .child(div().w(px(120.)).child(draft.to_table.clone()))
-            .child(div().w(px(100.)).child(draft.to_column.clone()))
+            .child(crate::widgets::text_field(&draft.to_table, cx).w(px(120.)))
+            .child(crate::widgets::text_field(&draft.to_column, cx).w(px(100.)))
             .child(
                 IconButton::new(("drop-fk", index), IconName::Trash)
                     .icon_size(IconSize::XSmall)
@@ -1130,8 +1190,8 @@ impl ModifyTableView {
             .items_center()
             .py_0p5()
             .when(dropped, |row| row.opacity(0.5))
-            .child(div().w(px(160.)).child(draft.name.clone()))
-            .child(div().w(px(220.)).child(draft.expression.clone()))
+            .child(crate::widgets::text_field(&draft.name, cx).w(px(160.)))
+            .child(crate::widgets::text_field(&draft.expression, cx).w(px(220.)))
             .child(
                 IconButton::new(("drop-check", index), IconName::Trash)
                     .icon_size(IconSize::XSmall)
@@ -1592,6 +1652,126 @@ mod tests {
             index_diff_changes(&[index_draft(Some("idx_old"), "idx_old", "", false, true)]);
         let sql = generate_index_statements("t", DatabaseDriver::Cassandra, &changes);
         assert_eq!(sql, vec!["DROP INDEX \"idx_old\";"]);
+    }
+
+    // Before this fix, ClickHouse fell through to the generic non-Cassandra
+    // branch, which emits `ADD COLUMN ... NOT NULL`/`NULL` -- both rejected
+    // by ClickHouse's parser (`Nullable(T)` is the only way it expresses
+    // nullability), verified against a live ClickHouse 24.10 instance.
+    #[test]
+    fn clickhouse_add_column_omits_the_nullability_clause() {
+        let changes = diff_changes(&[draft(None, "email", "String", false, false)]);
+        let sql = generate_alter_statements("users", DatabaseDriver::ClickHouse, &changes);
+        assert_eq!(
+            sql,
+            vec!["ALTER TABLE \"users\" ADD COLUMN \"email\" String;"]
+        );
+    }
+
+    #[test]
+    fn clickhouse_drop_and_rename_column_match_the_generic_non_mysql_form() {
+        let dropped = diff_changes(&[draft(
+            Some(col("legacy", "String", true)),
+            "legacy",
+            "String",
+            true,
+            true,
+        )]);
+        assert_eq!(
+            generate_alter_statements("t", DatabaseDriver::ClickHouse, &dropped),
+            vec!["ALTER TABLE \"t\" DROP COLUMN \"legacy\";"]
+        );
+
+        let renamed = diff_changes(&[draft(
+            Some(col("old", "String", true)),
+            "new",
+            "String",
+            true,
+            false,
+        )]);
+        assert_eq!(
+            generate_alter_statements("t", DatabaseDriver::ClickHouse, &renamed),
+            vec!["ALTER TABLE \"t\" RENAME COLUMN \"old\" TO \"new\";"]
+        );
+    }
+
+    // Before this fix, ClickHouse's Modify emitted a second `ALTER COLUMN ...
+    // SET/DROP NOT NULL;` statement (the generic non-MySQL branch's
+    // nullability half), which is a syntax error in ClickHouse -- it has no
+    // per-column nullability operation to set or drop, only the `TYPE`
+    // change itself (verified against a live ClickHouse 24.10 instance).
+    #[test]
+    fn clickhouse_modify_type_emits_only_the_type_change_no_nullability_statement() {
+        let changes = diff_changes(&[draft(
+            Some(col("amount", "UInt32", true)),
+            "amount",
+            "Int64",
+            false,
+            false,
+        )]);
+        let sql = generate_alter_statements("t", DatabaseDriver::ClickHouse, &changes);
+        assert_eq!(
+            sql,
+            vec!["ALTER TABLE \"t\" ALTER COLUMN \"amount\" TYPE Int64;"]
+        );
+    }
+
+    // Before this fix, ClickHouse fell through to the generic branch, which
+    // emits `CREATE UNIQUE INDEX` (ClickHouse: "CREATE UNIQUE INDEX is not
+    // supported") and `CREATE INDEX` with no `TYPE` (ClickHouse: "CREATE
+    // INDEX without TYPE is forbidden") -- both confirmed against a live
+    // ClickHouse 24.10 instance.
+    #[test]
+    fn clickhouse_index_has_no_unique_modifier_and_carries_a_type() {
+        let changes = index_diff_changes(&[index_draft(None, "idx_email", "email", true, false)]);
+        let sql = generate_index_statements("users", DatabaseDriver::ClickHouse, &changes);
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX \"idx_email\" ON \"users\" (\"email\") TYPE minmax;"]
+        );
+    }
+
+    #[test]
+    fn clickhouse_composite_index_stays_one_statement_with_all_columns() {
+        let changes = index_diff_changes(&[index_draft(
+            None,
+            "idx_name",
+            "last_name, first_name",
+            false,
+            false,
+        )]);
+        let sql = generate_index_statements("users", DatabaseDriver::ClickHouse, &changes);
+        assert_eq!(
+            sql,
+            vec![
+                "CREATE INDEX \"idx_name\" ON \"users\" (\"last_name\", \"first_name\") TYPE minmax;"
+            ]
+        );
+    }
+
+    // Before this fix, ClickHouse fell through to the generic non-MySQL
+    // branch's bare `DROP INDEX name;`, which ClickHouse's parser rejects
+    // ("Expected ON") -- verified against a live ClickHouse 24.10 instance.
+    #[test]
+    fn clickhouse_drop_index_uses_alter_table_drop_index() {
+        let changes =
+            index_diff_changes(&[index_draft(Some("idx_old"), "idx_old", "", false, true)]);
+        let sql = generate_index_statements("t", DatabaseDriver::ClickHouse, &changes);
+        assert_eq!(sql, vec!["ALTER TABLE \"t\" DROP INDEX \"idx_old\";"]);
+    }
+
+    // Before this fix, ClickHouse fell through to the generic branch's `ADD
+    // CONSTRAINT ... FOREIGN KEY ...`, a syntax error there -- ClickHouse's
+    // `ADD CONSTRAINT` only accepts `CHECK`/`ASSUME` (verified against a live
+    // ClickHouse 24.10 instance), matching how SQLite is already gated below.
+    #[test]
+    fn foreign_key_statements_are_not_generated_for_clickhouse() {
+        let changes =
+            fk_diff_changes(&[fk_draft(None, "fk_owner", "owner_id", "users", "id", false)]);
+        assert!(
+            generate_foreign_key_statements("orders", DatabaseDriver::ClickHouse, &changes)
+                .is_empty()
+        );
     }
 
     fn fk_draft(
