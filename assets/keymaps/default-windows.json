@@ -748,6 +748,20 @@
     }
   },
   {
+    "context": "ApiClientRequestView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "api_client_panel::SendRequest"
+    }
+  },
+  {
+    "context": "ApiClientRequestView > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "api_client_panel::SendRequest"
+    }
+  },
+  {
     "context": "Workspace && debugger_running",
     "use_key_equivalents": true,
     "bindings": {

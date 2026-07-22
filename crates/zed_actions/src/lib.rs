@@ -792,6 +792,9 @@ pub mod database_panel {
             RunQuery,
             /// Runs EXPLAIN on the current SQL query or selection and shows the query plan.
             ExplainQuery,
+            /// Runs EXPLAIN ANALYZE on the current SQL query or selection and
+            /// shows the query plan with actual execution statistics.
+            ExplainAnalyzeQuery,
             /// Opens a new blank SQL query editor tab.
             NewQuery,
             /// Toggles focus on the database query results panel.
@@ -848,6 +851,8 @@ pub mod api_client_panel {
             NewFolder,
             /// Creates a new request under the selected collection or folder.
             NewRequest,
+            /// Sends the request shown in the active request view.
+            SendRequest,
             /// Collapses the selected folder in the API Client tree.
             CollapseSelectedEntry,
             /// Expands the selected folder in the API Client tree.

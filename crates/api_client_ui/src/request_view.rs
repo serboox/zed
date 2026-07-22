@@ -761,7 +761,16 @@ impl RequestView {
         }
 
         if this.body_kind == BodyKind::Raw {
-            this.sync_body_language(this.body_content_type, window, cx);
+            // `RequestView::new` runs inside `cx.new` while callers
+            // (`ApiClientPanel::open_request`, `HistoryView::reopen`) are
+            // themselves inside `workspace.update(...)`. `sync_body_language`
+            // reads the same `Workspace` entity, which double-lease-panics
+            // while it's still being updated -- defer it past the end of
+            // this effect cycle, once the outer update has released its lease.
+            let content_type = this.body_content_type;
+            cx.defer_in(window, move |this, window, cx| {
+                this.sync_body_language(content_type, window, cx);
+            });
         }
 
         this.watch_editor(this.param_bulk_editor.clone(), window, cx, |this, _, cx| {
@@ -3408,10 +3417,15 @@ impl RequestView {
         }
     }
 
-    fn render_response_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_response_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let border = cx.theme().colors().border;
         let border_variant = cx.theme().colors().border_variant;
         let background = cx.theme().colors().background;
+        let line_height = window.line_height();
         match &self.send_state {
             SendState::Idle => v_flex()
                 .id("request-response-idle-hint")
@@ -3706,11 +3720,21 @@ impl RequestView {
                                     .color(Color::Muted),
                             );
                         }
+                        // `flex_1` pins flex-basis to 0, which would discard
+                        // the explicit `h` below and always fall back to
+                        // shrinking to nothing -- `flex_initial` (shrink but
+                        // no forced grow, flex-basis: auto) lets the editor's
+                        // own content-driven height act as its natural size,
+                        // which the `response_region` wrapper in `render`
+                        // then caps at the remaining window space and scrolls
+                        // once it doesn't fit.
+                        let line_count = editor.read(cx).text(cx).lines().count().max(1);
+                        let content_height = line_height * line_count as f32 + px(24.);
                         column
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_h(px(400.))
+                                    .flex_initial()
+                                    .h(content_height.max(px(120.)))
                                     .px_2()
                                     .py_1p5()
                                     .rounded_md()
@@ -3931,13 +3955,18 @@ impl Render for RequestView {
                 },
             ));
 
-        let response_section = self.render_response_section(cx);
+        let response_section = self.render_response_section(window, cx);
 
         if self.response_fullscreen {
             return v_flex()
                 .id("api-client-request-view")
                 .key_context("ApiClientRequestView")
                 .track_focus(&self.focus_handle)
+                .on_action(cx.listener(
+                    |this, _: &zed_actions::api_client_panel::SendRequest, window, cx| {
+                        this.send(window, cx);
+                    },
+                ))
                 .size_full()
                 .p_4()
                 .gap_3()
@@ -3956,28 +3985,55 @@ impl Render for RequestView {
 
         let tab_body = self.render_tab_body(window, cx);
 
-        v_flex()
-            .id("api-client-request-view")
-            .key_context("ApiClientRequestView")
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .p_4()
+        // The form (URL/env/tabs) always keeps its natural height
+        // (`flex_shrink_0`) -- only the response below it gives up space.
+        let top_section = v_flex()
+            .id("api-client-request-top-section")
+            .debug_selector(|| "api-client-request-top-section".to_string())
+            .flex_shrink_0()
             .gap_3()
-            .bg(editor_background)
-            .overflow_scroll()
-            .track_scroll(&self.scroll_handle)
             .child(url_row)
             .when_some(url_warning, |this, warning| this.child(warning))
             .child(environment_row)
             .child(tab_strip)
-            .child(div().child(tab_body))
+            .child(div().child(tab_body));
+
+        // `flex_initial` (grow: 0, shrink: 1, basis: auto) sizes this to the
+        // response's own content height when there's room, and lets it shrink
+        // below that -- via `min_h(0)`, overriding Taffy's default
+        // min-height-equals-content -- once the window doesn't have enough
+        // remaining space, at which point `overflow_scroll` reveals the rest.
+        let response_region = div()
+            .id("api-client-response-scroll-region")
+            .debug_selector(|| "api-client-response-scroll-region".to_string())
+            .flex_initial()
+            .min_h(px(0.))
+            .overflow_scroll()
+            .track_scroll(&self.scroll_handle)
             .child(response_section)
             .custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Vertical)
                     .tracked_scroll_handle(&self.scroll_handle),
                 window,
                 cx,
-            )
+            );
+
+        v_flex()
+            .id("api-client-request-view")
+            .debug_selector(|| "api-client-request-view".to_string())
+            .key_context("ApiClientRequestView")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(
+                |this, _: &zed_actions::api_client_panel::SendRequest, window, cx| {
+                    this.send(window, cx);
+                },
+            ))
+            .size_full()
+            .p_4()
+            .gap_3()
+            .bg(editor_background)
+            .child(top_section)
+            .child(response_region)
             .into_any_element()
     }
 }
@@ -4930,6 +4986,75 @@ mod tests {
             let raw_text = view.raw_body_editor.read(cx).text(cx);
             assert_eq!(raw_text, r#"{"id":1}"#);
         });
+    }
+
+    // Reproduces the reported bug: the response region used to be a regular
+    // child of one page-wide scroll container, so it never had a bounded
+    // height of its own -- a short response left dead space or stretched to
+    // fill the window, and a long one just kept pushing the whole page
+    // (including the request form above it) taller instead of scrolling on
+    // its own. It must now size to its own content when that fits, and cap
+    // at the remaining window space (scrolling internally) when it doesn't.
+    #[gpui::test]
+    async fn response_region_sizes_to_content_and_scrolls_when_it_overflows(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, r#"{"id":1}"#), window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let window_bounds = cx
+            .debug_bounds("api-client-request-view")
+            .expect("expected debug bounds for the request view");
+        let short_response_bounds = cx
+            .debug_bounds("api-client-response-scroll-region")
+            .expect("expected debug bounds for the response region");
+        assert!(
+            short_response_bounds.size.height < window_bounds.size.height / 2.,
+            "a short response must size to its own content, not stretch to fill the window: \
+             response height {:?}, window height {:?}",
+            short_response_bounds.size.height,
+            window_bounds.size.height,
+        );
+        let max_offset_short = view.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+        assert_eq!(
+            max_offset_short.y,
+            px(0.),
+            "a short response must fit without needing to scroll"
+        );
+
+        let long_body = format!(
+            "{{{}}}",
+            (0..500)
+                .map(|i| format!(r#""field_{i}": {i}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, &long_body), window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let long_response_bounds = cx
+            .debug_bounds("api-client-response-scroll-region")
+            .expect("expected debug bounds for the response region");
+        assert!(
+            long_response_bounds.size.height <= window_bounds.size.height,
+            "the response region must be capped at the window's height, not grow past it: \
+             response height {:?}, window height {:?}",
+            long_response_bounds.size.height,
+            window_bounds.size.height,
+        );
+        let max_offset_long = view.read_with(&cx, |view, _| view.scroll_handle.max_offset());
+        assert!(
+            max_offset_long.y > px(0.),
+            "a response too tall for the remaining window space must become scrollable, got max_offset {max_offset_long:?}"
+        );
     }
 
     #[gpui::test]
