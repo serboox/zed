@@ -3,8 +3,8 @@ use fs::Fs;
 
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling, WeakEntity,
-    Window, WindowId, actions, deferred, px,
+    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity, Window,
+    WindowId, actions, deferred, px,
 };
 use project::Project;
 pub use project::ProjectGroupKey;
@@ -1212,7 +1212,9 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if let Some(workspace) = self.workspace_for_paths(&paths, host.as_ref(), cx) {
+        if let Some(workspace) =
+            self.workspace_for_paths_excluding(&paths, host.as_ref(), excluding, cx)
+        {
             self.activate(workspace.clone(), source_workspace, window, cx);
             return Task::ready(Ok(workspace));
         }
@@ -2255,11 +2257,6 @@ impl Render for MultiWorkspace {
                 })),
             window,
             cx,
-            Tiling {
-                left: !sidebar_on_right && multi_workspace_enabled && self.sidebar_open(),
-                right: sidebar_on_right && multi_workspace_enabled && self.sidebar_open(),
-                ..Tiling::default()
-            },
         )
     }
 }
