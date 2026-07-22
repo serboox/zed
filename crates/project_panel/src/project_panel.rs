@@ -98,6 +98,14 @@ struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
     entries: Vec<GitEntry>,
     index: OnceCell<HashSet<Arc<RelPath>>>,
+    /// Lazily-built `entry id -> position in entries`, so lookups by id are
+    /// O(1) instead of a linear scan. `index_for_entry` runs every frame for
+    /// the active indent guide, so on a large worktree the scan was O(n) per
+    /// frame. Rebuilt with `entries` (a fresh cell per `update_visible_entries`).
+    id_index: OnceCell<HashMap<ProjectEntryId, usize>>,
+    /// Lazily-built `entry id -> git summary`, so sticky-scroll headers read a
+    /// cached map instead of collecting one over every entry each frame.
+    git_summaries: OnceCell<HashMap<ProjectEntryId, GitSummary>>,
 }
 
 struct State {
@@ -4559,6 +4567,8 @@ impl ProjectPanel {
                             worktree_id,
                             entries: visible_worktree_entries,
                             index: OnceCell::new(),
+                            id_index: OnceCell::new(),
+                            git_summaries: OnceCell::new(),
                         })
                     }
                     if let Some((project_entry_id, worktree_id, _)) = max_width_item {
@@ -5124,12 +5134,17 @@ impl ProjectPanel {
                 continue;
             }
 
-            return visible
-                .entries
-                .iter()
-                .enumerate()
-                .find(|(_, entry)| entry.id == entry_id)
-                .map(|(ix, _)| (worktree_ix, ix, total_ix + ix));
+            let id_index = visible.id_index.get_or_init(|| {
+                visible
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, entry)| (entry.id, ix))
+                    .collect()
+            });
+            return id_index
+                .get(&entry_id)
+                .map(|&ix| (worktree_ix, ix, total_ix + ix));
         }
         None
     }
@@ -6882,14 +6897,17 @@ impl ProjectPanel {
         let git_status_enabled = panel_settings.git_status;
         let root_name = worktree.root_name();
 
+        let empty_git_summaries = HashMap::default();
         let git_summaries_by_id = if git_status_enabled {
-            visible
-                .entries
-                .iter()
-                .map(|e| (e.id, e.git_summary))
-                .collect::<HashMap<_, _>>()
+            visible.git_summaries.get_or_init(|| {
+                visible
+                    .entries
+                    .iter()
+                    .map(|e| (e.id, e.git_summary))
+                    .collect()
+            })
         } else {
-            Default::default()
+            &empty_git_summaries
         };
 
         // already checked if non empty above
