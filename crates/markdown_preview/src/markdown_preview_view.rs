@@ -21,6 +21,7 @@ use markdown::{
 use project::search::SearchQuery;
 use project::{Project, ProjectPath};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
+use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{ContextMenu, LinkPreview, WithScrollbar, prelude::*, right_click_menu};

@@ -5269,8 +5269,10 @@ impl BackgroundScanner {
                 let should_stat = child_abs_path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .and_then(|name| RelPath::unix(name).ok())
-                    .is_some_and(|name| !self.settings.is_path_excluded(&job.path.join(name)));
+                    .and_then(|name| RelPath::new(Path::new(name), PathStyle::local()).ok())
+                    .is_some_and(|name| {
+                        !self.settings.is_path_excluded(&job.path.join(name.as_ref()))
+                    });
                 (child_abs_path.clone(), should_stat)
             })
             .collect();

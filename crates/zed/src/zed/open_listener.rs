@@ -862,6 +862,9 @@ pub(crate) fn open_options_for_request(
         match workspace::WorkspaceSettings::get_global(cx).default_open_behavior {
             settings::DefaultOpenBehavior::ExistingWindow => cli::OpenBehavior::ExistingWindow,
             settings::DefaultOpenBehavior::NewWindow => cli::OpenBehavior::PreferNewWindow,
+            // The "Ask" prompt is driven by the interactive open flow
+            // (workspace/welcome); this CLI fallback defaults to a new window.
+            settings::DefaultOpenBehavior::Ask => cli::OpenBehavior::PreferNewWindow,
         }
     });
     open_options_for_behavior(open_behavior, location, cx)
