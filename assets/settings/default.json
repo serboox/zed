@@ -901,6 +901,21 @@
     "diagnostic_badges": false,
     // Whether to show the git status indicator next to file names in the project panel.
     "git_status_indicator": false,
+    // Performance mode for the project panel tree on large worktrees.
+    // This setting can take three values:
+    //
+    // 1. Stock behavior: rebuild immediately on every event, full live git:
+    //    "vanilla"
+    // 2. Coalesce bursts of events into one rebuild, and skip per-file git
+    //    decoration above "large_tree_threshold" entries (default):
+    //    "balanced"
+    // 3. Above "large_tree_threshold" entries, freeze the tree against
+    //    background events and rebuild only via the RefreshTree action:
+    //    "snapshot"
+    "tree_performance": "balanced",
+    // Total worktree entry count above which the "balanced" and "snapshot"
+    // modes engage their large-tree behavior. Ignored in "vanilla" mode.
+    "large_tree_threshold": 5000,
     // Whether to enable drag-and-drop operations in the project panel.
     "drag_and_drop": true,
     // Whether to hide the root entry when only one folder is open in the window;

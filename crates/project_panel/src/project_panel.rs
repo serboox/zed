@@ -44,8 +44,8 @@ use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    DockSide, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides,
-    update_settings_file,
+    DockSide, ProjectPanelEntrySpacing, ProjectPanelTreePerformance, Settings, SettingsStore,
+    ShowDiagnostics, ShowIndentGuides, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::{
@@ -93,6 +93,9 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+/// Quiet window used to debounce background-driven tree rebuilds in the
+/// `balanced`/`snapshot` tree performance modes.
+const BACKGROUND_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -182,8 +185,18 @@ pub struct ProjectPanel {
     pending_expansions: HashSet<ProjectEntryId>,
     // Coalesces background refresh triggers (worktree/git events). A burst of
     // such events delivered in one effect cycle rebuilds the visible entries
-    // once instead of once per event.
+    // once instead of once per event. Used only in `vanilla` tree performance
+    // mode; the other modes debounce via `refresh_debounce_task` instead.
     pending_visible_entries_refresh: bool,
+    // Debounce handle for background-driven refreshes in `balanced`/`snapshot`
+    // modes. A new trigger replaces the pending task, collapsing a burst of
+    // events into a single rebuild once the quiet window elapses.
+    refresh_debounce_task: Option<Task<()>>,
+    // Input signature of the last background rebuild (total worktree entries,
+    // summed worktree scan ids, expanded dir count). A background refresh whose
+    // signature is unchanged is skipped, but only while git decoration is off
+    // (large trees), where the signature fully determines the rendered tree.
+    last_tree_input_signature: Option<(usize, usize, usize)>,
     #[cfg(test)]
     update_visible_entries_run_count: usize,
 }
@@ -433,6 +446,10 @@ actions!(
         Redo,
         /// Opens a markdown preview for the selected file.
         OpenMarkdownPreview,
+        /// Forces a full rebuild of the project panel tree. Useful when the
+        /// `snapshot` tree performance mode has frozen the tree against
+        /// background changes on a large worktree.
+        RefreshTree,
     ]
 );
 
@@ -531,6 +548,14 @@ pub fn init(cx: &mut App) {
             if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
                 panel.update(cx, |panel, cx| {
                     panel.expand_all_entries(action, window, cx);
+                });
+            }
+        });
+
+        workspace.register_action(|workspace, action: &RefreshTree, window, cx| {
+            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.refresh_tree(action, window, cx);
                 });
             }
         });
@@ -703,6 +728,9 @@ impl ProjectPanel {
                     GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
                     | GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_) => {
+                        if this.is_snapshot_frozen(cx) {
+                            return;
+                        }
                         this.schedule_visible_entries_refresh(window, cx);
                     }
                     _ => {}
@@ -768,6 +796,13 @@ impl ProjectPanel {
                     project::Event::WorktreeUpdatedEntries(_, _)
                     | project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
+                        // Snapshot mode ignores background filesystem churn, but a
+                        // user-initiated directory expansion still needs the follow-up
+                        // event that renders its freshly loaded children -- let events
+                        // through while an expansion is pending.
+                        if this.is_snapshot_frozen(cx) && this.pending_expansions.is_empty() {
+                            return;
+                        }
                         this.schedule_visible_entries_refresh(window, cx);
                     }
                     project::Event::ExpandedAllForEntry(worktree_id, entry_id) => {
@@ -846,6 +881,14 @@ impl ProjectPanel {
                     if project_panel_settings.sort_order != new_settings.sort_order {
                         this.update_visible_entries(None, false, false, window, cx);
                     }
+                    if project_panel_settings.tree_performance != new_settings.tree_performance
+                        || project_panel_settings.large_tree_threshold
+                            != new_settings.large_tree_threshold
+                    {
+                        // These decide whether entries carry git decoration, so a
+                        // runtime change must rebuild for it to take effect immediately.
+                        this.update_visible_entries(None, false, false, window, cx);
+                    }
                     if project_panel_settings.sticky_scroll && !new_settings.sticky_scroll {
                         this.sticky_items_count = 0;
                     }
@@ -902,6 +945,8 @@ impl ProjectPanel {
                 ),
                 pending_expansions: HashSet::default(),
                 pending_visible_entries_refresh: false,
+                refresh_debounce_task: None,
+                last_tree_input_signature: None,
                 #[cfg(test)]
                 update_visible_entries_run_count: 0,
             };
@@ -1508,6 +1553,11 @@ impl ProjectPanel {
     ) {
         let roots = self.all_worktree_roots(cx);
         self.expand_worktree_roots(roots, window, cx);
+    }
+
+    fn refresh_tree(&mut self, _: &RefreshTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_visible_entries(None, false, false, window, cx);
+        cx.notify();
     }
 
     fn expand_all_for_entry_and_refresh(
@@ -4326,7 +4376,6 @@ impl ProjectPanel {
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
         let project = self.project.read(cx);
-        let repo_snapshots = project.git_store().read(cx).repo_snapshots(cx);
 
         let old_ancestors = self.state.ancestors.clone();
         let temporary_unfolded_pending_state = self.state.temporarily_unfolded_pending_state.take();
@@ -4344,6 +4393,25 @@ impl ProjectPanel {
             .collect();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
+
+        let total_entries: usize = visible_worktrees
+            .iter()
+            .map(|worktree_snapshot| worktree_snapshot.entry_count())
+            .sum();
+        let skip_git = self.should_skip_git_decoration(total_entries, cx);
+        // On large worktrees (balanced/snapshot mode) skip per-file git
+        // decoration: an empty repo snapshot map makes GitTraversal leave every
+        // entry's summary at its default, cutting the dominant O(n) status
+        // lookup. Reading `git_summary` downstream stays O(1) and returns
+        // UNCHANGED.
+        let repo_snapshots = if skip_git {
+            HashMap::default()
+        } else {
+            project.git_store().read(cx).repo_snapshots(cx)
+        };
+
+        let input_signature = self.tree_input_signature(cx);
+        self.last_tree_input_signature = Some(input_signature);
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
             let new_state = cx
@@ -4638,26 +4706,107 @@ impl ProjectPanel {
         };
     }
 
+    /// Total number of entries across all visible worktrees, ignored ones
+    /// included. Cheap: reads per-worktree summary counts, does not walk entries.
+    fn total_worktree_entry_count(&self, cx: &App) -> usize {
+        self.project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).entry_count())
+            .sum()
+    }
+
+    /// In `snapshot` mode on a large tree the panel freezes its current list and
+    /// ignores background filesystem/git events until the `RefreshTree` action
+    /// (or a user expand/collapse) rebuilds it.
+    fn is_snapshot_frozen(&self, cx: &App) -> bool {
+        let settings = ProjectPanelSettings::get_global(cx);
+        settings.tree_performance == ProjectPanelTreePerformance::Snapshot
+            && self.total_worktree_entry_count(cx) > settings.large_tree_threshold
+    }
+
+    /// Whether per-file git decoration should be skipped for the current tree:
+    /// true in `balanced`/`snapshot` mode once the tree exceeds
+    /// `large_tree_threshold`. Always false in `vanilla` mode.
+    fn should_skip_git_decoration(&self, total_entries: usize, cx: &App) -> bool {
+        let settings = ProjectPanelSettings::get_global(cx);
+        matches!(
+            settings.tree_performance,
+            ProjectPanelTreePerformance::Balanced | ProjectPanelTreePerformance::Snapshot
+        ) && total_entries > settings.large_tree_threshold
+    }
+
+    /// Cheap signature of the inputs that determine the rendered tree when git
+    /// decoration is off: total entry count, summed worktree scan ids, and the
+    /// expanded-directory count. The scan ids catch renames/creates/deletes that
+    /// keep the entry count constant.
+    fn tree_input_signature(&self, cx: &App) -> (usize, usize, usize) {
+        let project = self.project.read(cx);
+        let mut entry_total = 0;
+        let mut scan_id_total = 0usize;
+        for worktree in project.visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            entry_total += worktree.entry_count();
+            scan_id_total = scan_id_total.wrapping_add(worktree.scan_id());
+        }
+        let expanded_total = self
+            .state
+            .expanded_dir_ids
+            .values()
+            .map(|ids| ids.len())
+            .sum();
+        (entry_total, scan_id_total, expanded_total)
+    }
+
     /// Requests a full rebuild of the visible entries in response to a
     /// background event (worktree entries changed, git statuses changed, etc.).
-    /// Triggers delivered in the same effect cycle are collapsed into a single
-    /// rebuild: the first schedules a foreground task, and while that task is
-    /// pending, further triggers are dropped. The task reads the latest project
-    /// state when it runs, so no needed refresh is lost.
+    ///
+    /// In `vanilla` mode this rebuilds immediately, coalescing only triggers
+    /// delivered in the same effect cycle. In `balanced`/`snapshot` mode it
+    /// instead time-debounces: a burst of events collapses into a single
+    /// rebuild after a short quiet window, and the rebuild is skipped entirely
+    /// when git decoration is off and the tree's input signature is unchanged.
     fn schedule_visible_entries_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_visible_entries_refresh {
-            return;
+        match ProjectPanelSettings::get_global(cx).tree_performance {
+            ProjectPanelTreePerformance::Vanilla => {
+                if self.pending_visible_entries_refresh {
+                    return;
+                }
+                self.pending_visible_entries_refresh = true;
+                cx.spawn_in(window, async move |this, cx| {
+                    this.update_in(cx, |this, window, cx| {
+                        this.pending_visible_entries_refresh = false;
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            ProjectPanelTreePerformance::Balanced | ProjectPanelTreePerformance::Snapshot => {
+                self.refresh_debounce_task = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(BACKGROUND_REFRESH_DEBOUNCE)
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        // Only safe to skip when git decoration is off: then the
+                        // input signature fully determines the rendered tree, so
+                        // an unchanged signature means an identical rebuild. With
+                        // live git, colors can change without the signature
+                        // changing, so we always rebuild.
+                        let total_entries = this.total_worktree_entry_count(cx);
+                        if this.should_skip_git_decoration(total_entries, cx)
+                            && this.last_tree_input_signature == Some(this.tree_input_signature(cx))
+                        {
+                            return;
+                        }
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
         }
-        self.pending_visible_entries_refresh = true;
-        cx.spawn_in(window, async move |this, cx| {
-            this.update_in(cx, |this, window, cx| {
-                this.pending_visible_entries_refresh = false;
-                this.update_visible_entries(None, false, false, window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn expand_entry(
@@ -7128,6 +7277,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::collapse_selected_entry))
                 .on_action(cx.listener(Self::collapse_all_entries))
                 .on_action(cx.listener(Self::expand_all_entries))
+                .on_action(cx.listener(Self::refresh_tree))
                 .on_action(cx.listener(Self::collapse_selected_entry_and_children))
                 .on_action(cx.listener(Self::expand_selected_entry_and_children))
                 .on_action(cx.listener(Self::open))

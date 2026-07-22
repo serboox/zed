@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockSide, ProjectPanelEntrySpacing, ProjectPanelSortMode, ProjectPanelSortOrder,
-    RegisterSetting, Settings, ShowDiagnostics, ShowIndentGuides,
+    ProjectPanelTreePerformance, RegisterSetting, Settings, ShowDiagnostics, ShowIndentGuides,
 };
 use ui::{
     px,
@@ -38,6 +38,8 @@ pub struct ProjectPanelSettings {
     pub sort_order: ProjectPanelSortOrder,
     pub diagnostic_badges: bool,
     pub git_status_indicator: bool,
+    pub tree_performance: ProjectPanelTreePerformance,
+    pub large_tree_threshold: usize,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -145,6 +147,8 @@ impl Settings for ProjectPanelSettings {
             sort_order: project_panel.sort_order.unwrap(),
             diagnostic_badges: project_panel.diagnostic_badges.unwrap(),
             git_status_indicator: project_panel.git_status_indicator.unwrap(),
+            tree_performance: project_panel.tree_performance.unwrap(),
+            large_tree_threshold: project_panel.large_tree_threshold.unwrap(),
         }
     }
 }

@@ -827,6 +827,20 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub git_status_indicator: Option<bool>,
+    /// Performance mode for the project panel tree. Controls how aggressively the
+    /// panel rebuilds and git-decorates its entries in response to background
+    /// filesystem and git events, trading fidelity for responsiveness on large
+    /// worktrees.
+    ///
+    /// Default: balanced
+    pub tree_performance: Option<ProjectPanelTreePerformance>,
+    /// Total worktree entry count above which the `balanced` and `snapshot`
+    /// performance modes engage their large-tree behavior (skipping per-file git
+    /// decoration and, for `snapshot`, freezing the tree against background
+    /// events). Has no effect in `vanilla` mode.
+    ///
+    /// Default: 5000
+    pub large_tree_threshold: Option<usize>,
 }
 
 #[derive(
@@ -875,6 +889,37 @@ pub enum ProjectPanelSortMode {
     Mixed,
     /// Show files first, then directories
     FilesFirst,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPanelTreePerformance {
+    /// Stock behavior: rebuild the tree immediately on every filesystem/git
+    /// event, with full live git decoration. Highest fidelity, highest cost on
+    /// large worktrees.
+    Vanilla,
+    /// Coalesce bursts of background events into a single debounced rebuild, and
+    /// above `large_tree_threshold` entries skip per-file git decoration. The
+    /// tree stays live; only git colors drop on very large worktrees.
+    #[default]
+    Balanced,
+    /// Above `large_tree_threshold` entries, freeze the tree: ignore background
+    /// filesystem/git events (git decoration is also skipped) and rebuild only
+    /// on demand via the `project_panel::RefreshTree` action.
+    Snapshot,
 }
 
 #[derive(

@@ -850,6 +850,8 @@ impl VsCodeSettings {
             auto_open: None,
             diagnostic_badges: None,
             git_status_indicator: None,
+            tree_performance: None,
+            large_tree_threshold: None,
         };
 
         if let (Some(false), Some(false)) = (
