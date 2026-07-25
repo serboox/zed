@@ -16,7 +16,8 @@ use gpui::{
 };
 use language::{LanguageRegistry, Point};
 use markdown::{
-    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
+    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
+    MarkdownOptions, MarkdownStyle,
 };
 use project::search::SearchQuery;
 use project::{Project, ProjectPath};
@@ -897,7 +898,19 @@ impl MarkdownPreviewView {
             }
         }
 
-        let markdown_style = markdown::github_style(window, cx);
+        // Two deliberate rendering modes: a chosen `markdown_preview_theme`
+        // paints the preview in that theme, and without one the preview is a
+        // GitHub-flavored document independent of the editor theme.
+        let markdown_style = match self.resolve_preview_theme(cx) {
+            Some(theme) => MarkdownStyle::themed_with_overrides(
+                MarkdownFont::Preview,
+                theme.colors(),
+                theme.syntax(),
+                window,
+                cx,
+            ),
+            None => markdown::github_style(window, cx),
+        };
 
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .code_block_renderer(CodeBlockRenderer::Default {
@@ -1373,7 +1386,10 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg_color = markdown::github_page_background(cx.theme().appearance());
+        let bg_color = match self.resolve_preview_theme(cx) {
+            Some(theme) => theme.colors().editor_background,
+            None => markdown::github_page_background(cx.theme().appearance()),
+        };
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         let hovered_url = self.hovered_url.clone();
         div()

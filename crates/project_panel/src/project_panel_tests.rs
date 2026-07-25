@@ -11096,6 +11096,76 @@ async fn test_focus_follows_mouse_into_blank_area(cx: &mut gpui::TestAppContext)
     });
 }
 
+#[gpui::test]
+async fn test_scanning_state_replaces_empty_state_while_worktree_loads(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+
+    let project = Project::test(fs.clone(), [], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<ProjectPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    draw(cx);
+    assert!(
+        cx.debug_bounds("project-panel-empty-state").is_some(),
+        "a project with no worktrees should still offer to open one"
+    );
+    assert!(cx.debug_bounds("project-panel-scanning").is_none());
+
+    // Deliberately not awaited: the panel has to render while the worktree is
+    // still being created and scanned.
+    let worktree_creation = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(path!("/root"), true, cx)
+    });
+
+    draw(cx);
+    let scanning_bounds = cx
+        .debug_bounds("project-panel-scanning")
+        .expect("an opening project must report that it is being scanned");
+    assert!(
+        scanning_bounds.size.width > px(0.) && scanning_bounds.size.height > px(0.),
+        "the scanning state must occupy real screen area, got {scanning_bounds:?}"
+    );
+    assert!(
+        cx.debug_bounds("project-panel-empty-state").is_none(),
+        "claiming no project is open while one is opening misleads the user"
+    );
+    assert!(cx.debug_bounds("project-panel-tree").is_none());
+
+    worktree_creation.await.unwrap();
+    cx.run_until_parked();
+
+    draw(cx);
+    assert!(
+        cx.debug_bounds("project-panel-tree").is_some(),
+        "the tree must replace the scanning state once entries arrive"
+    );
+    assert!(cx.debug_bounds("project-panel-scanning").is_none());
+    assert!(cx.debug_bounds("project-panel-empty-state").is_none());
+}
+
+/// Paints a frame without running the executor, so a test can inspect the
+/// rendered output at a chosen point of an in-flight load.
+fn draw(cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear();
+    });
+}
+
 pub(crate) fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);

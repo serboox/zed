@@ -1462,16 +1462,16 @@ pub struct Workspace {
     scheduled_tasks: Vec<Task<()>>,
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
-    /// Number of in-flight session restores (deserializing the saved
-    /// editors/panels). A counter, not a bool, so overlapping restores for the
-    /// same workspace keep the "Restoring session" indicator up until the last
-    /// one finishes -- otherwise the first to complete would hide it while
-    /// another is still running. A restoring window must not be mistaken for an
-    /// empty first-run window.
-    session_restore_count: usize,
+    /// Number of in-flight units of work per [`WorkspaceLoadPhase`], indexed by
+    /// the phase's discriminant. Counters, not flags, so overlapping begin/end
+    /// pairs for the same phase keep the indicator up until the last one
+    /// finishes -- otherwise the first to complete would hide it while another
+    /// is still running. A loading window must not be mistaken for an idle one.
+    load_phase_counts: [usize; WorkspaceLoadPhase::COUNT],
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
+    _project_scan_task: Option<Task<()>>,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     /// Shared with the parent `MultiWorkspace` and any sibling workspaces: holds
@@ -1486,6 +1486,48 @@ pub struct Workspace {
 }
 
 impl EventEmitter<Event> for Workspace {}
+
+/// A piece of workspace start-up work that the user is told about while it runs.
+///
+/// Declaration order is the reporting priority: when several phases overlap,
+/// [`Workspace::active_load_phase`] reports the earliest variant. It is also the
+/// index into [`Workspace::load_phase_counts`], which the assertion below pins.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum WorkspaceLoadPhase {
+    RestoringSession,
+    LoadingPanels,
+    RestoringTerminals,
+    ScanningProject,
+}
+
+impl WorkspaceLoadPhase {
+    pub const COUNT: usize = 4;
+
+    pub const ALL: [WorkspaceLoadPhase; Self::COUNT] = [
+        WorkspaceLoadPhase::RestoringSession,
+        WorkspaceLoadPhase::LoadingPanels,
+        WorkspaceLoadPhase::RestoringTerminals,
+        WorkspaceLoadPhase::ScanningProject,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            WorkspaceLoadPhase::RestoringSession => "Restoring session…",
+            WorkspaceLoadPhase::LoadingPanels => "Loading panels…",
+            WorkspaceLoadPhase::RestoringTerminals => "Restoring terminals…",
+            WorkspaceLoadPhase::ScanningProject => "Scanning project…",
+        }
+    }
+}
+
+const _: () = {
+    let phases = WorkspaceLoadPhase::ALL;
+    let mut index = 0;
+    while index < WorkspaceLoadPhase::COUNT {
+        assert!(phases[index] as usize == index);
+        index += 1;
+    }
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ViewId {
@@ -1593,6 +1635,9 @@ impl Workspace {
 
                 &project::Event::WorktreeAdded(id) => {
                     this.update_window_title(window, cx);
+                    // A folder added to a live project starts a fresh scan that
+                    // the construction-time watcher no longer covers.
+                    this.watch_project_scan(cx);
                     if this
                         .project()
                         .read(cx)
@@ -1870,7 +1915,9 @@ impl Workspace {
         center.set_is_center(true);
         center.mark_positions(cx);
 
-        Workspace {
+        let load_phase_counts = [0usize; WorkspaceLoadPhase::COUNT];
+
+        let mut workspace = Workspace {
             weak_self: weak_handle.clone(),
             zoomed: None,
             zoomed_position: None,
@@ -1929,7 +1976,8 @@ impl Workspace {
             scheduled_tasks: Vec::new(),
             last_open_dock_positions: Vec::new(),
             removing: false,
-            session_restore_count: 0,
+            load_phase_counts,
+            _project_scan_task: None,
             sidebar_focus_handle: None,
             multi_workspace,
             active_workspace_id: None,
@@ -1937,7 +1985,42 @@ impl Workspace {
             open_in_dev_container: false,
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
+        };
+        workspace.watch_project_scan(cx);
+        workspace
+    }
+
+    /// Reports a project scan for as long as one is in flight, re-arming for
+    /// every later scan: adding a folder to a live project starts a new scan,
+    /// and the previous watcher has already finished by then.
+    ///
+    /// The worktree store cannot notify when its scan state changes (its
+    /// updater only has an `&App`), so awaiting the signal is the only way to
+    /// learn that a scan ended.
+    fn watch_project_scan(&mut self, cx: &mut Context<Self>) {
+        if self.load_phase_counts[WorkspaceLoadPhase::ScanningProject as usize] > 0 {
+            // The pending watcher resolves once every visible worktree has
+            // finished scanning, so it already covers the new one.
+            return;
         }
+        if self
+            .project
+            .read(cx)
+            .worktree_store()
+            .read(cx)
+            .initial_scan_completed()
+        {
+            return;
+        }
+        self.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        let initial_scan = self.project.read(cx).wait_for_initial_scan(cx);
+        self._project_scan_task = Some(cx.spawn(async move |this, cx| {
+            initial_scan.await;
+            this.update(cx, |this, cx| {
+                this.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            })
+            .ok();
+        }));
     }
 
     pub fn new_local(
@@ -8388,9 +8471,30 @@ impl Workspace {
         self.zoomed.as_ref()
     }
 
-    /// True while a saved session is still being restored into this workspace.
+    /// Registers one more in-flight unit of work for `phase`, making it visible
+    /// to [`Self::active_load_phase`] until a matching [`Self::end_load_phase`].
+    pub fn begin_load_phase(&mut self, phase: WorkspaceLoadPhase, cx: &mut Context<Self>) {
+        self.load_phase_counts[phase as usize] += 1;
+        cx.notify();
+    }
+
+    pub fn end_load_phase(&mut self, phase: WorkspaceLoadPhase, cx: &mut Context<Self>) {
+        let count = &mut self.load_phase_counts[phase as usize];
+        *count = count.saturating_sub(1);
+        cx.notify();
+    }
+
+    /// The highest-priority phase with work still in flight, in
+    /// [`WorkspaceLoadPhase`] declaration order.
+    pub fn active_load_phase(&self) -> Option<WorkspaceLoadPhase> {
+        WorkspaceLoadPhase::ALL
+            .into_iter()
+            .find(|phase| self.load_phase_counts[*phase as usize] > 0)
+    }
+
+    /// True while any part of this workspace is still loading.
     pub fn is_restoring_session(&self) -> bool {
-        self.session_restore_count > 0
+        self.active_load_phase().is_some()
     }
 
     pub fn activate_next_window(&mut self, cx: &mut Context<Self>) {
@@ -8746,7 +8850,7 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
 
 fn open_items(
     serialized_workspace: Option<SerializedWorkspace>,
-    mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
+    project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> impl 'static + Future<Output = Result<Vec<Option<Result<Box<dyn ItemHandle>>>>>> + use<> {
@@ -8764,103 +8868,119 @@ fn open_items(
     });
 
     cx.spawn_in(window, async move |workspace, cx| {
-        let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
-
-        if let Some(restored_items) = restored_items {
+        // A first-ever open has no serialized workspace, yet the requested paths
+        // still take a while to appear, so the phase has to cover that case too.
+        let report_phase = restored_items.is_some() || !project_paths_to_open.is_empty();
+        if report_phase {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.session_restore_count += 1;
-                    cx.notify();
+                    workspace.begin_load_phase(WorkspaceLoadPhase::RestoringSession, cx);
                 })
                 .ok();
-            let restored_items = restored_items.await;
+        }
+
+        let opened_items = open_restored_and_requested_items(
+            restored_items,
+            project_paths_to_open,
+            &workspace,
+            cx,
+        )
+        .await;
+
+        if report_phase {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.session_restore_count =
-                        workspace.session_restore_count.saturating_sub(1);
-                    cx.notify();
+                    workspace.end_load_phase(WorkspaceLoadPhase::RestoringSession, cx);
                 })
                 .ok();
-            let restored_items = restored_items?;
-
-            let restored_project_paths = restored_items
-                .iter()
-                .filter_map(|item| {
-                    cx.update(|_, cx| item.as_ref()?.project_path(cx))
-                        .ok()
-                        .flatten()
-                })
-                .collect::<HashSet<_>>();
-
-            for restored_item in restored_items {
-                opened_items.push(restored_item.map(Ok));
-            }
-
-            project_paths_to_open
-                .iter_mut()
-                .for_each(|(_, project_path)| {
-                    if let Some(project_path_to_open) = project_path
-                        && restored_project_paths.contains(project_path_to_open)
-                    {
-                        *project_path = None;
-                    }
-                });
-        } else {
-            for _ in 0..project_paths_to_open.len() {
-                opened_items.push(None);
-            }
-        }
-        assert!(opened_items.len() == project_paths_to_open.len());
-
-        let tasks =
-            project_paths_to_open
-                .into_iter()
-                .enumerate()
-                .map(|(ix, (abs_path, project_path))| {
-                    let workspace = workspace.clone();
-                    cx.spawn(async move |cx| {
-                        let file_project_path = project_path?;
-                        let abs_path_task = workspace.update(cx, |workspace, cx| {
-                            workspace.project().update(cx, |project, cx| {
-                                project.resolve_abs_path(abs_path.to_string_lossy().as_ref(), cx)
-                            })
-                        });
-
-                        // We only want to open file paths here. If one of the items
-                        // here is a directory, it was already opened further above
-                        // with a `find_or_create_worktree`.
-                        if let Ok(task) = abs_path_task
-                            && task.await.is_none_or(|p| p.is_file())
-                        {
-                            return Some((
-                                ix,
-                                workspace
-                                    .update_in(cx, |workspace, window, cx| {
-                                        workspace.open_path(
-                                            file_project_path,
-                                            None,
-                                            true,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .log_err()?
-                                    .await,
-                            ));
-                        }
-                        None
-                    })
-                });
-
-        let tasks = tasks.collect::<Vec<_>>();
-
-        let tasks = futures::future::join_all(tasks);
-        for (ix, path_open_result) in tasks.await.into_iter().flatten() {
-            opened_items[ix] = Some(path_open_result);
         }
 
-        Ok(opened_items)
+        opened_items
     })
+}
+
+async fn open_restored_and_requested_items(
+    restored_items: Option<Task<Result<Vec<Option<Box<dyn ItemHandle>>>>>>,
+    mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) -> Result<Vec<Option<Result<Box<dyn ItemHandle>>>>> {
+    let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
+
+    if let Some(restored_items) = restored_items {
+        let restored_items = restored_items.await?;
+
+        let restored_project_paths = restored_items
+            .iter()
+            .filter_map(|item| {
+                cx.update(|_, cx| item.as_ref()?.project_path(cx))
+                    .ok()
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+
+        for restored_item in restored_items {
+            opened_items.push(restored_item.map(Ok));
+        }
+
+        project_paths_to_open
+            .iter_mut()
+            .for_each(|(_, project_path)| {
+                if let Some(project_path_to_open) = project_path
+                    && restored_project_paths.contains(project_path_to_open)
+                {
+                    *project_path = None;
+                }
+            });
+    } else {
+        for _ in 0..project_paths_to_open.len() {
+            opened_items.push(None);
+        }
+    }
+    assert!(opened_items.len() == project_paths_to_open.len());
+
+    let tasks =
+        project_paths_to_open
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (abs_path, project_path))| {
+                let workspace = workspace.clone();
+                cx.spawn(async move |cx| {
+                    let file_project_path = project_path?;
+                    let abs_path_task = workspace.update(cx, |workspace, cx| {
+                        workspace.project().update(cx, |project, cx| {
+                            project.resolve_abs_path(abs_path.to_string_lossy().as_ref(), cx)
+                        })
+                    });
+
+                    // We only want to open file paths here. If one of the items
+                    // here is a directory, it was already opened further above
+                    // with a `find_or_create_worktree`.
+                    if let Ok(task) = abs_path_task
+                        && task.await.is_none_or(|p| p.is_file())
+                    {
+                        return Some((
+                            ix,
+                            workspace
+                                .update_in(cx, |workspace, window, cx| {
+                                    workspace.open_path(file_project_path, None, true, window, cx)
+                                })
+                                .log_err()?
+                                .await,
+                        ));
+                    }
+                    None
+                })
+            });
+
+    let tasks = tasks.collect::<Vec<_>>();
+
+    let tasks = futures::future::join_all(tasks);
+    for (ix, path_open_result) in tasks.await.into_iter().flatten() {
+        opened_items[ix] = Some(path_open_result);
+    }
+
+    Ok(opened_items)
 }
 
 #[derive(Clone)]
@@ -16984,6 +17104,193 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.window_title().as_deref(), Some("root2"));
+    }
+
+    #[gpui::test]
+    async fn test_load_phase_counters_nest(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_load_phase(), None);
+            assert!(!workspace.is_restoring_session());
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::LoadingPanels),
+                "one of two nested begins finishing must not clear the phase"
+            );
+
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(workspace.active_load_phase(), None);
+
+            // An unbalanced end must not wrap the counter around.
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(workspace.active_load_phase(), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_active_load_phase_follows_declaration_priority(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update(cx, |workspace, cx| {
+            for phase in WorkspaceLoadPhase::ALL.into_iter().rev() {
+                workspace.begin_load_phase(phase, cx);
+            }
+
+            for phase in WorkspaceLoadPhase::ALL {
+                assert_eq!(
+                    workspace.active_load_phase(),
+                    Some(phase),
+                    "{phase:?} must be reported while it is the earliest active phase"
+                );
+                assert!(
+                    workspace.is_restoring_session(),
+                    "the indicator must stay up for {phase:?}, not only for a session restore"
+                );
+                workspace.end_load_phase(phase, cx);
+            }
+
+            assert_eq!(workspace.active_load_phase(), None);
+            assert!(!workspace.is_restoring_session());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_first_open_without_serialized_workspace_reports_progress(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let observed_phases = Rc::new(RefCell::new(Vec::new()));
+        let _observation = cx.update(|_, cx| {
+            let observed_phases = observed_phases.clone();
+            cx.observe(&workspace, move |workspace, cx| {
+                observed_phases
+                    .borrow_mut()
+                    .push(workspace.read(cx).active_load_phase());
+            })
+        });
+
+        let open = workspace.update_in(cx, |_, window, cx| {
+            open_items(
+                None,
+                vec![(PathBuf::from(path!("/root/a.txt")), None)],
+                window,
+                cx,
+            )
+        });
+        open.await.unwrap();
+
+        assert!(
+            observed_phases
+                .borrow()
+                .contains(&Some(WorkspaceLoadPhase::RestoringSession)),
+            "opening paths without a saved session must still report progress, got {:?}",
+            observed_phases.borrow()
+        );
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_load_phase(), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_project_scan_phase_ends_when_scan_completes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+
+        let project = Project::test(fs.clone(), [], cx).await;
+        // Deliberately not awaited: the workspace has to be built while the
+        // worktree is still being scanned.
+        let worktree_creation = project.update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/root"), true, cx)
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::ScanningProject),
+                "a workspace opened while a worktree is still being scanned must say so"
+            );
+        });
+
+        worktree_creation.await.unwrap();
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_load_phase(), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_adding_a_folder_to_a_live_project_reports_scanning(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/first"), json!({ "a.txt": "" }))
+            .await;
+        fs.insert_tree(path!("/second"), json!({ "b.txt": "" }))
+            .await;
+
+        let project = Project::test(fs.clone(), [path!("/first").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.active_load_phase(),
+                None,
+                "the first scan has finished, so nothing should be reported yet"
+            );
+        });
+
+        // Deliberately not awaited: the second folder's scan has to still be in
+        // flight while the assertion below runs.
+        let second_worktree = project.update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/second"), true, cx)
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::ScanningProject),
+                "a folder added to a live project must report its scan too"
+            );
+        });
+
+        second_worktree.await.unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_load_phase(), None);
+        });
     }
 
     fn pane_items_paths(pane: &Entity<Pane>, cx: &App) -> Vec<String> {

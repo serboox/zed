@@ -98,7 +98,7 @@ use workspace::notifications::{NotificationId, dismiss_app_notification, show_ap
 
 use workspace::{
     AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
-    WorkspaceSettings, create_and_open_local_file,
+    WorkspaceLoadPhase, WorkspaceSettings, create_and_open_local_file,
     notifications::simple_message_notification::MessageNotification, open_new,
 };
 use workspace::{
@@ -661,7 +661,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(image_info, window, cx);
         });
 
-        let panels_task = initialize_panels(window, cx);
+        let panels_task = initialize_panels(workspace, window, cx);
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
 
@@ -784,7 +784,16 @@ fn show_software_emulation_warning_if_needed(
     }
 }
 
-fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
+fn initialize_panels(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    // Opened before spawning so that no frame is painted between the window
+    // appearing and the indicator reporting that panels are still missing.
+    workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+    workspace.begin_load_phase(WorkspaceLoadPhase::RestoringTerminals, cx);
+
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
@@ -811,17 +820,56 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             }
         }
 
-        futures::join!(
-            add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(api_client_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+        // Closes `phase` once the panel is in. `add_panel_when_ready` swallows a
+        // failed load, so the phase is closed on every outcome.
+        async fn add_panel_when_ready_in_phase(
+            panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
+            phase: WorkspaceLoadPhase,
+            workspace_handle: WeakEntity<Workspace>,
+            mut cx: gpui::AsyncWindowContext,
+        ) {
+            add_panel_when_ready(panel_task, workspace_handle.clone(), cx.clone()).await;
+            workspace_handle
+                .update(&mut cx, |workspace, cx| {
+                    workspace.end_load_phase(phase, cx);
+                })
+                .log_err();
+        }
+
+        // The terminal panel is tracked apart from the rest so that once the
+        // quick panels are in, the indicator names the one slow thing left --
+        // restoring a terminal spawns the user's real login shell.
+        let terminal_panel_load = add_panel_when_ready_in_phase(
+            terminal_panel,
+            WorkspaceLoadPhase::RestoringTerminals,
+            workspace_handle.clone(),
+            cx.clone(),
         );
+
+        let other_panels_load = {
+            let workspace_handle = workspace_handle.clone();
+            let mut cx = cx.clone();
+            async move {
+                futures::join!(
+                    add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(api_client_panel, workspace_handle.clone(), cx.clone()),
+                    initialize_agent_panel(workspace_handle.clone(), cx.clone())
+                        .map(|r| r.log_err()),
+                );
+                workspace_handle
+                    .update(&mut cx, |workspace, cx| {
+                        workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+                    })
+                    .log_err();
+            }
+        };
+
+        futures::join!(terminal_panel_load, other_panels_load);
 
         anyhow::Ok(())
     })

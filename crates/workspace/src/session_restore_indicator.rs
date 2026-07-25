@@ -6,10 +6,10 @@ use ui::{CommonAnimationExt, prelude::*};
 
 use crate::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
-/// Status-bar indicator shown while a saved session is being restored. It keeps
-/// a restoring window from being mistaken for an empty first-run window: the
-/// editors and panels appear only once deserialization finishes, so without a
-/// signal the window looks blank and "ready" when it is not.
+/// Status-bar indicator naming the workspace start-up work still in flight (see
+/// [`crate::WorkspaceLoadPhase`]). The window chrome is painted before any of
+/// that work finishes, so without a signal a loading window looks blank and
+/// "ready" when it is not.
 pub struct SessionRestoreIndicator {
     workspace: WeakEntity<Workspace>,
     _observation: Subscription,
@@ -27,14 +27,15 @@ impl SessionRestoreIndicator {
 
 impl Render for SessionRestoreIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let restoring = self
+        let active_phase = self
             .workspace
-            .read_with(cx, |workspace, _| workspace.is_restoring_session())
-            .unwrap_or(false);
+            .read_with(cx, |workspace, _| workspace.active_load_phase())
+            .ok()
+            .flatten();
 
-        if !restoring {
+        let Some(active_phase) = active_phase else {
             return Empty.into_any_element();
-        }
+        };
 
         h_flex()
             .gap_1()
@@ -45,7 +46,7 @@ impl Render for SessionRestoreIndicator {
                     .with_rotate_animation(2),
             )
             .child(
-                Label::new("Restoring session…")
+                Label::new(active_phase.label())
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )

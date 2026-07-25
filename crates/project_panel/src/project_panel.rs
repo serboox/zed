@@ -197,6 +197,11 @@ pub struct ProjectPanel {
     // signature is unchanged is skipped, but only while git decoration is off
     // (large trees), where the signature fully determines the rendered tree.
     last_tree_input_signature: Option<(usize, usize, usize)>,
+    // Keeps the "scanning" placeholder from getting stuck. The worktree store
+    // cannot notify when the initial scan finishes, and the dock caches this
+    // panel's subtree, so nothing else repaints it once the scan ends without
+    // changing any entry.
+    initial_scan_notify: Task<()>,
     #[cfg(test)]
     update_visible_entries_run_count: usize,
 }
@@ -796,6 +801,11 @@ impl ProjectPanel {
                     project::Event::WorktreeUpdatedEntries(_, _)
                     | project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
+                        if matches!(event, project::Event::WorktreeAdded(_)) {
+                            // A new worktree restarts the initial scan, so the
+                            // one-shot completion watcher has to be re-armed.
+                            this.notify_when_initial_scan_completes(cx);
+                        }
                         // Snapshot mode ignores background filesystem churn, but a
                         // user-initiated directory expansion still needs the follow-up
                         // event that renders its freshly loaded children -- let events
@@ -947,10 +957,12 @@ impl ProjectPanel {
                 pending_visible_entries_refresh: false,
                 refresh_debounce_task: None,
                 last_tree_input_signature: None,
+                initial_scan_notify: Task::ready(()),
                 #[cfg(test)]
                 update_visible_entries_run_count: 0,
             };
             this.update_visible_entries(None, false, false, window, cx);
+            this.notify_when_initial_scan_completes(cx);
 
             this
         });
@@ -4809,6 +4821,17 @@ impl ProjectPanel {
         }
     }
 
+    /// Arms a one-shot repaint for the moment the project's initial scan ends.
+    /// A scan that finishes without changing an entry emits no event, so the
+    /// "scanning" placeholder would otherwise stay up for an empty worktree.
+    fn notify_when_initial_scan_completes(&mut self, cx: &mut Context<Self>) {
+        let initial_scan = self.project.read(cx).wait_for_initial_scan(cx);
+        self.initial_scan_notify = cx.spawn(async move |this, cx| {
+            initial_scan.await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+    }
+
     fn expand_entry(
         &mut self,
         worktree_id: WorktreeId,
@@ -7137,6 +7160,11 @@ impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = !self.state.visible_entries.is_empty();
         let project = self.project.read(cx);
+        // `initial_scan_completed` is false only while a visible worktree is
+        // being created or scanned, so an empty tree during that window means
+        // "not ready yet", never "no project open".
+        let is_scanning_project =
+            !has_worktree && !project.worktree_store().read(cx).initial_scan_completed();
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
         let show_indent_guides = panel_settings.indent_guides.show == ShowIndentGuides::Always;
@@ -7241,6 +7269,7 @@ impl Render for ProjectPanel {
             h_flex()
                 .id("project-panel")
                 .group("project-panel")
+                .debug_selector(|| "project-panel-tree".into())
                 .when(panel_settings.drag_and_drop, |this| {
                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
                         .on_drag_move(cx.listener(handle_drag_move::<DraggedSelection>))
@@ -7742,6 +7771,21 @@ impl Render for ProjectPanel {
                     )
                     .with_priority(3)
                 }))
+        } else if is_scanning_project {
+            v_flex()
+                .id("scanning-project_panel-wrapper")
+                .debug_selector(|| "project-panel-scanning".into())
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .child(Label::new("Scanning project…").color(Color::Muted))
         } else {
             let focus_handle = self.focus_handle(cx);
             let workspace = self.workspace.clone();
@@ -7749,6 +7793,7 @@ impl Render for ProjectPanel {
 
             v_flex()
                 .id("empty-project_panel-wrapper")
+                .debug_selector(|| "project-panel-empty-state".into())
                 .size_full()
                 .child(
                     ProjectEmptyState::new(
