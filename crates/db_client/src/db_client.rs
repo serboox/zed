@@ -61,6 +61,71 @@ pub const MAX_RESULT_ROWS: usize = 500;
 /// no longer want the result, disconnecting is the intended way to cancel.
 pub const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Wording that identifies a lost or unusable connection across the drivers.
+/// Matched case-insensitively against every error in a chain, because each
+/// driver reports the same underlying socket death in its own words and only
+/// sqlx exposes a typed variant for it.
+const TRANSPORT_FAILURE_MARKERS: &[&str] = &[
+    "broken pipe",
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "connection aborted",
+    "connection unexpectedly closed",
+    "server has gone away",
+    "lost connection",
+    "server closed the connection",
+    "terminating connection",
+    "no connection to the server",
+    "pool timed out",
+    "pool has been closed",
+    "closed pool",
+    "timed out",
+    "unexpected end of file",
+    "unexpected eof",
+    "network is unreachable",
+    "no route to host",
+    "not connected",
+];
+
+fn mentions_transport_failure(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    TRANSPORT_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// True when `error` means the connection itself is gone -- a dead socket, a
+/// closed or exhausted pool, a collapsed tunnel, a failed handshake, or the
+/// uniform [`QUERY_TIMEOUT`] firing on a wedged call.
+///
+/// The distinction decides whether a cached provider is still worth anything:
+/// a syntax or permission error arrives over a healthy connection and must not
+/// throw it away, while a transport failure leaves a handle that can never
+/// succeed again, so it has to be dropped and rebuilt.
+pub fn is_transport_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(sqlx_error) = cause.downcast_ref::<sqlx::Error>() {
+            return match sqlx_error {
+                sqlx::Error::Io(_)
+                | sqlx::Error::Tls(_)
+                | sqlx::Error::Protocol(_)
+                | sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed => true,
+                // Reached the server over a working socket, so only the codes
+                // the servers use to announce a dropped session count.
+                sqlx::Error::Database(db_error) => mentions_transport_failure(db_error.message()),
+                _ => false,
+            };
+        }
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+    }
+    mentions_transport_failure(&format!("{error:#}"))
+}
+
 /// True when `sql` only reads data, so it is safe to wrap or limit. A leading
 /// keyword check mirrors the per-provider detection used for the read/write
 /// split, kept here so the UI can reason about a statement without a provider.
@@ -142,5 +207,44 @@ mod tests {
             apply_default_limit("SELECT delimiter FROM cfg", 500),
             "SELECT delimiter FROM cfg LIMIT 500"
         );
+    }
+
+    #[test]
+    fn transport_errors_are_told_apart_from_statement_errors() {
+        // Server-side complaints arrive over a healthy socket: the provider
+        // must survive them.
+        assert!(!is_transport_error(&anyhow::anyhow!(
+            "You have an error in your SQL syntax near 'SELCT'"
+        )));
+        assert!(!is_transport_error(&anyhow::anyhow!(
+            "Access denied for user 'reader'@'localhost'"
+        )));
+
+        // Socket death, however worded by whichever driver.
+        for message in [
+            "Query execution failed: Broken pipe (os error 32)",
+            "MySQL server has gone away",
+            "Lost connection to MySQL server during query",
+            "server closed the connection unexpectedly",
+            "Database call timed out after 30 minutes",
+        ] {
+            assert!(
+                is_transport_error(&anyhow::anyhow!(message)),
+                "expected a transport failure for: {message}"
+            );
+        }
+
+        // Wrapped in context the way the providers report it.
+        let wrapped = anyhow::Error::new(sqlx::Error::PoolClosed).context("Query execution failed");
+        assert!(is_transport_error(&wrapped));
+        let io_failure =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+                .context("list_databases failed");
+        assert!(is_transport_error(&io_failure));
+
+        // A typed database error keeps the connection: not transport.
+        assert!(!is_transport_error(&anyhow::Error::new(
+            sqlx::Error::RowNotFound
+        )));
     }
 }

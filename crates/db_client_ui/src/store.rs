@@ -1,5 +1,5 @@
 use crate::db_migration::ConnectionSecrets;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use credentials_provider::CredentialsProvider;
 use db_client::{
     ConnectionConfig, ConnectionId, DatabaseDriver, FkInfo, Folder, FolderId,
@@ -261,10 +261,16 @@ pub struct ActiveConnection {
     /// provider holds a single persistent connection per `ActiveConnection`
     /// (MySQL, PostgreSQL) -- see [`transaction_boundary`].
     pub in_transaction: bool,
+    /// Bumped every time the connection is torn down or replaced. Tasks capture
+    /// it before they start and compare on completion, so a slow connect,
+    /// refresh or prefetch belonging to a previous incarnation cannot write its
+    /// result -- otherwise it would silently resurrect a connection the user
+    /// just disconnected.
+    epoch: u64,
 }
 
 impl ActiveConnection {
-    fn new(config: ConnectionConfig) -> Self {
+    pub(crate) fn new(config: ConnectionConfig) -> Self {
         Self {
             config,
             status: ConnectionStatus::Disconnected,
@@ -282,6 +288,7 @@ impl ActiveConnection {
             expanded_database_set: HashSet::new(),
             expanded_table_set: HashSet::new(),
             in_transaction: false,
+            epoch: 0,
         }
     }
 }
@@ -610,10 +617,17 @@ impl DatabaseStore {
         let preferred_database = conn.config.database.clone().filter(|d| !d.is_empty());
 
         cx.spawn(async move |this, cx| {
+            // Captured out here so the failure handling below can tell whether
+            // the connection it is about to blame is still the same one.
+            let mut prefetched_epoch = None;
             let outcome = async {
                 let provider = this
                     .update(cx, |store, cx| store.ensure_connected(id, cx))?
                     .await?;
+                let epoch = this
+                    .read_with(cx, |store, _| store.connection_epoch(id))?
+                    .context("connection removed while prefetching its schema")?;
+                prefetched_epoch = Some(epoch);
                 let databases = provider.list_databases().await?;
                 let primary = preferred_database
                     .clone()
@@ -698,6 +712,11 @@ impl DatabaseStore {
                 }
 
                 this.update(cx, |store, cx| {
+                    // A disconnect while the prefetch was running means this
+                    // schema belongs to a connection the user already closed.
+                    if store.connection_at_epoch(id, epoch).is_none() {
+                        return;
+                    }
                     if let Some(conn) = store.connections.iter_mut().find(|c| c.config.id == id) {
                         conn.databases = Some(cache.databases.clone());
                         for (database, tables) in &cache.tables {
@@ -721,8 +740,11 @@ impl DatabaseStore {
                 anyhow::Ok(())
             }
             .await;
-            this.update(cx, |store, _| {
+            this.update(cx, |store, cx| {
                 store.prefetching_schema.remove(&id);
+                if let (Err(error), Some(epoch)) = (&outcome, prefetched_epoch) {
+                    store.note_operation_failure(id, epoch, error, cx);
+                }
             })
             .ok();
             outcome
@@ -940,10 +962,17 @@ impl DatabaseStore {
         cx: &mut Context<Self>,
     ) {
         let id = config.id;
+        // Mirrors a real connect, including the epoch bump, so calling this
+        // twice for one id reconnects it rather than adding a duplicate row.
+        let epoch = self.connection_epoch(id).unwrap_or(0) + 1;
         let mut conn = ActiveConnection::new(config);
         conn.status = ConnectionStatus::Connected;
         conn.provider = Some(provider);
-        self.connections.push(conn);
+        conn.epoch = epoch;
+        match self.connections.iter_mut().find(|c| c.config.id == id) {
+            Some(existing) => *existing = conn,
+            None => self.connections.push(conn),
+        }
         self.active_connection_id = Some(id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
@@ -1549,6 +1578,8 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
         conn.status = ConnectionStatus::Connecting;
+        conn.epoch += 1;
+        let epoch = conn.epoch;
         let config = conn.config.clone();
         cx.notify();
 
@@ -1559,6 +1590,9 @@ impl DatabaseStore {
                 let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
                     return;
                 };
+                if conn.epoch != epoch {
+                    return;
+                }
                 let now_connected = matches!(result, Ok(_));
                 match result {
                     Ok((provider, tunnel)) => {
@@ -1572,7 +1606,9 @@ impl DatabaseStore {
                         }
                     }
                     Err(err) => {
+                        conn.provider = None;
                         conn.status = ConnectionStatus::Error(err.to_string());
+                        this.tunnels.remove(&id);
                     }
                 }
                 cx.emit(DatabaseStoreEvent::ConnectionsChanged);
@@ -1587,6 +1623,72 @@ impl DatabaseStore {
         })
     }
 
+    fn connection_epoch(&self, id: ConnectionId) -> Option<u64> {
+        self.connections
+            .iter()
+            .find(|c| c.config.id == id)
+            .map(|c| c.epoch)
+    }
+
+    /// Hands back the connection only while it is still the same incarnation the
+    /// caller started from, so a task that outlived a disconnect or a rebuild
+    /// writes nothing instead of restoring state the user cleared.
+    fn connection_at_epoch(
+        &mut self,
+        id: ConnectionId,
+        epoch: u64,
+    ) -> Option<&mut ActiveConnection> {
+        self.connections
+            .iter_mut()
+            .find(|c| c.config.id == id && c.epoch == epoch)
+    }
+
+    /// Drops a connection's provider when a call failed because the connection
+    /// itself is gone, so the next operation builds a fresh one instead of
+    /// reusing a handle that can only keep failing. Statement-level errors (bad
+    /// SQL, missing permissions) leave the connection alone.
+    ///
+    /// `epoch` is the incarnation the failing call ran against: a failure that
+    /// arrives after the user reconnected describes a provider that no longer
+    /// exists and must not evict the fresh one.
+    ///
+    /// Returns whether the provider was evicted.
+    pub fn note_operation_failure(
+        &mut self,
+        id: ConnectionId,
+        epoch: u64,
+        error: &anyhow::Error,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !db_client::is_transport_error(error) {
+            return false;
+        }
+        // Borrows only `connections`, so the tunnel and prefetch bookkeeping
+        // below can still be reached.
+        let Some(conn) = self
+            .connections
+            .iter_mut()
+            .find(|c| c.config.id == id && c.epoch == epoch)
+        else {
+            return false;
+        };
+        if conn.provider.is_none() {
+            return false;
+        }
+        conn.provider = None;
+        conn.status = ConnectionStatus::Error(error.to_string());
+        conn.in_transaction = false;
+        conn.epoch += 1;
+        self.tunnels.remove(&id);
+        self.prefetching_schema.remove(&id);
+        log::warn!(
+            "db_client: dropping connection {id:?} after a transport failure: {error:#}; the next operation will reconnect"
+        );
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+        true
+    }
+
     /// Returns the connection's live provider, establishing the connection first
     /// if it is not connected yet. This is how every provider-backed operation
     /// gets its provider, so a missing connection never blocks an action — it is
@@ -1599,7 +1701,12 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Err(anyhow::anyhow!("Connection not found")));
         };
-        if let Some(provider) = conn.provider.clone() {
+        // Only a connection the store still considers healthy may hand out its
+        // cached provider: after a transport failure the handle is kept nowhere,
+        // and an errored connection must be rebuilt rather than reused.
+        if matches!(conn.status, ConnectionStatus::Connected)
+            && let Some(provider) = conn.provider.clone()
+        {
             return Task::ready(Ok(provider));
         }
         cx.spawn(async move |this, cx| {
@@ -1616,15 +1723,21 @@ impl DatabaseStore {
         })
     }
 
+    /// Tears the connection down and makes that stick: the bumped epoch stops
+    /// any connect, refresh or prefetch still in flight from writing its result
+    /// afterwards, and clearing the prefetch guard keeps a later reconnect from
+    /// finding schema loading permanently disabled.
     pub fn disconnect(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         let Some(conn) = self.connections.iter_mut().find(|c| c.config.id == id) else {
             return;
         };
+        let epoch = conn.epoch + 1;
         *conn = ActiveConnection {
-            config: conn.config.clone(),
+            epoch,
             ..ActiveConnection::new(conn.config.clone())
         };
         self.tunnels.remove(&id);
+        self.prefetching_schema.remove(&id);
         if self.active_connection_id == Some(id) {
             self.active_connection_id = None;
         }
@@ -1658,6 +1771,9 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
+            let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
+                return Ok(());
+            };
             let (tables, views, procedures, sequences, events) = futures::join!(
                 provider.list_tables(&database),
                 provider.list_views(&database),
@@ -1665,13 +1781,22 @@ impl DatabaseStore {
                 provider.list_sequences(&database),
                 provider.list_events(&database)
             );
-            let tables = tables?;
+            let tables = match tables {
+                Ok(tables) => tables,
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, &error, cx);
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
             let views = views.unwrap_or_default();
             let procedures = procedures.unwrap_or_default();
             let sequences = sequences.unwrap_or_default();
             let events = events.unwrap_or_default();
             this.update(cx, |this, cx| {
-                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                let Some(conn) = this.connection_at_epoch(id, epoch) else {
                     return;
                 };
                 conn.expanded_databases.insert(database.clone(), tables);
@@ -1715,18 +1840,30 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
+            let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
+                return Ok(());
+            };
             let (columns, indexes, fks, triggers) = futures::join!(
                 provider.describe_table(&database, &table),
                 provider.list_indexes(&database, &table),
                 provider.list_foreign_keys(&database, &table),
                 provider.list_triggers(&database, &table)
             );
-            let columns = columns?;
+            let columns = match columns {
+                Ok(columns) => columns,
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, &error, cx);
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
             let indexes = indexes.unwrap_or_default();
             let fks = fks.unwrap_or_default();
             let triggers = triggers.unwrap_or_default();
             this.update(cx, |this, cx| {
-                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                let Some(conn) = this.connection_at_epoch(id, epoch) else {
                     return;
                 };
                 let key = (database, table);
@@ -1755,9 +1892,21 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let databases = provider.list_databases().await?;
+            let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
+                return Ok(());
+            };
+            let databases = match provider.list_databases().await {
+                Ok(databases) => databases,
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, &error, cx);
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
             this.update(cx, |this, cx| {
-                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                let Some(conn) = this.connection_at_epoch(id, epoch) else {
                     return;
                 };
                 conn.databases = Some(databases);
@@ -1784,6 +1933,7 @@ impl DatabaseStore {
         let Some(provider) = conn.provider.clone() else {
             return Task::ready(Ok(()));
         };
+        let epoch = conn.epoch;
         let need_databases = conn.databases.is_none();
         let need_tables = !database.is_empty() && !conn.expanded_databases.contains_key(&database);
         if !need_databases && !need_tables {
@@ -1807,7 +1957,7 @@ impl DatabaseStore {
                 None
             };
             this.update(cx, |this, cx| {
-                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                let Some(conn) = this.connection_at_epoch(id, epoch) else {
                     return;
                 };
                 if let Some(databases) = databases {
@@ -1846,11 +1996,12 @@ impl DatabaseStore {
         let Some(provider) = conn.provider.clone() else {
             return Task::ready(Ok(()));
         };
+        let epoch = conn.epoch;
 
         cx.spawn(async move |this, cx| {
             let columns = provider.describe_table(&database, &table).await.log_err();
             this.update(cx, |this, cx| {
-                let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) else {
+                let Some(conn) = this.connection_at_epoch(id, epoch) else {
                     return;
                 };
                 if let Some(columns) = columns {
@@ -1912,18 +2063,19 @@ impl DatabaseStore {
     /// fetching the table/view lists that are not cached yet. Tables themselves
     /// are not expanded, so this stays bounded by the number of databases.
     pub fn expand_all_databases(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let mut to_fetch: Vec<(ConnectionId, String, Arc<dyn DbProvider>)> = Vec::new();
+        let mut to_fetch: Vec<(ConnectionId, u64, String, Arc<dyn DbProvider>)> = Vec::new();
         for conn in &mut self.connections {
             let Some(databases) = conn.databases.clone() else {
                 continue;
             };
             let provider = conn.provider.clone();
+            let epoch = conn.epoch;
             for db in databases {
                 conn.expanded_database_set.insert(db.name.clone());
                 if !conn.expanded_databases.contains_key(&db.name)
                     && let Some(provider) = provider.clone()
                 {
-                    to_fetch.push((conn.config.id, db.name.clone(), provider));
+                    to_fetch.push((conn.config.id, epoch, db.name.clone(), provider));
                 }
             }
         }
@@ -1932,11 +2084,11 @@ impl DatabaseStore {
             return Task::ready(Ok(()));
         }
         cx.spawn(async move |this, cx| {
-            for (id, database, provider) in to_fetch {
+            for (id, epoch, database, provider) in to_fetch {
                 let tables = provider.list_tables(&database).await.unwrap_or_default();
                 let views = provider.list_views(&database).await.unwrap_or_default();
                 this.update(cx, |this, cx| {
-                    if let Some(conn) = this.connections.iter_mut().find(|c| c.config.id == id) {
+                    if let Some(conn) = this.connection_at_epoch(id, epoch) {
                         conn.expanded_databases.insert(database.clone(), tables);
                         conn.db_views.insert(database, views);
                         cx.emit(DatabaseStoreEvent::SchemaChanged);
@@ -1970,18 +2122,31 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
+            let Some(epoch) = this.read_with(cx, |store, _| store.connection_epoch(id))? else {
+                return Err(anyhow::anyhow!("Connection not found"));
+            };
             let result = provider.execute_query(&database, &sql).await;
-            if result.is_ok()
-                && let Some(opens_transaction) = transaction_boundary(driver, &sql)
-            {
-                this.update(cx, |store, cx| {
-                    if let Some(conn) = store.connections.iter_mut().find(|c| c.config.id == id) {
-                        conn.in_transaction = opens_transaction;
-                        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
-                        cx.notify();
+            match &result {
+                Ok(_) => {
+                    if let Some(opens_transaction) = transaction_boundary(driver, &sql) {
+                        this.update(cx, |store, cx| {
+                            // The transaction belongs to the connection this
+                            // statement ran on, not to whatever replaced it.
+                            if let Some(conn) = store.connection_at_epoch(id, epoch) {
+                                conn.in_transaction = opens_transaction;
+                                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
                     }
-                })
-                .ok();
+                }
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, error, cx);
+                    })
+                    .ok();
+                }
             }
             result
         })
@@ -2086,7 +2251,19 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let ddl = provider.get_table_ddl(&database, &table).await?;
+            let epoch = this
+                .read_with(cx, |store, _| store.connection_epoch(id))?
+                .context("connection removed while fetching table DDL")?;
+            let ddl = match provider.get_table_ddl(&database, &table).await {
+                Ok(ddl) => ddl,
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, &error, cx);
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
             this.update(cx, |store, cx| {
                 store
                     .ddl_cache
@@ -2135,7 +2312,19 @@ impl DatabaseStore {
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
-            let ddl = provider.get_database_ddl(&database).await?;
+            let epoch = this
+                .read_with(cx, |store, _| store.connection_epoch(id))?
+                .context("connection removed while fetching database DDL")?;
+            let ddl = match provider.get_database_ddl(&database).await {
+                Ok(ddl) => ddl,
+                Err(error) => {
+                    this.update(cx, |store, cx| {
+                        store.note_operation_failure(id, epoch, &error, cx);
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
             this.update(cx, |store, cx| {
                 store
                     .ddl_cache
@@ -4037,5 +4226,242 @@ mod tests {
             drop.await.is_err(),
             "Drop Table must be blocked on a read-only connection"
         );
+    }
+
+    struct FailingProvider {
+        error: String,
+    }
+
+    #[async_trait::async_trait]
+    impl DbProvider for FailingProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            anyhow::bail!("{}", self.error)
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[gpui::test]
+    async fn a_lost_connection_drops_its_provider_while_a_bad_statement_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A statement the server rejected travelled over a healthy socket, so
+        // the connection must stay usable.
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                Arc::new(FailingProvider {
+                    error: "You have an error in your SQL syntax near 'SELCT'".into(),
+                }),
+                cx,
+            );
+        });
+        let query = store.update(cx, |store, cx| {
+            store.execute_query(id, "shop".into(), "SELCT 1".into(), cx)
+        });
+        assert!(query.await.is_err());
+        store.read_with(cx, |store, _| {
+            let conn = store.connections.first().expect("connection present");
+            assert!(
+                conn.provider.is_some(),
+                "a rejected statement must not throw the connection away"
+            );
+            assert!(matches!(conn.status, ConnectionStatus::Connected));
+        });
+
+        // A dead socket, however, leaves a handle that can never succeed again.
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                Arc::new(FailingProvider {
+                    error: "Lost connection to MySQL server during query".into(),
+                }),
+                cx,
+            );
+        });
+        let query = store.update(cx, |store, cx| {
+            store.execute_query(id, "shop".into(), "SELECT 1".into(), cx)
+        });
+        assert!(query.await.is_err());
+        store.read_with(cx, |store, _| {
+            let conn = store.connections.first().expect("connection present");
+            assert!(
+                conn.provider.is_none(),
+                "a lost connection must be dropped so the next call rebuilds it"
+            );
+            assert!(
+                matches!(conn.status, ConnectionStatus::Error(_)),
+                "the tree must stop claiming the connection is healthy, got {:?}",
+                conn.status
+            );
+        });
+    }
+
+    struct BlockingSchemaProvider {
+        release: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DbProvider for BlockingSchemaProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            let release = self.release.lock().expect("poisoned").take();
+            if let Some(release) = release {
+                release.await.ok();
+            }
+            Ok(vec![DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, _database: &str) -> Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _database: &str, _table: &str) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[gpui::test]
+    async fn disconnect_is_not_undone_by_a_schema_prefetch_that_was_still_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (release, blocked) = futures::channel::oneshot::channel();
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(
+                config,
+                Arc::new(BlockingSchemaProvider {
+                    release: Mutex::new(Some(blocked)),
+                }),
+                cx,
+            );
+        });
+
+        let prefetch = store.update(cx, |store, cx| store.prefetch_full_schema(id, cx));
+        cx.run_until_parked();
+        store.update(cx, |store, cx| store.disconnect(id, cx));
+
+        release.send(()).expect("release the prefetch");
+        prefetch.await.ok();
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            let conn = store.connections.first().expect("connection present");
+            assert!(
+                matches!(conn.status, ConnectionStatus::Disconnected),
+                "a late prefetch must not revive a disconnected connection, got {:?}",
+                conn.status
+            );
+            assert!(conn.provider.is_none());
+            assert!(
+                conn.databases.is_none(),
+                "schema fetched for the closed connection must not be shown"
+            );
+            assert!(
+                !store.prefetching_schema.contains(&id),
+                "the prefetch guard must be cleared, or reconnecting can never load a schema again"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_late_failure_does_not_evict_a_connection_that_was_already_rebuilt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config.clone(), Arc::new(DdlMockProvider), cx);
+        });
+        let stale_epoch = store
+            .read_with(cx, |store, _| store.connection_epoch(id))
+            .expect("connection present");
+
+        // The user disconnects and reconnects, so the live provider now belongs
+        // to a later incarnation than the call that is about to fail.
+        store.update(cx, |store, cx| store.disconnect(id, cx));
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, Arc::new(DdlMockProvider), cx);
+        });
+        let fresh_epoch = store
+            .read_with(cx, |store, _| store.connection_epoch(id))
+            .expect("connection present");
+        assert_ne!(stale_epoch, fresh_epoch);
+
+        let evicted = store.update(cx, |store, cx| {
+            store.note_operation_failure(
+                id,
+                stale_epoch,
+                &anyhow::anyhow!("Lost connection to MySQL server during query"),
+                cx,
+            )
+        });
+        assert!(
+            !evicted,
+            "a failure from a previous incarnation must not touch the current connection"
+        );
+        store.read_with(cx, |store, _| {
+            let conn = store
+                .connections
+                .iter()
+                .find(|c| c.config.id == id)
+                .expect("connection present");
+            assert!(conn.provider.is_some());
+            assert!(matches!(conn.status, ConnectionStatus::Connected));
+        });
+
+        // The same failure reported against the live incarnation does evict.
+        let evicted = store.update(cx, |store, cx| {
+            store.note_operation_failure(
+                id,
+                fresh_epoch,
+                &anyhow::anyhow!("Lost connection to MySQL server during query"),
+                cx,
+            )
+        });
+        assert!(evicted);
     }
 }

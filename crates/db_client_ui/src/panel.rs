@@ -7648,9 +7648,14 @@ impl DatabasePanel {
         let selected = self.selected_connection(cx);
         let has_selection = selected.is_some();
         let id = selected.as_ref().map(|conn| conn.config.id);
-        let is_connected = selected
-            .as_ref()
-            .is_some_and(|conn| matches!(conn.status, ConnectionStatus::Connected));
+        // Offered for every state except a connection that is already down:
+        // a failed or still-connecting one has to be clearable too, otherwise
+        // the only way out of it is restarting the editor.
+        let disconnect_label = selected.as_ref().and_then(|conn| match conn.status {
+            ConnectionStatus::Disconnected => None,
+            ConnectionStatus::Connecting => Some("Cancel Connecting"),
+            ConnectionStatus::Connected | ConnectionStatus::Error(_) => Some("Disconnect"),
+        });
         let label = selected.as_ref().map(|conn| conn.config.label.clone());
         let driver = selected.as_ref().map(|conn| conn.config.driver);
         let database = selected
@@ -7714,8 +7719,8 @@ impl DatabasePanel {
                                             }
                                         })
                                     })
-                                    .when(is_connected, |menu| {
-                                        menu.entry("Disconnect", None, {
+                                    .when_some(disconnect_label, |menu, disconnect_label| {
+                                        menu.entry(disconnect_label, None, {
                                             let panel = panel.clone();
                                             move |_, cx| {
                                                 let Some(id) = id else { return };
@@ -10866,6 +10871,13 @@ impl DatabasePanel {
         };
         let config = connection.config.clone();
         let is_connected = matches!(connection.status, ConnectionStatus::Connected);
+        // See `render_overflow_menu`: every state but Disconnected must be
+        // clearable, so a failed or stuck connection is recoverable in place.
+        let disconnect_label = match connection.status {
+            ConnectionStatus::Disconnected => None,
+            ConnectionStatus::Connecting => Some("Cancel Connecting"),
+            ConnectionStatus::Connected | ConnectionStatus::Error(_) => Some("Disconnect"),
+        };
         let driver = config.driver;
         let label = config.label.clone();
         let default_database = config.database.clone();
@@ -10873,8 +10885,8 @@ impl DatabasePanel {
         let workspace = self.workspace.clone();
 
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
-            menu.when(is_connected, |menu| {
-                menu.entry("Disconnect", None, {
+            menu.when_some(disconnect_label, |menu, disconnect_label| {
+                menu.entry(disconnect_label, None, {
                     let panel = panel.clone();
                     move |_, cx| {
                         panel.update(cx, |panel, cx| {
@@ -12282,24 +12294,7 @@ mod tests {
             auto_connect: false,
             ..Default::default()
         };
-        ActiveConnection {
-            config,
-            status: ConnectionStatus::Disconnected,
-            provider: None,
-            databases: None,
-            expanded_databases: std::collections::HashMap::new(),
-            expanded_tables: std::collections::HashMap::new(),
-            expanded_database_set: std::collections::HashSet::new(),
-            expanded_table_set: std::collections::HashSet::new(),
-            db_views: std::collections::HashMap::new(),
-            db_procedures: std::collections::HashMap::new(),
-            db_sequences: std::collections::HashMap::new(),
-            db_events: std::collections::HashMap::new(),
-            table_indexes: std::collections::HashMap::new(),
-            table_fks: std::collections::HashMap::new(),
-            table_triggers: std::collections::HashMap::new(),
-            in_transaction: false,
-        }
+        ActiveConnection::new(config)
     }
 
     #[test]

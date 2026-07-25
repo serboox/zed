@@ -1,6 +1,8 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::task::Poll;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,6 +28,28 @@ fn runtime() -> Result<&'static Runtime> {
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!("failed to initialize database runtime: {error}"))
+}
+
+/// Awaits a spawned Tokio task, aborting it if this future is dropped.
+///
+/// A bare `JoinHandle` detaches its task on drop, so a caller that gives up --
+/// a cancelled GPUI task, a disconnected connection -- would leave the database
+/// call running, holding the pool's permit and keeping the provider alive. That
+/// is what lets a wedged query outlive the connection it belongs to.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
 }
 
 /// Drives `future` to completion on the shared Tokio runtime.
@@ -60,8 +84,11 @@ where
             )),
         }
     };
-    match handle.spawn(bounded).await {
+    match AbortOnDrop(handle.spawn(bounded)).await {
         Ok(output) => output,
+        Err(join_error) if join_error.is_cancelled() => {
+            Err(anyhow::anyhow!("database call was cancelled"))
+        }
         Err(join_error) => Err(anyhow::anyhow!("database task failed: {join_error}")),
     }
 }
@@ -247,6 +274,36 @@ mod tests {
         assert!(
             message.contains("timed out"),
             "expected a timeout error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn dropping_the_caller_aborts_the_spawned_database_call() {
+        use futures::FutureExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        fn slow_call(reached_end: Arc<AtomicBool>) -> impl Future<Output = Result<()>> {
+            on_runtime(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                reached_end.store(true, Ordering::SeqCst);
+                anyhow::Ok(())
+            })
+        }
+
+        // Awaited to completion the call reaches its end, so the flag itself is
+        // a sound signal for the dropped case below.
+        let completed = Arc::new(AtomicBool::new(false));
+        futures::executor::block_on(slow_call(completed.clone())).expect("call");
+        assert!(completed.load(Ordering::SeqCst));
+
+        // `now_or_never` polls once and drops the future, standing in for a
+        // caller that gave up mid-call.
+        let abandoned = Arc::new(AtomicBool::new(false));
+        assert!(slow_call(abandoned.clone()).now_or_never().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !abandoned.load(Ordering::SeqCst),
+            "dropping the caller must abort the Tokio task, not detach it"
         );
     }
 
