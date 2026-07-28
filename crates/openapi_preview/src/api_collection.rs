@@ -6,7 +6,7 @@ use gpui::SharedString;
 
 use crate::openapi_document::{HttpMethod as OpenApiHttpMethod, OpenApiDocument, Operation};
 
-const BASE_URL_VARIABLE: &str = "baseUrl";
+pub(crate) const BASE_URL_VARIABLE: &str = "baseUrl";
 
 /// Which operations `collection_from_document` turns into requests.
 #[derive(Debug, Clone)]
@@ -250,7 +250,7 @@ fn map_http_method(method: OpenApiHttpMethod) -> ApiHttpMethod {
 
 /// Extracts every `{name}` placeholder from an OpenAPI path template, in
 /// the order they appear.
-fn path_parameter_names(path: &str) -> Vec<String> {
+pub(crate) fn path_parameter_names(path: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut chars = path.chars().peekable();
     while let Some(ch) = chars.next() {

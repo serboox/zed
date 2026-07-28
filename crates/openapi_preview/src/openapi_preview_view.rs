@@ -16,6 +16,7 @@ use crate::openapi_document::{
     HttpMethod, OpenApiDocument, Operation, OperationGroup, Parameter, RequestBody, Response,
     SchemaSummary, parse,
 };
+use crate::try_it_out;
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -33,12 +34,56 @@ pub struct OpenApiPreviewView {
     collapsed_groups: HashSet<SharedString>,
     expanded_operations: HashSet<SharedString>,
     expanded_schemas: HashSet<SharedString>,
+    try_it_out_panels: HashMap<SharedString, TryItOutPanel>,
     pending_parse: Option<Task<()>>,
     /// Set when an edit arrives while a parse is already running. Without it the
     /// preview would keep showing the text that parse started from, because the
     /// running task captured the buffer before that edit existed.
     reparse_after_pending: bool,
     _editor_subscription: Subscription,
+}
+
+/// One parameter field in a "Try it out" panel: the reader's typed-in value
+/// for a single query/path/header parameter the operation declares (cookie
+/// parameters are skipped, matching `api_collection::build_request`).
+struct ParameterField {
+    name: SharedString,
+    location: SharedString,
+    required: bool,
+    editor: Entity<Editor>,
+}
+
+enum TryItOutSendState {
+    Idle,
+    Sending,
+    Success(TryItOutResponseMeta),
+    Error(SharedString),
+}
+
+struct TryItOutResponseMeta {
+    status: u16,
+    status_text: SharedString,
+    elapsed_ms: u64,
+    size_bytes: usize,
+    headers: Vec<(String, String)>,
+    body_truncated: bool,
+}
+
+/// The "Try it out" panel for a single expanded operation: everything the
+/// reader can fill in, plus the outcome of the last send.
+struct TryItOutPanel {
+    server_editor: Entity<Editor>,
+    /// Held only in this editor's in-memory buffer for as long as the panel
+    /// stays open. Read once per send to fill in the `Authorization` header
+    /// of the outgoing request -- never written to a collection, the
+    /// workspace database, or a log.
+    auth_editor: Entity<Editor>,
+    parameter_fields: Vec<ParameterField>,
+    body_editor: Option<Entity<Editor>>,
+    response_body_editor: Entity<Editor>,
+    headers_expanded: bool,
+    send_state: TryItOutSendState,
+    _send_task: Option<Task<()>>,
 }
 
 impl OpenApiPreviewView {
@@ -68,6 +113,7 @@ impl OpenApiPreviewView {
                 collapsed_groups: HashSet::default(),
                 expanded_operations: HashSet::default(),
                 expanded_schemas: HashSet::default(),
+                try_it_out_panels: HashMap::default(),
                 pending_parse: None,
                 reparse_after_pending: false,
                 _editor_subscription: subscription,
@@ -138,6 +184,272 @@ impl OpenApiPreviewView {
             self.expanded_schemas.insert(schema);
         }
         cx.notify();
+    }
+
+    /// Opens or closes the "Try it out" panel for one operation. Opening it
+    /// builds one editor per declared parameter (plus any path placeholder a
+    /// sloppily-written contract left undeclared, see
+    /// `try_it_out::undeclared_path_parameter_names`), a Server field seeded
+    /// from the document's first server URL, and -- when the operation has
+    /// one -- a body editor seeded from the same JSON skeleton
+    /// `collection_from_document` builds for "Save to API Client".
+    fn toggle_try_it_out(
+        &mut self,
+        operation_key: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.try_it_out_panels.remove(&operation_key).is_some() {
+            cx.notify();
+            return;
+        }
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some(operation) = document
+            .groups
+            .iter()
+            .flat_map(|group| &group.operations)
+            .find(|operation| operation.key() == operation_key)
+            .cloned()
+        else {
+            return;
+        };
+
+        let base_url = document
+            .base_urls
+            .first()
+            .map(|url| url.to_string())
+            .unwrap_or_default();
+        let server_editor =
+            new_try_it_out_field_editor("https://api.example.com", &base_url, window, cx);
+        let auth_editor = new_try_it_out_field_editor("Bearer <token>", "", window, cx);
+
+        let mut parameter_fields: Vec<ParameterField> = Vec::new();
+        for parameter in &operation.parameters {
+            if !try_it_out::parameter_is_fillable(
+                parameter.location.as_ref(),
+                parameter.name.as_ref(),
+                &operation.path,
+            ) {
+                continue;
+            }
+            let editor = new_try_it_out_field_editor("Value", "", window, cx);
+            parameter_fields.push(ParameterField {
+                name: parameter.name.clone(),
+                location: parameter.location.clone(),
+                required: parameter.required,
+                editor,
+            });
+        }
+        for name in
+            try_it_out::undeclared_path_parameter_names(&operation.path, &operation.parameters)
+        {
+            let editor = new_try_it_out_field_editor("Value", "", window, cx);
+            parameter_fields.push(ParameterField {
+                name: name.into(),
+                location: "path".into(),
+                required: true,
+                editor,
+            });
+        }
+
+        let body_editor = if operation.request_body.is_some() {
+            let imported = collection_from_document(
+                &document,
+                OperationSelection::SingleOperation(operation_key.clone()),
+            );
+            let initial_text = imported
+                .requests
+                .first()
+                .and_then(|request| match &request.body {
+                    api_client::RequestBody::Raw { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some(new_try_it_out_body_editor(&initial_text, window, cx))
+        } else {
+            None
+        };
+
+        let response_body_editor = new_try_it_out_response_editor(window, cx);
+
+        self.try_it_out_panels.insert(
+            operation_key,
+            TryItOutPanel {
+                server_editor,
+                auth_editor,
+                parameter_fields,
+                body_editor,
+                response_body_editor,
+                headers_expanded: false,
+                send_state: TryItOutSendState::Idle,
+                _send_task: None,
+            },
+        );
+        cx.notify();
+    }
+
+    fn toggle_try_it_out_headers(&mut self, operation_key: SharedString, cx: &mut Context<Self>) {
+        if let Some(panel) = self.try_it_out_panels.get_mut(&operation_key) {
+            panel.headers_expanded = !panel.headers_expanded;
+        }
+        cx.notify();
+    }
+
+    fn clear_try_it_out_response(
+        &mut self,
+        operation_key: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.try_it_out_panels.get_mut(&operation_key) else {
+            return;
+        };
+        panel._send_task = None;
+        panel.send_state = TryItOutSendState::Idle;
+        panel.response_body_editor.update(cx, |editor, cx| {
+            editor.set_read_only(false);
+            editor.set_text("", window, cx);
+            editor.set_read_only(true);
+        });
+        cx.notify();
+    }
+
+    /// Builds the single-operation request `api_collection` already knows how
+    /// to construct, overlays every value the reader typed in via
+    /// `try_it_out::apply_overrides`, resolves it, and sends it through the
+    /// same `api_client::execute` the API Client panel itself uses.
+    fn execute_try_it_out(
+        &mut self,
+        operation_key: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.try_it_out_panels.get(&operation_key) else {
+            return;
+        };
+        if matches!(panel.send_state, TryItOutSendState::Sending) {
+            return;
+        }
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+
+        let Some(store) = ApiClientStore::global(cx) else {
+            if let Some(panel) = self.try_it_out_panels.get_mut(&operation_key) {
+                panel.send_state = TryItOutSendState::Error(
+                    "The API Client isn't available, so this request can't be sent.".into(),
+                );
+            }
+            cx.notify();
+            return;
+        };
+        let client = store.read(cx).http_client.clone();
+
+        let Some(panel) = self.try_it_out_panels.get(&operation_key) else {
+            return;
+        };
+        let server_url = panel.server_editor.read(cx).text(cx);
+        let auth_header_value = panel.auth_editor.read(cx).text(cx);
+        let body_text = panel
+            .body_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx));
+        let parameters: Vec<try_it_out::ParameterOverride> = panel
+            .parameter_fields
+            .iter()
+            .map(|field| try_it_out::ParameterOverride {
+                name: field.name.to_string(),
+                location: field.location.to_string(),
+                required: field.required,
+                value: field.editor.read(cx).text(cx),
+            })
+            .collect();
+
+        if let Some(panel) = self.try_it_out_panels.get_mut(&operation_key) {
+            panel.send_state = TryItOutSendState::Sending;
+        }
+        cx.notify();
+
+        let overrides = try_it_out::TryItOutOverrides {
+            server_url,
+            auth_header_value,
+            body_text,
+            parameters,
+        };
+
+        let panel_key = operation_key.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let imported = collection_from_document(
+                &document,
+                OperationSelection::SingleOperation(operation_key.clone()),
+            );
+            let Some(base_request) = imported.requests.into_iter().next() else {
+                this.update(cx, |this, cx| {
+                    if let Some(panel) = this.try_it_out_panels.get_mut(&operation_key) {
+                        panel.send_state = TryItOutSendState::Error(
+                            "This operation no longer has a request to send.".into(),
+                        );
+                    }
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+
+            let (request, collection) =
+                try_it_out::apply_overrides(base_request, imported.collection, &overrides);
+            let resolved = try_it_out::resolve_and_build(&request, &collection);
+
+            match api_client::execute(&client, &resolved).await {
+                Ok(summary) => {
+                    let content_type = summary
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let (body_text, truncated) =
+                        try_it_out::cap_and_render_body(&summary.body, &content_type);
+                    let meta = TryItOutResponseMeta {
+                        status: summary.status,
+                        status_text: summary.status_text.into(),
+                        elapsed_ms: summary.elapsed_ms,
+                        size_bytes: summary.body.len(),
+                        headers: summary.headers,
+                        body_truncated: truncated,
+                    };
+                    this.update_in(cx, |this, window, cx| {
+                        if let Some(panel) = this.try_it_out_panels.get_mut(&operation_key) {
+                            panel.response_body_editor.update(cx, |editor, cx| {
+                                editor.set_read_only(false);
+                                editor.set_text(body_text, window, cx);
+                                editor.set_read_only(true);
+                            });
+                            panel.send_state = TryItOutSendState::Success(meta);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    let message: SharedString = error.to_string().into();
+                    this.update(cx, |this, cx| {
+                        if let Some(panel) = this.try_it_out_panels.get_mut(&operation_key) {
+                            panel.send_state = TryItOutSendState::Error(message);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        });
+
+        if let Some(panel) = self.try_it_out_panels.get_mut(&panel_key) {
+            panel._send_task = Some(task);
+        }
     }
 
     fn save_document_to_api_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -492,7 +804,7 @@ impl OpenApiPreviewView {
     fn render_operation_details(
         &self,
         operation: &Operation,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let key = operation.key();
 
@@ -532,6 +844,280 @@ impl OpenApiPreviewView {
                     .child(section_title("Responses"))
                     .child(render_responses_table(&operation.responses, &key, cx))
             })
+            .child(self.render_try_it_out_section(operation, cx))
+    }
+
+    fn render_try_it_out_section(
+        &self,
+        operation: &Operation,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let key = operation.key();
+        let active = self.try_it_out_panels.contains_key(&key);
+        let toggle_key = key.clone();
+
+        let mut section = v_flex().gap_2().child(
+            Button::new(
+                SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
+                if active {
+                    "Close Try it out"
+                } else {
+                    "Try it out"
+                },
+            )
+            .style(ButtonStyle::Subtle)
+            .start_icon(Icon::new(if active {
+                IconName::ChevronDown
+            } else {
+                IconName::PlayOutlined
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_try_it_out(toggle_key.clone(), window, cx);
+            })),
+        );
+
+        if let Some(panel) = self.try_it_out_panels.get(&key) {
+            section = section.child(self.render_try_it_out_panel(&key, panel, cx));
+        }
+
+        section
+    }
+
+    fn render_try_it_out_panel(
+        &self,
+        operation_key: &SharedString,
+        panel: &TryItOutPanel,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let border_variant = cx.theme().colors().border_variant;
+
+        let mut fields = v_flex().gap_2().child(render_try_it_out_field(
+            "Server".into(),
+            None,
+            false,
+            panel.server_editor.clone(),
+            cx,
+        ));
+        for field in &panel.parameter_fields {
+            fields = fields.child(render_try_it_out_field(
+                field.name.clone(),
+                Some(field.location.clone()),
+                field.required,
+                field.editor.clone(),
+                cx,
+            ));
+        }
+        fields = fields.child(render_try_it_out_field(
+            "Authorization".into(),
+            None,
+            false,
+            panel.auth_editor.clone(),
+            cx,
+        ));
+
+        let mut column = v_flex()
+            .gap_3()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(border_variant)
+            .child(fields);
+
+        if let Some(body_editor) = &panel.body_editor {
+            column = column.child(section_title("Request body")).child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border_variant)
+                    .px_2()
+                    .py_1p5()
+                    .child(body_editor.clone()),
+            );
+        }
+
+        let is_sending = matches!(panel.send_state, TryItOutSendState::Sending);
+        let is_idle = matches!(panel.send_state, TryItOutSendState::Idle);
+        let execute_key = operation_key.clone();
+        let clear_key = operation_key.clone();
+
+        column = column.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new(
+                        SharedString::from(format!("openapi-try-it-out-execute-{operation_key}")),
+                        if is_sending { "Sending…" } else { "Execute" },
+                    )
+                    .start_icon(Icon::new(IconName::Send))
+                    .loading(is_sending)
+                    .disabled(is_sending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.execute_try_it_out(execute_key.clone(), window, cx);
+                    })),
+                )
+                .child(
+                    Button::new(
+                        SharedString::from(format!("openapi-try-it-out-clear-{operation_key}")),
+                        "Clear",
+                    )
+                    .style(ButtonStyle::Subtle)
+                    // Clearing drops the task that carries the request, so it
+                    // stays out of reach until the reply is in: a cleared panel
+                    // mid-flight would look like nothing had been asked for.
+                    .disabled(is_idle || is_sending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.clear_try_it_out_response(clear_key.clone(), window, cx);
+                    })),
+                ),
+        );
+
+        column.child(self.render_try_it_out_result(operation_key, panel, cx))
+    }
+
+    fn render_try_it_out_result(
+        &self,
+        operation_key: &SharedString,
+        panel: &TryItOutPanel,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match &panel.send_state {
+            TryItOutSendState::Idle => div().into_any_element(),
+            TryItOutSendState::Sending => h_flex()
+                .pt_2()
+                .child(
+                    Label::new("Sending…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            TryItOutSendState::Error(message) => v_flex()
+                .gap_1()
+                .pt_2()
+                .child(
+                    Label::new("Request failed")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+                .child(
+                    Label::new(message.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .buffer_font(cx),
+                )
+                .into_any_element(),
+            TryItOutSendState::Success(meta) => {
+                let status_label = format!("{} {}", meta.status, meta.status_text);
+                let color = status_color(&meta.status.to_string());
+                let size_label = try_it_out::format_response_size(meta.size_bytes);
+                let headers_expanded = panel.headers_expanded;
+                let headers = meta.headers.clone();
+                let toggle_headers_key = operation_key.clone();
+                let border_variant = cx.theme().colors().border_variant;
+
+                let mut result = v_flex()
+                    .gap_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(border_variant)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                Label::new(status_label)
+                                    .weight(gpui::FontWeight::BOLD)
+                                    .color(color),
+                            )
+                            .child(
+                                Label::new(format!("{} ms", meta.elapsed_ms))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(size_label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "openapi-try-it-out-headers-toggle-{operation_key}"
+                                    )))
+                                    .gap_1()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_try_it_out_headers(
+                                            toggle_headers_key.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        Icon::new(if headers_expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(format!("Headers ({})", headers.len()))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .when(headers_expanded, |section| {
+                                section.child(v_flex().gap_0p5().pl_4().children(
+                                    headers.iter().map(|(key, value)| {
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Label::new(key.clone())
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(value.clone()).size(LabelSize::XSmall),
+                                            )
+                                    }),
+                                ))
+                            }),
+                    );
+
+                if meta.body_truncated {
+                    result = result.child(
+                        Label::new(format!(
+                            "Response body truncated -- only the first {} KB is shown.",
+                            try_it_out::MAX_RESPONSE_BODY_BYTES / 1024
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                    );
+                }
+
+                result = result.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "openapi-try-it-out-response-{operation_key}"
+                        )))
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border_variant)
+                        .px_2()
+                        .py_1p5()
+                        .child(panel.response_body_editor.clone()),
+                );
+
+                result.into_any_element()
+            }
+        }
     }
 
     fn render_schemas(
@@ -933,6 +1519,88 @@ fn section_title(title: &'static str) -> impl IntoElement {
         .size(LabelSize::XSmall)
         .color(Color::Muted)
         .weight(gpui::FontWeight::SEMIBOLD)
+}
+
+fn new_try_it_out_field_editor(
+    placeholder: &str,
+    initial_value: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text(placeholder, window, cx);
+        if !initial_value.is_empty() {
+            editor.set_text(initial_value.to_string(), window, cx);
+        }
+        editor
+    })
+}
+
+fn new_try_it_out_body_editor(
+    initial_value: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_placeholder_text("Request body", window, cx);
+        if !initial_value.is_empty() {
+            editor.set_text(initial_value.to_string(), window, cx);
+        }
+        editor
+    })
+}
+
+fn new_try_it_out_response_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_read_only(true);
+        editor
+    })
+}
+
+/// One labelled field row of a "Try it out" panel: the parameter's name,
+/// its location (query/path/header) when it has one, a required marker, and
+/// the single-line editor the reader types the value into.
+fn render_try_it_out_field(
+    label: SharedString,
+    location: Option<SharedString>,
+    required: bool,
+    editor: Entity<Editor>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    v_flex()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::BOLD),
+                )
+                .when(required, |row| {
+                    row.child(Label::new("*").size(LabelSize::Small).color(Color::Error))
+                })
+                .when_some(location, |row, location| {
+                    row.child(
+                        Label::new(location)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .px_2()
+                .py_1()
+                .child(editor),
+        )
 }
 
 fn pill(text: SharedString, background: Hsla, text_color: Color, _cx: &App) -> impl IntoElement {
