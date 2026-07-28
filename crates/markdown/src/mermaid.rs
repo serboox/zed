@@ -30,6 +30,31 @@ pub(crate) struct ParsedMarkdownMermaidDiagramContents {
     pub(crate) scale: u32,
 }
 
+/// Which colours a diagram is drawn with. A document is not always painted in
+/// the editor's theme, and a diagram that ignores that ends up clashing with the
+/// prose around it.
+#[derive(Clone, Debug, Default)]
+pub enum MermaidPalette {
+    /// Follows the active editor theme.
+    #[default]
+    EditorTheme,
+    /// Follows one specific theme, for a document painted in it.
+    Theme(Arc<theme::Theme>),
+    /// Matches a GitHub-styled document at this appearance.
+    Github(theme::Appearance),
+}
+
+impl PartialEq for MermaidPalette {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::EditorTheme, Self::EditorTheme) => true,
+            (Self::Theme(left), Self::Theme(right)) => Arc::ptr_eq(left, right),
+            (Self::Github(left), Self::Github(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct MermaidState {
     cache: MermaidDiagramCache,
@@ -83,7 +108,12 @@ impl MermaidState {
         })
     }
 
-    pub(crate) fn update(&mut self, parsed: &ParsedMarkdown, cx: &mut Context<Markdown>) {
+    pub(crate) fn update(
+        &mut self,
+        parsed: &ParsedMarkdown,
+        palette: &MermaidPalette,
+        cx: &mut Context<Markdown>,
+    ) {
         let mut new_order = Vec::new();
         for mermaid_diagram in parsed.mermaid_diagrams.values() {
             new_order.push(mermaid_diagram.contents.clone());
@@ -95,7 +125,12 @@ impl MermaidState {
                     Self::get_fallback_image(idx, &self.order, new_order.len(), &self.cache);
                 self.cache.insert(
                     new_content.clone(),
-                    Arc::new(CachedMermaidDiagram::new(new_content.clone(), fallback, cx)),
+                    Arc::new(CachedMermaidDiagram::new(
+                        new_content.clone(),
+                        fallback,
+                        palette,
+                        cx,
+                    )),
                 );
             }
         }
@@ -111,12 +146,13 @@ impl CachedMermaidDiagram {
     fn new(
         contents: ParsedMarkdownMermaidDiagramContents,
         fallback_image: Option<Arc<RenderImage>>,
+        palette: &MermaidPalette,
         cx: &mut Context<Markdown>,
     ) -> Self {
         let render_image = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
         let render_image_clone = render_image.clone();
         let svg_renderer = cx.svg_renderer();
-        let mermaid_theme = build_mermaid_theme(cx);
+        let mermaid_theme = build_mermaid_theme(palette, cx);
 
         let task = cx.spawn(async move |this, cx| {
             let value = cx
@@ -181,12 +217,71 @@ fn mermaid_font_family(font_family: &str) -> String {
     }
 }
 
-fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
-    let colors = cx.theme().colors();
-    let theme_settings = ThemeSettings::get_global(cx);
-    let is_dark = !cx.theme().appearance.is_light();
+fn build_mermaid_theme(
+    palette: &MermaidPalette,
+    cx: &Context<Markdown>,
+) -> mermaid_render::MermaidTheme {
+    match palette {
+        MermaidPalette::EditorTheme => theme_from(&cx.theme().clone(), cx),
+        MermaidPalette::Theme(theme) => theme_from(theme, cx),
+        MermaidPalette::Github(appearance) => github_theme_from(*appearance, cx),
+    }
+}
 
-    let players = cx.theme().players();
+/// A diagram drawn to match a GitHub-styled document: the same page background,
+/// text and border the prose uses, so the two cannot disagree.
+fn github_theme_from(
+    appearance: theme::Appearance,
+    cx: &Context<Markdown>,
+) -> mermaid_render::MermaidTheme {
+    let colors = crate::github_diagram_colors(appearance);
+    let theme_settings = ThemeSettings::get_global(cx);
+    let accents = colors.accents;
+    let git_branch_colors = std::array::from_fn(|i| accents[i % accents.len()]);
+    let git_branch_label_colors = git_branch_colors.map(mermaid_render::text_color_for_background);
+
+    mermaid_render::MermaidTheme {
+        dark_mode: !appearance.is_light(),
+        font_family: mermaid_font_family(theme_settings.ui_font.family.as_ref()),
+        background: colors.background,
+        primary_color: colors.surface,
+        primary_text_color: colors.text,
+        primary_border_color: colors.border,
+        secondary_color: colors.raised_surface,
+        tertiary_color: colors.raised_surface,
+        line_color: colors.border,
+        text_color: colors.text,
+        edge_label_background: colors.background,
+        cluster_background: colors.surface,
+        cluster_border: colors.border,
+        note_background: colors.surface,
+        note_border: colors.border,
+        actor_background: colors.raised_surface,
+        actor_border: colors.border,
+        activation_background: colors.raised_surface,
+        activation_border: colors.border,
+        git_branch_colors,
+        git_branch_label_colors,
+        er_attr_bg_odd: colors.surface,
+        er_attr_bg_even: colors.raised_surface,
+        error_color: cx.theme().status().error,
+        warning_color: cx.theme().status().warning,
+        accent_colors: accents
+            .iter()
+            .map(|accent| mermaid_render::AccentColor {
+                foreground: *accent,
+                background: colors.surface,
+            })
+            .collect(),
+    }
+}
+
+fn theme_from(theme: &Arc<theme::Theme>, cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
+    let colors = theme.colors();
+    let theme_settings = ThemeSettings::get_global(cx);
+    let is_dark = !theme.appearance.is_light();
+
+    let players = theme.players();
     let git_branch_colors = std::array::from_fn(|i| players.0[i % players.0.len()].cursor);
     let git_branch_label_colors = git_branch_colors.map(mermaid_render::text_color_for_background);
 
@@ -214,8 +309,8 @@ fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
         git_branch_label_colors,
         er_attr_bg_odd: colors.surface_background,
         er_attr_bg_even: colors.element_background,
-        error_color: cx.theme().status().error,
-        warning_color: cx.theme().status().warning,
+        error_color: theme.status().error,
+        warning_color: theme.status().warning,
         accent_colors: players
             .0
             .iter()

@@ -5,7 +5,11 @@ pub mod parser;
 mod path_range;
 mod selection;
 
-pub use github_style::{github_page_background, github_style, github_style_for_appearance};
+pub use github_style::{
+    GithubDiagramColors, github_diagram_colors, github_page_background, github_style,
+    github_style_for_appearance,
+};
+pub use mermaid::MermaidPalette;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
@@ -438,6 +442,7 @@ pub struct Markdown {
     _mermaid_theme_subscription: Option<Subscription>,
     mermaid_showing_code: HashSet<usize>,
     mermaid_expanded: Option<usize>,
+    mermaid_palette: MermaidPalette,
     copied_code_blocks: HashSet<ElementId>,
     wrapped_code_blocks: HashSet<usize>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
@@ -632,6 +637,7 @@ impl Markdown {
             _mermaid_theme_subscription: theme_subscription,
             mermaid_showing_code: HashSet::default(),
             mermaid_expanded: None,
+            mermaid_palette: MermaidPalette::default(),
             copied_code_blocks: HashSet::default(),
             wrapped_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
@@ -689,7 +695,9 @@ impl Markdown {
         }
 
         self.mermaid_state.clear();
-        self.mermaid_state.update(&self.parsed_markdown, cx);
+        let palette = self.mermaid_palette.clone();
+        self.mermaid_state
+            .update(&self.parsed_markdown, &palette, cx);
         cx.notify();
     }
 
@@ -716,6 +724,16 @@ impl Markdown {
 
     pub fn mermaid_expanded(&self) -> Option<usize> {
         self.mermaid_expanded
+    }
+
+    /// Chooses the colours diagrams are drawn with. Changing them re-renders the
+    /// cached pictures, since the colours are baked into them.
+    pub fn set_mermaid_palette(&mut self, palette: MermaidPalette, cx: &mut Context<Self>) {
+        if self.mermaid_palette == palette {
+            return;
+        }
+        self.mermaid_palette = palette;
+        self.invalidate_mermaid_cache(cx);
     }
 
     /// The rendered picture of the diagram currently marked as expanded, if it
@@ -1147,7 +1165,8 @@ impl Markdown {
                 }
                 if this.options.render_mermaid_diagrams {
                     let parsed_markdown = this.parsed_markdown.clone();
-                    this.mermaid_state.update(&parsed_markdown, cx);
+                    let palette = this.mermaid_palette.clone();
+                    this.mermaid_state.update(&parsed_markdown, &palette, cx);
                     this.mermaid_showing_code
                         .retain(|offset| parsed_markdown.mermaid_diagrams.contains_key(offset));
                     if let Some(expanded) = this.mermaid_expanded

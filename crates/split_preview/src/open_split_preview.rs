@@ -4,7 +4,7 @@ use html_preview::html_preview_view::HtmlPreviewView;
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use openapi_preview::{OpenApiPreviewView, looks_like_openapi};
 use ui::prelude::*;
-use workspace::Workspace;
+use workspace::{SaveIntent, Workspace};
 
 use crate::split_preview_view::{PreviewLayout, SplitPreviewView};
 use crate::{OpenSplitPreview, split_preview_view};
@@ -47,9 +47,29 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     else {
         return;
     };
-    let Some(kind) = preview_kind_for(&source_editor, cx) else {
+    open_for_editor(
+        workspace,
+        &source_editor,
+        PreviewLayout::EditorAndPreview,
+        window,
+        cx,
+    );
+}
+
+/// Opens `source_editor`'s document next to its preview, in place of the tab the
+/// document is already in, so the reader stays on the same tab instead of
+/// gaining a second one for the same file.
+pub fn open_for_editor(
+    workspace: &mut Workspace,
+    source_editor: &Entity<Editor>,
+    layout: PreviewLayout,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(kind) = preview_kind_for(source_editor, cx) else {
         return;
     };
+    let source_editor = source_editor.clone();
 
     let pane = workspace.active_pane().clone();
     // Reactivate an existing split preview for the same buffer instead of
@@ -72,6 +92,12 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     let language_registry = workspace.project().read(cx).languages().clone();
     let workspace_handle = workspace.weak_handle();
 
+    // The tab the document is in now, so the split can take its place.
+    let replaced = pane.read(cx).active_item().and_then(|item| {
+        let index = pane.read(cx).index_for_item(item.as_ref())?;
+        Some((item.item_id(), index))
+    });
+
     let view = match kind {
         PreviewKind::Markdown => {
             let preview = MarkdownPreviewView::new(
@@ -82,7 +108,7 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                 window,
                 cx,
             );
-            cx.new(|cx| SplitPreviewView::new(editor, preview, PreviewLayout::EditorAndPreview, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
         }
         PreviewKind::Html => {
             let preview = HtmlPreviewView::new(
@@ -92,16 +118,29 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                 window,
                 cx,
             );
-            cx.new(|cx| SplitPreviewView::new(editor, preview, PreviewLayout::EditorAndPreview, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
         }
         PreviewKind::OpenApi => {
             let preview = OpenApiPreviewView::new(editor.clone(), window, cx);
-            cx.new(|cx| SplitPreviewView::new(editor, preview, PreviewLayout::EditorAndPreview, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
         }
     };
 
     pane.update(cx, |pane, cx| {
-        pane.add_item(Box::new(view), true, true, None, window, cx);
+        pane.add_item(
+            Box::new(view),
+            true,
+            true,
+            replaced.map(|(_, index)| index),
+            window,
+            cx,
+        );
+        // The buffer lives on in the split, so the tab it replaces is closed
+        // without asking about unsaved changes -- nothing is being discarded.
+        if let Some((item_id, _)) = replaced {
+            pane.close_item_by_id(item_id, SaveIntent::Skip, window, cx)
+                .detach_and_log_err(cx);
+        }
     });
 }
 

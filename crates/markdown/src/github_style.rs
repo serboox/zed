@@ -92,6 +92,43 @@ fn dark_palette() -> GithubPalette {
     }
 }
 
+/// The document colours a diagram has to match when the document is
+/// GitHub-styled. Without this a diagram keeps the editor theme's colours and
+/// ends up dark inside a light document, or the other way round.
+pub struct GithubDiagramColors {
+    pub background: Hsla,
+    pub text: Hsla,
+    pub muted_text: Hsla,
+    pub border: Hsla,
+    pub surface: Hsla,
+    pub raised_surface: Hsla,
+    pub link: Hsla,
+    pub accents: [Hsla; 8],
+}
+
+pub fn github_diagram_colors(appearance: Appearance) -> GithubDiagramColors {
+    let palette = palette_for(appearance);
+    GithubDiagramColors {
+        background: palette.page_background,
+        text: palette.text,
+        muted_text: palette.muted_text,
+        border: palette.border,
+        surface: palette.code_block_background,
+        raised_surface: palette.inline_code_background,
+        link: palette.link,
+        accents: [
+            palette.keyword,
+            palette.string,
+            palette.function,
+            palette.type_name,
+            palette.constant,
+            palette.tag,
+            palette.property,
+            palette.variable,
+        ],
+    }
+}
+
 fn palette_for(appearance: Appearance) -> GithubPalette {
     if appearance.is_light() {
         light_palette()

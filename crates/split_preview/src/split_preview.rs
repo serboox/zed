@@ -1,9 +1,11 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
+pub mod layout_toolbar;
 pub mod open_split_preview;
 pub mod split_preview_view;
 
+pub use layout_toolbar::PreviewLayoutToolbar;
 pub use open_split_preview::{PreviewKind, preview_kind_for};
 pub use split_preview_view::{PreviewLayout, SplitPreviewView};
 

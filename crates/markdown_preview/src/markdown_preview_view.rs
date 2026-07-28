@@ -18,7 +18,7 @@ use gpui::{
 use language::{LanguageRegistry, Point};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
-    MarkdownOptions, MarkdownStyle,
+    MarkdownOptions, MarkdownStyle, MermaidPalette,
 };
 use project::search::SearchQuery;
 use project::{Project, ProjectPath};
@@ -49,6 +49,10 @@ use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp,
 /// How visible the floating reading controls are at rest.
 const RESTING_CONTROL_OPACITY: f32 = 0.35;
 
+const MIN_DIAGRAM_ZOOM: f32 = 0.1;
+const MAX_DIAGRAM_ZOOM: f32 = 10.0;
+const DIAGRAM_ZOOM_STEP: f32 = 1.2;
+
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 // GitHub's own markdown body has no internal width cap; it just fills its
@@ -72,6 +76,10 @@ pub struct MarkdownPreviewView {
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
     reading_appearance: ReadingAppearance,
+    /// Zoom for the expanded diagram. `None` fits it to the view, which is what
+    /// expanding is for; a number is the reader's own scale, kept separate so
+    /// closing and reopening starts from the fitted size again.
+    expanded_diagram_zoom: Option<f32>,
 }
 
 /// Light-or-dark choice for reading a rendered document, kept per view and never
@@ -362,6 +370,7 @@ impl MarkdownPreviewView {
                 hovered_url: None,
                 mode,
                 reading_appearance: ReadingAppearance::default(),
+                expanded_diagram_zoom: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -962,6 +971,7 @@ impl MarkdownPreviewView {
     }
 
     fn collapse_expanded_diagram(&mut self, cx: &mut Context<Self>) {
+        self.expanded_diagram_zoom = None;
         self.markdown
             .update(cx, |markdown, cx| markdown.set_mermaid_expanded(None, cx));
     }
@@ -970,41 +980,125 @@ impl MarkdownPreviewView {
         self.collapse_expanded_diagram(cx);
     }
 
+    /// Scales the expanded diagram. The first step has to start from the size the
+    /// diagram is actually shown at, not from its natural size, or zooming in on
+    /// a diagram that was fitted down would jump instead of step.
+    fn zoom_expanded_diagram(&mut self, factor: f32, fitted_zoom: f32, cx: &mut Context<Self>) {
+        let current = self.expanded_diagram_zoom.unwrap_or(fitted_zoom);
+        self.expanded_diagram_zoom =
+            Some((current * factor).clamp(MIN_DIAGRAM_ZOOM, MAX_DIAGRAM_ZOOM));
+        cx.notify();
+    }
+
+    fn fit_expanded_diagram(&mut self, cx: &mut Context<Self>) {
+        self.expanded_diagram_zoom = None;
+        cx.notify();
+    }
+
     /// The expanded diagram, drawn over the whole document at the size of the
     /// view. Rendered here rather than inside the markdown element because only
     /// the view knows how much room there is to fill.
-    fn render_expanded_diagram(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_expanded_diagram(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let image = self.markdown.read(cx).expanded_mermaid_image()?;
+        let natural = image.size(0);
+        let natural_width = px(natural.width.0 as f32);
+        let natural_height = px(natural.height.0 as f32);
+
+        // The size the diagram is shown at when it is merely fitted, which is
+        // both the starting scale and what the "fit" button returns to.
+        let available = window.viewport_size();
+        let fitted_zoom = if natural_width > px(0.) && natural_height > px(0.) {
+            (available.width / natural_width)
+                .min(available.height / natural_height)
+                .min(1.0)
+        } else {
+            1.0
+        };
+        let zoom = self.expanded_diagram_zoom.unwrap_or(fitted_zoom);
+        let fitted = self.expanded_diagram_zoom.is_none();
+
         Some(
             div()
                 .id("markdown-expanded-diagram")
                 .absolute()
                 .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_6()
                 .bg(cx.theme().colors().elevated_surface_background)
-                // Anywhere outside the picture closes it, which is what a reader
-                // reaches for first after enlarging something.
-                .on_click(cx.listener(|this, _, _, cx| this.collapse_expanded_diagram(cx)))
                 .child(
-                    img(ImageSource::Render(image))
-                        .max_w_full()
-                        .max_h_full()
-                        .with_fallback(|| {
-                            Label::new("Failed to load mermaid diagram").into_any_element()
-                        }),
+                    div()
+                        .id("markdown-expanded-diagram-scroll")
+                        .size_full()
+                        .overflow_scroll()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        // Anywhere beside the picture closes it, which is what a
+                        // reader reaches for first after enlarging something.
+                        .on_click(cx.listener(|this, _, _, cx| this.collapse_expanded_diagram(cx)))
+                        .child(
+                            img(ImageSource::Render(image))
+                                .w(natural_width * zoom)
+                                .h(natural_height * zoom)
+                                .with_fallback(|| {
+                                    Label::new("Failed to load mermaid diagram").into_any_element()
+                                }),
+                        ),
                 )
                 .child(
-                    div().absolute().top_2().right_3().child(
-                        IconButton::new("markdown-collapse-diagram", IconName::Minimize)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Close the expanded diagram"))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.collapse_expanded_diagram(cx)),
-                            ),
-                    ),
+                    h_flex()
+                        .absolute()
+                        .top_2()
+                        .right_3()
+                        .p_0p5()
+                        .gap_px()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().elevated_surface_background)
+                        .shadow_sm()
+                        .child(
+                            IconButton::new("markdown-diagram-zoom-out", IconName::Dash)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Zoom out"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.zoom_expanded_diagram(
+                                        1.0 / DIAGRAM_ZOOM_STEP,
+                                        fitted_zoom,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            IconButton::new("markdown-diagram-zoom-in", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Zoom in"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.zoom_expanded_diagram(DIAGRAM_ZOOM_STEP, fitted_zoom, cx)
+                                })),
+                        )
+                        .child(
+                            IconButton::new("markdown-diagram-fit", IconName::Maximize)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(fitted)
+                                .tooltip(Tooltip::text("Fit the diagram to the view"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.fit_expanded_diagram(cx)),
+                                ),
+                        )
+                        .child(
+                            IconButton::new("markdown-collapse-diagram", IconName::Minimize)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Close the expanded diagram"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.collapse_expanded_diagram(cx)
+                                    }),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1027,6 +1121,20 @@ impl MarkdownPreviewView {
                 workspace_directory = Some(tree.read(cx).abs_path().to_path_buf());
             }
         }
+
+        // Diagrams are drawn into pictures, so they have to be told which colours
+        // the document around them uses; otherwise a diagram keeps the editor
+        // theme and clashes with a document painted some other way.
+        let diagram_palette = match self.reading_appearance.resolve() {
+            Some(appearance) => MermaidPalette::Github(appearance),
+            None => match self.resolve_preview_theme(cx) {
+                Some(theme) => MermaidPalette::Theme(theme),
+                None => MermaidPalette::Github(cx.theme().appearance()),
+            },
+        };
+        self.markdown.update(cx, |markdown, cx| {
+            markdown.set_mermaid_palette(diagram_palette, cx)
+        });
 
         // Three deliberate rendering modes. An explicit light/dark reading choice
         // wins, because it is the reader's answer to "how do I want to read this
@@ -1656,7 +1764,7 @@ impl Render for MarkdownPreviewView {
                 self.markdown.read(cx).mermaid_expanded().is_none(),
                 |this| this.child(self.render_reading_controls(cx)),
             )
-            .children(self.render_expanded_diagram(cx))
+            .children(self.render_expanded_diagram(window, cx))
     }
 }
 

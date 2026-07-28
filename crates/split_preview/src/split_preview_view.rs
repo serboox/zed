@@ -36,7 +36,7 @@ impl PreviewLayout {
         }
     }
 
-    fn icon(self) -> IconName {
+    pub fn icon(self) -> IconName {
         match self {
             Self::Editor => IconName::Pencil,
             Self::EditorAndPreview => IconName::SplitAlt,
