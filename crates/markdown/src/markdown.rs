@@ -5,7 +5,7 @@ pub mod parser;
 mod path_range;
 mod selection;
 
-pub use github_style::{github_page_background, github_style};
+pub use github_style::{github_page_background, github_style, github_style_for_appearance};
 
 use base64::Engine as _;
 use futures::FutureExt as _;
@@ -38,8 +38,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DefiniteLength,
     DispatchPhase, Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
-    Hitbox, Hsla, Image, ImageFormat, ImageSource, KeyContext, Length, MouseButton,
-    MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful,
+    Hitbox, Hsla, Image, ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Point, RenderImage, ScrollHandle, Stateful,
     StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
     TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img,
     point, quad,
@@ -437,6 +437,7 @@ pub struct Markdown {
     mermaid_state: MermaidState,
     _mermaid_theme_subscription: Option<Subscription>,
     mermaid_showing_code: HashSet<usize>,
+    mermaid_expanded: Option<usize>,
     copied_code_blocks: HashSet<ElementId>,
     wrapped_code_blocks: HashSet<usize>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
@@ -630,6 +631,7 @@ impl Markdown {
             mermaid_state: MermaidState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_showing_code: HashSet::default(),
+            mermaid_expanded: None,
             copied_code_blocks: HashSet::default(),
             wrapped_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
@@ -699,6 +701,29 @@ impl Markdown {
         if !self.mermaid_showing_code.remove(&source_offset) {
             self.mermaid_showing_code.insert(source_offset);
         }
+    }
+
+    /// Marks a diagram as the one to show enlarged, or clears the choice. The
+    /// enlarged copy is drawn by whoever renders this document, since only it
+    /// knows how much room there is to fill.
+    pub fn set_mermaid_expanded(&mut self, source_offset: Option<usize>, cx: &mut Context<Self>) {
+        if self.mermaid_expanded == source_offset {
+            return;
+        }
+        self.mermaid_expanded = source_offset;
+        cx.notify();
+    }
+
+    pub fn mermaid_expanded(&self) -> Option<usize> {
+        self.mermaid_expanded
+    }
+
+    /// The rendered picture of the diagram currently marked as expanded, if it
+    /// still exists in this document and has finished rendering.
+    pub fn expanded_mermaid_image(&self) -> Option<Arc<RenderImage>> {
+        let source_offset = self.mermaid_expanded?;
+        let diagram = self.parsed_markdown.mermaid_diagrams.get(&source_offset)?;
+        self.mermaid_state.rendered_image(&diagram.contents)
     }
 
     fn clear_code_block_scroll_handles(&mut self) {
@@ -821,6 +846,7 @@ impl Markdown {
         self.autoscroll_request = None;
         self.pending_parse = None;
         self.should_reparse = false;
+        self.mermaid_expanded = None;
         self.search_highlights.clear();
         self.active_search_highlight = None;
         // Don't clear parsed_markdown here - keep existing content visible until new parse completes
@@ -977,6 +1003,7 @@ impl Markdown {
             self.active_root_block = None;
             self.images_by_source_offset.clear();
             self.mermaid_state.clear();
+            self.mermaid_expanded = None;
             cx.notify();
             cx.refresh_windows();
             return;
@@ -1123,9 +1150,15 @@ impl Markdown {
                     this.mermaid_state.update(&parsed_markdown, cx);
                     this.mermaid_showing_code
                         .retain(|offset| parsed_markdown.mermaid_diagrams.contains_key(offset));
+                    if let Some(expanded) = this.mermaid_expanded
+                        && !parsed_markdown.mermaid_diagrams.contains_key(&expanded)
+                    {
+                        this.mermaid_expanded = None;
+                    }
                 } else {
                     this.mermaid_state.clear();
                     this.mermaid_showing_code.clear();
+                    this.mermaid_expanded = None;
                 }
                 this.pending_parse.take();
                 if this.should_reparse {

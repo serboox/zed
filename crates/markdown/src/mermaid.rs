@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use ui::{CopyButton, TintColor, prelude::*};
+use ui::{CopyButton, TintColor, Tooltip, prelude::*};
 
 use crate::parser::{CodeBlockKind, MarkdownEvent, MarkdownTag};
 use settings::Settings as _;
@@ -34,6 +34,20 @@ pub(crate) struct ParsedMarkdownMermaidDiagramContents {
 pub(crate) struct MermaidState {
     cache: MermaidDiagramCache,
     order: Vec<ParsedMarkdownMermaidDiagramContents>,
+}
+
+impl MermaidState {
+    /// The already-rendered image for a diagram, if it finished rendering.
+    /// Used to show the same picture enlarged without rendering it twice.
+    pub(crate) fn rendered_image(
+        &self,
+        contents: &ParsedMarkdownMermaidDiagramContents,
+    ) -> Option<Arc<RenderImage>> {
+        match self.cache.get(contents)?.render_image.get() {
+            Some(Ok(image)) => Some(image.clone()),
+            _ => None,
+        }
+    }
 }
 
 struct CachedMermaidDiagram {
@@ -455,7 +469,12 @@ fn render_mermaid_tab_header(
         Arc::new(ElementId::from(("mermaid-tab-code", markdown.entity_id()))),
         source_offset.to_string().into(),
     );
+    let expand_id = ElementId::NamedChild(
+        Arc::new(ElementId::from(("mermaid-expand", markdown.entity_id()))),
+        source_offset.to_string().into(),
+    );
     let preview_markdown = markdown.clone();
+    let expand_markdown = markdown.clone();
     let code_markdown = markdown;
 
     h_flex()
@@ -489,6 +508,20 @@ fn render_mermaid_tab_header(
                     });
                 }),
         )
+        // A diagram is often wider than the column it is read in, so it can be
+        // opened at the size of the whole view.
+        .when(!showing_code, |header| {
+            header.child(
+                IconButton::new(expand_id, IconName::Maximize)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Expand diagram"))
+                    .on_click(move |_event, _window, cx| {
+                        expand_markdown.update(cx, |md, cx| {
+                            md.set_mermaid_expanded(Some(source_offset), cx);
+                        });
+                    }),
+            )
+        })
 }
 
 fn render_mermaid_copy_button(

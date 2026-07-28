@@ -187,7 +187,18 @@ fn font_fallbacks(names: &[&str]) -> FontFallbacks {
 /// the active editor theme. The only thing read from the active theme is whether it is broadly
 /// light or dark, via [`theme::ActiveTheme::appearance`].
 pub fn github_style(window: &Window, cx: &App) -> MarkdownStyle {
-    let appearance = cx.theme().appearance();
+    github_style_for_appearance(cx.theme().appearance(), window, cx)
+}
+
+/// Like [`github_style`], but rendered for an explicit appearance rather than
+/// the active theme's. The palette is fixed, so light-or-dark is the only thing
+/// left to choose -- which is what lets a reader keep a light document open in a
+/// dark editor.
+pub fn github_style_for_appearance(
+    appearance: Appearance,
+    window: &Window,
+    cx: &App,
+) -> MarkdownStyle {
     let palette = palette_for(appearance);
     let theme_settings = ThemeSettings::get_global(cx);
 

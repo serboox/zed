@@ -10,9 +10,10 @@ use anyhow::{Context as _, Result};
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
-    InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
+    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ImageSource, InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource,
+    RetainAllImageCache, ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity,
+    Window, img, point, px,
 };
 use language::{LanguageRegistry, Point};
 use markdown::{
@@ -22,10 +23,10 @@ use markdown::{
 use project::search::SearchQuery;
 use project::{Project, ProjectPath};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
-use theme::{SystemAppearance, Theme, ThemeRegistry};
+use theme::{Appearance, SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
-use ui::{ContextMenu, LinkPreview, WithScrollbar, prelude::*, right_click_menu};
+use ui::{ContextMenu, LinkPreview, Tooltip, WithScrollbar, prelude::*, right_click_menu};
 use util::{
     ResultExt,
     markdown::{source_position_from_fragment, split_local_url_fragment},
@@ -44,6 +45,9 @@ use crate::{
     ScrollDownByItem,
 };
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
+
+/// How visible the floating reading controls are at rest.
+const RESTING_CONTROL_OPACITY: f32 = 0.35;
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -67,6 +71,48 @@ pub struct MarkdownPreviewView {
     pending_update_task: Option<Task<Result<()>>>,
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
+    reading_appearance: ReadingAppearance,
+}
+
+/// Light-or-dark choice for reading a rendered document, kept per view and never
+/// touching the application theme -- the same control the SVG and image viewers
+/// offer, so a light document can stay readable in a dark editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadingAppearance {
+    #[default]
+    Match,
+    Light,
+    Dark,
+}
+
+impl ReadingAppearance {
+    fn next(self) -> Self {
+        match self {
+            Self::Match => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Match,
+        }
+    }
+
+    fn resolve(self) -> Option<Appearance> {
+        match self {
+            Self::Match => None,
+            Self::Light => Some(Appearance::Light),
+            Self::Dark => Some(Appearance::Dark),
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Match => "Reading theme: follow the editor (click for light)",
+            Self::Light => "Reading theme: light (click for dark)",
+            Self::Dark => "Reading theme: dark (click to follow the editor)",
+        }
+    }
+
+    fn overrides_editor(self) -> bool {
+        !matches!(self, Self::Match)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -315,6 +361,7 @@ impl MarkdownPreviewView {
                 pending_update_task: None,
                 hovered_url: None,
                 mode,
+                reading_appearance: ReadingAppearance::default(),
             };
 
             this.set_editor(active_editor, window, cx);
@@ -880,6 +927,89 @@ impl MarkdownPreviewView {
         ThemeRegistry::global(cx).get(&theme_name.0).ok()
     }
 
+    fn cycle_reading_appearance(&mut self, cx: &mut Context<Self>) {
+        self.reading_appearance = self.reading_appearance.next();
+        cx.notify();
+    }
+
+    /// Floating reading controls over the document. Kept faint until the pointer
+    /// reaches them so they stay out of the way of the text they sit on, and
+    /// placed bottom-right to leave the top-right corner to the split-preview
+    /// layout switch.
+    fn render_reading_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let appearance = self.reading_appearance;
+        h_flex()
+            .id("markdown-reading-controls")
+            .absolute()
+            .bottom_2()
+            .right_3()
+            .p_0p5()
+            .gap_px()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_sm()
+            .opacity(RESTING_CONTROL_OPACITY)
+            .hover(|style| style.opacity(1.0))
+            .child(
+                IconButton::new("markdown-reading-theme", IconName::Screen)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(appearance.overrides_editor())
+                    .tooltip(Tooltip::text(appearance.tooltip()))
+                    .on_click(cx.listener(|this, _, _, cx| this.cycle_reading_appearance(cx))),
+            )
+    }
+
+    fn collapse_expanded_diagram(&mut self, cx: &mut Context<Self>) {
+        self.markdown
+            .update(cx, |markdown, cx| markdown.set_mermaid_expanded(None, cx));
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapse_expanded_diagram(cx);
+    }
+
+    /// The expanded diagram, drawn over the whole document at the size of the
+    /// view. Rendered here rather than inside the markdown element because only
+    /// the view knows how much room there is to fill.
+    fn render_expanded_diagram(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let image = self.markdown.read(cx).expanded_mermaid_image()?;
+        Some(
+            div()
+                .id("markdown-expanded-diagram")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .bg(cx.theme().colors().elevated_surface_background)
+                // Anywhere outside the picture closes it, which is what a reader
+                // reaches for first after enlarging something.
+                .on_click(cx.listener(|this, _, _, cx| this.collapse_expanded_diagram(cx)))
+                .child(
+                    img(ImageSource::Render(image))
+                        .max_w_full()
+                        .max_h_full()
+                        .with_fallback(|| {
+                            Label::new("Failed to load mermaid diagram").into_any_element()
+                        }),
+                )
+                .child(
+                    div().absolute().top_2().right_3().child(
+                        IconButton::new("markdown-collapse-diagram", IconName::Minimize)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close the expanded diagram"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.collapse_expanded_diagram(cx)),
+                            ),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_markdown_element(
         &self,
         window: &mut Window,
@@ -898,18 +1028,23 @@ impl MarkdownPreviewView {
             }
         }
 
-        // Two deliberate rendering modes: a chosen `markdown_preview_theme`
-        // paints the preview in that theme, and without one the preview is a
-        // GitHub-flavored document independent of the editor theme.
-        let markdown_style = match self.resolve_preview_theme(cx) {
-            Some(theme) => MarkdownStyle::themed_with_overrides(
-                MarkdownFont::Preview,
-                theme.colors(),
-                theme.syntax(),
-                window,
-                cx,
-            ),
-            None => markdown::github_style(window, cx),
+        // Three deliberate rendering modes. An explicit light/dark reading choice
+        // wins, because it is the reader's answer to "how do I want to read this
+        // right now"; otherwise a chosen `markdown_preview_theme` paints the
+        // preview, and with neither the preview is a GitHub-flavored document
+        // independent of the editor theme.
+        let markdown_style = match self.reading_appearance.resolve() {
+            Some(appearance) => markdown::github_style_for_appearance(appearance, window, cx),
+            None => match self.resolve_preview_theme(cx) {
+                Some(theme) => MarkdownStyle::themed_with_overrides(
+                    MarkdownFont::Preview,
+                    theme.colors(),
+                    theme.syntax(),
+                    window,
+                    cx,
+                ),
+                None => markdown::github_style(window, cx),
+            },
         };
 
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
@@ -1386,9 +1521,12 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg_color = match self.resolve_preview_theme(cx) {
-            Some(theme) => theme.colors().editor_background,
-            None => markdown::github_page_background(cx.theme().appearance()),
+        let bg_color = match self.reading_appearance.resolve() {
+            Some(appearance) => markdown::github_page_background(appearance),
+            None => match self.resolve_preview_theme(cx) {
+                Some(theme) => theme.colors().editor_background,
+                None => markdown::github_page_background(cx.theme().appearance()),
+            },
         };
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         let hovered_url = self.hovered_url.clone();
@@ -1414,6 +1552,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
+            .on_action(cx.listener(MarkdownPreviewView::cancel))
             .w_full()
             .flex_1()
             .min_h_0()
@@ -1513,6 +1652,11 @@ impl Render for MarkdownPreviewView {
                         .child(LinkPreview::new(hovered_url.as_ref(), cx)),
                 )
             })
+            .when(
+                self.markdown.read(cx).mermaid_expanded().is_none(),
+                |this| this.child(self.render_reading_controls(cx)),
+            )
+            .children(self.render_expanded_diagram(cx))
     }
 }
 
