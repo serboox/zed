@@ -3,6 +3,30 @@ use uuid::Uuid;
 use crate::collection::Collection;
 use crate::environment::{Environment, Variable};
 
+/// OpenAPI path templates use single braces (`/users/{id}`); variable
+/// substitution here uses double braces (`{{id}}`) -- every `{name}` segment in
+/// an OpenAPI path is therefore a path parameter that must be rewritten to the
+/// double-brace form before it means anything to [`resolve`].
+pub fn rewrite_path_template(path: &str) -> String {
+    let mut rewritten = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            rewritten.push_str("{{");
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+                rewritten.push(inner);
+            }
+            rewritten.push_str("}}");
+        } else {
+            rewritten.push(ch);
+        }
+    }
+    rewritten
+}
+
 /// Every scope a `{{name}}` token can resolve against, ordered
 /// narrowest-to-widest. Precedence when the same key exists in more than one
 /// scope: **Environment > Collection > Global**. `Local`/data-file scopes

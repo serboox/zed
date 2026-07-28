@@ -13537,10 +13537,14 @@ name = "openapi_preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "api_client",
+ "api_client_ui",
  "editor",
  "gpui",
+ "serde_json",
  "serde_yaml_ng",
  "ui",
+ "workspace",
 ]
 
 [[package]]

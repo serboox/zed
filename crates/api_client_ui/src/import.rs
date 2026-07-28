@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, bail};
 use api_client::{
     ApiKeyPlacement, AuthConfig, Collection, CollectionId, Environment, Folder, FolderId, Header,
     HttpMethod, JwtAlgorithm, JwtAuthConfig, RawBodyContentType, Request, RequestBody,
-    SavedExample, Variable,
+    SavedExample, Variable, rewrite_path_template,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -712,31 +712,6 @@ fn openapi_base_url(document: &OpenApiDocument) -> String {
         .unwrap_or("https");
     let base_path = document.base_path.as_deref().unwrap_or("");
     format!("{scheme}://{host}{base_path}")
-}
-
-/// OpenAPI path templates use single braces (`/users/{id}`); this crate's
-/// variable substitution uses double braces (`{{id}}`) -- every `{name}`
-/// segment in an OpenAPI path is therefore a path parameter that must be
-/// rewritten to the double-brace form before it means anything to
-/// `variable_resolution::resolve`.
-fn rewrite_path_template(path: &str) -> String {
-    let mut rewritten = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            rewritten.push_str("{{");
-            for inner in chars.by_ref() {
-                if inner == '}' {
-                    break;
-                }
-                rewritten.push(inner);
-            }
-            rewritten.push_str("}}");
-        } else {
-            rewritten.push(ch);
-        }
-    }
-    rewritten
 }
 
 pub fn parse_openapi_document(json: &str) -> Result<ImportedCollection> {

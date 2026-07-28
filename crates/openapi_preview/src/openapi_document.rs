@@ -7,6 +7,9 @@ const HTTP_METHODS: [&str; 8] = [
     "get", "post", "put", "patch", "delete", "head", "options", "trace",
 ];
 
+/// Name given to the synthetic group that holds operations with no tag.
+/// `pub(crate)` so `api_collection` can recognize this group without
+/// duplicating the literal string.
 const UNGROUPED: &str = "Other";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,10 @@ pub struct OperationGroup {
     pub name: SharedString,
     pub description: Option<SharedString>,
     pub operations: Vec<Operation>,
+    /// False for the bucket that collects operations declaring no tag. Its name
+    /// is a plain word a document is free to use as a real tag, so the two cases
+    /// cannot be told apart by name.
+    pub tagged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +260,7 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
             name: name.clone(),
             description: description.clone(),
             operations: Vec::new(),
+            tagged: true,
         })
         .collect();
 
@@ -274,7 +282,8 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
 
             let mut parameter_nodes = shared_parameter_nodes.clone();
             parameter_nodes.extend(parameter_nodes_of(operation));
-            let group_name = first_tag(operation).unwrap_or_else(|| UNGROUPED.into());
+            let tag = first_tag(operation);
+            let group_name = tag.clone().unwrap_or_else(|| UNGROUPED.into());
 
             let operation = Operation {
                 method,
@@ -290,12 +299,17 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
             };
             operation_count += 1;
 
-            match grouped.iter_mut().find(|group| group.name == group_name) {
+            let tagged = tag.is_some();
+            match grouped
+                .iter_mut()
+                .find(|group| group.name == group_name && group.tagged == tagged)
+            {
                 Some(group) => group.operations.push(operation),
                 None => grouped.push(OperationGroup {
                     name: group_name,
                     description: None,
                     operations: vec![operation],
+                    tagged,
                 }),
             }
         }

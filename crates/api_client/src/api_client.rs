@@ -50,5 +50,5 @@ pub use scripting::{
 };
 pub use variable_resolution::{
     DYNAMIC_VARIABLE_NAMES, DynamicVariableSource, ResolveMode, SystemDynamicVariableSource,
-    VariableContext, resolve,
+    VariableContext, resolve, rewrite_path_template,
 };
