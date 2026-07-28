@@ -61,12 +61,13 @@ use futures::{
     future::{Shared, try_join_all},
 };
 use gpui::{
-    Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
-    Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    Action, AnyElement, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis,
+    Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
+    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
+    transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -1000,6 +1001,72 @@ impl Global for ProjectItemRegistry {}
 /// was added last.
 pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
     cx.default_global::<ProjectItemRegistry>().register::<I>();
+}
+
+type ItemOverlayRenderer =
+    Box<dyn Fn(&dyn ItemHandle, &Entity<Pane>, &mut Window, &mut App) -> Option<AnyElement>>;
+
+#[derive(Default)]
+pub struct ItemOverlayRegistry(Vec<ItemOverlayRenderer>);
+
+impl Global for ItemOverlayRegistry {}
+
+/// Registers controls painted over the active item of a pane, floating in the
+/// bottom left corner of the document. Registered from outside this crate so a
+/// document kind can offer controls of its own without [`Pane`] knowing about
+/// it.
+///
+/// The renderer is handed the pane the controls are painted into, so that acting
+/// on them can target that pane rather than whichever one happens to be active.
+/// It runs while that pane is being updated though, so the handle must only be
+/// read from the event handlers it builds, never while rendering.
+pub fn register_item_overlay(
+    cx: &mut App,
+    render: impl Fn(&dyn ItemHandle, &Entity<Pane>, &mut Window, &mut App) -> Option<AnyElement>
+    + 'static,
+) {
+    cx.default_global::<ItemOverlayRegistry>()
+        .0
+        .push(Box::new(render));
+}
+
+impl ItemOverlayRegistry {
+    fn render_all(
+        item: &dyn ItemHandle,
+        pane: &Entity<Pane>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        if !cx.has_global::<Self>() {
+            return Vec::new();
+        }
+        cx.update_global::<Self, _>(|this, cx| {
+            this.0
+                .iter()
+                .filter_map(|render| render(item, pane, window, cx))
+                .collect()
+        })
+    }
+
+    pub(crate) fn render_for(
+        item: &dyn ItemHandle,
+        pane: &Entity<Pane>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Div> {
+        let overlays = Self::render_all(item, pane, window, cx);
+        if overlays.is_empty() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_2()
+                .left_3()
+                .gap_1()
+                .children(overlays),
+        )
+    }
 }
 
 #[derive(Default)]

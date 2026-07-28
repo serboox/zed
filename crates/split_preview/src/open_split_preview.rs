@@ -4,7 +4,7 @@ use html_preview::html_preview_view::HtmlPreviewView;
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use openapi_preview::{OpenApiPreviewView, looks_like_openapi};
 use ui::prelude::*;
-use workspace::{SaveIntent, Workspace};
+use workspace::{Pane, SaveIntent, Workspace};
 
 use crate::split_preview_view::{PreviewLayout, SplitPreviewView};
 use crate::{OpenSplitPreview, split_preview_view};
@@ -47,8 +47,10 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     else {
         return;
     };
+    let pane = workspace.active_pane().clone();
     open_for_editor(
         workspace,
+        &pane,
         &source_editor,
         PreviewLayout::EditorAndPreview,
         window,
@@ -59,8 +61,13 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
 /// Opens `source_editor`'s document next to its preview, in place of the tab the
 /// document is already in, so the reader stays on the same tab instead of
 /// gaining a second one for the same file.
+///
+/// `pane` is the pane holding that tab. It is passed in rather than taken from
+/// the workspace, because the document being previewed does not have to live in
+/// the pane that currently has focus.
 pub fn open_for_editor(
     workspace: &mut Workspace,
+    pane: &Entity<Pane>,
     source_editor: &Entity<Editor>,
     layout: PreviewLayout,
     window: &mut Window,
@@ -71,7 +78,7 @@ pub fn open_for_editor(
     };
     let source_editor = source_editor.clone();
 
-    let pane = workspace.active_pane().clone();
+    let pane = pane.clone();
     // Reactivate an existing split preview for the same buffer instead of
     // stacking a second one on top of it.
     if let Some(existing) = existing_index_for(&pane, &source_editor, cx) {
@@ -145,7 +152,7 @@ pub fn open_for_editor(
 }
 
 fn existing_index_for(
-    pane: &Entity<workspace::Pane>,
+    pane: &Entity<Pane>,
     source_editor: &Entity<Editor>,
     cx: &App,
 ) -> Option<usize> {

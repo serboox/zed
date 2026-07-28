@@ -1,11 +1,10 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
-pub mod layout_toolbar;
+pub mod item_overlay;
 pub mod open_split_preview;
 pub mod split_preview_view;
 
-pub use layout_toolbar::PreviewLayoutToolbar;
 pub use open_split_preview::{PreviewKind, preview_kind_for};
 pub use split_preview_view::{PreviewLayout, SplitPreviewView};
 
@@ -27,6 +26,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    item_overlay::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {
             return;

@@ -1381,6 +1381,10 @@ impl Pane {
             .filter_map(|item| item.to_any_view().downcast().ok())
     }
 
+    pub fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+
     pub fn active_item(&self) -> Option<Box<dyn ItemHandle>> {
         self.items.get(self.active_item_index).cloned()
     }
@@ -4488,12 +4492,19 @@ impl Render for Pane {
                     })
                     .map(|div| {
                         if let Some(item) = self.active_item() {
+                            let overlay = crate::ItemOverlayRegistry::render_for(
+                                item.as_ref(),
+                                &cx.entity(),
+                                window,
+                                cx,
+                            );
                             div.id("pane_placeholder")
                                 .v_flex()
                                 .size_full()
                                 .overflow_hidden()
                                 .child(self.toolbar.clone())
                                 .child(item.to_any_view())
+                                .children(overlay)
                         } else {
                             let placeholder = div
                                 .id("pane_placeholder")

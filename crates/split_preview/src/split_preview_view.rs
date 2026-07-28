@@ -8,15 +8,12 @@ use gpui::{
     ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div,
 };
 use project::{Project, ProjectPath};
-use ui::{Tooltip, prelude::*};
+use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent, SaveOptions, TabContentParams};
 use workspace::searchable::SearchableItemHandle;
 
 use crate::{CycleLayout, ShowEditorAndPreview, ShowEditorOnly, ShowPreviewOnly};
-
-/// How visible the floating layout switch is when the pointer is elsewhere.
-const RESTING_SWITCH_OPACITY: f32 = 0.35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewLayout {
@@ -139,40 +136,6 @@ impl SplitPreviewView {
         cx.notify();
     }
 
-    fn render_layout_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .id("split-preview-layout-switch")
-            .debug_selector(|| "split-preview-layout-switch".into())
-            .absolute()
-            .top_1()
-            .right_3()
-            .p_0p5()
-            .gap_px()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().elevated_surface_background)
-            .shadow_sm()
-            // The panel floats over the document, so it stays faint until the
-            // pointer is on it -- present enough to be found, quiet enough not
-            // to sit on top of the text being read.
-            .opacity(RESTING_SWITCH_OPACITY)
-            .hover(|style| style.opacity(1.0))
-            .children(PreviewLayout::ALL.map(|layout| {
-                let selected = self.layout == layout;
-                IconButton::new(
-                    ("split-preview-layout", layout.to_db() as usize),
-                    layout.icon(),
-                )
-                .icon_size(IconSize::Small)
-                .toggle_state(selected)
-                .tooltip(Tooltip::text(layout.label()))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.set_layout(layout, window, cx)),
-                )
-            }))
-    }
-
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.editor.clone().into_any_element();
         let preview = self.preview.clone().into_any_element();
@@ -253,7 +216,6 @@ impl Render for SplitPreviewView {
                 this.set_layout(next, window, cx)
             }))
             .child(self.render_body(cx))
-            .child(self.render_layout_switch(cx))
     }
 }
 
@@ -520,10 +482,6 @@ mod tests {
             side_by_side_editor.origin.x < side_by_side_preview.origin.x,
             "the editor belongs on the left of the preview"
         );
-        assert!(
-            cx.debug_bounds("split-preview-layout-switch").is_some(),
-            "the layout switch has to be reachable in every layout"
-        );
 
         view.update_in(cx, |view, window, cx| {
             view.set_layout(PreviewLayout::Editor, window, cx)
@@ -553,7 +511,6 @@ mod tests {
             .debug_bounds("split-preview-preview")
             .expect("preview pane");
         assert!(preview_only.size.width > side_by_side_preview.size.width);
-        assert!(cx.debug_bounds("split-preview-layout-switch").is_some());
     }
 
     #[gpui::test]
