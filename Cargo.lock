@@ -13532,6 +13532,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openapi_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "serde_yaml_ng",
+ "ui",
+]
+
+[[package]]
 name = "opencode"
 version = "0.1.0"
 dependencies = [
@@ -18869,6 +18880,22 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der 0.7.10",
+]
+
+[[package]]
+name = "split_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "html_preview",
+ "language",
+ "markdown_preview",
+ "openapi_preview",
+ "project",
+ "ui",
+ "workspace",
 ]
 
 [[package]]
@@ -24971,6 +24998,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "snippets_ui",
+ "split_preview",
  "svg_preview",
  "sysinfo 0.37.2",
  "system_specs",

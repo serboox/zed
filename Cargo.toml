@@ -154,6 +154,7 @@ members = [
     "crates/open_ai",
     "crates/open_path_prompt",
     "crates/open_router",
+    "crates/openapi_preview",
     "crates/outline",
     "crates/outline_panel",
     "crates/panel",
@@ -197,6 +198,7 @@ members = [
     "crates/snippet_provider",
     "crates/snippets_ui",
     "crates/sql_semantic_tokens_lsp",
+    "crates/split_preview",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",
@@ -424,6 +426,7 @@ opencode = { path = "crates/opencode" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
+openapi_preview = { path = "crates/openapi_preview" }
 outline = { path = "crates/outline" }
 outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
@@ -464,6 +467,7 @@ shell_command_parser = { path = "crates/shell_command_parser" }
 snippet = { path = "crates/snippet" }
 snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
+split_preview = { path = "crates/split_preview" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }

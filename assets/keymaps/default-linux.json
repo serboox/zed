@@ -600,6 +600,23 @@
     },
   },
   {
+    "context": "Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k ctrl-v": "preview::OpenSplitPreview",
+    },
+  },
+  {
+    "context": "SplitPreview",
+    "use_key_equivalents": true,
+    "bindings": {
+      "alt-1": "preview::ShowEditorOnly",
+      "alt-2": "preview::ShowEditorAndPreview",
+      "alt-3": "preview::ShowPreviewOnly",
+      "ctrl-k ctrl-v": "preview::CycleLayout",
+    },
+  },
+  {
     "context": "Editor && extension == md",
     "use_key_equivalents": true,
     "bindings": {

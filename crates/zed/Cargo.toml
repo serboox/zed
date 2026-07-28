@@ -193,6 +193,7 @@ settings_ui.workspace = true
 shellexpand.workspace = true
 sidebar.workspace = true
 smol.workspace = true
+split_preview.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
 svg_preview.workspace = true
