@@ -1543,12 +1543,23 @@ fn render_responses_table(
 /// A response naming nothing this document defines has no example to show, and
 /// inventing one would be worse than leaving it out.
 fn response_example(document: &OpenApiDocument, response: &Response) -> Option<SharedString> {
-    let skeleton = crate::api_collection::json_skeleton(document, response.type_label.as_ref());
-    let object = skeleton.as_object()?;
-    if object.is_empty() {
+    let label = response.type_label.as_ref()?;
+    // A collection is named after what it holds, so the schema to build from is
+    // the item's -- shown back inside an array, which is what arrives.
+    let (item_name, is_array) = match label.as_ref().strip_suffix("[]") {
+        Some(item) => (SharedString::from(item.to_owned()), true),
+        None => (label.clone(), false),
+    };
+    let skeleton = crate::api_collection::json_skeleton(document, Some(&item_name));
+    if skeleton.as_object().is_none_or(serde_json::Map::is_empty) {
         return None;
     }
-    serde_json::to_string_pretty(&skeleton)
+    let example = if is_array {
+        serde_json::Value::Array(vec![skeleton])
+    } else {
+        skeleton
+    };
+    serde_json::to_string_pretty(&example)
         .ok()
         .map(SharedString::from)
 }
@@ -1847,6 +1858,31 @@ mod tests {
         assert_eq!(method_accent(HttpMethod::Put), MethodAccent::Warning);
         assert_eq!(method_accent(HttpMethod::Patch), MethodAccent::Warning);
         assert_eq!(method_accent(HttpMethod::Delete), MethodAccent::Error);
+    }
+
+    #[test]
+    fn a_collection_response_shows_its_items_inside_an_array() {
+        let document = crate::openapi_document::parse(
+            "openapi: 3.0.3\ninfo:\n  title: Pets\npaths:\n  /pets:\n    get:\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema:\n                type: array\n                items:\n                  $ref: '#/components/schemas/Pet'\ncomponents:\n  schemas:\n    Pet:\n      type: object\n      properties:\n        id:\n          type: integer\n        name:\n          type: string\n",
+        )
+        .expect("parse");
+        let response = &document.groups[0].operations[0].responses[0];
+        assert_eq!(response.type_label.as_deref(), Some("Pet[]"));
+
+        let example = response_example(&document, response).expect("an example for a known schema");
+        assert!(
+            example.starts_with('[') && example.contains("\"id\"") && example.contains("\"name\""),
+            "a collection has to be shown as one, got {example}"
+        );
+
+        // A response naming nothing this document defines has nothing to show.
+        let unknown = Response {
+            status: "200".into(),
+            description: None,
+            content_types: Vec::new(),
+            type_label: Some("Missing".into()),
+        };
+        assert!(response_example(&document, &unknown).is_none());
     }
 
     #[test]
