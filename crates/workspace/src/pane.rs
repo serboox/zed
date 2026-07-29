@@ -4514,6 +4514,10 @@ impl Render for Pane {
                                     v_flex()
                                         .relative()
                                         .size_full()
+                                        // Room for the controls, so they never
+                                        // cover the document's first line or
+                                        // swallow a click meant for it.
+                                        .pt(crate::ITEM_OVERLAY_RESERVED_HEIGHT)
                                         .debug_selector(|| "pane-item-area".into())
                                         .child(item.to_any_view())
                                         .child(overlay),

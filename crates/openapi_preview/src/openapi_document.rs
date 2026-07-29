@@ -190,7 +190,9 @@ pub fn parse(text: &str) -> anyhow::Result<OpenApiDocument> {
         .and_then(|info| string_at(info, "title"))
         .unwrap_or_else(|| "Untitled API".into());
     let version = info.and_then(|info| string_at(info, "version"));
-    let description = info.and_then(|info| string_at(info, "description"));
+    let description = info
+        .and_then(|info| string_at(info, "description"))
+        .map(prose);
 
     let base_urls = base_urls(root);
     let schema_definitions = mapping_at(root, "components")
@@ -300,8 +302,8 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
             let operation = Operation {
                 method,
                 path: path.to_owned().into(),
-                summary: string_at(operation, "summary"),
-                description: string_at(operation, "description"),
+                summary: string_at(operation, "summary").map(one_line),
+                description: string_at(operation, "description").map(prose),
                 operation_id: string_at(operation, "operationId"),
                 deprecated: bool_at(operation, "deprecated"),
                 secured: is_secured(root, operation),
@@ -340,7 +342,8 @@ fn declared_tag_order(root: &Mapping) -> Vec<(SharedString, Option<SharedString>
             tags.iter()
                 .filter_map(Value::as_mapping)
                 .filter_map(|tag| {
-                    string_at(tag, "name").map(|name| (name, string_at(tag, "description")))
+                    string_at(tag, "name")
+                        .map(|name| (name, string_at(tag, "description").map(prose)))
                 })
                 .collect()
         })
@@ -379,7 +382,7 @@ fn describe_parameters(nodes: &[&Mapping]) -> Vec<Parameter> {
             type_label: mapping_at(parameter, "schema")
                 .map(type_label)
                 .unwrap_or_else(|| type_label(parameter)),
-            description: string_at(parameter, "description"),
+            description: string_at(parameter, "description").map(prose),
         })
         .collect()
 }
@@ -449,7 +452,7 @@ fn responses(operation: &Mapping) -> Vec<Response> {
                 from_content.or_else(|| mapping_at(response, "schema").map(type_label));
             Some(Response {
                 status: status.into(),
-                description: string_at(response, "description"),
+                description: string_at(response, "description").map(prose),
                 content_types,
                 type_label,
             })
@@ -552,6 +555,46 @@ fn mapping_at<'a>(owner: &'a Mapping, key: &str) -> Option<&'a Mapping> {
 
 fn sequence_at<'a>(owner: &'a Mapping, key: &str) -> Option<&'a Vec<Value>> {
     owner.get(Value::from(key))?.as_sequence()
+}
+
+/// Contract prose is Markdown, and a reader of it should not have to read link
+/// syntax: `[text](url)` becomes the text it names, or the address itself when
+/// the two are the same. Nothing here is clickable, so keeping the brackets
+/// would only put punctuation between the reader and the sentence.
+fn prose(text: SharedString) -> SharedString {
+    if !text.contains("](") {
+        return text;
+    }
+    let source = text.as_ref();
+    let mut unwrapped = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find('[') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find("](") else {
+            break;
+        };
+        let label = &after_open[..close];
+        let after_label = &after_open[close + 2..];
+        let Some(end) = after_label.find(')') else {
+            break;
+        };
+        let target = &after_label[..end];
+        unwrapped.push_str(&rest[..open]);
+        unwrapped.push_str(if label.is_empty() { target } else { label });
+        rest = &after_label[end + 1..];
+    }
+    unwrapped.push_str(rest);
+    unwrapped.into()
+}
+
+/// A summary belongs on the operation's own row, so a contract that wrote it as
+/// a folded or multi-line block is squeezed back onto one line. Its description
+/// keeps its shape; only this one-line label is collapsed.
+fn one_line(text: SharedString) -> SharedString {
+    if !text.contains(['\n', '\r', '\t']) && !text.contains("  ") {
+        return text;
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ").into()
 }
 
 fn string_at(owner: &Mapping, key: &str) -> Option<SharedString> {
@@ -677,6 +720,42 @@ components:
         assert!(!looks_like_openapi("name: openapi-generator\n"));
         assert!(!looks_like_openapi("services:\n  web:\n    image: nginx\n"));
         assert!(!looks_like_openapi(r#"{"generator":"openapi-generator"}"#));
+    }
+
+    #[test]
+    fn link_syntax_is_unwrapped_in_prose() {
+        assert_eq!(
+            prose("See [the repository](https://example.com/repo) for more.".into()).as_ref(),
+            "See the repository for more."
+        );
+        // A link whose text is the address itself has to keep the address.
+        assert_eq!(
+            prose("Read [https://example.com](https://example.com).".into()).as_ref(),
+            "Read https://example.com."
+        );
+        assert_eq!(
+            prose("- [One](https://a.example) and [Two](https://b.example)".into()).as_ref(),
+            "- One and Two"
+        );
+        // Text that only looks like the start of a link is left alone.
+        assert_eq!(
+            prose("An array [of things] stays as written".into()).as_ref(),
+            "An array [of things] stays as written"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_summary_is_squeezed_onto_one_line() {
+        let document = parse(
+            "openapi: 3.0.3\ninfo:\n  title: Sessions\npaths:\n  /sessions:\n    get:\n      summary: >\n        Returns a time interval\n        for the given instrument.\n      responses:\n        '200':\n          description: ok\n",
+        )
+        .expect("parse");
+        let operation = &document.groups[0].operations[0];
+        assert_eq!(
+            operation.summary.as_deref(),
+            Some("Returns a time interval for the given instrument."),
+            "a row shows one line, however the contract wrapped it"
+        );
     }
 
     #[test]

@@ -1003,6 +1003,9 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
     cx.default_global::<ProjectItemRegistry>().register::<I>();
 }
 
+/// Vertical room a pane keeps free for the controls painted over its item.
+pub const ITEM_OVERLAY_RESERVED_HEIGHT: Pixels = px(28.);
+
 type ItemOverlayRenderer =
     Box<dyn Fn(&dyn ItemHandle, &Entity<Pane>, &mut Window, &mut App) -> Option<AnyElement>>;
 
@@ -1061,7 +1064,7 @@ impl ItemOverlayRegistry {
         Some(
             h_flex()
                 .absolute()
-                .top_2()
+                .top_0p5()
                 .left_3()
                 .gap_1()
                 .children(overlays),
