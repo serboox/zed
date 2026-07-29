@@ -140,13 +140,7 @@ impl GoToObjectDelegate {
                 });
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(
-                            Box::new(result_view),
-                            None,
-                            true,
-                            window,
-                            cx,
-                        );
+                        crate::panel::add_result_item(workspace, result_view, window, cx);
                     })
                     .ok();
             })

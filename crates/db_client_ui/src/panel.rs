@@ -3168,6 +3168,30 @@ pub fn new_query_for_active_connection(
     open_new_sql_query(workspace, id, label, window, cx);
 }
 
+// Every result table belongs in the bottom dock, beside the terminals and the
+// query results, so one place holds every answer the client produces. A
+// workspace without that dock keeps them in the center pane rather than dropping
+// them.
+pub(crate) fn add_result_item(
+    workspace: &mut Workspace,
+    view: Entity<ResultView>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let dock_pane = workspace
+        .panel::<TerminalPanel>(cx)
+        .and_then(|panel| panel.read(cx).pane());
+    match dock_pane {
+        Some(pane) => {
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(view), true, true, None, window, cx);
+            });
+            workspace.open_panel::<TerminalPanel>(window, cx);
+        }
+        None => workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx),
+    }
+}
+
 // Finds the result tab bound to `connection_id` in `pane`, or creates one, then
 // activates it. One reused tab per connection so re-running a query updates its
 // own tab instead of stacking new ones.
@@ -9031,7 +9055,7 @@ impl DatabasePanel {
                                                         Err(e) => view.set_error(format_query_error(&e), cx),
                                                     });
                                                     ws.update_in(cx, |ws, window, cx| {
-                                                        ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                        add_result_item(ws, result_view, window, cx);
                                                     }).log_err();
                                                     anyhow::Ok(())
                                                 }).detach_and_log_err(cx);
@@ -9074,7 +9098,7 @@ impl DatabasePanel {
                                                         Err(e) => view.set_error(format_query_error(&e), cx),
                                                     });
                                                     ws.update_in(cx, |ws, window, cx| {
-                                                        ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                        add_result_item(ws, result_view, window, cx);
                                                     }).log_err();
                                                     anyhow::Ok(())
                                                 }).detach_and_log_err(cx);
@@ -9311,13 +9335,7 @@ impl DatabasePanel {
                                             });
                                             workspace
                                                 .update_in(cx, |ws, window, cx| {
-                                                    ws.add_item_to_active_pane(
-                                                        Box::new(result_view),
-                                                        None,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    add_result_item(ws, result_view, window, cx);
                                                 })
                                                 .log_err();
                                             anyhow::Ok(())
@@ -9447,7 +9465,7 @@ impl DatabasePanel {
                                                                         Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
-                                                                        ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                                        add_result_item(ws, result_view, window, cx);
                                                                     }).log_err();
                                                                     anyhow::Ok(())
                                                                 })
@@ -9709,7 +9727,7 @@ impl DatabasePanel {
                                                                         Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
-                                                                        ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                                        add_result_item(ws, result_view, window, cx);
                                                                     }).log_err();
                                                                     anyhow::Ok(())
                                                                 }).detach_and_log_err(cx);
@@ -9756,7 +9774,7 @@ impl DatabasePanel {
                                                                         Err(e) => view.set_error(format_query_error(&e), cx),
                                                                     });
                                                                     ws.update_in(cx, |ws, window, cx| {
-                                                                        ws.add_item_to_active_pane(Box::new(result_view), None, true, window, cx);
+                                                                        add_result_item(ws, result_view, window, cx);
                                                                     }).log_err();
                                                                     anyhow::Ok(())
                                                                 }).detach_and_log_err(cx);
@@ -10409,13 +10427,7 @@ impl DatabasePanel {
                                                     }
                                                 });
                                                 ws.update_in(cx, |ws, window, cx| {
-                                                    ws.add_item_to_active_pane(
-                                                        Box::new(result_view),
-                                                        None,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    add_result_item(ws, result_view, window, cx);
                                                 })
                                                 .log_err();
                                                 anyhow::Ok(())
@@ -19496,6 +19508,98 @@ mod tests {
         assert!(
             !has_modal_after_confirm,
             "confirming must dismiss the dialog"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_result_table_lands_in_the_bottom_dock_next_to_the_terminals(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let terminal_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        let center_items_before =
+            workspace.read_with(cx, |workspace, cx| workspace.active_pane().read(cx).items_len());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let view = cx.new(|cx| ResultView::new("public.users — Search", cx));
+            add_result_item(workspace, view, window, cx);
+        });
+        cx.run_until_parked();
+
+        let dock_result_tabs = terminal_panel.read_with(cx, |panel, cx| {
+            panel
+                .pane()
+                .map(|pane| pane.read(cx).items_of_type::<ResultView>().count())
+                .unwrap_or(0)
+        });
+        assert_eq!(
+            dock_result_tabs, 1,
+            "the result table must open as a tab in the bottom dock's pane"
+        );
+
+        let center_items_after =
+            workspace.read_with(cx, |workspace, cx| workspace.active_pane().read(cx).items_len());
+        assert_eq!(
+            center_items_after, center_items_before,
+            "nothing may be added to the center pane, which is for consoles and documents"
+        );
+
+        let dock_is_open = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .bottom_dock()
+                .read(cx)
+                .visible_panel()
+                .is_some_and(|panel| panel.panel_id() == terminal_panel.entity_id())
+        });
+        assert!(
+            dock_is_open,
+            "the dock must be revealed so the first result is actually visible"
+        );
+    }
+
+    #[gpui::test]
+    async fn without_a_bottom_dock_a_result_table_still_opens_somewhere(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let view = cx.new(|cx| ResultView::new("public.users — Search", cx));
+            add_result_item(workspace, view, window, cx);
+        });
+        cx.run_until_parked();
+
+        let center_result_tabs = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ResultView>()
+                .count()
+        });
+        assert_eq!(
+            center_result_tabs, 1,
+            "with no dock to put it in, the result table must fall back to the center pane"
         );
     }
 }
