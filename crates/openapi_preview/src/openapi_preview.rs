@@ -1,6 +1,7 @@
 pub mod api_collection;
 pub mod openapi_document;
 pub mod openapi_preview_view;
+mod palette;
 mod try_it_out;
 
 pub use api_collection::{ImportedCollection, OperationSelection, collection_from_document};

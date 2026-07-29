@@ -15,6 +15,7 @@ pub mod path_list {
 }
 pub mod path_link;
 mod persistence;
+pub mod preview_appearance;
 pub mod searchable;
 pub mod security_modal;
 pub mod session_restore_indicator;
@@ -829,6 +830,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     theme_preview::init(cx);
     toast_layer::init(cx);
     history_manager::init(app_state.fs.clone(), cx);
+    preview_appearance::init(cx);
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))

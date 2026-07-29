@@ -8,6 +8,7 @@ mod import;
 mod panel;
 mod redirect_capture;
 mod request_view;
+mod response_dock;
 mod response_view;
 mod runner;
 mod runner_view;
@@ -15,6 +16,7 @@ mod store;
 mod text_prompt_modal;
 
 pub use panel::ApiClientPanel;
+pub use response_dock::ResponseDockPanel;
 pub use store::{ApiClientStore, GlobalApiClientStore};
 
 use gpui::App;

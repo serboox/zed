@@ -13543,6 +13543,9 @@ dependencies = [
  "gpui",
  "serde_json",
  "serde_yaml_ng",
+ "settings",
+ "theme",
+ "theme_settings",
  "ui",
  "workspace",
 ]

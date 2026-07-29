@@ -884,6 +884,8 @@ pub mod api_client_panel {
             MoveSelectedUp,
             /// Moves the selected folder or request down among its siblings.
             MoveSelectedDown,
+            /// Toggles focus on the shared API response dock.
+            ToggleResponseDockFocus,
         ]
     );
 }

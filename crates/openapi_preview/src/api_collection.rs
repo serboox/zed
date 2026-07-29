@@ -50,10 +50,8 @@ pub fn collection_from_document(
     let mut collection = Collection::new(collection_name(document));
     collection.description = collection_description(document);
 
-    let base_url = document
-        .base_urls
-        .first()
-        .map(|url| url.to_string())
+    let base_url = crate::openapi_document::default_server(&document.servers)
+        .map(|server| server.url.to_string())
         .unwrap_or_default();
     collection
         .variables
@@ -575,7 +573,7 @@ paths:
 "#,
         )
         .expect("parse");
-        assert!(document.base_urls.is_empty());
+        assert!(document.servers.is_empty());
 
         let imported = collection_from_document(&document, OperationSelection::AllOperations);
         let base_url = imported

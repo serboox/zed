@@ -59,6 +59,9 @@ pub struct Parameter {
     pub location: SharedString,
     pub required: bool,
     pub type_label: SharedString,
+    /// The values an `enum` schema restricts this parameter to, in
+    /// declaration order. Empty when the parameter is not an enum.
+    pub allowed_values: Vec<SharedString>,
     pub description: Option<SharedString>,
 }
 
@@ -119,13 +122,21 @@ pub struct SchemaSummary {
     pub properties: Vec<(SharedString, SharedString)>,
 }
 
+/// One entry of the document's `servers:` list -- a "Try it out" request goes
+/// to whichever of these the reader has picked from the servers dropdown.
+#[derive(Debug, Clone)]
+pub struct Server {
+    pub url: SharedString,
+    pub description: Option<SharedString>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenApiDocument {
     pub spec_label: SharedString,
     pub title: SharedString,
     pub version: Option<SharedString>,
     pub description: Option<SharedString>,
-    pub base_urls: Vec<SharedString>,
+    pub servers: Vec<Server>,
     pub groups: Vec<OperationGroup>,
     pub schemas: Vec<SchemaSummary>,
     /// Things the document does not say. Surfaced in the preview so an empty
@@ -194,7 +205,7 @@ pub fn parse(text: &str) -> anyhow::Result<OpenApiDocument> {
         .and_then(|info| string_at(info, "description"))
         .map(prose);
 
-    let base_urls = base_urls(root);
+    let servers = servers(root);
     let schema_definitions = mapping_at(root, "components")
         .and_then(|components| mapping_at(components, "schemas"))
         .or_else(|| mapping_at(root, "definitions"));
@@ -207,7 +218,7 @@ pub fn parse(text: &str) -> anyhow::Result<OpenApiDocument> {
         title,
         version,
         description,
-        base_urls,
+        servers,
         groups,
         schemas,
         notes,
@@ -225,15 +236,20 @@ fn spec_label(root: &Mapping, notes: &mut Vec<SharedString>) -> SharedString {
     "Unknown specification".into()
 }
 
-fn base_urls(root: &Mapping) -> Vec<SharedString> {
-    if let Some(servers) = sequence_at(root, "servers") {
-        let urls: Vec<SharedString> = servers
+fn servers(root: &Mapping) -> Vec<Server> {
+    if let Some(entries) = sequence_at(root, "servers") {
+        let servers: Vec<Server> = entries
             .iter()
             .filter_map(|server| server.as_mapping())
-            .filter_map(|server| string_at(server, "url"))
+            .filter_map(|server| {
+                string_at(server, "url").map(|url| Server {
+                    url,
+                    description: string_at(server, "description").map(prose),
+                })
+            })
             .collect();
-        if !urls.is_empty() {
-            return urls;
+        if !servers.is_empty() {
+            return servers;
         }
     }
 
@@ -253,12 +269,36 @@ fn base_urls(root: &Mapping) -> Vec<SharedString> {
         })
         .unwrap_or_default();
     if schemes.is_empty() {
-        return vec![format!("{host}{base_path}").into()];
+        return vec![Server {
+            url: format!("{host}{base_path}").into(),
+            description: None,
+        }];
     }
     schemes
         .into_iter()
-        .map(|scheme| format!("{scheme}://{host}{base_path}").into())
+        .map(|scheme| Server {
+            url: format!("{scheme}://{host}{base_path}").into(),
+            description: None,
+        })
         .collect()
+}
+
+/// The server a fresh "Try it out" panel sends to before the reader picks one
+/// explicitly: whichever the document lists first.
+pub fn default_server(servers: &[Server]) -> Option<&Server> {
+    servers.first()
+}
+
+/// The server currently in effect for "Try it out": the reader's last pick,
+/// as long as the document still lists it (a reparse may have dropped it),
+/// otherwise `default_server`.
+pub fn resolve_selected_server<'a>(
+    servers: &'a [Server],
+    selected_url: Option<&SharedString>,
+) -> Option<&'a Server> {
+    selected_url
+        .and_then(|url| servers.iter().find(|server| &server.url == url))
+        .or_else(|| default_server(servers))
 }
 
 fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<OperationGroup> {
@@ -382,9 +422,89 @@ fn describe_parameters(nodes: &[&Mapping]) -> Vec<Parameter> {
             type_label: mapping_at(parameter, "schema")
                 .map(type_label)
                 .unwrap_or_else(|| type_label(parameter)),
+            allowed_values: mapping_at(parameter, "schema")
+                .map(enum_values)
+                .unwrap_or_else(|| enum_values(parameter)),
             description: string_at(parameter, "description").map(prose),
         })
         .collect()
+}
+
+/// The values an `enum` schema restricts its input to, checked at the same
+/// level `type_label` reads its type from: an OpenAPI 3 parameter nests them
+/// under `schema`, a Swagger 2.0 one declares them directly on the parameter.
+fn enum_values(mapping: &Mapping) -> Vec<SharedString> {
+    sequence_at(mapping, "enum")
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    Value::String(text) => Some(SharedString::from(text.clone())),
+                    Value::Number(number) => Some(SharedString::from(number.to_string())),
+                    Value::Bool(flag) => Some(SharedString::from(flag.to_string())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The line Swagger's reference view shows above an enum input, formatted
+/// exactly the way it renders it.
+pub fn available_values_label(values: &[SharedString]) -> Option<SharedString> {
+    if values.is_empty() {
+        return None;
+    }
+    let joined = values
+        .iter()
+        .map(SharedString::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("Available values : {joined}").into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProseSpan {
+    Plain(SharedString),
+    Code(SharedString),
+}
+
+/// Splits Markdown backtick code spans out of `text` so a renderer can style
+/// each one separately instead of the backticks reaching the reader as-is.
+/// An unterminated backtick is left as plain text, backtick included, since
+/// there is no closing mark to make a span out of.
+pub fn split_code_spans(text: &SharedString) -> Vec<ProseSpan> {
+    if !text.contains('`') {
+        return vec![ProseSpan::Plain(text.clone())];
+    }
+
+    let source = text.as_ref();
+    let mut spans = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find('`') {
+        if open > 0 {
+            spans.push(ProseSpan::Plain(rest[..open].to_owned().into()));
+        }
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            spans.push(ProseSpan::Plain(rest[open..].to_owned().into()));
+            rest = "";
+            break;
+        };
+        let code = &after_open[..close];
+        if code.is_empty() {
+            // An empty pair is not a code span; dropping it would swallow the
+            // backticks the author actually wrote.
+            spans.push(ProseSpan::Plain("``".into()));
+        } else {
+            spans.push(ProseSpan::Code(code.to_owned().into()));
+        }
+        rest = &after_open[close + 1..];
+    }
+    if !rest.is_empty() {
+        spans.push(ProseSpan::Plain(rest.to_owned().into()));
+    }
+    spans
 }
 
 /// An operation without its own `security` inherits the document's, and an
@@ -765,9 +885,10 @@ components:
         assert_eq!(document.spec_label.as_ref(), "OpenAPI 3.0.3");
         assert_eq!(document.title.as_ref(), "Swagger Petstore");
         assert_eq!(document.version.as_deref(), Some("1.0.0"));
+        assert_eq!(document.servers.len(), 1);
         assert_eq!(
-            document.base_urls,
-            vec![SharedString::from("https://petstore.example.com/v2")]
+            document.servers[0].url.as_ref(),
+            "https://petstore.example.com/v2"
         );
         assert!(document.notes.is_empty(), "notes: {:?}", document.notes);
 
@@ -893,9 +1014,10 @@ definitions:
         .expect("parse");
 
         assert_eq!(document.spec_label.as_ref(), "Swagger 2.0");
+        assert_eq!(document.servers.len(), 1);
         assert_eq!(
-            document.base_urls,
-            vec![SharedString::from("https://api.example.com/v1")]
+            document.servers[0].url.as_ref(),
+            "https://api.example.com/v1"
         );
         // Untagged operations still get a group so nothing is dropped.
         assert_eq!(document.groups.len(), 1);
@@ -1022,5 +1144,203 @@ definitions:
             post.parameters.is_empty(),
             "the body must not also be listed among the plain parameters"
         );
+    }
+
+    #[test]
+    fn enum_parameters_capture_their_allowed_values() {
+        let document = parse(
+            r#"
+openapi: 3.0.3
+info:
+  title: Filters
+  version: "1"
+paths:
+  /pets:
+    get:
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [available, pending, sold]
+      responses:
+        '200':
+          description: ok
+"#,
+        )
+        .expect("parse");
+
+        let parameter = &document.groups[0].operations[0].parameters[0];
+        assert_eq!(
+            parameter.allowed_values,
+            vec![
+                SharedString::from("available"),
+                SharedString::from("pending"),
+                SharedString::from("sold"),
+            ]
+        );
+        assert_eq!(parameter.type_label.as_ref(), "enum");
+    }
+
+    #[test]
+    fn a_swagger_two_parameter_declares_its_enum_directly_on_itself() {
+        let document = parse(
+            r#"
+swagger: "2.0"
+info:
+  title: Filters
+  version: "1"
+paths:
+  /pets:
+    get:
+      parameters:
+        - name: status
+          in: query
+          required: true
+          type: string
+          enum: [available, sold]
+      responses:
+        '200':
+          description: ok
+"#,
+        )
+        .expect("parse");
+
+        let parameter = &document.groups[0].operations[0].parameters[0];
+        assert_eq!(
+            parameter.allowed_values,
+            vec![SharedString::from("available"), SharedString::from("sold")]
+        );
+    }
+
+    #[test]
+    fn a_parameter_without_an_enum_has_no_allowed_values() {
+        let document = parse(PETSTORE_V3).expect("parse");
+        let pet_id = &document.groups[0]
+            .operations
+            .iter()
+            .find(|operation| operation.method == HttpMethod::Get)
+            .expect("GET /pet/{petId}")
+            .parameters[0];
+        assert!(pet_id.allowed_values.is_empty());
+    }
+
+    #[test]
+    fn available_values_label_matches_the_reference_wording() {
+        assert_eq!(available_values_label(&[]), None);
+        assert_eq!(
+            available_values_label(&["web".into(), "android".into(), "ios".into()]).as_deref(),
+            Some("Available values : web, android, ios")
+        );
+    }
+
+    #[test]
+    fn an_empty_backtick_pair_stays_as_written() {
+        let spans = split_code_spans(&"Use `` for nothing".into());
+        assert_eq!(
+            spans,
+            vec![
+                ProseSpan::Plain("Use ".into()),
+                ProseSpan::Plain("``".into()),
+                ProseSpan::Plain(" for nothing".into()),
+            ],
+            "text must never disappear, however odd the backticks are"
+        );
+
+        let only_backticks = split_code_spans(&"``".into());
+        assert_eq!(only_backticks, vec![ProseSpan::Plain("``".into())]);
+
+        let unterminated = split_code_spans(&"a `b".into());
+        assert_eq!(
+            unterminated,
+            vec![ProseSpan::Plain("a ".into()), ProseSpan::Plain("`b".into())]
+        );
+    }
+
+    #[test]
+    fn split_code_spans_alternates_plain_and_code_text() {
+        let spans = split_code_spans(&"See `foo` and `bar`.".into());
+        assert_eq!(
+            spans,
+            vec![
+                ProseSpan::Plain("See ".into()),
+                ProseSpan::Code("foo".into()),
+                ProseSpan::Plain(" and ".into()),
+                ProseSpan::Code("bar".into()),
+                ProseSpan::Plain(".".into()),
+            ]
+        );
+
+        // Plain text without a code span is left as a single element.
+        assert_eq!(
+            split_code_spans(&"No code here.".into()),
+            vec![ProseSpan::Plain("No code here.".into())]
+        );
+
+        // An unterminated backtick has no closing mark to make a span out of.
+        assert_eq!(
+            split_code_spans(&"An `open span".into()),
+            vec![
+                ProseSpan::Plain("An ".into()),
+                ProseSpan::Plain("`open span".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn servers_capture_their_description_and_default_to_the_first() {
+        let document = parse(
+            r#"
+openapi: 3.0.3
+info:
+  title: Multi Server
+  version: "1"
+servers:
+  - url: https://api.example.com/v1
+    description: Production
+  - url: https://staging.example.com/v1
+    description: Staging
+paths:
+  /ping:
+    get:
+      responses:
+        '200':
+          description: ok
+"#,
+        )
+        .expect("parse");
+
+        assert_eq!(document.servers.len(), 2);
+        assert_eq!(
+            document.servers[0].url.as_ref(),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            document.servers[0].description.as_deref(),
+            Some("Production")
+        );
+
+        let default =
+            default_server(&document.servers).expect("a document with servers has a default");
+        assert_eq!(default.url.as_ref(), "https://api.example.com/v1");
+
+        // The reader's earlier pick is kept as long as the document still lists it.
+        let staging_url: SharedString = "https://staging.example.com/v1".into();
+        let resolved = resolve_selected_server(&document.servers, Some(&staging_url))
+            .expect("the previously selected server is still in the document");
+        assert_eq!(resolved.url.as_ref(), "https://staging.example.com/v1");
+
+        // A pick the document no longer lists (e.g. after an edit) falls back
+        // to the default.
+        let stale_url: SharedString = "https://removed.example.com".into();
+        let fallback = resolve_selected_server(&document.servers, Some(&stale_url))
+            .expect("falls back to the default server");
+        assert_eq!(fallback.url.as_ref(), "https://api.example.com/v1");
+
+        // No prior pick at all also falls back to the default.
+        let fallback_none =
+            resolve_selected_server(&document.servers, None).expect("falls back with no pick");
+        assert_eq!(fallback_none.url.as_ref(), "https://api.example.com/v1");
     }
 }

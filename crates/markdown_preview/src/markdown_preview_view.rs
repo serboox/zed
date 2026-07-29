@@ -23,7 +23,7 @@ use markdown::{
 use project::search::SearchQuery;
 use project::{Project, ProjectPath};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
-use theme::{Appearance, SystemAppearance, Theme, ThemeRegistry};
+use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{ContextMenu, LinkPreview, Tooltip, WithScrollbar, prelude::*, right_click_menu};
@@ -33,6 +33,9 @@ use util::{
 };
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
 use workspace::notifications::NotifyResultExt;
+use workspace::preview_appearance::{
+    PreviewAppearance, preview_appearance, set_preview_appearance,
+};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
@@ -75,52 +78,11 @@ pub struct MarkdownPreviewView {
     pending_update_task: Option<Task<Result<()>>>,
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
-    reading_appearance: ReadingAppearance,
+    reading_appearance: PreviewAppearance,
     /// Zoom for the expanded diagram. `None` fits it to the view, which is what
     /// expanding is for; a number is the reader's own scale, kept separate so
     /// closing and reopening starts from the fitted size again.
     expanded_diagram_zoom: Option<f32>,
-}
-
-/// Light-or-dark choice for reading a rendered document, kept per view and never
-/// touching the application theme -- the same control the SVG and image viewers
-/// offer, so a light document can stay readable in a dark editor.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReadingAppearance {
-    #[default]
-    Match,
-    Light,
-    Dark,
-}
-
-impl ReadingAppearance {
-    fn next(self) -> Self {
-        match self {
-            Self::Match => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::Match,
-        }
-    }
-
-    fn resolve(self) -> Option<Appearance> {
-        match self {
-            Self::Match => None,
-            Self::Light => Some(Appearance::Light),
-            Self::Dark => Some(Appearance::Dark),
-        }
-    }
-
-    fn tooltip(self) -> &'static str {
-        match self {
-            Self::Match => "Reading theme: follow the editor (click for light)",
-            Self::Light => "Reading theme: light (click for dark)",
-            Self::Dark => "Reading theme: dark (click to follow the editor)",
-        }
-    }
-
-    fn overrides_editor(self) -> bool {
-        !matches!(self, Self::Match)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -369,7 +331,7 @@ impl MarkdownPreviewView {
                 pending_update_task: None,
                 hovered_url: None,
                 mode,
-                reading_appearance: ReadingAppearance::default(),
+                reading_appearance: preview_appearance(cx),
                 expanded_diagram_zoom: None,
             };
 
@@ -938,6 +900,9 @@ impl MarkdownPreviewView {
 
     fn cycle_reading_appearance(&mut self, cx: &mut Context<Self>) {
         self.reading_appearance = self.reading_appearance.next();
+        // Remembered for every preview, not just this document: a reader who
+        // wants light pages wants them for the next file too.
+        set_preview_appearance(self.reading_appearance, cx);
         cx.notify();
     }
 

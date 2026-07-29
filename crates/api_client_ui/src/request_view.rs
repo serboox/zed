@@ -1,3 +1,4 @@
+use crate::response_dock::{DockResponseEntry, ResponseDockPanel, SendGeneration};
 use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::ApiClientStore;
 use crate::text_prompt_modal::TextPromptModal;
@@ -18,7 +19,7 @@ use ui::{
     ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt;
-use workspace::{Item, Workspace, item::ItemEvent};
+use workspace::{Item, Toast, Workspace, item::ItemEvent, notifications::NotificationId};
 
 /// The enabled `key -> value_for_send()` snapshot a script sees as
 /// `pm.environment`/`pm.collectionVariables` when it starts running --
@@ -434,6 +435,14 @@ pub struct RequestView {
     response_fullscreen: bool,
     url_looks_malformed: bool,
     body_json_invalid: bool,
+    /// Whether the most recent send successfully reached the shared
+    /// response dock. When `false` (dock not registered, or the workspace is
+    /// gone), `render` falls back to showing the response inline the way
+    /// this view always used to, so a response is never silently lost.
+    /// The send this view handed to the dock, if any. The dock shows one
+    /// response for the whole workspace, so this is what tells the view whether
+    /// what is on screen there is still its own reply or somebody else's.
+    dock_generation: Option<SendGeneration>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -738,6 +747,7 @@ impl RequestView {
             response_fullscreen: false,
             url_looks_malformed: false,
             body_json_invalid: false,
+            dock_generation: None,
             _subscriptions: Vec::new(),
         };
 
@@ -1785,6 +1795,132 @@ impl RequestView {
         .detach_and_log_err(cx);
     }
 
+    /// Looks up the workspace's shared response dock, if one is registered.
+    /// `None` here is the "dock unavailable" case every `route_*_to_dock`
+    /// caller must fall back from -- either the workspace itself is gone, or
+    /// (e.g. during startup, before `initialize_panels` finishes) the panel
+    /// simply hasn't been added yet.
+    fn find_response_dock(&self, cx: &App) -> Option<Entity<ResponseDockPanel>> {
+        self.workspace
+            .upgrade()?
+            .read(cx)
+            .panel::<ResponseDockPanel>(cx)
+    }
+
+    fn reveal_response_dock(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.reveal_panel::<ResponseDockPanel>(window, cx);
+            });
+        }
+    }
+
+    /// Reports that a response could not be handed off to the dock, so it is
+    /// never silently lost: the caller already keeps rendering its own copy
+    /// inline (see `render`'s use of `response_shown_in_dock`), and this adds
+    /// a toast pointing that out, unless the workspace itself is gone (in
+    /// which case there is no window left to show a toast in either).
+    fn warn_response_dock_unavailable(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            log::warn!(
+                "api client: workspace no longer exists; showing the response in the request view instead"
+            );
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::named("api-client-response-dock-missing".into()),
+                    "Couldn't open the Response panel -- showing the response here instead.",
+                ),
+                cx,
+            );
+        });
+    }
+
+    /// Shared tail of every `route_*_to_dock` call: on success, reveals the
+    /// dock and marks the response as shown there (dropping the now-moot
+    /// inline fullscreen mode); on failure, `render` falls back to showing
+    /// the response inline instead, so nothing is lost either way.
+    fn route_to_dock(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        apply: impl FnOnce(&mut ResponseDockPanel, &mut Context<ResponseDockPanel>),
+    ) {
+        match self.find_response_dock(cx) {
+            Some(dock) => {
+                dock.update(cx, apply);
+                self.reveal_response_dock(window, cx);
+                self.response_fullscreen = false;
+            }
+            None => {
+                self.dock_generation = None;
+                self.warn_response_dock_unavailable(cx);
+            }
+        }
+    }
+
+    fn route_sending_to_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.title.clone();
+        let claimed = std::cell::Cell::new(None);
+        self.route_to_dock(window, cx, |dock, cx| {
+            claimed.set(Some(dock.begin_send(title, cx)));
+        });
+        if let Some(generation) = claimed.get() {
+            self.dock_generation = Some(generation);
+        }
+    }
+
+    fn route_error_to_dock(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A reply can arrive without this view having claimed the dock -- a
+        // saved example replayed straight into `apply_response`, for one -- and
+        // it still belongs on screen.
+        if self.dock_generation.is_none() {
+            self.route_sending_to_dock(window, cx);
+        }
+        let Some(generation) = self.dock_generation else {
+            return;
+        };
+        let title = self.title.clone();
+        self.route_to_dock(window, cx, move |dock, cx| {
+            dock.show_error(generation, title, message, cx)
+        });
+    }
+
+    fn route_response_to_dock(
+        &mut self,
+        entry: DockResponseEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dock_generation.is_none() {
+            self.route_sending_to_dock(window, cx);
+        }
+        let Some(generation) = self.dock_generation else {
+            return;
+        };
+        self.route_to_dock(window, cx, move |dock, cx| {
+            dock.show_response(generation, entry, cx)
+        });
+    }
+
+    /// True while the dock is showing this view's own reply. Once another
+    /// request takes the dock over, this view shows its response inline again
+    /// rather than pointing at a panel that has moved on.
+    fn response_shown_in_dock(&self, cx: &App) -> bool {
+        let Some(generation) = self.dock_generation else {
+            return false;
+        };
+        self.find_response_dock(cx)
+            .is_some_and(|dock| dock.read(cx).showing() == generation)
+    }
+
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.send_state, SendState::Sending) {
             return;
@@ -1804,6 +1940,7 @@ impl RequestView {
         self.send_state = SendState::Sending;
         self.test_results.clear();
         self.visualize_data = None;
+        self.route_sending_to_dock(window, cx);
         cx.notify();
 
         let request_id = self.request_id;
@@ -1842,8 +1979,9 @@ impl RequestView {
                     }
                     Err(error) => {
                         let message = format!("Pre-request script failed: {error}");
-                        this.update(cx, |this, cx| {
-                            this.send_state = SendState::Error(message);
+                        this.update_in(cx, |this, window, cx| {
+                            this.send_state = SendState::Error(message.clone());
+                            this.route_error_to_dock(message, window, cx);
                             cx.notify();
                         })
                         .ok();
@@ -1946,8 +2084,9 @@ impl RequestView {
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    this.update(cx, |this, cx| {
-                        this.send_state = SendState::Error(message);
+                    this.update_in(cx, |this, window, cx| {
+                        this.send_state = SendState::Error(message.clone());
+                        this.route_error_to_dock(message, window, cx);
                         cx.notify();
                     })
                     .ok();
@@ -2045,7 +2184,19 @@ impl RequestView {
             })
             .detach();
         }
+
+        let dock_entry = DockResponseEntry {
+            request_title: self.title.clone(),
+            response: response.clone(),
+            response_is_html: self.response_is_html,
+            pretty_body_editor: self.pretty_body_editor.clone(),
+            raw_body_editor: self.raw_body_editor.clone(),
+            preview_body_editor: self.preview_body_editor.clone(),
+            test_results: self.test_results.clone(),
+            visualize_data: self.visualize_data.clone(),
+        };
         self.send_state = SendState::Success(response);
+        self.route_response_to_dock(dock_entry, window, cx);
         cx.notify();
     }
 
@@ -3417,6 +3568,37 @@ impl RequestView {
         }
     }
 
+    /// Replaces `render_response_section` once a response has been handed
+    /// off to the shared dock -- a thin pointer at the dock rather than a
+    /// second copy of the same response.
+    fn render_response_dock_redirect(&self, cx: &mut Context<Self>) -> AnyElement {
+        let border_variant = cx.theme().colors().border_variant;
+        v_flex()
+            .id("api-client-response-in-dock")
+            .debug_selector(|| "api-client-response-in-dock".to_string())
+            .pt_3()
+            .border_t_1()
+            .border_color(border_variant)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new("Response shown in the Response panel below")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("api-client-response-reveal-dock", "Show Response")
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reveal_response_dock(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_response_section(
         &mut self,
         window: &mut Window,
@@ -3955,7 +4137,11 @@ impl Render for RequestView {
                 },
             ));
 
-        let response_section = self.render_response_section(window, cx);
+        let response_section = if self.response_shown_in_dock(cx) {
+            self.render_response_dock_redirect(cx)
+        } else {
+            self.render_response_section(window, cx)
+        };
 
         if self.response_fullscreen {
             return v_flex()
@@ -4257,6 +4443,54 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         let view = window.root(&mut cx).unwrap();
         (store, request_id, view, cx)
+    }
+
+    /// Unlike `build_request_view`, this mounts `RequestView` as a real pane
+    /// item inside the workspace's own window (matching how
+    /// `ApiClientPanel::open_request` wires it up in production) -- needed
+    /// for the dock-routing tests below, since revealing a panel calls
+    /// `workspace.reveal_panel`/`add_panel` against that same window.
+    async fn build_request_view_in_workspace(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ApiClientStore>,
+        Entity<Workspace>,
+        Entity<RequestView>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let collection_id = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        let request = store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|r| r.id == request_id)
+                .unwrap()
+                .clone()
+        });
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let view = window
+            .update(cx, |workspace, window, cx| {
+                let workspace_handle = workspace.weak_handle();
+                let view = cx.new(|cx| {
+                    RequestView::new(&request, store.clone(), workspace_handle, window, cx)
+                });
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                view
+            })
+            .unwrap();
+
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let workspace = window.root(&mut cx).unwrap();
+        (store, workspace, view, cx)
     }
 
     fn debug_center(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Point<Pixels> {
@@ -5816,6 +6050,75 @@ mod tests {
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert!(request.examples.is_empty());
+        });
+    }
+
+    fn sample_response_data(status: u16) -> ResponseData {
+        ResponseData {
+            status,
+            status_text: "status".into(),
+            elapsed_ms: 3,
+            size_bytes: 2,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+            cookies: Vec::new(),
+        }
+    }
+
+    /// A response must never vanish just because no dock happens to be
+    /// registered on the workspace -- `RequestView` falls back to keeping
+    /// (and rendering) its own copy, exactly as it always has.
+    #[gpui::test]
+    async fn a_response_falls_back_to_the_request_view_when_no_dock_is_registered(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(200), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                !view.response_shown_in_dock(cx),
+                "no dock is registered, so the response must stay local"
+            );
+            assert!(
+                matches!(&view.send_state, SendState::Success(response) if response.status == 200)
+            );
+        });
+    }
+
+    /// Once a `ResponseDockPanel` is registered on the workspace, sending a
+    /// request must route the response there and reveal the bottom dock,
+    /// instead of leaving it in the request view's own inline section.
+    #[gpui::test]
+    async fn a_response_is_routed_to_the_registered_response_dock(cx: &mut TestAppContext) {
+        let (_store, workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let dock = cx.new(|cx| ResponseDockPanel::new(cx));
+            workspace.add_panel(dock, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                view.response_shown_in_dock(cx),
+                "a registered dock must take over showing the response"
+            );
+        });
+        workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                workspace.bottom_dock().read(cx).is_open(),
+                "sending a response must reveal the bottom dock"
+            );
         });
     }
 }
