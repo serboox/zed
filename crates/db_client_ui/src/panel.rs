@@ -23,7 +23,7 @@ use crate::result_view::{ResultView, format_query_error};
 use crate::sql_completion_provider::install_on_editor;
 use crate::store::{
     ActiveConnection, ConnectionStatus, DatabaseStore, DatabaseStoreEvent, RelativePosition,
-    RunConfiguration, TreeItemRef,
+    RunConfiguration, SchemaCacheStatus, TreeItemRef,
 };
 use anyhow::Context as _;
 use collections::{HashMap, HashSet};
@@ -55,13 +55,14 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
 use ui::{
     CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
-    Indicator, Label, LabelSize, PopoverMenu, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
-    prelude::*, right_click_menu,
+    Indicator, Label, LabelSize, PopoverMenu, ProgressBar, ScrollAxes, Scrollbars, Tooltip,
+    WithScrollbar, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use util::TryFutureExt as _;
@@ -545,6 +546,119 @@ fn render_query_status_indicator(row: u32, status: QueryExecutionStatus) -> impl
                 .color(Color::Error)
                 .into_any_element(),
         })
+}
+
+/// Past this age a cached-and-otherwise-quiet schema still earns a subtle
+/// hint on its row. Long enough that a routine background refresh (seconds
+/// to a few minutes on most servers) never trips it, short enough that a
+/// connection left open for a work session visibly invites a refresh.
+const SCHEMA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// What the schema-cache status affordance should show for one connection
+/// row, decided from `SchemaCacheStatus`. Kept separate from rendering so the
+/// decision -- which icon, whether the bar is determinate, whether to show
+/// anything at all -- is unit-testable without a GPUI window.
+#[derive(Debug, Clone, PartialEq)]
+enum SchemaStatusAffordance {
+    /// A prefetch is running but no table count is known yet.
+    Spinner,
+    /// A prefetch is running and `done` of `total` tables have been
+    /// introspected.
+    Progress { done: usize, total: usize },
+    /// The last prefetch failed; `reason` is the tooltip text.
+    Failed { reason: String },
+    /// Cached, but old enough that a refresh is worth calling out.
+    Stale { age: Duration },
+}
+
+fn schema_status_affordance(status: Option<SchemaCacheStatus>) -> Option<SchemaStatusAffordance> {
+    match status? {
+        SchemaCacheStatus::Loading {
+            progress: Some((done, total)),
+        } if total > 0 => Some(SchemaStatusAffordance::Progress { done, total }),
+        SchemaCacheStatus::Loading { .. } => Some(SchemaStatusAffordance::Spinner),
+        SchemaCacheStatus::Failed { reason } => Some(SchemaStatusAffordance::Failed { reason }),
+        SchemaCacheStatus::Cached { age: Some(age) } if age >= SCHEMA_STALE_AFTER => {
+            Some(SchemaStatusAffordance::Stale { age })
+        }
+        SchemaCacheStatus::Cached { .. } => None,
+    }
+}
+
+/// Renders a cache age as a short phrase for the stale-schema tooltip, e.g.
+/// "42 minutes ago" or "2 hours ago". Minute granularity is enough since this
+/// only ever appears once the cache is already past `SCHEMA_STALE_AFTER`.
+fn format_schema_cache_age(age: Duration) -> String {
+    let minutes = age.as_secs() / 60;
+    if minutes < 60 {
+        format!(
+            "{minutes} minute{} ago",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else {
+        let hours = minutes / 60;
+        format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+    }
+}
+
+fn render_schema_status_indicator(
+    connection_id: ConnectionId,
+    affordance: SchemaStatusAffordance,
+    cx: &App,
+) -> AnyElement {
+    let id = ElementId::from(SharedString::from(format!("schema-status-{connection_id}")));
+    match affordance {
+        SchemaStatusAffordance::Spinner => div()
+            .id(id)
+            .flex_none()
+            .child(
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2),
+            )
+            .tooltip(Tooltip::text("Loading schema…"))
+            .into_any_element(),
+        SchemaStatusAffordance::Progress { done, total } => div()
+            .id(id)
+            .flex_none()
+            .w(px(20.))
+            .child(ProgressBar::new(
+                ElementId::from(SharedString::from(format!(
+                    "schema-status-progress-{connection_id}"
+                ))),
+                done as f32,
+                total as f32,
+                cx,
+            ))
+            .tooltip(Tooltip::text(format!(
+                "Loading schema: {done} of {total} tables"
+            )))
+            .into_any_element(),
+        SchemaStatusAffordance::Failed { reason } => div()
+            .id(id)
+            .flex_none()
+            .child(
+                Icon::new(IconName::Warning)
+                    .size(IconSize::XSmall)
+                    .color(Color::Error),
+            )
+            .tooltip(Tooltip::text(format!("Schema failed to load: {reason}")))
+            .into_any_element(),
+        SchemaStatusAffordance::Stale { age } => div()
+            .id(id)
+            .flex_none()
+            .child(
+                Icon::new(IconName::Clock)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(Tooltip::text(format!(
+                "Schema cached {}",
+                format_schema_cache_age(age)
+            )))
+            .into_any_element(),
+    }
 }
 
 struct DbSemanticsProvider {
@@ -8409,6 +8523,9 @@ impl DatabasePanel {
                 let is_before_target = self.drag_target == Some(DropTarget::BeforeConnection(id));
                 let is_after_target = self.drag_target == Some(DropTarget::AfterConnection(id));
                 let drag_label: SharedString = label.clone().into();
+                let schema_status_element =
+                    schema_status_affordance(self.store.read(cx).schema_cache_status(id))
+                        .map(|affordance| render_schema_status_indicator(id, affordance, cx));
                 let status_indicator = match status {
                     ConnectionStatus::Connected => {
                         Indicator::icon(Icon::new(IconName::Check)).color(Color::Success)
@@ -8582,7 +8699,8 @@ impl DatabasePanel {
                                         ),
                                 )
                             }),
-                    );
+                    )
+                    .when_some(schema_status_element, |el, element| el.child(element));
                 header_row.into_any_element()
             }
 
@@ -8906,6 +9024,8 @@ impl DatabasePanel {
                                                                 rows,
                                                                 rows_affected: procedures.len() as u64,
                                                                 execution_time_ms: 0,
+                                                                timing: None,
+                                                                raw_documents: None,
                                                             }, cx);
                                                         }
                                                         Err(e) => view.set_error(format_query_error(&e), cx),
@@ -8947,6 +9067,8 @@ impl DatabasePanel {
                                                                 rows,
                                                                 rows_affected: users.len() as u64,
                                                                 execution_time_ms: 0,
+                                                                timing: None,
+                                                                raw_documents: None,
                                                             }, cx);
                                                         }
                                                         Err(e) => view.set_error(format_query_error(&e), cx),
@@ -9580,6 +9702,8 @@ impl DatabasePanel {
                                                                                 rows,
                                                                                 rows_affected: indexes.len() as u64,
                                                                                 execution_time_ms: 0,
+                                                                                timing: None,
+                                                                                raw_documents: None,
                                                                             }, cx);
                                                                         }
                                                                         Err(e) => view.set_error(format_query_error(&e), cx),
@@ -9625,6 +9749,8 @@ impl DatabasePanel {
                                                                                 rows,
                                                                                 rows_affected: triggers.len() as u64,
                                                                                 execution_time_ms: 0,
+                                                                                timing: None,
+                                                                                raw_documents: None,
                                                                             }, cx);
                                                                         }
                                                                         Err(e) => view.set_error(format_query_error(&e), cx),
@@ -11254,6 +11380,105 @@ mod tests {
         assert_eq!(new_query_button_label(DatabaseDriver::Redis), "Commands");
     }
 
+    #[test]
+    fn schema_status_affordance_is_none_when_nothing_is_known() {
+        assert_eq!(schema_status_affordance(None), None);
+    }
+
+    #[test]
+    fn schema_status_affordance_shows_a_spinner_before_a_total_is_known() {
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Loading { progress: None })),
+            Some(SchemaStatusAffordance::Spinner)
+        );
+    }
+
+    #[test]
+    fn schema_status_affordance_shows_a_determinate_progress_once_a_total_is_known() {
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Loading {
+                progress: Some((4, 12))
+            })),
+            Some(SchemaStatusAffordance::Progress { done: 4, total: 12 })
+        );
+    }
+
+    #[test]
+    fn schema_status_affordance_treats_a_zero_total_as_indeterminate() {
+        // A planned total of 0 tables would render a nonsensical 0/0 bar;
+        // fall back to the spinner instead.
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Loading {
+                progress: Some((0, 0))
+            })),
+            Some(SchemaStatusAffordance::Spinner)
+        );
+    }
+
+    #[test]
+    fn schema_status_affordance_shows_the_failure_reason() {
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Failed {
+                reason: "timed out".to_string()
+            })),
+            Some(SchemaStatusAffordance::Failed {
+                reason: "timed out".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_status_affordance_stays_quiet_for_a_fresh_cache() {
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Cached {
+                age: Some(Duration::from_secs(30))
+            })),
+            None
+        );
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Cached { age: None })),
+            None,
+            "an unknown age must not be treated as stale"
+        );
+    }
+
+    #[test]
+    fn schema_status_affordance_flags_a_stale_cache() {
+        assert_eq!(
+            schema_status_affordance(Some(SchemaCacheStatus::Cached {
+                age: Some(SCHEMA_STALE_AFTER)
+            })),
+            Some(SchemaStatusAffordance::Stale {
+                age: SCHEMA_STALE_AFTER
+            }),
+            "the threshold itself must already count as stale"
+        );
+    }
+
+    #[test]
+    fn format_schema_cache_age_uses_minutes_under_an_hour() {
+        assert_eq!(
+            format_schema_cache_age(Duration::from_secs(60)),
+            "1 minute ago"
+        );
+        assert_eq!(
+            format_schema_cache_age(Duration::from_secs(42 * 60)),
+            "42 minutes ago"
+        );
+    }
+
+    #[test]
+    fn format_schema_cache_age_uses_hours_at_and_beyond_an_hour() {
+        assert_eq!(
+            format_schema_cache_age(Duration::from_secs(60 * 60)),
+            "1 hour ago"
+        );
+        assert_eq!(
+            format_schema_cache_age(Duration::from_secs(3 * 60 * 60)),
+            "3 hours ago"
+        );
+    }
+
     // Before this fix, every driver's console file (including Redis's) got a
     // hardcoded `.sql` extension, so Zed's language-by-extension detection
     // always applied the SQL grammar to Redis's whitespace-tokenized
@@ -12610,6 +12835,8 @@ mod tests {
                 rows: vec![vec![Some("1".to_string())]],
                 rows_affected: 1,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
@@ -12656,6 +12883,8 @@ mod tests {
                 rows: vec![vec![Some(sql.to_string())]],
                 rows_affected: 1,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
@@ -13152,6 +13381,8 @@ mod tests {
                     rows: vec![vec![Some(sql.to_string())]],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 })
             }
             async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
@@ -17978,6 +18209,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
@@ -18908,6 +19141,8 @@ mod tests {
                 rows: vec![vec![Some("1".to_string())]],
                 rows_affected: 1,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {

@@ -403,6 +403,8 @@ fn help_query_result() -> QueryResult {
             .collect(),
         rows_affected: 0,
         execution_time_ms: 0,
+        timing: None,
+        raw_documents: None,
     }
 }
 
@@ -1318,12 +1320,23 @@ fn documents_to_query_result(documents: Vec<Document>) -> QueryResult {
                 .collect()
         })
         .collect();
+    let raw_documents = documents.iter().map(bson_document_pretty_text).collect();
     QueryResult {
         columns,
         rows,
         rows_affected: 0,
         execution_time_ms: 0,
+        timing: None,
+        raw_documents: Some(raw_documents),
     }
+}
+
+// The alternate-form flag (`{:#}`) on `Document`'s `Display` impl renders it
+// exactly the way `mongosh` prints a document: quoted keys, insertion order
+// preserved, `ObjectId("...")`/`DateTime("...")` constructor syntax for those
+// types, and one field per line for nested objects/arrays.
+fn bson_document_pretty_text(document: &Document) -> String {
+    format!("{document:#}")
 }
 
 /// Maps the recognized keys of a `createIndex(keys, options)` options
@@ -1616,6 +1629,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::InsertMany {
@@ -1632,6 +1647,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::UpdateOne {
@@ -1649,6 +1666,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: outcome.modified_count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::UpdateMany {
@@ -1666,6 +1685,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: outcome.modified_count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::DeleteOne { collection, filter } => {
@@ -1679,6 +1700,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: outcome.deleted_count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::DeleteMany { collection, filter } => {
@@ -1692,6 +1715,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: outcome.deleted_count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::Aggregate {
@@ -1724,6 +1749,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![vec![Some(count.to_string())]],
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::Distinct {
@@ -1744,6 +1771,8 @@ impl DbProvider for MongoProvider {
                         .collect(),
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::ReplaceOne {
@@ -1761,6 +1790,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: outcome.modified_count,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::FindOneAndUpdate {
@@ -1867,6 +1898,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::Drop { collection } => {
@@ -1877,6 +1910,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::CreateIndex {
@@ -1897,6 +1932,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::DropIndex { collection, name } => {
@@ -1909,6 +1946,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::GetIndexes { collection } => {
@@ -1951,6 +1990,8 @@ impl DbProvider for MongoProvider {
                     rows,
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::CollectionStats { collection } => {
@@ -1973,6 +2014,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![vec![Some(count.to_string())]],
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::RenameCollection {
@@ -1992,6 +2035,8 @@ impl DbProvider for MongoProvider {
                     rows: vec![],
                     rows_affected: 1,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::Help => help_query_result(),
@@ -2014,6 +2059,8 @@ impl DbProvider for MongoProvider {
                     rows: tables.into_iter().map(|t| vec![Some(t.name)]).collect(),
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
             MongoStatement::ShowDatabases => {
@@ -2026,6 +2073,8 @@ impl DbProvider for MongoProvider {
                     rows: databases.into_iter().map(|d| vec![Some(d.name)]).collect(),
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 }
             }
         };
@@ -2792,7 +2841,7 @@ mod tests {
             doc! { "id": 1i64, "name": "Ada" },
             doc! { "id": 2i64, "name": "Grace", "extra": true },
         ];
-        let result = documents_to_query_result(documents);
+        let result = documents_to_query_result(documents.clone());
         assert_eq!(result.columns, vec!["id", "name", "extra"]);
         assert_eq!(
             result.rows,
@@ -2805,6 +2854,52 @@ mod tests {
                 ],
             ]
         );
+        // The ragged second document's missing/present fields must land in
+        // the right column (a `None` cell, not a shifted value) *and* the
+        // raw per-document text must survive alongside the flattened grid,
+        // in the same row order, for the Documents view to fall back on.
+        let raw_documents = result.raw_documents.expect("mongo results carry raw docs");
+        assert_eq!(raw_documents.len(), documents.len());
+        assert_eq!(raw_documents[0], bson_document_pretty_text(&documents[0]));
+        assert_eq!(raw_documents[1], bson_document_pretty_text(&documents[1]));
+    }
+
+    #[test]
+    fn documents_to_query_result_preserves_row_order_in_raw_documents() {
+        let documents = vec![
+            doc! { "id": 3i64 },
+            doc! { "id": 1i64 },
+            doc! { "id": 2i64 },
+        ];
+        let result = documents_to_query_result(documents);
+        let raw_documents = result.raw_documents.unwrap();
+        assert!(raw_documents[0].contains("3"));
+        assert!(raw_documents[1].contains("1"));
+        assert!(raw_documents[2].contains("2"));
+    }
+
+    #[test]
+    fn bson_document_pretty_text_matches_mongosh_shell_style_output() {
+        let object_id = mongodb::bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011")
+            .expect("valid ObjectId hex");
+        let document = doc! {
+            "_id": object_id,
+            "name": "Ada",
+            "tags": ["admin", "active"],
+            "address": { "city": "London" },
+        };
+        let text = bson_document_pretty_text(&document);
+        // Field order is preserved (BSON documents keep insertion order),
+        // keys are quoted, and ObjectId/nested shapes render the way
+        // mongosh prints them rather than as a flat one-line JSON blob.
+        let id_pos = text
+            .find("\"_id\": ObjectId(\"507f1f77bcf86cd799439011\")")
+            .unwrap();
+        let name_pos = text.find("\"name\": \"Ada\"").unwrap();
+        let tags_pos = text.find("\"tags\": [").unwrap();
+        let address_pos = text.find("\"address\": {").unwrap();
+        assert!(id_pos < name_pos && name_pos < tags_pos && tags_pos < address_pos);
+        assert!(text.contains("\"city\": \"London\""));
     }
 }
 

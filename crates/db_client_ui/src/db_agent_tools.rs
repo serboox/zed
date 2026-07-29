@@ -597,6 +597,8 @@ mod tests {
                 rows: vec![vec![Some("1".to_string())]],
                 rows_affected: 1,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {

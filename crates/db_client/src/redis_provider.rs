@@ -456,10 +456,12 @@ impl DbProvider for RedisProvider {
         let tokens: Vec<&str> = sql.split_whitespace().collect();
         if tokens.is_empty() {
             return Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
             });
         }
 
@@ -485,20 +487,24 @@ impl DbProvider for RedisProvider {
                 _ => 0,
             };
             return Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected,
                 execution_time_ms,
+                timing: None,
             });
         }
 
         let (columns, rows) = format_redis_result(cmd_name, &value);
         let rows_affected = rows.len() as u64;
         Ok(QueryResult {
+            raw_documents: None,
             columns,
             rows,
             rows_affected,
             execution_time_ms,
+            timing: None,
         })
     }
 }

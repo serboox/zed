@@ -5,13 +5,13 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
 
+use crate::MAX_RESULT_ROWS;
 use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, FkInfo, IndexInfo, ProcedureInfo, ProcedureKind,
     QueryResult, SequenceInfo, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
-use crate::MAX_RESULT_ROWS;
 
 pub struct PostgresProvider {
     pool: PgPool,
@@ -262,10 +262,12 @@ impl DbProvider for PostgresProvider {
             let execution_time_ms = start.elapsed().as_millis() as u64;
             let rows_affected = result_rows.len() as u64;
             Ok(QueryResult {
+                raw_documents: None,
                 columns,
                 rows: result_rows,
                 rows_affected,
                 execution_time_ms,
+                timing: None,
             })
         } else {
             let result = sqlx::query(&prefixed)
@@ -274,10 +276,12 @@ impl DbProvider for PostgresProvider {
                 .context("Query execution failed")?;
 
             Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected: result.rows_affected(),
                 execution_time_ms: start.elapsed().as_millis() as u64,
+                timing: None,
             })
         }
     }

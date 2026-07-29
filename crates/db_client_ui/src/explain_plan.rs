@@ -963,6 +963,8 @@ mod tests {
                 )]],
                 rows_affected: 0,
                 execution_time_ms: 1,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {

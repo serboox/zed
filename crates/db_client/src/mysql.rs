@@ -13,7 +13,7 @@ use crate::connection::{ConnectionConfig, SslMode};
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, EventInfo, FkInfo, IndexInfo, ProcedureInfo,
-    ProcedureKind, QueryResult, TableInfo, TableKind, TriggerInfo, UserInfo,
+    ProcedureKind, QueryResult, QueryTiming, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
 pub struct MySqlProvider {
@@ -539,7 +539,9 @@ impl DbProvider for MySqlProvider {
         // caller's SQL, so a silently dead connection (see
         // `CONNECTION_HEALTH_TIMEOUT`) is caught and replaced up front,
         // instead of leaving the query itself to hang indefinitely.
+        let pool_wait_start = Instant::now();
         let pool = self.ensure_live_pool().await?;
+        let pool_wait_ms = pool_wait_start.elapsed().as_millis() as u64;
 
         if !database.is_empty() {
             // USE must use the text protocol; MySQL rejects it in the
@@ -593,6 +595,11 @@ impl DbProvider for MySqlProvider {
             let mut stream = sqlx::raw_sql(&prefixed).fetch(&pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+            // Set once the first row (or end-of-stream) arrives, splitting
+            // `execute_ms` (submit the query, wait for the server to start
+            // answering) from `streaming_ms` (pull and decode the rest).
+            let mut execute_ms: Option<u64> = None;
+            let mut first_row_at: Option<Instant> = None;
 
             loop {
                 // Bound each row fetch so a connection that goes silently dead
@@ -600,13 +607,22 @@ impl DbProvider for MySqlProvider {
                 // guard then drops on return and the next query can reconnect.
                 let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
                     Ok(Ok(Some(row))) => row,
-                    Ok(Ok(None)) => break,
+                    Ok(Ok(None)) => {
+                        if execute_ms.is_none() {
+                            execute_ms = Some(start.elapsed().as_millis() as u64);
+                        }
+                        break;
+                    }
                     Ok(Err(error)) => return Err(error).context("Query execution failed"),
                     Err(_elapsed) => anyhow::bail!(
                         "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
                          the database connection stalled mid-result"
                     ),
                 };
+                if execute_ms.is_none() {
+                    execute_ms = Some(start.elapsed().as_millis() as u64);
+                    first_row_at = Some(Instant::now());
+                }
                 if columns.is_empty() {
                     columns = row
                         .columns()
@@ -627,11 +643,18 @@ impl DbProvider for MySqlProvider {
 
             let execution_time_ms = start.elapsed().as_millis() as u64;
             let rows_affected = result_rows.len() as u64;
+            let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
             Ok(QueryResult {
+                raw_documents: None,
                 columns,
                 rows: result_rows,
                 rows_affected,
                 execution_time_ms,
+                timing: Some(QueryTiming {
+                    pool_wait_ms,
+                    execute_ms: execute_ms.unwrap_or(execution_time_ms),
+                    streaming_ms,
+                }),
             })
         } else {
             let result = if requires_text_protocol {
@@ -646,11 +669,18 @@ impl DbProvider for MySqlProvider {
                     .context("Query execution failed")?
             };
 
+            let execution_time_ms = start.elapsed().as_millis() as u64;
             Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected: result.rows_affected(),
-                execution_time_ms: start.elapsed().as_millis() as u64,
+                execution_time_ms,
+                timing: Some(QueryTiming {
+                    pool_wait_ms,
+                    execute_ms: execution_time_ms,
+                    streaming_ms: None,
+                }),
             })
         }
     }

@@ -343,10 +343,12 @@ mod tests {
         async fn execute_query(&self, _database: &str, _sql: &str) -> Result<QueryResult> {
             self.assert_in_tokio("execute_query").await?;
             Ok(QueryResult {
+                raw_documents: None,
                 columns: Vec::new(),
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {

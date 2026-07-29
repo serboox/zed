@@ -232,10 +232,12 @@ impl DbProvider for CassandraProvider {
         if !is_select {
             self.query(cql).await?;
             return Ok(QueryResult {
+                raw_documents: None,
                 columns: Vec::new(),
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: start.elapsed().as_millis() as u64,
+                timing: None,
             });
         }
 
@@ -274,10 +276,12 @@ impl DbProvider for CassandraProvider {
         }
 
         Ok(QueryResult {
+            raw_documents: None,
             columns,
             rows,
             rows_affected: 0,
             execution_time_ms: start.elapsed().as_millis() as u64,
+            timing: None,
         })
     }
 

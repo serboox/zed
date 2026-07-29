@@ -308,6 +308,8 @@ mod tests {
                     rows: vec![vec![Some("1".to_string())]],
                     rows_affected: 0,
                     execution_time_ms: 0,
+                    timing: None,
+                    raw_documents: None,
                 },
                 cx,
             );

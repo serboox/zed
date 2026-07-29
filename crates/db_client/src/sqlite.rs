@@ -6,13 +6,13 @@ use sqlx::{Column as _, Row as _, ValueRef as _};
 use std::path::Path;
 use std::time::Instant;
 
+use crate::MAX_RESULT_ROWS;
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
 use crate::schema::{
     CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
     TriggerInfo,
 };
-use crate::MAX_RESULT_ROWS;
 
 pub struct SqliteProvider {
     pool: SqlitePool,
@@ -301,10 +301,12 @@ impl DbProvider for SqliteProvider {
             let execution_time_ms = start.elapsed().as_millis() as u64;
             let rows_affected = result_rows.len() as u64;
             Ok(QueryResult {
+                raw_documents: None,
                 columns,
                 rows: result_rows,
                 rows_affected,
                 execution_time_ms,
+                timing: None,
             })
         } else {
             let result = sqlx::query(sql)
@@ -313,10 +315,12 @@ impl DbProvider for SqliteProvider {
                 .context("Query execution failed")?;
 
             Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected: result.rows_affected(),
                 execution_time_ms: start.elapsed().as_millis() as u64,
+                timing: None,
             })
         }
     }

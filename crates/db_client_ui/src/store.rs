@@ -27,6 +27,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use util::ResultExt;
 
 const MAX_QUERY_HISTORY: usize = 100;
@@ -66,6 +67,29 @@ struct SchemaCache {
     views: HashMap<String, Vec<String>>,
     #[serde(default)]
     columns: HashMap<String, HashMap<String, Vec<ColumnInfo>>>,
+    /// Unix-epoch milliseconds when this snapshot was captured, so the panel
+    /// can show how stale it is. `None` for a cache written before this field
+    /// existed -- the freshness affordance simply stays quiet for those.
+    #[serde(default)]
+    cached_at_unix_ms: Option<i64>,
+}
+
+/// One connection's schema-cache lifecycle, as shown by the tree row's status
+/// affordance. Returning `None` (no variant, see `DatabaseStore::schema_cache_status`)
+/// means nothing has ever been attempted, so the row stays free of any icon.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaCacheStatus {
+    /// A prefetch is running. `progress` becomes `Some((tables_done,
+    /// tables_total))` once the column-loading phase knows the table count
+    /// -- see `prefetch_full_schema` -- so the caller can switch from an
+    /// indeterminate spinner to a determinate bar.
+    Loading { progress: Option<(usize, usize)> },
+    /// The last prefetch attempt failed; `reason` is the error text for a
+    /// hover tooltip.
+    Failed { reason: String },
+    /// Schema is cached. `age` is how long ago it was captured; `None` when
+    /// the cache predates the freshness field and its age is simply unknown.
+    Cached { age: Option<Duration> },
 }
 
 /// The kind of a flattened schema entry, as surfaced to the go-to-object palette.
@@ -345,6 +369,15 @@ pub struct DatabaseStore {
     ddl_cache: HashMap<ConnectionId, DdlCache>,
     schema_cache: HashMap<ConnectionId, SchemaCache>,
     prefetching_schema: HashSet<ConnectionId>,
+    /// (tables introspected so far, planned total) for a connection whose
+    /// prefetch has reached the column-loading phase -- see
+    /// `prefetch_full_schema`. Absent while the database/table lists
+    /// themselves are still being listed, since no total is known yet.
+    schema_load_progress: HashMap<ConnectionId, (usize, usize)>,
+    /// The error text of the most recent failed prefetch, shown on hover by
+    /// the tree row's status affordance. Cleared as soon as a prefetch for
+    /// the same connection succeeds.
+    schema_load_errors: HashMap<ConnectionId, String>,
     run_configurations: Vec<RunConfiguration>,
     pub exec_jobs: Vec<crate::sql_exec::ExecJob>,
     pub(crate) next_exec_job_id: usize,
@@ -507,6 +540,8 @@ impl DatabaseStore {
             ddl_cache: HashMap::new(),
             schema_cache: HashMap::new(),
             prefetching_schema: HashSet::new(),
+            schema_load_progress: HashMap::new(),
+            schema_load_errors: HashMap::new(),
             run_configurations: Vec::new(),
             exec_jobs: Vec::new(),
             next_exec_job_id: 0,
@@ -614,6 +649,11 @@ impl DatabaseStore {
         if !self.prefetching_schema.insert(id) {
             return Task::ready(Ok(()));
         }
+        // Drop any progress left over from a run this connection interrupted
+        // (e.g. a disconnect mid-prefetch), so this run starts as an
+        // indeterminate spinner instead of showing a stale fraction until it
+        // reaches the column-loading phase and recomputes its own total.
+        self.schema_load_progress.remove(&id);
         let preferred_database = conn.config.database.clone().filter(|d| !d.is_empty());
 
         cx.spawn(async move |this, cx| {
@@ -668,8 +708,26 @@ impl DatabaseStore {
                     }
                 }
 
+                // Total tables this prefetch plans to `describe_table`, capped the
+                // same way the loop below is, so a determinate progress bar's
+                // denominator matches what will actually be attempted.
+                let tables_planned: usize = column_order
+                    .iter()
+                    .filter_map(|database| cache.tables.get(database))
+                    .map(|tables| tables.len().min(MAX_PREFETCH_TABLES_PER_DATABASE))
+                    .sum::<usize>()
+                    .min(MAX_PREFETCH_COLUMN_TABLES_TOTAL);
+                if tables_planned > 0 {
+                    this.update(cx, |store, cx| {
+                        store.schema_load_progress.insert(id, (0, tables_planned));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+
                 let mut column_budget = MAX_PREFETCH_COLUMN_TABLES_TOTAL;
                 let mut budget_skipped: Vec<String> = Vec::new();
+                let mut tables_introspected: usize = 0;
                 for database in &column_order {
                     let Some(tables) = cache.tables.get(database) else {
                         continue;
@@ -688,6 +746,16 @@ impl DatabaseStore {
                             provider.describe_table(database, &table.name).await.log_err()
                         {
                             columns.insert(table.name.clone(), cols);
+                        }
+                        tables_introspected += 1;
+                        if tables_planned > 0 {
+                            this.update(cx, |store, cx| {
+                                store
+                                    .schema_load_progress
+                                    .insert(id, (tables_introspected, tables_planned));
+                                cx.notify();
+                            })
+                            .ok();
                         }
                     }
                     column_budget = column_budget.saturating_sub(total.min(per_database_limit));
@@ -710,6 +778,13 @@ impl DatabaseStore {
                         budget_skipped.join(", ")
                     );
                 }
+
+                cache.cached_at_unix_ms = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as i64)
+                        .unwrap_or(0),
+                );
 
                 this.update(cx, |store, cx| {
                     // A disconnect while the prefetch was running means this
@@ -734,6 +809,7 @@ impl DatabaseStore {
                     }
                     store.schema_cache.insert(id, cache);
                     store.persist_schema_cache(cx);
+                    store.schema_load_errors.remove(&id);
                     cx.emit(DatabaseStoreEvent::SchemaChanged);
                     cx.notify();
                 })?;
@@ -742,8 +818,10 @@ impl DatabaseStore {
             .await;
             this.update(cx, |store, cx| {
                 store.prefetching_schema.remove(&id);
+                store.schema_load_progress.remove(&id);
                 if let (Err(error), Some(epoch)) = (&outcome, prefetched_epoch) {
                     store.note_operation_failure(id, epoch, error, cx);
+                    store.schema_load_errors.insert(id, error.to_string());
                 }
             })
             .ok();
@@ -753,6 +831,32 @@ impl DatabaseStore {
 
     pub fn connections(&self) -> &[ActiveConnection] {
         &self.connections
+    }
+
+    /// The schema-cache status of one connection, for the tree row's status
+    /// affordance. Checked in priority order: a prefetch in flight always
+    /// wins (even over a previous failure or a still-valid old cache), then
+    /// the last failure, then whatever is cached. `None` means the row shows
+    /// nothing -- no prefetch has ever run for this connection.
+    pub fn schema_cache_status(&self, id: ConnectionId) -> Option<SchemaCacheStatus> {
+        if self.prefetching_schema.contains(&id) {
+            return Some(SchemaCacheStatus::Loading {
+                progress: self.schema_load_progress.get(&id).copied(),
+            });
+        }
+        if let Some(reason) = self.schema_load_errors.get(&id) {
+            return Some(SchemaCacheStatus::Failed {
+                reason: reason.clone(),
+            });
+        }
+        let cache = self.schema_cache.get(&id)?;
+        let age = cache.cached_at_unix_ms.and_then(|cached_at_unix_ms| {
+            let cached_at = UNIX_EPOCH.checked_add(Duration::from_millis(
+                u64::try_from(cached_at_unix_ms).ok()?,
+            ))?;
+            SystemTime::now().duration_since(cached_at).ok()
+        });
+        Some(SchemaCacheStatus::Cached { age })
     }
 
     /// Flattens the prefetched schema cache of `id` into a single searchable
@@ -3295,6 +3399,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
@@ -3333,6 +3439,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
@@ -3490,6 +3598,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
@@ -3523,6 +3633,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, table: &str) -> Result<String> {
@@ -3611,12 +3723,16 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, table: &str) -> Result<String> {
             let mut calls = self.table_ddl_calls.lock().expect("table ddl calls lock");
             *calls += 1;
-            Ok(format!("CREATE TABLE `{table}` (id INT) /* call {calls} */"))
+            Ok(format!(
+                "CREATE TABLE `{table}` (id INT) /* call {calls} */"
+            ))
         }
         async fn get_database_ddl(&self, database: &str) -> Result<String> {
             let mut calls = self
@@ -3667,7 +3783,10 @@ mod tests {
         );
 
         assert_eq!(
-            *provider.table_ddl_calls.lock().expect("table ddl calls lock"),
+            *provider
+                .table_ddl_calls
+                .lock()
+                .expect("table ddl calls lock"),
             1,
             "get_table_ddl must hit the live provider exactly once"
         );
@@ -4097,6 +4216,132 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn schema_cache_status_is_none_before_anything_is_attempted(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.read_with(cx, |store, _| {
+            assert!(store.schema_cache_status(id).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_reports_loading_with_no_progress_yet(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.update(cx, |store, _| {
+            store.prefetching_schema.insert(id);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.schema_cache_status(id),
+                Some(SchemaCacheStatus::Loading { progress: None })
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_reports_loading_with_a_determinate_progress(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.update(cx, |store, _| {
+            store.prefetching_schema.insert(id);
+            store.schema_load_progress.insert(id, (3, 10));
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.schema_cache_status(id),
+                Some(SchemaCacheStatus::Loading {
+                    progress: Some((3, 10))
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_reports_failure_reason(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.update(cx, |store, _| {
+            store
+                .schema_load_errors
+                .insert(id, "connection refused".to_string());
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.schema_cache_status(id),
+                Some(SchemaCacheStatus::Failed {
+                    reason: "connection refused".to_string()
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_prioritizes_loading_over_a_stale_failure(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.update(cx, |store, _| {
+            store
+                .schema_load_errors
+                .insert(id, "connection refused".to_string());
+            store.prefetching_schema.insert(id);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.schema_cache_status(id),
+                Some(SchemaCacheStatus::Loading { progress: None }),
+                "a retry in flight must hide the previous failure"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_reports_cache_age_when_known(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        let sixty_seconds_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 60_000;
+        store.update(cx, |store, _| {
+            store.schema_cache.insert(
+                id,
+                SchemaCache {
+                    cached_at_unix_ms: Some(sixty_seconds_ago),
+                    ..Default::default()
+                },
+            );
+        });
+        store.read_with(cx, |store, _| match store.schema_cache_status(id) {
+            Some(SchemaCacheStatus::Cached { age: Some(age) }) => {
+                assert!(
+                    age >= Duration::from_secs(59) && age <= Duration::from_secs(65),
+                    "expected an age of about 60s, got {age:?}"
+                );
+            }
+            other => panic!("expected a cached status with a known age, got {other:?}"),
+        });
+    }
+
+    #[gpui::test]
+    fn schema_cache_status_omits_age_for_a_pre_freshness_cache(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(DatabaseStore::new);
+        let id = ConnectionConfig::default().id;
+        store.update(cx, |store, _| {
+            store.schema_cache.insert(id, SchemaCache::default());
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.schema_cache_status(id),
+                Some(SchemaCacheStatus::Cached { age: None })
+            );
+        });
+    }
+
     struct CliMockProvider;
 
     #[async_trait::async_trait]
@@ -4123,6 +4368,8 @@ mod tests {
                 rows: vec![vec![Some("1".into())]],
                 rows_affected: 0,
                 execution_time_ms: 7,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
@@ -4354,6 +4601,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {

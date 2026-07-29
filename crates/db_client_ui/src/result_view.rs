@@ -1,7 +1,7 @@
 use crate::store::DatabaseStore;
 use db_client::{
     ConnectionId, DatabaseDriver,
-    schema::{ColumnInfo, FkInfo, QueryResult},
+    schema::{ColumnInfo, FkInfo, QueryResult, QueryTiming},
 };
 use editor::{CompletionContext, CompletionProvider, Editor, EditorEvent, MinimapVisibility};
 use gpui::{
@@ -193,6 +193,95 @@ fn loading_spinner(id: impl Into<ElementId>, size: IconSize) -> impl IntoElement
         .size(size)
         .color(Color::Hint)
         .with_keyed_rotate_animation(id, 1)
+}
+
+/// One visual segment of the query-timing breakdown bar: a measured phase's
+/// duration plus the fraction of the bar's width it should occupy. Kept
+/// separate from rendering so the width math is unit-testable without a
+/// GPUI window.
+struct QueryTimingSegment {
+    label: &'static str,
+    ms: u64,
+    fraction: f32,
+}
+
+/// Splits a measured `QueryTiming` into the segments the breakdown bar draws,
+/// in phase order. Only includes `streaming_ms` when the provider actually
+/// measured it (writes and empty reads leave it unset) -- a phase that was
+/// never measured must never appear, not even as a zero-width segment.
+/// Returns `None` when the total is zero, since a bar with nothing to show
+/// as a fraction would be meaningless.
+fn query_timing_segments(timing: &QueryTiming) -> Option<Vec<QueryTimingSegment>> {
+    let total = timing.total_ms();
+    if total == 0 {
+        return None;
+    }
+    let fraction = |ms: u64| ms as f32 / total as f32;
+    let mut segments = vec![
+        QueryTimingSegment {
+            label: "Waiting for connection",
+            ms: timing.pool_wait_ms,
+            fraction: fraction(timing.pool_wait_ms),
+        },
+        QueryTimingSegment {
+            label: "Executing",
+            ms: timing.execute_ms,
+            fraction: fraction(timing.execute_ms),
+        },
+    ];
+    if let Some(streaming_ms) = timing.streaming_ms {
+        segments.push(QueryTimingSegment {
+            label: "Streaming rows",
+            ms: streaming_ms,
+            fraction: fraction(streaming_ms),
+        });
+    }
+    Some(segments)
+}
+
+/// Tooltip text naming every measured phase, e.g.
+/// "Waiting for connection: 2ms · Executing: 8ms · Streaming rows: 15ms".
+fn format_query_timing_tooltip(segments: &[QueryTimingSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| format!("{}: {}ms", segment.label, segment.ms))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Color for the Nth segment of the breakdown bar, cycling if there were ever
+/// more segments than colors. Muted-to-accent progression reads as "waiting"
+/// (passive) through "streaming" (active), matching phase order.
+fn query_timing_segment_color(index: usize) -> Color {
+    const COLORS: [Color; 3] = [Color::Muted, Color::Accent, Color::Success];
+    COLORS[index % COLORS.len()]
+}
+
+/// The small stacked-bar affordance next to a query's elapsed time, when the
+/// provider measured a phase breakdown. Absent entirely (not a plain bar with
+/// one segment) when `result.timing` is `None`, so a provider that only ever
+/// measures the total never implies a breakdown that does not exist.
+fn render_query_timing_bar(timing: &QueryTiming, cx: &App) -> Option<AnyElement> {
+    let segments = query_timing_segments(timing)?;
+    let tooltip = format_query_timing_tooltip(&segments);
+    Some(
+        div()
+            .id("query-timing-bar")
+            .flex()
+            .flex_row()
+            .h(px(8.))
+            .w(px(28.))
+            .rounded_sm()
+            .overflow_hidden()
+            .children(segments.iter().enumerate().map(|(index, segment)| {
+                div()
+                    .h_full()
+                    .w(relative(segment.fraction))
+                    .bg(query_timing_segment_color(index).color(cx))
+            }))
+            .tooltip(Tooltip::text(tooltip))
+            .into_any_element(),
+    )
 }
 
 // Length-bounded preview of a cell value. Iterates at most
@@ -734,6 +823,43 @@ enum SpecialResult {
     ExplainPlan,
 }
 
+// The two ways to look at a MongoDB document result: a flat grid (documents
+// projected into columns) or the documents themselves, pretty-printed. Only
+// meaningful when `QueryResult::raw_documents` is populated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MongoResultView {
+    Table,
+    Documents,
+}
+
+// Picks the view a fresh Mongo result should open in, from its shape alone:
+// a document missing a field that its siblings have produces a `None` cell
+// once projected into columns (see `documents_to_query_result` in
+// mongo_provider.rs), so any `None` cell means the documents aren't all
+// shaped alike and read better as documents than as a table with holes.
+fn default_mongo_view_for_result(result: &QueryResult) -> MongoResultView {
+    let ragged = result
+        .rows
+        .iter()
+        .any(|row| row.iter().any(|cell| cell.is_none()));
+    if ragged {
+        MongoResultView::Documents
+    } else {
+        MongoResultView::Table
+    }
+}
+
+// Joins each document's pretty-printed text (already mongosh-shell-style, see
+// `bson_document_pretty_text` in mongo_provider.rs) into one block, in row
+// order, with a blank line between documents the way a shell session prints
+// consecutive results.
+fn mongo_documents_display_text(result: &QueryResult) -> String {
+    match result.raw_documents.as_deref() {
+        Some(documents) if !documents.is_empty() => documents.join("\n\n"),
+        _ => String::new(),
+    }
+}
+
 // Skips leading whitespace and SQL comments so the first keyword can be matched.
 fn sql_effective_start(sql: &str) -> &str {
     let mut rest = sql.trim_start();
@@ -1034,6 +1160,17 @@ pub struct ResultView {
     result_generation: u64,
     // The generation the cached special view was built for.
     special_built_for: Option<u64>,
+    // The user's Table/Documents choice for a MongoDB document result (see
+    // `raw_documents` on `QueryResult`). `None` picks the default from the
+    // result's shape instead of a fixed value; set on toggle, reset with the
+    // rest of the special-view state whenever a new result arrives.
+    mongo_view_override: Option<MongoResultView>,
+    // Lazily-built read-only editor showing the current result's documents
+    // as pretty-printed BSON/JSON, one per row, in the Documents view.
+    mongo_documents_view: Option<Entity<Editor>>,
+    // The generation `mongo_documents_view` was built for, mirroring
+    // `special_built_for`.
+    mongo_documents_built_for: Option<u64>,
     // Bumped by `begin_request` every time a new query is dispatched into this
     // view. A caller that awaits a query's result compares the token it got
     // back against `is_current_request` before applying that result, so an
@@ -1263,6 +1400,9 @@ impl ResultView {
             explain_view: None,
             result_generation: 0,
             special_built_for: None,
+            mongo_view_override: None,
+            mongo_documents_view: None,
+            mongo_documents_built_for: None,
             active_request: 0,
         }
     }
@@ -2324,6 +2464,9 @@ impl ResultView {
         self.ddl_view = None;
         self.explain_view = None;
         self.special_built_for = None;
+        self.mongo_view_override = None;
+        self.mongo_documents_view = None;
+        self.mongo_documents_built_for = None;
     }
 
     // The formatted view to show for the current result, or None to fall back to
@@ -2470,6 +2613,139 @@ impl ResultView {
                                 cx.notify();
                             })),
                     ),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
+    // The view to show for the current result if it's Mongo document-shaped,
+    // or None for every other result (nothing to toggle).
+    fn active_mongo_view(&self) -> Option<MongoResultView> {
+        let result = self.result.as_ref()?;
+        result.raw_documents.as_ref()?;
+        Some(
+            self.mongo_view_override
+                .unwrap_or_else(|| default_mongo_view_for_result(result)),
+        )
+    }
+
+    fn set_mongo_view(&mut self, mode: MongoResultView, cx: &mut Context<Self>) {
+        self.mongo_view_override = Some(mode);
+        cx.notify();
+    }
+
+    // Builds (once per result) the read-only editor backing the Documents
+    // view. Runs in render(), where a Window is available, mirroring
+    // `sync_special_view`.
+    fn sync_mongo_documents_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_mongo_view() != Some(MongoResultView::Documents)
+            || self.mongo_documents_built_for == Some(self.result_generation)
+        {
+            return;
+        }
+        let Some(result) = self.result.clone() else {
+            return;
+        };
+        let text = mongo_documents_display_text(&result);
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_show_gutter(false, cx);
+            editor.disable_expand_excerpt_buttons(cx);
+            editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
+            editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.disable_mouse_wheel_zoom();
+            editor.set_text(text, window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+        self.mongo_documents_view = Some(editor);
+        self.mongo_documents_built_for = Some(self.result_generation);
+    }
+
+    // The Table/Documents toggle chips, shared between the Documents view's
+    // own header and the grid toolbar (so either view can flip to the other).
+    fn render_mongo_view_toggle(
+        &self,
+        mode: MongoResultView,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(
+                div().debug_selector(|| "mongo-view-table".into()).child(
+                    Button::new("mongo-view-table", "Table")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .toggle_state(mode == MongoResultView::Table)
+                        .tooltip(Tooltip::text("Show documents projected into columns"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_mongo_view(MongoResultView::Table, cx);
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mongo-view-documents".into())
+                    .child(
+                        Button::new("mongo-view-documents", "Documents")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .toggle_state(mode == MongoResultView::Documents)
+                            .tooltip(Tooltip::text("Show documents as pretty-printed BSON/JSON"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_mongo_view(MongoResultView::Documents, cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_mongo_documents_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(result) = self.result.as_ref() else {
+            return div().into_any_element();
+        };
+        let total_rows = result.rows.len();
+        let status = format!(
+            "{} document{}",
+            total_rows,
+            if total_rows == 1 { "" } else { "s" }
+        );
+        let mode = self
+            .active_mongo_view()
+            .unwrap_or(MongoResultView::Documents);
+        let body = self
+            .mongo_documents_view
+            .clone()
+            .map(|editor| {
+                div()
+                    .id("mongo-documents-view")
+                    .debug_selector(|| "MONGO_DOCUMENTS_VIEW".to_string())
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .p_2()
+                    .child(editor)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| div().flex_1().into_any_element());
+
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new(status)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(self.render_mongo_view_toggle(mode, cx)),
             )
             .child(body)
             .into_any_element()
@@ -4708,6 +4984,8 @@ impl ResultView {
             rows,
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -4941,6 +5219,8 @@ impl ResultView {
                 .collect(),
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         })
     }
 
@@ -5347,13 +5627,17 @@ impl ResultView {
         let ms = result.execution_time_ms;
 
         let row_summary = format!(
-            "{} row{} · {} col{} · {}ms",
+            "{} row{} · {} col{}",
             total_rows,
             if total_rows == 1 { "" } else { "s" },
             total_cols,
             if total_cols == 1 { "" } else { "s" },
-            ms,
         );
+        let elapsed_label = format!("{ms}ms");
+        let timing_bar = result
+            .timing
+            .as_ref()
+            .and_then(|timing| render_query_timing_bar(timing, cx));
 
         let col_summary = self.selected_cell.and_then(|(_, col_idx)| {
             if col_idx < total_cols {
@@ -5402,6 +5686,17 @@ impl ResultView {
                     Label::new(row_summary)
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .when_some(timing_bar, |el, bar| el.child(bar))
+                        .child(
+                            Label::new(elapsed_label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
                 )
                 .when_some(fk_button, |el, (label, tip)| {
                     el.child(
@@ -6443,6 +6738,7 @@ impl ResultView {
         let record_view_open = self.record_view_open;
         let quick_doc_open = self.quick_doc_open;
         let history_open = self.history_open;
+        let mongo_mode = self.active_mongo_view();
         let transposed = self.transposed;
         let chart_open = self.chart_open;
         let heatmap_enabled = self.heatmap_enabled;
@@ -6740,6 +7036,10 @@ impl ResultView {
                                 this.toggle_column_list(cx);
                             })),
                     )
+                    .when_some(mongo_mode, |el, mode| {
+                        el.child(Divider::vertical())
+                            .child(self.render_mongo_view_toggle(mode, cx))
+                    })
                     .child(Divider::vertical())
                     .child(
                         PopoverMenu::new("view-dropdown")
@@ -10254,6 +10554,7 @@ impl Render for ResultView {
         }
         self.sync_value_editor(window, cx);
         self.sync_special_view(window, cx);
+        self.sync_mongo_documents_view(window, cx);
         let filter_bar = self.render_filter_bar(cx);
         let content = if self.is_loading {
             div()
@@ -10271,6 +10572,8 @@ impl Render for ResultView {
         } else if self.result.is_some() {
             if self.active_special() != SpecialResult::None {
                 self.render_special_view(cx).into_any_element()
+            } else if self.active_mongo_view() == Some(MongoResultView::Documents) {
+                self.render_mongo_documents_view(cx).into_any_element()
             } else {
                 // Borrow the result (do NOT clone it): cloning the whole result
                 // set on every scroll frame is a large per-frame cost on big
@@ -10621,6 +10924,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn query_timing_segments_is_none_without_any_measured_time() {
+        let timing = QueryTiming {
+            pool_wait_ms: 0,
+            execute_ms: 0,
+            streaming_ms: None,
+        };
+        assert!(query_timing_segments(&timing).is_none());
+    }
+
+    #[test]
+    fn query_timing_segments_omits_streaming_when_not_measured() {
+        let timing = QueryTiming {
+            pool_wait_ms: 2,
+            execute_ms: 8,
+            streaming_ms: None,
+        };
+        let segments = query_timing_segments(&timing).expect("non-zero total");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].label, "Waiting for connection");
+        assert_eq!(segments[0].ms, 2);
+        assert_eq!(segments[1].label, "Executing");
+        assert_eq!(segments[1].ms, 8);
+    }
+
+    #[test]
+    fn query_timing_segments_includes_streaming_when_measured() {
+        let timing = QueryTiming {
+            pool_wait_ms: 2,
+            execute_ms: 8,
+            streaming_ms: Some(10),
+        };
+        let segments = query_timing_segments(&timing).expect("non-zero total");
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2].label, "Streaming rows");
+        assert_eq!(segments[2].ms, 10);
+    }
+
+    #[test]
+    fn query_timing_segments_fractions_sum_to_the_whole_bar() {
+        let timing = QueryTiming {
+            pool_wait_ms: 3,
+            execute_ms: 5,
+            streaming_ms: Some(12),
+        };
+        let segments = query_timing_segments(&timing).expect("non-zero total");
+        let total_fraction: f32 = segments.iter().map(|segment| segment.fraction).sum();
+        assert!(
+            (total_fraction - 1.0).abs() < 0.0001,
+            "expected the segment fractions to sum to 1.0, got {total_fraction}"
+        );
+    }
+
+    #[test]
+    fn format_query_timing_tooltip_names_every_present_phase() {
+        let timing = QueryTiming {
+            pool_wait_ms: 2,
+            execute_ms: 8,
+            streaming_ms: Some(15),
+        };
+        let segments = query_timing_segments(&timing).expect("non-zero total");
+        let tooltip = format_query_timing_tooltip(&segments);
+        assert_eq!(
+            tooltip,
+            "Waiting for connection: 2ms · Executing: 8ms · Streaming rows: 15ms"
+        );
+    }
+
+    #[test]
+    fn format_query_timing_tooltip_omits_streaming_when_absent() {
+        let timing = QueryTiming {
+            pool_wait_ms: 1,
+            execute_ms: 4,
+            streaming_ms: None,
+        };
+        let segments = query_timing_segments(&timing).expect("non-zero total");
+        let tooltip = format_query_timing_tooltip(&segments);
+        assert_eq!(tooltip, "Waiting for connection: 1ms · Executing: 4ms");
+        assert!(!tooltip.contains("Streaming"));
+    }
+
     #[gpui::test]
     fn clicking_the_copy_button_on_a_query_error_puts_the_full_message_on_the_clipboard(
         cx: &mut gpui::TestAppContext,
@@ -10698,6 +11082,8 @@ mod tests {
             )]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
 
         assert_eq!(
@@ -11167,6 +11553,8 @@ mod tests {
             rows,
             rows_affected: total as u64,
             execution_time_ms: 1,
+            timing: None,
+            raw_documents: None,
         };
 
         let window = cx.add_window(|_window, cx| ResultView::new("perf", cx));
@@ -11396,6 +11784,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let html = ResultView::export_html(&result);
         assert!(html.contains("<th>a</th>"));
@@ -11420,6 +11810,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let sql = ResultView::export_sql_update(&result, "users");
         assert!(sql.contains("UPDATE users SET name = 'alice', val = NULL WHERE id = 1;"));
@@ -11436,6 +11828,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let sql = ResultView::export_sql_multi_insert(&result, "users", '`');
         assert_eq!(
@@ -11456,6 +11850,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let bytes = ResultView::export_xlsx(&result).expect("xlsx export should succeed");
 
@@ -11499,6 +11895,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -11574,6 +11972,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let series = ResultView::chart_series(&result, Some(0), 1);
         assert_eq!(
@@ -11756,6 +12156,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("test", cx);
@@ -11805,6 +12207,8 @@ mod tests {
             ]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("test", cx);
@@ -11848,6 +12252,45 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        }
+    }
+
+    // Every document shares the same top-level fields, so no cell is `None`
+    // once projected into columns.
+    fn mongo_homogeneous_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["_id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("Ada".to_string())],
+                vec![Some("2".to_string()), Some("Grace".to_string())],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: Some(vec![
+                "{ \"_id\": 1, \"name\": \"Ada\" }".to_string(),
+                "{ \"_id\": 2, \"name\": \"Grace\" }".to_string(),
+            ]),
+        }
+    }
+
+    // The second document lacks "extra", so its projected cell is `None`.
+    fn mongo_ragged_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["_id".to_string(), "extra".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("yes".to_string())],
+                vec![Some("2".to_string()), None],
+            ],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: Some(vec![
+                "{ \"_id\": 1, \"extra\": \"yes\" }".to_string(),
+                "{ \"_id\": 2 }".to_string(),
+            ]),
         }
     }
 
@@ -11865,6 +12308,8 @@ mod tests {
             rows,
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -11961,6 +12406,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -12119,6 +12566,58 @@ mod tests {
     }
 
     #[test]
+    fn default_mongo_view_picks_table_for_a_homogeneous_result() {
+        use super::{MongoResultView, default_mongo_view_for_result};
+        assert_eq!(
+            default_mongo_view_for_result(&mongo_homogeneous_result()),
+            MongoResultView::Table
+        );
+    }
+
+    #[test]
+    fn default_mongo_view_picks_documents_for_a_ragged_result() {
+        use super::{MongoResultView, default_mongo_view_for_result};
+        assert_eq!(
+            default_mongo_view_for_result(&mongo_ragged_result()),
+            MongoResultView::Documents
+        );
+    }
+
+    #[test]
+    fn default_mongo_view_picks_table_for_an_empty_result() {
+        use super::{MongoResultView, default_mongo_view_for_result};
+        let result = QueryResult {
+            columns: vec!["_id".to_string()],
+            rows: vec![],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: Some(vec![]),
+        };
+        assert_eq!(
+            default_mongo_view_for_result(&result),
+            MongoResultView::Table
+        );
+    }
+
+    #[test]
+    fn mongo_documents_display_text_joins_documents_with_a_blank_line_in_row_order() {
+        use super::mongo_documents_display_text;
+        let result = mongo_homogeneous_result();
+        let text = mongo_documents_display_text(&result);
+        assert_eq!(
+            text,
+            "{ \"_id\": 1, \"name\": \"Ada\" }\n\n{ \"_id\": 2, \"name\": \"Grace\" }"
+        );
+    }
+
+    #[test]
+    fn mongo_documents_display_text_is_empty_for_a_non_document_result() {
+        use super::mongo_documents_display_text;
+        assert_eq!(mongo_documents_display_text(&sample_table_result()), "");
+    }
+
+    #[test]
     fn ddl_text_from_result_picks_create_column_then_last() {
         use super::ddl_text_from_result;
         let with_create = QueryResult {
@@ -12129,6 +12628,8 @@ mod tests {
             ]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         assert_eq!(
             ddl_text_from_result(&with_create).as_deref(),
@@ -12139,6 +12640,8 @@ mod tests {
             rows: vec![vec![Some("x".to_string()), Some("y".to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         assert_eq!(ddl_text_from_result(&without_create).as_deref(), Some("y"));
     }
@@ -12153,6 +12656,8 @@ mod tests {
             ]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (_window, _view, mut cx) = plain_result_window(cx, result);
         assert!(
@@ -12175,6 +12680,8 @@ mod tests {
                 ],
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             };
             view.set_result(result, cx);
             view
@@ -12192,6 +12699,74 @@ mod tests {
         let (_window, _view, mut cx) = plain_result_window(cx, sample_table_result());
         assert!(cx.debug_bounds("DDL_RESULT_VIEW").is_none());
         assert!(cx.debug_bounds("EXPLAIN_PLAN_VIEW").is_none());
+    }
+
+    #[gpui::test]
+    fn mongo_ragged_result_opens_in_documents_view_by_default(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = plain_result_window(cx, mongo_ragged_result());
+        assert!(
+            cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_some(),
+            "a ragged Mongo result must open as documents, not a table with holes"
+        );
+        assert!(cx.debug_bounds("CELL-0-0").is_none());
+    }
+
+    #[gpui::test]
+    fn mongo_homogeneous_result_opens_in_table_view_by_default(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = plain_result_window(cx, mongo_homogeneous_result());
+        assert!(
+            cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_none(),
+            "a homogeneous Mongo result must open as a table by default"
+        );
+        assert!(cx.debug_bounds("CELL-0-0").is_some());
+    }
+
+    #[gpui::test]
+    fn mongo_view_toggle_is_absent_for_non_mongo_results(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = plain_result_window(cx, sample_table_result());
+        assert!(cx.debug_bounds("mongo-view-table").is_none());
+        assert!(cx.debug_bounds("mongo-view-documents").is_none());
+    }
+
+    #[gpui::test]
+    fn clicking_table_toggle_switches_a_ragged_mongo_result_to_the_grid(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _view, mut cx) = plain_result_window(cx, mongo_ragged_result());
+        assert!(cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_some());
+
+        let target = cx
+            .debug_bounds("mongo-view-table")
+            .map(|bounds| bounds.center())
+            .expect("the Table toggle should render in the Documents view header");
+        cx.simulate_click(target, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("CELL-0-0").is_some(),
+            "clicking Table must switch a ragged Mongo result to the grid"
+        );
+        assert!(cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_none());
+    }
+
+    #[gpui::test]
+    fn clicking_documents_toggle_switches_a_homogeneous_mongo_result_to_documents(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _view, mut cx) = plain_result_window(cx, mongo_homogeneous_result());
+        assert!(cx.debug_bounds("CELL-0-0").is_some());
+
+        let target = cx
+            .debug_bounds("mongo-view-documents")
+            .map(|bounds| bounds.center())
+            .expect("the Documents toggle should render in the grid toolbar");
+        cx.simulate_click(target, gpui::Modifiers::none());
+        draw_result_view(window, &mut cx);
+
+        assert!(
+            cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_some(),
+            "clicking Documents must switch a homogeneous Mongo result to the documents view"
+        );
     }
 
     #[gpui::test]
@@ -12602,6 +13177,8 @@ mod tests {
             rows: vec![vec![Some(ddl.to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
         let cell_center = debug_center(&mut cx, "CELL-0-0");
@@ -12633,6 +13210,8 @@ mod tests {
             rows: vec![vec![Some(ddl.to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
         let cell_center = debug_center(&mut cx, "CELL-0-0");
@@ -12667,6 +13246,8 @@ mod tests {
             rows: vec![vec![Some(ddl.to_string()), Some("x".to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
         let cell_center = debug_center(&mut cx, "CELL-0-0");
@@ -13324,6 +13905,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let display_order = [0, 1, 2, 3];
         let summary = ResultView::compute_column_aggregates(&result, 0, &display_order);
@@ -13361,6 +13944,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
         view.update(&mut cx, |view, _| assert!(view.sort_columns.is_empty()));
@@ -13405,6 +13990,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
 
@@ -13488,6 +14075,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (window, view, mut cx) = plain_result_window(cx, result);
 
@@ -13539,6 +14128,8 @@ mod tests {
             ]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (_window, _view, mut cx) = table_backed_result_window_with(cx, result);
         // The outer CELL bounds are pinned to GRID_ROW_H and clip overflow, so they
@@ -13630,6 +14221,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (_window, view, mut cx) = table_backed_result_window_with(cx, result);
         view.update(&mut cx, |view, _| {
@@ -13679,6 +14272,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let (_window, view, mut cx) = table_backed_result_window_with(cx, result);
         view.update(&mut cx, |view, _| {
@@ -14374,6 +14969,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("test", cx);
@@ -14414,6 +15011,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("test", cx);
@@ -14448,6 +15047,8 @@ mod tests {
             rows: vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         };
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("test", cx);
@@ -14591,6 +15192,8 @@ mod tests {
                 rows: Vec::new(),
                 rows_affected: 0,
                 execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
             })
         }
         async fn get_table_ddl(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
@@ -14955,7 +15558,9 @@ mod tests {
     // unrelated jump to a different table via `run_sql`, not `set_query_result`
     // -- it needs the identical hidden-columns reset for the same reason.
     #[gpui::test]
-    fn run_sql_clears_hidden_columns_from_a_previous_unrelated_query(cx: &mut gpui::TestAppContext) {
+    fn run_sql_clears_hidden_columns_from_a_previous_unrelated_query(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (_window, view, mut cx) = table_backed_result_window(cx);
         let connection_id = uuid::Uuid::new_v4();
         view.update(&mut cx, |view, cx| {
@@ -15036,6 +15641,8 @@ mod tests {
                 .collect(),
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -15386,6 +15993,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -15398,6 +16007,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -16036,6 +16647,8 @@ mod tests {
             ],
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 

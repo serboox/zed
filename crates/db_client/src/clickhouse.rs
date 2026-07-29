@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::time::Instant;
 
+use crate::MAX_RESULT_ROWS;
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
 use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
-use crate::MAX_RESULT_ROWS;
 
 pub struct ClickHouseProvider {
     client: reqwest::Client,
@@ -362,18 +362,22 @@ impl DbProvider for ClickHouseProvider {
                 .collect();
             let rows_affected = rows.len() as u64;
             Ok(QueryResult {
+                raw_documents: None,
                 columns,
                 rows,
                 rows_affected,
                 execution_time_ms,
+                timing: None,
             })
         } else {
             let rows_affected = self.execute_dml(&prefixed, db_opt).await?;
             Ok(QueryResult {
+                raw_documents: None,
                 columns: vec![],
                 rows: vec![],
                 rows_affected,
                 execution_time_ms: start.elapsed().as_millis() as u64,
+                timing: None,
             })
         }
     }

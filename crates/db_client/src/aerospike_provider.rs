@@ -373,10 +373,12 @@ impl DbProvider for AerospikeProvider {
         }
 
         Ok(QueryResult {
+            raw_documents: None,
             columns,
             rows,
             rows_affected: 0,
             execution_time_ms: 0,
+            timing: None,
         })
     }
 }
