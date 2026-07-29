@@ -266,6 +266,30 @@ impl MySqlProvider {
     }
 }
 
+/// Renders one cell as the text a reader sees. The order is load-bearing.
+///
+/// MySQL has no boolean type of its own -- `BOOL` is an alias for `TINYINT(1)`
+/// -- and sqlx accepts a `bool` decode for *every* integer width, unsigned
+/// included, while refusing an `i64` decode for an unsigned column. A `bool`
+/// attempt anywhere before the unsigned integers therefore renders every
+/// unsigned number, `smallint unsigned` counters and `bigint unsigned` ids
+/// alike, as `true`/`false`. Since a number cannot be told apart from a flag
+/// here, a number is always shown as a number.
+fn cell_to_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<String> {
+    row.try_get::<Option<String>, _>(index)
+        .ok()
+        .flatten()
+        .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
+        .or_else(|| row.try_get::<u64, _>(index).ok().map(|v| v.to_string()))
+        .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
+        .or_else(|| {
+            row.try_get::<Option<Vec<u8>>, _>(index)
+                .ok()
+                .flatten()
+                .map(bytes_to_string)
+        })
+}
+
 // MySQL reports string columns from SHOW/information_schema with a binary
 // collation on some servers, so sqlx types them as VARBINARY and a direct
 // String decode fails. Reading the raw bytes works for both VARCHAR and
@@ -592,20 +616,7 @@ impl DbProvider for MySqlProvider {
                 }
 
                 let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| {
-                        row.try_get::<Option<String>, _>(index)
-                            .ok()
-                            .flatten()
-                            .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
-                            .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
-                            .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
-                            .or_else(|| {
-                                row.try_get::<Option<Vec<u8>>, _>(index)
-                                    .ok()
-                                    .flatten()
-                                    .map(bytes_to_string)
-                            })
-                    })
+                    .map(|index| cell_to_string(&row, index))
                     .collect();
                 result_rows.push(decoded);
 
@@ -715,20 +726,7 @@ impl DbProvider for MySqlProvider {
             }
 
             let decoded: Vec<Option<String>> = (0..columns.len())
-                .map(|index| {
-                    row.try_get::<Option<String>, _>(index)
-                        .ok()
-                        .flatten()
-                        .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
-                        .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
-                        .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
-                        .or_else(|| {
-                            row.try_get::<Option<Vec<u8>>, _>(index)
-                                .ok()
-                                .flatten()
-                                .map(bytes_to_string)
-                        })
-                })
+                .map(|index| cell_to_string(&row, index))
                 .collect();
             sink.write_row(&decoded)?;
             row_count += 1;
@@ -985,6 +983,90 @@ mod integration_tests {
             auto_connect: false,
             ..ConnectionConfig::default()
         })
+    }
+
+    /// An unsigned column is a number, and has to read as one. sqlx refuses an
+    /// `i64` decode for an unsigned column but accepts a `bool` decode for every
+    /// integer width, so any `bool` attempt before the unsigned integers turns
+    /// counters and ids into `true`/`false`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_unsigned_columns_read_as_numbers() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        provider
+            .execute_query("", "DROP TABLE IF EXISTS zed_unsigned_probe")
+            .await
+            .expect("failed to drop the probe table");
+        provider
+            .execute_query(
+                "",
+                "CREATE TABLE zed_unsigned_probe (\
+                   ci smallint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY,\
+                   tiny tinyint unsigned NOT NULL,\
+                   big bigint unsigned NOT NULL,\
+                   signed_small smallint NOT NULL,\
+                   flagish tinyint(1) NOT NULL\
+                 )",
+            )
+            .await
+            .expect("failed to create the probe table");
+        provider
+            .execute_query(
+                "",
+                "INSERT INTO zed_unsigned_probe (ci, tiny, big, signed_small, flagish) \
+                 VALUES (7, 1, 18446744073709551615, -3, 1), (8, 0, 0, 0, 0)",
+            )
+            .await
+            .expect("failed to seed the probe table");
+
+        let result = provider
+            .execute_query(
+                "",
+                "SELECT ci, tiny, big, signed_small, flagish FROM zed_unsigned_probe ORDER BY ci",
+            )
+            .await
+            .expect("failed to read the probe table");
+
+        provider
+            .execute_query("", "DROP TABLE zed_unsigned_probe")
+            .await
+            .expect("failed to drop the probe table");
+
+        let rendered: Vec<Vec<String>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.clone().unwrap_or_else(|| "NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                vec![
+                    "7".to_string(),
+                    "1".to_string(),
+                    "18446744073709551615".to_string(),
+                    "-3".to_string(),
+                    "1".to_string(),
+                ],
+                vec![
+                    "8".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                ],
+            ],
+            "every number has to read as a number, flags included"
+        );
     }
 
     #[tokio::test]
@@ -1359,9 +1441,9 @@ mod integration_tests {
         let error =
             result.expect_err("expected the query to fail once the connection froze in flight");
         assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("Query results stopped streaming")),
+            error.chain().any(|cause| cause
+                .to_string()
+                .contains("Query results stopped streaming")),
             "expected the row-fetch timeout's own error context in the chain, got: {error:#}"
         );
         assert!(
