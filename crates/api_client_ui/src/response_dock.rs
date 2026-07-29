@@ -185,6 +185,15 @@ impl ResponseDockPanel {
     }
 
 
+    /// Switching tabs starts at the top: the offset left over from the tab
+    /// before it belongs to content that is no longer on screen, and would hide
+    /// the first lines of what is.
+    fn show_tab(&mut self, tab: ResponseTab, cx: &mut Context<Self>) {
+        self.response_tab = tab;
+        self.scroll_handle.set_offset(gpui::Point::default());
+        cx.notify();
+    }
+
     /// Claims the dock for a send that is starting. Requests finish in whatever
     /// order the network answers, so every later update carries this number and
     /// an older one is ignored -- otherwise a slow first request would land on
@@ -286,8 +295,14 @@ impl Render for ResponseDockPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().colors().border;
         let background = cx.theme().colors().background;
-        let line_height = window.line_height();
         let response_tab = self.response_tab;
+        // A reply's body is shown in an editor, which scrolls itself; every other
+        // tab is a plain list that needs this view to scroll it.
+        let body_scrolls_itself = matches!(self.display, ResponseDockDisplay::Success(_))
+            && matches!(
+                response_tab,
+                ResponseTab::Pretty | ResponseTab::Preview | ResponseTab::Raw
+            );
 
         let content: AnyElement = match &self.display {
             ResponseDockDisplay::Idle => {
@@ -373,8 +388,7 @@ impl Render for ResponseDockPanel {
                     response_tab == ResponseTab::Pretty,
                     cx,
                     |this, _, _, cx| {
-                        this.response_tab = ResponseTab::Pretty;
-                        cx.notify();
+                        this.show_tab(ResponseTab::Pretty, cx);
                     },
                 ));
                 if entry.response_is_html {
@@ -383,8 +397,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::Preview,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::Preview;
-                            cx.notify();
+                            this.show_tab(ResponseTab::Preview, cx);
                         },
                     ));
                 }
@@ -394,8 +407,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::Raw,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::Raw;
-                            cx.notify();
+                            this.show_tab(ResponseTab::Raw, cx);
                         },
                     ))
                     .child(Self::render_tab_chip(
@@ -403,8 +415,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::Headers,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::Headers;
-                            cx.notify();
+                            this.show_tab(ResponseTab::Headers, cx);
                         },
                     ))
                     .child(Self::render_tab_chip(
@@ -412,8 +423,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::Cookies,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::Cookies;
-                            cx.notify();
+                            this.show_tab(ResponseTab::Cookies, cx);
                         },
                     ));
                 if !entry.test_results.is_empty() {
@@ -422,8 +432,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::TestResults,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::TestResults;
-                            cx.notify();
+                            this.show_tab(ResponseTab::TestResults, cx);
                         },
                     ));
                 }
@@ -433,8 +442,7 @@ impl Render for ResponseDockPanel {
                         response_tab == ResponseTab::Visualize,
                         cx,
                         |this, _, _, cx| {
-                            this.response_tab = ResponseTab::Visualize;
-                            cx.notify();
+                            this.show_tab(ResponseTab::Visualize, cx);
                         },
                     ));
                 }
@@ -508,13 +516,22 @@ impl Render for ResponseDockPanel {
                                     .color(Color::Muted),
                             );
                         }
-                        let line_count = editor.read(cx).text(cx).lines().count().max(1);
-                        let content_height = line_height * line_count as f32 + px(24.);
+                        // The editor fills what is left and scrolls itself. Sizing
+                        // this box to a guess at the text's height instead would
+                        // leave the editor clipped and scrolling inside a box that
+                        // barely scrolls, so the visible thumb would crawl while
+                        // the body ran past the end.
                         column
+                            .min_h_0()
                             .child(
                                 div()
-                                    .flex_initial()
-                                    .h(content_height.max(px(120.)))
+                                    .flex_1()
+                                    .min_h_0()
+                                    // A dock dragged down to almost nothing must
+                                    // still show some of the reply rather than
+                                    // collapsing it away entirely.
+                                    .min_h(px(80.))
+                                    .debug_selector(|| "api-response-body".to_string())
                                     .px_2()
                                     .py_1p5()
                                     .rounded_md()
@@ -579,32 +596,52 @@ impl Render for ResponseDockPanel {
                     .into_any_element(),
                 };
 
-                v_flex()
+                let column = v_flex()
                     .gap_2()
                     .child(summary_row)
                     .child(tab_strip)
-                    .child(body)
-                    .into_any_element()
+                    .child(body);
+                // Held to the tab's height only when the body inside scrolls
+                // itself. A list has no scroller of its own, so it must be free
+                // to be taller than the tab -- that overflow is what gives this
+                // view something to scroll.
+                if body_scrolls_itself {
+                    column.flex_1().min_h_0().into_any_element()
+                } else {
+                    column.into_any_element()
+                }
             }
         };
 
-        v_flex()
+        let shell = v_flex()
             .id("api-response-dock")
             .debug_selector(|| "api-response-dock".to_string())
             .track_focus(&self.focus_handle)
             .size_full()
             .p_2()
-            .gap_2()
+            .gap_2();
+
+        // Only one thing scrolls at a time. A body shown in an editor scrolls
+        // itself, and its own scrollbar is the one that tracks the reply; the
+        // lists (headers, cookies, test results) have no scroller of their own,
+        // so this container is theirs.
+        let shell = shell
+            .min_h_0()
             .overflow_scroll()
             .track_scroll(&self.scroll_handle)
-            .child(content)
-            .custom_scrollbars(
-                Scrollbars::always_visible(ScrollAxes::Vertical)
-                    .tracked_scroll_handle(&self.scroll_handle),
-                window,
-                cx,
-            )
-            .into_any_element()
+            .child(content);
+        if body_scrolls_itself {
+            shell.into_any_element()
+        } else {
+            shell
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&self.scroll_handle),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+        }
     }
 }
 
@@ -740,6 +777,121 @@ mod tests {
             }
             _ => panic!("expected the dock to be showing the most recently sent response"),
         });
+    }
+
+    /// A long body must be shown in a box that fills the tab, so the editor's own
+    /// scrollbar tracks the whole reply. Sizing that box to a guess at the text's
+    /// height instead left the editor clipped and scrolling inside a container
+    /// that barely scrolled -- reaching the end of the body moved the visible
+    /// thumb a few percent.
+    #[gpui::test]
+    fn a_long_body_fills_the_tab_instead_of_a_guessed_height(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let dock = window.root(cx).unwrap();
+        let long_json: String = std::iter::repeat_n("  \"key\": \"value\",\n", 400).collect();
+        let editor = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    let mut editor = Editor::multi_line(window, cx);
+                    editor.set_text(long_json, window, cx);
+                    editor
+                })
+            })
+            .unwrap();
+
+        dock.update(cx, |dock, cx| {
+            let generation = dock.begin_send("Long".into(), cx);
+            dock.show_response(
+                generation,
+                DockResponseEntry {
+                    request_title: "Long".into(),
+                    response: sample_response(200),
+                    response_is_html: false,
+                    pretty_body_editor: editor.clone(),
+                    raw_body_editor: editor.clone(),
+                    preview_body_editor: editor.clone(),
+                    test_results: Vec::new(),
+                    visualize_data: None,
+                },
+                cx,
+            );
+        });
+
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let dock_bounds = cx
+            .debug_bounds("api-response-dock")
+            .expect("the dock paints");
+        let body_bounds = cx
+            .debug_bounds("api-response-body")
+            .expect("the body box paints");
+        assert!(
+            body_bounds.size.height <= dock_bounds.size.height,
+            "the body must not paint taller than the tab it lives in: {:?} vs {:?}",
+            body_bounds.size.height,
+            dock_bounds.size.height
+        );
+        assert!(
+            body_bounds.size.height > dock_bounds.size.height * 0.5,
+            "the body has to take the room left over, got {:?} of {:?}",
+            body_bounds.size.height,
+            dock_bounds.size.height
+        );
+        // Nothing for this view to scroll: the editor owns it, so its own
+        // scrollbar is the one that tracks the reply.
+        assert_eq!(
+            dock.read_with(cx, |dock, _| dock.scroll_handle.max_offset().y),
+            gpui::px(0.),
+            "the container must not offer a second, near-still scrollbar"
+        );
+    }
+
+    /// A list has no scroller of its own, so the tab must stay scrollable for it:
+    /// holding the content to the tab's height would leave the visible scrollbar
+    /// with nothing to travel over and the last headers unreachable.
+    #[gpui::test]
+    fn a_long_headers_list_keeps_the_tab_scrollable(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let dock = window.root(cx).unwrap();
+        let editor = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| Editor::multi_line(window, cx))
+            })
+            .unwrap();
+        let mut response = sample_response(200);
+        response.headers = (0..120)
+            .map(|index| (format!("x-header-{index}"), format!("value {index}")))
+            .collect();
+
+        dock.update(cx, |dock, cx| {
+            let generation = dock.begin_send("Headers".into(), cx);
+            dock.show_response(
+                generation,
+                DockResponseEntry {
+                    request_title: "Headers".into(),
+                    response,
+                    response_is_html: false,
+                    pretty_body_editor: editor.clone(),
+                    raw_body_editor: editor.clone(),
+                    preview_body_editor: editor.clone(),
+                    test_results: Vec::new(),
+                    visualize_data: None,
+                },
+                cx,
+            );
+            dock.show_tab(ResponseTab::Headers, cx);
+        });
+
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        assert!(
+            dock.read_with(cx, |dock, _| dock.scroll_handle.max_offset().y) > gpui::px(0.),
+            "a list taller than the tab has to leave this view something to scroll"
+        );
     }
 
     /// Requests finish in whatever order the network answers, and the dock shows

@@ -4083,7 +4083,13 @@ impl Render for RequestView {
                             "request-send-button",
                             if is_sending { "Sending..." } else { "Send" },
                         )
-                        .style(ButtonStyle::Filled)
+                        // Sending is the one thing this view exists for, so the
+                        // button carries the accent while everything around it
+                        // stays quiet.
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .size(ButtonSize::Large)
+                        .start_icon(Icon::new(IconName::PlayFilled).color(Color::Accent))
+                        .color(Color::Accent)
                         .disabled(is_sending)
                         .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
