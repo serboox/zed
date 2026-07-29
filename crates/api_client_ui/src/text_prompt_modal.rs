@@ -3,7 +3,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
 };
 use std::sync::Arc;
-use ui::prelude::*;
+use ui::{ElevationIndex, cyberpunk, prelude::*};
 use workspace::ModalView;
 
 /// A single-field text-input modal shared by every "give this a name" flow in
@@ -132,24 +132,31 @@ impl Render for TextPromptModal {
             .w(px(420.))
             .p_3()
             .gap_3()
-            .bg(cx.theme().colors().elevated_surface_background)
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .child(Label::new(self.title.clone()).size(LabelSize::Large))
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
+            .child(
+                div()
+                    .cyberpunk_monospace(cx)
+                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
+                    .text_size(HeadlineSize::Small.rems())
+                    .text_color(cyberpunk::text_primary())
+                    .child(self.title.to_uppercase()),
+            )
             .child(
                 div()
                     .p_2()
-                    .rounded_md()
+                    .rounded_none()
                     .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .bg(cx.theme().colors().editor_background)
+                    .border_color(cyberpunk::border_dim())
+                    .bg(cyberpunk::surface())
                     .child(self.editor.clone()),
             )
             .child(
                 h_flex().justify_end().gap_2().child(
                     Button::new("text-prompt-confirm", self.confirm_label.clone())
-                        .style(ButtonStyle::Filled)
+                        .style(ButtonStyle::OutlinedCustom(
+                            cyberpunk::Accent::Cyan.border(),
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                 ),
             )

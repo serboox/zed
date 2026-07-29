@@ -14,6 +14,7 @@ pub use ui_macros::RegisterComponent;
 
 pub use crate::DynamicSpacing;
 pub use crate::animation::{AnimationDirection, AnimationDuration, DefaultAnimations};
+pub use crate::cyberpunk::CyberpunkSurface;
 pub use crate::styles::{
     PlatformStyle, Severity, StyledTypography, TextSize, rems_from_px, vh, vw,
 };

@@ -34,7 +34,7 @@ use util::{
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
 use workspace::notifications::NotifyResultExt;
 use workspace::preview_appearance::{
-    PreviewAppearance, preview_appearance, set_preview_appearance,
+    observe_preview_appearance, preview_appearance, set_preview_appearance,
 };
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -78,7 +78,7 @@ pub struct MarkdownPreviewView {
     pending_update_task: Option<Task<Result<()>>>,
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
-    reading_appearance: PreviewAppearance,
+    _appearance_observation: Subscription,
     /// Zoom for the expanded diagram. `None` fits it to the view, which is what
     /// expanding is for; a number is the reader's own scale, kept separate so
     /// closing and reopening starts from the fitted size again.
@@ -331,7 +331,7 @@ impl MarkdownPreviewView {
                 pending_update_task: None,
                 hovered_url: None,
                 mode,
-                reading_appearance: preview_appearance(cx),
+                _appearance_observation: observe_preview_appearance(cx),
                 expanded_diagram_zoom: None,
             };
 
@@ -899,10 +899,10 @@ impl MarkdownPreviewView {
     }
 
     fn cycle_reading_appearance(&mut self, cx: &mut Context<Self>) {
-        self.reading_appearance = self.reading_appearance.next();
+        let next = preview_appearance(cx).next();
         // Remembered for every preview, not just this document: a reader who
         // wants light pages wants them for the next file too.
-        set_preview_appearance(self.reading_appearance, cx);
+        set_preview_appearance(next, cx);
         cx.notify();
     }
 
@@ -911,7 +911,7 @@ impl MarkdownPreviewView {
     /// placed bottom-right to leave the top-right corner to the split-preview
     /// layout switch.
     fn render_reading_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let appearance = self.reading_appearance;
+        let appearance = preview_appearance(cx);
         h_flex()
             .id("markdown-reading-controls")
             .absolute()
@@ -1090,7 +1090,7 @@ impl MarkdownPreviewView {
         // Diagrams are drawn into pictures, so they have to be told which colours
         // the document around them uses; otherwise a diagram keeps the editor
         // theme and clashes with a document painted some other way.
-        let diagram_palette = match self.reading_appearance.resolve() {
+        let diagram_palette = match preview_appearance(cx).resolve() {
             Some(appearance) => MermaidPalette::Github(appearance),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => MermaidPalette::Theme(theme),
@@ -1106,7 +1106,7 @@ impl MarkdownPreviewView {
         // right now"; otherwise a chosen `markdown_preview_theme` paints the
         // preview, and with neither the preview is a GitHub-flavored document
         // independent of the editor theme.
-        let markdown_style = match self.reading_appearance.resolve() {
+        let markdown_style = match preview_appearance(cx).resolve() {
             Some(appearance) => markdown::github_style_for_appearance(appearance, window, cx),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => MarkdownStyle::themed_with_overrides(
@@ -1594,7 +1594,7 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg_color = match self.reading_appearance.resolve() {
+        let bg_color = match preview_appearance(cx).resolve() {
             Some(appearance) => markdown::github_page_background(appearance),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => theme.colors().editor_background,

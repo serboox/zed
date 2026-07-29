@@ -5,7 +5,7 @@ use gpui::{
     Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Window,
     prelude::*,
 };
-use ui::{Checkbox, Divider, Tooltip, prelude::*};
+use ui::{Checkbox, Divider, ElevationIndex, Tooltip, cyberpunk, prelude::*};
 use util::ResultExt;
 use workspace::ModalView;
 
@@ -1008,9 +1008,9 @@ impl ModifyTableView {
                 self.table,
             );
             let receiver =
-                window.prompt(PromptLevel::Warning, &msg, None, &["Apply", "Cancel"], cx);
+                window.prompt(PromptLevel::Warning, &msg, None, &["Cancel", "Apply"], cx);
             cx.spawn_in(window, async move |this, cx| {
-                if receiver.await == Ok(0) {
+                if receiver.await == Ok(1) {
                     this.update(cx, |this, cx| this.run_statements(statements, cx))?;
                 }
                 anyhow::Ok(())
@@ -1258,7 +1258,8 @@ impl Render for ModifyTableView {
         v_flex()
             .key_context("ModifyTable")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .w(px(640.))
             .max_h(px(560.))
             .p_3()
@@ -1348,8 +1349,10 @@ impl Render for ModifyTableView {
                     .max_h(px(120.))
                     .overflow_y_scroll()
                     .p_2()
-                    .rounded_md()
-                    .bg(cx.theme().colors().editor_background)
+                    .rounded_none()
+                    .border_1()
+                    .border_color(cyberpunk::border_dim())
+                    .bg(cyberpunk::surface())
                     .font_family("monospace")
                     .child(Label::new(preview_text).size(LabelSize::Small)),
             )
@@ -1372,7 +1375,9 @@ impl Render for ModifyTableView {
                     )
                     .child(
                         Button::new("execute", "Execute")
-                            .style(ButtonStyle::Filled)
+                            .style(ButtonStyle::OutlinedCustom(
+                                cyberpunk::Accent::Cyan.border(),
+                            ))
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| this.execute(window, cx))),
                     ),

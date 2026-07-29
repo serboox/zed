@@ -13,6 +13,9 @@ use workspace::preview_appearance::PreviewAppearance;
 /// from this instead of calling `cx.theme()` directly.
 #[derive(Clone, Copy)]
 pub struct Palette {
+    /// Which way the page reads, so a colour that must differ between a light
+    /// and a dark page can be picked without asking the theme again.
+    pub appearance: Appearance,
     pub background: Hsla,
     pub surface_background: Hsla,
     pub elevated_surface_background: Hsla,
@@ -23,8 +26,6 @@ pub struct Palette {
     pub text: Hsla,
     pub text_muted: Hsla,
     pub accent: Hsla,
-    pub info: Hsla,
-    pub created: Hsla,
     pub warning: Hsla,
     pub warning_background: Hsla,
     pub error: Hsla,
@@ -36,6 +37,7 @@ impl Palette {
         let colors = theme.colors();
         let status = theme.status();
         Self {
+            appearance: theme.appearance(),
             background: colors.editor_background,
             surface_background: colors.surface_background,
             elevated_surface_background: colors.elevated_surface_background,
@@ -46,8 +48,6 @@ impl Palette {
             text: colors.text,
             text_muted: colors.text_muted,
             accent: colors.text_accent,
-            info: status.info,
-            created: status.created,
             warning: status.warning,
             warning_background: status.warning_background,
             error: status.error,
@@ -132,6 +132,7 @@ mod tests {
 
     fn sample_palette() -> Palette {
         Palette {
+            appearance: Appearance::Dark,
             background: hsla(0., 0., 0.1, 1.),
             surface_background: hsla(0., 0., 0.15, 1.),
             elevated_surface_background: hsla(0., 0., 0.2, 1.),
@@ -142,8 +143,6 @@ mod tests {
             text: hsla(0., 0., 0.9, 1.),
             text_muted: hsla(0., 0., 0.6, 1.),
             accent: hsla(0.55, 0.8, 0.6, 1.),
-            info: hsla(0.6, 0.8, 0.5, 1.),
-            created: hsla(0.3, 0.8, 0.5, 1.),
             warning: hsla(0.1, 0.8, 0.5, 1.),
             warning_background: hsla(0.1, 0.8, 0.15, 1.),
             error: hsla(0., 0.8, 0.5, 1.),

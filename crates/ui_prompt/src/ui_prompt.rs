@@ -7,7 +7,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
 use theme::ClientDecorationsExt;
 use theme_settings::ThemeSettings;
-use ui::{FluentBuilder, TintColor, prelude::*};
+use ui::{ElevationIndex, FluentBuilder, cyberpunk, prelude::*};
 use workspace::WorkspaceSettings;
 
 pub fn init(cx: &mut App) {
@@ -39,7 +39,7 @@ fn zed_prompt_renderer(
 ) -> RenderablePromptHandle {
     let renderer = cx.new({
         |cx| ZedPromptRenderer {
-            _level: level,
+            level,
             message: cx.new(|cx| Markdown::new(SharedString::new(message), None, None, cx)),
             actions: actions.iter().map(|a| a.label().to_string()).collect(),
             focus: cx.focus_handle(),
@@ -54,7 +54,7 @@ fn zed_prompt_renderer(
 }
 
 pub struct ZedPromptRenderer {
-    _level: PromptLevel,
+    level: PromptLevel,
     message: Entity<Markdown>,
     actions: Vec<String>,
     focus: FocusHandle,
@@ -111,6 +111,7 @@ impl ZedPromptRenderer {
 impl Render for ZedPromptRenderer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = ThemeSettings::get_global(cx);
+        let accent = cyberpunk::accent_for_prompt_level(self.level);
 
         let dialog = v_flex()
             .key_context("Prompt")
@@ -125,7 +126,8 @@ impl Render for ZedPromptRenderer {
             .w_80()
             .p_4()
             .gap_4()
-            .elevation_3(cx)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .overflow_hidden()
             .font_family(settings.ui_font.family.clone())
             .child(div().w_full().child(MarkdownElement::new(
@@ -146,7 +148,7 @@ impl Render for ZedPromptRenderer {
                             .full_width()
                             .style(ButtonStyle::Outlined)
                             .when(ix == self.active_action_id, |s| {
-                                s.style(ButtonStyle::Tinted(TintColor::Accent))
+                                s.style(ButtonStyle::OutlinedCustom(accent.border()))
                             })
                             .tab_index(ix as isize)
                             .on_click(cx.listener(move |_, _, _window, cx| {
@@ -186,9 +188,9 @@ fn markdown_style(main_message: bool, window: &Window, cx: &App) -> MarkdownStyl
     let font_size = settings.ui_font_size(cx).into();
 
     let color = if main_message {
-        Color::Default.color(cx)
+        cyberpunk::text_primary()
     } else {
-        Color::Muted.color(cx)
+        cyberpunk::text_secondary()
     };
 
     base_text_style.refine(&TextStyleRefinement {

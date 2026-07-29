@@ -41,6 +41,36 @@ pub struct TryItOutOverrides {
 /// written directly onto the matching row, and the body/auth header replace
 /// whatever placeholder was there. The result is ready for
 /// `resolve_and_build`.
+/// Header names whose value is a credential. Such a value is fine to send and
+/// must never be written into a collection, which lives on disk.
+const SECRET_HEADER_MARKERS: [&str; 6] = [
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "key",
+    "password",
+];
+
+/// True when a header carries something that must not be persisted.
+pub fn header_carries_a_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_HEADER_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+/// Strips from `overrides` everything that must not reach a saved collection:
+/// the Authorization field and any header parameter whose name says it carries a
+/// credential. What is left is what the reader typed and can safely be kept.
+pub fn without_secrets(mut overrides: TryItOutOverrides) -> TryItOutOverrides {
+    overrides.auth_header_value.clear();
+    overrides.parameters.retain(|parameter| {
+        parameter.location != "header" || !header_carries_a_secret(&parameter.name)
+    });
+    overrides
+}
+
 pub fn apply_overrides(
     mut request: Request,
     mut collection: Collection,
@@ -425,6 +455,54 @@ paths:
         let (text, truncated) = cap_and_render_body(&huge, "text/plain");
         assert!(truncated);
         assert_eq!(text.len(), MAX_RESPONSE_BODY_BYTES);
+    }
+
+    #[test]
+    fn a_credential_header_never_survives_into_a_saved_request() {
+        assert!(header_carries_a_secret("Authorization"));
+        assert!(header_carries_a_secret("X-API-Key"));
+        assert!(header_carries_a_secret("Proxy-Authorization"));
+        assert!(header_carries_a_secret("Cookie"));
+        assert!(header_carries_a_secret("X-Session-Token"));
+        assert!(!header_carries_a_secret("Accept-Language"));
+        assert!(!header_carries_a_secret("X-Trace-Id"));
+
+        let stripped = without_secrets(TryItOutOverrides {
+            server_url: "https://example.com".to_string(),
+            auth_header_value: "Bearer sensitive".to_string(),
+            body_text: None,
+            parameters: vec![
+                ParameterOverride {
+                    name: "X-Api-Key".to_string(),
+                    location: "header".to_string(),
+                    required: true,
+                    value: "sensitive".to_string(),
+                },
+                ParameterOverride {
+                    name: "X-Trace-Id".to_string(),
+                    location: "header".to_string(),
+                    required: false,
+                    value: "trace-1".to_string(),
+                },
+                ParameterOverride {
+                    name: "platform".to_string(),
+                    location: "path".to_string(),
+                    required: true,
+                    value: "ios".to_string(),
+                },
+            ],
+        });
+
+        assert!(stripped.auth_header_value.is_empty());
+        assert_eq!(
+            stripped
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["X-Trace-Id", "platform"],
+            "only the credential header is dropped"
+        );
     }
 
     #[test]

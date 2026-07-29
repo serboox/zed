@@ -552,6 +552,46 @@ impl ApiClientStore {
         true
     }
 
+    /// How much a collection holds, so a reader can be told what deleting it
+    /// takes with it.
+    pub fn collection_contents(&self, id: CollectionId) -> (usize, usize) {
+        let folders = self
+            .folders
+            .iter()
+            .filter(|folder| folder.collection_id == id)
+            .count();
+        let requests = self
+            .requests
+            .iter()
+            .filter(|request| request.collection_id == id)
+            .count();
+        (folders, requests)
+    }
+
+    /// Removes a collection with everything inside it. The guarded
+    /// [`Self::delete_collection`] is for a collection already known to be
+    /// empty; this is what a reader asking to delete a full one means.
+    pub fn delete_collection_with_contents(
+        &mut self,
+        id: CollectionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .collections
+            .iter()
+            .any(|collection| collection.id == id)
+        {
+            return false;
+        }
+        self.requests.retain(|request| request.collection_id != id);
+        self.folders.retain(|folder| folder.collection_id != id);
+        self.collections.retain(|collection| collection.id != id);
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+        true
+    }
+
     // ----- Folder tree helpers (mirror db_client_ui::store's) -----
 
     pub fn folder_depth(&self, folder_id: FolderId) -> usize {
@@ -668,6 +708,56 @@ impl ApiClientStore {
             return false;
         }
         self.folders.retain(|f| f.id != id);
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+        true
+    }
+
+    /// How much a folder holds, counting nested folders and every request under
+    /// them, so deleting it can say what goes.
+    pub fn folder_contents(&self, id: FolderId) -> (usize, usize) {
+        let descendants = self.folder_and_descendants(id);
+        let folders = descendants.len() - 1;
+        let requests = self
+            .requests
+            .iter()
+            .filter(|request| {
+                request
+                    .folder_id
+                    .is_some_and(|folder_id| descendants.contains(&folder_id))
+            })
+            .count();
+        (folders, requests)
+    }
+
+    fn folder_and_descendants(&self, id: FolderId) -> Vec<FolderId> {
+        let mut collected = vec![id];
+        let mut index = 0;
+        while index < collected.len() {
+            let current = collected[index];
+            for folder in &self.folders {
+                if folder.parent_id == Some(current) && !collected.contains(&folder.id) {
+                    collected.push(folder.id);
+                }
+            }
+            index += 1;
+        }
+        collected
+    }
+
+    /// Removes a folder with everything inside it, nested folders included.
+    pub fn delete_folder_with_contents(&mut self, id: FolderId, cx: &mut Context<Self>) -> bool {
+        if !self.folders.iter().any(|folder| folder.id == id) {
+            return false;
+        }
+        let doomed = self.folder_and_descendants(id);
+        self.requests.retain(|request| {
+            !request
+                .folder_id
+                .is_some_and(|folder_id| doomed.contains(&folder_id))
+        });
+        self.folders.retain(|folder| !doomed.contains(&folder.id));
         cx.emit(ApiClientStoreEvent::TreeChanged);
         cx.notify();
         self.persist_collections(cx);
@@ -1162,6 +1252,124 @@ mod tests {
 
     fn new_store(cx: &mut TestAppContext) -> Entity<ApiClientStore> {
         cx.new(|cx| ApiClientStore::new(cx))
+    }
+
+    /// A reader deleting a full collection means the whole thing. The guarded
+    /// call refuses a non-empty one, which is why the menu entry used to do
+    /// nothing at all.
+    #[gpui::test]
+    fn deleting_a_collection_with_contents_takes_everything_in_it(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (doomed, kept) = store.update(cx, |store, cx| {
+            let doomed = store.create_collection("Doomed".into(), cx);
+            let folder = store
+                .create_folder(doomed, "icons".into(), None, cx)
+                .expect("folder");
+            let nested = store
+                .create_folder(doomed, "nested".into(), Some(folder), cx)
+                .expect("nested folder");
+            store.create_request(doomed, "one".into(), Some(folder), cx);
+            store.create_request(doomed, "two".into(), Some(nested), cx);
+            store.create_request(doomed, "root".into(), None, cx);
+
+            let kept = store.create_collection("Kept".into(), cx);
+            store.create_request(kept, "survivor".into(), None, cx);
+            (doomed, kept)
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.collection_contents(doomed), (2, 3));
+        });
+        assert!(
+            !store.update(cx, |store, cx| store.delete_collection(doomed, cx)),
+            "the guarded call has to keep refusing a full collection"
+        );
+
+        assert!(store.update(cx, |store, cx| {
+            store.delete_collection_with_contents(doomed, cx)
+        }));
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.collections.iter().all(|c| c.id != doomed),
+                "the collection has to be gone"
+            );
+            assert!(store.folders.iter().all(|f| f.collection_id != doomed));
+            assert!(store.requests.iter().all(|r| r.collection_id != doomed));
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .filter(|r| r.collection_id == kept)
+                    .count(),
+                1,
+                "another collection must not be touched"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn deleting_a_folder_with_contents_takes_its_nested_folders_too(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (collection, folder, sibling) = store.update(cx, |store, cx| {
+            let collection = store.create_collection("Contract".into(), cx);
+            let folder = store
+                .create_folder(collection, "icons".into(), None, cx)
+                .expect("folder");
+            let nested = store
+                .create_folder(collection, "flags".into(), Some(folder), cx)
+                .expect("nested folder");
+            store.create_request(collection, "one".into(), Some(folder), cx);
+            store.create_request(collection, "two".into(), Some(nested), cx);
+            let sibling = store
+                .create_folder(collection, "orders".into(), None, cx)
+                .expect("sibling folder");
+            store.create_request(collection, "kept".into(), Some(sibling), cx);
+            (collection, folder, sibling)
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.folder_contents(folder), (1, 2));
+        });
+        assert!(
+            !store.update(cx, |store, cx| store.delete_folder(folder, cx)),
+            "the guarded call has to keep refusing a full folder"
+        );
+
+        assert!(store.update(cx, |store, cx| {
+            store.delete_folder_with_contents(folder, cx)
+        }));
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .folders
+                    .iter()
+                    .filter(|f| f.collection_id == collection)
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                vec![sibling],
+                "only the sibling folder survives"
+            );
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["kept"],
+                "a request outside the folder must not be swept up"
+            );
+        });
+    }
+
+    #[test]
+    fn contents_are_described_for_a_reader() {
+        assert_eq!(crate::panel::describe_contents(0, 1), "1 request");
+        assert_eq!(crate::panel::describe_contents(0, 3), "3 requests");
+        assert_eq!(crate::panel::describe_contents(2, 0), "2 folders");
+        assert_eq!(
+            crate::panel::describe_contents(1, 5),
+            "1 folder and 5 requests"
+        );
     }
 
     #[gpui::test]

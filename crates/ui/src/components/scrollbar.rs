@@ -1704,7 +1704,10 @@ mod tests {
             div().id("frame").w(px(400.)).h(px(300.)).child(
                 render_scrollbar(
                     wrapper,
-                    div().id("content").size_full().child(div().w(px(2000.)).h(px(2000.))),
+                    div()
+                        .id("content")
+                        .size_full()
+                        .child(div().w(px(2000.)).h(px(2000.))),
                     cx,
                 )
                 .overflow_scroll()
@@ -1722,7 +1725,10 @@ mod tests {
     fn generic_scrollbar_cross_axis_position_is_unaffected_by_scroll(cx: &mut TestAppContext) {
         cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
         let handle = ScrollHandle::new();
-        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame { handle: handle.clone(), state: None });
+        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame {
+            handle: handle.clone(),
+            state: None,
+        });
         let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
 
         cx.update(|window, cx| {
@@ -1735,8 +1741,12 @@ mod tests {
             .update(cx, |frame, _window, cx| {
                 frame.state.as_ref().unwrap().update(cx, |state, _cx| {
                     (
-                        state.thumb_for_axis(ScrollbarAxis::Horizontal).map(|t| t.thumb_bounds),
-                        state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds),
+                        state
+                            .thumb_for_axis(ScrollbarAxis::Horizontal)
+                            .map(|t| t.thumb_bounds),
+                        state
+                            .thumb_for_axis(ScrollbarAxis::Vertical)
+                            .map(|t| t.thumb_bounds),
                     )
                 })
             })
@@ -1758,8 +1768,12 @@ mod tests {
             .update(cx, |frame, _window, cx| {
                 frame.state.as_ref().unwrap().update(cx, |state, _cx| {
                     (
-                        state.thumb_for_axis(ScrollbarAxis::Horizontal).map(|t| t.thumb_bounds),
-                        state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds),
+                        state
+                            .thumb_for_axis(ScrollbarAxis::Horizontal)
+                            .map(|t| t.thumb_bounds),
+                        state
+                            .thumb_for_axis(ScrollbarAxis::Vertical)
+                            .map(|t| t.thumb_bounds),
                     )
                 })
             })
@@ -1804,7 +1818,10 @@ mod tests {
     ) {
         cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
         let handle = ScrollHandle::new();
-        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame { handle: handle.clone(), state: None });
+        let view = cx.add_window(|_window, _cx| GenericScrollbarFrame {
+            handle: handle.clone(),
+            state: None,
+        });
         let cx = &mut gpui::VisualTestContext::from_window(*view, cx);
 
         cx.update(|window, cx| {
@@ -1815,11 +1832,11 @@ mod tests {
 
         let v_before = view
             .update(cx, |frame, _window, cx| {
-                frame
-                    .state
-                    .as_ref()
-                    .unwrap()
-                    .update(cx, |state, _cx| state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds))
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    state
+                        .thumb_for_axis(ScrollbarAxis::Vertical)
+                        .map(|t| t.thumb_bounds)
+                })
             })
             .unwrap()
             .expect("vertical thumb should exist before scroll");
@@ -1839,11 +1856,11 @@ mod tests {
 
         let v_after = view
             .update(cx, |frame, _window, cx| {
-                frame
-                    .state
-                    .as_ref()
-                    .unwrap()
-                    .update(cx, |state, _cx| state.thumb_for_axis(ScrollbarAxis::Vertical).map(|t| t.thumb_bounds))
+                frame.state.as_ref().unwrap().update(cx, |state, _cx| {
+                    state
+                        .thumb_for_axis(ScrollbarAxis::Vertical)
+                        .map(|t| t.thumb_bounds)
+                })
             })
             .unwrap()
             .expect("vertical thumb should still exist after a horizontal scroll");

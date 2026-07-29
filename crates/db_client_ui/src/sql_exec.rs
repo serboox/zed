@@ -8,7 +8,7 @@ use gpui::{
 };
 use ui::{
     Button, ButtonStyle, Icon, IconName, Label, LabelSize, PopoverMenu, PopoverMenuHandle,
-    prelude::*,
+    cyberpunk, prelude::*,
 };
 use util::ResultExt;
 use workspace::{ModalView, StatusItemView, item::ItemHandle};
@@ -269,7 +269,7 @@ impl Focusable for ExecDialog {
 
 impl Render for ExecDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::widgets::popup_surface(cx)
+        crate::widgets::dialog_surface(cx)
             .track_focus(&self.focus_handle)
             .key_context("ExecDialog")
             .w(px(720.))
@@ -298,10 +298,10 @@ impl Render for ExecDialog {
                 div()
                     .flex_1()
                     .min_h(px(240.))
-                    .rounded_md()
+                    .rounded_none()
                     .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .bg(cx.theme().colors().editor_background)
+                    .border_color(cyberpunk::border_dim())
+                    .bg(cyberpunk::surface())
                     .p_2()
                     .child(self.sql_editor.clone()),
             )
@@ -320,9 +320,17 @@ impl Render for ExecDialog {
                     .child(
                         h_flex()
                             .gap_2()
+                            .child(Button::new("exec-cancel", "Cancel").on_click(cx.listener(
+                                |_, _, _, cx| {
+                                    cx.emit(ExecDialogEvent::Dismissed);
+                                    cx.emit(DismissEvent);
+                                },
+                            )))
                             .child(
                                 Button::new("exec-run", "Run")
-                                    .style(ButtonStyle::Filled)
+                                    .style(ButtonStyle::OutlinedCustom(
+                                        cyberpunk::Accent::Cyan.border(),
+                                    ))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let text = this.sql_editor.read(cx).text(cx);
                                         if let Some(callback) = this.on_run.clone() {
@@ -330,13 +338,7 @@ impl Render for ExecDialog {
                                         }
                                         cx.emit(DismissEvent);
                                     })),
-                            )
-                            .child(Button::new("exec-cancel", "Cancel").on_click(cx.listener(
-                                |_, _, _, cx| {
-                                    cx.emit(ExecDialogEvent::Dismissed);
-                                    cx.emit(DismissEvent);
-                                },
-                            ))),
+                            ),
                     ),
             )
     }

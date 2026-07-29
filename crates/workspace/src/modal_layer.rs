@@ -2,7 +2,7 @@ use gpui::{
     AnyView, App, DismissEvent, Entity, EventEmitter, FocusHandle, Global, ManagedView,
     MouseButton, Subscription, WeakFocusHandle,
 };
-use ui::prelude::*;
+use ui::{cyberpunk, prelude::*};
 
 #[derive(Debug)]
 pub enum DismissDecision {
@@ -297,7 +297,7 @@ impl Render for ModalLayer {
             .inset_0()
             .occlude()
             .when(active_modal.modal.fade_out_background(cx), |this| {
-                let mut background = cx.theme().colors().elevated_surface_background;
+                let mut background = cyberpunk::canvas();
                 background.fade_out(0.2);
                 this.bg(background)
             })

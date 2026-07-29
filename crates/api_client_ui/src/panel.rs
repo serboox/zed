@@ -7,8 +7,8 @@ use api_client::{Collection, CollectionId, EnvironmentId, Folder, FolderId, Requ
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window, div,
+    Focusable, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
+    Render, ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window, div,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -195,6 +195,27 @@ fn flatten_navigable_entities(
         }
     }
     flat
+}
+
+/// "3 requests", "2 folders and 5 requests" -- what a delete takes with it,
+/// said plainly so the confirmation is worth reading.
+pub(crate) fn describe_contents(folders: usize, requests: usize) -> String {
+    let plural = |count: usize, word: &str| {
+        if count == 1 {
+            format!("{count} {word}")
+        } else {
+            format!("{count} {word}s")
+        }
+    };
+    match (folders, requests) {
+        (0, requests) => plural(requests, "request"),
+        (folders, 0) => plural(folders, "folder"),
+        (folders, requests) => format!(
+            "{} and {}",
+            plural(folders, "folder"),
+            plural(requests, "request")
+        ),
+    }
 }
 
 fn request_matches_search(request: &Request, query_lowercase: &str) -> bool {
@@ -1348,16 +1369,85 @@ impl ApiClientPanel {
         });
     }
 
-    fn delete_collection(&mut self, id: CollectionId, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
-            store.delete_collection(id, cx);
-        });
+    /// Deleting a collection means deleting what is in it. An empty one goes
+    /// straight away; a full one is confirmed first, naming what goes with it,
+    /// because the guarded store call would otherwise refuse and the menu entry
+    /// would look broken.
+    fn delete_collection(&mut self, id: CollectionId, window: &mut Window, cx: &mut Context<Self>) {
+        let (folders, requests) = self.store.read(cx).collection_contents(id);
+        if folders == 0 && requests == 0 {
+            self.store.update(cx, |store, cx| {
+                store.delete_collection(id, cx);
+            });
+            return;
+        }
+        let name = self
+            .store
+            .read(cx)
+            .collections
+            .iter()
+            .find(|collection| collection.id == id)
+            .map(|collection| collection.name.clone())
+            .unwrap_or_default();
+        let message = format!(
+            "Delete the collection \"{name}\" with {}? This cannot be undone.",
+            describe_contents(folders, requests)
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Delete"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            // Cancel comes first, so deleting is the second button.
+            if answer.await == Ok(1) {
+                store.update(cx, |store, cx| {
+                    store.delete_collection_with_contents(id, cx);
+                });
+            }
+        })
+        .detach();
     }
 
-    fn delete_folder(&mut self, id: FolderId, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
-            store.delete_folder(id, cx);
-        });
+    fn delete_folder(&mut self, id: FolderId, window: &mut Window, cx: &mut Context<Self>) {
+        let (folders, requests) = self.store.read(cx).folder_contents(id);
+        if folders == 0 && requests == 0 {
+            self.store.update(cx, |store, cx| {
+                store.delete_folder(id, cx);
+            });
+            return;
+        }
+        let name = self
+            .store
+            .read(cx)
+            .folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.name.clone())
+            .unwrap_or_default();
+        let message = format!(
+            "Delete the folder \"{name}\" with {}? This cannot be undone.",
+            describe_contents(folders, requests)
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Delete"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            if answer.await == Ok(1) {
+                store.update(cx, |store, cx| {
+                    store.delete_folder_with_contents(id, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn delete_request(&mut self, id: RequestId, cx: &mut Context<Self>) {
@@ -1470,8 +1560,10 @@ impl ApiClientPanel {
                 })
                 .entry("Delete", None, {
                     let panel = panel.clone();
-                    move |_window, cx| {
-                        panel.update(cx, |panel, cx| panel.delete_collection(collection_id, cx));
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.delete_collection(collection_id, window, cx)
+                        });
                     }
                 })
         })
@@ -1544,8 +1636,8 @@ impl ApiClientPanel {
                 })
                 .entry("Delete", None, {
                     let panel = panel.clone();
-                    move |_window, cx| {
-                        panel.update(cx, |panel, cx| panel.delete_folder(folder_id, cx));
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| panel.delete_folder(folder_id, window, cx));
                     }
                 })
         })
@@ -2835,7 +2927,6 @@ mod tests {
         );
     }
 
-    #[gpui::test]
     /// Searching for a collection by name is a way of asking for what is in it.
     /// A request whose address is written with a variable matches no host text,
     /// and pruning it here is what made a freshly saved request look lost.
@@ -2894,6 +2985,7 @@ mod tests {
         assert_eq!(children.len(), 1, "only the DELETE request may remain");
     }
 
+    #[gpui::test]
     async fn typing_in_the_search_box_filters_the_tree_to_matching_requests(
         cx: &mut TestAppContext,
     ) {

@@ -10,10 +10,12 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
     Window, prelude::*,
 };
-use ui::{Button, ButtonStyle, Checkbox, Divider, Icon, IconName, Label, LabelSize, prelude::*};
+use ui::{
+    Button, ButtonStyle, Checkbox, Divider, Icon, IconName, Label, LabelSize, cyberpunk, prelude::*,
+};
 use workspace::ModalView;
 
-use crate::widgets::{dialog_header, popup_surface, text_field};
+use crate::widgets::{dialog_header, dialog_surface, text_field};
 
 /// Invoked when the dump dialog is confirmed, so the owning panel can spawn the
 /// run without this dialog depending on the panel type.
@@ -577,7 +579,7 @@ impl Render for NativeDumpDialog {
             }
         }
 
-        popup_surface(cx)
+        dialog_surface(cx)
             .track_focus(&self.focus_handle)
             .key_context("NativeDumpDialog")
             .w(px(720.))
@@ -620,10 +622,10 @@ impl Render for NativeDumpDialog {
                     .w_full()
                     .px_2()
                     .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().colors().editor_background)
+                    .rounded_none()
+                    .bg(cyberpunk::surface())
                     .border_1()
-                    .border_color(cx.theme().colors().border)
+                    .border_color(cyberpunk::border_dim())
                     .child(Label::new(SharedString::from(preview)).size(LabelSize::Small)),
             )
             .child(
@@ -644,7 +646,9 @@ impl Render for NativeDumpDialog {
                     .child(
                         div().debug_selector(|| "DUMP_RUN_BTN".to_string()).child(
                             Button::new("dump-run", "Run")
-                                .style(ButtonStyle::Filled)
+                                .style(ButtonStyle::OutlinedCustom(
+                                    cyberpunk::Accent::Cyan.border(),
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     let request = this.build_request(cx);
                                     if let Some(callback) = this.on_run.clone() {

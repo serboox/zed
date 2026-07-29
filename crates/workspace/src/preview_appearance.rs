@@ -1,5 +1,5 @@
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Global, TaskExt as _};
+use gpui::{App, AppContext as _, Context, Global, Subscription, TaskExt as _};
 use theme::Appearance;
 use util::ResultExt as _;
 
@@ -104,6 +104,14 @@ pub fn set_preview_appearance(appearance: PreviewAppearance, cx: &mut App) {
             .await
     })
     .detach_and_log_err(cx);
+}
+
+/// Notifies a preview whenever the choice changes, wherever it was changed from:
+/// the control on the floating panel and the one inside a preview write to the
+/// same place, and a view holding its own copy would otherwise keep showing the
+/// palette it was opened with.
+pub fn observe_preview_appearance<T: 'static>(cx: &mut Context<T>) -> Subscription {
+    cx.observe_global::<GlobalPreviewAppearance>(|_, cx| cx.notify())
 }
 
 /// Restores the last choice. The read goes through the background so startup is

@@ -1,4 +1,4 @@
-use crate::{IconButtonShape, prelude::*};
+use crate::{IconButtonShape, cyberpunk, prelude::*};
 
 use gpui::{prelude::FluentBuilder, *};
 use smallvec::SmallVec;
@@ -68,6 +68,8 @@ impl RenderOnce for Modal {
             .size_full()
             .flex_1()
             .overflow_hidden()
+            .bg(cyberpunk::surface())
+            .rounded_none()
             .child(self.header)
             .child(
                 v_flex()
@@ -157,11 +159,18 @@ impl RenderOnce for ModalHeader {
         let mut children = self.children;
 
         if let Some(headline) = self.headline {
+            // The headline is a short structural title (e.g. "Rename File"), the
+            // one place in the dialog allowed to shout: uppercase, heavy weight,
+            // monospace, full-contrast, per the dialog's fixed cyberpunk palette
+            // rather than the active theme's text color.
             children.insert(
                 0,
-                Headline::new(headline)
-                    .size(HeadlineSize::Small)
-                    .color(Color::Muted)
+                div()
+                    .cyberpunk_monospace(cx)
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_size(HeadlineSize::Small.rems())
+                    .text_color(cyberpunk::text_primary())
+                    .child(headline.to_uppercase())
                     .into_any_element(),
             );
         }
@@ -210,7 +219,12 @@ impl RenderOnce for ModalHeader {
                             }),
                     )
                     .when_some(self.description, |this, description| {
-                        this.child(Label::new(description).color(Color::Muted).mb_2().flex_1())
+                        this.child(
+                            Label::new(description)
+                                .color(Color::Custom(cyberpunk::text_secondary()))
+                                .mb_2()
+                                .flex_1(),
+                        )
                     }),
             )
     }
@@ -287,7 +301,7 @@ impl RenderOnce for ModalFooter {
             .justify_between()
             .gap_1()
             .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
+            .border_color(cyberpunk::border_dim())
             .child(div().when_some(self.start_slot, |this, start_slot| this.child(start_slot)))
             .child(div().when_some(self.end_slot, |this, end_slot| this.child(end_slot)))
     }

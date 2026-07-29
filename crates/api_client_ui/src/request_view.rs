@@ -15,8 +15,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    ContextMenu, ContextMenuEntry, DocumentationSide, Icon, IconName, IconSize, Label, LabelSize,
-    ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
+    ContextMenu, ContextMenuEntry, DocumentationSide, ElevationIndex, Icon, IconName, IconSize,
+    Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, Toast, Workspace, item::ItemEvent, notifications::NotificationId};
@@ -4280,26 +4280,33 @@ impl Render for CurlPreviewModal {
             .w(px(640.))
             .p_3()
             .gap_3()
-            .bg(cx.theme().colors().elevated_surface_background)
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .child(Label::new("Copy as cURL").size(LabelSize::Large))
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
+            .child(
+                div()
+                    .cyberpunk_monospace(cx)
+                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
+                    .text_size(ui::HeadlineSize::Small.rems())
+                    .text_color(cyberpunk::text_primary())
+                    .child("COPY AS CURL"),
+            )
             .child(
                 div()
                     .id("curl-preview-editor-hitbox")
                     .max_h(px(320.))
                     .p_2()
-                    .rounded_md()
+                    .rounded_none()
                     .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .bg(cx.theme().colors().editor_background)
+                    .border_color(cyberpunk::border_dim())
+                    .bg(cyberpunk::surface())
                     .child(self.curl_editor.clone()),
             )
             .child(
                 h_flex().justify_end().gap_2().child(
                     Button::new("curl-preview-copy", "Copy")
-                        .style(ButtonStyle::Filled)
+                        .style(ButtonStyle::OutlinedCustom(
+                            cyberpunk::Accent::Cyan.border(),
+                        ))
                         .on_click(cx.listener(|this, _, _window, cx| {
                             this.copy(cx);
                             cx.emit(gpui::DismissEvent);

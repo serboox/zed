@@ -1,8 +1,9 @@
 use crate::component_prelude::*;
 use crate::prelude::*;
-use crate::{Checkbox, ListBulletItem, ToggleState};
+use crate::{Checkbox, ElevationIndex, ListBulletItem, ToggleState, cyberpunk};
 use gpui::Action;
 use gpui::FocusHandle;
+use gpui::FontWeight;
 use gpui::IntoElement;
 use gpui::Stateful;
 use smallvec::{SmallVec, smallvec};
@@ -105,9 +106,9 @@ impl RenderOnce for AlertModal {
                 this.track_focus(&focus_handle)
             })
             .id(self.id)
-            .elevation_3(cx)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .w(width)
-            .bg(cx.theme().colors().elevated_surface_background)
             .overflow_hidden();
 
         for handler in self.action_handlers {
@@ -118,12 +119,14 @@ impl RenderOnce for AlertModal {
             modal = modal.child(header);
         } else if let Some(title) = self.title {
             modal = modal.child(
-                v_flex()
-                    .pt_3()
-                    .pr_3()
-                    .pl_3()
-                    .pb_1()
-                    .child(Headline::new(title).size(HeadlineSize::Small)),
+                v_flex().pt_3().pr_3().pl_3().pb_1().child(
+                    div()
+                        .cyberpunk_monospace(cx)
+                        .font_weight(FontWeight::EXTRA_BOLD)
+                        .text_size(HeadlineSize::Small.rems())
+                        .text_color(cyberpunk::text_primary())
+                        .child(title.to_uppercase()),
+                ),
             );
         }
 
@@ -132,7 +135,7 @@ impl RenderOnce for AlertModal {
                 v_flex()
                     .p_3()
                     .text_ui(cx)
-                    .text_color(Color::Muted.color(cx))
+                    .text_color(cyberpunk::text_secondary())
                     .gap_1()
                     .children(self.children),
             );

@@ -8,9 +8,10 @@ use gpui::{
     AnyElement, App, Entity, FocusHandle, Focusable, Hsla, ScrollHandle, SharedString,
     Subscription, Task, Window,
 };
+use theme::Appearance;
 use ui::{ContextMenu, DropdownMenu, Tooltip, WithScrollbar, prelude::*};
 use workspace::preview_appearance::{
-    PreviewAppearance, preview_appearance, set_preview_appearance,
+    observe_preview_appearance, preview_appearance, set_preview_appearance,
 };
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
@@ -55,7 +56,9 @@ pub struct OpenApiPreviewView {
     reparse_after_pending: bool,
     /// The palette the reader picked to read this contract in, independent of
     /// the editor's own theme.
-    reading_appearance: PreviewAppearance,
+    /// Not stored: the choice lives in one place for every preview, and a copy
+    /// here would keep showing the palette this view was opened with.
+    _appearance_observation: Subscription,
     _editor_subscription: Subscription,
 }
 
@@ -144,7 +147,7 @@ impl OpenApiPreviewView {
                 selected_server_url: None,
                 pending_parse: None,
                 reparse_after_pending: false,
-                reading_appearance: preview_appearance(cx),
+                _appearance_observation: observe_preview_appearance(cx),
                 _editor_subscription: subscription,
             };
             this.schedule_parse(false, cx);
@@ -228,10 +231,10 @@ impl OpenApiPreviewView {
     }
 
     fn cycle_reading_appearance(&mut self, cx: &mut Context<Self>) {
-        self.reading_appearance = self.reading_appearance.next();
+        let next = preview_appearance(cx).next();
         // Remembered for every preview, not just this document: a reader who
         // wants light pages wants them for the next contract too.
-        set_preview_appearance(self.reading_appearance, cx);
+        set_preview_appearance(next, cx);
         cx.notify();
     }
 
@@ -241,7 +244,7 @@ impl OpenApiPreviewView {
     /// preview's own control -- it follows the editor's theme rather than the
     /// palette the document itself is forced to read in.
     fn render_reading_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let appearance = self.reading_appearance;
+        let appearance = preview_appearance(cx);
         h_flex()
             .id("openapi-reading-controls")
             .absolute()
@@ -466,34 +469,15 @@ impl OpenApiPreviewView {
         };
         let client = store.read(cx).http_client.clone();
 
-        let Some(panel) = self.try_it_out_panels.get(&operation_key) else {
+        let Some(try_it_out::TryItOutOverrides {
+            server_url,
+            auth_header_value,
+            body_text,
+            parameters,
+        }) = self.try_it_out_overrides(&operation_key, cx)
+        else {
             return;
         };
-        let server_url = panel.server_editor.read(cx).text(cx);
-        let auth_header_value = panel.auth_editor.read(cx).text(cx);
-        let body_text = panel
-            .body_editor
-            .as_ref()
-            .map(|editor| editor.read(cx).text(cx));
-        let parameters: Vec<try_it_out::ParameterOverride> = panel
-            .parameter_fields
-            .iter()
-            .map(|field| {
-                let value = match &field.input {
-                    ParameterInput::Text(editor) => editor.read(cx).text(cx),
-                    ParameterInput::Select { selected, .. } => selected
-                        .as_ref()
-                        .map(SharedString::to_string)
-                        .unwrap_or_default(),
-                };
-                try_it_out::ParameterOverride {
-                    name: field.name.to_string(),
-                    location: field.location.to_string(),
-                    required: field.required,
-                    value,
-                }
-            })
-            .collect();
 
         if let Some(panel) = self.try_it_out_panels.get_mut(&operation_key) {
             panel.send_state = TryItOutSendState::Sending;
@@ -584,6 +568,44 @@ impl OpenApiPreviewView {
         self.save_operations_to_api_client(OperationSelection::AllOperations, window, cx);
     }
 
+    /// What the reader has filled in for an operation, or `None` when its panel
+    /// is closed. Both sending and saving read from here, so a saved request is
+    /// the request that would have been sent.
+    fn try_it_out_overrides(
+        &self,
+        operation_key: &SharedString,
+        cx: &App,
+    ) -> Option<try_it_out::TryItOutOverrides> {
+        let panel = self.try_it_out_panels.get(operation_key)?;
+        Some(try_it_out::TryItOutOverrides {
+            server_url: panel.server_editor.read(cx).text(cx),
+            auth_header_value: panel.auth_editor.read(cx).text(cx),
+            body_text: panel
+                .body_editor
+                .as_ref()
+                .map(|editor| editor.read(cx).text(cx)),
+            parameters: panel
+                .parameter_fields
+                .iter()
+                .map(|field| {
+                    let value = match &field.input {
+                        ParameterInput::Text(editor) => editor.read(cx).text(cx),
+                        ParameterInput::Select { selected, .. } => selected
+                            .as_ref()
+                            .map(SharedString::to_string)
+                            .unwrap_or_default(),
+                    };
+                    try_it_out::ParameterOverride {
+                        name: field.name.to_string(),
+                        location: field.location.to_string(),
+                        required: field.required,
+                        value,
+                    }
+                })
+                .collect(),
+        })
+    }
+
     fn save_operation_to_api_client(
         &mut self,
         operation_key: SharedString,
@@ -623,7 +645,19 @@ impl OpenApiPreviewView {
             return;
         };
 
-        let imported = collection_from_document(&document, selection);
+        let mut imported = collection_from_document(&document, selection.clone());
+        // What the reader typed into "Try it out" is what they mean to save: the
+        // token is the one exception, since a collection is written to disk.
+        if let OperationSelection::SingleOperation(operation_key) = &selection
+            && let Some(overrides) = self.try_it_out_overrides(operation_key, cx)
+            && let Some(request) = imported.requests.pop()
+        {
+            let overrides = try_it_out::without_secrets(overrides);
+            let (request, collection) =
+                try_it_out::apply_overrides(request, imported.collection, &overrides);
+            imported.requests.push(request);
+            imported.collection = collection;
+        }
         let requested = imported.requests.len();
         let collection_name = imported.collection.name.clone();
         let added = apply_import_to_store(&store, imported, cx);
@@ -886,7 +920,7 @@ impl OpenApiPreviewView {
         let key = operation.key();
         let expanded = self.expanded_operations.contains(&key);
         let toggle_key = key.clone();
-        let accent = method_accent_color(method_accent(operation.method), palette);
+        let accent = method_accent_color(method_accent(operation.method), palette.appearance);
 
         v_flex()
             .debug_selector(|| format!("openapi-operation-row-{key}"))
@@ -1029,8 +1063,25 @@ impl OpenApiPreviewView {
         details = details.child(
             h_flex()
                 .justify_between()
-                .items_center()
-                .child(section_title("Parameters", palette))
+                .items_end()
+                .border_b_1()
+                .border_color(palette.border_variant)
+                .pb_1()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Label::new("Parameters")
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .color(palette.resolve(Color::Default)),
+                        )
+                        // The bar under the heading is what marks it as the
+                        // section in hand, the way a reference page does.
+                        .child(div().h(px(2.)).w_full().bg(method_accent_color(
+                            method_accent(operation.method),
+                            palette.appearance,
+                        ))),
+                )
                 .child(self.render_try_it_out_toggle(operation, cx)),
         );
         details = if operation.parameters.is_empty() {
@@ -1097,18 +1148,9 @@ impl OpenApiPreviewView {
 
         Button::new(
             SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
-            if active {
-                "Close Try it out"
-            } else {
-                "Try it out"
-            },
+            if active { "Cancel" } else { "Try it out" },
         )
-        .style(ButtonStyle::Subtle)
-        .start_icon(Icon::new(if active {
-            IconName::ChevronDown
-        } else {
-            IconName::PlayOutlined
-        }))
+        .style(ButtonStyle::Outlined)
         .on_click(cx.listener(move |this, _, window, cx| {
             this.toggle_try_it_out(toggle_key.clone(), window, cx);
         }))
@@ -2165,28 +2207,36 @@ fn status_color(status: &str) -> Color {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MethodAccent {
-    Info,
-    Created,
-    Warning,
-    Error,
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+    Trace,
 }
 
-/// Idempotent reads in blue, creation in green, mutation in amber, deletion in
-/// red -- the colouring a reader of a contract reference page expects.
+/// Every method carries its own colour on a contract reference page, and a
+/// reader recognises the row by that colour before reading a word of it.
 fn method_accent(method: HttpMethod) -> MethodAccent {
     match method {
-        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options | HttpMethod::Trace => {
-            MethodAccent::Info
-        }
-        HttpMethod::Post => MethodAccent::Created,
-        HttpMethod::Put | HttpMethod::Patch => MethodAccent::Warning,
-        HttpMethod::Delete => MethodAccent::Error,
+        HttpMethod::Get => MethodAccent::Get,
+        HttpMethod::Post => MethodAccent::Post,
+        HttpMethod::Put => MethodAccent::Put,
+        HttpMethod::Delete => MethodAccent::Delete,
+        HttpMethod::Patch => MethodAccent::Patch,
+        HttpMethod::Head => MethodAccent::Head,
+        HttpMethod::Options => MethodAccent::Options,
+        HttpMethod::Trace => MethodAccent::Trace,
     }
 }
 
-/// Text laid over a solid accent fill. The status palette a theme picks is free
-/// to be light -- amber in a light theme is -- so the foreground follows the
-/// fill instead of always being white.
+/// The hues a reference page uses, and their counterparts for a dark page: the
+/// light set is too dark to read against near-black, so each one is lifted
+/// rather than reused.
+/// Text laid over a solid method fill. A light fill needs dark text, and the
+/// canonical amber and teal are light.
 fn badge_foreground(fill: Hsla) -> Hsla {
     if fill.l > 0.6 {
         gpui::hsla(0., 0., 0.12, 1.)
@@ -2195,13 +2245,22 @@ fn badge_foreground(fill: Hsla) -> Hsla {
     }
 }
 
-fn method_accent_color(accent: MethodAccent, palette: &Palette) -> Hsla {
-    match accent {
-        MethodAccent::Info => palette.info,
-        MethodAccent::Created => palette.created,
-        MethodAccent::Warning => palette.warning,
-        MethodAccent::Error => palette.error,
-    }
+fn method_accent_color(accent: MethodAccent, appearance: Appearance) -> Hsla {
+    let (light, dark) = match accent {
+        MethodAccent::Get => (0x61affe, 0x7cc3ff),
+        MethodAccent::Post => (0x49cc90, 0x5fe0a4),
+        MethodAccent::Put => (0xfca130, 0xffb454),
+        MethodAccent::Delete => (0xf93e3e, 0xff6b6b),
+        MethodAccent::Patch => (0x50e3c2, 0x6df0d3),
+        MethodAccent::Head => (0x9012fe, 0xb267ff),
+        MethodAccent::Options => (0x0d5aa7, 0x4d8fd6),
+        MethodAccent::Trace => (0x6b6b6b, 0xa0a0a0),
+    };
+    let value = match appearance {
+        Appearance::Light => light,
+        Appearance::Dark => dark,
+    };
+    gpui::rgb(value).into()
 }
 
 impl Focusable for OpenApiPreviewView {
@@ -2212,7 +2271,7 @@ impl Focusable for OpenApiPreviewView {
 
 impl Render for OpenApiPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = resolve_theme(self.reading_appearance, cx);
+        let theme = resolve_theme(preview_appearance(cx), cx);
         let palette = Palette::from_theme(&theme);
 
         let contents = match self.document.clone() {
@@ -2319,15 +2378,47 @@ mod tests {
     }
 
     #[test]
-    fn method_accent_groups_verbs_by_what_they_do() {
-        assert_eq!(method_accent(HttpMethod::Get), MethodAccent::Info);
-        assert_eq!(method_accent(HttpMethod::Head), MethodAccent::Info);
-        assert_eq!(method_accent(HttpMethod::Options), MethodAccent::Info);
-        assert_eq!(method_accent(HttpMethod::Trace), MethodAccent::Info);
-        assert_eq!(method_accent(HttpMethod::Post), MethodAccent::Created);
-        assert_eq!(method_accent(HttpMethod::Put), MethodAccent::Warning);
-        assert_eq!(method_accent(HttpMethod::Patch), MethodAccent::Warning);
-        assert_eq!(method_accent(HttpMethod::Delete), MethodAccent::Error);
+    fn method_accent_names_every_verb_separately() {
+        assert_eq!(method_accent(HttpMethod::Get), MethodAccent::Get);
+        assert_eq!(method_accent(HttpMethod::Post), MethodAccent::Post);
+        assert_eq!(method_accent(HttpMethod::Put), MethodAccent::Put);
+        assert_eq!(method_accent(HttpMethod::Delete), MethodAccent::Delete);
+        assert_eq!(method_accent(HttpMethod::Patch), MethodAccent::Patch);
+        assert_eq!(method_accent(HttpMethod::Head), MethodAccent::Head);
+        assert_eq!(method_accent(HttpMethod::Options), MethodAccent::Options);
+        assert_eq!(method_accent(HttpMethod::Trace), MethodAccent::Trace);
+    }
+
+    /// A dark page needs its own set: the light hues are too dark against
+    /// near-black, and a badge has to stay readable either way.
+    #[test]
+    fn every_method_colour_differs_between_a_light_and_a_dark_page() {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+            HttpMethod::Patch,
+            HttpMethod::Head,
+            HttpMethod::Options,
+            HttpMethod::Trace,
+        ] {
+            let accent = method_accent(method);
+            let light = method_accent_color(accent, Appearance::Light);
+            let dark = method_accent_color(accent, Appearance::Dark);
+            assert_ne!(
+                light, dark,
+                "{method:?} has to be lifted for a dark page, not reused"
+            );
+            assert!(
+                dark.l > light.l,
+                "{method:?} must read lighter against near-black"
+            );
+            assert!(
+                badge_foreground(light).l < 0.3 || badge_foreground(light).l > 0.7,
+                "badge text has to commit to dark or light"
+            );
+        }
     }
 
     #[test]
@@ -2410,6 +2501,57 @@ mod tests {
             assert_eq!(store.collections.len(), 1);
             assert_eq!(store.collections[0].name, "pd-instruments");
         });
+    }
+
+    /// What the reader filled in under "Try it out" is what they mean to save.
+    /// The token is the one exception: a collection is written to disk.
+    #[test]
+    fn saving_carries_the_values_filled_in_for_the_operation() {
+        let document = crate::openapi_document::parse(ICONS_CONTRACT).expect("parse");
+        let request = collection_from_document(
+            &document,
+            OperationSelection::SingleOperation(document.groups[0].operations[0].key()),
+        );
+        let base = request.requests.first().cloned().expect("one request");
+
+        let overrides = try_it_out::TryItOutOverrides {
+            server_url: "https://stage.example.com".to_string(),
+            auth_header_value: String::new(),
+            body_text: None,
+            parameters: vec![try_it_out::ParameterOverride {
+                name: "platform".to_string(),
+                location: "path".to_string(),
+                required: true,
+                value: "ios".to_string(),
+            }],
+        };
+        let (saved, collection) = try_it_out::apply_overrides(base, request.collection, &overrides);
+
+        assert_eq!(
+            collection
+                .variables
+                .iter()
+                .find(|variable| variable.key == "platform")
+                .map(|variable| variable.current_value.as_str()),
+            Some("ios"),
+            "the value chosen for a path parameter has to be saved with the request"
+        );
+        assert_eq!(
+            collection
+                .variables
+                .iter()
+                .find(|variable| variable.key == "baseUrl")
+                .map(|variable| variable.current_value.as_str()),
+            Some("https://stage.example.com"),
+            "the server chosen for the try has to be saved too"
+        );
+        assert!(
+            saved
+                .headers
+                .iter()
+                .all(|header| !header.key.eq_ignore_ascii_case("authorization")),
+            "a token must never reach a saved collection"
+        );
     }
 
     /// Saving the same operation twice must not grow a second copy, and must not

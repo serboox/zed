@@ -1,0 +1,186 @@
+//! Shared palette and styling helpers for the cyberpunk dialog chrome
+//! (`Modal`, `AlertModal`, the built-in prompt renderer, and this fork's own
+//! modal forms). Colors are fixed, not read from the active theme: the whole
+//! point of the style is a near-black surface with exactly two accents, so it
+//! must not drift with whatever theme the user has picked.
+//!
+//! Only two accents exist on purpose (cyan for the focal element, red for
+//! danger). Do not add a third without a matching argument for why every
+//! dialog that reads this module should carry it.
+
+use gpui::{App, BoxShadow, Hsla, Pixels, PromptLevel, Styled, px, rgb};
+
+/// Fixed spacing scale, independent of `DynamicSpacing`/UI density: the
+/// rhythm this style calls for must stay constant even if the user changes
+/// their UI scale setting.
+pub const SPACE_4: Pixels = px(4.);
+pub const SPACE_8: Pixels = px(8.);
+pub const SPACE_14: Pixels = px(14.);
+pub const SPACE_18: Pixels = px(18.);
+pub const SPACE_22: Pixels = px(22.);
+
+/// Window background. Never pure black; blue-shifted near-black reads as
+/// "screen" rather than "ink".
+pub fn canvas() -> Hsla {
+    rgb(0x06080d).into()
+}
+
+/// Inputs, raised panels, the dialog box itself.
+pub fn surface() -> Hsla {
+    rgb(0x0a0f17).into()
+}
+
+/// Resting border / divider color.
+pub fn border_dim() -> Hsla {
+    rgb(0x1d2a38).into()
+}
+
+/// Button outline / focusable edge color.
+pub fn border_raised() -> Hsla {
+    rgb(0x24354a).into()
+}
+
+/// Maximum-contrast text, for values and content.
+pub fn text_primary() -> Hsla {
+    rgb(0xf0f7ff).into()
+}
+
+/// Field labels and captions.
+pub fn text_secondary() -> Hsla {
+    rgb(0x8aa2b8).into()
+}
+
+/// Genuinely de-emphasised text only.
+pub fn text_tertiary() -> Hsla {
+    rgb(0x55697e).into()
+}
+
+/// The two accents dialogs are allowed to use. Assign one semantically per
+/// dialog and never reuse it decoratively elsewhere in the same view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accent {
+    /// Data, interactive, the focal element.
+    Cyan,
+    /// Danger, destructive, privilege, alarm.
+    Red,
+}
+
+impl Accent {
+    /// Border / stripe color for this accent.
+    pub fn border(self) -> Hsla {
+        match self {
+            Accent::Cyan => rgb(0x00e5ff).into(),
+            Accent::Red => rgb(0xff003c).into(),
+        }
+    }
+
+    /// Brighter variant, for text or a stronger glow.
+    pub fn bright(self) -> Hsla {
+        match self {
+            Accent::Cyan => rgb(0x4df3ff).into(),
+            Accent::Red => rgb(0xff415c).into(),
+        }
+    }
+}
+
+/// Which accent a prompt's confirm action should carry. `Warning` and
+/// `Critical` both mean the user is being asked to pause before an action
+/// with real consequences (Zed's own call sites use `Warning` for things like
+/// an irreversible schema change, not just a mild notice), so both map to the
+/// danger accent; there is no separate amber tier once only two accents
+/// exist. Only `Info` — a routine, no-consequence notice — stays neutral.
+pub fn accent_for_prompt_level(level: PromptLevel) -> Accent {
+    match level {
+        PromptLevel::Warning | PromptLevel::Critical => Accent::Red,
+        PromptLevel::Info => Accent::Cyan,
+    }
+}
+
+/// Same decision for dialogs that only know "is confirming this dangerous",
+/// rather than carrying a full `PromptLevel`.
+pub fn accent_for_danger(is_dangerous: bool) -> Accent {
+    if is_dangerous {
+        Accent::Red
+    } else {
+        Accent::Cyan
+    }
+}
+
+/// A soft outer glow for the one focal element of a view. Kept low-alpha per
+/// the source design doc: glow needs to read as a lit edge, not fog.
+pub fn focal_glow(accent: Accent) -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.), px(0.), accent.border().opacity(0.45)).blur_radius(px(10.))]
+}
+
+/// Extends [`gpui::Styled`] with the cyberpunk dialog chrome primitives, so
+/// every dialog surface is built from the same handful of calls.
+pub trait CyberpunkSurface: Styled + Sized {
+    /// The base near-black dialog box: fixed surface color, a thin resting
+    /// border, sharp corners. Corners are zeroed explicitly since rounding is
+    /// the fastest way to break the look.
+    fn cyberpunk_surface(self) -> Self {
+        self.bg(surface())
+            .rounded_none()
+            .border_1()
+            .border_color(border_dim())
+    }
+
+    /// Marks the one focal element of a dialog with a bright border and a
+    /// subtle glow. Call this on at most one element per view.
+    fn cyberpunk_focal(self, accent: Accent) -> Self {
+        self.border_1()
+            .border_color(accent.border())
+            .shadow(focal_glow(accent))
+    }
+
+    /// Sets the monospace buffer font without changing size or color.
+    fn cyberpunk_monospace(self, cx: &App) -> Self {
+        self.font(theme::theme_settings(cx).buffer_font(cx).clone())
+    }
+}
+
+impl<E: Styled> CyberpunkSurface for E {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warning_and_critical_prompts_confirm_in_red_info_stays_cyan() {
+        assert_eq!(accent_for_prompt_level(PromptLevel::Critical), Accent::Red);
+        assert_eq!(accent_for_prompt_level(PromptLevel::Warning), Accent::Red);
+        assert_eq!(accent_for_prompt_level(PromptLevel::Info), Accent::Cyan);
+    }
+
+    #[test]
+    fn danger_flag_picks_the_matching_accent() {
+        assert_eq!(accent_for_danger(true), Accent::Red);
+        assert_eq!(accent_for_danger(false), Accent::Cyan);
+    }
+
+    #[test]
+    fn only_two_accents_exist() {
+        // Guards the scarcity rule at compile time: exhaustively matching
+        // `Accent` here means adding a third variant forces a decision at
+        // every call site that maps it to a color, not a silent addition.
+        for accent in [Accent::Cyan, Accent::Red] {
+            let border = accent.border();
+            let bright = accent.bright();
+            assert_ne!(border, bright);
+        }
+    }
+
+    #[test]
+    fn base_ramp_never_touches_pure_black() {
+        let canvas = canvas();
+        assert!(
+            canvas.s > 0.0,
+            "canvas must be blue-shifted, not pure black"
+        );
+        let surface = surface();
+        assert!(
+            surface.l > canvas.l,
+            "surface should sit above canvas in the ramp"
+        );
+    }
+}

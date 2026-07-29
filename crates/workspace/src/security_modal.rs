@@ -15,10 +15,9 @@ use project::{
     worktree_store::WorktreeStore,
 };
 use smallvec::SmallVec;
-use theme::ActiveTheme;
 use ui::{
     AlertModal, Checkbox, FluentBuilder, KeyBinding, ListBulletItem, ToggleState, WithScrollbar,
-    prelude::*,
+    cyberpunk, prelude::*,
 };
 use ui_input::InputField;
 
@@ -114,15 +113,21 @@ impl Render for SecurityModal {
                 v_flex()
                     .p_3()
                     .gap_1()
-                    .rounded_t_md()
-                    .bg(cx.theme().colors().editor_background.opacity(0.5))
+                    .rounded_none()
+                    .bg(cyberpunk::surface())
                     .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
+                    .border_color(cyberpunk::Accent::Red.border())
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Icon::new(IconName::Warning).color(Color::Warning))
-                            .child(Label::new(header_label)),
+                            .child(
+                                Icon::new(IconName::Warning)
+                                    .color(Color::Custom(cyberpunk::Accent::Red.border())),
+                            )
+                            .child(
+                                Label::new(header_label)
+                                    .color(Color::Custom(cyberpunk::text_primary())),
+                            ),
                     )
                     .child(
                         div()
@@ -171,7 +176,11 @@ impl Render for SecurityModal {
                                                             IconSize::default().rems() + rems(0.5),
                                                         )
                                                         .child(
-                                                            Label::new(label).color(Color::Muted),
+                                                            Label::new(label).color(
+                                                                Color::Custom(
+                                                                    cyberpunk::text_secondary(),
+                                                                ),
+                                                            ),
                                                         ),
                                                 )
                                             },
@@ -289,7 +298,7 @@ impl Render for SecurityModal {
                     )
                     .child(
                         Button::new("tc", "Trust and Continue")
-                            .style(ButtonStyle::Filled)
+                            .style(ButtonStyle::OutlinedCustom(cyberpunk::Accent::Red.border()))
                             .layer(ui::ElevationIndex::ModalSurface)
                             .key_binding(
                                 KeyBinding::for_action(&menu::Confirm, cx)

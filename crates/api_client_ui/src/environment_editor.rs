@@ -7,8 +7,8 @@ use gpui::{
     point, size,
 };
 use ui::{
-    Checkbox, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, ToggleState,
-    WithScrollbar, prelude::*,
+    Checkbox, ElevationIndex, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
+    ToggleState, WithScrollbar, cyberpunk, prelude::*,
 };
 use workspace::ModalView;
 
@@ -771,7 +771,6 @@ impl Focusable for EnvironmentEditorModal {
 
 impl Render for EnvironmentEditorModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let title = if self.show_scope_list {
             "Manage Environments"
         } else {
@@ -793,7 +792,14 @@ impl Render for EnvironmentEditorModal {
             .on_drag(DraggedEnvironmentEditorMove, |_, _, _, cx| {
                 cx.new(|_| Empty)
             })
-            .child(Label::new(title).size(LabelSize::Large));
+            .child(
+                div()
+                    .cyberpunk_monospace(cx)
+                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
+                    .text_size(ui::HeadlineSize::Small.rems())
+                    .text_color(cyberpunk::text_primary())
+                    .child(title.to_uppercase()),
+            );
 
         let resize_handle = div()
             .id("environment-editor-resize-handle")
@@ -806,7 +812,7 @@ impl Render for EnvironmentEditorModal {
             .cursor_nwse_resize()
             .border_r_2()
             .border_b_2()
-            .border_color(colors.border_variant)
+            .border_color(cyberpunk::border_raised())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
@@ -831,10 +837,8 @@ impl Render for EnvironmentEditorModal {
             .h(self.size.height)
             .p_3()
             .gap_3()
-            .bg(colors.elevated_surface_background)
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .on_drag_move::<DraggedEnvironmentEditorMove>(cx.listener(
                 |this, event: &DragMoveEvent<DraggedEnvironmentEditorMove>, window, cx| {
                     let delta = event.event.position - this.drag_start_mouse;
@@ -866,7 +870,7 @@ impl Render for EnvironmentEditorModal {
             .child(
                 h_flex().justify_end().child(
                     Button::new("environment-editor-close", "Close")
-                        .style(ButtonStyle::Filled)
+                        .style(ButtonStyle::Outlined)
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 ),
             )

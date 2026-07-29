@@ -9,6 +9,7 @@
 
 pub mod component_prelude;
 mod components;
+pub mod cyberpunk;
 pub mod prelude;
 mod styles;
 mod traits;

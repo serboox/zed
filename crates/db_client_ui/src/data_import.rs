@@ -5,7 +5,10 @@ use gpui::{
     px,
 };
 use ui::prelude::*;
-use ui::{Button, ButtonStyle, Checkbox, ContextMenu, Divider, Label, PopoverMenu};
+use ui::{
+    Button, ButtonStyle, Checkbox, ContextMenu, Divider, ElevationIndex, Label, PopoverMenu,
+    cyberpunk,
+};
 use util::ResultExt;
 use workspace::ModalView;
 
@@ -573,7 +576,8 @@ impl Render for ImportDataView {
         v_flex()
             .key_context("DataImport")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .w(px(640.0))
             .max_h(px(560.0))
             .p_4()
@@ -685,7 +689,9 @@ impl Render for ImportDataView {
                     )
                     .child(
                         ui::Button::new("run-import", "Import")
-                            .style(ButtonStyle::Filled)
+                            .style(ButtonStyle::OutlinedCustom(
+                                cyberpunk::Accent::Cyan.border(),
+                            ))
                             .disabled(importing)
                             .on_click(
                                 cx.listener(|view, _, window, cx| view.run_import(window, cx)),
