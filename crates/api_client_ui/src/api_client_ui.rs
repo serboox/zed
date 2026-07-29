@@ -16,7 +16,7 @@ mod store;
 mod text_prompt_modal;
 
 pub use panel::ApiClientPanel;
-pub use response_dock::ResponseDockPanel;
+pub use response_dock::{ResponseDockPanel, focus_response_tab};
 pub use store::{ApiClientStore, GlobalApiClientStore};
 
 use gpui::App;

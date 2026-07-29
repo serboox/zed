@@ -1,4 +1,7 @@
-use crate::response_dock::{DockResponseEntry, ResponseDockPanel, SendGeneration};
+use crate::response_dock::{
+    DockResponseEntry, ResponseDockPanel, SendGeneration, existing_response_tab,
+    reveal_response_tab,
+};
 use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::ApiClientStore;
 use crate::text_prompt_modal::TextPromptModal;
@@ -443,6 +446,10 @@ pub struct RequestView {
     /// response for the whole workspace, so this is what tells the view whether
     /// what is on screen there is still its own reply or somebody else's.
     dock_generation: Option<SendGeneration>,
+    /// Which tab the claim above was made against. A closed tab is replaced by a
+    /// fresh one that numbers its sends from scratch, so the number alone cannot
+    /// tell "my claim is stale" from "someone newer owns the tab".
+    dock_tab: Option<gpui::EntityId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -748,6 +755,7 @@ impl RequestView {
             url_looks_malformed: false,
             body_json_invalid: false,
             dock_generation: None,
+            dock_tab: None,
             _subscriptions: Vec::new(),
         };
 
@@ -1801,18 +1809,26 @@ impl RequestView {
     /// (e.g. during startup, before `initialize_panels` finishes) the panel
     /// simply hasn't been added yet.
     fn find_response_dock(&self, cx: &App) -> Option<Entity<ResponseDockPanel>> {
-        self.workspace
-            .upgrade()?
-            .read(cx)
-            .panel::<ResponseDockPanel>(cx)
+        let workspace = self.workspace.upgrade()?;
+        existing_response_tab(workspace.read(cx), cx)
+    }
+
+    /// The response tab, opened beside the terminals if it is not there yet.
+    /// Every reply lands in that one tab, so the answers sit with the rest of the
+    /// output instead of in a panel of their own.
+    fn open_response_tab(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ResponseDockPanel>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace.update(cx, |workspace, cx| {
+            reveal_response_tab(workspace, window, cx)
+        })
     }
 
     fn reveal_response_dock(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.reveal_panel::<ResponseDockPanel>(window, cx);
-            });
-        }
+        self.open_response_tab(window, cx);
     }
 
     /// Reports that a response could not be handed off to the dock, so it is
@@ -1831,7 +1847,7 @@ impl RequestView {
             workspace.show_toast(
                 Toast::new(
                     NotificationId::named("api-client-response-dock-missing".into()),
-                    "Couldn't open the Response panel -- showing the response here instead.",
+                    "Couldn't open the Response tab -- showing the response here instead.",
                 ),
                 cx,
             );
@@ -1848,7 +1864,7 @@ impl RequestView {
         cx: &mut Context<Self>,
         apply: impl FnOnce(&mut ResponseDockPanel, &mut Context<ResponseDockPanel>),
     ) {
-        match self.find_response_dock(cx) {
+        match self.open_response_tab(window, cx) {
             Some(dock) => {
                 dock.update(cx, apply);
                 self.reveal_response_dock(window, cx);
@@ -1856,6 +1872,7 @@ impl RequestView {
             }
             None => {
                 self.dock_generation = None;
+                self.dock_tab = None;
                 self.warn_response_dock_unavailable(cx);
             }
         }
@@ -1865,10 +1882,22 @@ impl RequestView {
         let title = self.title.clone();
         let claimed = std::cell::Cell::new(None);
         self.route_to_dock(window, cx, |dock, cx| {
-            claimed.set(Some(dock.begin_send(title, cx)));
+            claimed.set(Some((cx.entity_id(), dock.begin_send(title, cx))));
         });
-        if let Some(generation) = claimed.get() {
+        if let Some((tab, generation)) = claimed.get() {
             self.dock_generation = Some(generation);
+            self.dock_tab = Some(tab);
+        }
+    }
+
+    /// Claims the tab again when the one this view claimed is no longer there --
+    /// the reader closed it mid-send -- because a fresh tab starts its own
+    /// numbering and would otherwise dismiss the reply as belonging to an older
+    /// send.
+    fn reclaim_response_tab_if_replaced(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.find_response_dock(cx).map(|tab| tab.entity_id());
+        if self.dock_generation.is_none() || current != self.dock_tab {
+            self.route_sending_to_dock(window, cx);
         }
     }
 
@@ -1878,12 +1907,10 @@ impl RequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A reply can arrive without this view having claimed the dock -- a
+        // A reply can arrive without this view having claimed the tab -- a
         // saved example replayed straight into `apply_response`, for one -- and
         // it still belongs on screen.
-        if self.dock_generation.is_none() {
-            self.route_sending_to_dock(window, cx);
-        }
+        self.reclaim_response_tab_if_replaced(window, cx);
         let Some(generation) = self.dock_generation else {
             return;
         };
@@ -1899,9 +1926,7 @@ impl RequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dock_generation.is_none() {
-            self.route_sending_to_dock(window, cx);
-        }
+        self.reclaim_response_tab_if_replaced(window, cx);
         let Some(generation) = self.dock_generation else {
             return;
         };
@@ -4322,6 +4347,9 @@ mod tests {
     use crate::store::ApiClientStore;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
+    use terminal_view::terminal_panel::TerminalPanel;
+    use workspace::ItemHandle as _;
+    use workspace::dock::Panel as _;
 
     #[test]
     fn every_raw_body_content_type_maps_to_the_matching_language_and_header_value() {
@@ -6097,16 +6125,17 @@ mod tests {
         });
     }
 
-    /// Once a `ResponseDockPanel` is registered on the workspace, sending a
-    /// request must route the response there and reveal the bottom dock,
-    /// instead of leaving it in the request view's own inline section.
+    /// A reply opens a tab in the terminal panel's pane -- where the terminals
+    /// and the database results already are -- and shows itself there rather than
+    /// in the request view's own inline section.
     #[gpui::test]
-    async fn a_response_is_routed_to_the_registered_response_dock(cx: &mut TestAppContext) {
+    async fn a_response_opens_a_tab_next_to_the_terminals(cx: &mut TestAppContext) {
         let (_store, workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
 
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            let dock = cx.new(|cx| ResponseDockPanel::new(cx));
-            workspace.add_panel(dock, window, cx);
+        let terminal_panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
         });
         cx.run_until_parked();
 
@@ -6115,16 +6144,134 @@ mod tests {
         });
         cx.run_until_parked();
 
+        let response_tabs = terminal_panel.read_with(&cx, |panel, cx| {
+            panel
+                .pane()
+                .map(|pane| pane.read(cx).items_of_type::<ResponseDockPanel>().count())
+                .unwrap_or(0)
+        });
+        assert_eq!(
+            response_tabs, 1,
+            "the reply has to open exactly one tab in the terminal panel's pane"
+        );
         view.read_with(&cx, |view, cx| {
             assert!(
                 view.response_shown_in_dock(cx),
-                "a registered dock must take over showing the response"
+                "that tab is what shows the response, so the inline copy steps aside"
             );
         });
         workspace.read_with(&cx, |workspace, cx| {
             assert!(
                 workspace.bottom_dock().read(cx).is_open(),
-                "sending a response must reveal the bottom dock"
+                "the dock has to be revealed so the reply is actually visible"
+            );
+        });
+
+        // A second reply belongs in the same tab: one tab for every request.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+        let response_tabs_after = terminal_panel.read_with(&cx, |panel, cx| {
+            panel
+                .pane()
+                .map(|pane| pane.read(cx).items_of_type::<ResponseDockPanel>().count())
+                .unwrap_or(0)
+        });
+        assert_eq!(
+            response_tabs_after, 1,
+            "a later reply replaces what the tab shows instead of stacking another tab"
+        );
+    }
+
+    /// The reader can close the response tab while a request is still in flight.
+    /// The reply then has to open a tab and show itself there, rather than being
+    /// dismissed as belonging to a send the fresh tab knows nothing about.
+    #[gpui::test]
+    async fn a_reply_after_the_tab_was_closed_shows_in_a_fresh_tab(cx: &mut TestAppContext) {
+        let (_store, _workspace_handle, view, mut cx) = {
+            let (store, workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                workspace.add_panel(panel, window, cx);
+            });
+            cx.run_until_parked();
+            (store, workspace, view, cx)
+        };
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(200), window, cx);
+        });
+        cx.run_until_parked();
+
+        let pane = view
+            .read_with(&cx, |view, cx| {
+                view.workspace
+                    .upgrade()
+                    .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
+                    .and_then(|panel| panel.read(cx).pane())
+            })
+            .expect("the terminal panel has a pane");
+        let tab_id = pane
+            .read_with(&cx, |pane, _| {
+                pane.items_of_type::<ResponseDockPanel>()
+                    .next()
+                    .map(|tab| tab.item_id())
+            })
+            .expect("the first reply opened a tab");
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.remove_item(tab_id, false, false, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(&cx, |pane, _| pane
+                .items_of_type::<ResponseDockPanel>()
+                .count()),
+            0,
+            "the tab has to be gone before the next reply arrives"
+        );
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(204), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(&cx, |pane, _| pane
+                .items_of_type::<ResponseDockPanel>()
+                .count()),
+            1,
+            "the reply has to open a tab again"
+        );
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                view.response_shown_in_dock(cx),
+                "the fresh tab has to be the one showing the reply"
+            );
+        });
+    }
+
+    /// With no terminal panel there is no pane to put the tab in, so the reply
+    /// stays in the request view rather than disappearing.
+    #[gpui::test]
+    async fn without_a_terminal_panel_the_reply_stays_in_the_request_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                !view.response_shown_in_dock(cx),
+                "with nowhere to open a tab, the response has to stay on screen here"
+            );
+            assert!(
+                matches!(&view.send_state, SendState::Success(response) if response.status == 201),
+                "the reply itself must not be lost"
             );
         });
     }

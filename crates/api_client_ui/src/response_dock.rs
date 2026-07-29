@@ -2,18 +2,12 @@ use crate::response_view::{ResponseData, ResponseTab, format_size};
 use api_client::TestResult;
 use editor::Editor;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, WeakEntity,
-    Window, div,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, div,
 };
+use terminal_view::terminal_panel::TerminalPanel;
 use ui::{IconName, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
-use workspace::{
-    Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
-use zed_actions::api_client_panel::ToggleResponseDockFocus;
-
-const API_RESPONSE_DOCK_PANEL_KEY: &str = "ApiResponseDockPanel";
+use workspace::{Item, ItemHandle as _, Workspace, dock::Panel as _};
 
 /// Everything the dock needs to render a completed response. The body
 /// editors are the very same `Entity<Editor>` the originating `RequestView`
@@ -90,7 +84,88 @@ pub struct ResponseDockPanel {
     scroll_handle: ScrollHandle,
 }
 
-impl EventEmitter<PanelEvent> for ResponseDockPanel {}
+/// A tab carries no events of its own; the enum exists because `Item` needs one.
+pub enum ResponseTabEvent {}
+
+impl EventEmitter<ResponseTabEvent> for ResponseDockPanel {}
+
+impl Item for ResponseDockPanel {
+    type Event = ResponseTabEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "API Response".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
+        Some(ui::Icon::new(IconName::ReplyArrowRight))
+    }
+}
+
+/// The tab every reply lands in, opened beside the terminals if it is not there
+/// yet, activated and revealed. One tab for all requests: a later reply replaces
+/// what the tab shows rather than stacking another tab beside it.
+pub fn reveal_response_tab(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<ResponseDockPanel>> {
+    let pane = workspace
+        .panel::<TerminalPanel>(cx)
+        .and_then(|panel| panel.read(cx).pane())?;
+    let existing = pane.read(cx).items_of_type::<ResponseDockPanel>().next();
+    let tab = match existing {
+        Some(tab) => tab,
+        None => {
+            let tab = cx.new(ResponseDockPanel::new);
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(tab.clone()), false, false, None, window, cx);
+            });
+            tab
+        }
+    };
+    let index = pane
+        .read(cx)
+        .items()
+        .position(|item| item.item_id() == tab.item_id());
+    if let Some(index) = index {
+        pane.update(cx, |pane, cx| {
+            // Activated but not focused: a reply must not take the caret out of
+            // the request being edited.
+            pane.activate_item(index, false, false, window, cx);
+        });
+    }
+    // Revealed rather than merely opened: a zoomed item elsewhere would leave the
+    // tab activated but hidden behind it.
+    workspace.reveal_panel::<TerminalPanel>(window, cx);
+    Some(tab)
+}
+
+/// Opens the response tab and puts the caret in it, for the reader who asked for
+/// it by its own shortcut rather than by sending something.
+pub fn focus_response_tab(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(tab) = reveal_response_tab(workspace, window, cx) {
+        let handle = tab.read(cx).focus_handle.clone();
+        window.focus(&handle, cx);
+    }
+}
+
+/// The response tab if it is already open, without opening one.
+pub fn existing_response_tab(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<Entity<ResponseDockPanel>> {
+    workspace
+        .panel::<TerminalPanel>(cx)?
+        .read(cx)
+        .pane()?
+        .read(cx)
+        .items_of_type::<ResponseDockPanel>()
+        .next()
+}
 
 impl Focusable for ResponseDockPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -109,12 +184,6 @@ impl ResponseDockPanel {
         }
     }
 
-    pub async fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> anyhow::Result<Entity<Self>> {
-        workspace.update(&mut cx, |_workspace, cx| cx.new(|cx| Self::new(cx)))
-    }
 
     /// Claims the dock for a send that is starting. Requests finish in whatever
     /// order the network answers, so every later update carries this number and
@@ -536,52 +605,6 @@ impl Render for ResponseDockPanel {
                 cx,
             )
             .into_any_element()
-    }
-}
-
-impl Panel for ResponseDockPanel {
-    fn persistent_name() -> &'static str {
-        API_RESPONSE_DOCK_PANEL_KEY
-    }
-
-    fn panel_key() -> &'static str {
-        API_RESPONSE_DOCK_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Bottom
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        position == DockPosition::Bottom
-    }
-
-    fn set_position(
-        &mut self,
-        _position: DockPosition,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(280.)
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
-        Some(IconName::ReplyArrowRight)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("API Response")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleResponseDockFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        10
     }
 }
 

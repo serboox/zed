@@ -10,6 +10,7 @@ use gpui::{
 };
 use theme::Appearance;
 use ui::{ContextMenu, DropdownMenu, Tooltip, WithScrollbar, prelude::*};
+use util::ResultExt as _;
 use workspace::preview_appearance::{
     observe_preview_appearance, preview_appearance, set_preview_appearance,
 };
@@ -771,12 +772,8 @@ impl OpenApiPreviewView {
                     Some(description) => format!("{} -- {description}", server.url).into(),
                     None => server.url.clone(),
                 };
-                menu = menu.entry(label, None, move |_, cx| {
-                    let url = url.clone();
-                    weak.update_in(cx, |view, window, cx| {
-                        view.select_server(url, window, cx);
-                    })
-                    .ok();
+                menu = menu.entry(label, None, move |window, cx| {
+                    apply_server_pick(&weak, url.clone(), window, cx);
                 });
             }
             menu
@@ -1480,6 +1477,22 @@ impl OpenApiPreviewView {
                 )
             })
     }
+}
+
+/// Applies a pick from the servers dropdown. A menu entry runs with the window
+/// already borrowed for the click, so the pick must be applied through that very
+/// window: asking the app to enter the window again fails while it is in use, and
+/// the pick would be dropped without a trace.
+fn apply_server_pick(
+    view: &gpui::WeakEntity<OpenApiPreviewView>,
+    url: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    view.update(cx, |view, cx| {
+        view.select_server(url, window, cx);
+    })
+    .log_err();
 }
 
 /// Adds `imported` to the API client store: a brand-new collection when none
@@ -2631,6 +2644,76 @@ mod tests {
                 store.folders.first().map(|folder| folder.id),
                 "the new request belongs in the tag's folder"
             );
+        });
+    }
+
+    const TWO_SERVER_CONTRACT: &str = "openapi: 3.0.3\ninfo:\n  title: pd-instruments\n  version: 1.0.0\nservers:\n  - url: http://127.0.0.1:8080\n    description: local\n  - url: https://stage.example.com\n    description: stage\npaths:\n  /v1/icons:\n    get:\n      summary: Lists icons.\n      responses:\n        '200':\n          description: ok\n";
+
+    /// A menu entry runs with the window already borrowed for the click, which is
+    /// the context this drives: picking through it has to reach the view, and the
+    /// panel already open has to follow the pick.
+    #[gpui::test]
+    async fn picking_a_server_changes_the_selection_and_the_open_try_it_out_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_text(TWO_SERVER_CONTRACT, window, cx);
+            editor
+        });
+        let editor = window.root(cx).expect("the editor is the window's root");
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let view = cx.update(|window, cx| OpenApiPreviewView::new(editor, window, cx));
+        cx.run_until_parked();
+
+        let key = view
+            .read_with(cx, |view, _| {
+                view.document
+                    .as_ref()
+                    .map(|document| document.groups[0].operations[0].key())
+            })
+            .expect("the contract has to parse into one operation");
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_try_it_out(key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let seeded = view.read_with(cx, |view, cx| {
+            view.try_it_out_panels[&key].server_editor.read(cx).text(cx)
+        });
+        assert_eq!(
+            seeded, "http://127.0.0.1:8080",
+            "the panel starts on the contract's first server"
+        );
+
+        let weak = view.downgrade();
+        cx.update(|window, cx| {
+            apply_server_pick(&weak, "https://stage.example.com".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.selected_server_url.as_deref(),
+                Some("https://stage.example.com"),
+                "the pick has to be remembered for the next panel that opens"
+            );
+            assert_eq!(
+                view.try_it_out_panels[&key].server_editor.read(cx).text(cx),
+                "https://stage.example.com",
+                "the panel already open has to follow the pick, since that is what a send reads"
+            );
+        });
+    }
+
+    fn init_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
         });
     }
 

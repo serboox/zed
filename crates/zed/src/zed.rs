@@ -18,7 +18,7 @@ pub(crate) mod windows_only_instance;
 use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
-use api_client_ui::{ApiClientPanel, ResponseDockPanel};
+use api_client_ui::ApiClientPanel;
 pub use app_menus::*;
 use assets::Assets;
 
@@ -803,8 +803,6 @@ fn initialize_panels(
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
         let api_client_panel = ApiClientPanel::load(workspace_handle.clone(), cx.clone());
-        let api_response_dock_panel =
-            ResponseDockPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -860,11 +858,6 @@ fn initialize_panels(
                     add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
                     add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
                     add_panel_when_ready(api_client_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(
-                        api_response_dock_panel,
-                        workspace_handle.clone(),
-                        cx.clone(),
-                    ),
                     initialize_agent_panel(workspace_handle.clone(), cx.clone())
                         .map(|r| r.log_err()),
                 );
@@ -1350,7 +1343,7 @@ fn register_actions(
              _: &zed_actions::api_client_panel::ToggleResponseDockFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<ResponseDockPanel>(window, cx);
+                api_client_ui::focus_response_tab(workspace, window, cx);
             },
         )
         .register_action(
