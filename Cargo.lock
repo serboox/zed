@@ -18899,7 +18899,9 @@ dependencies = [
  "markdown_preview",
  "openapi_preview",
  "project",
+ "serde_json",
  "ui",
+ "util",
  "workspace",
 ]
 

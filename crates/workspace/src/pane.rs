@@ -4498,13 +4498,28 @@ impl Render for Pane {
                                 window,
                                 cx,
                             );
-                            div.id("pane_placeholder")
+                            let div = div
+                                .id("pane_placeholder")
                                 .v_flex()
                                 .size_full()
                                 .overflow_hidden()
-                                .child(self.toolbar.clone())
-                                .child(item.to_any_view())
-                                .children(overlay)
+                                .child(self.toolbar.clone());
+                            match overlay {
+                                // Only a pane that has controls to paint gets the
+                                // extra box: it is what makes "the top of the
+                                // document" mean the item rather than the toolbar
+                                // above it, and every other pane keeps the layout
+                                // it had.
+                                Some(overlay) => div.child(
+                                    v_flex()
+                                        .relative()
+                                        .size_full()
+                                        .debug_selector(|| "pane-item-area".into())
+                                        .child(item.to_any_view())
+                                        .child(overlay),
+                                ),
+                                None => div.child(item.to_any_view()),
+                            }
                         } else {
                             let placeholder = div
                                 .id("pane_placeholder")

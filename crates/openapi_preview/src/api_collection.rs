@@ -281,7 +281,7 @@ fn json_content_type(content_types: &[SharedString]) -> Option<&SharedString> {
 /// property list, falling back to an empty object when the type label does
 /// not resolve to a known schema (an array, a composite, a primitive, or an
 /// unresolvable reference).
-fn json_skeleton(
+pub(crate) fn json_skeleton(
     document: &OpenApiDocument,
     type_label: Option<&SharedString>,
 ) -> serde_json::Value {

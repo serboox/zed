@@ -4,7 +4,7 @@ use html_preview::html_preview_view::HtmlPreviewView;
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use openapi_preview::{OpenApiPreviewView, looks_like_openapi};
 use ui::prelude::*;
-use workspace::{Pane, SaveIntent, Workspace};
+use workspace::{Pane, Workspace};
 
 use crate::split_preview_view::{PreviewLayout, SplitPreviewView};
 use crate::{OpenSplitPreview, split_preview_view};
@@ -133,7 +133,16 @@ pub fn open_for_editor(
         }
     };
 
+    // The pane counts a second tab for the same file as a duplicate and
+    // activates the tab it already has instead of adding the new one, so the tab
+    // being replaced has to be gone first. It is removed rather than closed:
+    // closing runs the save path, which reloads a saveable buffer from disk and
+    // would throw away edits the reader has not saved yet. Nothing is lost by
+    // removing it -- the buffer itself lives on in the split.
     pane.update(cx, |pane, cx| {
+        if let Some((item_id, _)) = replaced {
+            pane.remove_item(item_id, false, false, window, cx);
+        }
         pane.add_item(
             Box::new(view),
             true,
@@ -142,12 +151,6 @@ pub fn open_for_editor(
             window,
             cx,
         );
-        // The buffer lives on in the split, so the tab it replaces is closed
-        // without asking about unsaved changes -- nothing is being discarded.
-        if let Some((item_id, _)) = replaced {
-            pane.close_item_by_id(item_id, SaveIntent::Skip, window, cx)
-                .detach_and_log_err(cx);
-        }
     });
 }
 

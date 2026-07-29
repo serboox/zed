@@ -1012,7 +1012,7 @@ pub struct ItemOverlayRegistry(Vec<ItemOverlayRenderer>);
 impl Global for ItemOverlayRegistry {}
 
 /// Registers controls painted over the active item of a pane, floating in the
-/// bottom left corner of the document. Registered from outside this crate so a
+/// top left corner of the document. Registered from outside this crate so a
 /// document kind can offer controls of its own without [`Pane`] knowing about
 /// it.
 ///
@@ -1061,7 +1061,7 @@ impl ItemOverlayRegistry {
         Some(
             h_flex()
                 .absolute()
-                .bottom_2()
+                .top_2()
                 .left_3()
                 .gap_1()
                 .children(overlays),
@@ -17285,36 +17285,104 @@ mod tests {
         });
     }
 
+    /// Whether a scan is still in flight at any particular moment is a race the
+    /// test cannot win by looking once, so the phases are collected as they are
+    /// reported and the sequence is what gets asserted.
+    fn observe_load_phases(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (Rc<RefCell<Vec<Option<WorkspaceLoadPhase>>>>, Subscription) {
+        let observed_phases = Rc::new(RefCell::new(Vec::new()));
+        let observation = cx.update(|_, cx| {
+            let observed_phases = observed_phases.clone();
+            cx.observe(workspace, move |workspace, cx| {
+                observed_phases
+                    .borrow_mut()
+                    .push(workspace.read(cx).active_load_phase());
+            })
+        });
+        (observed_phases, observation)
+    }
+
+    /// Reporting a real scan is covered by the added-folder test below; what a
+    /// fake filesystem cannot reproduce is a scan slow enough to still be in
+    /// flight at any chosen moment, so the bookkeeping the reporting rests on --
+    /// nesting and which phase wins -- is asserted directly.
     #[gpui::test]
-    async fn test_project_scan_phase_ends_when_scan_completes(cx: &mut TestAppContext) {
+    async fn test_load_phases_nest_and_report_the_most_important_one(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
-
-        let project = Project::test(fs.clone(), [], cx).await;
-        // Deliberately not awaited: the workspace has to be built while the
-        // worktree is still being scanned.
-        let worktree_creation = project.update(cx, |project, cx| {
-            project.find_or_create_worktree(path!("/root"), true, cx)
-        });
-
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        workspace.update(cx, |workspace, _| {
+        cx.run_until_parked();
+
+        let (observed_phases, _observation) = observe_load_phases(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.active_load_phase(), None);
+
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::ScanningProject)
+            );
+
+            // Two phases at once: the one declared first is the one the reader is
+            // told about, and the other has to survive underneath it.
+            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::LoadingPanels)
+            );
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
             assert_eq!(
                 workspace.active_load_phase(),
                 Some(WorkspaceLoadPhase::ScanningProject),
-                "a workspace opened while a worktree is still being scanned must say so"
+                "the scan is still in flight and must still be reported"
             );
-        });
 
-        worktree_creation.await.unwrap();
-        cx.run_until_parked();
+            // Two claims on the same phase: it ends when both are done, not the
+            // first, or the reader would be told the work finished too early.
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            assert_eq!(
+                workspace.active_load_phase(),
+                Some(WorkspaceLoadPhase::ScanningProject)
+            );
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            assert_eq!(workspace.active_load_phase(), None);
 
-        workspace.update(cx, |workspace, _| {
+            // An end with nothing outstanding must not wrap around into a phase
+            // that never finishes.
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
             assert_eq!(workspace.active_load_phase(), None);
         });
+
+        // Announcing is a separate promise from bookkeeping: the indicator only
+        // redraws when the workspace says something changed, and an observer is
+        // called after the update that changed it, not inside it.
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            observed_phases.borrow().last(),
+            Some(&Some(WorkspaceLoadPhase::ScanningProject)),
+            "starting work has to be announced, got {:?}",
+            observed_phases.borrow()
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            observed_phases.borrow().last(),
+            Some(&None),
+            "finishing has to be announced too, or the indicator never goes away"
+        );
     }
 
     #[gpui::test]
@@ -17339,24 +17407,26 @@ mod tests {
             );
         });
 
-        // Deliberately not awaited: the second folder's scan has to still be in
-        // flight while the assertion below runs.
+        let (observed_phases, _observation) = observe_load_phases(&workspace, cx);
         let second_worktree = project.update(cx, |project, cx| {
             project.find_or_create_worktree(path!("/second"), true, cx)
         });
+        second_worktree.await.unwrap();
         cx.run_until_parked();
+
+        assert!(
+            observed_phases
+                .borrow()
+                .contains(&Some(WorkspaceLoadPhase::ScanningProject)),
+            "a folder added to a live project must report its scan too, got {:?}",
+            observed_phases.borrow()
+        );
         workspace.update(cx, |workspace, _| {
             assert_eq!(
                 workspace.active_load_phase(),
-                Some(WorkspaceLoadPhase::ScanningProject),
-                "a folder added to a live project must report its scan too"
+                None,
+                "the phase has to end once the added folder is scanned"
             );
-        });
-
-        second_worktree.await.unwrap();
-        cx.run_until_parked();
-        workspace.update(cx, |workspace, _| {
-            assert_eq!(workspace.active_load_phase(), None);
         });
     }
 

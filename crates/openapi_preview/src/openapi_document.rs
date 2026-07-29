@@ -149,17 +149,29 @@ pub fn looks_like_openapi(text: &str) -> bool {
         Some((index, _)) => &text[..index],
         None => text,
     };
+    declares_version_as_yaml(head) || declares_version_as_json(head)
+}
+
+/// A YAML root key sits at the start of its line and is followed by a colon.
+fn declares_version_as_yaml(head: &str) -> bool {
     head.lines().any(|line| {
-        let trimmed = line.trim_start();
-        let unquoted = trimmed.trim_start_matches(['"', '\'']);
-        // A root key is not indented in YAML; in JSON it sits inside the
-        // opening brace, so leading whitespace is allowed there as well.
-        (unquoted.starts_with("openapi") || unquoted.starts_with("swagger"))
-            && unquoted
+        let key = line.trim_start_matches(['"', '\'']);
+        (key.starts_with("openapi") || key.starts_with("swagger"))
+            && key
                 .trim_start_matches(|c: char| c.is_alphanumeric())
                 .trim_start_matches(['"', '\''])
                 .trim_start()
                 .starts_with(':')
+    })
+}
+
+/// A JSON key is quoted and may sit anywhere, including in the middle of a
+/// single very long line -- a minified contract is one line from `{` to `}`, so
+/// scanning line beginnings would never find it.
+fn declares_version_as_json(head: &str) -> bool {
+    ["\"openapi\"", "\"swagger\""].iter().any(|key| {
+        head.match_indices(key)
+            .any(|(index, _)| head[index + key.len()..].trim_start().starts_with(':'))
     })
 }
 
@@ -653,9 +665,18 @@ components:
         assert!(looks_like_openapi("openapi: 3.0.3\ninfo:\n  title: x\n"));
         assert!(looks_like_openapi("swagger: \"2.0\"\n"));
         assert!(looks_like_openapi("{\n  \"openapi\": \"3.1.0\"\n}"));
+        // A contract served minified is a single line from brace to brace, and
+        // the version key can sit anywhere along it.
+        assert!(looks_like_openapi(
+            r#"{"openapi":"3.0.4","info":{"title":"Pets"}}"#
+        ));
+        assert!(looks_like_openapi(
+            r#"{"info":{"title":"Pets"},"swagger":"2.0"}"#
+        ));
         // A key that merely mentions the word is not a version declaration.
         assert!(!looks_like_openapi("name: openapi-generator\n"));
         assert!(!looks_like_openapi("services:\n  web:\n    image: nginx\n"));
+        assert!(!looks_like_openapi(r#"{"generator":"openapi-generator"}"#));
     }
 
     #[test]

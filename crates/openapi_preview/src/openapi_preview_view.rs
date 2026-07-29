@@ -829,10 +829,23 @@ impl OpenApiPreviewView {
                         ),
                 )
             })
-            .when(!operation.parameters.is_empty(), |details| {
-                details
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
                     .child(section_title("Parameters"))
-                    .child(render_parameters_table(&operation.parameters, &key, cx))
+                    .child(self.render_try_it_out_toggle(operation, cx)),
+            )
+            .map(|details| {
+                if operation.parameters.is_empty() {
+                    details.child(
+                        Label::new("No parameters")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                } else {
+                    details.child(render_parameters_table(&operation.parameters, &key, cx))
+                }
             })
             .when_some(operation.request_body.clone(), |details, body| {
                 details
@@ -842,12 +855,14 @@ impl OpenApiPreviewView {
             .when(!operation.responses.is_empty(), |details| {
                 details
                     .child(section_title("Responses"))
-                    .child(render_responses_table(&operation.responses, &key, cx))
+                    .children(self.document.as_ref().map(|document| {
+                        render_responses_table(document, &operation.responses, &key, cx)
+                    }))
             })
-            .child(self.render_try_it_out_section(operation, cx))
+            .children(self.render_try_it_out_section(operation, cx))
     }
 
-    fn render_try_it_out_section(
+    fn render_try_it_out_toggle(
         &self,
         operation: &Operation,
         cx: &mut Context<Self>,
@@ -856,31 +871,38 @@ impl OpenApiPreviewView {
         let active = self.try_it_out_panels.contains_key(&key);
         let toggle_key = key.clone();
 
-        let mut section = v_flex().gap_2().child(
-            Button::new(
-                SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
-                if active {
-                    "Close Try it out"
-                } else {
-                    "Try it out"
-                },
-            )
-            .style(ButtonStyle::Subtle)
-            .start_icon(Icon::new(if active {
-                IconName::ChevronDown
+        Button::new(
+            SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
+            if active {
+                "Close Try it out"
             } else {
-                IconName::PlayOutlined
-            }))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_try_it_out(toggle_key.clone(), window, cx);
-            })),
-        );
+                "Try it out"
+            },
+        )
+        .style(ButtonStyle::Subtle)
+        .start_icon(Icon::new(if active {
+            IconName::ChevronDown
+        } else {
+            IconName::PlayOutlined
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.toggle_try_it_out(toggle_key.clone(), window, cx);
+        }))
+    }
 
-        if let Some(panel) = self.try_it_out_panels.get(&key) {
-            section = section.child(self.render_try_it_out_panel(&key, panel, cx));
-        }
-
-        section
+    fn render_try_it_out_section(
+        &self,
+        operation: &Operation,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let key = operation.key();
+        let panel = self.try_it_out_panels.get(&key)?;
+        Some(
+            v_flex()
+                .gap_2()
+                .child(self.render_try_it_out_panel(&key, panel, cx))
+                .into_any_element(),
+        )
     }
 
     fn render_try_it_out_panel(
@@ -1376,6 +1398,11 @@ fn render_parameters_table(
                                             .weight(gpui::FontWeight::BOLD)
                                             .color(Color::Error),
                                     )
+                                    .child(
+                                        Label::new("required")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Error),
+                                    )
                                 }),
                         )
                         .child(
@@ -1434,6 +1461,7 @@ fn parameters_table_header(cx: &App) -> impl IntoElement {
 }
 
 fn render_responses_table(
+    document: &OpenApiDocument,
     responses: &[Response],
     operation_key: &SharedString,
     cx: &App,
@@ -1483,9 +1511,46 @@ fn render_responses_table(
                             Label::new(content_type.clone())
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted)
+                        }))
+                        .children(response_example(document, response).map(|example| {
+                            v_flex()
+                                .gap_0p5()
+                                .child(
+                                    Label::new("Example value")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border_variant)
+                                        .bg(cx.theme().colors().editor_background)
+                                        .px_2()
+                                        .py_1()
+                                        .child(
+                                            Label::new(example)
+                                                .size(LabelSize::XSmall)
+                                                .buffer_font(cx),
+                                        ),
+                                )
                         })),
                 )
         }))
+}
+
+/// The shape a reader can expect back, built from the schema the response names.
+/// A response naming nothing this document defines has no example to show, and
+/// inventing one would be worse than leaving it out.
+fn response_example(document: &OpenApiDocument, response: &Response) -> Option<SharedString> {
+    let skeleton = crate::api_collection::json_skeleton(document, response.type_label.as_ref());
+    let object = skeleton.as_object()?;
+    if object.is_empty() {
+        return None;
+    }
+    serde_json::to_string_pretty(&skeleton)
+        .ok()
+        .map(SharedString::from)
 }
 
 fn responses_table_header(cx: &App) -> impl IntoElement {
