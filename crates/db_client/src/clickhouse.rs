@@ -6,7 +6,9 @@ use std::time::Instant;
 use crate::MAX_RESULT_ROWS;
 use crate::connection::ConnectionConfig;
 use crate::provider::DbProvider;
-use crate::schema::{ColumnInfo, DatabaseInfo, QueryResult, TableInfo, TableKind};
+use crate::schema::{
+    CheckConstraintInfo, ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo, TableKind,
+};
 
 pub struct ClickHouseProvider {
     client: reqwest::Client,
@@ -74,7 +76,29 @@ impl ClickHouseProvider {
             .context("Failed to read ClickHouse response body")?;
         let parsed: ClickHouseJsonResponse =
             serde_json::from_str(&body).context("Failed to parse ClickHouse JSON response")?;
+        if let Some(exception) = &parsed.exception {
+            anyhow::bail!("ClickHouse error: {exception}");
+        }
         Ok(parsed)
+    }
+
+    async fn data_skipping_indices(
+        &self,
+        database: &str,
+        table: &str,
+        type_column: &str,
+    ) -> Result<Vec<IndexInfo>> {
+        let sql = format!(
+            "-- name: ListDataSkippingIndices :many
+             SELECT name, {type_column}, expr
+             FROM system.data_skipping_indices
+             WHERE database = '{}' AND table = '{}'
+             ORDER BY name",
+            database.replace('\'', "\\'"),
+            table.replace('\'', "\\'"),
+        );
+        let resp = self.query_json(&sql, Some(database)).await?;
+        Ok(index_infos_from_rows(resp.data))
     }
 
     async fn execute_dml(&self, sql: &str, database: Option<&str>) -> Result<u64> {
@@ -109,6 +133,9 @@ impl ClickHouseProvider {
 struct ClickHouseJsonResponse {
     meta: Vec<ClickHouseColumnMeta>,
     data: Vec<Vec<serde_json::Value>>,
+    // An error raised after the response has begun streaming arrives inside the
+    // body, under a 200, so a reply that parses is not a reply that succeeded.
+    exception: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +155,219 @@ fn is_read_query(sql: &str) -> bool {
         || upper.starts_with("DESC")
         || upper.starts_with("EXISTS")
         || upper.starts_with("WITH")
+}
+
+// ClickHouse keeps no system table for constraints, so a CHECK lives only in the
+// table's CREATE statement. Expressions carry their own commas, parentheses and
+// quotes, so the scan tracks nesting and quoting instead of splitting on text.
+fn parse_check_constraints(ddl: &str) -> Vec<CheckConstraintInfo> {
+    let chars: Vec<char> = ddl.chars().collect();
+    let mut constraints = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if matches!(chars.get(index), Some('\'') | Some('"') | Some('`')) {
+            index = skip_quoted(&chars, index);
+            continue;
+        }
+        if !keyword_at(&chars, index, "CONSTRAINT") {
+            index += 1;
+            continue;
+        }
+        let after_keyword = skip_whitespace(&chars, index + "CONSTRAINT".len());
+        let Some((name, after_name)) = read_identifier(&chars, after_keyword) else {
+            index += 1;
+            continue;
+        };
+        let at_check = skip_whitespace(&chars, after_name);
+        if !keyword_at(&chars, at_check, "CHECK") {
+            index = after_name;
+            continue;
+        }
+        let expression_start = skip_whitespace(&chars, at_check + "CHECK".len());
+        let (expression, after_expression) = read_expression(&chars, expression_start);
+        if !expression.is_empty() {
+            constraints.push(CheckConstraintInfo { name, expression });
+        }
+        index = after_expression;
+    }
+    constraints
+}
+
+// A query naming a column the server does not have comes back as
+// UNKNOWN_IDENTIFIER, quoting the name. The wording has changed across releases,
+// so the check reads the code and the phrasings alongside the name.
+fn names_an_unknown_column(error: &anyhow::Error, column: &str) -> bool {
+    let message = format!("{error:#}");
+    message.contains(column)
+        && (message.contains("UNKNOWN_IDENTIFIER")
+            || message.contains("Code: 47")
+            || message.contains("Unknown expression identifier")
+            || message.contains("Missing columns"))
+}
+
+// Rows of (name, type, expr) as system.data_skipping_indices returns them.
+// A data-skipping index never enforces uniqueness, whatever its type.
+fn index_infos_from_rows(rows: Vec<Vec<serde_json::Value>>) -> Vec<IndexInfo> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let mut values = row.into_iter();
+            let name = values.next()?.as_str()?.to_string();
+            let index_type = values.next()?.as_str()?.to_string();
+            let expression = values
+                .next()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            Some(IndexInfo {
+                name,
+                columns: split_index_expression(&expression),
+                unique: false,
+                index_type,
+            })
+        })
+        .collect()
+}
+
+// An index expression is one or more columns, or a call over them. Only the
+// top-level commas separate columns; the ones inside a call belong to it.
+fn split_index_expression(expression: &str) -> Vec<String> {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut columns = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let (piece, next) = read_expression(&chars, start);
+        if !piece.is_empty() {
+            columns.push(piece);
+        }
+        // Steps over the separator the reader stopped on, so the scan always
+        // moves forward even when it consumed nothing.
+        start = next + 1;
+    }
+    columns
+}
+
+fn skip_quoted(chars: &[char], start: usize) -> usize {
+    let Some(&quote) = chars.get(start) else {
+        return start + 1;
+    };
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars.get(index) {
+            Some('\\') => index += 2,
+            Some(&ch) if ch == quote => {
+                // A doubled quote stands for the character itself, so the string
+                // carries on rather than ending here.
+                if chars.get(index + 1) == Some(&quote) {
+                    index += 2;
+                } else {
+                    return index + 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+fn keyword_at(chars: &[char], start: usize, keyword: &str) -> bool {
+    if start > 0 && chars.get(start - 1).is_some_and(|ch| is_identifier_char(*ch)) {
+        return false;
+    }
+    let mut index = start;
+    for expected in keyword.chars() {
+        match chars.get(index) {
+            Some(actual) if actual.eq_ignore_ascii_case(&expected) => index += 1,
+            _ => return false,
+        }
+    }
+    !chars.get(index).is_some_and(|ch| is_identifier_char(*ch))
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+fn skip_whitespace(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+        index += 1;
+    }
+    index
+}
+
+fn read_identifier(chars: &[char], start: usize) -> Option<(String, usize)> {
+    match chars.get(start)? {
+        quote @ ('`' | '"') => {
+            let quote = *quote;
+            let mut name = String::new();
+            let mut index = start + 1;
+            while let Some(&ch) = chars.get(index) {
+                if ch == quote {
+                    if chars.get(index + 1) == Some(&quote) {
+                        name.push(quote);
+                        index += 2;
+                        continue;
+                    }
+                    return Some((name, index + 1));
+                }
+                if ch == '\\' {
+                    if let Some(&escaped) = chars.get(index + 1) {
+                        name.push(escaped);
+                    }
+                    index += 2;
+                    continue;
+                }
+                name.push(ch);
+                index += 1;
+            }
+            None
+        }
+        _ => {
+            let mut name = String::new();
+            let mut index = start;
+            while let Some(&ch) = chars.get(index) {
+                if !is_identifier_char(ch) {
+                    break;
+                }
+                name.push(ch);
+                index += 1;
+            }
+            if name.is_empty() {
+                None
+            } else {
+                Some((name, index))
+            }
+        }
+    }
+}
+
+// Reads one element of a list: it ends at the comma separating it from the next
+// element, or at the parenthesis closing the list it sits in.
+fn read_expression(chars: &[char], start: usize) -> (String, usize) {
+    let mut depth: i32 = 0;
+    let mut index = start;
+    while index < chars.len() {
+        match chars.get(index) {
+            Some('\'') | Some('"') | Some('`') => {
+                index = skip_quoted(chars, index);
+                continue;
+            }
+            Some('(') => depth += 1,
+            Some(')') => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            Some(',') if depth == 0 => break,
+            _ => {}
+        }
+        index += 1;
+    }
+    let expression: String = chars
+        .get(start..index)
+        .map(|slice| slice.iter().collect())
+        .unwrap_or_default();
+    (expression.trim().to_string(), index)
 }
 
 mod urlencoding {
@@ -163,6 +403,137 @@ mod tests {
     fn test_urlencoding_special_chars() {
         assert_eq!(urlencoding::encode("my db"), "my%20db");
         assert_eq!(urlencoding::encode("db/name"), "db%2fname");
+    }
+
+    // Copied verbatim from what ClickHouse 25.6.13.41 answered SHOW CREATE TABLE
+    // with, so the parser is read against the server's own formatting rather
+    // than a guess at it.
+    const DDL_WITH_CONSTRAINTS: &str = r"CREATE TABLE trades.orders
+(
+    `id` UInt64,
+    `side` LowCardinality(String),
+    `price` Decimal(18, 4),
+    `note` String DEFAULT 'a, b',
+    INDEX idx_price price TYPE minmax GRANULARITY 3,
+    INDEX idx_pair (side, price) TYPE set(100) GRANULARITY 4,
+    INDEX idx_expr lower(note) TYPE bloom_filter(0.01) GRANULARITY 2,
+    CONSTRAINT positive_price CHECK price > 0,
+    CONSTRAINT `known side` CHECK side IN ('buy', 'sell'),
+    CONSTRAINT ranged CHECK (price >= 1) AND (price <= 100)
+)
+ENGINE = MergeTree
+ORDER BY id
+SETTINGS index_granularity = 8192";
+
+    #[test]
+    fn check_constraints_are_read_out_of_the_create_statement() {
+        let constraints = super::parse_check_constraints(DDL_WITH_CONSTRAINTS);
+        let named: Vec<(&str, &str)> = constraints
+            .iter()
+            .map(|constraint| (constraint.name.as_str(), constraint.expression.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("positive_price", "price > 0"),
+                ("known side", "side IN ('buy', 'sell')"),
+                ("ranged", "(price >= 1) AND (price <= 100)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_without_constraints_reports_none() {
+        let ddl = "CREATE TABLE trades.ticks\n(\n    `id` UInt64,\n    `note` String DEFAULT 'CONSTRAINT c CHECK id > 0'\n)\nENGINE = MergeTree\nORDER BY id";
+        assert!(super::parse_check_constraints(ddl).is_empty());
+    }
+
+    #[test]
+    fn a_constraint_word_inside_an_identifier_is_not_a_constraint() {
+        let ddl = "CREATE TABLE t (`constraints_checked` UInt8, `my_constraint` String) ENGINE = Log";
+        assert!(super::parse_check_constraints(ddl).is_empty());
+    }
+
+    #[test]
+    fn a_server_without_the_column_is_retried_but_a_broken_connection_is_not() {
+        // Quoted from what 25.6.13.41 answered a query naming a column it does
+        // not have.
+        let unknown_column = anyhow::anyhow!(
+            "ClickHouse error (404 Not Found): Code: 47. DB::Exception: Unknown expression identifier `type_full` in scope SELECT name, type_full, expr FROM system.data_skipping_indices. (UNKNOWN_IDENTIFIER) (version 25.6.13.41 (official build))"
+        );
+        assert!(super::names_an_unknown_column(&unknown_column, "type_full"));
+
+        let refused = anyhow::anyhow!("HTTP request to ClickHouse failed")
+            .context("error sending request for url (http://localhost:8123/)");
+        assert!(!super::names_an_unknown_column(&refused, "type_full"));
+
+        // A failure that echoes the query carries the column name too, so the
+        // name alone must not be taken for the server rejecting the column.
+        let timed_out = anyhow::anyhow!(
+            "ClickHouse error (500 Internal Server Error): Code: 159. DB::Exception: Timeout exceeded: elapsed 30 s, maximum: 30 s: While executing SELECT name, type_full, expr FROM system.data_skipping_indices. (TIMEOUT_EXCEEDED)"
+        );
+        assert!(!super::names_an_unknown_column(&timed_out, "type_full"));
+    }
+
+    #[test]
+    fn index_rows_carry_type_parameters_and_split_columns() {
+        // The data array below is what a live 25.6.13.41 server returned for
+        // SELECT name, type_full, expr FROM system.data_skipping_indices.
+        let payload = r#"[
+            ["idx_expr", "bloom_filter(0.01)", "lower(note)"],
+            ["idx_pair", "set(100)", "side, price"],
+            ["idx_price", "minmax", "price"]
+        ]"#;
+        let rows: Vec<Vec<serde_json::Value>> =
+            serde_json::from_str(payload).expect("the recorded payload parses");
+        let indexes = super::index_infos_from_rows(rows);
+        let described: Vec<(&str, &str, Vec<&str>, bool)> = indexes
+            .iter()
+            .map(|index| {
+                (
+                    index.name.as_str(),
+                    index.index_type.as_str(),
+                    index.columns.iter().map(String::as_str).collect(),
+                    index.unique,
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                ("idx_expr", "bloom_filter(0.01)", vec!["lower(note)"], false),
+                ("idx_pair", "set(100)", vec!["side", "price"], false),
+                ("idx_price", "minmax", vec!["price"], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_missing_its_type_is_skipped_rather_than_guessed_at() {
+        let rows: Vec<Vec<serde_json::Value>> =
+            serde_json::from_str(r#"[["idx_price"], ["idx_pair", "set(100)", "side, price"]]"#)
+                .expect("the payload parses");
+        let indexes = super::index_infos_from_rows(rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "idx_pair");
+    }
+
+    #[test]
+    fn index_expressions_split_on_their_own_commas_only() {
+        assert_eq!(super::split_index_expression("price"), vec!["price"]);
+        assert_eq!(
+            super::split_index_expression("side, price"),
+            vec!["side", "price"]
+        );
+        assert_eq!(
+            super::split_index_expression("lower(note), toDate(created_at)"),
+            vec!["lower(note)", "toDate(created_at)"]
+        );
+        assert_eq!(
+            super::split_index_expression("concat(a, ',', b)"),
+            vec!["concat(a, ',', b)"]
+        );
+        assert!(super::split_index_expression("").is_empty());
     }
 }
 
@@ -263,6 +634,36 @@ impl DbProvider for ClickHouseProvider {
                 })
             })
             .collect())
+    }
+
+    async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
+        // Data-skipping indexes are the only per-table index objects ClickHouse
+        // has. The sorting key belongs to the engine clause, not here: reporting
+        // it as an index would have a schema diff offer to ADD INDEX for it.
+        match self
+            .data_skipping_indices(database, table, "type_full")
+            .await
+        {
+            Ok(indexes) => Ok(indexes),
+            // `type_full` carries the index parameters that the DDL needs. A
+            // server old enough to lack the column still reports its indexes, by
+            // their bare type. Everything else -- a refused connection, a
+            // timeout, a denied user -- belongs to the caller, so only the server
+            // saying it does not know the column is retried.
+            Err(error) if names_an_unknown_column(&error, "type_full") => {
+                self.data_skipping_indices(database, table, "type").await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_check_constraints(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<CheckConstraintInfo>> {
+        let ddl = self.get_table_ddl(database, table).await?;
+        Ok(parse_check_constraints(&ddl))
     }
 
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
