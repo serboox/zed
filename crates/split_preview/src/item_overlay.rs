@@ -3,6 +3,7 @@ use gpui::{AnyElement, App, Entity, Window};
 use ui::{Tooltip, prelude::*};
 use workspace::Pane;
 use workspace::item::ItemHandle;
+use workspace::preview_appearance::{preview_appearance, set_preview_appearance};
 
 use crate::open_split_preview;
 use crate::split_preview_view::{PreviewLayout, SplitPreviewView};
@@ -55,8 +56,24 @@ fn render_layout_switch(
                             .on_click(move |_, window, cx| target.choose(layout, window, cx)),
                     )
             }))
+            // The palette a document is read in belongs with the choice of how
+            // it is read: same panel, right after the layouts.
+            .child(
+                div()
+                    .debug_selector(|| "preview-appearance".into())
+                    .child(render_appearance_button(cx)),
+            )
             .into_any_element(),
     )
+}
+
+fn render_appearance_button(cx: &mut App) -> impl IntoElement {
+    let appearance = preview_appearance(cx);
+    IconButton::new("preview-appearance", IconName::Screen)
+        .icon_size(IconSize::Small)
+        .toggle_state(appearance.overrides_editor())
+        .tooltip(Tooltip::text(appearance.tooltip()))
+        .on_click(move |_, _, cx| set_preview_appearance(appearance.next(), cx))
 }
 
 #[derive(Clone)]

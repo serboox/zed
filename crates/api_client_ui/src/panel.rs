@@ -224,7 +224,12 @@ fn filter_tree(
                 children,
             } => {
                 let name_matches = collection.name.to_lowercase().contains(query_lowercase);
-                let filtered_children = filter_tree(children, query_lowercase, method_filters);
+                // Naming the container is a way of asking for everything in it:
+                // a request whose address is written with a variable would
+                // otherwise be hidden inside the very collection just searched
+                // for. Method chips still apply -- those are about the requests.
+                let child_query = if name_matches { "" } else { query_lowercase };
+                let filtered_children = filter_tree(children, child_query, method_filters);
                 if name_matches || !filtered_children.is_empty() {
                     Some(TreeNode::Collection {
                         collection,
@@ -236,7 +241,8 @@ fn filter_tree(
             }
             TreeNode::Folder { folder, children } => {
                 let name_matches = folder.name.to_lowercase().contains(query_lowercase);
-                let filtered_children = filter_tree(children, query_lowercase, method_filters);
+                let child_query = if name_matches { "" } else { query_lowercase };
+                let filtered_children = filter_tree(children, child_query, method_filters);
                 if name_matches || !filtered_children.is_empty() {
                     Some(TreeNode::Folder {
                         folder,
@@ -2830,6 +2836,64 @@ mod tests {
     }
 
     #[gpui::test]
+    /// Searching for a collection by name is a way of asking for what is in it.
+    /// A request whose address is written with a variable matches no host text,
+    /// and pruning it here is what made a freshly saved request look lost.
+    #[test]
+    fn a_collection_matched_by_name_keeps_the_requests_it_holds() {
+        let collection = Collection::new("pd-instruments".to_string());
+        let mut folder = Folder::new(collection.id, "icons".to_string(), None, 0);
+        folder.collection_id = collection.id;
+        let mut request = Request::new(collection.id, "Deletes an icon object.".to_string());
+        request.folder_id = Some(folder.id);
+        request.url = "{{baseUrl}}/v1/icons/{{platform}}".to_string();
+
+        let nodes = vec![TreeNode::Collection {
+            collection,
+            children: vec![TreeNode::Folder {
+                folder,
+                children: vec![TreeNode::Request(request)],
+            }],
+        }];
+
+        let filtered = filter_tree(nodes, "pd-ins", &HashSet::default());
+        let TreeNode::Collection { children, .. } = &filtered[0] else {
+            panic!("the collection matched by name has to stay");
+        };
+        let TreeNode::Folder { children, .. } = &children[0] else {
+            panic!("its folder has to stay");
+        };
+        assert_eq!(
+            children.len(),
+            1,
+            "a request in the collection searched for must not be pruned by that same search"
+        );
+    }
+
+    /// The method chips still apply inside a collection matched by name: they
+    /// are about the requests, not about finding the container.
+    #[test]
+    fn method_chips_still_narrow_a_collection_matched_by_name() {
+        let collection = Collection::new("pd-instruments".to_string());
+        let mut get = Request::new(collection.id, "list".to_string());
+        get.method = api_client::HttpMethod::Get;
+        let mut delete = Request::new(collection.id, "drop".to_string());
+        delete.method = api_client::HttpMethod::Delete;
+
+        let nodes = vec![TreeNode::Collection {
+            collection,
+            children: vec![TreeNode::Request(get), TreeNode::Request(delete)],
+        }];
+        let mut chips = HashSet::default();
+        chips.insert("DELETE".to_string());
+
+        let filtered = filter_tree(nodes, "pd-ins", &chips);
+        let TreeNode::Collection { children, .. } = &filtered[0] else {
+            panic!("the collection has to stay");
+        };
+        assert_eq!(children.len(), 1, "only the DELETE request may remain");
+    }
+
     async fn typing_in_the_search_box_filters_the_tree_to_matching_requests(
         cx: &mut TestAppContext,
     ) {

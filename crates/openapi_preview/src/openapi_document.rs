@@ -324,7 +324,7 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
         let Some(path_item) = path_item.as_mapping() else {
             continue;
         };
-        let shared_parameter_nodes = parameter_nodes(path_item);
+        let shared_parameter_nodes = parameter_nodes(root, path_item);
 
         for method_name in HTTP_METHODS {
             let Some(method) = HttpMethod::parse(method_name) else {
@@ -335,7 +335,7 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
             };
 
             let mut parameter_nodes = shared_parameter_nodes.clone();
-            parameter_nodes.extend(parameter_nodes_of(operation));
+            parameter_nodes.extend(parameter_nodes_of(root, operation));
             let tag = first_tag(operation);
             let group_name = tag.clone().unwrap_or_else(|| UNGROUPED.into());
 
@@ -347,7 +347,7 @@ fn operation_groups(root: &Mapping, notes: &mut Vec<SharedString>) -> Vec<Operat
                 operation_id: string_at(operation, "operationId"),
                 deprecated: bool_at(operation, "deprecated"),
                 secured: is_secured(root, operation),
-                parameters: describe_parameters(&parameter_nodes),
+                parameters: describe_parameters(root, &parameter_nodes),
                 request_body: request_body(root, operation, &parameter_nodes),
                 responses: responses(operation),
             };
@@ -400,32 +400,84 @@ fn first_tag(operation: &Mapping) -> Option<SharedString> {
 /// An operation inherits the path item's parameters, so both levels are
 /// collected before anything is classified: Swagger 2.0 may declare the request
 /// body at either level.
-fn parameter_nodes(owner: &Mapping) -> Vec<&Mapping> {
-    parameter_nodes_of(owner)
+fn parameter_nodes<'a>(root: &'a Mapping, owner: &'a Mapping) -> Vec<&'a Mapping> {
+    parameter_nodes_of(root, owner)
 }
 
-fn parameter_nodes_of(owner: &Mapping) -> Vec<&Mapping> {
+fn parameter_nodes_of<'a>(root: &'a Mapping, owner: &'a Mapping) -> Vec<&'a Mapping> {
     sequence_at(owner, "parameters")
-        .map(|entries| entries.iter().filter_map(Value::as_mapping).collect())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_mapping)
+                .map(|entry| resolve_ref(root, entry))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-fn describe_parameters(nodes: &[&Mapping]) -> Vec<Parameter> {
+/// How many `$ref` hops are followed before giving up. A contract that points a
+/// reference back at itself would otherwise never finish resolving.
+const MAX_REF_HOPS: usize = 8;
+
+/// Follows a `$ref` into the document's own components. Naming a parameter or a
+/// schema once and referencing it everywhere is the norm, and a reference left
+/// unresolved reads as a nameless parameter of the wrong kind.
+fn resolve_ref<'a>(root: &'a Mapping, node: &'a Mapping) -> &'a Mapping {
+    let mut current = node;
+    for _ in 0..MAX_REF_HOPS {
+        let Some(reference) = string_at(current, "$ref") else {
+            return current;
+        };
+        let Some(target) = follow_pointer(root, reference.as_ref()) else {
+            return current;
+        };
+        current = target;
+    }
+    current
+}
+
+fn follow_pointer<'a>(root: &'a Mapping, reference: &str) -> Option<&'a Mapping> {
+    let path = reference.strip_prefix("#/")?;
+    let mut current = root;
+    for segment in path.split('/') {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        current = mapping_at(current, &segment)?;
+    }
+    Some(current)
+}
+
+fn describe_parameters(root: &Mapping, nodes: &[&Mapping]) -> Vec<Parameter> {
     nodes
         .iter()
         // A body parameter is Swagger 2.0's request body, rendered as one.
         .filter(|parameter| string_at(parameter, "in").as_deref() != Some("body"))
-        .map(|parameter| Parameter {
-            name: string_at(parameter, "name").unwrap_or_else(|| "(unnamed)".into()),
-            location: string_at(parameter, "in").unwrap_or_else(|| "query".into()),
-            required: bool_at(parameter, "required"),
-            type_label: mapping_at(parameter, "schema")
-                .map(type_label)
-                .unwrap_or_else(|| type_label(parameter)),
-            allowed_values: mapping_at(parameter, "schema")
+        .map(|parameter| {
+            let schema = mapping_at(parameter, "schema");
+            // A parameter's schema is itself often a reference, and that is where
+            // the values it accepts live.
+            let resolved = schema.map(|schema| resolve_ref(root, schema));
+            let allowed_values = resolved
                 .map(enum_values)
-                .unwrap_or_else(|| enum_values(parameter)),
-            description: string_at(parameter, "description").map(prose),
+                .unwrap_or_else(|| enum_values(parameter));
+            let type_label = match (schema, resolved) {
+                // A named enumeration reads as the kind of value it accepts,
+                // not as the name it was defined under and not as the word
+                // "enum", which says nothing about what to type.
+                (_, Some(resolved)) if !allowed_values.is_empty() => {
+                    string_at(resolved, "type").unwrap_or_else(|| type_label(resolved))
+                }
+                (Some(schema), _) => type_label(schema),
+                _ => type_label(parameter),
+            };
+            Parameter {
+                name: string_at(parameter, "name").unwrap_or_else(|| "(unnamed)".into()),
+                location: string_at(parameter, "in").unwrap_or_else(|| "query".into()),
+                required: bool_at(parameter, "required"),
+                type_label,
+                allowed_values,
+                description: string_at(parameter, "description").map(prose),
+            }
         })
         .collect()
 }
@@ -842,6 +894,53 @@ components:
         assert!(!looks_like_openapi(r#"{"generator":"openapi-generator"}"#));
     }
 
+    /// A contract that names its parameters once and references them everywhere
+    /// is the norm. Left unresolved, every such parameter reads as "(unnamed)"
+    /// query string and the values it accepts are nowhere on the page.
+    #[test]
+    fn referenced_parameters_and_their_enums_are_resolved() {
+        let document = parse(
+            "openapi: 3.0.3\ninfo:\n  title: Icons\npaths:\n  /icons/{platform}:\n    delete:\n      parameters:\n        - $ref: '#/components/parameters/IconPlatformPath'\n      responses:\n        '200':\n          description: ok\ncomponents:\n  parameters:\n    IconPlatformPath:\n      name: platform\n      in: path\n      required: true\n      description: Which platform's icons.\n      schema:\n        $ref: '#/components/schemas/IconPlatform'\n  schemas:\n    IconPlatform:\n      type: string\n      enum: [web, android, ios]\n",
+        )
+        .expect("parse");
+
+        let parameter = &document.groups[0].operations[0].parameters[0];
+        assert_eq!(parameter.name.as_ref(), "platform");
+        assert_eq!(parameter.location.as_ref(), "path");
+        assert!(parameter.required, "the referenced parameter says required");
+        assert_eq!(
+            parameter.type_label.as_ref(),
+            "string",
+            "an enumeration reads as what it accepts, not as its schema name"
+        );
+        assert_eq!(
+            parameter.allowed_values,
+            vec![
+                SharedString::from("web"),
+                SharedString::from("android"),
+                SharedString::from("ios")
+            ]
+        );
+        assert_eq!(
+            parameter.description.as_deref(),
+            Some("Which platform's icons.")
+        );
+    }
+
+    #[test]
+    fn a_reference_that_points_nowhere_leaves_the_parameter_as_written() {
+        let document = parse(
+            "openapi: 3.0.3\ninfo:\n  title: Icons\npaths:\n  /icons:\n    get:\n      parameters:\n        - $ref: '#/components/parameters/Missing'\n      responses:\n        '200':\n          description: ok\n",
+        )
+        .expect("parse");
+        let parameter = &document.groups[0].operations[0].parameters[0];
+        assert_eq!(
+            parameter.name.as_ref(),
+            "(unnamed)",
+            "a dangling reference must not panic or invent a name"
+        );
+    }
+
     #[test]
     fn link_syntax_is_unwrapped_in_prose() {
         assert_eq!(
@@ -1180,7 +1279,11 @@ paths:
                 SharedString::from("sold"),
             ]
         );
-        assert_eq!(parameter.type_label.as_ref(), "enum");
+        assert_eq!(
+            parameter.type_label.as_ref(),
+            "string",
+            "the reader needs the kind of value to type, which \"enum\" does not say"
+        );
     }
 
     #[test]

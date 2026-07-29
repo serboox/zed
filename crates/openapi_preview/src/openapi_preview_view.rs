@@ -1449,7 +1449,7 @@ impl OpenApiPreviewView {
 fn apply_import_to_store(
     store: &Entity<ApiClientStore>,
     imported: ImportedCollection,
-    cx: &mut Context<OpenApiPreviewView>,
+    cx: &mut App,
 ) -> usize {
     store.update(cx, |store, cx| {
         let existing_collection_id = store
@@ -1986,14 +1986,28 @@ fn render_prose(
     palette: &Palette,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let mut row = h_flex().flex_wrap().gap_1();
+    let mut row = h_flex().flex_wrap().gap_1().items_center();
     for span in split_code_spans(text) {
         row = match span {
-            ProseSpan::Plain(text) => row.child(Label::new(text).size(size).color(color)),
+            // One label per word: a whole sentence in a single label wraps on
+            // its own and drags the chips around it out of the line, so the
+            // paragraph is laid out word by word and the row does the wrapping.
+            ProseSpan::Plain(text) => row.children(
+                prose_words(&text)
+                    .into_iter()
+                    .map(|word| Label::new(word).size(size).color(color)),
+            ),
             ProseSpan::Code(text) => row.child(code_chip(text, size, palette, cx)),
         };
     }
     row
+}
+
+/// The words of a plain prose run, punctuation kept with the word it belongs to.
+fn prose_words(text: &SharedString) -> Vec<SharedString> {
+    text.split_whitespace()
+        .map(|word| SharedString::from(word.to_owned()))
+        .collect()
 }
 
 /// A single inline code chip: `buffer_font` on a raised background, the same
@@ -2339,6 +2353,161 @@ mod tests {
             type_label: Some("Missing".into()),
         };
         assert!(response_example(&document, &unknown).is_none());
+    }
+
+    const ICONS_CONTRACT: &str = "openapi: 3.0.3\ninfo:\n  title: pd-instruments\n  version: 1.0.0\nservers:\n  - url: http://127.0.0.1:8080\ntags:\n  - name: icons\npaths:\n  /v1/icons/{platform}:\n    delete:\n      tags: [icons]\n      summary: Deletes an icon object.\n      parameters:\n        - $ref: '#/components/parameters/IconPlatformPath'\n      responses:\n        '200':\n          description: ok\ncomponents:\n  parameters:\n    IconPlatformPath:\n      name: platform\n      in: path\n      required: true\n      schema:\n        type: string\n        enum: [web, ios]\n";
+
+    fn saved_requests(
+        store: &Entity<ApiClientStore>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Vec<(String, String, Option<String>)> {
+        store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .map(|request| {
+                    let folder = request.folder_id.and_then(|folder_id| {
+                        store
+                            .folders
+                            .iter()
+                            .find(|folder| folder.id == folder_id)
+                            .map(|folder| folder.name.clone())
+                    });
+                    (format!("{:?}", request.method), request.url.clone(), folder)
+                })
+                .collect()
+        })
+    }
+
+    /// Saving an operation has to leave a request a reader can actually find: in
+    /// the collection named after the contract, inside the folder named after
+    /// the tag, with the method and address the contract declares.
+    #[gpui::test]
+    fn saving_one_operation_puts_a_findable_request_in_the_store(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let document = crate::openapi_document::parse(ICONS_CONTRACT).expect("parse");
+        let key = document.groups[0].operations[0].key();
+
+        let added = cx.update(|cx| {
+            let imported = collection_from_document(
+                &document,
+                OperationSelection::SingleOperation(key.clone()),
+            );
+            apply_import_to_store(&store, imported, cx)
+        });
+
+        assert_eq!(added, 1, "one operation saved has to report one request");
+        assert_eq!(
+            saved_requests(&store, cx),
+            vec![(
+                "Delete".to_string(),
+                "{{baseUrl}}/v1/icons/{{platform}}".to_string(),
+                Some("icons".to_string()),
+            )],
+            "the request has to be in the tag's folder, with the contract's method and address"
+        );
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.collections.len(), 1);
+            assert_eq!(store.collections[0].name, "pd-instruments");
+        });
+    }
+
+    /// Saving the same operation twice must not grow a second copy, and must not
+    /// claim it saved something when it did not.
+    #[gpui::test]
+    fn saving_the_same_operation_twice_adds_nothing_the_second_time(cx: &mut gpui::TestAppContext) {
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let document = crate::openapi_document::parse(ICONS_CONTRACT).expect("parse");
+        let key = document.groups[0].operations[0].key();
+
+        let mut counts = Vec::new();
+        for _ in 0..2 {
+            counts.push(cx.update(|cx| {
+                let imported = collection_from_document(
+                    &document,
+                    OperationSelection::SingleOperation(key.clone()),
+                );
+                apply_import_to_store(&store, imported, cx)
+            }));
+        }
+
+        assert_eq!(
+            counts,
+            vec![1, 0],
+            "the second save has to report that nothing was added"
+        );
+        assert_eq!(saved_requests(&store, cx).len(), 1);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.collections.len(), 1, "one contract, one collection");
+            assert_eq!(store.folders.len(), 1, "one tag, one folder");
+        });
+    }
+
+    /// A collection that already holds requests -- imported some other way, with
+    /// no folders -- must gain the tag folder and the new request, not silently
+    /// merge into nothing.
+    #[gpui::test]
+    fn saving_into_an_existing_collection_adds_the_folder_and_the_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let collection_id = store.update(cx, |store, cx| {
+            let id = store.create_collection("pd-instruments".to_string(), cx);
+            store.create_request(id, "/v1/icons".to_string(), None, cx);
+            id
+        });
+        let document = crate::openapi_document::parse(ICONS_CONTRACT).expect("parse");
+        let key = document.groups[0].operations[0].key();
+
+        let added = cx.update(|cx| {
+            let imported =
+                collection_from_document(&document, OperationSelection::SingleOperation(key));
+            apply_import_to_store(&store, imported, cx)
+        });
+
+        assert_eq!(added, 1);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.collections.len(),
+                1,
+                "a contract already saved here must not spawn a second collection"
+            );
+            let folders: Vec<&str> = store
+                .folders
+                .iter()
+                .filter(|folder| folder.collection_id == collection_id)
+                .map(|folder| folder.name.as_str())
+                .collect();
+            assert_eq!(folders, vec!["icons"], "the tag's folder has to be created");
+            let saved = store
+                .requests
+                .iter()
+                .find(|request| request.url.contains("/v1/icons/"))
+                .expect("the new request has to be in the store");
+            assert_eq!(
+                saved.folder_id,
+                store.folders.first().map(|folder| folder.id),
+                "the new request belongs in the tag's folder"
+            );
+        });
+    }
+
+    #[test]
+    fn prose_is_laid_out_word_by_word() {
+        let words = prose_words(&"Deletes an icon,\n  only when unused.".into());
+        assert_eq!(
+            words,
+            vec![
+                SharedString::from("Deletes"),
+                SharedString::from("an"),
+                SharedString::from("icon,"),
+                SharedString::from("only"),
+                SharedString::from("when"),
+                SharedString::from("unused."),
+            ],
+            "punctuation stays with its word, and line breaks in the source do not survive"
+        );
+        assert!(prose_words(&"   ".into()).is_empty());
     }
 
     #[test]
