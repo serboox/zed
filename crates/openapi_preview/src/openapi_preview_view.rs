@@ -762,9 +762,10 @@ impl OpenApiPreviewView {
         if document.servers.is_empty() {
             return None;
         }
-        let selected_url = resolve_selected_server(&document.servers, self.selected_server_url.as_ref())
-            .map(|server| server.url.clone())
-            .unwrap_or_default();
+        let selected_url =
+            resolve_selected_server(&document.servers, self.selected_server_url.as_ref())
+                .map(|server| server.url.clone())
+                .unwrap_or_default();
 
         Some(
             h_flex()
@@ -779,7 +780,7 @@ impl OpenApiPreviewView {
                     "openapi-servers-dropdown",
                     selected_url,
                     DropdownKey::Server,
-                    false,
+                    FieldStyle::plain(),
                     *palette,
                     cx,
                 ))
@@ -839,11 +840,10 @@ impl OpenApiPreviewView {
 
         let key = open.key.clone();
         let selected_now: Option<SharedString> = match &key {
-            DropdownKey::Server => resolve_selected_server(
-                &document.servers,
-                self.selected_server_url.as_ref(),
-            )
-            .map(|server| server.url.clone()),
+            DropdownKey::Server => {
+                resolve_selected_server(&document.servers, self.selected_server_url.as_ref())
+                    .map(|server| server.url.clone())
+            }
             DropdownKey::Parameter {
                 operation_key,
                 name,
@@ -892,7 +892,21 @@ impl OpenApiPreviewView {
             gpui::deferred(
                 gpui::anchored()
                     .position(open.position)
-                    .child(div().occlude().child(list)),
+                    // Opened next to a window edge the list would otherwise hang
+                    // off-screen, taking its rows with it.
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .occlude()
+                            // Anywhere but the list itself dismisses it. The handler
+                            // belongs to the list, not to the page: a page-wide
+                            // handler only sees clicks that leave the preview.
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.open_dropdown = None;
+                                cx.notify();
+                            }))
+                            .child(list),
+                    ),
             )
             .with_priority(1)
             .into_any_element(),
@@ -1243,8 +1257,11 @@ impl OpenApiPreviewView {
             if let Some(panel) = panel
                 && let Some(body_editor) = &panel.body_editor
             {
-                details =
-                    details.child(render_try_it_out_body_editor(body_editor.clone(), palette));
+                details = details.child(render_try_it_out_body_editor(
+                    body_editor.clone(),
+                    palette,
+                    cx,
+                ));
             }
         }
 
@@ -1284,8 +1301,16 @@ impl OpenApiPreviewView {
 
         palette_button(
             SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
-            if active { "Cancel".into() } else { "Try it out".into() },
-            ButtonWeight::Outlined,
+            if active {
+                "Cancel".into()
+            } else {
+                "Try it out".into()
+            },
+            if active {
+                ButtonWeight::Danger
+            } else {
+                ButtonWeight::Outlined
+            },
             false,
             *palette,
             cx.listener(move |this, _, window, cx| {
@@ -1335,37 +1360,36 @@ impl OpenApiPreviewView {
             .rounded_md()
             .border_1()
             .border_color(palette.border_variant)
+            .bg(palette.surface_background)
             .child(fields)
+            .child(palette_button(
+                SharedString::from(format!("openapi-try-it-out-execute-{operation_key}")),
+                if is_sending {
+                    "Sending…".into()
+                } else {
+                    "Execute".into()
+                },
+                ButtonWeight::Primary,
+                is_sending,
+                *palette,
+                cx.listener(move |this, _, window, cx| {
+                    this.execute_try_it_out(execute_key.clone(), window, cx);
+                }),
+            ))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(palette_button(
-                        SharedString::from(format!("openapi-try-it-out-execute-{operation_key}")),
-                        if is_sending {
-                            "Sending…".into()
-                        } else {
-                            "Execute".into()
-                        },
-                        ButtonWeight::Primary,
-                        is_sending,
-                        *palette,
-                        cx.listener(move |this, _, window, cx| {
-                            this.execute_try_it_out(execute_key.clone(), window, cx);
-                        }),
-                    ))
-                    // Clearing drops the task that carries the request, so it stays
-                    // out of reach until the reply is in: a cleared panel mid-flight
-                    // would look like nothing had been asked for.
-                    .child(palette_button(
-                        SharedString::from(format!("openapi-try-it-out-clear-{operation_key}")),
-                        "Clear".into(),
-                        ButtonWeight::Subtle,
-                        is_idle || is_sending,
-                        *palette,
-                        cx.listener(move |this, _, window, cx| {
-                            this.clear_try_it_out_response(clear_key.clone(), window, cx);
-                        }),
-                    )),
+                // Clearing drops the task that carries the request, so it stays
+                // out of reach until the reply is in: a cleared panel mid-flight
+                // would look like nothing had been asked for.
+                h_flex().justify_end().child(palette_button(
+                    SharedString::from(format!("openapi-try-it-out-clear-{operation_key}")),
+                    "Clear".into(),
+                    ButtonWeight::Subtle,
+                    is_idle || is_sending,
+                    *palette,
+                    cx.listener(move |this, _, window, cx| {
+                        this.clear_try_it_out_response(clear_key.clone(), window, cx);
+                    }),
+                )),
             )
     }
 
@@ -1497,18 +1521,10 @@ impl OpenApiPreviewView {
                     );
                 }
 
+                paint_body_editor_from_palette(&panel.response_body_editor, *palette, cx);
                 result = result.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "openapi-try-it-out-response-{operation_key}"
-                        )))
-                        .max_h(px(320.))
-                        .overflow_y_scroll()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(palette.border_variant)
-                        .px_2()
-                        .py_1p5()
+                    field_box(FieldStyle::plain(), *palette)
+                        .debug_selector(|| "openapi-reply-body".to_string())
                         .child(panel.response_body_editor.clone()),
                 );
 
@@ -1620,12 +1636,61 @@ impl OpenApiPreviewView {
 /// How much weight a palette-painted button carries.
 #[derive(Clone, Copy, PartialEq)]
 enum ButtonWeight {
-    /// The one action a panel exists for.
+    /// The one action a panel exists for: filled with the accent, and as wide as
+    /// the panel, the way the reference view paints Execute.
     Primary,
+    /// Turning the panel off, and anything else the reader may not want by
+    /// accident: outlined in the error colour.
+    Danger,
     /// An action worth an outline, but not the accent.
     Outlined,
     /// A side action that only needs a label.
     Subtle,
+}
+
+/// The fill of the one action a panel exists for. A dark theme's accent is a
+/// pale blue, too pale to carry a white label, so the fill is deepened until it
+/// can: the button then looks the same on either page instead of washing out on
+/// one of them.
+fn primary_fill(accent: Hsla) -> Hsla {
+    Hsla {
+        l: accent.l.min(0.55),
+        ..accent
+    }
+}
+
+/// The label a filled button carries: white, the way the reference view paints
+/// its own, for as long as white can be read on the fill. A theme whose accent
+/// is a bright yellow leaves no room for that, and takes a dark label instead.
+fn contrasting_text(background: Hsla) -> Hsla {
+    let light = gpui::hsla(0., 0., 1., 1.);
+    if contrast_ratio(background, light) >= MIN_LABEL_CONTRAST {
+        light
+    } else {
+        gpui::hsla(0., 0., 0.08, 1.)
+    }
+}
+
+/// The contrast a large, semibold label needs to stay readable.
+const MIN_LABEL_CONTRAST: f32 = 3.;
+
+/// The WCAG contrast ratio between two opaque colours.
+fn contrast_ratio(one: Hsla, other: Hsla) -> f32 {
+    let one = relative_luminance(one);
+    let other = relative_luminance(other);
+    (one.max(other) + 0.05) / (one.min(other) + 0.05)
+}
+
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgba = gpui::Rgba::from(color);
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(rgba.r) + 0.7152 * linear(rgba.g) + 0.0722 * linear(rgba.b)
 }
 
 /// A button painted from the reading palette. `ui::Button` takes its colours
@@ -1641,7 +1706,11 @@ fn palette_button(
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let (background, border, text) = match weight {
-        ButtonWeight::Primary => (palette.accent.opacity(0.14), palette.accent, palette.accent),
+        ButtonWeight::Primary => {
+            let fill = primary_fill(palette.accent);
+            (fill, fill, contrasting_text(fill))
+        }
+        ButtonWeight::Danger => (gpui::transparent_black(), palette.error, palette.error),
         ButtonWeight::Outlined => (gpui::transparent_black(), palette.border, palette.text),
         ButtonWeight::Subtle => (
             gpui::transparent_black(),
@@ -1649,12 +1718,19 @@ fn palette_button(
             palette.text_muted,
         ),
     };
-    let hover = palette.element_hover;
+    let fills_the_row = matches!(weight, ButtonWeight::Primary);
+    let hover = match weight {
+        ButtonWeight::Primary => primary_fill(palette.accent).opacity(0.85),
+        _ => palette.element_hover,
+    };
     h_flex()
         .id(id)
+        .when(fills_the_row, |this| {
+            this.w_full().justify_center().py_1p5()
+        })
+        .when(!fills_the_row, |this| this.py_0p5())
         .px_2()
-        .py_0p5()
-        .rounded_sm()
+        .rounded_md()
         .border_1()
         .border_color(border)
         .bg(background)
@@ -1667,9 +1743,67 @@ fn palette_button(
         .child(
             Label::new(label)
                 .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD)
                 .color(Color::Custom(text)),
         )
         .into_any_element()
+}
+
+/// How a field-shaped control is laid out and marked.
+#[derive(Clone, Copy)]
+struct FieldStyle {
+    /// A required value gets a heavier border, the way the reference view marks
+    /// the parameters that must be filled in.
+    required: bool,
+    full_width: bool,
+}
+
+impl FieldStyle {
+    fn plain() -> Self {
+        Self {
+            required: false,
+            full_width: false,
+        }
+    }
+
+    fn required(required: bool) -> Self {
+        Self {
+            required,
+            full_width: false,
+        }
+    }
+
+    fn wide(required: bool) -> Self {
+        Self {
+            required,
+            full_width: true,
+        }
+    }
+}
+
+/// The border of a field box. `palette.border` alone is nearly invisible on a
+/// light page, which is what made the inputs read as empty space, so the box is
+/// drawn from the text colour instead: firm when a value is required, quieter
+/// when it is optional.
+fn field_border(required: bool, palette: Palette) -> Hsla {
+    if required {
+        palette.text_muted.opacity(0.9)
+    } else {
+        palette.text_muted.opacity(0.45)
+    }
+}
+
+/// The box every fillable control sits in: the page's own brightest surface, a
+/// border that is visible on both a light and a dark page, and room to breathe.
+fn field_box(style: FieldStyle, palette: Palette) -> gpui::Div {
+    div()
+        .when(style.full_width, |this| this.w_full())
+        .rounded_md()
+        .border_1()
+        .border_color(field_border(style.required, palette))
+        .bg(palette.background)
+        .px_2()
+        .py_1()
 }
 
 /// Which list a click opened, so the open one can be found again on the next
@@ -1700,21 +1834,18 @@ fn palette_dropdown_trigger(
     id: impl Into<ElementId>,
     label: SharedString,
     key: DropdownKey,
-    full_width: bool,
+    style: FieldStyle,
     palette: Palette,
     cx: &mut Context<OpenApiPreviewView>,
 ) -> AnyElement {
     let hover = palette.element_hover;
-    h_flex()
+    field_box(style, palette)
         .id(id)
-        .when(full_width, |this| this.w_full())
-        .gap_1()
-        .px_2()
-        .py_0p5()
-        .rounded_sm()
-        .border_1()
-        .border_color(palette.border)
-        .bg(palette.element_background)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
         .child(
@@ -1723,7 +1854,7 @@ fn palette_dropdown_trigger(
                 .color(Color::Custom(palette.text)),
         )
         .child(
-            Icon::new(IconName::ChevronUpDown)
+            Icon::new(IconName::ChevronDown)
                 .size(IconSize::XSmall)
                 .color(Color::Custom(palette.text_muted)),
         )
@@ -1907,13 +2038,11 @@ fn render_request_body(
 fn render_try_it_out_body_editor(
     body_editor: Entity<Editor>,
     palette: &Palette,
+    cx: &mut App,
 ) -> impl IntoElement + use<> {
-    div()
-        .rounded_md()
-        .border_1()
-        .border_color(palette.border_variant)
-        .px_2()
-        .py_1p5()
+    paint_body_editor_from_palette(&body_editor, *palette, cx);
+    field_box(FieldStyle::plain(), *palette)
+        .debug_selector(|| "openapi-request-body".to_string())
         .child(body_editor)
 }
 
@@ -1936,6 +2065,7 @@ fn render_parameters_table(
         .rounded_md()
         .border_1()
         .border_color(palette.border_variant)
+        .bg(palette.surface_background)
         .overflow_hidden()
         .child(parameters_table_header(palette));
 
@@ -2043,12 +2173,15 @@ fn render_parameter_input(
     cx: &mut Context<OpenApiPreviewView>,
 ) -> AnyElement {
     match &field.input {
-        ParameterInput::Text(editor) => palette_input(editor.clone(), *palette, cx)
-            .into_any_element(),
+        ParameterInput::Text(editor) => palette_input(
+            editor.clone(),
+            FieldStyle::required(field.required),
+            *palette,
+            cx,
+        ),
         ParameterInput::Select { selected, .. } => render_parameter_enum_dropdown(
             operation_key.clone(),
-            field.name.clone(),
-            field.location.clone(),
+            field,
             selected.clone(),
             palette,
             cx,
@@ -2062,25 +2195,25 @@ fn render_parameter_input(
 /// this"); a required one does not, since some value has to go out either way.
 fn render_parameter_enum_dropdown(
     operation_key: SharedString,
-    parameter_name: SharedString,
-    parameter_location: SharedString,
+    field: &ParameterField,
     selected: Option<SharedString>,
     palette: &Palette,
     cx: &mut Context<OpenApiPreviewView>,
 ) -> AnyElement {
     let label = selected.unwrap_or_else(|| "--".into());
     let id = SharedString::from(format!(
-        "openapi-param-enum-{operation_key}-{parameter_location}-{parameter_name}"
+        "openapi-param-enum-{operation_key}-{}-{}",
+        field.location, field.name
     ));
     palette_dropdown_trigger(
         id,
         label,
         DropdownKey::Parameter {
             operation_key,
-            name: parameter_name,
-            location: parameter_location,
+            name: field.name.clone(),
+            location: field.location.clone(),
         },
-        true,
+        FieldStyle::wide(field.required),
         *palette,
         cx,
     )
@@ -2351,13 +2484,21 @@ fn default_enum_selection(required: bool, allowed_values: &[SharedString]) -> Op
     }
 }
 
+/// How tall a body box may grow before the editor scrolls inside it. A
+/// `multi_line` editor takes its height from its parent, and the page gives it
+/// none -- it would paint as an empty sliver -- so both body editors size
+/// themselves to their own text instead.
+const BODY_EDITOR_MIN_LINES: usize = 4;
+const BODY_EDITOR_MAX_LINES: usize = 18;
+
 fn new_try_it_out_body_editor(
     initial_value: &str,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Editor> {
     cx.new(|cx| {
-        let mut editor = Editor::multi_line(window, cx);
+        let mut editor =
+            Editor::auto_height(BODY_EDITOR_MIN_LINES, BODY_EDITOR_MAX_LINES, window, cx);
         editor.set_placeholder_text("Request body", window, cx);
         if !initial_value.is_empty() {
             editor.set_text(initial_value.to_string(), window, cx);
@@ -2368,37 +2509,62 @@ fn new_try_it_out_body_editor(
 
 fn new_try_it_out_response_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
     cx.new(|cx| {
-        let mut editor = Editor::multi_line(window, cx);
+        let mut editor =
+            Editor::auto_height(BODY_EDITOR_MIN_LINES, BODY_EDITOR_MAX_LINES, window, cx);
         editor.set_read_only(true);
         editor
     })
 }
 
-/// One labelled field row of a "Try it out" panel: the parameter's name,
-/// its location (query/path/header) when it has one, a required marker, and
-/// the single-line editor the reader types the value into.
-/// The box an input sits in, painted from the reading palette, with the editor's
-/// own text colour set to match. An editor otherwise takes its text and border
-/// colours from the editor's theme, which is the wrong palette as soon as the
-/// reader picks a different one for the page.
-fn palette_input(editor: Entity<Editor>, palette: Palette, cx: &mut App) -> AnyElement {
+/// An editor paints its text with the editor theme's colour, which is the wrong
+/// palette as soon as the reader picks a different one for the page -- light page
+/// text stays light on a dark editor theme and the body reads as empty.
+fn paint_editor_from_palette(editor: &Entity<Editor>, palette: Palette, cx: &mut App) {
     editor.update(cx, |editor, _| {
         editor.set_text_style_refinement(gpui::TextStyleRefinement {
             color: Some(palette.text),
             ..Default::default()
         });
     });
-    div()
-        .rounded_sm()
-        .border_1()
-        .border_color(palette.border)
-        .bg(palette.element_background)
-        .px_2()
-        .py_1()
-        .child(editor)
-        .into_any_element()
 }
 
+/// A body editor sizes itself to its own text, which also puts it in the UI
+/// font -- the wrong face for JSON. Paint it in the buffer font, in the page's
+/// own colour.
+fn paint_body_editor_from_palette(editor: &Entity<Editor>, palette: Palette, cx: &mut App) {
+    use settings::Settings as _;
+
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font = settings.buffer_font.clone();
+    let font_size = settings.buffer_font_size(cx);
+    let refinement = gpui::TextStyleRefinement {
+        color: Some(palette.text),
+        font_family: Some(font.family),
+        font_features: Some(font.features),
+        font_fallbacks: font.fallbacks,
+        font_size: Some(font_size.into()),
+        ..Default::default()
+    };
+    editor.update(cx, |editor, _| {
+        editor.set_text_style_refinement(refinement);
+    });
+}
+
+/// The box an input sits in, painted from the reading palette, with the editor's
+/// own text colour set to match.
+fn palette_input(
+    editor: Entity<Editor>,
+    style: FieldStyle,
+    palette: Palette,
+    cx: &mut App,
+) -> AnyElement {
+    paint_editor_from_palette(&editor, palette, cx);
+    field_box(style, palette).child(editor).into_any_element()
+}
+
+/// One labelled field row of a "Try it out" panel: the parameter's name,
+/// its location (query/path/header) when it has one, a required marker, and
+/// the single-line editor the reader types the value into.
 fn render_try_it_out_field(
     label: SharedString,
     location: Option<SharedString>,
@@ -2434,7 +2600,12 @@ fn render_try_it_out_field(
                     )
                 }),
         )
-        .child(palette_input(editor, *palette, cx))
+        .child(palette_input(
+            editor,
+            FieldStyle::required(required),
+            *palette,
+            cx,
+        ))
 }
 
 fn pill(text: SharedString, background: Hsla, text_color: Color) -> impl IntoElement {
@@ -2618,13 +2789,6 @@ impl Render for OpenApiPreviewView {
                     .clone()
                     .and_then(|document| self.render_open_dropdown(&document, &palette, cx)),
             )
-            // A click anywhere else is how a reader dismisses an open list.
-            .when(self.open_dropdown.is_some(), |body| {
-                body.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.open_dropdown = None;
-                    cx.notify();
-                }))
-            })
     }
 }
 
@@ -2964,6 +3128,251 @@ mod tests {
                 "the panel already open has to follow the pick, since that is what a send reads"
             );
         });
+    }
+
+    #[test]
+    fn a_filled_button_takes_a_label_that_reads_against_its_own_fill() {
+        // The two blues a light and a dark theme actually hand out. Deepened for
+        // the button, both have to carry the same white label.
+        for accent in [
+            Hsla::from(gpui::rgb(0x5c78e2)),
+            Hsla::from(gpui::rgb(0x74ade8)),
+        ] {
+            let fill = primary_fill(accent);
+            assert!(
+                contrasting_text(fill).l > 0.8,
+                "a blue button reads with a light label: {accent:?} -> {fill:?}"
+            );
+            assert!(
+                contrast_ratio(fill, contrasting_text(fill)) >= MIN_LABEL_CONTRAST,
+                "the label has to stand out from its own fill: {fill:?}"
+            );
+        }
+
+        // A theme whose accent is a bright yellow cannot take a white label,
+        // however deep the fill is allowed to be.
+        let yellow = primary_fill(gpui::hsla(0.15, 0.9, 0.6, 1.));
+        assert!(
+            contrasting_text(yellow).l < 0.2,
+            "a bright fill needs a dark label: {yellow:?}"
+        );
+    }
+
+    #[test]
+    fn a_required_field_is_outlined_more_firmly_than_an_optional_one() {
+        let palette = crate::palette::sample_palette();
+
+        let required = field_border(true, palette);
+        let optional = field_border(false, palette);
+
+        assert!(
+            required.a > optional.a,
+            "the required marker has to be visible in the box itself, not only in the label"
+        );
+        assert!(
+            optional.a > 0.4,
+            "an optional field still has to read as a box: {optional:?}"
+        );
+    }
+
+    struct PreviewFrame {
+        view: Entity<OpenApiPreviewView>,
+    }
+
+    impl Render for PreviewFrame {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.view.clone())
+        }
+    }
+
+    /// A window holding nothing but the preview, so a real mouse event lands on
+    /// what the preview actually painted.
+    fn preview_window(
+        contract: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<PreviewFrame>,
+        Entity<OpenApiPreviewView>,
+        gpui::VisualTestContext,
+    ) {
+        init_test(cx);
+        let contract = contract.to_string();
+        let window = cx.add_window(move |window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::multi_line(window, cx);
+                editor.set_text(contract, window, cx);
+                editor
+            });
+            PreviewFrame {
+                view: OpenApiPreviewView::new(editor, window, cx),
+            }
+        });
+        let view = window
+            .read_with(cx, |frame, _| frame.view.clone())
+            .expect("the window holds the preview");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_preview(window, &mut cx);
+        (window, view, cx)
+    }
+
+    fn draw_preview(_window: gpui::WindowHandle<PreviewFrame>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn first_operation_key(
+        view: &Entity<OpenApiPreviewView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> SharedString {
+        view.read_with(cx, |view, _| {
+            view.document
+                .as_ref()
+                .map(|document| document.groups[0].operations[0].key())
+        })
+        .expect("the contract has to parse into one operation")
+    }
+
+    const SAMPLE_REPLY: &str = "{\n  \"instruments\": [\n    {\n      \"id\": 1001\n    }\n  ]\n}";
+
+    /// A window showing one operation open, its "Try it out" panel filled in, and
+    /// a reply in hand -- the state a reader reads the reply in. The reply editor
+    /// is left painted in `foreign`, the way a dark editor theme leaves it on a
+    /// light page: a colour no reading palette would ever produce.
+    fn preview_with_a_reply(
+        foreign: Hsla,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<PreviewFrame>,
+        Entity<OpenApiPreviewView>,
+        SharedString,
+        gpui::VisualTestContext,
+    ) {
+        let (window, view, mut cx) = preview_window(TWO_SERVER_CONTRACT, cx);
+        let key = first_operation_key(&view, &mut cx);
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_operation(key.clone(), cx);
+            view.toggle_try_it_out(key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.update_in(&mut cx, |view, window, cx| {
+            let panel = view
+                .try_it_out_panels
+                .get_mut(&key)
+                .expect("the panel was just opened");
+            panel.send_state = TryItOutSendState::Success(TryItOutResponseMeta {
+                status: 200,
+                status_text: "OK".into(),
+                elapsed_ms: 12,
+                size_bytes: SAMPLE_REPLY.len(),
+                headers: Vec::new(),
+                body_truncated: false,
+            });
+            panel.response_body_editor.update(cx, |editor, cx| {
+                editor.set_read_only(false);
+                editor.set_text(SAMPLE_REPLY, window, cx);
+                editor.set_read_only(true);
+                editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                    color: Some(foreign),
+                    ..Default::default()
+                });
+            });
+            cx.notify();
+        });
+        draw_preview(window, &mut cx);
+        (window, view, key, cx)
+    }
+
+    /// An editor paints its text with the editor theme's colour unless the render
+    /// says otherwise, which is how a reply came out unreadable on a light page.
+    #[gpui::test]
+    fn the_reply_editor_is_painted_from_the_page_palette(cx: &mut gpui::TestAppContext) {
+        let foreign = gpui::hsla(0.85, 1., 0.5, 1.);
+        let (_window, view, key, mut cx) = preview_with_a_reply(foreign, cx);
+
+        let page_text =
+            cx.update(|_, cx| Palette::from_theme(&resolve_theme(preview_appearance(cx), cx)).text);
+        let painted = view.update(&mut cx, |view, cx| {
+            view.try_it_out_panels[&key]
+                .response_body_editor
+                .update(cx, |editor, cx| editor.style(cx).text.color)
+        });
+
+        assert_ne!(
+            painted, foreign,
+            "the render has to repaint the reply, not leave the editor theme's own colour"
+        );
+        assert_eq!(
+            painted, page_text,
+            "the reply has to be painted with the page's own text colour"
+        );
+    }
+
+    /// The reported symptom: a reply arrives, the status line says 200 OK, and the
+    /// body is nowhere -- the box paints as a sliver a line high because a
+    /// `multi_line` editor takes its height from a parent that offers none.
+    #[gpui::test]
+    fn the_reply_body_box_paints_at_the_height_of_its_own_text(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, _key, mut cx) =
+            preview_with_a_reply(gpui::hsla(0.85, 1., 0.5, 1.), cx);
+
+        let bounds = cx
+            .debug_bounds("openapi-reply-body")
+            .expect("the reply body box has to be painted once a reply is in");
+
+        assert!(
+            bounds.size.height > px(48.),
+            "a reply of {} lines has to be readable, not a one-line sliver: got {:?}",
+            SAMPLE_REPLY.lines().count(),
+            bounds.size
+        );
+        assert!(
+            bounds.size.width > px(0.),
+            "the reply body box has to occupy real width: got {:?}",
+            bounds.size
+        );
+    }
+
+    /// A reader dismisses an open list by clicking somewhere else on the page --
+    /// which is still inside the preview, so the handler cannot live on the page.
+    #[gpui::test]
+    fn a_click_elsewhere_on_the_page_closes_an_open_dropdown(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = preview_window(TWO_SERVER_CONTRACT, cx);
+
+        view.update(&mut cx, |view, cx| {
+            view.open_dropdown = Some(OpenDropdown {
+                key: DropdownKey::Server,
+                position: gpui::point(px(120.), px(120.)),
+            });
+            cx.notify();
+        });
+        draw_preview(window, &mut cx);
+        assert!(
+            view.read_with(&cx, |view, _| view.open_dropdown.is_some()),
+            "the list has to be open before the click that dismisses it"
+        );
+
+        let far_corner = cx.update(|window, _| {
+            let viewport = window.viewport_size();
+            gpui::point(viewport.width - px(24.), viewport.height - px(24.))
+        });
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: far_corner,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(&cx, |view, _| view.open_dropdown.is_none()),
+            "a click on the page, away from the list, has to dismiss it"
+        );
     }
 
     fn init_test(cx: &mut gpui::TestAppContext) {

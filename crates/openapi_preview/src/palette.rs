@@ -124,31 +124,36 @@ fn resolve_theme_name(
     }
 }
 
+/// A palette with no theme behind it, for tests that only care how a colour is
+/// used rather than which theme it came from.
+#[cfg(test)]
+pub(crate) fn sample_palette() -> Palette {
+    use gpui::hsla;
+
+    Palette {
+        appearance: Appearance::Dark,
+        background: hsla(0., 0., 0.1, 1.),
+        surface_background: hsla(0., 0., 0.15, 1.),
+        elevated_surface_background: hsla(0., 0., 0.2, 1.),
+        element_background: hsla(0., 0., 0.25, 1.),
+        element_hover: hsla(0., 0., 0.3, 1.),
+        border: hsla(0., 0., 0.35, 1.),
+        border_variant: hsla(0., 0., 0.4, 1.),
+        text: hsla(0., 0., 0.9, 1.),
+        text_muted: hsla(0., 0., 0.6, 1.),
+        accent: hsla(0.55, 0.8, 0.6, 1.),
+        warning: hsla(0.1, 0.8, 0.5, 1.),
+        warning_background: hsla(0.1, 0.8, 0.15, 1.),
+        error: hsla(0., 0.8, 0.5, 1.),
+        success: hsla(0.3, 0.8, 0.4, 1.),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::hsla;
     use theme_settings::{ThemeAppearanceMode, ThemeName};
-
-    fn sample_palette() -> Palette {
-        Palette {
-            appearance: Appearance::Dark,
-            background: hsla(0., 0., 0.1, 1.),
-            surface_background: hsla(0., 0., 0.15, 1.),
-            elevated_surface_background: hsla(0., 0., 0.2, 1.),
-            element_background: hsla(0., 0., 0.25, 1.),
-            element_hover: hsla(0., 0., 0.3, 1.),
-            border: hsla(0., 0., 0.35, 1.),
-            border_variant: hsla(0., 0., 0.4, 1.),
-            text: hsla(0., 0., 0.9, 1.),
-            text_muted: hsla(0., 0., 0.6, 1.),
-            accent: hsla(0.55, 0.8, 0.6, 1.),
-            warning: hsla(0.1, 0.8, 0.5, 1.),
-            warning_background: hsla(0.1, 0.8, 0.15, 1.),
-            error: hsla(0., 0.8, 0.5, 1.),
-            success: hsla(0.3, 0.8, 0.4, 1.),
-        }
-    }
 
     #[test]
     fn resolve_maps_every_semantic_colour_to_its_own_palette_field() {
