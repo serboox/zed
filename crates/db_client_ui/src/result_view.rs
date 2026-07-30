@@ -614,34 +614,12 @@ fn heatmap_ratio(value: f64, min: f64, max: f64) -> f32 {
     (((value - min) / (max - min)) as f32).clamp(0.0, 1.0)
 }
 
-// Decides whether a column looks boolean before real type metadata has loaded. A
-// known SQL type is authoritative (mirrors column_is_numeric); without it, every
-// non-empty sampled value must look like a boolean literal.
-fn column_is_boolean<'a>(
-    data_type: Option<&str>,
-    values: impl Iterator<Item = Option<&'a str>>,
-) -> bool {
-    if let Some(data_type) = data_type {
-        return matches!(column_editor_kind(data_type), CellEditorKind::Boolean);
-    }
-    column_values_look_boolean(values)
-}
-
-fn column_values_look_boolean<'a>(values: impl Iterator<Item = Option<&'a str>>) -> bool {
-    let mut saw_value = false;
-    for value in values {
-        match value {
-            None => {}
-            Some("") => {}
-            Some(text) => {
-                if !matches!(text.to_lowercase().as_str(), "0" | "1" | "true" | "false") {
-                    return false;
-                }
-                saw_value = true;
-            }
-        }
-    }
-    saw_value
+// Only a column whose declared type says boolean is shown as one. Values are
+// never asked: a `mediumint` holding nothing but zeros looks exactly like a
+// boolean, and answering "false" where the row holds 0 states something the
+// database never said. Without a type, the number is shown as it is.
+fn column_is_boolean(data_type: Option<&str>) -> bool {
+    data_type.is_some_and(|data_type| matches!(column_editor_kind(data_type), CellEditorKind::Boolean))
 }
 
 fn is_valid_date(text: &str) -> bool {
@@ -1692,10 +1670,7 @@ impl ResultView {
                         .find(|info| &info.name == col_name)
                         .map(|info| info.data_type.as_str())
                 });
-                let values = result.rows[..sample]
-                    .iter()
-                    .map(move |row| row.get(data_col).and_then(|cell| cell.as_deref()));
-                column_is_boolean(data_type, values)
+                column_is_boolean(data_type)
             })
             .collect();
 
@@ -14183,41 +14158,39 @@ mod tests {
         });
     }
 
-    // Grid-audit item 7, pure logic half (mirrors column_is_numeric_prefers_type_over_values).
+    /// Only the declared type decides. A number column holding nothing but zeros
+    /// and ones looks exactly like a boolean, and calling it one would show
+    /// "false" where the row holds 0 -- stating something the database never said.
     #[test]
-    fn column_is_boolean_prefers_type_over_values() {
-        let no_values: [Option<&str>; 0] = [];
-        assert!(column_is_boolean(Some("boolean"), no_values.into_iter()));
-        assert!(column_is_boolean(Some("tinyint(1)"), no_values.into_iter()));
+    fn only_a_declared_boolean_type_is_shown_as_a_boolean() {
+        assert!(column_is_boolean(Some("boolean")));
+        assert!(column_is_boolean(Some("bool")));
+        assert!(column_is_boolean(Some("tinyint(1)")));
+        assert!(column_is_boolean(Some("bit(1)")));
 
-        // A known non-boolean type is not boolean even when its values look boolean.
-        let boolean_looking = [Some("0"), Some("1")];
-        assert!(!column_is_boolean(
-            Some("varchar(255)"),
-            boolean_looking.into_iter()
-        ));
+        // Every other declared type keeps its own rendering, whatever it holds.
+        assert!(!column_is_boolean(Some("varchar(255)")));
+        assert!(!column_is_boolean(Some("mediumint")));
+        assert!(!column_is_boolean(Some("smallint unsigned")));
+        assert!(!column_is_boolean(Some("tinyint")));
+        assert!(!column_is_boolean(Some("int")));
 
-        // With no type metadata, the sampled values decide.
-        assert!(column_is_boolean(None, [Some("0"), Some("1")].into_iter()));
-        assert!(column_is_boolean(
-            None,
-            [Some("true"), Some("false")].into_iter()
-        ));
-        assert!(!column_is_boolean(None, [Some("0"), Some("2")].into_iter()));
+        // No type is no reason to guess.
+        assert!(!column_is_boolean(None));
     }
 
-    // Grid-audit item 7, rendering half: a boolean-looking column must classify as
-    // Boolean (so it renders normalized "true"/"false" text, not the raw "1"/"0")
-    // on the very first layout pass, before any describe_table metadata has loaded.
+    /// A column of zeros and ones with no type behind it stays a number. Reading
+    /// "false" out of a `mediumint` holding 0 is the database being paraphrased,
+    /// which is worse than showing the 0 it actually holds.
     #[gpui::test]
-    fn boolean_looking_column_classifies_as_boolean_before_metadata_loads(
+    fn a_column_of_zeros_and_ones_stays_a_number_until_a_type_says_otherwise(
         cx: &mut gpui::TestAppContext,
     ) {
         let result = QueryResult {
-            columns: vec!["id".to_string(), "is_active".to_string()],
+            columns: vec!["id".to_string(), "override_country_ID".to_string()],
             rows: vec![
-                vec![Some("1".to_string()), Some("1".to_string())],
-                vec![Some("2".to_string()), Some("0".to_string())],
+                vec![Some("1".to_string()), Some("0".to_string())],
+                vec![Some("2".to_string()), Some("1".to_string())],
             ],
             rows_affected: 0,
             execution_time_ms: 0,
@@ -14228,10 +14201,12 @@ mod tests {
         view.update(&mut cx, |view, _| {
             assert!(
                 view.column_infos.is_none(),
-                "this test only proves the pre-metadata fallback; describe_table must not \
-                 have loaded yet"
+                "the point of this test is the state before describe_table has loaded"
             );
-            assert!(matches!(view.column_kind_at(1), CellEditorKind::Boolean));
+            assert!(
+                !matches!(view.column_kind_at(1), CellEditorKind::Boolean),
+                "a column with no declared type must not be read as a boolean"
+            );
         });
     }
 
@@ -14276,6 +14251,30 @@ mod tests {
             raw_documents: None,
         };
         let (_window, view, mut cx) = table_backed_result_window_with(cx, result);
+        // The column is a boolean because the table says so, which is the only
+        // thing that makes one.
+        view.update(&mut cx, |view, cx| {
+            view.column_infos = Some(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+                ColumnInfo {
+                    name: "is_active".to_string(),
+                    data_type: "tinyint(1)".to_string(),
+                    is_nullable: false,
+                    column_key: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ]);
+            cx.notify();
+        });
+        cx.run_until_parked();
         view.update(&mut cx, |view, _| {
             assert!(matches!(view.column_kind_at(1), CellEditorKind::Boolean));
         });
