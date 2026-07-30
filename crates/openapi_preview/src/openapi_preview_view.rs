@@ -9,8 +9,7 @@ use gpui::{
     Subscription, Task, Window,
 };
 use theme::Appearance;
-use ui::{ContextMenu, DropdownMenu, Tooltip, WithScrollbar, prelude::*};
-use util::ResultExt as _;
+use ui::{Tooltip, WithScrollbar, prelude::*};
 use workspace::preview_appearance::{
     observe_preview_appearance, preview_appearance, set_preview_appearance,
 };
@@ -46,6 +45,9 @@ pub struct OpenApiPreviewView {
     expanded_operations: HashSet<SharedString>,
     expanded_schemas: HashSet<SharedString>,
     try_it_out_panels: HashMap<SharedString, TryItOutPanel>,
+    /// The dropdown list a click opened, painted from the reading palette rather
+    /// than the editor's theme.
+    open_dropdown: Option<OpenDropdown>,
     /// The server the reader picked from the header's servers dropdown. `None`
     /// means "use the document's default" -- `resolve_selected_server` reads
     /// this the same way whether it holds a pick or not.
@@ -145,6 +147,7 @@ impl OpenApiPreviewView {
                 expanded_operations: HashSet::default(),
                 expanded_schemas: HashSet::default(),
                 try_it_out_panels: HashMap::default(),
+                open_dropdown: None,
                 selected_server_url: None,
                 pending_parse: None,
                 reparse_after_pending: false,
@@ -689,7 +692,7 @@ impl OpenApiPreviewView {
         &self,
         document: &OpenApiDocument,
         palette: &Palette,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         v_flex()
@@ -723,16 +726,18 @@ impl OpenApiPreviewView {
                         palette.border_variant,
                         palette.resolve(Color::Muted),
                     ))
-                    .child(
-                        Button::new("openapi-save-document", "Save to API Client")
-                            .start_icon(Icon::new(IconName::Bookmark))
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_document_to_api_client(window, cx)
-                            })),
-                    ),
+                    .child(palette_button(
+                        "openapi-save-document",
+                        "Save to API Client".into(),
+                        ButtonWeight::Outlined,
+                        false,
+                        *palette,
+                        cx.listener(|this, _, window, cx| {
+                            this.save_document_to_api_client(window, cx)
+                        }),
+                    )),
             )
-            .children(self.render_servers_dropdown(document, palette, window, cx))
+            .children(self.render_servers_dropdown(document, palette, cx))
             .when_some(document.description.clone(), |header, description| {
                 header.child(render_prose(
                     &description,
@@ -752,32 +757,14 @@ impl OpenApiPreviewView {
         &self,
         document: &OpenApiDocument,
         palette: &Palette,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if document.servers.is_empty() {
             return None;
         }
-        let servers = document.servers.clone();
-        let selected_url = resolve_selected_server(&servers, self.selected_server_url.as_ref())
+        let selected_url = resolve_selected_server(&document.servers, self.selected_server_url.as_ref())
             .map(|server| server.url.clone())
             .unwrap_or_default();
-        let weak = cx.weak_entity();
-
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for server in &servers {
-                let weak = weak.clone();
-                let url = server.url.clone();
-                let label: SharedString = match &server.description {
-                    Some(description) => format!("{} -- {description}", server.url).into(),
-                    None => server.url.clone(),
-                };
-                menu = menu.entry(label, None, move |window, cx| {
-                    apply_server_pick(&weak, url.clone(), window, cx);
-                });
-            }
-            menu
-        });
 
         Some(
             h_flex()
@@ -788,13 +775,158 @@ impl OpenApiPreviewView {
                         .size(LabelSize::Small)
                         .color(palette.resolve(Color::Muted)),
                 )
-                .child(DropdownMenu::new(
+                .child(palette_dropdown_trigger(
                     "openapi-servers-dropdown",
                     selected_url,
-                    menu,
+                    DropdownKey::Server,
+                    false,
+                    *palette,
+                    cx,
                 ))
                 .into_any_element(),
         )
+    }
+
+    /// The open dropdown list, hung over the page from the reading palette. It
+    /// is rendered once, at the end of the page, so it paints above everything
+    /// else without any of the page's own rows covering it.
+    fn render_open_dropdown(
+        &self,
+        document: &OpenApiDocument,
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let open = self.open_dropdown.as_ref()?;
+        let entries: Vec<(SharedString, SharedString, Option<SharedString>)> = match &open.key {
+            DropdownKey::Server => document
+                .servers
+                .iter()
+                .map(|server| {
+                    let label: SharedString = match &server.description {
+                        Some(description) => format!("{} -- {description}", server.url).into(),
+                        None => server.url.clone(),
+                    };
+                    (server.url.clone(), label, Some(server.url.clone()))
+                })
+                .collect(),
+            DropdownKey::Parameter {
+                operation_key,
+                name,
+                location,
+            } => {
+                let panel = self.try_it_out_panels.get(operation_key)?;
+                let field = panel
+                    .parameter_fields
+                    .iter()
+                    .find(|field| &field.name == name && &field.location == location)?;
+                let ParameterInput::Select { allowed_values, .. } = &field.input else {
+                    return None;
+                };
+                let mut entries: Vec<(SharedString, SharedString, Option<SharedString>)> =
+                    Vec::with_capacity(allowed_values.len() + 1);
+                if !field.required {
+                    entries.push(("--".into(), "--".into(), None));
+                }
+                for value in allowed_values {
+                    entries.push((value.clone(), value.clone(), Some(value.clone())));
+                }
+                entries
+            }
+        };
+        if entries.is_empty() {
+            return None;
+        }
+
+        let key = open.key.clone();
+        let selected_now: Option<SharedString> = match &key {
+            DropdownKey::Server => resolve_selected_server(
+                &document.servers,
+                self.selected_server_url.as_ref(),
+            )
+            .map(|server| server.url.clone()),
+            DropdownKey::Parameter {
+                operation_key,
+                name,
+                location,
+            } => self
+                .try_it_out_panels
+                .get(operation_key)
+                .and_then(|panel| {
+                    panel
+                        .parameter_fields
+                        .iter()
+                        .find(|field| &field.name == name && &field.location == location)
+                })
+                .and_then(|field| match &field.input {
+                    ParameterInput::Select { selected, .. } => selected.clone(),
+                    ParameterInput::Text(_) => None,
+                }),
+        };
+
+        let mut list = v_flex()
+            .id("openapi-dropdown-list")
+            .min_w(px(220.))
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .p_1()
+            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.elevated_surface_background);
+        for (index, (value, label, pick)) in entries.into_iter().enumerate() {
+            let key = key.clone();
+            let pick = pick.clone();
+            list = list.child(palette_dropdown_entry(
+                SharedString::from(format!("openapi-dropdown-entry-{index}")),
+                label,
+                selected_now.as_ref() == Some(&value),
+                *palette,
+                cx.listener(move |this, _, window, cx| {
+                    this.apply_dropdown_pick(&key, pick.clone(), window, cx);
+                }),
+            ));
+        }
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(open.position)
+                    .child(div().occlude().child(list)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Applies what a dropdown row means and closes the list.
+    fn apply_dropdown_pick(
+        &mut self,
+        key: &DropdownKey,
+        pick: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match key {
+            DropdownKey::Server => {
+                if let Some(url) = pick {
+                    self.select_server(url, window, cx);
+                }
+            }
+            DropdownKey::Parameter {
+                operation_key,
+                name,
+                location,
+            } => self.set_parameter_value(
+                operation_key.clone(),
+                name.clone(),
+                location.clone(),
+                pick,
+                cx,
+            ),
+        }
+        self.open_dropdown = None;
+        cx.notify();
     }
 
     fn render_notes(&self, notes: &[SharedString], palette: &Palette) -> Option<AnyElement> {
@@ -918,6 +1050,7 @@ impl OpenApiPreviewView {
         let expanded = self.expanded_operations.contains(&key);
         let toggle_key = key.clone();
         let accent = method_accent_color(method_accent(operation.method), palette.appearance);
+        let hover_background = palette.element_hover;
 
         v_flex()
             .debug_selector(|| format!("openapi-operation-row-{key}"))
@@ -990,17 +1123,22 @@ impl OpenApiPreviewView {
                         )
                     })
                     .child(
-                        IconButton::new(
-                            SharedString::from(format!("openapi-save-operation-{key}")),
-                            IconName::Bookmark,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Save to API Client"))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
+                        div()
+                            .id(SharedString::from(format!("openapi-save-operation-{key}")))
+                            .flex_none()
+                            .p_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover_background))
+                            .tooltip(Tooltip::text("Save to API Client"))
+                            .child(
+                                Icon::new(IconName::Bookmark)
+                                    .size(IconSize::XSmall)
+                                    .color(palette.resolve(Color::Muted)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.save_operation_to_api_client(key.clone(), window, cx)
-                            },
-                        )),
+                            })),
                     ),
             )
             .when(expanded, |card| {
@@ -1079,7 +1217,7 @@ impl OpenApiPreviewView {
                             palette.appearance,
                         ))),
                 )
-                .child(self.render_try_it_out_toggle(operation, cx)),
+                .child(self.render_try_it_out_toggle(operation, palette, cx)),
         );
         details = if operation.parameters.is_empty() {
             details.child(
@@ -1137,20 +1275,23 @@ impl OpenApiPreviewView {
     fn render_try_it_out_toggle(
         &self,
         operation: &Operation,
+        palette: &Palette,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> AnyElement {
         let key = operation.key();
         let active = self.try_it_out_panels.contains_key(&key);
         let toggle_key = key.clone();
 
-        Button::new(
+        palette_button(
             SharedString::from(format!("openapi-try-it-out-toggle-{key}")),
-            if active { "Cancel" } else { "Try it out" },
+            if active { "Cancel".into() } else { "Try it out".into() },
+            ButtonWeight::Outlined,
+            false,
+            *palette,
+            cx.listener(move |this, _, window, cx| {
+                this.toggle_try_it_out(toggle_key.clone(), window, cx);
+            }),
         )
-        .style(ButtonStyle::Outlined)
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.toggle_try_it_out(toggle_key.clone(), window, cx);
-        }))
     }
 
     /// The Server/Authorization fields plus the Execute/Clear buttons -- the
@@ -1172,6 +1313,7 @@ impl OpenApiPreviewView {
                 false,
                 panel.server_editor.clone(),
                 palette,
+                cx,
             ))
             .child(render_try_it_out_field(
                 "Authorization".into(),
@@ -1179,6 +1321,7 @@ impl OpenApiPreviewView {
                 false,
                 panel.auth_editor.clone(),
                 palette,
+                cx,
             ));
 
         let is_sending = matches!(panel.send_state, TryItOutSendState::Sending);
@@ -1196,38 +1339,33 @@ impl OpenApiPreviewView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
-                        Button::new(
-                            SharedString::from(format!(
-                                "openapi-try-it-out-execute-{operation_key}"
-                            )),
-                            if is_sending { "Sending…" } else { "Execute" },
-                        )
-                        .start_icon(Icon::new(IconName::Send))
-                        .loading(is_sending)
-                        .disabled(is_sending)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.execute_try_it_out(execute_key.clone(), window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("openapi-try-it-out-clear-{operation_key}")),
-                            "Clear",
-                        )
-                        .style(ButtonStyle::Subtle)
-                        // Clearing drops the task that carries the request, so it
-                        // stays out of reach until the reply is in: a cleared panel
-                        // mid-flight would look like nothing had been asked for.
-                        .disabled(is_idle || is_sending)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.clear_try_it_out_response(clear_key.clone(), window, cx);
-                            },
-                        )),
-                    ),
+                    .child(palette_button(
+                        SharedString::from(format!("openapi-try-it-out-execute-{operation_key}")),
+                        if is_sending {
+                            "Sending…".into()
+                        } else {
+                            "Execute".into()
+                        },
+                        ButtonWeight::Primary,
+                        is_sending,
+                        *palette,
+                        cx.listener(move |this, _, window, cx| {
+                            this.execute_try_it_out(execute_key.clone(), window, cx);
+                        }),
+                    ))
+                    // Clearing drops the task that carries the request, so it stays
+                    // out of reach until the reply is in: a cleared panel mid-flight
+                    // would look like nothing had been asked for.
+                    .child(palette_button(
+                        SharedString::from(format!("openapi-try-it-out-clear-{operation_key}")),
+                        "Clear".into(),
+                        ButtonWeight::Subtle,
+                        is_idle || is_sending,
+                        *palette,
+                        cx.listener(move |this, _, window, cx| {
+                            this.clear_try_it_out_response(clear_key.clone(), window, cx);
+                        }),
+                    )),
             )
     }
 
@@ -1479,20 +1617,154 @@ impl OpenApiPreviewView {
     }
 }
 
-/// Applies a pick from the servers dropdown. A menu entry runs with the window
-/// already borrowed for the click, so the pick must be applied through that very
-/// window: asking the app to enter the window again fails while it is in use, and
-/// the pick would be dropped without a trace.
-fn apply_server_pick(
-    view: &gpui::WeakEntity<OpenApiPreviewView>,
-    url: SharedString,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    view.update(cx, |view, cx| {
-        view.select_server(url, window, cx);
-    })
-    .log_err();
+/// How much weight a palette-painted button carries.
+#[derive(Clone, Copy, PartialEq)]
+enum ButtonWeight {
+    /// The one action a panel exists for.
+    Primary,
+    /// An action worth an outline, but not the accent.
+    Outlined,
+    /// A side action that only needs a label.
+    Subtle,
+}
+
+/// A button painted from the reading palette. `ui::Button` takes its colours
+/// from the editor's theme, which is the wrong palette as soon as the reader
+/// picks a different one for the page: a near-black chip on a light page reads
+/// as a hole rather than a button.
+fn palette_button(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    weight: ButtonWeight,
+    disabled: bool,
+    palette: Palette,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let (background, border, text) = match weight {
+        ButtonWeight::Primary => (palette.accent.opacity(0.14), palette.accent, palette.accent),
+        ButtonWeight::Outlined => (gpui::transparent_black(), palette.border, palette.text),
+        ButtonWeight::Subtle => (
+            gpui::transparent_black(),
+            gpui::transparent_black(),
+            palette.text_muted,
+        ),
+    };
+    let hover = palette.element_hover;
+    h_flex()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(move |event, window, cx| on_click(event, window, cx))
+        })
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Custom(text)),
+        )
+        .into_any_element()
+}
+
+/// Which list a click opened, so the open one can be found again on the next
+/// render and closed when a value is picked.
+#[derive(Clone, PartialEq)]
+enum DropdownKey {
+    /// The document header's servers list.
+    Server,
+    /// One enum parameter's allowed values, inside a "Try it out" panel.
+    Parameter {
+        operation_key: SharedString,
+        name: SharedString,
+        location: SharedString,
+    },
+}
+
+/// The list a reader opened and where to hang it.
+struct OpenDropdown {
+    key: DropdownKey,
+    position: gpui::Point<Pixels>,
+}
+
+/// The closed state of a dropdown: the value in hand plus a chevron, painted
+/// from the reading palette. A `ui::DropdownMenu` would paint its list from the
+/// editor's theme instead, which is what left a black list hanging over a light
+/// page.
+fn palette_dropdown_trigger(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    key: DropdownKey,
+    full_width: bool,
+    palette: Palette,
+    cx: &mut Context<OpenApiPreviewView>,
+) -> AnyElement {
+    let hover = palette.element_hover;
+    h_flex()
+        .id(id)
+        .when(full_width, |this| this.w_full())
+        .gap_1()
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(palette.border)
+        .bg(palette.element_background)
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Custom(palette.text)),
+        )
+        .child(
+            Icon::new(IconName::ChevronUpDown)
+                .size(IconSize::XSmall)
+                .color(Color::Custom(palette.text_muted)),
+        )
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            // Hung a little below the click so the list never covers the trigger
+            // that opened it.
+            let position = event.position() + gpui::point(px(0.), px(14.));
+            this.open_dropdown = Some(OpenDropdown {
+                key: key.clone(),
+                position,
+            });
+            cx.notify();
+        }))
+        .into_any_element()
+}
+
+/// One row of an open dropdown list.
+fn palette_dropdown_entry(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    selected: bool,
+    palette: Palette,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let hover = palette.element_hover;
+    h_flex()
+        .id(id)
+        .w_full()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .when(selected, |this| this.bg(palette.element_background))
+        .hover(move |style| style.bg(hover))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Custom(palette.text)),
+        )
+        .on_click(move |event, window, cx| on_click(event, window, cx))
+        .into_any_element()
 }
 
 /// Adds `imported` to the API client store: a brand-new collection when none
@@ -1767,32 +2039,20 @@ fn render_parameter_input(
     operation_key: &SharedString,
     field: &ParameterField,
     palette: &Palette,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<OpenApiPreviewView>,
 ) -> AnyElement {
     match &field.input {
-        ParameterInput::Text(editor) => div()
-            .rounded_sm()
-            .border_1()
-            .border_color(palette.border_variant)
-            .px_2()
-            .py_1()
-            .child(editor.clone())
+        ParameterInput::Text(editor) => palette_input(editor.clone(), *palette, cx)
             .into_any_element(),
-        ParameterInput::Select {
-            allowed_values,
-            selected,
-        } => render_parameter_enum_dropdown(
+        ParameterInput::Select { selected, .. } => render_parameter_enum_dropdown(
             operation_key.clone(),
             field.name.clone(),
             field.location.clone(),
-            allowed_values,
-            field.required,
             selected.clone(),
-            window,
+            palette,
             cx,
-        )
-        .into_any_element(),
+        ),
     }
 }
 
@@ -1804,61 +2064,26 @@ fn render_parameter_enum_dropdown(
     operation_key: SharedString,
     parameter_name: SharedString,
     parameter_location: SharedString,
-    allowed_values: &[SharedString],
-    required: bool,
     selected: Option<SharedString>,
-    window: &mut Window,
+    palette: &Palette,
     cx: &mut Context<OpenApiPreviewView>,
-) -> impl IntoElement + use<> {
+) -> AnyElement {
     let label = selected.unwrap_or_else(|| "--".into());
     let id = SharedString::from(format!(
         "openapi-param-enum-{operation_key}-{parameter_location}-{parameter_name}"
     ));
-    let weak = cx.weak_entity();
-    let values = allowed_values.to_vec();
-
-    let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-        if !required {
-            let weak = weak.clone();
-            let operation_key = operation_key.clone();
-            let parameter_name = parameter_name.clone();
-            let parameter_location = parameter_location.clone();
-            menu = menu.entry("--", None, move |_, cx| {
-                weak.update(cx, |view, cx| {
-                    view.set_parameter_value(
-                        operation_key.clone(),
-                        parameter_name.clone(),
-                        parameter_location.clone(),
-                        None,
-                        cx,
-                    )
-                })
-                .ok();
-            });
-        }
-        for value in &values {
-            let weak = weak.clone();
-            let operation_key = operation_key.clone();
-            let parameter_name = parameter_name.clone();
-            let parameter_location = parameter_location.clone();
-            let value = value.clone();
-            menu = menu.entry(value.clone(), None, move |_, cx| {
-                weak.update(cx, |view, cx| {
-                    view.set_parameter_value(
-                        operation_key.clone(),
-                        parameter_name.clone(),
-                        parameter_location.clone(),
-                        Some(value.clone()),
-                        cx,
-                    )
-                })
-                .ok();
-            });
-        }
-        menu
-    });
-
-    DropdownMenu::new(id, label, menu).full_width(true)
+    palette_dropdown_trigger(
+        id,
+        label,
+        DropdownKey::Parameter {
+            operation_key,
+            name: parameter_name,
+            location: parameter_location,
+        },
+        true,
+        *palette,
+        cx,
+    )
 }
 
 fn parameters_table_header(palette: &Palette) -> impl IntoElement {
@@ -2152,12 +2377,35 @@ fn new_try_it_out_response_editor(window: &mut Window, cx: &mut App) -> Entity<E
 /// One labelled field row of a "Try it out" panel: the parameter's name,
 /// its location (query/path/header) when it has one, a required marker, and
 /// the single-line editor the reader types the value into.
+/// The box an input sits in, painted from the reading palette, with the editor's
+/// own text colour set to match. An editor otherwise takes its text and border
+/// colours from the editor's theme, which is the wrong palette as soon as the
+/// reader picks a different one for the page.
+fn palette_input(editor: Entity<Editor>, palette: Palette, cx: &mut App) -> AnyElement {
+    editor.update(cx, |editor, _| {
+        editor.set_text_style_refinement(gpui::TextStyleRefinement {
+            color: Some(palette.text),
+            ..Default::default()
+        });
+    });
+    div()
+        .rounded_sm()
+        .border_1()
+        .border_color(palette.border)
+        .bg(palette.element_background)
+        .px_2()
+        .py_1()
+        .child(editor)
+        .into_any_element()
+}
+
 fn render_try_it_out_field(
     label: SharedString,
     location: Option<SharedString>,
     required: bool,
     editor: Entity<Editor>,
     palette: &Palette,
+    cx: &mut App,
 ) -> impl IntoElement + use<> {
     v_flex()
         .gap_0p5()
@@ -2186,15 +2434,7 @@ fn render_try_it_out_field(
                     )
                 }),
         )
-        .child(
-            div()
-                .rounded_sm()
-                .border_1()
-                .border_color(palette.border_variant)
-                .px_2()
-                .py_1()
-                .child(editor),
-        )
+        .child(palette_input(editor, *palette, cx))
 }
 
 fn pill(text: SharedString, background: Hsla, text_color: Color) -> impl IntoElement {
@@ -2373,6 +2613,18 @@ impl Render for OpenApiPreviewView {
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
             .child(self.render_reading_controls(cx))
+            .children(
+                self.document
+                    .clone()
+                    .and_then(|document| self.render_open_dropdown(&document, &palette, cx)),
+            )
+            // A click anywhere else is how a reader dismisses an open list.
+            .when(self.open_dropdown.is_some(), |body| {
+                body.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.open_dropdown = None;
+                    cx.notify();
+                }))
+            })
     }
 }
 
@@ -2688,9 +2940,15 @@ mod tests {
             "the panel starts on the contract's first server"
         );
 
-        let weak = view.downgrade();
-        cx.update(|window, cx| {
-            apply_server_pick(&weak, "https://stage.example.com".into(), window, cx);
+        // The same call a dropdown row makes: the row runs with the window it was
+        // clicked in, and applies the pick through it.
+        view.update_in(cx, |view, window, cx| {
+            view.apply_dropdown_pick(
+                &DropdownKey::Server,
+                Some("https://stage.example.com".into()),
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
