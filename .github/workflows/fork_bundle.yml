@@ -1,0 +1,287 @@
+name: Bundle this fork
+
+# Every platform is built where it runs. Windows and macOS cannot be
+# cross-compiled from Linux at all -- their renderers compile shaders with
+# `fxc.exe` and `xcrun metal`, both host tools -- and the embedded HTML engine
+# only has prebuilt SpiderMonkey archives for native targets.
+#
+# Each job also runs the engine's own integration tests, so the answer to "does
+# HTML rendering work on that platform" comes from the platform itself rather
+# than from hope. The tests report `HTML_ENGINE: ok` or, on a machine whose
+# graphics stack the engine cannot use, `HTML_ENGINE: unavailable`, and the job
+# summary repeats whichever it was.
+on:
+  push:
+    branches: [personal_zed_fork, bundle/**]
+  workflow_dispatch:
+    inputs:
+      linux:
+        description: Linux tarball, .deb and .rpm
+        type: boolean
+        default: true
+      windows:
+        description: Windows x86_64 executable
+        type: boolean
+        default: true
+      macos:
+        description: macOS app
+        type: choice
+        default: arm64
+        options: [none, arm64, x86_64, both]
+      html_engine:
+        description: Include the embedded HTML engine (Servo)
+        type: boolean
+        default: true
+
+# A newer push replaces an older one rather than queueing behind it.
+concurrency:
+  group: fork-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  # `release-fast` carries full debug info, which costs minutes of build time
+  # and hundreds of megabytes in an artifact nobody will debug.
+  CARGO_PROFILE_RELEASE_FAST_DEBUG: "false"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.pick.outputs.linux }}
+      windows: ${{ steps.pick.outputs.windows }}
+      macos: ${{ steps.pick.outputs.macos }}
+      engine: ${{ steps.pick.outputs.engine }}
+    steps:
+      # A push carries no inputs, so every empty value falls back to the
+      # default the dispatch form offers.
+      - id: pick
+        env:
+          LINUX: ${{ inputs.linux }}
+          WINDOWS: ${{ inputs.windows }}
+          MACOS: ${{ inputs.macos }}
+          ENGINE: ${{ inputs.html_engine }}
+        run: |
+          set -euo pipefail
+          for what in LINUX WINDOWS; do
+            key="$(echo "$what" | tr '[:upper:]' '[:lower:]')"
+            if [ "${!what}" = "false" ]; then
+              echo "$key=no" >> "$GITHUB_OUTPUT"
+            else
+              echo "$key=yes" >> "$GITHUB_OUTPUT"
+            fi
+          done
+          if [ "$ENGINE" = "false" ]; then
+            echo "engine=" >> "$GITHUB_OUTPUT"
+          else
+            echo "engine=--features servo" >> "$GITHUB_OUTPUT"
+          fi
+          case "${MACOS:-arm64}" in
+            arm64)  macos='[{"arch":"arm64","runner":"macos-latest"}]' ;;
+            x86_64) macos='[{"arch":"x86_64","runner":"macos-15-intel"}]' ;;
+            both)   macos='[{"arch":"arm64","runner":"macos-latest"},{"arch":"x86_64","runner":"macos-15-intel"}]' ;;
+            *)      macos='[]' ;;
+          esac
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.linux == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the editor's build dependencies
+        run: script/linux
+
+      - name: Install the packaging and headless-graphics tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base
+          sudo gem install --no-document fpm
+
+      - run: rustup show
+
+      - name: Build the packages with the HTML engine
+        id: engine
+        if: needs.plan.outputs.engine != ''
+        continue-on-error: true
+        env:
+          CARGO_ARGS: ${{ needs.plan.outputs.engine }}
+        run: script/fork-bundle-linux
+
+      - name: Build the packages without the HTML engine
+        if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
+        run: script/fork-bundle-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-linux-x86_64
+          path: target/fork-packages/*
+          if-no-files-found: error
+
+      # A package that installs and answers is worth more than a package that
+      # merely exists: this catches a wrong path, a broken launcher symlink or a
+      # missing library before the file reaches anyone.
+      - name: Install the .deb and ask the editor its version
+        run: |
+          set -euo pipefail
+          sudo dpkg -i target/fork-packages/zed-fork_*.deb
+          zed-fork --version
+          rpm -qlp target/fork-packages/zed-fork-*.rpm | head -20
+          sudo dpkg -r zed-fork
+
+      - name: Test the HTML engine
+        if: steps.engine.outcome == 'success'
+        run: |
+          set -o pipefail
+          xvfb-run -a cargo test --profile release-fast --package html_render \
+            --features servo -- --nocapture 2>&1 | tee engine-test.log
+
+      - name: Say whether the engine ran here
+        if: always() && steps.engine.outcome == 'success'
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.windows == 'yes'
+    runs-on: windows-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      # The TLS backend the engine pulls in assembles its own x86_64 primitives.
+      - name: Install NASM
+        run: choco install nasm --no-progress -y
+        continue-on-error: true
+
+      - name: Add NASM to the path
+        run: Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+
+      - run: rustup show
+
+      - name: Build with the HTML engine
+        id: engine
+        if: needs.plan.outputs.engine != ''
+        continue-on-error: true
+        run: cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }}
+
+      - name: Build without the HTML engine
+        if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
+        run: cargo build --profile release-fast --package zed
+
+      # Proof that what was built starts at all, which a compile alone does not
+      # promise on a platform nobody here can run.
+      - name: Ask the editor for its usage
+        run: target/release-fast/zed.exe --help
+
+      - name: Report what came out
+        run: |
+          $exe = Get-Item target/release-fast/zed.exe
+          $engine = if ('${{ steps.engine.outcome }}' -eq 'success') { 'yes' } else { 'no' }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Add-Content $env:GITHUB_STEP_SUMMARY "size: $($exe.Length) bytes"
+          Add-Content $env:GITHUB_STEP_SUMMARY "HTML engine compiled in: $engine"
+          Add-Content $env:GITHUB_STEP_SUMMARY "sha256: $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-x86_64
+          path: target/release-fast/zed.exe
+          if-no-files-found: error
+
+      - name: Test the HTML engine
+        if: steps.engine.outcome == 'success'
+        run: |
+          cargo test --profile release-fast --package html_render --features servo -- --nocapture 2>&1 |
+            Tee-Object -FilePath engine-test.log
+
+      - name: Say whether the engine ran here
+        if: always() && steps.engine.outcome == 'success'
+        run: |
+          $line = Select-String -Path engine-test.log -Pattern '^HTML_ENGINE:' | Select-Object -First 1
+          if ($line) { Add-Content $env:GITHUB_STEP_SUMMARY $line.Line }
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.macos != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.macos) }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup show
+
+      - name: Build with the HTML engine
+        id: engine
+        if: needs.plan.outputs.engine != ''
+        continue-on-error: true
+        run: cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }}
+
+      - name: Build without the HTML engine
+        if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
+        run: cargo build --profile release-fast --package zed
+
+      # Proof that what was built starts at all, which a compile alone does not
+      # promise on a platform nobody here can run.
+      - name: Ask the editor for its usage
+        run: target/release-fast/zed --help
+
+      # A hand-made bundle rather than `script/bundle-mac`: that script also
+      # builds the remote server, downloads a git to embed and signs with the
+      # project's own identity, none of which a test build needs.
+      - name: Wrap the binary in an app bundle
+        run: |
+          set -euo pipefail
+          app="target/Zed.app"
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release-fast/zed "$app/Contents/MacOS/zed"
+          cat > "$app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Zed</string>
+            <key>CFBundleDisplayName</key><string>Zed</string>
+            <key>CFBundleIdentifier</key><string>dev.zed.Zed-Dev</string>
+            <key>CFBundleExecutable</key><string>zed</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.0.0</string>
+            <key>CFBundleVersion</key><string>0.0.0</string>
+            <key>LSMinimumSystemVersion</key><string>10.15.7</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" "target/Zed-macos-${{ matrix.target.arch }}.app.zip"
+          if [ '${{ steps.engine.outcome }}' = 'success' ]; then engine=yes; else engine=no; fi
+          {
+            echo "size: $(du -h "target/Zed-macos-${{ matrix.target.arch }}.app.zip" | cut -f1)"
+            echo "HTML engine compiled in: $engine"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-${{ matrix.target.arch }}
+          path: target/Zed-macos-${{ matrix.target.arch }}.app.zip
+          if-no-files-found: error
+
+      - name: Test the HTML engine
+        if: steps.engine.outcome == 'success'
+        run: |
+          set -o pipefail
+          cargo test --profile release-fast --package html_render \
+            --features servo -- --nocapture 2>&1 | tee engine-test.log
+
+      - name: Say whether the engine ran here
+        if: always() && steps.engine.outcome == 'success'
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true

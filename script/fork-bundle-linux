@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Packages this fork for Linux: a tarball, a .deb and an .rpm.
+#
+# `script/bundle-linux` also builds the remote server against musl and uploads
+# to the project's own blob store, neither of which a fork's test build needs,
+# so this takes the same layout and stops at the packages.
+#
+# Everything installs under /opt and is named apart from an official Zed, so a
+# machine can carry both.
+set -euo pipefail
+
+PROFILE="${PROFILE:-release-fast}"
+# Extra arguments for cargo, e.g. `--features servo`.
+CARGO_ARGS="${CARGO_ARGS:-}"
+PACKAGE_NAME="zed-fork"
+APP_ROOT="/opt/${PACKAGE_NAME}.app"
+
+target_dir="${CARGO_TARGET_DIR:-target}"
+version="$(script/get-crate-version zed)"
+commit="$(git rev-parse HEAD | cut -c 1-7)"
+architecture="$(uname -m)"
+
+# shellcheck disable=SC2086
+cargo build --profile "${PROFILE}" --package zed --package cli ${CARGO_ARGS}
+
+stage="$(mktemp -d)"
+trap 'rm -rf "${stage}"' EXIT
+app="${stage}${APP_ROOT}"
+mkdir -p "${app}/bin" "${app}/libexec" "${app}/lib"
+
+cp "${target_dir}/${PROFILE}/zed" "${app}/libexec/zed-editor"
+cp "${target_dir}/${PROFILE}/cli" "${app}/bin/${PACKAGE_NAME}"
+strip --strip-debug "${app}/libexec/zed-editor" "${app}/bin/${PACKAGE_NAME}" || true
+
+# The same libraries the project's own bundle carries, so a machine with an
+# older toolchain than the builder still starts the editor. What is left out is
+# what every distribution has and what must come from the running system.
+libraries="$(ldd "${target_dir}/${PROFILE}/zed" |
+    cut -d' ' -f3 |
+    grep '^/' |
+    grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' || true)"
+if [ -n "${libraries}" ]; then
+    echo "${libraries}" | xargs cp -t "${app}/lib"
+fi
+
+icons="${stage}/usr/share/icons/hicolor"
+mkdir -p "${icons}/512x512/apps" "${icons}/1024x1024/apps"
+cp crates/zed/resources/app-icon-dev.png "${icons}/512x512/apps/${PACKAGE_NAME}.png"
+cp crates/zed/resources/app-icon-dev@2x.png "${icons}/1024x1024/apps/${PACKAGE_NAME}.png"
+
+export APP_NAME="Zed (fork)"
+export APP_CLI="${PACKAGE_NAME}"
+export APP_ICON="${PACKAGE_NAME}"
+export APP_ARGS="%U"
+export DO_STARTUP_NOTIFY="true"
+mkdir -p "${stage}/usr/share/applications"
+envsubst < crates/zed/resources/zed.desktop.in \
+    > "${stage}/usr/share/applications/dev.zed.Zed-Fork.desktop"
+
+# The launcher resolves its own path to find the editor beside it, so the link
+# in the path has to point at the real file rather than carry a copy.
+mkdir -p "${stage}/usr/bin"
+ln -s "${APP_ROOT}/bin/${PACKAGE_NAME}" "${stage}/usr/bin/${PACKAGE_NAME}"
+
+mkdir -p "${target_dir}/fork-packages"
+out="$(cd "${target_dir}/fork-packages" && pwd)"
+tar -czf "${out}/${PACKAGE_NAME}-linux-${architecture}.tar.gz" -C "${stage}" .
+
+for kind in deb rpm; do
+    fpm \
+        --input-type dir \
+        --output-type "${kind}" \
+        --name "${PACKAGE_NAME}" \
+        --version "${version}" \
+        --iteration "git${commit}" \
+        --architecture native \
+        --description "Zed editor, built from a personal fork" \
+        --url "https://github.com/serboox/zed" \
+        --maintainer "fork build <noreply@example.com>" \
+        --license "GPL-3.0-or-later" \
+        --package "${out}/" \
+        --force \
+        --chdir "${stage}" \
+        .
+done
+
+ls -lh "${out}"
