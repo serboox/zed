@@ -104,6 +104,15 @@ jobs:
 
       - run: rustup show
 
+      # The engine's nine hundred crates never change, so compiling them once per
+      # push is the whole cost of these runs. This keeps the dependency artifacts
+      # between runs; the workspace's own crates are dropped before saving, so
+      # what comes back is only the part that would have been identical anyway.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-bundle-linux
+          cache-on-failure: true
+
       - name: Build the packages with the HTML engine
         id: engine
         if: needs.plan.outputs.engine != ''
@@ -172,6 +181,13 @@ jobs:
 
       - run: rustup show
 
+      # Same reason as the Linux job: the engine's crates are identical from run
+      # to run, so they are compiled once and kept.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-bundle-${{ runner.os }}
+          cache-on-failure: true
+
       - name: Build with the HTML engine
         id: engine
         if: needs.plan.outputs.engine != ''
@@ -227,6 +243,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - run: rustup show
+
+      # Same reason as the Linux job: the engine's crates are identical from run
+      # to run, so they are compiled once and kept.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-bundle-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Build with the HTML engine
         id: engine
