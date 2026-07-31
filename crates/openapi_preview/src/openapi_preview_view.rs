@@ -2489,7 +2489,15 @@ fn default_enum_selection(required: bool, allowed_values: &[SharedString]) -> Op
 /// none -- it would paint as an empty sliver -- so both body editors size
 /// themselves to their own text instead.
 const BODY_EDITOR_MIN_LINES: usize = 4;
-const BODY_EDITOR_MAX_LINES: usize = 18;
+const BODY_EDITOR_MAX_LINES: usize = 24;
+
+/// Sizes a body editor to its own text, and leaves the box to scroll whatever
+/// does not fit. No scrollbar: an auto-height editor keeps wrapping its text to
+/// the full width, so a thumb would be painted over the end of a long line
+/// rather than beside it.
+fn new_body_editor(window: &mut Window, cx: &mut Context<Editor>) -> Editor {
+    Editor::auto_height(BODY_EDITOR_MIN_LINES, BODY_EDITOR_MAX_LINES, window, cx)
+}
 
 fn new_try_it_out_body_editor(
     initial_value: &str,
@@ -2497,8 +2505,7 @@ fn new_try_it_out_body_editor(
     cx: &mut App,
 ) -> Entity<Editor> {
     cx.new(|cx| {
-        let mut editor =
-            Editor::auto_height(BODY_EDITOR_MIN_LINES, BODY_EDITOR_MAX_LINES, window, cx);
+        let mut editor = new_body_editor(window, cx);
         editor.set_placeholder_text("Request body", window, cx);
         if !initial_value.is_empty() {
             editor.set_text(initial_value.to_string(), window, cx);
@@ -2509,8 +2516,7 @@ fn new_try_it_out_body_editor(
 
 fn new_try_it_out_response_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
     cx.new(|cx| {
-        let mut editor =
-            Editor::auto_height(BODY_EDITOR_MIN_LINES, BODY_EDITOR_MAX_LINES, window, cx);
+        let mut editor = new_body_editor(window, cx);
         editor.set_read_only(true);
         editor
     })
