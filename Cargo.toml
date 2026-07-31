@@ -267,6 +267,10 @@ members = [
     "tooling/xtask",
 ]
 default-members = ["crates/zed"]
+# The Servo-backed HTML engine is kept out of the workspace: `servo-storage`
+# wants libsqlite3-sys 0.35 while `sqlez` is on 0.30, and cargo allows only one
+# package to link the native sqlite. Bumping sqlez is what lets it come in.
+exclude = ["crates/html_render"]
 
 [workspace.package]
 publish = false

@@ -1,0 +1,33 @@
+[package]
+name = "html_render"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/html_render.rs"
+doctest = false
+
+# Servo brings SpiderMonkey and some six hundred crates with it, so it is opt-in.
+# The crate is also kept out of the Zed workspace for now: `servo-storage` wants
+# libsqlite3-sys 0.35 while `sqlez` is on 0.30, and cargo allows only one package
+# to link the native sqlite library.
+[features]
+default = []
+servo = ["dep:dpi", "dep:image", "dep:servo", "dep:smallvec", "dep:tempfile", "dep:url"]
+
+[dependencies]
+anyhow = "1.0"
+gpui = { path = "../gpui" }
+log = "0.4"
+
+dpi = { version = "0.1", optional = true }
+image = { version = "0.25", optional = true }
+# servo-script pins p521 to a release candidate that does not build against the
+# stable primeorder cargo would otherwise pick, so a consumer has to pin it too:
+# primeorder = "=0.14.0-rc.14".
+servo = { version = "0.4", optional = true }
+smallvec = { version = "1.6", optional = true }
+tempfile = { version = "3.20", optional = true }
+url = { version = "2.2", optional = true }
