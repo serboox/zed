@@ -43,6 +43,13 @@ pub struct HtmlPreviewView {
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
+    /// The page as the engine drew it, when this build has one. Until it
+    /// arrives -- and on any machine without a rendering surface -- the
+    /// Markdown rendering below is what the reader sees.
+    #[cfg(feature = "servo")]
+    engine_page: Option<std::sync::Arc<gpui::RenderImage>>,
+    #[cfg(feature = "servo")]
+    engine_task: Option<Task<()>>,
 }
 
 impl HtmlPreviewView {
@@ -190,6 +197,10 @@ impl HtmlPreviewView {
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 pending_update_task: None,
+                #[cfg(feature = "servo")]
+                engine_page: None,
+                #[cfg(feature = "servo")]
+                engine_task: None,
             };
             this.set_editor(active_editor, window, cx);
             this
@@ -287,11 +298,48 @@ impl HtmlPreviewView {
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(sanitized.into(), cx);
                     });
+                    #[cfg(feature = "servo")]
+                    view.draw_with_engine(contents, cx);
                 }
                 view.pending_update_task = None;
                 cx.notify();
             })
         })
+    }
+
+    /// Hands the page to the embedded engine and keeps the picture it draws.
+    /// A page that fails to render leaves the Markdown rendering in place rather
+    /// than blanking the preview.
+    #[cfg(feature = "servo")]
+    fn draw_with_engine(&mut self, contents: String, cx: &mut Context<Self>) {
+        let base_directory = self.base_directory.clone();
+        let viewport = gpui::size(gpui::px(1200.), gpui::px(900.));
+        // The picture on screen belongs to the document that was there a moment
+        // ago. Drop it while the new one is drawn, so an edit that fails to
+        // render falls back to the Markdown rendering instead of showing a page
+        // that no longer exists.
+        self.engine_page = None;
+        let render = html_render::HtmlEngine::render(
+            contents.into(),
+            base_directory.as_deref(),
+            viewport,
+            cx,
+        );
+        self.engine_task = Some(cx.spawn(async move |view, cx| {
+            let page = render.await;
+            view.update(cx, |view, cx| {
+                match page {
+                    Ok(page) => view.engine_page = Some(page),
+                    Err(error) => {
+                        view.engine_page = None;
+                        log::warn!("the HTML engine did not draw the page: {error:#}");
+                    }
+                }
+                view.engine_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn get_folder_for_active_editor(editor: &Editor, cx: &App) -> Option<PathBuf> {
@@ -304,6 +352,23 @@ impl HtmlPreviewView {
         } else {
             None
         }
+    }
+
+    /// The page itself, drawn by the engine when this build has one and it has
+    /// finished, and the Markdown rendering of it otherwise.
+    #[cfg(feature = "servo")]
+    fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.engine_page.clone() {
+            Some(page) => gpui::img(gpui::ImageSource::Render(page))
+                .w_full()
+                .into_any_element(),
+            None => self.render_markdown_element(window, cx).into_any_element(),
+        }
+    }
+
+    #[cfg(not(feature = "servo"))]
+    fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.render_markdown_element(window, cx).into_any_element()
     }
 
     fn render_markdown_element(
@@ -484,7 +549,7 @@ impl Render for HtmlPreviewView {
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll_handle)
                         .p_4()
-                        .child(self.render_markdown_element(window, cx)),
+                        .child(self.render_page(window, cx)),
                 ),
             )
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)

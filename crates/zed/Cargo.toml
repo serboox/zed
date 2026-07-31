@@ -52,6 +52,7 @@ visual-tests = [
     "recent_projects/test-support",
     "title_bar/test-support",
 ]
+servo = ["html_preview/servo"]
 
 [[bin]]
 name = "zed"

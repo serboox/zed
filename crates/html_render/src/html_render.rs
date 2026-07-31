@@ -12,6 +12,9 @@
 //! driven from a foreground task.
 
 #[cfg(feature = "servo")]
+use primeorder as _;
+
+#[cfg(feature = "servo")]
 mod engine {
     use std::cell::{Cell, RefCell};
     use std::path::Path;
@@ -72,11 +75,13 @@ mod engine {
                     .map_err(|_| {
                         anyhow!("this platform has no rendering surface for HTML previews")
                     })?
-                    .context("building a software rendering context for HTML previews")?;
+                    .map_err(|error| {
+                        anyhow!("no rendering surface for HTML previews: {error:?}")
+                    })?;
             let rendering_context = Rc::new(rendering_context);
             rendering_context
                 .make_current()
-                .context("making the HTML preview rendering context current")?;
+                .map_err(|error| anyhow!("the HTML preview surface refused to bind: {error:?}"))?;
 
             let servo = ServoBuilder::default()
                 .event_loop_waker(Box::new(Waker(Arc::new(AtomicBool::new(false)))))
@@ -103,8 +108,8 @@ mod engine {
             cx: &mut App,
         ) -> Task<Result<Arc<RenderImage>>> {
             let viewport = PhysicalSize {
-                width: viewport.width.0.max(1.) as u32,
-                height: viewport.height.0.max(1.) as u32,
+                width: f32::from(viewport.width).max(1.) as u32,
+                height: f32::from(viewport.height).max(1.) as u32,
             };
             let engine = match Self::global(viewport, cx) {
                 Ok(engine) => engine,

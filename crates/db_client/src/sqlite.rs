@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
+use sqlx::AssertSqlSafe;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::{Column as _, Row as _, ValueRef as _};
 use std::path::Path;
@@ -78,7 +79,7 @@ impl DbProvider for SqliteProvider {
     async fn describe_table(&self, _database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
         let safe_table = table.replace('\'', "''");
         let sql = format!("PRAGMA table_info('{safe_table}')");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .fetch_all(&self.pool)
             .await
             .context("Failed to describe table")?;
@@ -130,7 +131,7 @@ impl DbProvider for SqliteProvider {
     async fn list_indexes(&self, _database: &str, table: &str) -> Result<Vec<IndexInfo>> {
         let safe_table = table.replace('\'', "''");
         let list_sql = format!("PRAGMA index_list('{safe_table}')");
-        let index_rows = sqlx::query(&list_sql)
+        let index_rows = sqlx::query(AssertSqlSafe(list_sql.as_str()))
             .fetch_all(&self.pool)
             .await
             .context("Failed to list indexes")?;
@@ -141,7 +142,7 @@ impl DbProvider for SqliteProvider {
             let unique_val: i64 = row.try_get("unique").unwrap_or(0);
             let safe_name = name.replace('\'', "''");
             let info_sql = format!("PRAGMA index_info('{safe_name}')");
-            let col_rows = sqlx::query(&info_sql)
+            let col_rows = sqlx::query(AssertSqlSafe(info_sql.as_str()))
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to get index info")?;
@@ -227,7 +228,7 @@ impl DbProvider for SqliteProvider {
 
     async fn truncate_table(&self, _database: &str, table: &str) -> Result<()> {
         let safe = table.replace('"', "\"\"");
-        sqlx::query(&format!("DELETE FROM \"{safe}\""))
+        sqlx::query(AssertSqlSafe(format!("DELETE FROM \"{safe}\"")))
             .execute(&self.pool)
             .await
             .context("Failed to truncate table")?;
@@ -236,7 +237,7 @@ impl DbProvider for SqliteProvider {
 
     async fn drop_table(&self, _database: &str, table: &str) -> Result<()> {
         let safe = table.replace('"', "\"\"");
-        sqlx::query(&format!("DROP TABLE \"{safe}\""))
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE \"{safe}\"")))
             .execute(&self.pool)
             .await
             .context("Failed to drop table")?;
@@ -244,7 +245,7 @@ impl DbProvider for SqliteProvider {
     }
 
     async fn rename_table(&self, _database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        sqlx::query(&rename_table_sql(old_name, new_name))
+        sqlx::query(AssertSqlSafe(rename_table_sql(old_name, new_name)))
             .execute(&self.pool)
             .await
             .context("Failed to rename table")?;
@@ -260,7 +261,7 @@ impl DbProvider for SqliteProvider {
             || trimmed_upper.starts_with("WITH");
 
         if is_read_query {
-            let mut stream = sqlx::query(sql).fetch(&self.pool);
+            let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(&self.pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -309,7 +310,7 @@ impl DbProvider for SqliteProvider {
                 timing: None,
             })
         } else {
-            let result = sqlx::query(sql)
+            let result = sqlx::query(AssertSqlSafe(sql))
                 .execute(&self.pool)
                 .await
                 .context("Query execution failed")?;

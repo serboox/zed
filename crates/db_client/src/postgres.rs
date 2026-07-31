@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
+use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{Column as _, Row as _};
 use std::time::Instant;
@@ -215,7 +216,7 @@ impl DbProvider for PostgresProvider {
     async fn execute_query(&self, schema: &str, sql: &str) -> Result<QueryResult> {
         if !schema.is_empty() {
             let set_path = format!("SET search_path = \"{}\"", schema.replace('"', "\"\""));
-            sqlx::query(&set_path)
+            sqlx::query(AssertSqlSafe(set_path.as_str()))
                 .execute(&self.pool)
                 .await
                 .context("Failed to set search_path")?;
@@ -237,7 +238,7 @@ impl DbProvider for PostgresProvider {
         );
 
         if is_read_query {
-            let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
+            let mut stream = sqlx::query(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -270,7 +271,7 @@ impl DbProvider for PostgresProvider {
                 timing: None,
             })
         } else {
-            let result = sqlx::query(&prefixed)
+            let result = sqlx::query(AssertSqlSafe(prefixed.as_str()))
                 .execute(&self.pool)
                 .await
                 .context("Query execution failed")?;
@@ -294,7 +295,7 @@ impl DbProvider for PostgresProvider {
     ) -> Result<u64> {
         if !schema.is_empty() {
             let set_path = format!("SET search_path = \"{}\"", schema.replace('"', "\"\""));
-            sqlx::query(&set_path)
+            sqlx::query(AssertSqlSafe(set_path.as_str()))
                 .execute(&self.pool)
                 .await
                 .context("Failed to set search_path")?;
@@ -315,7 +316,7 @@ impl DbProvider for PostgresProvider {
         );
 
         if !is_read_query {
-            sqlx::query(&prefixed)
+            sqlx::query(AssertSqlSafe(prefixed.as_str()))
                 .execute(&self.pool)
                 .await
                 .context("Query execution failed")?;
@@ -326,7 +327,7 @@ impl DbProvider for PostgresProvider {
         // whole point of "execute to file" is exporting result sets too large
         // for the grid. Cells are still capped for safety against a single
         // multi-megabyte value, but the row count itself is unbounded.
-        let mut stream = sqlx::query(&prefixed).fetch(&self.pool);
+        let mut stream = sqlx::query(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
         let mut columns: Vec<String> = Vec::new();
         let mut row_count: u64 = 0;
 
@@ -553,7 +554,7 @@ impl DbProvider for PostgresProvider {
             database.replace('"', "\"\""),
             table.replace('"', "\"\""),
         );
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
             .await
             .context("Failed to truncate table")?;
@@ -566,7 +567,7 @@ impl DbProvider for PostgresProvider {
             database.replace('"', "\"\""),
             table.replace('"', "\"\""),
         );
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
             .await
             .context("Failed to drop table")?;
@@ -574,7 +575,7 @@ impl DbProvider for PostgresProvider {
     }
 
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        sqlx::query(&rename_table_sql(database, old_name, new_name))
+        sqlx::query(AssertSqlSafe(rename_table_sql(database, old_name, new_name)))
             .execute(&self.pool)
             .await
             .context("Failed to rename table")?;

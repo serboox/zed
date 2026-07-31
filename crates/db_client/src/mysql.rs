@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use smol::lock::Mutex as AsyncMutex;
+use sqlx::AssertSqlSafe;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::{Column as _, Row as _};
 use std::sync::RwLock;
@@ -252,7 +253,7 @@ impl MySqlProvider {
             host.replace('\'', "''"),
         );
         let pool = self.current_pool();
-        let query = sqlx::query(&sql).fetch_all(&pool);
+        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(&pool);
         let rows = Self::bounded_metadata(query, "Failed to read grants").await?;
         Ok(rows
             .into_iter()
@@ -403,7 +404,7 @@ impl DbProvider for MySqlProvider {
             "-- name: ListViews :many\n\
              SHOW FULL TABLES IN `{escaped}` WHERE Table_type = 'VIEW'"
         );
-        let query = sqlx::query(&sql).fetch_all(&pool);
+        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(&pool);
         let rows = Self::bounded_metadata(query, "Failed to list views").await?;
 
         Ok(rows
@@ -513,7 +514,7 @@ impl DbProvider for MySqlProvider {
             database.replace('`', "``"),
             table.replace('`', "``")
         );
-        let query = sqlx::query(&sql).fetch_one(&pool);
+        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&pool);
         let row = Self::bounded_metadata(query, "Failed to get table DDL").await?;
         row.try_get::<Vec<u8>, _>(1)
             .map(bytes_to_string)
@@ -525,7 +526,7 @@ impl DbProvider for MySqlProvider {
         let _guard = self.op_lock.lock().await;
         let pool = self.current_pool();
         let sql = format!("SHOW CREATE DATABASE `{}`", database.replace('`', "``"));
-        let query = sqlx::query(&sql).fetch_one(&pool);
+        let query = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_one(&pool);
         let row = Self::bounded_metadata(query, "Failed to get database DDL").await?;
         row.try_get::<Vec<u8>, _>(1)
             .map(bytes_to_string)
@@ -551,7 +552,7 @@ impl DbProvider for MySqlProvider {
             // connection, so a silent death here must not hang forever holding
             // `op_lock` and wedge every later query.
             let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(&use_stmt).execute(&pool))
+            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool))
                 .await
                 .context("Timed out switching database -- the connection stalled")?
                 .context("Failed to switch database")?;
@@ -592,7 +593,7 @@ impl DbProvider for MySqlProvider {
             // decoded and its cells capped before the next row is read, so a huge
             // result (many rows or multi-megabyte BLOB cells) cannot be pulled
             // into memory all at once and freeze the client.
-            let mut stream = sqlx::raw_sql(&prefixed).fetch(&pool);
+            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
             // Set once the first row (or end-of-stream) arrives, splitting
@@ -658,12 +659,12 @@ impl DbProvider for MySqlProvider {
             })
         } else {
             let result = if requires_text_protocol {
-                sqlx::raw_sql(&prefixed)
+                sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
                     .execute(&pool)
                     .await
                     .context("Query execution failed")?
             } else {
-                sqlx::query(&prefixed)
+                sqlx::query(AssertSqlSafe(prefixed.as_str()))
                     .execute(&pool)
                     .await
                     .context("Query execution failed")?
@@ -698,7 +699,7 @@ impl DbProvider for MySqlProvider {
             // Bounded for the same reason as in `execute_query`: a silent
             // connection death here must not hang forever holding `op_lock`.
             let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(&use_stmt).execute(&pool))
+            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool))
                 .await
                 .context("Timed out switching database -- the connection stalled")?
                 .context("Failed to switch database")?;
@@ -718,7 +719,7 @@ impl DbProvider for MySqlProvider {
         );
 
         if !is_read_query {
-            sqlx::query(&prefixed)
+            sqlx::query(AssertSqlSafe(prefixed.as_str()))
                 .execute(&pool)
                 .await
                 .context("Query execution failed")?;
@@ -729,7 +730,7 @@ impl DbProvider for MySqlProvider {
         // whole point of "execute to file" is exporting result sets too large
         // for the grid. Cells are still capped for safety against a single
         // multi-megabyte BLOB, but the row count itself is unbounded.
-        let mut stream = sqlx::raw_sql(&prefixed).fetch(&pool);
+        let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&pool);
         let mut columns: Vec<String> = Vec::new();
         let mut row_count: u64 = 0;
 
@@ -911,7 +912,7 @@ impl DbProvider for MySqlProvider {
             database.replace('`', "``"),
             table.replace('`', "``")
         );
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(sql.as_str()))
             .execute(&pool)
             .await
             .context("Failed to truncate table")?;
@@ -926,7 +927,7 @@ impl DbProvider for MySqlProvider {
             database.replace('`', "``"),
             table.replace('`', "``")
         );
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(sql.as_str()))
             .execute(&pool)
             .await
             .context("Failed to drop table")?;
@@ -936,7 +937,7 @@ impl DbProvider for MySqlProvider {
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
         let _guard = self.op_lock.lock().await;
         let pool = self.current_pool();
-        sqlx::query(&rename_table_sql(database, old_name, new_name))
+        sqlx::query(AssertSqlSafe(rename_table_sql(database, old_name, new_name)))
             .execute(&pool)
             .await
             .context("Failed to rename table")?;
@@ -1140,7 +1141,7 @@ mod integration_tests {
             sqlx::mysql::MySqlConnection::connect_with(&super::mysql_connect_options(&config))
                 .await
                 .expect("failed to open killer connection");
-        sqlx::query(&format!("KILL {connection_id}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("KILL {connection_id}")))
             .execute(&mut killer)
             .await
             .expect("KILL failed");

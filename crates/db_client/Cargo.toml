@@ -26,7 +26,7 @@ aerospike = { version = "3.0.0-alpha.1", default-features = false, features = [
     "async",
     "rt-tokio",
 ] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "postgres", "sqlite", "json", "time"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring", "mysql", "postgres", "sqlite-bundled", "json", "time"] }
 mongodb = "3.7"
 scylla = "1.7"
 tempfile.workspace = true
