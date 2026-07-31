@@ -19,6 +19,8 @@ doctest = false
 default = []
 servo = [
     "dep:dpi",
+    "dep:euclid",
+    "dep:keyboard_types",
     "dep:primeorder",
     "dep:image",
     "dep:servo",
@@ -33,6 +35,8 @@ gpui.workspace = true
 log.workspace = true
 
 dpi = { workspace = true, optional = true }
+euclid = { workspace = true, optional = true }
+keyboard_types = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 # A pin, not a use: servo-script requires release-candidate elliptic curve crates
 # that do not build against the stable primeorder cargo would pick on its own.
@@ -44,3 +48,4 @@ url = { workspace = true, optional = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+keyboard_types.workspace = true

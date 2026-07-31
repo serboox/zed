@@ -28,6 +28,10 @@ use workspace::{Pane, Workspace};
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// How often the engine is given a turn. Thirty frames a second is plenty for
+/// reading a page, and every frame costs a full copy of it.
+#[cfg(feature = "servo")]
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 struct EditorState {
     editor: Entity<Editor>,
@@ -43,13 +47,23 @@ pub struct HtmlPreviewView {
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
-    /// The page as the engine drew it, when this build has one. Until it
-    /// arrives -- and on any machine without a rendering surface -- the
+    /// The live page, when this build has an engine: a real document that lays
+    /// itself out, runs its scripts and answers the mouse. Without one the
     /// Markdown rendering below is what the reader sees.
     #[cfg(feature = "servo")]
-    engine_page: Option<std::sync::Arc<gpui::RenderImage>>,
+    page: Option<html_render::HtmlPage>,
     #[cfg(feature = "servo")]
-    engine_task: Option<Task<()>>,
+    frame: Option<std::sync::Arc<gpui::RenderImage>>,
+    #[cfg(feature = "servo")]
+    pump: Option<Task<()>>,
+    /// Where the page is painted, so a click can be told where it landed and a
+    /// resize can be passed on to the engine.
+    #[cfg(feature = "servo")]
+    page_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// Whether the button now held down was pressed on the page. A drag that
+    /// began elsewhere belongs to whoever started it.
+    #[cfg(feature = "servo")]
+    page_pressed: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl HtmlPreviewView {
@@ -198,10 +212,27 @@ impl HtmlPreviewView {
                 base_directory: None,
                 pending_update_task: None,
                 #[cfg(feature = "servo")]
-                engine_page: None,
+                page: None,
                 #[cfg(feature = "servo")]
-                engine_task: None,
+                frame: None,
+                #[cfg(feature = "servo")]
+                pump: None,
+                #[cfg(feature = "servo")]
+                page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
+                #[cfg(feature = "servo")]
+                page_pressed: std::rc::Rc::new(std::cell::Cell::new(false)),
             };
+            #[cfg(feature = "servo")]
+            cx.on_release_in(window, |this: &mut Self, window, _| {
+                // The last frame a closed preview painted would otherwise sit
+                // in the sprite atlas for as long as the window lives.
+                if let Some(frame) = this.frame.take()
+                    && let Err(error) = window.drop_image(frame)
+                {
+                    log::warn!("the page's last frame could not be released: {error:#}");
+                }
+            })
+            .detach();
             this.set_editor(active_editor, window, cx);
             this
         })
@@ -292,14 +323,16 @@ impl HtmlPreviewView {
                 })
             })?;
 
-            view.update(cx, move |view, cx| {
+            view.update_in(cx, move |view, window, cx| {
                 if let Some(contents) = contents {
                     let sanitized = sanitize_html(&contents);
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(sanitized.into(), cx);
                     });
                     #[cfg(feature = "servo")]
-                    view.draw_with_engine(contents, cx);
+                    view.show_in_engine(contents, window, cx);
+                    #[cfg(not(feature = "servo"))]
+                    let _ = window;
                 }
                 view.pending_update_task = None;
                 cx.notify();
@@ -307,39 +340,130 @@ impl HtmlPreviewView {
         })
     }
 
-    /// Hands the page to the embedded engine and keeps the picture it draws.
-    /// A page that fails to render leaves the Markdown rendering in place rather
-    /// than blanking the preview.
+    /// Opens the document in the engine, or reloads the page already open, and
+    /// keeps the frames coming.
     #[cfg(feature = "servo")]
-    fn draw_with_engine(&mut self, contents: String, cx: &mut Context<Self>) {
+    fn show_in_engine(&mut self, contents: String, window: &mut Window, cx: &mut Context<Self>) {
         let base_directory = self.base_directory.clone();
-        let viewport = gpui::size(gpui::px(1200.), gpui::px(900.));
-        // The picture on screen belongs to the document that was there a moment
-        // ago. Drop it while the new one is drawn, so an edit that fails to
-        // render falls back to the Markdown rendering instead of showing a page
-        // that no longer exists.
-        self.engine_page = None;
-        let render = html_render::HtmlEngine::render(
-            contents.into(),
+        let contents: gpui::SharedString = contents.into();
+        if let Some(page) = self.page.as_mut() {
+            if let Err(error) = page.reload(contents, base_directory.as_deref()) {
+                log::warn!("the page could not be reloaded: {error:#}");
+            }
+            return;
+        }
+
+        let bounds = self.page_bounds.get();
+        let size = match bounds.size.width > gpui::px(64.) {
+            true => bounds.size,
+            // Before the first paint there is nothing to measure; the page is
+            // resized as soon as there is.
+            false => gpui::size(gpui::px(900.), gpui::px(700.)),
+        };
+        match html_render::HtmlPage::open(
+            contents,
             base_directory.as_deref(),
-            viewport,
+            size,
+            window.scale_factor(),
             cx,
-        );
-        self.engine_task = Some(cx.spawn(async move |view, cx| {
-            let page = render.await;
-            view.update(cx, |view, cx| {
-                match page {
-                    Ok(page) => view.engine_page = Some(page),
-                    Err(error) => {
-                        view.engine_page = None;
-                        log::warn!("the HTML engine did not draw the page: {error:#}");
+        ) {
+            Ok(page) => {
+                self.page = Some(page);
+                self.start_pumping(cx);
+            }
+            Err(error) => log::warn!("the HTML engine did not open the page: {error:#}"),
+        }
+    }
+
+    /// Drives the engine while the page is open. Servo lays out, runs script and
+    /// paints only while its event loop is being turned, so this is what makes
+    /// the page live rather than a photograph.
+    #[cfg(feature = "servo")]
+    fn start_pumping(&mut self, cx: &mut Context<Self>) {
+        self.pump = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(FRAME_INTERVAL).await;
+                let carried_on = view.update_in(cx, |view, window, cx| {
+                    let Some(page) = view.page.as_mut() else {
+                        return false;
+                    };
+                    let bounds = view.page_bounds.get();
+                    if bounds.size.width > gpui::px(64.) {
+                        page.resize(bounds.size, window.scale_factor());
                     }
+                    if page.pump() {
+                        let superseded = view.frame.take();
+                        view.frame = page.frame();
+                        // Dropping the handle is not enough: the texture stays in
+                        // the sprite atlas until the window is told to let it go,
+                        // and a page hands over a new one many times a second.
+                        // That rate is also why a failure here is only noted:
+                        // thirty warnings a second would drown the log.
+                        if let Some(superseded) = superseded
+                            && let Err(error) = window.drop_image(superseded)
+                        {
+                            log::debug!("a superseded frame could not be released: {error:#}");
+                        }
+                        cx.notify();
+                    }
+                    if let Some(url) = page.take_link_for_new_tab() {
+                        log::debug!("the page navigated to {url}");
+                    }
+                    true
+                });
+                match carried_on {
+                    Ok(true) => {}
+                    _ => break,
                 }
-                view.engine_task = None;
-                cx.notify();
-            })
-            .ok();
+            }
         }));
+    }
+
+    /// Whether the engine's page is what the reader is looking at.
+    #[cfg(feature = "servo")]
+    fn showing_live_page(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    #[cfg(not(feature = "servo"))]
+    fn showing_live_page(&self) -> bool {
+        false
+    }
+
+    /// Typing reaches the page from the element that holds focus. A handler on
+    /// the picture itself sits below the focus path and never hears a key, so
+    /// the keys are taken where focus actually lands and passed down.
+    #[cfg(feature = "servo")]
+    fn with_page_keys(
+        root: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        root.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, _| {
+            if let Some(page) = view.page.as_ref() {
+                page.key(servo_key(
+                    &event.keystroke,
+                    keyboard_types::KeyState::Down,
+                    event.is_held,
+                ));
+            }
+        }))
+        .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, _, _| {
+            if let Some(page) = view.page.as_ref() {
+                page.key(servo_key(
+                    &event.keystroke,
+                    keyboard_types::KeyState::Up,
+                    false,
+                ));
+            }
+        }))
+    }
+
+    #[cfg(not(feature = "servo"))]
+    fn with_page_keys(
+        root: gpui::Stateful<gpui::Div>,
+        _: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        root
     }
 
     fn get_folder_for_active_editor(editor: &Editor, cx: &App) -> Option<PathBuf> {
@@ -354,16 +478,136 @@ impl HtmlPreviewView {
         }
     }
 
-    /// The page itself, drawn by the engine when this build has one and it has
-    /// finished, and the Markdown rendering of it otherwise.
+    /// The live page when the engine has one, and the Markdown rendering of the
+    /// document otherwise.
+    ///
+    /// The page's own input is delivered through window-level listeners rather
+    /// than the element's: an element only hears about the mouse while it is
+    /// hovered, and a drag -- which is how text is selected -- is exactly the
+    /// case where that stops being true.
     #[cfg(feature = "servo")]
     fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match self.engine_page.clone() {
-            Some(page) => gpui::img(gpui::ImageSource::Render(page))
-                .w_full()
-                .into_any_element(),
-            None => self.render_markdown_element(window, cx).into_any_element(),
-        }
+        let Some(frame) = self.frame.clone() else {
+            return self.render_markdown_element(window, cx).into_any_element();
+        };
+        let bounds_cell = self.page_bounds.clone();
+        let holding = self.page_pressed.clone();
+        let view = cx.entity().downgrade();
+        div()
+            .size_full()
+            .relative()
+            // The picture's own bounds are what a click is measured against: an
+            // absolutely positioned overlay has no size of its own to offer, and
+            // a hit test against nothing lets nothing through.
+            .on_children_prepainted({
+                let bounds_cell = bounds_cell.clone();
+                move |children, _, _| {
+                    if let Some(page) = children.first() {
+                        bounds_cell.set(*page);
+                    }
+                }
+            })
+            .child(gpui::img(gpui::ImageSource::Render(frame)).size_full())
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        let bounds = bounds_cell.get();
+                        let page_point = move |position: gpui::Point<gpui::Pixels>| {
+                            gpui::point(position.x - bounds.origin.x, position.y - bounds.origin.y)
+                        };
+                        let inside = move |position: gpui::Point<gpui::Pixels>| {
+                            // Before the first paint there is nothing to measure
+                            // against, and a page that hears nothing is worse
+                            // than one that hears too much.
+                            bounds.size.width <= gpui::px(1.) || bounds.contains(&position)
+                        };
+
+                        window.on_mouse_event({
+                            let view = view.clone();
+                            let holding = holding.clone();
+                            move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                if phase != gpui::DispatchPhase::Bubble {
+                                    return;
+                                }
+                                // A drag that started on the page keeps steering it
+                                // even when the pointer wanders off the edge, which
+                                // is what selecting to the end of a line does. A
+                                // drag that started elsewhere is somebody else's.
+                                if !inside(event.position) && !holding.get() {
+                                    return;
+                                }
+                                view.update(cx, |view, _| {
+                                    if let Some(page) = view.page.as_ref() {
+                                        page.mouse_moved(page_point(event.position));
+                                    }
+                                })
+                                .ok();
+                            }
+                        });
+                        window.on_mouse_event({
+                            let view = view.clone();
+                            let holding = holding.clone();
+                            move |event: &gpui::MouseDownEvent, phase, _, cx| {
+                                if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                                    return;
+                                }
+                                holding.set(true);
+                                view.update(cx, |view, _| {
+                                    if let Some(page) = view.page.as_ref() {
+                                        page.mouse_down(
+                                            page_point(event.position),
+                                            servo_button(event.button),
+                                        );
+                                    }
+                                })
+                                .ok();
+                            }
+                        });
+                        window.on_mouse_event({
+                            let view = view.clone();
+                            let holding = holding.clone();
+                            move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                                if phase != gpui::DispatchPhase::Bubble {
+                                    return;
+                                }
+                                // Only the button the page itself is holding is
+                                // released to it; a click that began in the editor
+                                // must not finish inside the page.
+                                if !holding.replace(false) && !inside(event.position) {
+                                    return;
+                                }
+                                view.update(cx, |view, _| {
+                                    if let Some(page) = view.page.as_ref() {
+                                        page.mouse_up(
+                                            page_point(event.position),
+                                            servo_button(event.button),
+                                        );
+                                    }
+                                })
+                                .ok();
+                            }
+                        });
+                        window.on_mouse_event({
+                            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                                    return;
+                                }
+                                let delta = event.delta.pixel_delta(window.line_height());
+                                view.update(cx, |view, _| {
+                                    if let Some(page) = view.page.as_ref() {
+                                        page.scrolled(page_point(event.position), delta);
+                                    }
+                                })
+                                .ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
     }
 
     #[cfg(not(feature = "servo"))]
@@ -529,18 +773,121 @@ impl Focusable for HtmlPreviewView {
 
 impl EventEmitter<()> for HtmlPreviewView {}
 
+/// gpui and the engine name the keys separately. Anything that produces a
+/// character is passed through as that character; the rest are named keys a
+/// page can act on.
+#[cfg(feature = "servo")]
+fn servo_key(
+    keystroke: &gpui::Keystroke,
+    state: keyboard_types::KeyState,
+    repeat: bool,
+) -> keyboard_types::KeyboardEvent {
+    use keyboard_types::{Code, Key, Location, Modifiers, NamedKey};
+
+    let named = |name| Key::Named(name);
+    let key = match keystroke.key.as_str() {
+        "enter" => named(NamedKey::Enter),
+        "escape" => named(NamedKey::Escape),
+        "backspace" => named(NamedKey::Backspace),
+        "delete" => named(NamedKey::Delete),
+        "insert" => named(NamedKey::Insert),
+        "tab" => named(NamedKey::Tab),
+        "space" => Key::Character(" ".into()),
+        "up" => named(NamedKey::ArrowUp),
+        "down" => named(NamedKey::ArrowDown),
+        "left" => named(NamedKey::ArrowLeft),
+        "right" => named(NamedKey::ArrowRight),
+        "home" => named(NamedKey::Home),
+        "end" => named(NamedKey::End),
+        "pageup" => named(NamedKey::PageUp),
+        "pagedown" => named(NamedKey::PageDown),
+        "shift" => named(NamedKey::Shift),
+        "control" => named(NamedKey::Control),
+        "alt" => named(NamedKey::Alt),
+        "cmd" | "super" | "win" | "platform" => named(NamedKey::Meta),
+        "capslock" => named(NamedKey::CapsLock),
+        other => {
+            // A page reads a function key by name, so `f7` has to arrive as F7
+            // rather than as the two characters it is spelled with.
+            let function_key = other
+                .strip_prefix('f')
+                .and_then(|number| number.parse::<u8>().ok())
+                .filter(|number| (1..=12).contains(number));
+            match function_key {
+                Some(1) => named(NamedKey::F1),
+                Some(2) => named(NamedKey::F2),
+                Some(3) => named(NamedKey::F3),
+                Some(4) => named(NamedKey::F4),
+                Some(5) => named(NamedKey::F5),
+                Some(6) => named(NamedKey::F6),
+                Some(7) => named(NamedKey::F7),
+                Some(8) => named(NamedKey::F8),
+                Some(9) => named(NamedKey::F9),
+                Some(10) => named(NamedKey::F10),
+                Some(11) => named(NamedKey::F11),
+                Some(12) => named(NamedKey::F12),
+                _ => match keystroke.key_char.clone() {
+                    Some(character) => Key::Character(character),
+                    None if other.chars().count() == 1 => Key::Character(other.to_string()),
+                    None => named(NamedKey::Unidentified),
+                },
+            }
+        }
+    };
+
+    let mut modifiers = Modifiers::empty();
+    if keystroke.modifiers.shift {
+        modifiers |= Modifiers::SHIFT;
+    }
+    if keystroke.modifiers.control {
+        modifiers |= Modifiers::CONTROL;
+    }
+    if keystroke.modifiers.alt {
+        modifiers |= Modifiers::ALT;
+    }
+    if keystroke.modifiers.platform {
+        modifiers |= Modifiers::META;
+    }
+
+    keyboard_types::KeyboardEvent {
+        state,
+        key,
+        code: Code::Unidentified,
+        location: Location::Standard,
+        modifiers,
+        repeat,
+        is_composing: false,
+    }
+}
+
+/// gpui and the engine name the mouse buttons separately.
+#[cfg(feature = "servo")]
+fn servo_button(button: gpui::MouseButton) -> html_render::MouseButton {
+    match button {
+        gpui::MouseButton::Right => html_render::MouseButton::Right,
+        gpui::MouseButton::Middle => html_render::MouseButton::Middle,
+        _ => html_render::MouseButton::Left,
+    }
+}
+
 impl Render for HtmlPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = markdown::github_page_background(cx.theme().appearance());
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
-        div()
-            .image_cache(self.image_cache.clone())
+        let root = div()
+            // The retain-all cache belongs to the Markdown rendering's images.
+            // A live page replaces its frame many times a second, and keeping
+            // every one of those is how a preview eats a machine's memory.
+            .when(!self.showing_live_page(), |this| {
+                this.image_cache(self.image_cache.clone())
+            })
             .id("HtmlPreview")
             .key_context("HtmlPreview")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .min_h_0()
-            .bg(background)
+            .bg(background);
+        Self::with_page_keys(root, cx)
             .child(
                 WithRemSize::new(preview_font_size).size_full().child(
                     div()

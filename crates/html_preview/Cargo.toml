@@ -14,7 +14,7 @@ path = "src/html_preview.rs"
 [features]
 default = []
 # Renders the page with the embedded engine instead of turning it into Markdown.
-servo = ["dep:html_render", "html_render/servo"]
+servo = ["dep:html_render", "html_render/servo", "dep:keyboard_types"]
 
 [dependencies]
 anyhow.workspace = true
@@ -22,6 +22,7 @@ editor.workspace = true
 gpui.workspace = true
 html5ever.workspace = true
 html_render = { workspace = true, optional = true }
+keyboard_types = { workspace = true, optional = true }
 log.workspace = true
 language.workspace = true
 markdown.workspace = true
