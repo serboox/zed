@@ -152,6 +152,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # One dependency carries test fixtures with paths past the Windows limit,
+      # and cargo's built-in git client cannot write them: `class=Filesystem
+      # (30)` on a checkout of python-environment-tools. git.exe can, with long
+      # paths turned on, and a short CARGO_HOME keeps the rest well clear.
+      - name: Let Windows take long paths
+        run: |
+          git config --system core.longpaths true
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Add-Content $env:GITHUB_ENV
+          "CARGO_HOME=D:\c" | Add-Content $env:GITHUB_ENV
+
       # The TLS backend the engine pulls in assembles its own x86_64 primitives.
       - name: Install NASM
         run: choco install nasm --no-progress -y
