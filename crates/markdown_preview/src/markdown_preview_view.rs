@@ -422,6 +422,11 @@ impl MarkdownPreviewView {
         .detach();
     }
 
+    /// The document the preview is showing, which is what it renders.
+    pub fn source(&self, cx: &App) -> SharedString {
+        self.markdown.read(cx).source().clone()
+    }
+
     pub fn is_markdown_file(editor: &Entity<Editor>, cx: &App) -> bool {
         let buffer = editor.read(cx).buffer().read(cx);
         if let Some(buffer) = buffer.as_singleton()
@@ -1626,14 +1631,14 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
             .on_action(cx.listener(MarkdownPreviewView::cancel))
-            .w_full()
-            .flex_1()
+            .size_full()
             .min_h_0()
             .relative()
             .bg(bg_color)
             .child(
                 WithRemSize::new(preview_font_size).size_full().child(
                     div()
+                        .debug_selector(|| "markdown-preview-scroll".into())
                         .id("markdown-preview-scroll-container")
                         .size_full()
                         .overflow_y_scroll()
@@ -1697,6 +1702,7 @@ impl Render for MarkdownPreviewView {
                                     }))
                                 });
                             div()
+                                .debug_selector(|| "markdown-preview-content".into())
                                 .w_full()
                                 .when_some(max_width, |this, _| {
                                     this.max_w(relative(RESPONSIVE_CONTENT_WIDTH_FRACTION))

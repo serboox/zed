@@ -136,6 +136,7 @@ mod tests {
     use language::{Buffer, Language, LanguageConfig, LanguageMatcher};
     use project::Project;
     use serde_json::json;
+    use settings::Settings as _;
     use std::sync::Arc;
     use util::path;
     use util::rel_path::rel_path;
@@ -540,6 +541,180 @@ mod tests {
                     .is_some()
             }),
             "markdown has to open next to its preview from the same control"
+        );
+    }
+
+    /// The reported bug: the switch opened the split and its preview half showed
+    /// nothing at all. Opening the split is not enough -- the preview has to be
+    /// showing the document.
+    #[gpui::test]
+    async fn the_markdown_split_shows_the_document_in_its_preview(cx: &mut TestAppContext) {
+        const DOCUMENT: &str = "# Notes\n\nSome prose.\n";
+        let (workspace, cx) =
+            workspace_with_file("notes.md", DOCUMENT, markdown_language(), cx).await;
+
+        let switch = cx
+            .debug_bounds("preview-layout-1")
+            .expect("markdown offers the switch");
+        cx.simulate_click(switch.center(), Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+
+        let shown = workspace.read_with(cx, |workspace, cx| {
+            let split = workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<SplitPreviewView>())
+                .expect("the split is open");
+            let preview = split
+                .read(cx)
+                .preview()
+                .clone()
+                .downcast::<markdown_preview::markdown_preview_view::MarkdownPreviewView>()
+                .expect("a markdown split previews markdown");
+            preview.read(cx).source(cx)
+        });
+
+        assert_eq!(
+            shown.as_ref(),
+            DOCUMENT,
+            "the preview half has to be showing the document, not an empty page"
+        );
+
+        let half = cx
+            .debug_bounds("split-preview-preview")
+            .expect("the preview half is painted");
+        let content = cx
+            .debug_bounds("markdown-preview-content")
+            .expect("the preview half paints the document, not an empty page");
+        // The container that collapsed: it clips everything below it, so a page
+        // laid out at full height still came out as a sliver of its own padding.
+        let scroll = cx
+            .debug_bounds("markdown-preview-scroll")
+            .expect("the preview half has a scroll container");
+        assert!(
+            scroll.size.height > half.size.height / 2.,
+            "the page's scroll container has to fill the half, not collapse to its \
+             padding: half {:?}, container {:?}",
+            half.size,
+            scroll.size
+        );
+
+        // `inner` is the markdown element's own container, and its bounds are
+        // recorded while painting: no entry means the page was laid out and then
+        // never drawn, which is exactly how the half came out blank.
+        let body = cx
+            .debug_bounds("inner")
+            .expect("the document has to be painted, not merely laid out");
+        assert!(
+            body.size.height > px(0.),
+            "the painted document has to have real height: {:?}",
+            body.size
+        );
+
+        // A heading, a paragraph and two list items cannot fit in a sliver a few
+        // pixels tall -- that is what an empty-looking preview half measures.
+        assert!(
+            content.size.width > half.size.width / 2. && content.size.height > px(60.),
+            "the document has to fill the preview half it was given: half {:?}, content {:?}",
+            half.size,
+            content.size
+        );
+    }
+
+    /// Zoom, pressed while reading a document next to its source, has to scale
+    /// the page. The font size of the editor half is an application-wide setting
+    /// handled on the workspace, so without a handler here the keystroke walked
+    /// straight past the page it was aimed at.
+    #[gpui::test]
+    async fn zoom_scales_the_page_being_read_not_the_code_beside_it(cx: &mut TestAppContext) {
+        let (_workspace, cx) = workspace_with_file(
+            "notes.md",
+            "# Notes\n\nSome prose.\n",
+            markdown_language(),
+            cx,
+        )
+        .await;
+
+        let switch = cx
+            .debug_bounds("preview-layout-1")
+            .expect("markdown offers the switch");
+        cx.simulate_click(switch.center(), Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+
+        let (page_before, code_before) = cx.update(|_, cx| {
+            let settings = theme_settings::ThemeSettings::get_global(cx);
+            (
+                settings.markdown_preview_font_size(cx),
+                settings.buffer_font_size(cx),
+            )
+        });
+
+        cx.dispatch_action(zed_actions::IncreaseBufferFontSize { persist: false });
+        cx.run_until_parked();
+        draw(cx);
+
+        let (page_after, code_after) = cx.update(|_, cx| {
+            let settings = theme_settings::ThemeSettings::get_global(cx);
+            (
+                settings.markdown_preview_font_size(cx),
+                settings.buffer_font_size(cx),
+            )
+        });
+
+        assert!(
+            page_after > page_before,
+            "the page has to grow: {page_before:?} -> {page_after:?}"
+        );
+        assert_eq!(
+            code_after, code_before,
+            "the code beside the page has to keep its own size"
+        );
+    }
+
+    /// With no page on screen there is nothing here to zoom: the keystroke has to
+    /// be left to the application rather than quietly scaling a hidden page.
+    #[gpui::test]
+    async fn zoom_leaves_a_hidden_page_alone(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            workspace_with_file("notes.md", "# Notes\n", markdown_language(), cx).await;
+
+        let switch = cx
+            .debug_bounds("preview-layout-1")
+            .expect("markdown offers the switch");
+        cx.simulate_click(switch.center(), Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+        let editor_only = cx
+            .debug_bounds("preview-layout-0")
+            .expect("the editor-only layout is offered over the split");
+        cx.simulate_click(editor_only.center(), Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+        let layout = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<SplitPreviewView>())
+                .map(|view| view.read(cx).layout())
+        });
+        assert_eq!(
+            layout,
+            Some(PreviewLayout::Editor),
+            "only the editor is showing"
+        );
+
+        let page_before = cx.update(|_, cx| {
+            theme_settings::ThemeSettings::get_global(cx).markdown_preview_font_size(cx)
+        });
+        cx.dispatch_action(zed_actions::IncreaseBufferFontSize { persist: false });
+        cx.run_until_parked();
+        let page_after = cx.update(|_, cx| {
+            theme_settings::ThemeSettings::get_global(cx).markdown_preview_font_size(cx)
+        });
+
+        assert_eq!(
+            page_after, page_before,
+            "a page nobody is reading must not be scaled"
         );
     }
 

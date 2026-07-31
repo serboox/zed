@@ -473,8 +473,7 @@ impl Render for HtmlPreviewView {
             .id("HtmlPreview")
             .key_context("HtmlPreview")
             .track_focus(&self.focus_handle(cx))
-            .w_full()
-            .flex_1()
+            .size_full()
             .min_h_0()
             .bg(background)
             .child(

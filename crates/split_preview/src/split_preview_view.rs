@@ -110,6 +110,10 @@ impl SplitPreviewView {
         &self.editor
     }
 
+    pub fn preview(&self) -> &AnyView {
+        &self.preview
+    }
+
     pub fn layout(&self) -> PreviewLayout {
         self.layout
     }
@@ -136,6 +140,78 @@ impl SplitPreviewView {
         cx.notify();
     }
 
+    /// Zoom belongs to whatever is being read. The editor's font size is an
+    /// application-wide setting handled on the workspace, which is why zooming
+    /// in a split tab used to scale the code beside the page instead of the page
+    /// itself. Here the page is scaled while it is on screen, and the action is
+    /// left alone when only the editor is.
+    fn zoom_preview(&mut self, delta: Pixels, cx: &mut Context<Self>) -> bool {
+        if matches!(self.layout, PreviewLayout::Editor) || !self.preview_reads_the_page_font() {
+            return false;
+        }
+        theme_settings::adjust_markdown_preview_font_size(cx, |size| size + delta);
+        true
+    }
+
+    /// Whether this preview is drawn at the page font size. A contract preview is
+    /// not: taking its zoom over would move a setting it never reads and leave
+    /// the keystroke doing nothing at all.
+    fn preview_reads_the_page_font(&self) -> bool {
+        self.preview
+            .clone()
+            .downcast::<markdown_preview::markdown_preview_view::MarkdownPreviewView>()
+            .is_ok()
+            || self
+                .preview
+                .clone()
+                .downcast::<html_preview::html_preview_view::HtmlPreviewView>()
+                .is_ok()
+    }
+
+    /// An action handler here stops the action by default, so everything this
+    /// tab does not mean to take over has to be handed back on with
+    /// `cx.propagate()` -- otherwise zoom would go dead in the editor-only
+    /// layout, and the palette's persisting commands with it.
+    fn increase_preview_font_size(
+        &mut self,
+        action: &zed_actions::IncreaseBufferFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only the keyboard's own zoom is taken over. The persisting variants come
+        // from the palette and mean "change the setting", which stays global.
+        if action.persist || !self.zoom_preview(px(1.), cx) {
+            cx.propagate();
+        }
+    }
+
+    fn decrease_preview_font_size(
+        &mut self,
+        action: &zed_actions::DecreaseBufferFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if action.persist || !self.zoom_preview(px(-1.), cx) {
+            cx.propagate();
+        }
+    }
+
+    fn reset_preview_font_size(
+        &mut self,
+        action: &zed_actions::ResetBufferFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if action.persist
+            || matches!(self.layout, PreviewLayout::Editor)
+            || !self.preview_reads_the_page_font()
+        {
+            cx.propagate();
+            return;
+        }
+        theme_settings::reset_markdown_preview_font_size(cx);
+    }
+
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.editor.clone().into_any_element();
         let preview = self.preview.clone().into_any_element();
@@ -157,7 +233,7 @@ impl SplitPreviewView {
                 .size_full()
                 .items_stretch()
                 .child(
-                    div()
+                    v_flex()
                         .debug_selector(|| "split-preview-editor".into())
                         .flex_1()
                         .min_w_0()
@@ -172,7 +248,11 @@ impl SplitPreviewView {
                         .bg(cx.theme().colors().border),
                 )
                 .child(
-                    div()
+                    // A column, so that a preview which sizes itself with `flex_1`
+                    // grows down the half rather than across it. In a row it took
+                    // its height from its content and the page ended up clipped to
+                    // the height of its own padding.
+                    v_flex()
                         .debug_selector(|| "split-preview-preview".into())
                         .flex_1()
                         .min_w_0()
@@ -215,6 +295,9 @@ impl Render for SplitPreviewView {
                 let next = this.layout.next();
                 this.set_layout(next, window, cx)
             }))
+            .on_action(cx.listener(Self::increase_preview_font_size))
+            .on_action(cx.listener(Self::decrease_preview_font_size))
+            .on_action(cx.listener(Self::reset_preview_font_size))
             .child(self.render_body(cx))
     }
 }
