@@ -36,6 +36,11 @@ const HEARTBEAT: Duration = Duration::from_millis(250);
 /// The same, for a preview nobody is looking at.
 #[cfg(feature = "servo")]
 const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
+/// How often the page is asked where it stands. Asking runs a script in the
+/// page, so it is worth doing often enough for the scrollbar to keep up with a
+/// reader's thumb and no more.
+#[cfg(feature = "servo")]
+const WHERE_THE_PAGE_STANDS: Duration = Duration::from_millis(100);
 
 struct EditorState {
     editor: Entity<Editor>,
@@ -68,10 +73,11 @@ pub struct HtmlPreviewView {
     /// resize can be passed on to the engine.
     #[cfg(feature = "servo")]
     page_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
-    /// Whether the button now held down was pressed on the page. A drag that
-    /// began elsewhere belongs to whoever started it.
+    /// Which button, if any, was pressed on the page and is still down. A drag
+    /// that began elsewhere belongs to whoever started it, and a button let go
+    /// is only the one that was held.
     #[cfg(feature = "servo")]
-    page_pressed: std::rc::Rc<std::cell::Cell<bool>>,
+    page_pressed: std::rc::Rc<std::cell::Cell<Option<gpui::MouseButton>>>,
     /// Whether this preview is the one its pane is showing. A page nobody is
     /// looking at is held back, and this is the pane saying so -- silence from
     /// the renderer would not do, because a page that has settled stops being
@@ -82,6 +88,15 @@ pub struct HtmlPreviewView {
     /// answers on a later turn of its own loop, so the answer is left here.
     #[cfg(feature = "servo")]
     pending_copy: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    /// Where the page stands, for the scrollbar to show and for a drag of its
+    /// thumb to change. The engine scrolls the page itself, so this is the only
+    /// thing the editor knows about it.
+    #[cfg(feature = "servo")]
+    page_scroll: crate::page_scroll::PageScrollHandle,
+    /// When the page was last asked where it stands. Asking runs a script, so it
+    /// is asked at a pace of its own rather than on every frame.
+    #[cfg(feature = "servo")]
+    asked_where: Option<std::time::Instant>,
 }
 
 impl HtmlPreviewView {
@@ -240,11 +255,13 @@ impl HtmlPreviewView {
                 #[cfg(feature = "servo")]
                 page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
                 #[cfg(feature = "servo")]
-                page_pressed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                page_pressed: std::rc::Rc::new(std::cell::Cell::new(None)),
                 #[cfg(feature = "servo")]
                 on_screen: true,
                 #[cfg(feature = "servo")]
                 pending_copy: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                page_scroll: crate::page_scroll::PageScrollHandle::default(),
+                asked_where: None,
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -441,6 +458,30 @@ impl HtmlPreviewView {
                     if let Some(url) = page.take_link_for_new_tab() {
                         log::debug!("the page navigated to {url}");
                     }
+                    // A drag of the scrollbar's thumb is a request to the page,
+                    // which only the engine can carry out.
+                    if let Some(down) = view.page_scroll.take_request() {
+                        page.scroll_to(down);
+                    }
+                    // Where the page stands is a script's answer, which arrives
+                    // on a later turn, so it is asked for at a pace of its own
+                    // rather than on every frame. Nothing has to be redrawn when
+                    // the answer lands: a page that is moving is painting, and a
+                    // page that is still has not moved.
+                    let due = view
+                        .asked_where
+                        .is_none_or(|asked| asked.elapsed() >= WHERE_THE_PAGE_STANDS);
+                    if due {
+                        view.asked_where = Some(std::time::Instant::now());
+                        let scroll = view.page_scroll.clone();
+                        page.scroll_position(move |down, document, view| {
+                            scroll.stands_at(crate::page_scroll::PageScroll {
+                                down,
+                                document,
+                                view,
+                            });
+                        });
+                    }
                     // The page answers a copy request on a turn of its own, so
                     // the answer is collected here rather than where it was
                     // asked for. It belongs to every path through this loop.
@@ -593,6 +634,7 @@ impl HtmlPreviewView {
         let bounds_cell = self.page_bounds.clone();
         let holding = self.page_pressed.clone();
         let view = cx.entity().downgrade();
+        let scroll = self.page_scroll.clone();
         div()
             .size_full()
             .relative()
@@ -642,7 +684,7 @@ impl HtmlPreviewView {
                                 // even when the pointer wanders off the edge, which
                                 // is what selecting to the end of a line does. A
                                 // drag that started elsewhere is somebody else's.
-                                if !inside(event.position) && !holding.get() {
+                                if !inside(event.position) && holding.get().is_none() {
                                     return;
                                 }
                                 view.update(cx, |view, _| {
@@ -656,18 +698,23 @@ impl HtmlPreviewView {
                         window.on_mouse_event({
                             let view = view.clone();
                             let holding = holding.clone();
-                            move |event: &gpui::MouseDownEvent, phase, _, cx| {
+                            move |event: &gpui::MouseDownEvent, phase, window, cx| {
                                 if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
                                     return;
                                 }
                                 let Some(button) = servo_button(event.button) else {
                                     return;
                                 };
-                                holding.set(true);
-                                view.update(cx, |view, _| {
+                                holding.set(Some(event.button));
+                                view.update(cx, |view, cx| {
                                     if let Some(page) = view.page.as_ref() {
                                         page.mouse_down(page_point(event.position), button);
                                     }
+                                    // Whoever is clicked on is who types next. A
+                                    // page that takes the mouse but leaves the
+                                    // keyboard with the source is a page the
+                                    // reader cannot type into.
+                                    view.focus_handle.focus(window, cx);
                                 })
                                 .ok();
                             }
@@ -683,9 +730,15 @@ impl HtmlPreviewView {
                                     return;
                                 };
                                 // Only the button the page itself is holding is
-                                // released to it; a click that began in the editor
-                                // must not finish inside the page.
-                                if !holding.replace(false) && !inside(event.position) {
+                                // released to it, and only that button: a drag
+                                // held with one button and let go with another
+                                // would otherwise leave the first one down for
+                                // ever. A click that began in the editor must not
+                                // finish inside the page either.
+                                let held = holding.get() == Some(event.button);
+                                if held {
+                                    holding.set(None);
+                                } else if !inside(event.position) {
                                     return;
                                 }
                                 view.update(cx, |view, _| {
@@ -714,6 +767,17 @@ impl HtmlPreviewView {
                 )
                 .absolute()
                 .size_full(),
+            )
+            // The page scrolls inside the engine, so there is no scroll
+            // container here to hang a scrollbar on. This one is a decoration
+            // over the picture: it shows where the page says it stands, and a
+            // drag of its thumb asks the page to go elsewhere.
+            .custom_scrollbars(
+                ui::Scrollbars::new(ui::ScrollAxes::Vertical)
+                    .id("html-preview-page")
+                    .tracked_scroll_handle(&scroll),
+                window,
+                cx,
             )
             .into_any_element()
     }

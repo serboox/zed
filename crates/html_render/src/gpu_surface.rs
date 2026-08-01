@@ -59,6 +59,8 @@ pub(crate) struct GpuSurface {
     /// A mark left in the graphics card's queue after the page was drawn. The
     /// window may not read the buffer until the card has reached it.
     sealed: Cell<gleam::gl::GLsync>,
+    /// How many turns the card has been asked about the current mark.
+    asked: Cell<u32>,
     /// Where a frame is read into while the graphics card is still working on
     /// it. Reading straight into memory makes the processor wait for the card to
     /// finish; reading into one of these does not, and the frame is collected on
@@ -305,6 +307,7 @@ impl GpuSurface {
             cannot_share: Cell::new(false),
             read_format: Cell::new(None),
             sealed: Cell::new(std::ptr::null()),
+            asked: Cell::new(0),
             readback: RefCell::new(Readback::default()),
         })
     }
@@ -556,6 +559,17 @@ impl GpuSurface {
         self.readback.borrow().waiting.is_some()
     }
 
+    /// Gives back the buffers frames were copied through. The page draws where
+    /// the window can read it now, so nothing will read through them again, and
+    /// at the size of a preview they are worth several megabytes each.
+    pub(crate) fn stop_reading_back(&self) {
+        let mut readback = self.readback.borrow_mut();
+        if let Some(buffers) = readback.buffers.take() {
+            self.gleam_gl.delete_buffers(&buffers);
+        }
+        *readback = Readback::default();
+    }
+
     /// Marks the graphics card's queue after the page. The window reads this
     /// buffer with a different API, which knows nothing of OpenGL's queue, so
     /// the drawing has to be done before it looks -- but waiting for it here
@@ -584,6 +598,17 @@ impl GpuSurface {
         if sealed.is_null() {
             return true;
         }
+        // A card that is asked often enough and never answers would keep the
+        // page from ever showing a frame, so after a few turns the old, blunt
+        // way is used instead of asking again.
+        const ASK_AT_MOST: u32 = 8;
+        if self.asked.get() >= ASK_AT_MOST {
+            log::debug!("the page's frame is waited for outright: the mark was not reached");
+            self.gleam_gl.finish();
+            self.forget_seal();
+            return true;
+        }
+        self.asked.set(self.asked.get() + 1);
         match self.gleam_gl.client_wait_sync(sealed, 0, 0) {
             gleam::gl::ALREADY_SIGNALED | gleam::gl::CONDITION_SATISFIED => {
                 self.forget_seal();
@@ -600,6 +625,7 @@ impl GpuSurface {
     }
 
     fn forget_seal(&self) {
+        self.asked.set(0);
         let sealed = self.sealed.replace(std::ptr::null());
         if !sealed.is_null() {
             self.gleam_gl.delete_sync(sealed);

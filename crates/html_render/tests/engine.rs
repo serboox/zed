@@ -428,6 +428,8 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         );
         drop(sharp);
 
+        the_page_can_be_taken_somewhere(cx);
+
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
 
@@ -751,5 +753,56 @@ fn what_a_plain_page_costs(cx: &mut gpui::App) {
         2.,
         &mut scrolls,
         0,
+    );
+}
+
+/// The scrollbar beside a live page is a decoration: the page scrolls inside the
+/// engine, tells the editor where it stands, and is told where to go. Both
+/// halves are checked against what the page actually shows.
+fn the_page_can_be_taken_somewhere(cx: &mut gpui::App) {
+    let tall = "<div style=\"height:64px;background:rgb(255,0,0)\"></div>\
+         <div style=\"height:2000px;background:rgb(0,0,255)\"></div>";
+    let mut page = page(&document("margin:0", tall), 100., 64., 1., cx)
+        .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 0, 0], "a page that can be scrolled");
+
+    let standing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let ask = |page: &mut HtmlPage,
+               standing: &std::rc::Rc<std::cell::RefCell<Option<[f32; 3]>>>| {
+        page.scroll_position({
+            let standing = standing.clone();
+            move |down, document, view| *standing.borrow_mut() = Some([down, document, view])
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && standing.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        standing.borrow_mut().take().expect("the page said nothing")
+    };
+
+    let [down, document, view] = ask(&mut page, &standing);
+    assert_eq!(down, 0., "a page starts at the top");
+    assert!(
+        document > view && document >= 2000.,
+        "the page should be taller than the view it is shown in: {document} against {view}"
+    );
+
+    // Where the scrollbar's thumb would take it.
+    page.scroll_to(400.);
+    wait_for_colour(&mut page, [0, 0, 255], "a page taken past its first screen");
+    let [down, _, _] = ask(&mut page, &standing);
+    assert!(
+        (down - 400.).abs() < 2.,
+        "the page should stand where it was taken, not at {down}"
+    );
+
+    // And back, so the thumb can be dragged either way.
+    page.scroll_to(0.);
+    wait_for_colour(&mut page, [255, 0, 0], "a page taken back to the top");
+    let [down, _, _] = ask(&mut page, &standing);
+    assert!(
+        down < 2.,
+        "the page should be back at the top, not at {down}"
     );
 }

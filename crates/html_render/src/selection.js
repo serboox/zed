@@ -56,6 +56,7 @@
       return words;
     }
     words = [];
+    var wrapped = 0;
     var texts = [];
     var walker = document.createTreeWalker(document.body, 4, null);
     var node;
@@ -93,12 +94,18 @@
         continue;
       }
       text.parentNode.replaceChild(replacement, text);
-      for (var m = 0; m < made.length; m++) {
-        words.push({ span: made[m], text: made[m].textContent });
-      }
-      if (words.length >= MOST_WORDS) {
+      wrapped += made.length;
+      if (wrapped >= MOST_WORDS) {
         break;
       }
+    }
+    // Taken from the page rather than from what was just wrapped: a page that
+    // has been through this before still carries its spans, and this run skips
+    // them. Reading them back is what keeps a page that rewrote itself -- and so
+    // was wrapped again -- from ending up with no words at all.
+    var already = document.querySelectorAll('[data-zed-selection="word"]');
+    for (var w = 0; w < already.length && w < MOST_WORDS; w++) {
+      words.push({ span: already[w], text: already[w].textContent });
     }
     // Reading a geometry property makes the engine lay the page out again, so
     // what is measured afterwards is the page as it now is rather than as it was

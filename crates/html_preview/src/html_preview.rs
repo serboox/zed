@@ -2,6 +2,8 @@ use gpui::App;
 use workspace::Workspace;
 
 pub mod html_preview_settings;
+#[cfg(feature = "servo")]
+pub mod page_scroll;
 pub mod html_preview_view;
 
 pub use zed_actions::preview::html::{OpenPreview, OpenPreviewToTheSide};

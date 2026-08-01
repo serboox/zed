@@ -124,6 +124,8 @@ mod engine {
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
         document: PageFile,
+        /// The document before it, until the new one has finished loading.
+        previous: Option<PageFile>,
     }
 
     impl HtmlPage {
@@ -174,6 +176,7 @@ mod engine {
                 awaiting_the_card: std::cell::Cell::new(false),
                 frame: None,
                 document,
+                previous: None,
             })
         }
 
@@ -182,7 +185,10 @@ mod engine {
         pub fn reload(&mut self, html: SharedString, base_directory: Option<&Path>) -> Result<()> {
             let document = PageFile::write(&html, base_directory)?;
             self.webview.load(document.url()?);
-            self.document = document;
+            // The old document is kept until the new one has arrived: a load is
+            // not finished when it is asked for, and the page may still be
+            // fetching a stylesheet or an image from beside the old file.
+            self.previous = Some(std::mem::replace(&mut self.document, document));
             Ok(())
         }
 
@@ -211,6 +217,11 @@ mod engine {
         pub fn pump(&mut self) -> bool {
             self.bind();
             self.engine.spin();
+            // Bound again: one turn of the engine runs every page there is, and
+            // it leaves current whichever page it painted last. What follows
+            // touches this page's own texture and buffers.
+            self.bind();
+            self.settled();
             let painted = self.delegate.painted.replace(false);
             if self.shared {
                 // The window samples the page's own buffer; copying it here
@@ -221,21 +232,32 @@ mod engine {
                 if painted {
                     self.rendering_context.seal_frame();
                 }
+                // Taken first: `||` would skip it whenever a frame was painted
+                // this turn, and a flag left standing reports a frame that is
+                // not there on some later turn.
+                let awaited = self.awaiting_the_card.take();
                 if self.rendering_context.frame_is_drawn() {
-                    return painted || self.awaiting_the_card.take();
+                    return painted || awaited;
                 }
                 self.awaiting_the_card.set(true);
                 self.engine.nudge();
                 return false;
             }
+            // Collected before the next is asked for: a frame asked for while
+            // one is already on its way replaces it, and then the read that is
+            // collected is the one just issued, which the card has had no time
+            // for. That is the wait this is all meant to avoid.
+            let collected = self.rendering_context.collect_frame();
             if painted {
                 self.rendering_context.ask_for_frame();
             }
-            // A frame asked for last turn is collected on this one, which is the
-            // whole point of asking: the graphics card had the meantime to
-            // finish it, and the processor never stood waiting.
-            if let Some(image) = self.rendering_context.collect_frame() {
+            if let Some(image) = collected {
                 self.frame = Some(Arc::new(render_image(image)));
+                // A frame was asked for just now, so there is something to come
+                // back for even though this turn has something to show.
+                if self.rendering_context.frame_on_the_way() {
+                    self.engine.nudge();
+                }
                 return true;
             }
             if self.rendering_context.frame_on_the_way() {
@@ -273,8 +295,11 @@ mod engine {
             }
             if !self.shared {
                 self.shared = true;
-                // Whatever was copied before is not what the window draws now.
+                // Whatever was copied before is not what the window draws now,
+                // and the buffers frames were copied through are so much memory
+                // nothing will read again.
                 self.frame = None;
+                self.rendering_context.stop_reading_back();
             }
             Some(frame)
         }
@@ -291,6 +316,19 @@ mod engine {
 
         pub fn is_loading(&self) -> bool {
             self.delegate.load_status.get() != LoadStatus::Complete
+        }
+
+        /// Called on every turn: a page that has finished loading no longer
+        /// needs the document it came from, and a page the reader has navigated
+        /// to has none of our own script in it, so it gets it again.
+        fn settled(&mut self) {
+            if self.delegate.load_status.get() != LoadStatus::Complete {
+                return;
+            }
+            self.previous = None;
+            if self.delegate.needs_the_shim.replace(false) {
+                self.evaluate(SELECTION_SHIM, |_| {});
+            }
         }
 
         /// A link the page asked to open elsewhere -- a target of `_blank`, or a
@@ -359,6 +397,31 @@ mod engine {
                         deliver(String::new())
                     }
                 });
+        }
+
+        /// Asks the page where it stands: how far down it is scrolled, how tall
+        /// the document is and how much of it is on screen, all in the page's
+        /// own pixels. The answer comes back on a later turn.
+        pub fn scroll_position(&self, deliver: impl FnOnce(f32, f32, f32) + 'static) {
+            self.evaluate(
+                "[window.scrollY, document.documentElement.scrollHeight, window.innerHeight]\
+                 .join(',')",
+                move |answer| {
+                    let mut numbers = answer.split(',').map(|part| part.trim().parse::<f32>());
+                    if let (Some(Ok(down)), Some(Ok(document)), Some(Ok(view))) =
+                        (numbers.next(), numbers.next(), numbers.next())
+                    {
+                        deliver(down, document, view);
+                    }
+                },
+            );
+        }
+
+        /// Takes the page to a position, as a drag of the scrollbar's thumb asks
+        /// for. The engine scrolls pages itself, so this is the page's own doing
+        /// rather than the compositor's.
+        pub fn scroll_to(&self, down: f32) {
+            self.evaluate(&format!("window.scrollTo(0, {down}), ''"), |_| {});
         }
 
         /// Asks the page for the text the reader has selected.
@@ -433,8 +496,6 @@ mod engine {
         }
     }
 
-    /// gpui draws premultiplied BGRA; the surface is read as RGBA, because that
-    /// is the one format every OpenGL and GLES driver will read back.
     /// The frame as the window holds it. Its pixels already come back blue
     /// first, which is the order `RenderImage` is uploaded in.
     fn render_image(image: RgbaImage) -> RenderImage {
@@ -481,6 +542,9 @@ mod engine {
         painted: Cell<bool>,
         load_status: Cell<LoadStatus>,
         link_for_new_tab: RefCell<Option<url::Url>>,
+        /// Set when the page has gone somewhere of its own accord. What it
+        /// arrives at has none of our script in it, so it has to be put back.
+        needs_the_shim: Cell<bool>,
     }
 
     impl Default for PageDelegate {
@@ -489,6 +553,7 @@ mod engine {
                 painted: Cell::new(false),
                 load_status: Cell::new(LoadStatus::Started),
                 link_for_new_tab: RefCell::new(None),
+                needs_the_shim: Cell::new(false),
             }
         }
     }
@@ -512,6 +577,7 @@ mod engine {
             navigation_request: servo::NavigationRequest,
         ) {
             *self.link_for_new_tab.borrow_mut() = Some(navigation_request.url.clone());
+            self.needs_the_shim.set(true);
             navigation_request.allow();
         }
     }

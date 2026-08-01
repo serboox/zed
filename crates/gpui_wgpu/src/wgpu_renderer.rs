@@ -1434,6 +1434,8 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            #[cfg(target_os = "linux")]
+            self.forget_frames_nobody_lends();
             return true;
         }
     }
@@ -1626,11 +1628,19 @@ impl WgpuRenderer {
             pass.set_bind_group(1, &bind_group, &[]);
             pass.draw(0..4, 0..1);
         }
-        // A frame nobody but this cache still holds has stopped arriving.
+        true
+    }
+
+    /// Lets go of frames nobody hands over any more. This runs every frame
+    /// rather than only when one is drawn: a preview that is closed stops
+    /// putting its frame in the scene, and its buffer -- several megabytes of
+    /// graphics memory and a file descriptor -- would otherwise be held until
+    /// the editor closed.
+    #[cfg(target_os = "linux")]
+    fn forget_frames_nobody_lends(&self) {
         self.shared_frames
             .borrow_mut()
             .retain(|_, entry| Arc::strong_count(&entry.frame) > 1);
-        true
     }
 
     fn draw_instances(
