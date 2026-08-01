@@ -434,7 +434,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_lends_its_own_memory(cx);
 
         if std::env::var("ZED_HTML_BENCH").is_ok() {
-            for scale in [1., 2.] {
+            for scale in [1., 1.5, 2.] {
                 how_long_a_frame_takes(scale, cx);
             }
             what_a_plain_page_costs(cx);
@@ -472,6 +472,8 @@ fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
     // and wait until a frame holding it is ready.
     let mut frames = Vec::new();
     let mut missed = 0;
+    let mut turns = 0_u32;
+    let mut turning = Duration::ZERO;
     for step in 0..40 {
         heavy.evaluate(
             &format!("document.body.style.marginTop = '{}px'", step % 7),
@@ -480,7 +482,19 @@ fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(2);
         loop {
-            if heavy.pump() {
+            let turn = Instant::now();
+            let new_frame = heavy.pump();
+            turning += turn.elapsed();
+            turns += 1;
+            // Turning the engine over as fast as the processor will go may be
+            // holding up the very threads it is waiting for, so the pace can be
+            // slowed to see whether that is what the wait is made of.
+            if let Ok(pause) = std::env::var("ZED_HTML_PUMP_PAUSE_US")
+                && let Ok(pause) = pause.parse::<u64>()
+            {
+                std::thread::sleep(Duration::from_micros(pause));
+            }
+            if new_frame {
                 frames.push(started.elapsed());
                 break;
             }
@@ -490,6 +504,12 @@ fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
             }
         }
     }
+    println!(
+        "BENCH: {} turns of the engine for {} frames, {:?} of it inside the engine",
+        turns,
+        frames.len(),
+        turning
+    );
     report(
         "a change to the page",
         width,

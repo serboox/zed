@@ -66,6 +66,7 @@ mod engine {
             let (tell, woken) = async_channel::bounded(1);
             let engine = Rc::new(Self {
                 servo: ServoBuilder::default()
+                    .preferences(preferences())
                     .event_loop_waker(Box::new(Waker(tell.clone())))
                     .build(),
                 woken,
@@ -92,6 +93,42 @@ mod engine {
         pub fn nudge(&self) {
             self.tell.try_send(()).ok();
         }
+    }
+
+    /// How the engine is set up for a preview rather than for a browser.
+    ///
+    /// Text is drawn with grey edges rather than coloured ones: subpixel
+    /// antialiasing costs the graphics card a second pass over every glyph and
+    /// only looks right on a display whose pixels are arranged the way it
+    /// assumes. Layout is given as many threads as the machine will spare, since
+    /// a preview is laid out again on every keystroke in the source.
+    fn preferences() -> servo::Preferences {
+        let mut preferences = servo::Preferences::default();
+        preferences.gfx_subpixel_text_antialiasing_enabled = false;
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        preferences.layout_threads = cores.clamp(2, 8) as i64;
+        // Whatever a machine's own answer, an environment saying otherwise wins:
+        // this is how the two are told apart when measuring.
+        if std::env::var("ZED_HTML_SUBPIXEL_TEXT").as_deref() == Ok("1") {
+            preferences.gfx_subpixel_text_antialiasing_enabled = true;
+        }
+        if let Ok(threads) = std::env::var("ZED_HTML_LAYOUT_THREADS")
+            && let Ok(threads) = threads.parse::<i64>()
+        {
+            preferences.layout_threads = threads;
+        }
+        log::info!(
+            "the engine lays pages out on {} threads, text edges {}",
+            preferences.layout_threads,
+            if preferences.gfx_subpixel_text_antialiasing_enabled {
+                "coloured"
+            } else {
+                "grey"
+            }
+        );
+        preferences
     }
 
     /// One live page. Holds its own surface, so two previews never draw over one
@@ -222,6 +259,12 @@ mod engine {
             // touches this page's own texture and buffers.
             self.bind();
             self.settled();
+            // One drawing for each turn, however many times the engine said it
+            // was ready during it.
+            if self.delegate.frame_waiting.replace(false) {
+                self.webview.paint();
+                self.delegate.painted.set(true);
+            }
             let painted = self.delegate.painted.replace(false);
             if self.shared {
                 // The window samples the page's own buffer; copying it here
@@ -379,21 +422,38 @@ mod engine {
             self.engine.nudge();
         }
 
-        /// A turn of the wheel. The engine scrolls the page from this event by
-        /// itself, so this is the whole of it: asking the compositor to scroll
-        /// as well moved every page twice as far as it was told to.
+        /// A turn of the wheel.
+        ///
+        /// Told to the compositor rather than dispatched into the page: the
+        /// compositor moves its own scroll node, which is a great deal less work
+        /// than laying the page out around a wheel event. Only one of the two is
+        /// sent -- sending both moved every page twice as far as it was told to.
         pub fn scrolled(&self, point: Point<Pixels>, delta: Point<Pixels>) {
             let (horizontal, vertical) = self.painted_scale();
-            self.webview
-                .notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                    WheelDelta {
-                        x: (f32::from(delta.x) * horizontal) as f64,
-                        y: (f32::from(delta.y) * vertical) as f64,
-                        z: 0.,
-                        mode: WheelMode::DeltaPixel,
-                    },
+            let across = f32::from(delta.x) * horizontal;
+            let down = f32::from(delta.y) * vertical;
+            if std::env::var("ZED_HTML_WHEEL_TO_PAGE").as_deref() == Ok("1") {
+                self.webview
+                    .notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                        WheelDelta {
+                            x: across as f64,
+                            y: down as f64,
+                            z: 0.,
+                            mode: WheelMode::DeltaPixel,
+                        },
+                        self.device(point),
+                    )));
+            } else {
+                // The compositor counts the other way from a wheel: a positive
+                // offset reveals what is below, where a wheel turned towards the
+                // reader gives a negative one.
+                self.webview.notify_scroll_event(
+                    servo::Scroll::Delta(servo::WebViewVector::Device(euclid::Vector2D::new(
+                        -across, -down,
+                    ))),
                     self.device(point),
-                )));
+                );
+            }
             self.engine.nudge();
         }
 
@@ -553,6 +613,8 @@ mod engine {
     }
 
     struct PageDelegate {
+        /// Whether the engine has a frame that has not been drawn yet.
+        frame_waiting: Cell<bool>,
         painted: Cell<bool>,
         load_status: Cell<LoadStatus>,
         link_for_new_tab: RefCell<Option<url::Url>>,
@@ -564,6 +626,7 @@ mod engine {
     impl Default for PageDelegate {
         fn default() -> Self {
             Self {
+                frame_waiting: Cell::new(false),
                 painted: Cell::new(false),
                 load_status: Cell::new(LoadStatus::Started),
                 link_for_new_tab: RefCell::new(None),
@@ -573,9 +636,13 @@ mod engine {
     }
 
     impl WebViewDelegate for PageDelegate {
-        fn notify_new_frame_ready(&self, webview: WebView) {
-            webview.paint();
-            self.painted.set(true);
+        /// The engine has a frame to show. It is not drawn here: this is called
+        /// from the middle of the engine's own turn, and Servo's own shell only
+        /// asks its window for a redraw at this point. Drawing once per turn of
+        /// the pump instead means one render for each frame the editor shows,
+        /// however many times the engine says it is ready.
+        fn notify_new_frame_ready(&self, _webview: WebView) {
+            self.frame_waiting.set(true);
         }
 
         fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {

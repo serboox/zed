@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::{Bounds, Pixels, Point, point, px, size};
 use ui::ScrollableHandle;
@@ -22,17 +23,39 @@ pub struct PageScroll {
 /// stands in for it: the page says where it stands, and a drag of the thumb asks
 /// the page to go somewhere, which the preview passes on when it next turns the
 /// engine over.
+/// How long after a drag the page's own word on where it stands is still
+/// disbelieved. An answer asked for before the drag arrives after it, and taking
+/// it would drag the thumb back to where the page was rather than where the
+/// reader has put it.
+const UNTIL_THE_PAGE_CATCHES_UP: Duration = Duration::from_millis(400);
+
 #[derive(Clone, Default)]
 pub struct PageScrollHandle {
     at: Rc<RefCell<PageScroll>>,
     /// Where a drag of the thumb has asked the page to go, until it is passed on.
     asked_for: Rc<Cell<Option<f32>>>,
+    /// Whether the thumb is being dragged now.
+    dragging: Rc<Cell<bool>>,
+    /// Until when the page's word on where it stands is not to be taken.
+    catching_up: Rc<Cell<Option<Instant>>>,
 }
 
 impl PageScrollHandle {
-    /// Records what the page last said about itself.
-    pub fn stands_at(&self, at: PageScroll) {
-        *self.at.borrow_mut() = at;
+    /// Records what the page last said about itself. How tall it is and how much
+    /// shows are always taken; where it stands is not, while the reader is
+    /// dragging the thumb or the page has yet to catch up with a drag.
+    pub fn stands_at(&self, said: PageScroll) {
+        let mut at = self.at.borrow_mut();
+        at.document = said.document;
+        at.view = said.view;
+        let leading = self.dragging.get()
+            || self
+                .catching_up
+                .get()
+                .is_some_and(|until| Instant::now() < until);
+        if !leading {
+            at.down = said.down;
+        }
     }
 
     /// Where a drag of the thumb wants the page, if anywhere. Taken, because it
@@ -61,10 +84,26 @@ impl ScrollableHandle for PageScrollHandle {
     }
 
     fn set_offset(&self, point: Point<Pixels>) {
-        let at = self.at.borrow();
+        let mut at = self.at.borrow_mut();
         let furthest = (at.document - at.view).max(0.);
-        self.asked_for
-            .set(Some((-f32::from(point.y)).clamp(0., furthest)));
+        let down = (-f32::from(point.y)).clamp(0., furthest);
+        // The thumb follows the hand at once. Waiting for the page to be asked,
+        // to answer, and to be asked again would let go of the thumb under the
+        // pointer and drag it back to where the page was.
+        at.down = down;
+        self.asked_for.set(Some(down));
+        self.catching_up
+            .set(Some(Instant::now() + UNTIL_THE_PAGE_CATCHES_UP));
+    }
+
+    fn drag_started(&self) {
+        self.dragging.set(true);
+    }
+
+    fn drag_ended(&self) {
+        self.dragging.set(false);
+        self.catching_up
+            .set(Some(Instant::now() + UNTIL_THE_PAGE_CATCHES_UP));
     }
 
     fn viewport(&self) -> Bounds<Pixels> {
