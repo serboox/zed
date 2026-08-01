@@ -46,6 +46,16 @@ struct SurfaceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct SharedFrameParams {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    /// Whether the buffer's first row is the bottom of the picture.
+    bottom_up: u32,
+    padding: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -645,7 +655,7 @@ impl WgpuRenderer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<SurfaceParams>() as u64
+                            std::mem::size_of::<SharedFrameParams>() as u64,
                         ),
                     },
                     count: None,
@@ -1566,13 +1576,15 @@ impl WgpuRenderer {
             };
 
             let resources = self.resources();
-            let locals = SurfaceParams {
+            let locals = SharedFrameParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                bottom_up: surface.frame.bottom_up as u32,
+                padding: [0; 3],
             };
             let uniform = resources.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("shared_frame_locals"),
-                size: std::mem::size_of::<SurfaceParams>() as u64,
+                size: std::mem::size_of::<SharedFrameParams>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });

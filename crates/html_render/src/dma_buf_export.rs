@@ -17,18 +17,12 @@ pub(crate) struct DmaBufExporter {
     export: Export,
 }
 
-type CreateImage = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    u32,
-    *mut c_void,
-    *const i32,
-) -> *mut c_void;
+type CreateImage =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const i32) -> *mut c_void;
 type DestroyImage = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
 type QueryExport =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut i32, *mut i32, *mut u64) -> u32;
-type Export =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut i32, *mut i32, *mut i32) -> u32;
+type Export = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut i32, *mut i32, *mut i32) -> u32;
 
 const EGL_GL_TEXTURE_2D: u32 = 0x30B1;
 const EGL_NONE: i32 = 0x3038;
@@ -119,13 +113,8 @@ impl DmaBufExporter {
             let mut format = 0_i32;
             let mut planes = 0_i32;
             let mut modifier = 0_u64;
-            let queried = (self.query_export)(
-                self.display,
-                image,
-                &mut format,
-                &mut planes,
-                &mut modifier,
-            );
+            let queried =
+                (self.query_export)(self.display, image, &mut format, &mut planes, &mut modifier);
             if queried != EGL_TRUE || planes != 1 {
                 log::warn!("the page's frames come in {planes} planes, which cannot be shared");
                 (self.destroy_image)(self.display, image);

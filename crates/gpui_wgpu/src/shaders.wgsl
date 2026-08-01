@@ -1369,7 +1369,15 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 // that drew it -- an embedded web engine, for instance. There is one texture and
 // it is already in the window's own colour order, so this only places it.
 
-@group(1) @binding(0) var<uniform> shared_frame_locals: SurfaceParams;
+struct SharedFrameParams {
+    bounds: Bounds,
+    content_mask: Bounds,
+    // Whether the buffer's first row is the bottom of the picture, as OpenGL
+    // hands it over.
+    bottom_up: u32,
+}
+
+@group(1) @binding(0) var<uniform> shared_frame_locals: SharedFrameParams;
 @group(1) @binding(1) var t_shared_frame: texture_2d<f32>;
 @group(1) @binding(2) var s_shared_frame: sampler;
 
@@ -1379,7 +1387,11 @@ fn vs_shared_frame(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, shared_frame_locals.bounds);
-    out.texture_position = unit_vertex;
+    out.texture_position = select(
+        unit_vertex,
+        vec2<f32>(unit_vertex.x, 1.0 - unit_vertex.y),
+        shared_frame_locals.bottom_up != 0u
+    );
     out.clip_distances = distance_from_clip_rect(
         unit_vertex,
         shared_frame_locals.bounds,

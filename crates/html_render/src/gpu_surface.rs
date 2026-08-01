@@ -7,7 +7,12 @@ use dpi::PhysicalSize;
 use euclid::Size2D;
 use gpui::SharedFrame;
 
+#[cfg(target_os = "linux")]
 use crate::dma_buf_export::DmaBufExporter;
+#[cfg(target_os = "linux")]
+use crate::shared_buffer::{SharedBuffer, SharedBuffers};
+#[cfg(not(target_os = "linux"))]
+use nothing::{SharedBuffer, SharedBuffers};
 use servo::{DeviceIntRect, RenderingContext, RgbaImage};
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, Error, GLApi,
@@ -33,39 +38,98 @@ pub(crate) struct GpuSurface {
     /// What the page is drawn into. It is ours rather than surfman's, because a
     /// texture we own is a texture we can hand to the window as it stands.
     target: RefCell<RenderTarget>,
+    /// Where the page's own memory comes from, when the driver will allocate
+    /// something the window can read. Absent when it will not.
+    buffers: Option<SharedBuffers>,
     /// How a texture becomes something the window can sample. Absent when this
     /// driver has no way to hand a buffer over, and then frames are copied.
+    #[cfg(target_os = "linux")]
     exporter: Option<DmaBufExporter>,
     /// The frame currently lent to the window, if any.
+    #[cfg(target_os = "linux")]
     shared: RefCell<Option<Arc<SharedFrame>>>,
+    #[cfg(target_os = "linux")]
     /// Whether handing frames over has already been found impossible on this
     /// machine. Asking again every frame costs an image each time and the answer
     /// does not change until the page is resized.
     cannot_share: Cell<bool>,
+    /// The byte order this driver reads pixels back in, once asked.
+    read_format: Cell<Option<u32>>,
+    /// Where a frame is read into while the graphics card is still working on
+    /// it. Reading straight into memory makes the processor wait for the card to
+    /// finish; reading into one of these does not, and the frame is collected on
+    /// the next turn from the other one.
+    readback: RefCell<Readback>,
 }
 
-/// A texture and the framebuffer that draws into it.
+/// Two buffers the graphics card copies frames into on its own time, and which
+/// of them the next frame goes to.
+#[derive(Default)]
+struct Readback {
+    buffers: Option<[u32; 2]>,
+    /// Which buffer the next frame is asked for.
+    next: usize,
+    /// How many bytes each holds, so a resized page grows them.
+    capacity: usize,
+    /// The frame that has been asked for and not yet collected.
+    waiting: Option<Waiting>,
+}
+
+/// A frame the graphics card is filling in, and what it will take to turn it
+/// into something the window can upload.
+struct Waiting {
+    slot: usize,
+    width: usize,
+    height: usize,
+    /// Whether the driver read the pixels red first. The window's textures want
+    /// blue first, so those frames are put right while they are turned over.
+    swap_red_and_blue: bool,
+}
+
+/// A texture and the framebuffer that draws into it. When the memory behind the
+/// texture came from the driver's allocator, the window can be handed it as it
+/// stands instead of being sent a copy.
 struct RenderTarget {
     texture: u32,
     framebuffer: u32,
+    shared: Option<SharedBuffer>,
 }
 
 impl RenderTarget {
-    fn new(gl: &Rc<dyn gleam::gl::Gl>, size: PhysicalSize<u32>) -> Option<Self> {
+    fn new(
+        gl: &Rc<dyn gleam::gl::Gl>,
+        size: PhysicalSize<u32>,
+        buffers: Option<&SharedBuffers>,
+    ) -> Option<Self> {
+        let shared = buffers.and_then(|buffers| {
+            let buffer = buffers.allocate(size.width, size.height)?;
+            Some((buffers, buffer))
+        });
+        let give_up = |shared: &Option<(&SharedBuffers, SharedBuffer)>| {
+            if let Some((buffers, buffer)) = shared {
+                buffers.discard(buffer);
+            }
+        };
         let textures = gl.gen_textures(1);
-        let texture = *textures.first()?;
+        let Some(&texture) = textures.first() else {
+            give_up(&shared);
+            return None;
+        };
         gl.bind_texture(gleam::gl::TEXTURE_2D, texture);
-        gl.tex_image_2d(
-            gleam::gl::TEXTURE_2D,
-            0,
-            gleam::gl::RGBA8 as i32,
-            size.width as i32,
-            size.height as i32,
-            0,
-            gleam::gl::RGBA,
-            gleam::gl::UNSIGNED_BYTE,
-            None,
-        );
+        match &shared {
+            Some((buffers, buffer)) => buffers.bind_to_texture(buffer),
+            None => gl.tex_image_2d(
+                gleam::gl::TEXTURE_2D,
+                0,
+                gleam::gl::RGBA8 as i32,
+                size.width as i32,
+                size.height as i32,
+                0,
+                gleam::gl::RGBA,
+                gleam::gl::UNSIGNED_BYTE,
+                None,
+            ),
+        }
         // No mipmaps and no wrapping: the page is sampled once, at its own size.
         for (name, value) in [
             (gleam::gl::TEXTURE_MIN_FILTER, gleam::gl::LINEAR),
@@ -77,7 +141,11 @@ impl RenderTarget {
         }
 
         let framebuffers = gl.gen_framebuffers(1);
-        let framebuffer = *framebuffers.first()?;
+        let Some(&framebuffer) = framebuffers.first() else {
+            gl.delete_textures(&[texture]);
+            give_up(&shared);
+            return None;
+        };
         gl.bind_framebuffer(gleam::gl::FRAMEBUFFER, framebuffer);
         gl.framebuffer_texture_2d(
             gleam::gl::FRAMEBUFFER,
@@ -91,17 +159,34 @@ impl RenderTarget {
             log::error!("the page has no framebuffer to draw into: status {status:#x}");
             gl.delete_framebuffers(&[framebuffer]);
             gl.delete_textures(&[texture]);
+            if let Some((buffers, buffer)) = &shared {
+                buffers.discard(buffer);
+                // A shared buffer was the reason it would not do; an ordinary
+                // texture still might.
+                return Self::new(gl, size, None);
+            }
             return None;
         }
         Some(Self {
             texture,
             framebuffer,
+            shared: shared.map(|(_, buffer)| buffer),
         })
     }
 
-    fn discard(&self, gl: &Rc<dyn gleam::gl::Gl>) {
+    fn discard(&self, gl: &Rc<dyn gleam::gl::Gl>, buffers: Option<&SharedBuffers>) {
         gl.delete_framebuffers(&[self.framebuffer]);
         gl.delete_textures(&[self.texture]);
+        self.discard_shared(buffers);
+    }
+
+    /// Gives back the memory the driver allocated. This asks nothing of OpenGL,
+    /// so it is also the right thing to do when the context cannot be made
+    /// current any more.
+    fn discard_shared(&self, buffers: Option<&SharedBuffers>) {
+        if let (Some(buffers), Some(buffer)) = (buffers, self.shared.as_ref()) {
+            buffers.discard(buffer);
+        }
     }
 }
 
@@ -190,9 +275,13 @@ impl GpuSurface {
 
         // The surfman surface exists so the context has something to be current
         // with; the page is drawn into a texture of our own, beside it.
-        let target = RenderTarget::new(&gleam_gl, size).ok_or(Error::Failed)?;
-        let exporter = DmaBufExporter::new(|name| device.get_proc_address(&context, name));
-        if exporter.is_none() {
+        let address = |name: &str| device.get_proc_address(&context, name);
+        let buffers = SharedBuffers::new(&address, &gleam_gl);
+        let target = RenderTarget::new(&gleam_gl, size, buffers.as_ref()).ok_or(Error::Failed)?;
+        #[cfg(target_os = "linux")]
+        let exporter = DmaBufExporter::new(address);
+        #[cfg(target_os = "linux")]
+        if exporter.is_none() && buffers.is_none() {
             log::info!("this driver cannot hand frames over, so they will be copied");
         }
 
@@ -203,14 +292,21 @@ impl GpuSurface {
             context: RefCell::new(context),
             size: Cell::new(size),
             target: RefCell::new(target),
+            buffers,
+            #[cfg(target_os = "linux")]
             exporter,
+            #[cfg(target_os = "linux")]
             shared: RefCell::new(None),
+            #[cfg(target_os = "linux")]
             cannot_share: Cell::new(false),
+            read_format: Cell::new(None),
+            readback: RefCell::new(Readback::default()),
         })
     }
 
-    /// The frame the window may sample directly, if this driver allows it. The
+    /// The frame the window may sample directly, if this machine allows it. The
     /// same one is handed out until the page is resized.
+    #[cfg(target_os = "linux")]
     pub(crate) fn shared_frame(&self) -> Option<Arc<SharedFrame>> {
         if let Some(shared) = self.shared.borrow().as_ref() {
             return Some(shared.clone());
@@ -218,23 +314,20 @@ impl GpuSurface {
         if self.cannot_share.get() {
             return None;
         }
-        let exported = match self.exporter.as_ref()?.export(self.target.borrow().texture) {
-            Some(exported) => exported,
-            None => {
-                self.cannot_share.set(true);
-                return None;
-            }
-        };
         let size = self.size.get();
-        let frame = Arc::new(SharedFrame {
-            descriptor: exported.descriptor,
-            width: size.width,
-            height: size.height,
-            stride: exported.stride,
-            offset: exported.offset,
-            format: exported.format,
-            modifier: exported.modifier,
-        });
+        let frame = match self.lend_own_memory(size) {
+            Some(frame) => frame,
+            // Nothing was allocated to be shared, but a driver that lays its own
+            // textures out plainly can still hand this one over.
+            None => match self.export_the_texture(size) {
+                Some(frame) => frame,
+                None => {
+                    self.cannot_share.set(true);
+                    return None;
+                }
+            },
+        };
+        let frame = Arc::new(frame);
         *self.shared.borrow_mut() = Some(frame.clone());
         log::info!(
             "the page's frames are handed to the window as they are, {}x{}",
@@ -244,8 +337,194 @@ impl GpuSurface {
         Some(frame)
     }
 
+    #[cfg(target_os = "linux")]
+    /// The page's own buffer, when it was allocated to be shared. The window
+    /// gets a descriptor of its own for it; the page keeps drawing into the
+    /// memory both now name.
+    fn lend_own_memory(&self, size: PhysicalSize<u32>) -> Option<SharedFrame> {
+        let target = self.target.borrow();
+        let buffer = target.shared.as_ref()?;
+        let descriptor = buffer
+            .descriptor
+            .try_clone()
+            .inspect_err(|error| log::warn!("the page's buffer would not be lent: {error}"))
+            .ok()?;
+        Some(SharedFrame {
+            descriptor,
+            width: size.width,
+            height: size.height,
+            stride: buffer.stride,
+            offset: buffer.offset,
+            format: crate::shared_buffer::FORMAT_ABGR8888,
+            // The page is drawn with OpenGL, which starts at the bottom.
+            bottom_up: true,
+            modifier: 0,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    /// The texture the driver made for itself, if it will hand it over.
+    fn export_the_texture(&self, size: PhysicalSize<u32>) -> Option<SharedFrame> {
+        let exported = self
+            .exporter
+            .as_ref()?
+            .export(self.target.borrow().texture)?;
+        Some(SharedFrame {
+            descriptor: exported.descriptor,
+            width: size.width,
+            height: size.height,
+            stride: exported.stride,
+            offset: exported.offset,
+            format: exported.format,
+            bottom_up: true,
+            modifier: exported.modifier,
+        })
+    }
+
     fn framebuffer(&self) -> u32 {
         self.target.borrow().framebuffer
+    }
+
+    /// Which byte order to read pixels back in. The window's textures want blue
+    /// first, so a driver that will read that way saves a pass over every pixel
+    /// of every frame; whether it will is settled by asking it for one pixel and
+    /// seeing whether it complains.
+    fn read_format(&self) -> u32 {
+        if let Some(format) = self.read_format.get() {
+            return format;
+        }
+        let gl = &self.gleam_gl;
+        gl.bind_framebuffer(gleam::gl::FRAMEBUFFER, self.framebuffer());
+        gl.bind_vertex_array(0);
+        gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, 0);
+        // Whatever went wrong before this is not what is being asked about. A
+        // driver that answers with an error every time is not worth waiting on.
+        drain_errors(gl);
+        let probe = gl.read_pixels(0, 0, 1, 1, gleam::gl::BGRA, gleam::gl::UNSIGNED_BYTE);
+        let format = if gl.get_error() == gleam::gl::NO_ERROR && probe.len() == 4 {
+            gleam::gl::BGRA
+        } else {
+            gleam::gl::RGBA
+        };
+        log::info!(
+            "the page's frames are read {}",
+            if format == gleam::gl::BGRA {
+                "in the window's own order"
+            } else {
+                "red first, and turned round as they are collected"
+            }
+        );
+        self.read_format.set(Some(format));
+        format
+    }
+
+    /// Asks the graphics card for the frame without waiting for it. It fills a
+    /// buffer while the editor gets on with its work, and the frame is collected
+    /// on a later turn.
+    pub(crate) fn ask_for_frame(&self) {
+        let (width, height) = {
+            let size = self.size.get();
+            (size.width as i32, size.height as i32)
+        };
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let wanted = width as usize * height as usize * 4;
+        let format = self.read_format();
+        let gl = &self.gleam_gl;
+        let mut readback = self.readback.borrow_mut();
+
+        gl.bind_framebuffer(gleam::gl::FRAMEBUFFER, self.framebuffer());
+        gl.bind_vertex_array(0);
+
+        let buffers = match readback.buffers {
+            Some(buffers) if readback.capacity == wanted => buffers,
+            existing => {
+                if let Some(existing) = existing {
+                    gl.delete_buffers(&existing);
+                }
+                let made = gl.gen_buffers(2);
+                let (Some(&first), Some(&second)) = (made.first(), made.get(1)) else {
+                    return;
+                };
+                for buffer in [first, second] {
+                    gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, buffer);
+                    gl.buffer_data_untyped(
+                        gleam::gl::PIXEL_PACK_BUFFER,
+                        wanted as isize,
+                        std::ptr::null(),
+                        gleam::gl::STREAM_READ,
+                    );
+                }
+                readback.buffers = Some([first, second]);
+                readback.capacity = wanted;
+                readback.waiting = None;
+                [first, second]
+            }
+        };
+
+        let slot = readback.next;
+        gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, buffers[slot]);
+        #[allow(unsafe_code)]
+        unsafe {
+            gl.read_pixels_into_pbo(0, 0, width, height, format, gleam::gl::UNSIGNED_BYTE);
+        }
+        let error = gl.get_error();
+        gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, 0);
+        if error != gleam::gl::NO_ERROR {
+            log::warn!("the page's surface could not be read: GL error {error:#x}");
+            // Nothing was asked for, so there will be nothing to collect.
+            return;
+        }
+        readback.waiting = Some(Waiting {
+            slot,
+            width: width as usize,
+            height: height as usize,
+            swap_red_and_blue: format == gleam::gl::RGBA,
+        });
+        readback.next = 1 - slot;
+    }
+
+    /// Collects a frame asked for earlier, if one is ready. The graphics card
+    /// has had a turn of the loop to finish it.
+    ///
+    /// The pixels come back in the order the window uploads them, blue first,
+    /// which is what `RenderImage` holds despite the name of its container.
+    pub(crate) fn collect_frame(&self) -> Option<RgbaImage> {
+        let gl = &self.gleam_gl;
+        let mut readback = self.readback.borrow_mut();
+        let waiting = readback.waiting.take()?;
+        let Waiting {
+            slot,
+            width,
+            height,
+            swap_red_and_blue,
+        } = waiting;
+        let buffers = readback.buffers?;
+        let wanted = width * height * 4;
+
+        gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, buffers[slot]);
+        let mapped = gl.map_buffer_range(
+            gleam::gl::PIXEL_PACK_BUFFER,
+            0,
+            wanted as isize,
+            gleam::gl::MAP_READ_BIT,
+        );
+        if mapped.is_null() {
+            log::warn!("the page's frame could not be collected");
+            gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, 0);
+            return None;
+        }
+        #[allow(unsafe_code)]
+        let rows = unsafe { std::slice::from_raw_parts(mapped as *const u8, wanted).to_vec() };
+        gl.unmap_buffer(gleam::gl::PIXEL_PACK_BUFFER);
+        gl.bind_buffer(gleam::gl::PIXEL_PACK_BUFFER, 0);
+        turned_over(rows, width, height, swap_red_and_blue)
+    }
+
+    /// Whether a frame has been asked for and not yet collected.
+    pub(crate) fn frame_on_the_way(&self) -> bool {
+        self.readback.borrow().waiting.is_some()
     }
 
     /// Waits for the graphics card to finish what it was told to draw. The
@@ -264,8 +543,20 @@ impl Drop for GpuSurface {
         // second preview open that is somebody else's. This one is made current
         // first, or its own resources are not the ones that go.
         match device.make_context_current(&context) {
-            Ok(()) => self.target.borrow().discard(&self.gleam_gl),
-            Err(error) => log::warn!("the page's own context would not come back: {error:?}"),
+            Ok(()) => {
+                self.target
+                    .borrow()
+                    .discard(&self.gleam_gl, self.buffers.as_ref());
+                if let Some(buffers) = self.readback.borrow().buffers {
+                    self.gleam_gl.delete_buffers(&buffers);
+                }
+            }
+            Err(error) => {
+                log::warn!("the page's own context would not come back: {error:?}");
+                // Whatever OpenGL holds goes with the context; the driver's own
+                // buffer does not, and the allocator is about to be closed.
+                self.target.borrow().discard_shared(self.buffers.as_ref());
+            }
         }
         device.destroy_context(&mut context).ok();
     }
@@ -277,18 +568,20 @@ impl RenderingContext for GpuSurface {
             .bind_framebuffer(gleam::gl::FRAMEBUFFER, self.framebuffer());
     }
 
+    /// A frame, read the plain way: ask and wait. Nothing in the editor uses
+    /// this -- the page is read a turn at a time instead, so the processor never
+    /// waits on the graphics card -- but the engine's own interface offers it and
+    /// it has to mean what it says.
     fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
         let width = source_rectangle.width();
         let height = source_rectangle.height();
         if width <= 0 || height <= 0 {
             return None;
         }
-        // The same sequence Servo reads with, including the empty vertex array:
-        // some drivers hand back nothing at all without it.
         self.gleam_gl
             .bind_framebuffer(gleam::gl::FRAMEBUFFER, self.framebuffer());
         self.gleam_gl.bind_vertex_array(0);
-        let mut rows = self.gleam_gl.read_pixels(
+        let rows = self.gleam_gl.read_pixels(
             source_rectangle.min.x,
             source_rectangle.min.y,
             width,
@@ -296,22 +589,7 @@ impl RenderingContext for GpuSurface {
             gleam::gl::RGBA,
             gleam::gl::UNSIGNED_BYTE,
         );
-        let error = self.gleam_gl.get_error();
-        if error != gleam::gl::NO_ERROR {
-            log::warn!("the page's surface could not be read: GL error 0x{error:x}");
-        }
-        let stride = width as usize * 4;
-        if rows.len() < stride * height as usize {
-            return None;
-        }
-        // OpenGL hands back the bottom row first; an image starts at the top.
-        for row in 0..(height as usize / 2) {
-            let (top, bottom) = (row * stride, (height as usize - 1 - row) * stride);
-            for byte in 0..stride {
-                rows.swap(top + byte, bottom + byte);
-            }
-        }
-        RgbaImage::from_raw(width as u32, height as u32, rows)
+        flipped(rows, width as usize, height as usize)
     }
 
     fn size(&self) -> PhysicalSize<u32> {
@@ -329,11 +607,14 @@ impl RenderingContext for GpuSurface {
             log::error!("the page's surface would not become current to resize: {error:?}");
             return;
         }
-        let Some(target) = RenderTarget::new(&self.gleam_gl, size) else {
+        let Some(target) = RenderTarget::new(&self.gleam_gl, size, self.buffers.as_ref()) else {
             return;
         };
+        // A frame asked for at the old size is not worth collecting, and the
+        // buffer it was going into is about to be the wrong size.
+        self.readback.borrow_mut().waiting = None;
         let previous = std::mem::replace(&mut *self.target.borrow_mut(), target);
-        previous.discard(&self.gleam_gl);
+        previous.discard(&self.gleam_gl, self.buffers.as_ref());
         // What the window was lent belonged to the old texture, and a new one
         // deserves a fresh attempt at handing it over.
         self.shared.borrow_mut().take();
@@ -388,6 +669,84 @@ impl RenderingContext for GpuSurface {
     }
 }
 
+/// Empties the driver's error queue, so what is asked next is answered about
+/// itself. Bounded, because a driver in a bad way can answer forever.
+fn drain_errors(gl: &Rc<dyn gleam::gl::Gl>) {
+    for _ in 0..16 {
+        if gl.get_error() == gleam::gl::NO_ERROR {
+            return;
+        }
+    }
+}
+
+/// The rows the other way up, and the colours put right in the same pass if the
+/// driver would not read them in the window's order.
+fn turned_over(
+    rows: Vec<u8>,
+    width: usize,
+    height: usize,
+    swap_red_and_blue: bool,
+) -> Option<RgbaImage> {
+    let stride = width * 4;
+    if rows.len() < stride * height {
+        return None;
+    }
+    let mut image = vec![0_u8; stride * height];
+    for row in 0..height {
+        let from = (height - 1 - row) * stride;
+        let source = rows.get(from..from + stride)?;
+        let target = image.get_mut(row * stride..(row + 1) * stride)?;
+        target.copy_from_slice(source);
+        if swap_red_and_blue {
+            for pixel in target.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+    }
+    RgbaImage::from_raw(width as u32, height as u32, image)
+}
+
+/// The rows the other way up: OpenGL hands back the bottom one first, and an
+/// image starts at the top.
+fn flipped(rows: Vec<u8>, width: usize, height: usize) -> Option<RgbaImage> {
+    let stride = width * 4;
+    if rows.len() < stride * height {
+        return None;
+    }
+    let mut image = vec![0_u8; stride * height];
+    for row in 0..height {
+        let from = (height - 1 - row) * stride;
+        image[row * stride..(row + 1) * stride].copy_from_slice(&rows[from..from + stride]);
+    }
+    RgbaImage::from_raw(width as u32, height as u32, image)
+}
+
 fn physical(size: PhysicalSize<u32>) -> Size2D<i32, euclid::UnknownUnit> {
     Size2D::new(size.width as i32, size.height as i32)
+}
+
+/// Sharing the page's memory with the window is a Linux arrangement. Elsewhere
+/// there is nothing to allocate and nothing to lend, and these stand in so the
+/// rest of this file does not have to ask which machine it is on.
+#[cfg(not(target_os = "linux"))]
+mod nothing {
+    pub(crate) enum SharedBuffers {}
+    pub(crate) enum SharedBuffer {}
+
+    impl SharedBuffers {
+        pub(crate) fn new(
+            _address: &dyn Fn(&str) -> *const std::ffi::c_void,
+            _gl: &std::rc::Rc<dyn gleam::gl::Gl>,
+        ) -> Option<Self> {
+            None
+        }
+
+        pub(crate) fn allocate(&self, _width: u32, _height: u32) -> Option<SharedBuffer> {
+            None
+        }
+
+        pub(crate) fn bind_to_texture(&self, _buffer: &SharedBuffer) {}
+
+        pub(crate) fn discard(&self, _buffer: &SharedBuffer) {}
+    }
 }

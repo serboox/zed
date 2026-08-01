@@ -26,6 +26,7 @@ servo = [
     "dep:keyboard_types",
     "dep:primeorder",
     "dep:image",
+    "dep:libc",
     "dep:servo",
     "dep:smallvec",
     "dep:tempfile",
@@ -42,6 +43,9 @@ dpi = { workspace = true, optional = true }
 euclid = { workspace = true, optional = true }
 keyboard_types = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+# The page's own frame buffer is asked for through the graphics driver's
+# allocator, which is reached the way every other driver entry point is.
+libc = { workspace = true, optional = true }
 # A pin, not a use: servo-script requires release-candidate elliptic curve crates
 # that do not build against the stable primeorder cargo would pick on its own.
 primeorder = { workspace = true, optional = true }
@@ -57,4 +61,5 @@ url = { workspace = true, optional = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+libc.workspace = true
 keyboard_types.workspace = true

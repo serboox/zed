@@ -12,10 +12,12 @@
 #[cfg(feature = "servo")]
 use primeorder as _;
 
-#[cfg(feature = "servo")]
+#[cfg(all(feature = "servo", target_os = "linux"))]
 mod dma_buf_export;
 #[cfg(feature = "servo")]
 mod gpu_surface;
+#[cfg(all(feature = "servo", target_os = "linux"))]
+mod shared_buffer;
 
 #[cfg(feature = "servo")]
 mod engine {
@@ -29,10 +31,9 @@ mod engine {
     use dpi::PhysicalSize;
     use gpui::{App, Global, Pixels, Point, RenderImage, SharedString, Size};
     use servo::{
-        DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton,
-        MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, RgbaImage, Servo,
-        ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-        WheelEvent, WheelMode,
+        DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton, MouseButtonAction,
+        MouseButtonEvent, MouseMoveEvent, RenderingContext, RgbaImage, Servo, ServoBuilder,
+        WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     };
     use smallvec::SmallVec;
 
@@ -202,27 +203,32 @@ mod engine {
         pub fn pump(&mut self) -> bool {
             self.bind();
             self.engine.spin();
-            if !self.delegate.painted.replace(false) {
-                return false;
-            }
+            let painted = self.delegate.painted.replace(false);
             if self.shared {
-                // The window samples the page's own buffer; copying it here
-                // would be the very cost this avoids. What it does need is for
-                // the drawing to be finished before the window reads it.
-                self.rendering_context.finish_drawing();
+                if painted {
+                    // The window samples the page's own buffer; copying it here
+                    // would be the very cost this avoids. What it does need is
+                    // for the drawing to be finished before the window reads it.
+                    self.rendering_context.finish_drawing();
+                }
+                return painted;
+            }
+            if painted {
+                self.rendering_context.ask_for_frame();
+            }
+            // A frame asked for last turn is collected on this one, which is the
+            // whole point of asking: the graphics card had the meantime to
+            // finish it, and the processor never stood waiting.
+            if let Some(image) = self.rendering_context.collect_frame() {
+                self.frame = Some(Arc::new(render_image(image)));
                 return true;
             }
-            let rect = DeviceIntRect::from_size(euclid::Size2D::new(
-                self.size.width as i32,
-                self.size.height as i32,
-            ));
-            match self.rendering_context.read_to_image(rect) {
-                Some(image) => {
-                    self.frame = Some(Arc::new(render_image(image)));
-                    true
-                }
-                None => false,
+            if self.rendering_context.frame_on_the_way() {
+                // A page at rest paints once and says nothing more, so the turn
+                // that collects this frame has to be asked for.
+                self.engine.nudge();
             }
+            false
         }
 
         pub fn frame(&self) -> Option<Arc<RenderImage>> {
@@ -236,6 +242,7 @@ mod engine {
 
         /// The frame the window can draw without a copy, when this machine
         /// allows it. `None` means the frame has to be handed over as pixels.
+        #[cfg(target_os = "linux")]
         pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
             let frame = self.rendering_context.shared_frame()?;
             if !self.shared {
@@ -385,13 +392,15 @@ mod engine {
     /// A display scale that cannot turn a page into a surface of no pixels or
     /// of far too many.
     fn usable_scale(scale: f32) -> f32 {
-        if scale.is_finite() { scale.clamp(0.5, 4.) } else { 1. }
+        if scale.is_finite() {
+            scale.clamp(0.5, 4.)
+        } else {
+            1.
+        }
     }
 
     fn surface_size(size: Size<Pixels>, scale: f32) -> PhysicalSize<u32> {
-        let device = |length: Pixels| {
-            ((f32::from(length) * scale).max(1.) as u32).min(MAX_SURFACE)
-        };
+        let device = |length: Pixels| ((f32::from(length) * scale).max(1.) as u32).min(MAX_SURFACE);
         PhysicalSize {
             width: device(size.width),
             height: device(size.height),
@@ -400,10 +409,9 @@ mod engine {
 
     /// gpui draws premultiplied BGRA; the surface is read as RGBA, because that
     /// is the one format every OpenGL and GLES driver will read back.
-    fn render_image(mut image: RgbaImage) -> RenderImage {
-        for pixel in image.pixels_mut() {
-            pixel.0.swap(0, 2);
-        }
+    /// The frame as the window holds it. Its pixels already come back blue
+    /// first, which is the order `RenderImage` is uploaded in.
+    fn render_image(image: RgbaImage) -> RenderImage {
         RenderImage::new(SmallVec::from_elem(image::Frame::new(image), 1))
     }
 

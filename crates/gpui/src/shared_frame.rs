@@ -26,6 +26,11 @@ pub struct SharedFrame {
     pub offset: u32,
     /// The pixel layout, as a DRM fourcc code.
     pub format: u32,
+    /// Whether the first row in the buffer is the bottom of the picture. A
+    /// producer that draws with OpenGL hands over a buffer this way round, since
+    /// OpenGL counts rows from the bottom and everyone reading a buffer starts
+    /// at the top.
+    pub bottom_up: bool,
     /// How the pixels are arranged in memory, as a DRM format modifier.
     /// Only a linear arrangement can be shared without an extension the window's
     /// own device does not ask for, so a producer should hand over linear

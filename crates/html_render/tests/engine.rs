@@ -14,7 +14,13 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const REQUIRE: &str = "ZED_REQUIRE_HTML_ENGINE";
 
 fn page(html: &str, width: f32, height: f32, scale: f32, cx: &mut App) -> Option<HtmlPage> {
-    match HtmlPage::open(html.to_string().into(), None, size(px(width), px(height)), scale, cx) {
+    match HtmlPage::open(
+        html.to_string().into(),
+        None,
+        size(px(width), px(height)),
+        scale,
+        cx,
+    ) {
         Ok(page) => {
             println!("HTML_ENGINE: ok");
             Some(page)
@@ -41,7 +47,10 @@ fn document(body_style: &str, extra: &str) -> String {
 fn colour_at(page: &HtmlPage, x: usize, y: usize) -> Option<[u8; 3]> {
     let frame = page.frame()?;
     let size = frame.size(0);
-    let (width, height) = (u32::from(size.width) as usize, u32::from(size.height) as usize);
+    let (width, height) = (
+        u32::from(size.width) as usize,
+        u32::from(size.height) as usize,
+    );
     if x >= width || y >= height {
         return None;
     }
@@ -56,7 +65,10 @@ fn colour_at(page: &HtmlPage, x: usize, y: usize) -> Option<[u8; 3]> {
 fn middle_colour(page: &HtmlPage) -> Option<[u8; 3]> {
     let frame = page.frame()?;
     let size = frame.size(0);
-    let (width, height) = (u32::from(size.width) as usize, u32::from(size.height) as usize);
+    let (width, height) = (
+        u32::from(size.width) as usize,
+        u32::from(size.height) as usize,
+    );
     colour_at(page, width / 2, height / 2)
 }
 
@@ -138,13 +150,9 @@ fn frame_size(page: &HtmlPage) -> Option<(u32, u32)> {
 #[gpui::test]
 fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        let Some(mut stylesheet) = page(
-            &document("background:rgb(255,0,0)", ""),
-            400.,
-            300.,
-            1.,
-            cx,
-        ) else {
+        let Some(mut stylesheet) =
+            page(&document("background:rgb(255,0,0)", ""), 400., 300., 1., cx)
+        else {
             return;
         };
 
@@ -160,8 +168,14 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         let script = "<script>setTimeout(function () {\
              document.body.style.background = 'rgb(0,128,0)';\
          }, 0);</script>";
-        let mut scripted = page(&document("background:rgb(255,0,0)", script), 400., 300., 1., cx)
-            .expect("the engine started once already");
+        let mut scripted = page(
+            &document("background:rgb(255,0,0)", script),
+            400.,
+            300.,
+            1.,
+            cx,
+        )
+        .expect("the engine started once already");
         wait_for_colour(&mut scripted, [0, 128, 0], "a script the page runs itself");
         drop(scripted);
 
@@ -175,8 +189,14 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
          document.getElementById('b').addEventListener('keydown', function () {\
              document.body.style.background = 'rgb(128,0,128)';\
          });</script>";
-        let mut clicked = page(&document("background:rgb(255,0,0)", button), 400., 300., 1., cx)
-            .expect("the engine started once already");
+        let mut clicked = page(
+            &document("background:rgb(255,0,0)", button),
+            400.,
+            300.,
+            1.,
+            cx,
+        )
+        .expect("the engine started once already");
         wait_for_colour(&mut clicked, [255, 0, 0], "the page before it is clicked");
 
         let middle = gpui::point(px(200.), px(150.));
@@ -248,7 +268,11 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
          GGGG HHHH IIII</p>";
         let mut three_lines = page(&document("background:white", lines), 600., 200., 1., cx)
             .expect("the engine started once already");
-        wait_for_colour(&mut three_lines, [255, 255, 255], "the page behind three lines");
+        wait_for_colour(
+            &mut three_lines,
+            [255, 255, 255],
+            "the page behind three lines",
+        );
 
         let middle_line = px(48.);
         three_lines.mouse_moved(gpui::point(px(2.), middle_line));
@@ -280,7 +304,9 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         // A page taller than its window, to find out what the engine's own
         // geometry means once the compositor has scrolled it.
         let tall = (1..=40)
-            .map(|i| format!("<p style=\"margin:0;font:16px monospace\">LINE{i:02} of the tall page</p>"))
+            .map(|i| {
+                format!("<p style=\"margin:0;font:16px monospace\">LINE{i:02} of the tall page</p>")
+            })
             .collect::<String>();
         let mut scrollable = page(&document("background:white", &tall), 600., 200., 1., cx)
             .expect("the engine started once already");
@@ -289,15 +315,28 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         // scrolled with the wheel before anything is selected. This is where a
         // drag along one line was taking whole paragraphs.
         let column = (1..=20)
-            .map(|i| format!("<p style=\"max-width:40em\">Paragraph {i}. This page has no script, \
+            .map(|i| {
+                format!(
+                    "<p style=\"max-width:40em\">Paragraph {i}. This page has no script, \
              no animation and no transition: once it is laid out and painted there is nothing left \
              for the engine to do, so any processor time spent while it is on screen is time the \
-             preview is wasting.</p>"))
+             preview is wasting.</p>"
+                )
+            })
             .collect::<String>();
-        let mut wrapped = page(&document("background:white;font:16px/1.6 sans-serif", &column), 1200., 900., 1., cx)
-            .expect("the engine started once already");
+        let mut wrapped = page(
+            &document("background:white;font:16px/1.6 sans-serif", &column),
+            1200.,
+            900.,
+            1.,
+            cx,
+        )
+        .expect("the engine started once already");
         wait_for_colour(&mut wrapped, [255, 255, 255], "the column of text");
-        wrapped.scrolled(gpui::point(px(600.), px(400.)), gpui::point(px(0.), px(-378.)));
+        wrapped.scrolled(
+            gpui::point(px(600.), px(400.)),
+            gpui::point(px(0.), px(-378.)),
+        );
         pump_for(&mut wrapped, Duration::from_millis(600));
         let line = px(100.);
         wrapped.mouse_moved(gpui::point(px(465.), line));
@@ -338,7 +377,10 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
             )
         };
         let before = line_at_top(&mut scrollable);
-        scrollable.scrolled(gpui::point(px(300.), px(100.)), gpui::point(px(0.), px(-60.)));
+        scrollable.scrolled(
+            gpui::point(px(300.), px(100.)),
+            gpui::point(px(0.), px(-60.)),
+        );
         pump_for(&mut scrollable, Duration::from_millis(600));
         let after_one = line_at_top(&mut scrollable);
         assert_ne!(
@@ -374,11 +416,144 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         // resolution rather than stretched from a smaller picture.
         let mut sharp = page(&document("background:rgb(255,0,0)", ""), 400., 300., 2., cx)
             .expect("the engine started once already");
-        wait_for_colour(&mut sharp, [255, 0, 0], "a page on a high-resolution display");
+        wait_for_colour(
+            &mut sharp,
+            [255, 0, 0],
+            "a page on a high-resolution display",
+        );
         assert_eq!(
             frame_size(&sharp),
             Some((800, 600)),
             "the surface should carry two device pixels per editor pixel"
         );
+        drop(sharp);
+
+        #[cfg(target_os = "linux")]
+        the_page_lends_its_own_memory(cx);
     });
+}
+
+/// A machine whose driver will allocate a buffer both sides can use hands the
+/// window the very memory the page drew into. What matters is that the page is
+/// really in there, so it is read back through the same descriptor the window
+/// is given.
+#[cfg(target_os = "linux")]
+fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
+    // Two halves, so which way up the buffer is laid out can be told apart:
+    // OpenGL draws from the bottom, and whoever reads the buffer starts at the
+    // top.
+    let mut lent = page(
+        &document(
+            "margin:0",
+            "<div style=\"height:32px;background:rgb(255,0,0)\"></div>\
+             <div style=\"height:32px;background:rgb(0,0,255)\"></div>",
+        ),
+        64.,
+        64.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && colour_at(&lent, 32, 8) != Some([255, 0, 0]) {
+        lent.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        colour_at(&lent, 32, 8),
+        Some([255, 0, 0]),
+        "the copied frame should have the red half at the top"
+    );
+
+    let Some(frame) = lent.shared_frame() else {
+        println!("SHARED: this machine copies frames");
+        return;
+    };
+    assert_eq!(
+        (frame.width, frame.height),
+        (64, 64),
+        "the lent buffer should be the size of the page"
+    );
+    assert_eq!(
+        frame.modifier, 0,
+        "only a buffer laid out row after row may be lent"
+    );
+    assert!(
+        frame.stride >= frame.width * 4,
+        "a row cannot be shorter than the pixels in it"
+    );
+
+    let length = (frame.offset + frame.stride * frame.height) as usize;
+    #[allow(unsafe_code)]
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            std::os::fd::AsRawFd::as_raw_fd(&frame.descriptor),
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        println!(
+            "SHARED: the page's buffer is lent but the processor may not read it, \
+             so its contents are the window's word"
+        );
+        return;
+    }
+
+    // Whoever reads a shared buffer has to say so, or the graphics card is under
+    // no obligation to have finished writing it.
+    const SYNC_READ_START: u64 = 1 | (1 << 2);
+    const SYNC_READ_END: u64 = (1 << 1) | (1 << 2);
+    const SYNC: libc::c_ulong = 0x4008_6200;
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(&frame.descriptor);
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::ioctl(descriptor, SYNC, &SYNC_READ_START);
+    }
+    let read_row = |row: u32| {
+        let at = (frame.offset + frame.stride * row + 32 * 4) as usize;
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(mapped as *const u8, length) };
+        [bytes[at], bytes[at + 1], bytes[at + 2]]
+    };
+    let near_the_start = read_row(8);
+    let near_the_end = read_row(56);
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::ioctl(descriptor, SYNC, &SYNC_READ_END);
+        libc::munmap(mapped, length);
+    }
+
+    println!(
+        "SHARED: the buffer starts with {near_the_start:?} and ends with {near_the_end:?}; \
+         the page is red on top and blue below"
+    );
+    assert!(
+        !close_to(near_the_start, near_the_end),
+        "the two halves of the page should have come out different colours; the \
+         buffer holds {near_the_start:?} throughout"
+    );
+    let starts_at_the_bottom = close_to(near_the_start, [0, 0, 255]);
+    assert!(
+        starts_at_the_bottom || close_to(near_the_start, [255, 0, 0]),
+        "the lent buffer should hold the page the engine drew, red first, as the \
+         format it is handed over under says; it starts with {near_the_start:?}"
+    );
+    // The window draws the buffer the way the frame says it is laid out, so what
+    // is measured here has to be what is claimed. A page shown upside down is
+    // this assertion going unmade.
+    assert_eq!(
+        frame.bottom_up,
+        starts_at_the_bottom,
+        "the frame says its first row is {}, and the buffer starts with \
+         {near_the_start:?} where the page is red on top and blue below",
+        if frame.bottom_up {
+            "the bottom of the page"
+        } else {
+            "the top of the page"
+        }
+    );
 }
