@@ -485,8 +485,91 @@
     window.addEventListener("load", prepare, false);
   }
 
+  // Everywhere the words appear, as the first and last word each occurrence
+  // falls in. The page's text is put together once, with a note of where each
+  // word begins in it, and searched as one string: a match found that way is
+  // counted once, whichever words it happens to straddle.
+  function everyMatch(query) {
+    var all = wrapWords();
+    var needle = query.toLowerCase().replace(/\s+/g, " ").trim();
+    var found = [];
+    if (!needle) {
+      return found;
+    }
+    var text = "";
+    var starts = [];
+    for (var i = 0; i < all.length; i++) {
+      if (i) {
+        text += " ";
+      }
+      starts.push(text.length);
+      text += all[i].text.toLowerCase();
+    }
+    var wordAtOffset = function (offset) {
+      var low = 0;
+      var high = starts.length - 1;
+      while (low < high) {
+        var middle = (low + high + 1) >> 1;
+        if (starts[middle] <= offset) {
+          low = middle;
+        } else {
+          high = middle - 1;
+        }
+      }
+      return low;
+    };
+    var at = text.indexOf(needle);
+    while (at >= 0) {
+      found.push({
+        from: wordAtOffset(at),
+        to: wordAtOffset(at + needle.length - 1),
+      });
+      at = text.indexOf(needle, at + needle.length);
+    }
+    return found;
+  }
+
+  var looking = { query: null, at: -1, found: [] };
+
+  /// Moves to the next place the words appear, or the one before. Answers with
+  /// where the reader now is and how many places there are.
+  function find(query, forward) {
+    if (looking.query !== query) {
+      looking = { query: query, at: -1, found: everyMatch(query) };
+    }
+    var total = looking.found.length;
+    if (!total) {
+      anchor = null;
+      head = null;
+      clearHighlight();
+      return "0,0";
+    }
+    looking.at = forward
+      ? (looking.at + 1) % total
+      : (looking.at <= 0 ? total : looking.at) - 1;
+    var place = looking.found[looking.at];
+    var all = wrapWords();
+    anchor = { index: place.from, offset: 0 };
+    head = { index: place.to, offset: all[place.to].text.length };
+    var span = all[place.from].span;
+    if (span && span.scrollIntoView) {
+      // Not the very top: a match with nothing above it is hard to place.
+      span.scrollIntoView({ block: "center" });
+    }
+    measured = null;
+    paintHighlight();
+    return looking.at + 1 + "," + total;
+  }
+
   window.__zedSelection = {
     text: selectedText,
+    find: find,
+    stopLooking: function () {
+      looking = { query: null, at: -1, found: [] };
+      anchor = null;
+      head = null;
+      clearHighlight();
+    },
     // What the two ends of the selection are, for working out why a drag
     // picked what it picked.
     trace: function () {

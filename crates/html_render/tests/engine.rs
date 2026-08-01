@@ -429,6 +429,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         drop(sharp);
 
         the_page_can_be_taken_somewhere(cx);
+        the_page_can_be_searched(cx);
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
@@ -824,5 +825,89 @@ fn the_page_can_be_taken_somewhere(cx: &mut gpui::App) {
     assert!(
         down < 2.,
         "the page should be back at the top, not at {down}"
+    );
+}
+
+/// Looking for words in the page: the reader is taken to each place they appear
+/// in turn, and what is found is what is selected.
+fn the_page_can_be_searched(cx: &mut gpui::App) {
+    let body = "<p>A giraffe is tall.</p><p>Another giraffe is taller.</p>\
+         <p>No giraffe here, only a horse.</p>";
+    let mut page = page(
+        &document("margin:0;background:#fff", body),
+        400.,
+        300.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page to search");
+    // The words are wrapped a moment after the page settles, and there is
+    // nothing to search until they are. How long that moment takes depends on
+    // the machine, so it is waited for rather than guessed at.
+    let deadline = Instant::now() + DEADLINE;
+    let mut wrapped = 0;
+    while Instant::now() < deadline && wrapped == 0 {
+        let trace = ask_selection_probe(
+            &mut page,
+            "window.__zedSelection ? window.__zedSelection.trace() : ''",
+        );
+        wrapped = trace
+            .split("\"words\":")
+            .nth(1)
+            .and_then(|rest| rest.trim_end_matches('}').trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if wrapped == 0 {
+            pump_for(&mut page, Duration::from_millis(100));
+        }
+    }
+    assert!(
+        wrapped > 0,
+        "the page's words should have been wrapped by now"
+    );
+
+    let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut look = |page: &mut HtmlPage, query: &str, forward: bool| {
+        page.find(query, forward, {
+            let answer = answer.clone();
+            move |at, total| *answer.borrow_mut() = Some((at, total))
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer.borrow_mut().take().expect("the page said nothing")
+    };
+
+    let (at, total) = look(&mut page, "giraffe", true);
+    assert_eq!(
+        (at, total),
+        (1, 3),
+        "there are three giraffes and the reader should be at the first"
+    );
+    assert_eq!(
+        ask_for_selection(&mut page).to_lowercase(),
+        "giraffe",
+        "what was found should be what is selected"
+    );
+
+    let (at, _) = look(&mut page, "giraffe", true);
+    assert_eq!(at, 2, "asking again should move to the next one");
+    let (at, _) = look(&mut page, "giraffe", false);
+    assert_eq!(at, 1, "and asking backwards should move back");
+
+    let (at, total) = look(&mut page, "hippopotamus", true);
+    assert_eq!(
+        (at, total),
+        (0, 0),
+        "a word that is not there should be found nowhere"
+    );
+
+    // A search widened to whole words: part of one still finds it.
+    let (_, total) = look(&mut page, "raff", true);
+    assert_eq!(
+        total, 3,
+        "part of a word should find the words it is part of"
     );
 }

@@ -26,7 +26,7 @@ use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
 #[cfg(feature = "servo")]
-use crate::NewBrowserTab;
+use crate::{FindInPage, FindNextInPage, FindPreviousInPage, NewBrowserTab, StopFindingInPage};
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -106,6 +106,18 @@ pub struct HtmlPreviewView {
     /// its own accord is noticed without asking the engine every frame.
     #[cfg(feature = "servo")]
     showing_address: Option<String>,
+    /// Where the reader types what to look for in the page, once they have asked
+    /// to look for anything.
+    #[cfg(feature = "servo")]
+    looking_for: Option<Entity<Editor>>,
+    /// Which of the places the words appear the reader is at, and how many there
+    /// are, as the page last answered.
+    #[cfg(feature = "servo")]
+    found: (usize, usize),
+    /// Where the page leaves that answer, since it arrives on a turn of the
+    /// engine's own.
+    #[cfg(feature = "servo")]
+    answer_from_the_page: std::rc::Rc<std::cell::Cell<Option<(usize, usize)>>>,
 }
 
 impl HtmlPreviewView {
@@ -324,6 +336,12 @@ impl HtmlPreviewView {
                 address: address_bar(window, cx),
                 #[cfg(feature = "servo")]
                 showing_address: None,
+                #[cfg(feature = "servo")]
+                looking_for: None,
+                #[cfg(feature = "servo")]
+                found: (0, 0),
+                #[cfg(feature = "servo")]
+                answer_from_the_page: std::rc::Rc::new(std::cell::Cell::new(None)),
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -579,6 +597,10 @@ impl HtmlPreviewView {
                             address.set_text(showing, window, cx);
                         });
                     }
+                    if let Some(found) = view.answer_from_the_page.take() {
+                        view.found = found;
+                        cx.notify();
+                    }
                     // A drag of the scrollbar's thumb is a request to the page,
                     // which only the engine can carry out.
                     if let Some(down) = view.page_scroll.take_request() {
@@ -688,8 +710,9 @@ impl HtmlPreviewView {
             let Some(page) = view.page.as_ref() else {
                 return;
             };
-            // What is being typed into the address bar is not for the page.
-            if view.address.focus_handle(cx).contains_focused(window, cx) {
+            // What is being typed into the address bar, or into the search
+            // field, is not for the page.
+            if view.typing_beside_the_page(window, cx) {
                 return;
             }
             // Copying is the editor's job, not the page's: the page is asked
@@ -709,7 +732,7 @@ impl HtmlPreviewView {
             ));
         }))
         .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, window, cx| {
-            if view.address.focus_handle(cx).contains_focused(window, cx) {
+            if view.typing_beside_the_page(window, cx) {
                 return;
             }
             if let Some(page) = view.page.as_ref() {
@@ -983,7 +1006,128 @@ impl HtmlPreviewView {
                     .border_color(colors.border_variant)
                     .child(self.address.clone()),
             )
+            .children(self.looking_for.as_ref().map(|field| {
+                let (at, total) = self.found;
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w(gpui::rems(12.))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(colors.editor_background)
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .key_context("HtmlPreviewFind")
+                            .on_action(cx.listener(|view, _: &menu::Confirm, _, cx| {
+                                view.look_again(true, cx);
+                            }))
+                            .child(field.clone()),
+                    )
+                    .child(
+                        Label::new(if total == 0 {
+                            "no matches".to_string()
+                        } else {
+                            format!("{at} of {total}")
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("html-preview-find-previous", IconName::ChevronUp)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Previous match"))
+                            .on_click(cx.listener(|view, _, _, cx| view.look_again(false, cx))),
+                    )
+                    .child(
+                        IconButton::new("html-preview-find-next", IconName::ChevronDown)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Next match"))
+                            .on_click(cx.listener(|view, _, _, cx| view.look_again(true, cx))),
+                    )
+                    .child(
+                        IconButton::new("html-preview-find-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Stop looking"))
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.stop_looking(window, cx)),
+                            ),
+                    )
+            }))
             .into_any_element()
+    }
+
+    /// Whether the reader is typing into one of the fields above the page
+    /// rather than into the page itself.
+    #[cfg(feature = "servo")]
+    fn typing_beside_the_page(&self, window: &Window, cx: &App) -> bool {
+        self.address.focus_handle(cx).contains_focused(window, cx)
+            || self
+                .looking_for
+                .as_ref()
+                .is_some_and(|field| field.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// Opens the search field, or puts the cursor back in it.
+    #[cfg(feature = "servo")]
+    fn start_looking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.looking_for.is_none() {
+            let field = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Find in page", window, cx);
+                editor
+            });
+            self.looking_for = Some(field);
+        }
+        if let Some(field) = self.looking_for.as_ref() {
+            field.focus_handle(cx).focus(window, cx);
+            field.update(cx, |field, cx| {
+                field.select_all(&Default::default(), window, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    /// Looks for what has been typed, and takes the reader to the next place it
+    /// appears -- or the one before.
+    #[cfg(feature = "servo")]
+    fn look_again(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(query) = self
+            .looking_for
+            .as_ref()
+            .map(|field| field.read(cx).text(cx))
+        else {
+            return;
+        };
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        if query.trim().is_empty() {
+            page.stop_looking();
+            self.found = (0, 0);
+            cx.notify();
+            return;
+        }
+        // The answer comes back on the engine's own turn, when there is no
+        // context to hand, so it is left here and the pump picks it up.
+        let answer = self.answer_from_the_page.clone();
+        page.find(&query, forward, move |at, total| {
+            answer.set(Some((at, total)));
+        });
+    }
+
+    /// Closes the search field and leaves the page as it was.
+    #[cfg(feature = "servo")]
+    fn stop_looking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.looking_for.take().is_some() {
+            if let Some(page) = self.page.as_ref() {
+                page.stop_looking();
+            }
+            self.found = (0, 0);
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
     }
 
     /// Takes the page wherever the address bar now says, and puts what it
@@ -1302,6 +1446,20 @@ impl Render for HtmlPreviewView {
             .min_h_0()
             .bg(background);
         let root = Self::with_page_keys(root, cx);
+        #[cfg(feature = "servo")]
+        let root = root
+            .on_action(cx.listener(|view, _: &FindInPage, window, cx| {
+                view.start_looking(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FindNextInPage, _, cx| {
+                view.look_again(true, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FindPreviousInPage, _, cx| {
+                view.look_again(false, cx);
+            }))
+            .on_action(cx.listener(|view, _: &StopFindingInPage, window, cx| {
+                view.stop_looking(window, cx);
+            }));
         // A live page scrolls itself and draws its own scrollbar. Wrapping it in
         // a scroll container gives one document two scrollers, and they fight:
         // the wheel moves both, and the picture slides under the pointer.

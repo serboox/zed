@@ -1489,6 +1489,15 @@
     },
   },
   {
+    "context": "HtmlPreview",
+    "bindings": {
+      "cmd-f": "html::FindInPage",
+      "cmd-g": "html::FindNextInPage",
+      "cmd-shift-g": "html::FindPreviousInPage",
+      "escape": "html::StopFindingInPage",
+    },
+  },
+  {
     "context": "MarkdownPreview",
     "bindings": {
       "pageup": "markdown::ScrollPageUp",

@@ -1420,6 +1420,15 @@
     },
   },
   {
+    "context": "HtmlPreview",
+    "bindings": {
+      "ctrl-f": "html::FindInPage",
+      "ctrl-g": "html::FindNextInPage",
+      "ctrl-shift-g": "html::FindPreviousInPage",
+      "escape": "html::StopFindingInPage",
+    },
+  },
+  {
     "context": "MarkdownPreview",
     "use_key_equivalents": true,
     "bindings": {

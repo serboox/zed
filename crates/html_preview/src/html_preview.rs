@@ -6,7 +6,10 @@ pub mod html_preview_settings;
 pub mod page_scroll;
 pub mod html_preview_view;
 
-pub use zed_actions::preview::html::{NewBrowserTab, OpenPreview, OpenPreviewToTheSide};
+pub use zed_actions::preview::html::{
+    FindInPage, FindNextInPage, FindPreviousInPage, NewBrowserTab, OpenPreview,
+    OpenPreviewToTheSide, StopFindingInPage,
+};
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

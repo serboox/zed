@@ -555,6 +555,38 @@ mod engine {
             self.evaluate(&format!("window.scrollTo(0, {down}), ''"), |_| {});
         }
 
+        /// Looks for `query` in the page and takes the reader to the next place
+        /// it appears, or the one before. The answer is which of them the reader
+        /// is now at and how many there are, and it comes on a later turn.
+        pub fn find(
+            &self,
+            query: &str,
+            forward: bool,
+            deliver: impl FnOnce(usize, usize) + 'static,
+        ) {
+            let query = serde_escape(query);
+            self.evaluate(
+                &format!(
+                    "window.__zedSelection ? window.__zedSelection.find(\"{query}\", {forward}) \
+                     : '0,0'"
+                ),
+                move |answer| {
+                    let mut numbers = answer.split(',').map(|part| part.trim().parse::<usize>());
+                    if let (Some(Ok(at)), Some(Ok(total))) = (numbers.next(), numbers.next()) {
+                        deliver(at, total);
+                    }
+                },
+            );
+        }
+
+        /// Puts the page back as it was before the search.
+        pub fn stop_looking(&self) {
+            self.evaluate(
+                "window.__zedSelection ? window.__zedSelection.stopLooking() : 0, ''",
+                |_| {},
+            );
+        }
+
         /// Asks the page for the text the reader has selected.
         pub fn selected_text(&self, deliver: impl FnOnce(String) + 'static) {
             self.evaluate(
@@ -623,6 +655,25 @@ mod engine {
                 f32::from(point.y).max(0.) * vertical,
             ))
         }
+    }
+
+    /// What the reader typed, as a JavaScript string may hold it. Anything that
+    /// would end the string early, or start a new line in the middle of it, is
+    /// written the way JavaScript writes it.
+    fn serde_escape(text: &str) -> String {
+        let mut escaped = String::with_capacity(text.len());
+        for character in text.chars() {
+            match character {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\u{2028}' => escaped.push_str("\\u2028"),
+                '\u{2029}' => escaped.push_str("\\u2029"),
+                other => escaped.push(other),
+            }
+        }
+        escaped
     }
 
     /// A display scale that cannot turn a page into a surface of no pixels or

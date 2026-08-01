@@ -987,6 +987,14 @@ pub mod preview {
                 /// Opens an empty page with an address bar, for reading the web
                 /// beside the code.
                 NewBrowserTab,
+                /// Looks for words in the page being previewed.
+                FindInPage,
+                /// Takes the reader to the next place the words appear.
+                FindNextInPage,
+                /// And to the one before.
+                FindPreviousInPage,
+                /// Puts the page back as it was before the search.
+                StopFindingInPage,
             ]
         );
     }
