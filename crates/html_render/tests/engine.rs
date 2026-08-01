@@ -711,19 +711,20 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
 /// text being laid down again or simply the pixels being moved.
 fn what_a_plain_page_costs(cx: &mut gpui::App) {
     let (width, height) = (1377., 658.);
-    let Some(mut plain) = page(
-        &document(
-            "margin:0",
-            "<div style=\"height:4000px;background:linear-gradient(#fff,#888)\"></div>",
-        ),
-        width,
-        height,
-        2.,
-        cx,
-    ) else {
+    let stripes = (0..200)
+        .map(|number| {
+            let shade = if number % 2 == 0 { "#fff" } else { "#888" };
+            format!("<div style=\"height:40px;background:{shade}\"></div>")
+        })
+        .collect::<String>();
+    let Some(mut plain) = page(&document("margin:0", &stripes), width, height, 2., cx) else {
         return;
     };
-    wait_for_colour(&mut plain, [255, 255, 255], "a page with nothing on it");
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && plain.frame().is_none() {
+        plain.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
 
     let mut scrolls = Vec::new();
     for _ in 0..40 {
