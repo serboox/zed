@@ -120,6 +120,32 @@ unsafe fn import_into_vulkan(
             .inspect_err(|error| log::warn!("no image for the shared frame: {error}"))
             .ok()?;
 
+        // The window's own device decides where each row starts in a linear
+        // image, and it need not agree with whoever allocated the buffer. Since
+        // there is no way to tell it otherwise -- that would take an extension
+        // it does not ask for -- a buffer laid out differently is refused rather
+        // than drawn skewed.
+        let layout = raw.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            },
+        );
+        if layout.row_pitch != u64::from(frame.stride) || layout.offset != u64::from(frame.offset) {
+            log::warn!(
+                "a shared frame's rows are {} bytes apart from {}, and this window would \
+                 have them {} apart from {}",
+                frame.stride,
+                frame.offset,
+                layout.row_pitch,
+                layout.offset
+            );
+            raw.destroy_image(image, None);
+            return None;
+        }
+
         let requirements = raw.get_image_memory_requirements(image);
         let external = ash::khr::external_memory_fd::Device::new(instance, raw);
         // The descriptor is duplicated: Vulkan takes ownership of what it is

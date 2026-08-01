@@ -114,6 +114,9 @@ mod engine {
         /// Whether the window draws this page's own buffer. While it does, there
         /// is no reason to read the frame back into memory at all.
         shared: bool,
+        /// Whether the window has looked at this page's buffer and refused it.
+        /// Then frames are copied, and the buffer is never offered again.
+        refused: bool,
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
@@ -164,6 +167,7 @@ mod engine {
                 viewport,
                 throttled: false,
                 shared: false,
+                refused: false,
                 frame: None,
                 document,
             })
@@ -244,7 +248,18 @@ mod engine {
         /// allows it. `None` means the frame has to be handed over as pixels.
         #[cfg(target_os = "linux")]
         pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
+            if self.refused {
+                return None;
+            }
             let frame = self.rendering_context.shared_frame()?;
+            if frame.is_refused() {
+                // The window looked at this buffer and could not draw it. Asking
+                // again would only get the same answer.
+                log::info!("the window will not draw the page's buffer, so frames are copied");
+                self.refused = true;
+                self.shared = false;
+                return None;
+            }
             if !self.shared {
                 self.shared = true;
                 // Whatever was copied before is not what the window draws now.

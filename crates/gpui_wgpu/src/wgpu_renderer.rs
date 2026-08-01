@@ -655,7 +655,7 @@ impl WgpuRenderer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<SharedFrameParams>() as u64,
+                            std::mem::size_of::<SharedFrameParams>() as u64
                         ),
                     },
                     count: None,
@@ -1562,6 +1562,9 @@ impl WgpuRenderer {
                     &self.resources().device,
                     &surface.frame,
                 ) else {
+                    // Nothing will be drawn for this frame; whoever produced it
+                    // is told so it can go back to handing over pixels.
+                    surface.frame.refuse();
                     continue;
                 };
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

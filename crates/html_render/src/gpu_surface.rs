@@ -359,6 +359,7 @@ impl GpuSurface {
             // The page is drawn with OpenGL, which starts at the bottom.
             bottom_up: true,
             modifier: 0,
+            refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -378,6 +379,7 @@ impl GpuSurface {
             format: exported.format,
             bottom_up: true,
             modifier: exported.modifier,
+            refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

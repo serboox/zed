@@ -37,7 +37,6 @@ const HEARTBEAT: Duration = Duration::from_millis(250);
 #[cfg(feature = "servo")]
 const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
 
-
 struct EditorState {
     editor: Entity<Editor>,
     _subscription: Subscription,
@@ -449,6 +448,16 @@ impl HtmlPreviewView {
                         && !text.is_empty()
                     {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    }
+                    #[cfg(target_os = "linux")]
+                    if view
+                        .shared_frame
+                        .as_ref()
+                        .is_some_and(|shared| shared.is_refused())
+                    {
+                        // The window could not draw the page's own buffer after
+                        // all, and the page has gone back to copying frames.
+                        view.shared_frame = None;
                     }
                     #[cfg(target_os = "linux")]
                     if painted && let Some(shared) = page.shared_frame() {

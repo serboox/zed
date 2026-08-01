@@ -1,4 +1,5 @@
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{DevicePixels, Size, size};
 
@@ -36,9 +37,24 @@ pub struct SharedFrame {
     /// own device does not ask for, so a producer should hand over linear
     /// buffers.
     pub modifier: u64,
+    /// Set by the renderer when it turns out it cannot draw this buffer after
+    /// all. A producer is expected to look, and to go back to handing over
+    /// pixels; a frame that is refused is never drawn.
+    pub refused: AtomicBool,
 }
 
 impl SharedFrame {
+    /// Says this buffer cannot be drawn, so whoever produced it stops offering
+    /// it and copies frames instead.
+    pub fn refuse(&self) {
+        self.refused.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the renderer has given up on this buffer.
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
     /// How large the frame is, in device pixels.
     pub fn size(&self) -> Size<DevicePixels> {
         size(
