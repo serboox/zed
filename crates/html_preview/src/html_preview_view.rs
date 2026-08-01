@@ -388,7 +388,7 @@ impl HtmlPreviewView {
             contents,
             base_directory.as_deref(),
             size,
-            window.scale_factor(),
+            page_scale(window, cx),
             cx,
         ) {
             Ok(page) => {
@@ -435,7 +435,7 @@ impl HtmlPreviewView {
                     }
                     let bounds = view.page_bounds.get();
                     if bounds.size.width > gpui::px(64.) {
-                        page.resize(bounds.size, window.scale_factor());
+                        page.resize(bounds.size, page_scale(window, cx));
                     }
                     let painted = page.pump();
                     if let Some(url) = page.take_link_for_new_tab() {
@@ -1064,4 +1064,13 @@ impl Item for HtmlPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+}
+
+/// How many pixels the page is drawn with for each of the editor's own: the
+/// display's, unless the reader has asked for fewer to buy smoothness.
+#[cfg(feature = "servo")]
+fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
+    use crate::html_preview_settings::HtmlPreviewSettings;
+
+    HtmlPreviewSettings::get_global(cx).scale_in(window.scale_factor())
 }

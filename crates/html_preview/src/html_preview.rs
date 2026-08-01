@@ -1,6 +1,7 @@
 use gpui::App;
 use workspace::Workspace;
 
+pub mod html_preview_settings;
 pub mod html_preview_view;
 
 pub use zed_actions::preview::html::{OpenPreview, OpenPreviewToTheSide};

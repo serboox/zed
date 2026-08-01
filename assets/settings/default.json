@@ -578,6 +578,15 @@
     // Any unrecognized input device will fall back to system default.
     "experimental.input_audio_device": null,
   },
+  // Configuration of the HTML preview.
+  "html_preview": {
+    // How many pixels the page is drawn with for each of the editor's own.
+    // `null` means the display's own, which is the sharpest. A page drawn at
+    // four times the pixels costs about a third more to redraw and twice as
+    // much to scroll, so a smaller number buys smoothness at the price of
+    // crispness.
+    "render_scale": null,
+  },
   // Scrollbar related settings
   "scrollbar": {
     // When to show the scrollbar in the editor.

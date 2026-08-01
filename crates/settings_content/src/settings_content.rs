@@ -176,6 +176,9 @@ pub struct SettingsContent {
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
 
+    /// Configuration of the HTML preview.
+    pub html_preview: Option<HtmlPreviewSettingsContent>,
+
     /// Whether or not to automatically check for updates.
     ///
     /// Default: true
@@ -496,6 +499,20 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// Configuration of the HTML preview.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct HtmlPreviewSettingsContent {
+    /// How many pixels the page is drawn with for each of the editor's own.
+    ///
+    /// Unset means the display's own, which is sharpest. A page drawn at four
+    /// times the pixels costs about a third more to redraw and twice as much to
+    /// scroll, so a smaller number buys smoothness at the price of crispness.
+    ///
+    /// Default: null
+    pub render_scale: Option<f32>,
 }
 
 /// Configuration of audio in Zed.
