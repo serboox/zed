@@ -46,9 +46,6 @@ pub(crate) struct GpuSurface {
     /// driver has no way to hand a buffer over, and then frames are copied.
     #[cfg(target_os = "linux")]
     exporter: Option<DmaBufExporter>,
-    /// The frame currently lent to the window, if any.
-    #[cfg(target_os = "linux")]
-    shared: RefCell<Option<Arc<SharedFrame>>>,
     #[cfg(target_os = "linux")]
     /// Whether handing frames over has already been found impossible on this
     /// machine. Asking again every frame costs an image each time and the answer
@@ -95,13 +92,93 @@ struct Waiting {
 /// A texture and the framebuffer that draws into it. When the memory behind the
 /// texture came from the driver's allocator, the window can be handed it as it
 /// stands instead of being sent a copy.
-struct RenderTarget {
+struct Face {
     texture: u32,
     framebuffer: u32,
     shared: Option<SharedBuffer>,
+    /// The frame the window is handed for this face, made once and handed out
+    /// every time this face comes round again.
+    frame: RefCell<Option<Arc<SharedFrame>>>,
+}
+
+/// What the page draws into.
+///
+/// When the window is drawing the page's own memory there are two of these and
+/// the page draws into them by turns: the window is still sampling the frame it
+/// was last handed, and drawing over that very memory is how a page tears -- or,
+/// where the driver orders it for us, how the page ends up waiting on the window
+/// before it may draw at all. When frames are copied instead, one is enough.
+struct RenderTarget {
+    faces: Vec<Face>,
+    /// Which face the engine is drawing into now.
+    drawing: Cell<usize>,
+    /// Which face was last finished, and so is the one to hand over.
+    drawn: Cell<usize>,
 }
 
 impl RenderTarget {
+    fn new(
+        gl: &Rc<dyn gleam::gl::Gl>,
+        size: PhysicalSize<u32>,
+        buffers: Option<&SharedBuffers>,
+    ) -> Option<Self> {
+        let wanted = if buffers.is_some() { 2 } else { 1 };
+        let mut faces = Vec::with_capacity(wanted);
+        while faces.len() < wanted {
+            match Face::new(gl, size, buffers) {
+                Some(face) => faces.push(face),
+                None => {
+                    for face in &faces {
+                        face.discard(gl, buffers);
+                    }
+                    // A shared buffer was the reason it would not do; an
+                    // ordinary texture still might.
+                    return buffers.and_then(|_| Self::new(gl, size, None));
+                }
+            }
+        }
+        Some(Self {
+            faces,
+            drawing: Cell::new(0),
+            drawn: Cell::new(0),
+        })
+    }
+
+    fn drawing(&self) -> &Face {
+        let at = self.drawing.get().min(self.faces.len() - 1);
+        &self.faces[at]
+    }
+
+    fn drawn(&self) -> &Face {
+        let at = self.drawn.get().min(self.faces.len() - 1);
+        &self.faces[at]
+    }
+
+    /// Says the page has been drawn: what was being drawn into is what the
+    /// window is handed, and the next frame goes somewhere else.
+    fn turn(&self) {
+        self.drawn.set(self.drawing.get());
+        self.drawing
+            .set((self.drawing.get() + 1) % self.faces.len());
+    }
+
+    fn discard(&self, gl: &Rc<dyn gleam::gl::Gl>, buffers: Option<&SharedBuffers>) {
+        for face in &self.faces {
+            face.discard(gl, buffers);
+        }
+    }
+
+    /// Gives back the memory the driver allocated. This asks nothing of OpenGL,
+    /// so it is also the right thing to do when the context cannot be made
+    /// current any more.
+    fn discard_shared(&self, buffers: Option<&SharedBuffers>) {
+        for face in &self.faces {
+            face.discard_shared(buffers);
+        }
+    }
+}
+
+impl Face {
     fn new(
         gl: &Rc<dyn gleam::gl::Gl>,
         size: PhysicalSize<u32>,
@@ -111,6 +188,11 @@ impl RenderTarget {
             let buffer = buffers.allocate(size.width, size.height)?;
             Some((buffers, buffer))
         });
+        // A buffer was asked for and refused: the whole target has to be built
+        // the other way round instead of half one and half the other.
+        if buffers.is_some() && shared.is_none() {
+            return None;
+        }
         let give_up = |shared: &Option<(&SharedBuffers, SharedBuffer)>| {
             if let Some((buffers, buffer)) = shared {
                 buffers.discard(buffer);
@@ -165,18 +247,14 @@ impl RenderTarget {
             log::error!("the page has no framebuffer to draw into: status {status:#x}");
             gl.delete_framebuffers(&[framebuffer]);
             gl.delete_textures(&[texture]);
-            if let Some((buffers, buffer)) = &shared {
-                buffers.discard(buffer);
-                // A shared buffer was the reason it would not do; an ordinary
-                // texture still might.
-                return Self::new(gl, size, None);
-            }
+            give_up(&shared);
             return None;
         }
         Some(Self {
             texture,
             framebuffer,
             shared: shared.map(|(_, buffer)| buffer),
+            frame: RefCell::new(None),
         })
     }
 
@@ -186,9 +264,6 @@ impl RenderTarget {
         self.discard_shared(buffers);
     }
 
-    /// Gives back the memory the driver allocated. This asks nothing of OpenGL,
-    /// so it is also the right thing to do when the context cannot be made
-    /// current any more.
     fn discard_shared(&self, buffers: Option<&SharedBuffers>) {
         if let (Some(buffers), Some(buffer)) = (buffers, self.shared.as_ref()) {
             buffers.discard(buffer);
@@ -302,8 +377,6 @@ impl GpuSurface {
             #[cfg(target_os = "linux")]
             exporter,
             #[cfg(target_os = "linux")]
-            shared: RefCell::new(None),
-            #[cfg(target_os = "linux")]
             cannot_share: Cell::new(false),
             read_format: Cell::new(None),
             sealed: Cell::new(std::ptr::null()),
@@ -312,11 +385,14 @@ impl GpuSurface {
         })
     }
 
-    /// The frame the window may sample directly, if this machine allows it. The
-    /// same one is handed out until the page is resized.
+    /// The frame the window may sample directly, if this machine allows it.
+    ///
+    /// This is the face the page has just finished, not the one it is drawing
+    /// into now. Each face keeps its own, so the two are handed out by turns and
+    /// the window has them both.
     #[cfg(target_os = "linux")]
     pub(crate) fn shared_frame(&self) -> Option<Arc<SharedFrame>> {
-        if let Some(shared) = self.shared.borrow().as_ref() {
+        if let Some(shared) = self.target.borrow().drawn().frame.borrow().as_ref() {
             return Some(shared.clone());
         }
         if self.cannot_share.get() {
@@ -343,7 +419,7 @@ impl GpuSurface {
             },
         };
         let frame = Arc::new(frame);
-        *self.shared.borrow_mut() = Some(frame.clone());
+        *self.target.borrow().drawn().frame.borrow_mut() = Some(frame.clone());
         log::info!(
             "the page's frames are handed to the window as they are, {}x{}",
             size.width,
@@ -352,13 +428,19 @@ impl GpuSurface {
         Some(frame)
     }
 
+    /// Says the page has been drawn, so the next frame goes into the other face
+    /// and the one just finished is what the window is handed.
+    pub(crate) fn turn_the_page(&self) {
+        self.target.borrow().turn();
+    }
+
     #[cfg(target_os = "linux")]
     /// The page's own buffer, when it was allocated to be shared. The window
     /// gets a descriptor of its own for it; the page keeps drawing into the
     /// memory both now name.
     fn lend_own_memory(&self, size: PhysicalSize<u32>) -> Option<SharedFrame> {
         let target = self.target.borrow();
-        let buffer = target.shared.as_ref()?;
+        let buffer = target.drawn().shared.as_ref()?;
         let descriptor = buffer
             .descriptor
             .try_clone()
@@ -385,7 +467,7 @@ impl GpuSurface {
         let exported = self
             .exporter
             .as_ref()?
-            .export(self.target.borrow().texture)?;
+            .export(self.target.borrow().drawn().texture)?;
         // The driver's own texture may have longer rows than the page is wide.
         // The window works a row's length out from the width it is given, so it
         // is told how wide the rows really are, and which part of them is the
@@ -414,7 +496,7 @@ impl GpuSurface {
     }
 
     fn framebuffer(&self) -> u32 {
-        self.target.borrow().framebuffer
+        self.target.borrow().drawing().framebuffer
     }
 
     /// Which byte order to read pixels back in. The window's textures want blue
@@ -714,13 +796,10 @@ impl RenderingContext for GpuSurface {
         self.readback.borrow_mut().waiting = None;
         let previous = std::mem::replace(&mut *self.target.borrow_mut(), target);
         previous.discard(&self.gleam_gl, self.buffers.as_ref());
-        // What the window was lent belonged to the old texture, and a new one
-        // deserves a fresh attempt at handing it over.
+        // What the window was lent belonged to the old textures, and new ones
+        // deserve a fresh attempt at handing them over.
         #[cfg(target_os = "linux")]
-        {
-            self.shared.borrow_mut().take();
-            self.cannot_share.set(false);
-        }
+        self.cannot_share.set(false);
         self.size.set(size);
     }
 

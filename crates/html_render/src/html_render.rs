@@ -231,6 +231,10 @@ mod engine {
                 // the mark rather than by standing and waiting for it.
                 if painted {
                     self.rendering_context.seal_frame();
+                    // The face just finished is what the window is handed; the
+                    // next frame goes into the other one, so the page never
+                    // draws over what the window is still reading.
+                    self.rendering_context.turn_the_page();
                 }
                 // Taken first: `||` would skip it whenever a frame was painted
                 // this turn, and a flag left standing reports a frame that is
@@ -284,7 +288,17 @@ mod engine {
             if self.refused {
                 return None;
             }
-            let frame = self.rendering_context.shared_frame()?;
+            let Some(frame) = self.rendering_context.shared_frame() else {
+                // The surface has stopped lending its memory -- a buffer it
+                // could not allocate, a driver that changed its mind. A page
+                // that goes on as though it were still lent shows the window
+                // nothing new ever again, so it goes back to copying.
+                if self.shared {
+                    log::info!("the page's memory is no longer lent, so frames are copied");
+                    self.shared = false;
+                }
+                return None;
+            };
             if frame.is_refused() {
                 // The window looked at this buffer and could not draw it. Asking
                 // again would only get the same answer.
