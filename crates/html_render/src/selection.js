@@ -24,6 +24,7 @@
 
   var words = null;
   var measured = null;
+  var measuredAt = { x: 0, y: 0 };
   var overlay = null;
   var anchor = null;
   var head = null;
@@ -110,14 +111,46 @@
   // Every word's box, measured in one pass and kept until the page moves. A
   // measurement is a layout query, and asking for one per word per mouse move --
   // hundreds of them, thirty times a second -- costs far more than the drag.
+  // Every word's box, measured in one pass and kept until the page changes. The
+  // boxes are in viewport coordinates, so a scroll moves the text out from under
+  // them -- but it moves every word by the same amount, so the boxes are shifted
+  // rather than measured again. Measuring is what a scroll used to cost, and it
+  // cost it in the page's own script, on every turn of the wheel.
   function boxes() {
     var all = wrapWords();
+    var x = window.scrollX;
+    var y = window.scrollY;
     if (measured && measured.length === all.length) {
+      var acrossBy = measuredAt.x - x;
+      var downBy = measuredAt.y - y;
+      if (acrossBy !== 0 || downBy !== 0) {
+        for (var moved = 0; moved < measured.length; moved++) {
+          var box = measured[moved];
+          measured[moved] = {
+            left: box.left + acrossBy,
+            right: box.right + acrossBy,
+            top: box.top + downBy,
+            bottom: box.bottom + downBy,
+            width: box.width,
+            height: box.height,
+          };
+        }
+        measuredAt = { x: x, y: y };
+      }
       return measured;
     }
     measured = [];
+    measuredAt = { x: x, y: y };
     for (var i = 0; i < all.length; i++) {
-      measured.push(all[i].span.getBoundingClientRect());
+      var rectangle = all[i].span.getBoundingClientRect();
+      measured.push({
+        left: rectangle.left,
+        right: rectangle.right,
+        top: rectangle.top,
+        bottom: rectangle.bottom,
+        width: rectangle.width,
+        height: rectangle.height,
+      });
     }
     return measured;
   }
@@ -223,6 +256,7 @@
   function paintHighlight() {
     clearHighlight();
     var span = ordered();
+    followTheScroll(!!span);
     if (!span) {
       return;
     }
@@ -349,18 +383,37 @@
     true
   );
 
-  // The boxes are placed in viewport coordinates, so a scroll moves the text out
-  // from under them; they are measured again rather than left behind.
-  // A scroll or a resize moves every word, so the measurements are thrown away
-  // and the highlight is drawn again from fresh ones.
-  var repaint = guarded(function () {
+  // A resize lays the page out afresh, so what was measured no longer describes
+  // it.
+  var relaidOut = guarded(function () {
     measured = null;
     if (ordered()) {
       paintHighlight();
     }
   });
-  window.addEventListener("scroll", repaint, true);
-  window.addEventListener("resize", repaint, true);
+  window.addEventListener("resize", relaidOut, true);
+
+  // The highlight is drawn in viewport coordinates, so it has to be drawn again
+  // when the page scrolls out from under it. That listener is only attached
+  // while there is something highlighted: a page with a scroll handler makes the
+  // engine run script on every turn of the wheel, whether the handler has
+  // anything to do or not, and most turns of the wheel happen with nothing
+  // selected at all.
+  var scrolled = guarded(function () {
+    paintHighlight();
+  });
+  var listeningToScroll = false;
+  function followTheScroll(should) {
+    if (should === listeningToScroll) {
+      return;
+    }
+    listeningToScroll = should;
+    if (should) {
+      window.addEventListener("scroll", scrolled, true);
+    } else {
+      window.removeEventListener("scroll", scrolled, true);
+    }
+  }
 
   // A page that rewrites itself leaves the word list describing a document that
   // is no longer there, so the list is thrown away and built again once the page

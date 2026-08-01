@@ -117,6 +117,9 @@ mod engine {
         /// Whether the window has looked at this page's buffer and refused it.
         /// Then frames are copied, and the buffer is never offered again.
         refused: bool,
+        /// Whether a frame has been drawn but the graphics card has not yet
+        /// reached the mark left after it, so the window may not read it.
+        awaiting_the_card: std::cell::Cell<bool>,
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
@@ -168,6 +171,7 @@ mod engine {
                 throttled: false,
                 shared: false,
                 refused: false,
+                awaiting_the_card: std::cell::Cell::new(false),
                 frame: None,
                 document,
             })
@@ -209,13 +213,20 @@ mod engine {
             self.engine.spin();
             let painted = self.delegate.painted.replace(false);
             if self.shared {
+                // The window samples the page's own buffer; copying it here
+                // would be the very cost this avoids. What it does need is for
+                // the drawing to be finished before it reads -- so the queue is
+                // marked, and the frame is shown on the turn the card reaches
+                // the mark rather than by standing and waiting for it.
                 if painted {
-                    // The window samples the page's own buffer; copying it here
-                    // would be the very cost this avoids. What it does need is
-                    // for the drawing to be finished before the window reads it.
-                    self.rendering_context.finish_drawing();
+                    self.rendering_context.seal_frame();
                 }
-                return painted;
+                if self.rendering_context.frame_is_drawn() {
+                    return painted || self.awaiting_the_card.take();
+                }
+                self.awaiting_the_card.set(true);
+                self.engine.nudge();
+                return false;
             }
             if painted {
                 self.rendering_context.ask_for_frame();

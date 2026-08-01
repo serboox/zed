@@ -435,6 +435,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
             for scale in [1., 2.] {
                 how_long_a_frame_takes(scale, cx);
             }
+            what_a_plain_page_costs(cx);
         }
     });
 }
@@ -702,5 +703,52 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
         } else {
             "the top of the page"
         }
+    );
+}
+
+/// The same measurements on a page with no text in it at all. Scrolling costs
+/// more for each pixel than redrawing does, and this says whether that is the
+/// text being laid down again or simply the pixels being moved.
+fn what_a_plain_page_costs(cx: &mut gpui::App) {
+    let (width, height) = (1377., 658.);
+    let Some(mut plain) = page(
+        &document(
+            "margin:0",
+            "<div style=\"height:4000px;background:linear-gradient(#fff,#888)\"></div>",
+        ),
+        width,
+        height,
+        2.,
+        cx,
+    ) else {
+        return;
+    };
+    wait_for_colour(&mut plain, [255, 255, 255], "a page with nothing on it");
+
+    let mut scrolls = Vec::new();
+    for _ in 0..40 {
+        plain.scrolled(
+            gpui::point(px(200.), px(200.)),
+            gpui::point(px(0.), px(-60.)),
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        loop {
+            if plain.pump() {
+                scrolls.push(started.elapsed());
+                break;
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+    }
+    report(
+        "a turn of the wheel, no text",
+        width,
+        height,
+        2.,
+        &mut scrolls,
+        0,
     );
 }

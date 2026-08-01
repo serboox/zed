@@ -55,6 +55,9 @@ pub(crate) struct GpuSurface {
     cannot_share: Cell<bool>,
     /// The byte order this driver reads pixels back in, once asked.
     read_format: Cell<Option<u32>>,
+    /// A mark left in the graphics card's queue after the page was drawn. The
+    /// window may not read the buffer until the card has reached it.
+    sealed: Cell<gleam::gl::GLsync>,
     /// Where a frame is read into while the graphics card is still working on
     /// it. Reading straight into memory makes the processor wait for the card to
     /// finish; reading into one of these does not, and the frame is collected on
@@ -300,6 +303,7 @@ impl GpuSurface {
             #[cfg(target_os = "linux")]
             cannot_share: Cell::new(false),
             read_format: Cell::new(None),
+            sealed: Cell::new(std::ptr::null()),
             readback: RefCell::new(Readback::default()),
         })
     }
@@ -551,11 +555,54 @@ impl GpuSurface {
         self.readback.borrow().waiting.is_some()
     }
 
-    /// Waits for the graphics card to finish what it was told to draw. The
-    /// window reads this buffer with a different API, which knows nothing of
-    /// OpenGL's queue, so the drawing has to be done before it looks.
-    pub(crate) fn finish_drawing(&self) {
-        self.gleam_gl.finish();
+    /// Marks the graphics card's queue after the page. The window reads this
+    /// buffer with a different API, which knows nothing of OpenGL's queue, so
+    /// the drawing has to be done before it looks -- but waiting for it here
+    /// would stop the editor's own thread until the card caught up, which is
+    /// the very cost this is meant to avoid.
+    pub(crate) fn seal_frame(&self) {
+        self.forget_seal();
+        let sealed = self
+            .gleam_gl
+            .fence_sync(gleam::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if sealed.is_null() {
+            // Without a mark there is nothing to wait on, so the old, blunt way
+            // is the only way to keep the window from reading too early.
+            self.gleam_gl.finish();
+            return;
+        }
+        // The card is told there is work to get on with; nobody waits.
+        self.gleam_gl.flush();
+        self.sealed.set(sealed);
+    }
+
+    /// Whether the graphics card has reached the mark, asked without waiting.
+    /// `true` also when there is no mark to wait for.
+    pub(crate) fn frame_is_drawn(&self) -> bool {
+        let sealed = self.sealed.get();
+        if sealed.is_null() {
+            return true;
+        }
+        match self.gleam_gl.client_wait_sync(sealed, 0, 0) {
+            gleam::gl::ALREADY_SIGNALED | gleam::gl::CONDITION_SATISFIED => {
+                self.forget_seal();
+                true
+            }
+            gleam::gl::TIMEOUT_EXPIRED => false,
+            // A mark that cannot be asked about is worse than none: it would
+            // hold the page back for ever.
+            _ => {
+                self.forget_seal();
+                true
+            }
+        }
+    }
+
+    fn forget_seal(&self) {
+        let sealed = self.sealed.replace(std::ptr::null());
+        if !sealed.is_null() {
+            self.gleam_gl.delete_sync(sealed);
+        }
     }
 }
 
@@ -568,6 +615,7 @@ impl Drop for GpuSurface {
         // first, or its own resources are not the ones that go.
         match device.make_context_current(&context) {
             Ok(()) => {
+                self.forget_seal();
                 self.target
                     .borrow()
                     .discard(&self.gleam_gl, self.buffers.as_ref());
