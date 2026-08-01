@@ -773,7 +773,8 @@ impl HtmlPreviewView {
             // over the picture: it shows where the page says it stands, and a
             // drag of its thumb asks the page to go elsewhere.
             .custom_scrollbars(
-                ui::Scrollbars::new(ui::ScrollAxes::Vertical)
+                ui::Scrollbars::for_settings::<PageScrollbarSetting>()
+                    .show_along(ui::ScrollAxes::Vertical)
                     .id("html-preview-page")
                     .tracked_scroll_handle(&scroll),
                 window,
@@ -1128,6 +1129,20 @@ impl Item for HtmlPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+}
+
+/// The scrollbar beside a page shows itself when the editor's own do: a preview
+/// that kept its bar while the editor hid theirs would look like another
+/// application.
+#[cfg(feature = "servo")]
+#[derive(Default)]
+struct PageScrollbarSetting;
+
+#[cfg(feature = "servo")]
+impl ui::scrollbars::ScrollbarVisibility for PageScrollbarSetting {
+    fn visibility(&self, cx: &gpui::App) -> ui::scrollbars::ShowScrollbar {
+        editor::EditorSettings::get_global(cx).scrollbar.show
+    }
 }
 
 /// How many pixels the page is drawn with for each of the editor's own: the
