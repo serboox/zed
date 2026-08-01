@@ -37,16 +37,27 @@ fn document(body_style: &str, extra: &str) -> String {
     format!("<html><body style=\"margin:0;{body_style}\">{extra}</body></html>")
 }
 
+/// The colour at a point on the page, as red, green and blue.
+fn colour_at(page: &HtmlPage, x: usize, y: usize) -> Option<[u8; 3]> {
+    let frame = page.frame()?;
+    let size = frame.size(0);
+    let (width, height) = (u32::from(size.width) as usize, u32::from(size.height) as usize);
+    if x >= width || y >= height {
+        return None;
+    }
+    let bytes = frame.as_bytes(0)?;
+    let offset = (y * width + x) * 4;
+    let pixel = bytes.get(offset..offset + 4)?;
+    // The frames are premultiplied BGRA, which is what gpui draws.
+    Some([pixel[2], pixel[1], pixel[0]])
+}
+
 /// The colour at the middle of the page, as red, green and blue.
 fn middle_colour(page: &HtmlPage) -> Option<[u8; 3]> {
     let frame = page.frame()?;
     let size = frame.size(0);
     let (width, height) = (u32::from(size.width) as usize, u32::from(size.height) as usize);
-    let bytes = frame.as_bytes(0)?;
-    let offset = ((height / 2) * width + width / 2) * 4;
-    let pixel = bytes.get(offset..offset + 4)?;
-    // The frames are premultiplied BGRA, which is what gpui draws.
-    Some([pixel[2], pixel[1], pixel[0]])
+    colour_at(page, width / 2, height / 2)
 }
 
 fn close_to(colour: [u8; 3], want: [u8; 3]) -> bool {
@@ -71,6 +82,47 @@ fn wait_for_colour(page: &mut HtmlPage, want: [u8; 3], what: &str) {
         std::thread::sleep(Duration::from_millis(8));
     }
     panic!("{what}: the page never turned {want:?}, it stayed {last:?}");
+}
+
+/// Turns the engine over for a while, so that whatever was just handed to it --
+/// an event, a script, a question -- is actually dealt with.
+fn pump_for(page: &mut HtmlPage, how_long: Duration) {
+    let deadline = Instant::now() + how_long;
+    while Instant::now() < deadline {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+
+/// Runs a script in the page and waits for the answer.
+fn ask_selection_probe(page: &mut HtmlPage, script: &str) -> String {
+    let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.evaluate(script, {
+        let answer = answer.clone();
+        move |text| *answer.borrow_mut() = Some(text)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && answer.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    answer.borrow_mut().take().unwrap_or_default()
+}
+
+/// What the page says is selected, waited for: the answer comes back through the
+/// engine's own loop.
+fn ask_for_selection(page: &mut HtmlPage) -> String {
+    let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.selected_text({
+        let answer = answer.clone();
+        move |text| *answer.borrow_mut() = Some(text)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && answer.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    answer.borrow_mut().take().unwrap_or_default()
 }
 
 fn frame_size(page: &HtmlPage) -> Option<(u32, u32)> {
@@ -160,6 +212,163 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
             "the surface should follow the view"
         );
         drop(stylesheet);
+
+        // Dragging over text selects it. The engine has no selection of its own
+        // outside form fields, so this exercises the page-side implementation
+        // all the way through: the drag, the highlight it paints, and the text
+        // it hands back for the clipboard.
+        let text = "<p style=\"position:absolute;left:0;top:0;margin:0;\
+         font:16px monospace;color:black\">SELECT ME PLEASE</p>";
+        let mut selectable = page(&document("background:white", text), 600., 200., 1., cx)
+            .expect("the engine started once already");
+        wait_for_colour(&mut selectable, [255, 255, 255], "the page behind the text");
+
+        let start = gpui::point(px(2.), px(8.));
+        selectable.mouse_moved(start);
+        selectable.mouse_down(start, MouseButton::Left);
+        for x in [30., 60., 90., 120.] {
+            selectable.mouse_moved(gpui::point(px(x), px(8.)));
+            pump_for(&mut selectable, Duration::from_millis(120));
+        }
+        selectable.mouse_up(gpui::point(px(120.), px(8.)), MouseButton::Left);
+        pump_for(&mut selectable, Duration::from_millis(400));
+
+        let selected = ask_for_selection(&mut selectable);
+        assert!(
+            selected.starts_with("SELECT"),
+            "the page should have handed back the text under the drag, not {selected:?}"
+        );
+
+        // A drag along one line takes that line, and nothing above or below it.
+        let lines = "<p style=\"position:absolute;left:0;top:0;margin:0;font:16px monospace\">\
+         AAAA BBBB CCCC</p>\
+         <p style=\"position:absolute;left:0;top:40px;margin:0;font:16px monospace\">\
+         DDDD EEEE FFFF</p>\
+         <p style=\"position:absolute;left:0;top:80px;margin:0;font:16px monospace\">\
+         GGGG HHHH IIII</p>";
+        let mut three_lines = page(&document("background:white", lines), 600., 200., 1., cx)
+            .expect("the engine started once already");
+        wait_for_colour(&mut three_lines, [255, 255, 255], "the page behind three lines");
+
+        let middle_line = px(48.);
+        three_lines.mouse_moved(gpui::point(px(2.), middle_line));
+        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Left);
+        for x in [40., 80., 110.] {
+            three_lines.mouse_moved(gpui::point(px(x), middle_line));
+            pump_for(&mut three_lines, Duration::from_millis(120));
+        }
+        three_lines.mouse_up(gpui::point(px(110.), middle_line), MouseButton::Left);
+        pump_for(&mut three_lines, Duration::from_millis(400));
+
+        let one_line = ask_for_selection(&mut three_lines);
+        assert!(
+            one_line.contains("DDDD") && !one_line.contains("AAAA") && !one_line.contains("IIII"),
+            "a drag along the middle line should take the middle line, not {one_line:?}"
+        );
+
+        // The same drag, but ending past the right edge of the text: a reader
+        // sweeping to the end of a line must not be given the rest of the page.
+        three_lines.mouse_moved(gpui::point(px(2.), middle_line));
+        three_lines.mouse_down(gpui::point(px(2.), middle_line), MouseButton::Left);
+        for x in [200., 400., 580.] {
+            three_lines.mouse_moved(gpui::point(px(x), middle_line));
+            pump_for(&mut three_lines, Duration::from_millis(120));
+        }
+        three_lines.mouse_up(gpui::point(px(580.), middle_line), MouseButton::Left);
+        pump_for(&mut three_lines, Duration::from_millis(400));
+
+        // A page taller than its window, to find out what the engine's own
+        // geometry means once the compositor has scrolled it.
+        let tall = (1..=40)
+            .map(|i| format!("<p style=\"margin:0;font:16px monospace\">LINE{i:02} of the tall page</p>"))
+            .collect::<String>();
+        let mut scrollable = page(&document("background:white", &tall), 600., 200., 1., cx)
+            .expect("the engine started once already");
+        wait_for_colour(&mut scrollable, [255, 255, 255], "the tall page");
+        // The shape of a real page: a column of wrapped text in a window,
+        // scrolled with the wheel before anything is selected. This is where a
+        // drag along one line was taking whole paragraphs.
+        let column = (1..=20)
+            .map(|i| format!("<p style=\"max-width:40em\">Paragraph {i}. This page has no script, \
+             no animation and no transition: once it is laid out and painted there is nothing left \
+             for the engine to do, so any processor time spent while it is on screen is time the \
+             preview is wasting.</p>"))
+            .collect::<String>();
+        let mut wrapped = page(&document("background:white;font:16px/1.6 sans-serif", &column), 1200., 900., 1., cx)
+            .expect("the engine started once already");
+        wait_for_colour(&mut wrapped, [255, 255, 255], "the column of text");
+        wrapped.scrolled(gpui::point(px(600.), px(400.)), gpui::point(px(0.), px(-378.)));
+        pump_for(&mut wrapped, Duration::from_millis(600));
+        let line = px(100.);
+        wrapped.mouse_moved(gpui::point(px(465.), line));
+        wrapped.mouse_down(gpui::point(px(465.), line), MouseButton::Left);
+        for x in [520., 620., 720., 815.] {
+            wrapped.mouse_moved(gpui::point(px(x), line));
+            pump_for(&mut wrapped, Duration::from_millis(120));
+        }
+        wrapped.mouse_up(gpui::point(px(815.), line), MouseButton::Left);
+        pump_for(&mut wrapped, Duration::from_millis(400));
+        for probe in [
+            "(function(){var w=document.querySelectorAll('[data-zed-selection=word]');\
+             var out=[];[0,20,50,100,200,400,879].forEach(function(i){\
+             var b=w[i].getBoundingClientRect();\
+             out.push(i+':'+w[i].textContent+'@'+Math.round(b.top)+'h'+Math.round(b.height));});\
+             return out.join(' | ');})()",
+            "(function(){var w=document.querySelectorAll('[data-zed-selection=word]');\
+             var zero=0,tall=0;for(var i=0;i<w.length;i++){\
+             if(w[i].getBoundingClientRect().height>0)tall++;else zero++;}\
+             return tall+' measured, '+zero+' with no box';})()",
+            "(function(){var p=document.querySelectorAll('p');\
+             var b=p[4].getBoundingClientRect();\
+             return 'p5 top='+Math.round(b.top)+' h='+Math.round(b.height);})()",
+        ] {
+            println!("WRAP {}", ask_selection_probe(&mut wrapped, probe));
+        }
+        let swept = ask_for_selection(&mut wrapped);
+        println!("WRAPPED selected {:?}", swept);
+        drop(wrapped);
+
+        // A wheel turn moves the page by what it was told, once: the delta the
+        // editor hands over in editor pixels is what the page travels.
+        let line_at_top = |page: &mut HtmlPage| {
+            ask_selection_probe(
+                page,
+                "(function(){var e=document.elementFromPoint(10,100);\
+                 return (e.textContent||'').slice(0,6)+'@'+window.scrollY;})()",
+            )
+        };
+        let before = line_at_top(&mut scrollable);
+        scrollable.scrolled(gpui::point(px(300.), px(100.)), gpui::point(px(0.), px(-60.)));
+        pump_for(&mut scrollable, Duration::from_millis(600));
+        let after_one = line_at_top(&mut scrollable);
+        assert_ne!(
+            before, after_one,
+            "one turn of the wheel should move the page"
+        );
+        assert!(
+            after_one.ends_with("@60"),
+            "the page should travel exactly as far as the wheel said, not {after_one:?}"
+        );
+        drop(scrollable);
+
+        let past_the_edge = ask_for_selection(&mut three_lines);
+        assert!(
+            past_the_edge.contains("FFFF") && !past_the_edge.contains("GGGG"),
+            "a drag past the end of a line should stop at that line, not {past_the_edge:?}"
+        );
+        drop(three_lines);
+
+        // And the reader has to be able to see it: the highlight is painted over
+        // the words, so the page is no longer plain white where they are.
+        let highlight = (0..40)
+            .flat_map(|x| (2..18).map(move |y| (x * 3, y)))
+            .filter_map(|(x, y)| colour_at(&selectable, x, y))
+            .find(|colour| colour[2] > colour[0].saturating_add(20));
+        assert!(
+            highlight.is_some(),
+            "the selected words should be painted over with the highlight"
+        );
+        drop(selectable);
 
         // On a high-resolution display the page is painted at the display's own
         // resolution rather than stretched from a smaller picture.

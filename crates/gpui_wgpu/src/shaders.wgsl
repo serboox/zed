@@ -1362,3 +1362,37 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- shared frames --- //
+//
+// A frame the graphics card already holds, lent to the window by something else
+// that drew it -- an embedded web engine, for instance. There is one texture and
+// it is already in the window's own colour order, so this only places it.
+
+@group(1) @binding(0) var<uniform> shared_frame_locals: SurfaceParams;
+@group(1) @binding(1) var t_shared_frame: texture_2d<f32>;
+@group(1) @binding(2) var s_shared_frame: sampler;
+
+@vertex
+fn vs_shared_frame(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+
+    var out = SurfaceVarying();
+    out.position = to_device_position(unit_vertex, shared_frame_locals.bounds);
+    out.texture_position = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(
+        unit_vertex,
+        shared_frame_locals.bounds,
+        shared_frame_locals.content_mask
+    );
+    return out;
+}
+
+@fragment
+fn fs_shared_frame(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let sample = textureSampleLevel(t_shared_frame, s_shared_frame, input.texture_position, 0.0);
+    return blend_color(sample, 1.0);
+}

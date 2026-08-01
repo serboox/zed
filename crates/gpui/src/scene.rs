@@ -771,6 +771,10 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// A frame the graphics card already holds, shared with this process rather
+    /// than copied into it.
+    #[cfg(target_os = "linux")]
+    pub frame: std::sync::Arc<crate::SharedFrame>,
 }
 
 impl From<PaintSurface> for Primitive {

@@ -1,4 +1,6 @@
 mod cosmic_text_system;
+#[cfg(target_os = "linux")]
+mod shared_frame_import;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;

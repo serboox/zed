@@ -20,6 +20,9 @@ default = []
 servo = [
     "dep:dpi",
     "dep:euclid",
+    "dep:gleam",
+    "dep:glow",
+    "dep:surfman",
     "dep:keyboard_types",
     "dep:primeorder",
     "dep:image",
@@ -31,6 +34,7 @@ servo = [
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 gpui.workspace = true
 log.workspace = true
 
@@ -42,6 +46,11 @@ image = { workspace = true, optional = true }
 # that do not build against the stable primeorder cargo would pick on its own.
 primeorder = { workspace = true, optional = true }
 servo = { workspace = true, optional = true }
+# The page is drawn by the graphics card through these: Servo's own offscreen
+# context asks surfman for a software adapter instead.
+gleam = { version = "0.15", optional = true }
+glow = { version = "0.17", optional = true }
+surfman = { version = "0.13", optional = true }
 smallvec = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

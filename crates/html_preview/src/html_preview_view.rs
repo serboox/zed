@@ -28,10 +28,15 @@ use workspace::{Pane, Workspace};
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
-/// How often the engine is given a turn. Thirty frames a second is plenty for
-/// reading a page, and every frame costs a full copy of it.
+/// How long the page's driver waits before looking anyway. The engine says when
+/// it has work, so this is only a safety net -- for a wake-up that was missed,
+/// and for a view that was resized without the page hearing about it.
 #[cfg(feature = "servo")]
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const HEARTBEAT: Duration = Duration::from_millis(250);
+/// The same, for a preview nobody is looking at.
+#[cfg(feature = "servo")]
+const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
+
 
 struct EditorState {
     editor: Entity<Editor>,
@@ -54,6 +59,10 @@ pub struct HtmlPreviewView {
     page: Option<html_render::HtmlPage>,
     #[cfg(feature = "servo")]
     frame: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// The page's own buffer, when the window can draw it where it lies. While
+    /// this is set, no frame is ever copied through memory.
+    #[cfg(all(feature = "servo", target_os = "linux"))]
+    shared_frame: Option<std::sync::Arc<gpui::SharedFrame>>,
     #[cfg(feature = "servo")]
     pump: Option<Task<()>>,
     /// Where the page is painted, so a click can be told where it landed and a
@@ -64,6 +73,16 @@ pub struct HtmlPreviewView {
     /// began elsewhere belongs to whoever started it.
     #[cfg(feature = "servo")]
     page_pressed: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Whether this preview is the one its pane is showing. A page nobody is
+    /// looking at is held back, and this is the pane saying so -- silence from
+    /// the renderer would not do, because a page that has settled stops being
+    /// redrawn while still very much on screen.
+    #[cfg(feature = "servo")]
+    on_screen: bool,
+    /// Text the page has been asked to hand over for the clipboard. The engine
+    /// answers on a later turn of its own loop, so the answer is left here.
+    #[cfg(feature = "servo")]
+    pending_copy: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl HtmlPreviewView {
@@ -215,12 +234,18 @@ impl HtmlPreviewView {
                 page: None,
                 #[cfg(feature = "servo")]
                 frame: None,
+                #[cfg(all(feature = "servo", target_os = "linux"))]
+                shared_frame: None,
                 #[cfg(feature = "servo")]
                 pump: None,
                 #[cfg(feature = "servo")]
                 page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
                 #[cfg(feature = "servo")]
                 page_pressed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                #[cfg(feature = "servo")]
+                on_screen: true,
+                #[cfg(feature = "servo")]
+                pending_copy: std::rc::Rc::new(std::cell::RefCell::new(None)),
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -378,20 +403,66 @@ impl HtmlPreviewView {
     /// Drives the engine while the page is open. Servo lays out, runs script and
     /// paints only while its event loop is being turned, so this is what makes
     /// the page live rather than a photograph.
+    ///
+    /// It is not turned on a timer. The engine says when it has work -- a load,
+    /// a script, an animation frame, an event we handed it -- and a page at rest
+    /// says nothing at all, which is what makes a still page free. A preview
+    /// nobody is looking at is told to hold back its animations and timers.
     #[cfg(feature = "servo")]
     fn start_pumping(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.page.as_ref().map(|page| page.engine()) else {
+            return;
+        };
         self.pump = Some(cx.spawn(async move |view, cx| {
+            let mut unseen = false;
             loop {
-                cx.background_executor().timer(FRAME_INTERVAL).await;
-                let carried_on = view.update_in(cx, |view, window, cx| {
+                // Whichever comes first: the engine saying it has work, or the
+                // safety net going off. Nothing here asks the engine again and
+                // again -- a page at rest wakes nobody and costs nothing.
+                let heartbeat = if unseen { UNSEEN_HEARTBEAT } else { HEARTBEAT };
+                smol::future::or(
+                    engine.wait_for_work(),
+                    cx.background_executor().timer(heartbeat),
+                )
+                .await;
+                let turn = view.update_in(cx, |view, window, cx| {
+                    let out_of_sight = !view.on_screen;
                     let Some(page) = view.page.as_mut() else {
-                        return false;
+                        return None;
                     };
+                    page.set_throttled(out_of_sight);
+                    if out_of_sight {
+                        return Some(true);
+                    }
                     let bounds = view.page_bounds.get();
                     if bounds.size.width > gpui::px(64.) {
                         page.resize(bounds.size, window.scale_factor());
                     }
-                    if page.pump() {
+                    let painted = page.pump();
+                    if let Some(url) = page.take_link_for_new_tab() {
+                        log::debug!("the page navigated to {url}");
+                    }
+                    // The page answers a copy request on a turn of its own, so
+                    // the answer is collected here rather than where it was
+                    // asked for. It belongs to every path through this loop.
+                    if let Some(text) = view.pending_copy.borrow_mut().take()
+                        && !text.is_empty()
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    }
+                    #[cfg(target_os = "linux")]
+                    if painted && let Some(shared) = page.shared_frame() {
+                        view.shared_frame = Some(shared);
+                        // What was copied before is not what is drawn now.
+                        if let Some(superseded) = view.frame.take()
+                            && let Err(error) = window.drop_image(superseded)
+                        {
+                            log::debug!("a superseded frame could not be released: {error:#}");
+                        }
+                        cx.notify();
+                        return Some(false);
+                    }
+                    if painted {
                         let superseded = view.frame.take();
                         view.frame = page.frame();
                         // Dropping the handle is not enough: the texture stays in
@@ -406,21 +477,25 @@ impl HtmlPreviewView {
                         }
                         cx.notify();
                     }
-                    if let Some(url) = page.take_link_for_new_tab() {
-                        log::debug!("the page navigated to {url}");
-                    }
-                    true
+                    Some(false)
                 });
-                match carried_on {
-                    Ok(true) => {}
-                    _ => break,
+                match turn {
+                    Ok(Some(out_of_sight)) => unseen = out_of_sight,
+                    // The page is gone, or the view is: either way there is
+                    // nothing left to drive.
+                    Ok(None) | Err(_) => break,
                 }
             }
         }));
     }
 
     /// Whether the engine's page is what the reader is looking at.
-    #[cfg(feature = "servo")]
+    #[cfg(all(feature = "servo", target_os = "linux"))]
+    fn showing_live_page(&self) -> bool {
+        self.frame.is_some() || self.shared_frame.is_some()
+    }
+
+    #[cfg(all(feature = "servo", not(target_os = "linux")))]
     fn showing_live_page(&self) -> bool {
         self.frame.is_some()
     }
@@ -438,14 +513,25 @@ impl HtmlPreviewView {
         root: gpui::Stateful<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        root.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, _| {
-            if let Some(page) = view.page.as_ref() {
-                page.key(servo_key(
-                    &event.keystroke,
-                    keyboard_types::KeyState::Down,
-                    event.is_held,
-                ));
+        root.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
+            let Some(page) = view.page.as_ref() else {
+                return;
+            };
+            // Copying is the editor's job, not the page's: the page is asked
+            // what is selected and the answer goes to the clipboard.
+            if asks_to_copy(&event.keystroke) {
+                let waiting = view.pending_copy.clone();
+                page.selected_text(move |text| {
+                    *waiting.borrow_mut() = Some(text);
+                });
+                cx.stop_propagation();
+                return;
             }
+            page.key(servo_key(
+                &event.keystroke,
+                keyboard_types::KeyState::Down,
+                event.is_held,
+            ));
         }))
         .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, _, _| {
             if let Some(page) = view.page.as_ref() {
@@ -487,9 +573,14 @@ impl HtmlPreviewView {
     /// case where that stops being true.
     #[cfg(feature = "servo")]
     fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(frame) = self.frame.clone() else {
+        #[cfg(target_os = "linux")]
+        let shared = self.shared_frame.clone();
+        #[cfg(not(target_os = "linux"))]
+        let shared: Option<()> = None;
+        let frame = self.frame.clone();
+        if frame.is_none() && shared.is_none() {
             return self.render_markdown_element(window, cx).into_any_element();
-        };
+        }
         let bounds_cell = self.page_bounds.clone();
         let holding = self.page_pressed.clone();
         let view = cx.entity().downgrade();
@@ -507,11 +598,19 @@ impl HtmlPreviewView {
                     }
                 }
             })
-            .child(gpui::img(gpui::ImageSource::Render(frame)).size_full())
+            .when_some(frame, |this, frame| {
+                this.child(gpui::img(gpui::ImageSource::Render(frame)).size_full())
+            })
             .child(
                 gpui::canvas(
                     |_, _, _| (),
-                    move |_, _, window, _| {
+                    move |painted_bounds, _, window, _| {
+                        // The page's own buffer, drawn where the graphics card
+                        // already holds it.
+                        #[cfg(target_os = "linux")]
+                        if let Some(shared) = shared.clone() {
+                            window.paint_shared_frame(painted_bounds, shared);
+                        }
                         let bounds = bounds_cell.get();
                         let page_point = move |position: gpui::Point<gpui::Pixels>| {
                             gpui::point(position.x - bounds.origin.x, position.y - bounds.origin.y)
@@ -552,13 +651,13 @@ impl HtmlPreviewView {
                                 if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
                                     return;
                                 }
+                                let Some(button) = servo_button(event.button) else {
+                                    return;
+                                };
                                 holding.set(true);
                                 view.update(cx, |view, _| {
                                     if let Some(page) = view.page.as_ref() {
-                                        page.mouse_down(
-                                            page_point(event.position),
-                                            servo_button(event.button),
-                                        );
+                                        page.mouse_down(page_point(event.position), button);
                                     }
                                 })
                                 .ok();
@@ -571,6 +670,9 @@ impl HtmlPreviewView {
                                 if phase != gpui::DispatchPhase::Bubble {
                                     return;
                                 }
+                                let Some(button) = servo_button(event.button) else {
+                                    return;
+                                };
                                 // Only the button the page itself is holding is
                                 // released to it; a click that began in the editor
                                 // must not finish inside the page.
@@ -579,10 +681,7 @@ impl HtmlPreviewView {
                                 }
                                 view.update(cx, |view, _| {
                                     if let Some(page) = view.page.as_ref() {
-                                        page.mouse_up(
-                                            page_point(event.position),
-                                            servo_button(event.button),
-                                        );
+                                        page.mouse_up(page_point(event.position), button);
                                     }
                                 })
                                 .ok();
@@ -860,13 +959,25 @@ fn servo_key(
     }
 }
 
-/// gpui and the engine name the mouse buttons separately.
+/// Whether a keystroke is the copy command. The page never sees it: what is
+/// selected there belongs on the editor's clipboard.
 #[cfg(feature = "servo")]
-fn servo_button(button: gpui::MouseButton) -> html_render::MouseButton {
+fn asks_to_copy(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = &keystroke.modifiers;
+    keystroke.key == "c" && (modifiers.control || modifiers.platform) && !modifiers.alt
+}
+
+/// gpui and the engine name the mouse buttons separately. A button the engine
+/// has no name for is not passed on at all: a back or forward button announced
+/// to a page as a left click starts selecting text from wherever the pointer
+/// happens to be.
+#[cfg(feature = "servo")]
+fn servo_button(button: gpui::MouseButton) -> Option<html_render::MouseButton> {
     match button {
-        gpui::MouseButton::Right => html_render::MouseButton::Right,
-        gpui::MouseButton::Middle => html_render::MouseButton::Middle,
-        _ => html_render::MouseButton::Left,
+        gpui::MouseButton::Left => Some(html_render::MouseButton::Left),
+        gpui::MouseButton::Right => Some(html_render::MouseButton::Right),
+        gpui::MouseButton::Middle => Some(html_render::MouseButton::Middle),
+        gpui::MouseButton::Navigate(_) => None,
     }
 }
 
@@ -874,11 +985,16 @@ impl Render for HtmlPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = markdown::github_page_background(cx.theme().appearance());
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
+        #[cfg(feature = "servo")]
+        {
+            self.on_screen = true;
+        }
+        let live_page = self.showing_live_page();
         let root = div()
             // The retain-all cache belongs to the Markdown rendering's images.
             // A live page replaces its frame many times a second, and keeping
             // every one of those is how a preview eats a machine's memory.
-            .when(!self.showing_live_page(), |this| {
+            .when(!live_page, |this| {
                 this.image_cache(self.image_cache.clone())
             })
             .id("HtmlPreview")
@@ -887,24 +1003,38 @@ impl Render for HtmlPreviewView {
             .size_full()
             .min_h_0()
             .bg(background);
-        Self::with_page_keys(root, cx)
-            .child(
-                WithRemSize::new(preview_font_size).size_full().child(
-                    div()
-                        .id("html-preview-scroll-container")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll_handle)
-                        .p_4()
-                        .child(self.render_page(window, cx)),
-                ),
-            )
-            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+        let root = Self::with_page_keys(root, cx);
+        // A live page scrolls itself and draws its own scrollbar. Wrapping it in
+        // a scroll container gives one document two scrollers, and they fight:
+        // the wheel moves both, and the picture slides under the pointer.
+        if live_page {
+            return root.child(self.render_page(window, cx)).into_any_element();
+        }
+        root.child(
+            WithRemSize::new(preview_font_size).size_full().child(
+                div()
+                    .id("html-preview-scroll-container")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .p_4()
+                    .child(self.render_page(window, cx)),
+            ),
+        )
+        .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+        .into_any_element()
     }
 }
 
 impl Item for HtmlPreviewView {
     type Event = ();
+
+    /// The pane has moved on to another tab. Whatever page this preview holds is
+    /// now behind it, and is told to hold back until it is looked at again.
+    #[cfg(feature = "servo")]
+    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.on_screen = false;
+    }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::FileDoc))

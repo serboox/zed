@@ -92,6 +92,8 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    #[cfg(target_os = "linux")]
+    shared_frames: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -99,6 +101,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    #[cfg(target_os = "linux")]
+    shared_frames: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -158,6 +162,25 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Frames another process lent this window, wrapped as textures. Wrapping is
+    /// cheap but not free, and the same buffers come back frame after frame, so
+    /// each is wrapped once and kept until it stops arriving.
+    #[cfg(target_os = "linux")]
+    shared_frames: RefCell<collections::HashMap<usize, SharedFrameTexture>>,
+}
+
+/// A frame lent by another process, as this window sees it.
+#[cfg(target_os = "linux")]
+struct SharedFrameTexture {
+    /// Kept for as long as the view is: dropping it takes the texture's memory
+    /// with it.
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// The frame it was made from, held so the buffer outlives the texture. It
+    /// is also how the cache knows the frame is still in use: when nobody else
+    /// holds it, this entry is the last one and can go.
+    frame: Arc<gpui::SharedFrame>,
 }
 
 impl WgpuRenderer {
@@ -488,6 +511,8 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            #[cfg(target_os = "linux")]
+            shared_frames: RefCell::new(collections::HashMap::default()),
         })
     }
 
@@ -607,11 +632,50 @@ impl WgpuRenderer {
             ],
         });
 
+        // A frame lent by another process is one plain texture, not the pair of
+        // planes a video frame arrives as.
+        #[cfg(target_os = "linux")]
+        let shared_frames = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shared_frames_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<SurfaceParams>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             instances_with_texture,
             surfaces,
+            #[cfg(target_os = "linux")]
+            shared_frames,
         }
     }
 
@@ -872,6 +936,19 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        #[cfg(target_os = "linux")]
+        let shared_frames = create_pipeline(
+            "shared_frames",
+            "vs_shared_frame",
+            "fs_shared_frame",
+            &layouts.globals,
+            &layouts.shared_frames,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -887,6 +964,8 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            #[cfg(target_os = "linux")]
+            shared_frames,
         }
     }
 
@@ -1304,6 +1383,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
+                        #[cfg(target_os = "linux")]
+                        PrimitiveBatch::Surfaces(range) => {
+                            self.draw_shared_frames(&scene.surfaces[range], &mut pass)
+                        }
+                        #[cfg(not(target_os = "linux"))]
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
@@ -1448,6 +1532,83 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    /// Draws frames another process lent this window. Each is sampled where the
+    /// graphics card already holds it: nothing is read back, nothing is uploaded,
+    /// and a frame that cannot be shared is simply not drawn -- whoever produced
+    /// it is expected to notice and fall back to handing over pixels instead.
+    #[cfg(target_os = "linux")]
+    fn draw_shared_frames(
+        &self,
+        surfaces: &[gpui::PaintSurface],
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        for surface in surfaces {
+            let key = Arc::as_ptr(&surface.frame) as usize;
+            let mut cache = self.shared_frames.borrow_mut();
+            if let collections::hash_map::Entry::Vacant(slot) = cache.entry(key) {
+                let Some(texture) = crate::shared_frame_import::import_shared_frame(
+                    &self.resources().device,
+                    &surface.frame,
+                ) else {
+                    continue;
+                };
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                slot.insert(SharedFrameTexture {
+                    texture,
+                    view,
+                    frame: surface.frame.clone(),
+                });
+            }
+            let Some(entry) = cache.get(&key) else {
+                continue;
+            };
+
+            let resources = self.resources();
+            let locals = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+            };
+            let uniform = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shared_frame_locals"),
+                size: std::mem::size_of::<SurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&uniform, 0, bytemuck::bytes_of(&locals));
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shared_frame"),
+                    layout: &resources.bind_group_layouts.shared_frames,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&entry.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+            pass.set_pipeline(&resources.pipelines.shared_frames);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        // A frame nobody but this cache still holds has stopped arriving.
+        self.shared_frames
+            .borrow_mut()
+            .retain(|_, entry| Arc::strong_count(&entry.frame) > 1);
+        true
     }
 
     fn draw_instances(

@@ -17,7 +17,9 @@ APP_ROOT="/opt/${PACKAGE_NAME}.app"
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 version="$(script/get-crate-version zed)"
-commit="$(git rev-parse HEAD | cut -c 1-7)"
+# The builder may hold a copy of the tree rather than a checkout, so the commit
+# can be handed in; a package is still a package without one.
+commit="${FORK_COMMIT:-$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)}"
 architecture="$(uname -m)"
 
 # shellcheck disable=SC2086
@@ -26,22 +28,17 @@ cargo build --profile "${PROFILE}" --package zed --package cli ${CARGO_ARGS}
 stage="$(mktemp -d)"
 trap 'rm -rf "${stage}"' EXIT
 app="${stage}${APP_ROOT}"
-mkdir -p "${app}/bin" "${app}/libexec" "${app}/lib"
+mkdir -p "${app}/bin" "${app}/libexec"
 
 cp "${target_dir}/${PROFILE}/zed" "${app}/libexec/zed-editor"
 cp "${target_dir}/${PROFILE}/cli" "${app}/bin/${PACKAGE_NAME}"
 strip --strip-debug "${app}/libexec/zed-editor" "${app}/bin/${PACKAGE_NAME}" || true
 
-# The same libraries the project's own bundle carries, so a machine with an
-# older toolchain than the builder still starts the editor. What is left out is
-# what every distribution has and what must come from the running system.
-libraries="$(ldd "${target_dir}/${PROFILE}/zed" |
-    cut -d' ' -f3 |
-    grep '^/' |
-    grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' || true)"
-if [ -n "${libraries}" ]; then
-    echo "${libraries}" | xargs cp -t "${app}/lib"
-fi
+# No libraries are carried along. The project's own bundle does carry them, but
+# it also links with `-rpath,$ORIGIN/../lib` to make them findable; this build
+# does not, so a copy beside the binary would never be loaded -- outside
+# flatpak, nothing here touches LD_LIBRARY_PATH -- and would only add forty
+# megabytes to every package.
 
 icons="${stage}/usr/share/icons/hicolor"
 mkdir -p "${icons}/512x512/apps" "${icons}/1024x1024/apps"

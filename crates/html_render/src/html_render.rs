@@ -13,12 +13,17 @@
 use primeorder as _;
 
 #[cfg(feature = "servo")]
+mod dma_buf_export;
+#[cfg(feature = "servo")]
+mod gpu_surface;
+
+#[cfg(feature = "servo")]
 mod engine {
+    use crate::gpu_surface::GpuSurface;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use anyhow::{Context as _, Result, anyhow};
     use dpi::PhysicalSize;
@@ -26,8 +31,8 @@ mod engine {
     use servo::{
         DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent, LoadStatus, MouseButton,
         MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, RgbaImage, Servo,
-        ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
-        WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+        ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+        WheelEvent, WheelMode,
     };
     use smallvec::SmallVec;
 
@@ -42,6 +47,11 @@ mod engine {
     /// its own thread pool, so a second instance is neither cheap nor safe.
     pub struct HtmlEngine {
         servo: Servo,
+        /// Told whenever the engine has work to do. Servo drives its embedder
+        /// this way -- a page at rest never asks for anything -- which is why
+        /// nothing here polls it on a timer.
+        woken: async_channel::Receiver<()>,
+        tell: async_channel::Sender<()>,
     }
 
     impl HtmlEngine {
@@ -50,10 +60,15 @@ mod engine {
             if let Some(engine) = cx.try_global::<GlobalHtmlEngine>() {
                 return engine.0.clone();
             }
+            // One is enough: a second pending wake-up says nothing the first
+            // one did not, so the sender drops it rather than queueing work.
+            let (tell, woken) = async_channel::bounded(1);
             let engine = Rc::new(Self {
                 servo: ServoBuilder::default()
-                    .event_loop_waker(Box::new(Waker(Arc::new(AtomicBool::new(false)))))
+                    .event_loop_waker(Box::new(Waker(tell.clone())))
                     .build(),
+                woken,
+                tell,
             });
             cx.set_global(GlobalHtmlEngine(engine.clone()));
             engine
@@ -64,13 +79,25 @@ mod engine {
         pub fn spin(&self) {
             self.servo.spin_event_loop();
         }
+
+        /// Waits until the engine has something to do. Whoever drives a page
+        /// awaits this instead of asking again and again.
+        pub async fn wait_for_work(&self) {
+            self.woken.recv().await.ok();
+        }
+
+        /// Says there is work without waiting for the engine to say so. Handing
+        /// the engine an event or a script is work it has not noticed yet.
+        pub fn nudge(&self) {
+            self.tell.try_send(()).ok();
+        }
     }
 
     /// One live page. Holds its own surface, so two previews never draw over one
     /// another, and hands out the latest frame the engine painted.
     pub struct HtmlPage {
         engine: Rc<HtmlEngine>,
-        rendering_context: Rc<SoftwareRenderingContext>,
+        rendering_context: Rc<GpuSurface>,
         webview: WebView,
         delegate: Rc<PageDelegate>,
         size: PhysicalSize<u32>,
@@ -81,6 +108,11 @@ mod engine {
         scale: f32,
         /// The view the picture is drawn across, in editor pixels.
         viewport: Size<Pixels>,
+        /// Whether the engine has been told to hold this page back.
+        throttled: bool,
+        /// Whether the window draws this page's own buffer. While it does, there
+        /// is no reason to read the frame back into memory at all.
+        shared: bool,
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
@@ -103,10 +135,9 @@ mod engine {
             let size = surface_size(size, scale);
             // Surfman panics rather than reporting when there is no EGL to talk
             // to. A preview is not worth a crash, so the panic is caught.
-            let rendering_context =
-                std::panic::catch_unwind(|| SoftwareRenderingContext::new(size))
-                    .map_err(|_| anyhow!("this platform has no rendering surface for HTML"))?
-                    .map_err(|error| anyhow!("no rendering surface for HTML: {error:?}"))?;
+            let rendering_context = std::panic::catch_unwind(|| GpuSurface::new(size))
+                .map_err(|_| anyhow!("this platform has no rendering surface for HTML"))?
+                .map_err(|error| anyhow!("no rendering surface for HTML: {error:?}"))?;
             let rendering_context = Rc::new(rendering_context);
             rendering_context
                 .make_current()
@@ -130,6 +161,8 @@ mod engine {
                 size,
                 scale,
                 viewport,
+                throttled: false,
+                shared: false,
                 frame: None,
                 document,
             })
@@ -172,6 +205,13 @@ mod engine {
             if !self.delegate.painted.replace(false) {
                 return false;
             }
+            if self.shared {
+                // The window samples the page's own buffer; copying it here
+                // would be the very cost this avoids. What it does need is for
+                // the drawing to be finished before the window reads it.
+                self.rendering_context.finish_drawing();
+                return true;
+            }
             let rect = DeviceIntRect::from_size(euclid::Size2D::new(
                 self.size.width as i32,
                 self.size.height as i32,
@@ -187,6 +227,23 @@ mod engine {
 
         pub fn frame(&self) -> Option<Arc<RenderImage>> {
             self.frame.clone()
+        }
+
+        /// The engine behind this page, for whoever drives it.
+        pub fn engine(&self) -> Rc<HtmlEngine> {
+            self.engine.clone()
+        }
+
+        /// The frame the window can draw without a copy, when this machine
+        /// allows it. `None` means the frame has to be handed over as pixels.
+        pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
+            let frame = self.rendering_context.shared_frame()?;
+            if !self.shared {
+                self.shared = true;
+                // Whatever was copied before is not what the window draws now.
+                self.frame = None;
+            }
+            Some(frame)
         }
 
         /// Makes this page's surface the one the engine draws into and reads
@@ -214,6 +271,7 @@ mod engine {
                 .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
                     self.device(point),
                 )));
+            self.engine.nudge();
         }
 
         pub fn mouse_down(&self, point: Point<Pixels>, button: MouseButton) {
@@ -223,6 +281,7 @@ mod engine {
                     button,
                     self.device(point),
                 )));
+            self.engine.nudge();
         }
 
         pub fn mouse_up(&self, point: Point<Pixels>, button: MouseButton) {
@@ -232,37 +291,66 @@ mod engine {
                     button,
                     self.device(point),
                 )));
+            self.engine.nudge();
         }
 
-        /// Both halves of a wheel turn: the event a script can see, and the
-        /// scroll the compositor performs.
+        /// A turn of the wheel. The engine scrolls the page from this event by
+        /// itself, so this is the whole of it: asking the compositor to scroll
+        /// as well moved every page twice as far as it was told to.
         pub fn scrolled(&self, point: Point<Pixels>, delta: Point<Pixels>) {
             let (horizontal, vertical) = self.painted_scale();
-            let (x, y) = (
-                (f32::from(delta.x) * horizontal) as f64,
-                (f32::from(delta.y) * vertical) as f64,
-            );
             self.webview
                 .notify_input_event(InputEvent::Wheel(WheelEvent::new(
                     WheelDelta {
-                        x,
-                        y,
+                        x: (f32::from(delta.x) * horizontal) as f64,
+                        y: (f32::from(delta.y) * vertical) as f64,
                         z: 0.,
                         mode: WheelMode::DeltaPixel,
                     },
                     self.device(point),
                 )));
-            self.webview.notify_scroll_event(
-                servo::Scroll::Delta(servo::WebViewVector::Device(servo::DeviceVector2D::new(
-                    x as f32, y as f32,
-                ))),
-                self.device(point),
+            self.engine.nudge();
+        }
+
+        /// Runs a script in the page and hands back what it evaluated to, as
+        /// text. The answer comes through the engine's own event loop, so it
+        /// arrives on a later turn rather than from this call.
+        pub fn evaluate(&self, script: &str, deliver: impl FnOnce(String) + 'static) {
+            self.engine.nudge();
+            self.webview
+                .evaluate_javascript(script, move |result| match result {
+                    Ok(servo::JSValue::String(text)) => deliver(text),
+                    Ok(other) => deliver(format!("{other:?}")),
+                    Err(error) => {
+                        log::warn!("the page would not run a script: {error:?}");
+                        deliver(String::new())
+                    }
+                });
+        }
+
+        /// Asks the page for the text the reader has selected.
+        pub fn selected_text(&self, deliver: impl FnOnce(String) + 'static) {
+            self.evaluate(
+                "window.__zedSelection ? window.__zedSelection.text() : ''",
+                deliver,
             );
+        }
+
+        /// Lets a page that nobody is looking at stop working: the engine holds
+        /// back its animations and timers, the way a browser does with a tab in
+        /// the background.
+        pub fn set_throttled(&mut self, throttled: bool) {
+            if self.throttled == throttled {
+                return;
+            }
+            self.throttled = throttled;
+            self.webview.set_throttled(throttled);
         }
 
         pub fn key(&self, event: keyboard_types::KeyboardEvent) {
             self.webview
                 .notify_input_event(InputEvent::Keyboard(servo::KeyboardEvent::new(event)));
+            self.engine.nudge();
         }
 
         /// Device pixels per editor pixel, taken from the sizes themselves. It
@@ -310,7 +398,8 @@ mod engine {
         }
     }
 
-    /// gpui wants premultiplied BGRA frames; Servo hands out RGBA.
+    /// gpui draws premultiplied BGRA; the surface is read as RGBA, because that
+    /// is the one format every OpenGL and GLES driver will read back.
     fn render_image(mut image: RgbaImage) -> RenderImage {
         for pixel in image.pixels_mut() {
             pixel.0.swap(0, 2);
@@ -326,6 +415,10 @@ mod engine {
         path: std::path::PathBuf,
     }
 
+    /// Mouse selection, implemented in the page itself because the engine has no
+    /// selection to offer outside form fields.
+    const SELECTION_SHIM: &str = include_str!("selection.js");
+
     impl PageFile {
         fn write(html: &str, base_directory: Option<&Path>) -> Result<Self> {
             let directory = tempfile::tempdir().context("creating a directory for the page")?;
@@ -335,6 +428,8 @@ mod engine {
                     Some(base) => format!("<base href=\"{base}\">\n{html}"),
                     None => html.to_string(),
                 };
+            // Last, so the document it works on is already built.
+            let document = format!("{document}\n<script>{SELECTION_SHIM}</script>\n");
             std::fs::write(&path, document).context("writing the page for the engine to load")?;
             Ok(Self {
                 _directory: directory,
@@ -388,7 +483,7 @@ mod engine {
     }
 
     #[derive(Clone)]
-    struct Waker(Arc<AtomicBool>);
+    struct Waker(async_channel::Sender<()>);
 
     impl EventLoopWaker for Waker {
         fn clone_box(&self) -> Box<dyn EventLoopWaker> {
@@ -396,7 +491,9 @@ mod engine {
         }
 
         fn wake(&self) {
-            self.0.store(true, Ordering::Relaxed);
+            // Called from the engine's own threads. A full channel already
+            // carries the same message, and nothing here may block.
+            self.0.try_send(()).ok();
         }
     }
 }
