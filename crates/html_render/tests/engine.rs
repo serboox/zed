@@ -430,7 +430,123 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
+
+        if std::env::var("ZED_HTML_BENCH").is_ok() {
+            how_long_a_frame_takes(cx);
+        }
     });
+}
+
+/// What a frame actually costs, at the size a preview really is. Not part of the
+/// checks -- it asserts nothing and only runs when asked for -- but the numbers
+/// are the only way to tell which of the two paths is worth having.
+fn how_long_a_frame_takes(cx: &mut gpui::App) {
+    let (width, height) = (1377., 658.);
+    let paragraphs = (0..60)
+        .map(|number| {
+            format!(
+                "<p style=\"font:16px sans-serif;margin:8px\">Paragraph {number} of a page that \
+                 is long enough to lay out, wrap and paint in earnest, with enough words in it \
+                 that the engine cannot pretend there is nothing to do.</p>"
+            )
+        })
+        .collect::<String>();
+    let Some(mut heavy) = page(
+        &document("background:#fff;color:#111", &paragraphs),
+        width,
+        height,
+        2.,
+        cx,
+    ) else {
+        return;
+    };
+    wait_for_colour(&mut heavy, [255, 255, 255], "a page to measure");
+
+    // Something has to change, or the engine settles and there is nothing to
+    // time. What is measured is the whole way round: ask the page for a change,
+    // and wait until a frame holding it is ready.
+    let mut frames = Vec::new();
+    let mut missed = 0;
+    for step in 0..40 {
+        heavy.evaluate(
+            &format!("document.body.style.marginTop = '{}px'", step % 7),
+            |_| {},
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        loop {
+            if heavy.pump() {
+                frames.push(started.elapsed());
+                break;
+            }
+            if Instant::now() > deadline {
+                missed += 1;
+                break;
+            }
+        }
+    }
+    report("a change to the page", width, height, &mut frames, missed);
+
+    // What the reader actually does: turn the wheel and move the pointer.
+    let mut scrolls = Vec::new();
+    for _ in 0..40 {
+        heavy.scrolled(
+            gpui::point(px(200.), px(200.)),
+            gpui::point(px(0.), px(-60.)),
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        loop {
+            if heavy.pump() {
+                scrolls.push(started.elapsed());
+                break;
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+    }
+    report("a turn of the wheel", width, height, &mut scrolls, 0);
+
+    let mut moves = Vec::new();
+    heavy.mouse_down(gpui::point(px(20.), px(20.)), MouseButton::Left);
+    for step in 0..40 {
+        heavy.mouse_moved(gpui::point(px(20. + step as f32 * 8.), px(40.)));
+        let started = Instant::now();
+        pump_for(&mut heavy, Duration::from_millis(0));
+        heavy.pump();
+        moves.push(started.elapsed());
+    }
+    heavy.mouse_up(gpui::point(px(340.), px(40.)), MouseButton::Left);
+    report(
+        "a pointer moved while selecting",
+        width,
+        height,
+        &mut moves,
+        0,
+    );
+}
+
+fn report(what: &str, width: f32, height: f32, taken: &mut Vec<Duration>, missed: usize) {
+    if taken.is_empty() {
+        println!("BENCH: {what} never finished");
+        return;
+    }
+    let frames = taken;
+    frames.sort();
+    let at = |part: f64| frames[((frames.len() as f64 - 1.0) * part) as usize];
+    let total: Duration = frames.iter().sum();
+    println!(
+        "BENCH: {what} at {}x{} device pixels: {} times, {missed} unanswered; {:?} at the \
+         middle, {:?} at nine in ten, {:?} at worst, {:.1} a second",
+        width as u32 * 2,
+        height as u32 * 2,
+        frames.len(),
+        at(0.5),
+        at(0.9),
+        at(1.0),
+        frames.len() as f64 / total.as_secs_f64()
+    );
 }
 
 /// A machine whose driver will allocate a buffer both sides can use hands the
@@ -448,7 +564,11 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
             "<div style=\"height:32px;background:rgb(255,0,0)\"></div>\
              <div style=\"height:32px;background:rgb(0,0,255)\"></div>",
         ),
-        64.,
+        // A width that is not a round number of pixels is the case that broke
+        // in the editor: the allocator rounds a row up and the window does not,
+        // so the page has to be given a buffer wide enough that neither has
+        // anything left to round.
+        100.,
         64.,
         1.,
         cx,
@@ -471,8 +591,18 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
     };
     assert_eq!(
         (frame.width, frame.height),
-        (64, 64),
-        "the lent buffer should be the size of the page"
+        (100, 64),
+        "the picture should be the size of the page"
+    );
+    assert!(
+        frame.buffer_width >= frame.width,
+        "the buffer cannot be narrower than the picture in it"
+    );
+    assert_eq!(
+        frame.stride,
+        frame.buffer_width * 4,
+        "the window works out a row's length from the buffer's width alone, so \
+         a buffer whose rows are any longer than that cannot be drawn"
     );
     assert_eq!(
         frame.modifier, 0,

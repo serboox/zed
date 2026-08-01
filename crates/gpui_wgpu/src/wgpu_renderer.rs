@@ -51,7 +51,10 @@ struct SharedFrameParams {
     content_mask: PodBounds,
     /// Whether the buffer's first row is the bottom of the picture.
     bottom_up: u32,
-    padding: [u32; 3],
+    /// How much of each row is the picture, the rest being padding the producer
+    /// added so that both sides agree where a row starts.
+    across: f32,
+    padding: [u32; 2],
 }
 
 #[repr(C)]
@@ -1583,7 +1586,9 @@ impl WgpuRenderer {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
                 bottom_up: surface.frame.bottom_up as u32,
-                padding: [0; 3],
+                across: surface.frame.width as f32
+                    / surface.frame.buffer_width.max(surface.frame.width) as f32,
+                padding: [0; 2],
             };
             let uniform = resources.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("shared_frame_locals"),

@@ -58,6 +58,12 @@ const EGL_PLANE0_PITCH: i32 = 0x3274;
 const EGL_PLANE0_MODIFIER_LOW: i32 = 0x3443;
 const EGL_PLANE0_MODIFIER_HIGH: i32 = 0x3444;
 
+/// How many pixels wide a buffer is rounded up to. Four bytes each makes 256,
+/// which is what the allocator rounds a row up to anyway -- asking for a width
+/// it does not have to pad is what makes the window and the allocator agree on
+/// where each row starts.
+const WIDTH_STEP: u32 = 64;
+
 /// One buffer, drawn into by the page and read by the window.
 pub(crate) struct SharedBuffer {
     buffer: *mut c_void,
@@ -67,6 +73,8 @@ pub(crate) struct SharedBuffer {
     pub(crate) descriptor: OwnedFd,
     pub(crate) stride: u32,
     pub(crate) offset: u32,
+    /// How wide the buffer really is. The page sits at the left of it.
+    pub(crate) width: u32,
 }
 
 impl SharedBuffers {
@@ -228,6 +236,7 @@ impl SharedBuffers {
         if width == 0 || height == 0 {
             return None;
         }
+        let width = width.div_ceil(WIDTH_STEP) * WIDTH_STEP;
         #[allow(unsafe_code)]
         unsafe {
             let buffer =
@@ -243,6 +252,17 @@ impl SharedBuffers {
             let descriptor = OwnedFd::from_raw_fd(raw);
             let stride = (self.buffer_stride)(buffer);
             let offset = (self.buffer_offset)(buffer, 0);
+            if stride != width * 4 || offset != 0 {
+                // The whole point of the rounded-up width is that the allocator
+                // has nothing left to pad. One that pads anyway lays its rows
+                // out where the window will not look for them.
+                log::info!(
+                    "the allocator puts a {width}-pixel row in {stride} bytes from {offset}, \
+                     which the window would not read; frames will be copied"
+                );
+                (self.destroy_buffer)(buffer);
+                return None;
+            }
 
             // Every value here is a 32-bit EGL integer: this is the older
             // entry point, not the one that takes machine-word attributes.
@@ -282,6 +302,7 @@ impl SharedBuffers {
                 descriptor,
                 stride,
                 offset,
+                width,
             })
         }
     }

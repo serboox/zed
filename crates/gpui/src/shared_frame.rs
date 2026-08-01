@@ -17,10 +17,14 @@ use crate::{DevicePixels, Size, size};
 pub struct SharedFrame {
     /// The buffer itself, as the graphics driver hands it out.
     pub descriptor: OwnedFd,
-    /// How wide the frame is, in device pixels.
+    /// How wide the picture is, in device pixels.
     pub width: u32,
     /// How tall the frame is, in device pixels.
     pub height: u32,
+    /// How wide the buffer holding it is, in device pixels. The picture sits at
+    /// the left of it: a producer may hand over a wider buffer so that both
+    /// sides work out the same distance between rows.
+    pub buffer_width: u32,
     /// Bytes from the start of one row of pixels to the start of the next.
     pub stride: u32,
     /// Where the first row starts within the buffer.

@@ -43,8 +43,10 @@ pub fn import_shared_frame(device: &wgpu::Device, frame: &SharedFrame) -> Option
         return None;
     }
     let format = texture_format(frame.format)?;
+    // The whole buffer is wrapped, picture and padding alike; which part of it
+    // is the picture is the shader's business.
     let size = wgpu::Extent3d {
-        width: frame.width,
+        width: frame.buffer_width.max(frame.width),
         height: frame.height,
         depth_or_array_layers: 1,
     };

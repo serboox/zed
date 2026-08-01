@@ -1375,6 +1375,8 @@ struct SharedFrameParams {
     // Whether the buffer's first row is the bottom of the picture, as OpenGL
     // hands it over.
     bottom_up: u32,
+    // How much of each row is the picture rather than the producer's padding.
+    across: f32,
 }
 
 @group(1) @binding(0) var<uniform> shared_frame_locals: SharedFrameParams;
@@ -1387,9 +1389,10 @@ fn vs_shared_frame(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, shared_frame_locals.bounds);
+    let across = unit_vertex.x * shared_frame_locals.across;
     out.texture_position = select(
-        unit_vertex,
-        vec2<f32>(unit_vertex.x, 1.0 - unit_vertex.y),
+        vec2<f32>(across, unit_vertex.y),
+        vec2<f32>(across, 1.0 - unit_vertex.y),
         shared_frame_locals.bottom_up != 0u
     );
     out.clip_distances = distance_from_clip_rect(

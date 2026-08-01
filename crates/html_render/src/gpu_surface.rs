@@ -314,6 +314,13 @@ impl GpuSurface {
         if self.cannot_share.get() {
             return None;
         }
+        // An escape hatch, and the way the two paths are compared: a machine
+        // where lending the buffer goes wrong can be told to copy instead.
+        if std::env::var("ZED_HTML_PAGE_SHARING").as_deref() == Ok("0") {
+            log::info!("frame sharing is switched off, so frames are copied");
+            self.cannot_share.set(true);
+            return None;
+        }
         let size = self.size.get();
         let frame = match self.lend_own_memory(size) {
             Some(frame) => frame,
@@ -353,6 +360,7 @@ impl GpuSurface {
             descriptor,
             width: size.width,
             height: size.height,
+            buffer_width: buffer.width,
             stride: buffer.stride,
             offset: buffer.offset,
             format: crate::shared_buffer::FORMAT_ABGR8888,
@@ -370,10 +378,24 @@ impl GpuSurface {
             .exporter
             .as_ref()?
             .export(self.target.borrow().texture)?;
+        // The driver's own texture may have longer rows than the page is wide.
+        // The window works a row's length out from the width it is given, so it
+        // is told how wide the rows really are, and which part of them is the
+        // page.
+        let across = exported.stride / 4;
+        if exported.stride % 4 != 0 || across < size.width {
+            log::info!(
+                "the page's texture has {}-byte rows, which do not hold {} pixels",
+                exported.stride,
+                size.width
+            );
+            return None;
+        }
         Some(SharedFrame {
             descriptor: exported.descriptor,
             width: size.width,
             height: size.height,
+            buffer_width: across,
             stride: exported.stride,
             offset: exported.offset,
             format: exported.format,
