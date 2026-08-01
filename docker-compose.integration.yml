@@ -1,0 +1,200 @@
+# Local integration-test stack for db_client's providers (mysql.rs,
+# postgres.rs, cassandra_provider.rs, mongo_provider.rs, redis_provider.rs,
+# aerospike_provider.rs, clickhouse.rs). Every host port is offset from the
+# database's default port so this stack never collides with a real,
+# separately-managed local install of the same database.
+#
+# The project also has a `compose.yml` (LiveKit/blob store for the collab
+# server) -- Docker Compose prefers that name over `docker-compose.yml` when
+# both exist, so this file uses a distinct name and must be selected with
+# `-f` explicitly to avoid silently running the wrong stack.
+#
+# Usage:
+#   docker compose -f docker-compose.integration.yml up -d
+#   MYSQL_TEST_URL=mysql://root:toor@127.0.0.1:13306/instruments \
+#   POSTGRES_TEST_URL=postgres://root:toor@127.0.0.1:15432/test_db \
+#   CASSANDRA_TEST_URL=cassandra://cassandra:cassandra@127.0.0.1:19042 \
+#   MONGO_TEST_URL=mongodb://127.0.0.1:27018 \
+#   REDIS_TEST_URL=redis://127.0.0.1:16379 \
+#   CLICKHOUSE_TEST_URL=clickhouse://default:@127.0.0.1:18123 \
+#     cargo test -p db_client -- --ignored
+#   docker compose -f docker-compose.integration.yml down
+
+name: zed-db-integration
+
+services:
+  mysql:
+    image: mysql:8.4
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      - MYSQL_ROOT_PASSWORD=toor
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./.docker/mysql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-ptoor", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  postgres:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=toor
+      - POSTGRES_DB=test_db
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./.docker/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=root"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  scylla:
+    # Pinned below the version that made tablet replication the default for
+    # new keyspaces: db_client's integration tests create scratch keyspaces
+    # with `SimpleStrategy`, which newer ScyllaDB releases reject outright
+    # ("SimpleStrategy doesn't support tablet replication") even with
+    # `--enable-tablets false` passed on the command line.
+    image: scylladb/scylla:5.4.9
+    command: >-
+      --smp 1
+      --memory 750M
+      --reserve-memory 0
+      --overprovisioned 1
+      --developer-mode 1
+    ports:
+      - "19042:9042"
+    volumes:
+      - scylla_data:/var/lib/scylla
+      - ./.docker/scylla:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  mongo:
+    # No root user/auth: db_client's mongo_provider integration test connects
+    # without credentials (MONGO_TEST_URL has no userinfo component) and
+    # needs privileged commands like dropDatabase to work unauthenticated.
+    image: mongo:7.0
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./.docker/mongo:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+
+  aerospike:
+    image: aerospike/aerospike-server:latest
+    ports:
+      - "13000-13002:3000-3002"
+    ulimits:
+      nofile:
+        soft: 20000
+        hard: 20000
+    environment:
+      - NAMESPACE=test_db
+      - SERVICE_ADDRESS=any
+      - SERVICE_PORT=3000
+      - MEM_GB=1
+      - STORAGE_GB=1
+    healthcheck:
+      test: ["CMD-SHELL", "asinfo -v build || exit 1"]
+      interval: 5s
+      timeout: 30s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_DB=test_db
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./.docker/clickhouse:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+volumes:
+  mysql_data:
+    driver: local
+  postgres_data:
+    driver: local
+  scylla_data:
+    driver: local
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+  clickhouse_data:
+    driver: local
