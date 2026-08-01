@@ -25,6 +25,8 @@ use ui::{Tooltip, WithScrollbar, prelude::*};
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
+#[cfg(feature = "servo")]
+use crate::NewBrowserTab;
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -124,6 +126,15 @@ impl HtmlPreviewView {
             }
         });
 
+        #[cfg(feature = "servo")]
+        workspace.register_action(move |workspace, _: &NewBrowserTab, window, cx| {
+            let view = Self::create_browser_tab(workspace, window, cx);
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.add_item(Box::new(view), true, true, None, window, cx);
+            });
+            cx.notify();
+        });
+
         workspace.register_action(move |workspace, _: &OpenPreviewToTheSide, window, cx| {
             if let Some(editor) = Self::resolve_active_item_as_html_editor(workspace, cx) {
                 let view = Self::create_html_view(workspace, editor.clone(), window, cx);
@@ -219,8 +230,46 @@ impl HtmlPreviewView {
             .and_then(|view| pane.index_for_item(&view))
     }
 
+    /// A page with nothing behind it: the reader types where to go. It is the
+    /// same preview in every other way -- the same engine, the same address bar,
+    /// the same page -- only without a document of the editor's to follow.
+    #[cfg(feature = "servo")]
+    fn create_browser_tab(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let language_registry = workspace.project().read(cx).languages().clone();
+        let weak = workspace.weak_handle();
+        let view = Self::new_empty(weak, language_registry, window, cx);
+        view.update(cx, |view, cx| {
+            // A page of nothing, so the engine is up and the reader has only to
+            // type. Sending this through the address bar's own reading of what
+            // is typed would have searched for the words "about:blank".
+            view.open_the_page(url::Url::parse("about:blank").ok(), window, cx);
+            view.address.focus_handle(cx).focus(window, cx);
+        });
+        view
+    }
+
     pub fn new(
         active_editor: Entity<Editor>,
+        workspace: WeakEntity<Workspace>,
+        language_registry: Arc<LanguageRegistry>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::build(
+            Some(active_editor),
+            workspace,
+            language_registry,
+            window,
+            cx,
+        )
+    }
+
+    fn build(
+        active_editor: Option<Entity<Editor>>,
         workspace: WeakEntity<Workspace>,
         language_registry: Arc<LanguageRegistry>,
         window: &mut Window,
@@ -287,9 +336,54 @@ impl HtmlPreviewView {
                 }
             })
             .detach();
-            this.set_editor(active_editor, window, cx);
+            if let Some(active_editor) = active_editor {
+                this.set_editor(active_editor, window, cx);
+            }
             this
         })
+    }
+
+    /// The same preview with no document behind it, for a page the reader goes
+    /// to rather than one the editor holds.
+    #[cfg(feature = "servo")]
+    pub fn new_empty(
+        workspace: WeakEntity<Workspace>,
+        language_registry: Arc<LanguageRegistry>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::build(None, workspace, language_registry, window, cx)
+    }
+
+    /// Sends the page somewhere, starting the engine if this preview has not
+    /// needed it yet.
+    #[cfg(feature = "servo")]
+    fn open_the_page(
+        &mut self,
+        going: Option<url::Url>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(going) = going else {
+            return;
+        };
+        if let Some(page) = self.page.as_mut() {
+            page.go_to(going);
+            return;
+        }
+        let bounds = self.page_bounds.get();
+        let size = match bounds.size.width > gpui::px(64.) {
+            true => bounds.size,
+            false => gpui::size(gpui::px(900.), gpui::px(700.)),
+        };
+        match html_render::HtmlPage::open_at(going, size, page_scale(window, cx), cx) {
+            Ok(page) => {
+                self.page = Some(page);
+                self.start_pumping(cx);
+                cx.notify();
+            }
+            Err(error) => log::warn!("the HTML engine did not open the page: {error:#}"),
+        }
     }
 
     fn set_editor(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {

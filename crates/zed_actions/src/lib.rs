@@ -984,6 +984,9 @@ pub mod preview {
                 OpenPreview,
                 /// Opens an HTML preview in a split pane.
                 OpenPreviewToTheSide,
+                /// Opens an empty page with an address bar, for reading the web
+                /// beside the code.
+                NewBrowserTab,
             ]
         );
     }

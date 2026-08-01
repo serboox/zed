@@ -227,6 +227,20 @@ mod engine {
             })
         }
 
+        /// Opens a page straight at an address, with no document of our own
+        /// behind it. What it arrives at is somebody else's page, so our own
+        /// script is put in once it has settled.
+        pub fn open_at(
+            url: url::Url,
+            size: Size<Pixels>,
+            scale: f32,
+            cx: &mut App,
+        ) -> Result<Self> {
+            let mut page = Self::open(SharedString::default(), None, size, scale, cx)?;
+            page.go_to(url);
+            Ok(page)
+        }
+
         /// Takes the page to an address. Everything else about the page stays:
         /// the same engine, the same surface, the same history.
         pub fn go_to(&mut self, url: url::Url) {
