@@ -260,7 +260,9 @@ impl HtmlPreviewView {
                 on_screen: true,
                 #[cfg(feature = "servo")]
                 pending_copy: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                #[cfg(feature = "servo")]
                 page_scroll: crate::page_scroll::PageScrollHandle::default(),
+                #[cfg(feature = "servo")]
                 asked_where: None,
             };
             #[cfg(feature = "servo")]
@@ -447,6 +449,7 @@ impl HtmlPreviewView {
                         return None;
                     };
                     page.set_throttled(out_of_sight);
+                    page.set_dark(reading_in_the_dark(cx));
                     if out_of_sight {
                         return Some(true);
                     }
@@ -629,6 +632,17 @@ impl HtmlPreviewView {
         let shared: Option<()> = None;
         let frame = self.frame.clone();
         if frame.is_none() && shared.is_none() {
+            if self.page.is_some() {
+                // The engine has the document and is drawing it. Showing the
+                // Markdown rendering of the source in the meantime, and
+                // replacing it with the page a moment later, looks like two
+                // previews arriving one after the other; an empty pane is what
+                // a browser shows while a page is on its way.
+                return div()
+                    .size_full()
+                    .bg(cx.theme().colors().editor_background)
+                    .into_any_element();
+            }
             return self.render_markdown_element(window, cx).into_any_element();
         }
         let bounds_cell = self.page_bounds.clone();
@@ -1129,6 +1143,19 @@ impl Item for HtmlPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+}
+
+/// Whether a page should read as dark. The reader's choice for previews comes
+/// first -- prose is often easier light while the code around it stays dark --
+/// and the editor's own theme answers when no choice has been made.
+#[cfg(feature = "servo")]
+fn reading_in_the_dark(cx: &gpui::App) -> bool {
+    use workspace::preview_appearance::preview_appearance;
+
+    let appearance = preview_appearance(cx)
+        .resolve()
+        .unwrap_or_else(|| cx.theme().appearance());
+    !appearance.is_light()
 }
 
 /// The scrollbar beside a page shows itself when the editor's own do: a preview

@@ -63,8 +63,37 @@ fn render_layout_switch(
                     .debug_selector(|| "preview-appearance".into())
                     .child(render_appearance_button(cx)),
             )
+            // Reading something in full takes two steps otherwise: choose the
+            // preview alone, then zoom the pane it sits in. This is the second
+            // of them, put where the first one is.
+            .child(
+                div()
+                    .debug_selector(|| "preview-zoom".into())
+                    .child(render_zoom_button(pane, cx)),
+            )
             .into_any_element(),
     )
+}
+
+/// Fills the window with whatever is being read, and gives the rest of the
+/// editor back when pressed again.
+fn render_zoom_button(pane: &Entity<Pane>, cx: &mut App) -> impl IntoElement {
+    let zoomed = pane.read(cx).is_zoomed();
+    let pane = pane.clone();
+    IconButton::new("preview-zoom", IconName::Maximize)
+        .icon_size(IconSize::Small)
+        .toggle_state(zoomed)
+        .selected_icon(IconName::Minimize)
+        .tooltip(Tooltip::text(if zoomed {
+            "Give the rest of the editor back"
+        } else {
+            "Fill the window with this"
+        }))
+        .on_click(move |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.toggle_zoom(&workspace::ToggleZoom, window, cx);
+            });
+        })
 }
 
 fn render_appearance_button(cx: &mut App) -> impl IntoElement {

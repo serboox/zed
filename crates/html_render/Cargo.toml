@@ -27,6 +27,7 @@ servo = [
     "dep:primeorder",
     "dep:image",
     "dep:libc",
+    "dep:rustls",
     "dep:servo",
     "dep:smallvec",
     "dep:tempfile",
@@ -50,6 +51,9 @@ libc = { workspace = true, optional = true }
 # that do not build against the stable primeorder cargo would pick on its own.
 primeorder = { workspace = true, optional = true }
 servo = { workspace = true, optional = true }
+# The engine's own network thread reads TLS through rustls, which refuses to
+# work until something in the process has chosen a cryptography provider.
+rustls = { workspace = true, optional = true }
 # The page is drawn by the graphics card through these: Servo's own offscreen
 # context asks surfman for a software adapter instead.
 gleam = { version = "0.15", optional = true }

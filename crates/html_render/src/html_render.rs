@@ -61,6 +61,12 @@ mod engine {
             if let Some(engine) = cx.try_global::<GlobalHtmlEngine>() {
                 return engine.0.clone();
             }
+            // The engine's network thread refuses to start without one, and
+            // whether anything else in the editor has chosen one by now is not
+            // something a preview should depend on. Already chosen is fine.
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .ok();
             // One is enough: a second pending wake-up says nothing the first
             // one did not, so the sender drops it rather than queueing work.
             let (tell, woken) = async_channel::bounded(1);
@@ -148,6 +154,9 @@ mod engine {
         viewport: Size<Pixels>,
         /// Whether the engine has been told to hold this page back.
         throttled: bool,
+        /// Whether the page has been told the editor is dark, once it has been
+        /// told anything at all.
+        dark: Option<bool>,
         /// Whether the window draws this page's own buffer. While it does, there
         /// is no reason to read the frame back into memory at all.
         shared: bool,
@@ -208,6 +217,7 @@ mod engine {
                 scale,
                 viewport,
                 throttled: false,
+                dark: None,
                 shared: false,
                 refused: false,
                 awaiting_the_card: std::cell::Cell::new(false),
@@ -504,6 +514,22 @@ mod engine {
                 "window.__zedSelection ? window.__zedSelection.text() : ''",
                 deliver,
             );
+        }
+
+        /// Tells the page whether the editor is dark or light, so a page that
+        /// asks -- through `prefers-color-scheme` -- is answered the same way
+        /// the rest of the window is dressed.
+        pub fn set_dark(&mut self, dark: bool) {
+            if self.dark == Some(dark) {
+                return;
+            }
+            self.dark = Some(dark);
+            self.webview.notify_theme_change(if dark {
+                servo::Theme::Dark
+            } else {
+                servo::Theme::Light
+            });
+            self.engine.nudge();
         }
 
         /// Lets a page that nobody is looking at stop working: the engine holds
