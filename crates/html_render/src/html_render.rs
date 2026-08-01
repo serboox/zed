@@ -227,6 +227,39 @@ mod engine {
             })
         }
 
+        /// Takes the page to an address. Everything else about the page stays:
+        /// the same engine, the same surface, the same history.
+        pub fn go_to(&mut self, url: url::Url) {
+            // What it arrives at is not our document, and none of our script
+            // will be in it until it has settled.
+            self.delegate.needs_the_shim.set(true);
+            self.webview.load(url);
+            self.engine.nudge();
+        }
+
+        /// A step back through the pages the reader has been to, and forward
+        /// again.
+        pub fn go_back(&self) {
+            self.webview.go_back(1);
+            self.engine.nudge();
+        }
+
+        pub fn go_forward(&self) {
+            self.webview.go_forward(1);
+            self.engine.nudge();
+        }
+
+        /// Where the page is now, as the engine has it.
+        pub fn address(&self) -> Option<url::Url> {
+            self.webview.url()
+        }
+
+        /// Whether there is anywhere to go back to, or forward to.
+        pub fn can_go(&self) -> (bool, bool) {
+            let (behind, ahead) = self.delegate.history.get();
+            (behind, ahead)
+        }
+
         /// Points the page at a fresh document, keeping the same engine and
         /// surface: an edit reloads rather than starting a new browser.
         pub fn reload(&mut self, html: SharedString, base_directory: Option<&Path>) -> Result<()> {
@@ -647,6 +680,8 @@ mod engine {
         /// Set when the page has gone somewhere of its own accord. What it
         /// arrives at has none of our script in it, so it has to be put back.
         needs_the_shim: Cell<bool>,
+        /// Whether there is anywhere behind and ahead of where the page is now.
+        history: Cell<(bool, bool)>,
     }
 
     impl Default for PageDelegate {
@@ -657,6 +692,7 @@ mod engine {
                 load_status: Cell::new(LoadStatus::Started),
                 link_for_new_tab: RefCell::new(None),
                 needs_the_shim: Cell::new(false),
+                history: Cell::new((false, false)),
             }
         }
     }
@@ -673,6 +709,15 @@ mod engine {
 
         fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
             self.load_status.set(status);
+        }
+
+        fn notify_history_changed(
+            &self,
+            _webview: WebView,
+            entries: Vec<url::Url>,
+            current: usize,
+        ) {
+            self.history.set((current > 0, current + 1 < entries.len()));
         }
 
         /// A link the reader followed. The page navigates as a browser does, and

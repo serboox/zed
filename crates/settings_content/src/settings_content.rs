@@ -513,6 +513,11 @@ pub struct HtmlPreviewSettingsContent {
     ///
     /// Default: null
     pub render_scale: Option<f32>,
+    /// Where a search typed into the preview's address bar is sent. The words
+    /// typed replace `{query}`.
+    ///
+    /// Default: "https://www.google.com/search?q={query}"
+    pub search_engine: Option<String>,
 }
 
 /// Configuration of audio in Zed.

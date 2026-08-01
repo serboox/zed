@@ -21,7 +21,7 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
-use ui::{WithScrollbar, prelude::*};
+use ui::{Tooltip, WithScrollbar, prelude::*};
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
@@ -97,6 +97,13 @@ pub struct HtmlPreviewView {
     /// is asked at a pace of its own rather than on every frame.
     #[cfg(feature = "servo")]
     asked_where: Option<std::time::Instant>,
+    /// Where the page is, and where the reader may type to send it elsewhere.
+    #[cfg(feature = "servo")]
+    address: Entity<Editor>,
+    /// The address last put into the bar, so a page that has gone somewhere of
+    /// its own accord is noticed without asking the engine every frame.
+    #[cfg(feature = "servo")]
+    showing_address: Option<String>,
 }
 
 impl HtmlPreviewView {
@@ -264,6 +271,10 @@ impl HtmlPreviewView {
                 page_scroll: crate::page_scroll::PageScrollHandle::default(),
                 #[cfg(feature = "servo")]
                 asked_where: None,
+                #[cfg(feature = "servo")]
+                address: address_bar(window, cx),
+                #[cfg(feature = "servo")]
+                showing_address: None,
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -461,6 +472,19 @@ impl HtmlPreviewView {
                     if let Some(url) = page.take_link_for_new_tab() {
                         log::debug!("the page navigated to {url}");
                     }
+                    // Where the page has got to, in the bar. Only when the
+                    // reader is not typing there: an address half typed is not
+                    // to be taken away.
+                    let now_at = page.address().map(|address| address.to_string());
+                    if now_at != view.showing_address
+                        && !view.address.focus_handle(cx).contains_focused(window, cx)
+                    {
+                        view.showing_address = now_at.clone();
+                        let showing = now_at.unwrap_or_default();
+                        view.address.update(cx, |address, cx| {
+                            address.set_text(showing, window, cx);
+                        });
+                    }
                     // A drag of the scrollbar's thumb is a request to the page,
                     // which only the engine can carry out.
                     if let Some(down) = view.page_scroll.take_request() {
@@ -566,10 +590,14 @@ impl HtmlPreviewView {
         root: gpui::Stateful<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        root.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
+        root.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
             let Some(page) = view.page.as_ref() else {
                 return;
             };
+            // What is being typed into the address bar is not for the page.
+            if view.address.focus_handle(cx).contains_focused(window, cx) {
+                return;
+            }
             // Copying is the editor's job, not the page's: the page is asked
             // what is selected and the answer goes to the clipboard.
             if asks_to_copy(&event.keystroke) {
@@ -586,7 +614,10 @@ impl HtmlPreviewView {
                 event.is_held,
             ));
         }))
-        .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, _, _| {
+        .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, window, cx| {
+            if view.address.focus_handle(cx).contains_focused(window, cx) {
+                return;
+            }
             if let Some(page) = view.page.as_ref() {
                 page.key(servo_key(
                     &event.keystroke,
@@ -795,6 +826,91 @@ impl HtmlPreviewView {
                 cx,
             )
             .into_any_element()
+    }
+
+    /// The line above the page: where it is, where it has been, and where the
+    /// reader would like to go. What is typed here is an address if it looks
+    /// like one and a search if it does not.
+    #[cfg(feature = "servo")]
+    fn render_address_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (behind, ahead) = self
+            .page
+            .as_ref()
+            .map(|page| page.can_go())
+            .unwrap_or((false, false));
+        let colors = cx.theme().colors();
+        h_flex()
+            .id("html-preview-address")
+            .key_context("HtmlPreviewAddress")
+            .on_action(cx.listener(|view, _: &menu::Confirm, window, cx| {
+                view.go_where_the_bar_says(window, cx);
+            }))
+            .w_full()
+            .flex_none()
+            .gap_1()
+            .px_1p5()
+            .py_1()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.toolbar_background)
+            .child(
+                IconButton::new("html-preview-back", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .disabled(!behind)
+                    .tooltip(Tooltip::text("Back"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(page) = view.page.as_ref() {
+                            page.go_back();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("html-preview-forward", IconName::ArrowRight)
+                    .icon_size(IconSize::Small)
+                    .disabled(!ahead)
+                    .tooltip(Tooltip::text("Forward"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(page) = view.page.as_ref() {
+                            page.go_forward();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(colors.editor_background)
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .child(self.address.clone()),
+            )
+            .into_any_element()
+    }
+
+    /// Takes the page wherever the address bar now says, and puts what it
+    /// arrives at back into the bar.
+    #[cfg(feature = "servo")]
+    fn go_where_the_bar_says(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.address.read(cx).text(cx);
+        let Some(going) =
+            crate::html_preview_settings::HtmlPreviewSettings::get_global(cx).where_to_go(&typed)
+        else {
+            return;
+        };
+        let showing = going.to_string();
+        if let Some(page) = self.page.as_mut() {
+            page.go_to(going);
+        }
+        self.address.update(cx, |address, cx| {
+            address.set_text(showing, window, cx);
+        });
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     #[cfg(not(feature = "servo"))]
@@ -1096,7 +1212,19 @@ impl Render for HtmlPreviewView {
         // a scroll container gives one document two scrollers, and they fight:
         // the wheel moves both, and the picture slides under the pointer.
         if live_page {
-            return root.child(self.render_page(window, cx)).into_any_element();
+            return root
+                .child(
+                    v_flex()
+                        .size_full()
+                        .child(self.render_address_bar(window, cx))
+                        .child(
+                            div()
+                                .size_full()
+                                .min_h_0()
+                                .child(self.render_page(window, cx)),
+                        ),
+                )
+                .into_any_element();
         }
         root.child(
             WithRemSize::new(preview_font_size).size_full().child(
@@ -1143,6 +1271,17 @@ impl Item for HtmlPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+}
+
+/// The address bar's own little editor: one line, no gutter, and a hint of what
+/// it is for when it is empty.
+#[cfg(feature = "servo")]
+fn address_bar(window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("Address, or something to search for", window, cx);
+        editor
+    })
 }
 
 /// Whether a page should read as dark. The reader's choice for previews comes
