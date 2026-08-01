@@ -44,6 +44,8 @@ struct SurfaceParams {
     content_mask: PodBounds,
 }
 
+/// Only the Linux renderer draws frames another process lent it.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SharedFrameParams {

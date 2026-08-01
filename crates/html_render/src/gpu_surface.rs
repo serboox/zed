@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use dpi::PhysicalSize;
 use euclid::Size2D;
+#[cfg(target_os = "linux")]
 use gpui::SharedFrame;
 
 #[cfg(target_os = "linux")]
@@ -689,8 +690,11 @@ impl RenderingContext for GpuSurface {
         previous.discard(&self.gleam_gl, self.buffers.as_ref());
         // What the window was lent belonged to the old texture, and a new one
         // deserves a fresh attempt at handing it over.
-        self.shared.borrow_mut().take();
-        self.cannot_share.set(false);
+        #[cfg(target_os = "linux")]
+        {
+            self.shared.borrow_mut().take();
+            self.cannot_share.set(false);
+        }
         self.size.set(size);
     }
 
