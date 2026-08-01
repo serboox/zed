@@ -432,7 +432,9 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_lends_its_own_memory(cx);
 
         if std::env::var("ZED_HTML_BENCH").is_ok() {
-            how_long_a_frame_takes(cx);
+            for scale in [1., 2.] {
+                how_long_a_frame_takes(scale, cx);
+            }
         }
     });
 }
@@ -440,7 +442,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 /// What a frame actually costs, at the size a preview really is. Not part of the
 /// checks -- it asserts nothing and only runs when asked for -- but the numbers
 /// are the only way to tell which of the two paths is worth having.
-fn how_long_a_frame_takes(cx: &mut gpui::App) {
+fn how_long_a_frame_takes(scale: f32, cx: &mut gpui::App) {
     let (width, height) = (1377., 658.);
     let paragraphs = (0..60)
         .map(|number| {
@@ -455,7 +457,7 @@ fn how_long_a_frame_takes(cx: &mut gpui::App) {
         &document("background:#fff;color:#111", &paragraphs),
         width,
         height,
-        2.,
+        scale,
         cx,
     ) else {
         return;
@@ -485,7 +487,14 @@ fn how_long_a_frame_takes(cx: &mut gpui::App) {
             }
         }
     }
-    report("a change to the page", width, height, &mut frames, missed);
+    report(
+        "a change to the page",
+        width,
+        height,
+        scale,
+        &mut frames,
+        missed,
+    );
 
     // What the reader actually does: turn the wheel and move the pointer.
     let mut scrolls = Vec::new();
@@ -506,7 +515,7 @@ fn how_long_a_frame_takes(cx: &mut gpui::App) {
             }
         }
     }
-    report("a turn of the wheel", width, height, &mut scrolls, 0);
+    report("a turn of the wheel", width, height, scale, &mut scrolls, 0);
 
     let mut moves = Vec::new();
     heavy.mouse_down(gpui::point(px(20.), px(20.)), MouseButton::Left);
@@ -522,12 +531,20 @@ fn how_long_a_frame_takes(cx: &mut gpui::App) {
         "a pointer moved while selecting",
         width,
         height,
+        scale,
         &mut moves,
         0,
     );
 }
 
-fn report(what: &str, width: f32, height: f32, taken: &mut Vec<Duration>, missed: usize) {
+fn report(
+    what: &str,
+    width: f32,
+    height: f32,
+    scale: f32,
+    taken: &mut Vec<Duration>,
+    missed: usize,
+) {
     if taken.is_empty() {
         println!("BENCH: {what} never finished");
         return;
@@ -539,8 +556,8 @@ fn report(what: &str, width: f32, height: f32, taken: &mut Vec<Duration>, missed
     println!(
         "BENCH: {what} at {}x{} device pixels: {} times, {missed} unanswered; {:?} at the \
          middle, {:?} at nine in ten, {:?} at worst, {:.1} a second",
-        width as u32 * 2,
-        height as u32 * 2,
+        (width * scale) as u32,
+        (height * scale) as u32,
         frames.len(),
         at(0.5),
         at(0.9),
