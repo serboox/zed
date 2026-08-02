@@ -1025,6 +1025,21 @@ impl HtmlPreviewView {
                     .border_color(colors.border_variant)
                     .child(self.address.clone()),
             )
+            .child({
+                // The switch that floats over a document is painted over the
+                // source, not over this: a preview opened in a tab of its own
+                // has nowhere else to offer the choice.
+                let appearance = workspace::preview_appearance::preview_appearance(cx);
+                Button::new("html-preview-reading-theme", appearance.initial())
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(appearance.tooltip()))
+                    .on_click(move |_, _, cx| {
+                        workspace::preview_appearance::set_preview_appearance(
+                            appearance.next(),
+                            cx,
+                        );
+                    })
+            })
             .children(self.looking_for.as_ref().map(|field| {
                 let (at, total) = self.found;
                 h_flex()
