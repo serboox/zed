@@ -1578,10 +1578,7 @@ fn address_bar(window: &mut Window, cx: &mut App) -> Entity<Editor> {
 fn reading_in_the_dark(cx: &gpui::App) -> bool {
     use workspace::preview_appearance::preview_appearance;
 
-    let appearance = preview_appearance(cx)
-        .resolve()
-        .unwrap_or_else(|| cx.theme().appearance());
-    !appearance.is_light()
+    !preview_appearance(cx).appearance().is_light()
 }
 
 /// The scrollbar beside a page shows itself when the editor's own do: a preview

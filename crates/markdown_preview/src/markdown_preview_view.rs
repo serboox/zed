@@ -34,7 +34,8 @@ use util::{
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
 use workspace::notifications::NotifyResultExt;
 use workspace::preview_appearance::{
-    observe_preview_appearance, preview_appearance, set_preview_appearance,
+    observe_preview_appearance, preview_appearance, preview_appearance_choice,
+    set_preview_appearance,
 };
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -932,9 +933,8 @@ impl MarkdownPreviewView {
             .opacity(RESTING_CONTROL_OPACITY)
             .hover(|style| style.opacity(1.0))
             .child(
-                IconButton::new("markdown-reading-theme", IconName::Screen)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(appearance.overrides_editor())
+                Button::new("markdown-reading-theme", appearance.initial())
+                    .label_size(LabelSize::Small)
                     .tooltip(Tooltip::text(appearance.tooltip()))
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_reading_appearance(cx))),
             )
@@ -1095,7 +1095,8 @@ impl MarkdownPreviewView {
         // Diagrams are drawn into pictures, so they have to be told which colours
         // the document around them uses; otherwise a diagram keeps the editor
         // theme and clashes with a document painted some other way.
-        let diagram_palette = match preview_appearance(cx).resolve() {
+        let diagram_palette = match preview_appearance_choice(cx).map(|chosen| chosen.appearance())
+        {
             Some(appearance) => MermaidPalette::Github(appearance),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => MermaidPalette::Theme(theme),
@@ -1111,7 +1112,7 @@ impl MarkdownPreviewView {
         // right now"; otherwise a chosen `markdown_preview_theme` paints the
         // preview, and with neither the preview is a GitHub-flavored document
         // independent of the editor theme.
-        let markdown_style = match preview_appearance(cx).resolve() {
+        let markdown_style = match preview_appearance_choice(cx).map(|chosen| chosen.appearance()) {
             Some(appearance) => markdown::github_style_for_appearance(appearance, window, cx),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => MarkdownStyle::themed_with_overrides(
@@ -1599,7 +1600,7 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg_color = match preview_appearance(cx).resolve() {
+        let bg_color = match preview_appearance_choice(cx).map(|chosen| chosen.appearance()) {
             Some(appearance) => markdown::github_page_background(appearance),
             None => match self.resolve_preview_theme(cx) {
                 Some(theme) => theme.colors().editor_background,

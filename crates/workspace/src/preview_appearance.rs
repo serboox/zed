@@ -1,6 +1,6 @@
 use db::kvp::KeyValueStore;
 use gpui::{App, AppContext as _, Context, Global, Subscription, TaskExt as _};
-use theme::Appearance;
+use theme::{ActiveTheme as _, Appearance};
 use util::ResultExt as _;
 
 const STORE_KEY: &str = "preview-appearance";
@@ -8,11 +8,12 @@ const STORE_KEY: &str = "preview-appearance";
 /// Which palette a document preview reads in, independent of the editor's own
 /// theme: a page of prose or a rendered contract is often easier on light while
 /// the code around it stays dark.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// There are two, and only two. A third that followed the editor looked exactly
+/// like one of these whenever the editor happened to agree with it, so pressing
+/// the control did nothing at all every third press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewAppearance {
-    /// Follow whatever the editor's theme is.
-    #[default]
-    Match,
     Light,
     Dark,
 }
@@ -20,57 +21,43 @@ pub enum PreviewAppearance {
 impl PreviewAppearance {
     pub fn next(self) -> Self {
         match self {
-            Self::Match => Self::Light,
             Self::Light => Self::Dark,
-            Self::Dark => Self::Match,
+            Self::Dark => Self::Light,
         }
     }
 
-    /// The palette to force, or `None` to leave the editor's own in place.
-    pub fn resolve(self) -> Option<Appearance> {
+    /// The palette itself.
+    pub fn appearance(self) -> Appearance {
         match self {
-            Self::Match => None,
-            Self::Light => Some(Appearance::Light),
-            Self::Dark => Some(Appearance::Dark),
+            Self::Light => Appearance::Light,
+            Self::Dark => Appearance::Dark,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Match => "Match Editor Theme",
             Self::Light => "Light",
             Self::Dark => "Dark",
         }
     }
 
-    /// A letter for the control, since there is no icon for a palette and three
-    /// positions cannot be told apart by a pressed state alone. `E` follows the
-    /// editor, `L` is light, `D` is dark.
+    /// A letter for the control, since there is no icon for a palette.
     pub fn initial(self) -> &'static str {
         match self {
-            Self::Match => "E",
             Self::Light => "L",
             Self::Dark => "D",
         }
     }
 
-    /// Whether the choice differs from the editor's own theme, which is what a
-    /// toggle control shows as "on".
-    pub fn overrides_editor(self) -> bool {
-        !matches!(self, Self::Match)
-    }
-
     pub fn tooltip(self) -> &'static str {
         match self {
-            Self::Match => "Reading theme: follow the editor (click for light)",
             Self::Light => "Reading theme: light (click for dark)",
-            Self::Dark => "Reading theme: dark (click to follow the editor)",
+            Self::Dark => "Reading theme: dark (click for light)",
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Match => "match",
             Self::Light => "light",
             Self::Dark => "dark",
         }
@@ -78,36 +65,49 @@ impl PreviewAppearance {
 
     fn from_str(value: &str) -> Option<Self> {
         match value {
-            "match" => Some(Self::Match),
             "light" => Some(Self::Light),
             "dark" => Some(Self::Dark),
             _ => None,
         }
     }
+
+    fn from_editor(appearance: Appearance) -> Self {
+        match appearance.is_light() {
+            true => Self::Light,
+            false => Self::Dark,
+        }
+    }
 }
 
+/// The choice, until one has been made. Nothing chosen means a preview opens in
+/// whatever the editor is wearing, which is what a reader expects the first time
+/// and never thinks about again.
 #[derive(Default)]
 struct GlobalPreviewAppearance {
-    appearance: PreviewAppearance,
-    /// Set once the reader has chosen. The stored value arrives from disk a
-    /// moment after startup, and it must not undo a choice made in between.
-    chosen: bool,
+    chosen: Option<PreviewAppearance>,
 }
 
 impl Global for GlobalPreviewAppearance {}
 
-/// The palette every preview opens in: the one chosen last, whichever document
-/// it was chosen on, so the choice does not have to be repeated per file.
+/// The palette every preview reads in: the one chosen last, whichever document
+/// it was chosen on, so the choice does not have to be repeated per file. Until
+/// something is chosen, the editor's own.
 pub fn preview_appearance(cx: &App) -> PreviewAppearance {
     cx.try_global::<GlobalPreviewAppearance>()
-        .map(|global| global.appearance)
-        .unwrap_or_default()
+        .and_then(|global| global.chosen)
+        .unwrap_or_else(|| PreviewAppearance::from_editor(cx.theme().appearance()))
+}
+
+/// What the reader has actually chosen, if anything. A preview that has a
+/// palette of its own -- a configured Markdown theme, say -- uses that until the
+/// reader says otherwise, and this is how it knows they have not.
+pub fn preview_appearance_choice(cx: &App) -> Option<PreviewAppearance> {
+    cx.try_global::<GlobalPreviewAppearance>()
+        .and_then(|global| global.chosen)
 }
 
 pub fn set_preview_appearance(appearance: PreviewAppearance, cx: &mut App) {
-    let global = cx.default_global::<GlobalPreviewAppearance>();
-    global.appearance = appearance;
-    global.chosen = true;
+    cx.default_global::<GlobalPreviewAppearance>().chosen = Some(appearance);
     // The control that sets this is painted over a document rather than owned by
     // a view that observes it, so nothing would redraw it: the choice would
     // change and the button would go on showing the old one.
@@ -143,8 +143,8 @@ pub fn init(cx: &mut App) {
         if let Some(appearance) = stored.as_deref().and_then(PreviewAppearance::from_str) {
             cx.update(|cx| {
                 let global = cx.default_global::<GlobalPreviewAppearance>();
-                if !global.chosen {
-                    global.appearance = appearance;
+                if global.chosen.is_none() {
+                    global.chosen = Some(appearance);
                 }
             });
         }
@@ -157,63 +157,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycling_visits_every_palette_and_wraps() {
-        let mut seen = vec![PreviewAppearance::default()];
-        for _ in 0..3 {
-            seen.push(seen.last().copied().unwrap_or_default().next());
-        }
-        assert_eq!(
-            seen,
-            vec![
-                PreviewAppearance::Match,
-                PreviewAppearance::Light,
-                PreviewAppearance::Dark,
-                PreviewAppearance::Match,
-            ]
-        );
+    fn there_are_two_palettes_and_pressing_goes_between_them() {
+        assert_eq!(PreviewAppearance::Light.next(), PreviewAppearance::Dark);
+        assert_eq!(PreviewAppearance::Dark.next(), PreviewAppearance::Light);
     }
 
     #[test]
-    fn only_a_forced_palette_overrides_the_editor() {
-        assert_eq!(PreviewAppearance::Match.resolve(), None);
-        assert_eq!(
-            PreviewAppearance::Light.resolve(),
-            Some(Appearance::Light),
-            "light has to override, or the choice does nothing"
-        );
-        assert_eq!(PreviewAppearance::Dark.resolve(), Some(Appearance::Dark));
-    }
-
-    #[gpui::test]
-    fn a_choice_made_before_the_stored_one_arrives_wins(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            set_preview_appearance(PreviewAppearance::Light, cx);
-            // What `init`'s background read does when it finally returns.
-            let global = cx.default_global::<GlobalPreviewAppearance>();
-            if !global.chosen {
-                global.appearance = PreviewAppearance::Dark;
-            }
-            assert_eq!(
-                preview_appearance(cx),
-                PreviewAppearance::Light,
-                "a reader's choice must not be undone by the value on disk"
-            );
-        });
-    }
-
-    #[test]
-    fn what_is_written_can_be_read_back() {
-        for appearance in [
-            PreviewAppearance::Match,
-            PreviewAppearance::Light,
-            PreviewAppearance::Dark,
-        ] {
+    fn what_is_stored_comes_back() {
+        for appearance in [PreviewAppearance::Light, PreviewAppearance::Dark] {
             assert_eq!(
                 PreviewAppearance::from_str(appearance.as_str()),
-                Some(appearance),
-                "a stored choice has to survive a restart"
+                Some(appearance)
             );
         }
-        assert_eq!(PreviewAppearance::from_str("sepia"), None);
+        // What an older editor wrote for the palette that followed the editor
+        // means nothing now, and the reader is left following it.
+        assert_eq!(PreviewAppearance::from_str("match"), None);
     }
 }

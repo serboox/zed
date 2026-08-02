@@ -76,9 +76,7 @@ impl Palette {
 /// appearance -- never a theme of the wrong appearance, and never a panic
 /// when nothing resolves.
 pub fn resolve_theme(reading_appearance: PreviewAppearance, cx: &App) -> Arc<Theme> {
-    let Some(appearance) = reading_appearance.resolve() else {
-        return cx.theme().clone();
-    };
+    let appearance = reading_appearance.appearance();
     let registry = ThemeRegistry::global(cx);
     let selection = &ThemeSettings::get_global(cx).theme;
     let name = resolve_theme_name(selection, appearance, |name| {

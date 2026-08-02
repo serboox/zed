@@ -266,7 +266,6 @@ impl OpenApiPreviewView {
             .child(
                 IconButton::new("openapi-reading-theme", IconName::Screen)
                     .icon_size(IconSize::Small)
-                    .toggle_state(appearance.overrides_editor())
                     .tooltip(Tooltip::text(appearance.tooltip()))
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_reading_appearance(cx))),
             )

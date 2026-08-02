@@ -96,13 +96,10 @@ fn render_zoom_button(pane: &Entity<Pane>) -> impl IntoElement {
 
 fn render_appearance_button(cx: &mut App) -> impl IntoElement {
     let appearance = preview_appearance(cx);
-    // Three positions, and on a dark editor two of them show the same palette:
-    // following the editor and choosing dark look alike until the editor's own
-    // theme changes. The letter is what tells them apart, so a press that
-    // changes nothing on the page still visibly changes something.
+    // Two positions, and the letter says which: L for light, D for dark. An icon
+    // would have to stand for a palette, which no icon does.
     Button::new("preview-appearance", appearance.initial())
         .label_size(LabelSize::Small)
-        .toggle_state(appearance.overrides_editor())
         .tooltip(Tooltip::text(appearance.tooltip()))
         .on_click(move |_, _, cx| set_preview_appearance(appearance.next(), cx))
 }
