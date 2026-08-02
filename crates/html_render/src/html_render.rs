@@ -47,7 +47,12 @@ mod engine {
     /// The engine itself. One per process: Servo keeps global state and starts
     /// its own thread pool, so a second instance is neither cheap nor safe.
     pub struct HtmlEngine {
-        servo: Servo,
+        /// Taken away when the editor is closing. Dropping it is how Servo is
+        /// told to stop -- it sends its own threads away and waits for them --
+        /// and it has to happen while the surfaces it draws through are still
+        /// there, which is why it is done deliberately rather than left to
+        /// whenever this happens to be dropped.
+        servo: RefCell<Option<Servo>>,
         /// Told whenever the engine has work to do. Servo drives its embedder
         /// this way -- a page at rest never asks for anything -- which is why
         /// nothing here polls it on a timer.
@@ -71,21 +76,49 @@ mod engine {
             // one did not, so the sender drops it rather than queueing work.
             let (tell, woken) = async_channel::bounded(1);
             let engine = Rc::new(Self {
-                servo: ServoBuilder::default()
-                    .preferences(preferences())
-                    .event_loop_waker(Box::new(Waker(tell.clone())))
-                    .build(),
+                servo: RefCell::new(Some(
+                    ServoBuilder::default()
+                        .preferences(preferences())
+                        .event_loop_waker(Box::new(Waker(tell.clone())))
+                        .build(),
+                )),
                 woken,
                 tell,
             });
             cx.set_global(GlobalHtmlEngine(engine.clone()));
+            // Told to stop before the editor takes its windows down. Servo waits
+            // for its own threads on the way out, and it cannot do that through
+            // surfaces that have already gone: left to the order things happen
+            // to be dropped in, the editor never finished closing.
+            cx.on_app_quit(|cx| {
+                if cx.has_global::<GlobalHtmlEngine>() {
+                    let engine = cx.remove_global::<GlobalHtmlEngine>();
+                    let started = std::time::Instant::now();
+                    log::info!("the HTML engine is being told to stop");
+                    engine.0.stop();
+                    log::info!("the HTML engine stopped in {:?}", started.elapsed());
+                }
+                async {}
+            })
+            .detach();
             engine
         }
 
         /// Lets the engine work: layout, script and painting all happen here, so
-        /// this has to be called regularly for a page to stay alive.
+        /// this has to be called regularly for a page to stay alive. A page
+        /// pumped after the engine has stopped simply has nothing to do.
         pub fn spin(&self) {
-            self.servo.spin_event_loop();
+            if let Some(servo) = self.servo.borrow().as_ref() {
+                servo.spin_event_loop();
+            }
+        }
+
+        /// Tells the engine to stop, and waits while it does. Servo's own way of
+        /// being told is to be dropped: it sends its threads away and turns its
+        /// loop over until they have gone.
+        pub fn stop(&self) {
+            let servo = self.servo.borrow_mut().take();
+            drop(servo);
         }
 
         /// Waits until the engine has something to do. Whoever drives a page
@@ -226,11 +259,17 @@ mod engine {
 
             let document = PageFile::write(&html, base_directory)?;
             let delegate = Rc::new(PageDelegate::default());
-            let webview = WebViewBuilder::new(&engine.servo, rendering_context.clone())
-                .url(document.url()?)
-                .hidpi_scale_factor(euclid::Scale::new(scale))
-                .delegate(delegate.clone())
-                .build();
+            let webview = {
+                let servo = engine.servo.borrow();
+                let servo = servo
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("the HTML engine has already stopped"))?;
+                WebViewBuilder::new(servo, rendering_context.clone())
+                    .url(document.url()?)
+                    .hidpi_scale_factor(euclid::Scale::new(scale))
+                    .delegate(delegate.clone())
+                    .build()
+            };
             webview.focus();
             webview.resize(size);
 

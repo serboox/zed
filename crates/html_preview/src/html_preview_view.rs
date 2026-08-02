@@ -352,6 +352,13 @@ impl HtmlPreviewView {
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
+                // In this order: nothing may turn the engine over once the page
+                // is going, and the window must let go of the page's buffer
+                // before the page lets go of the memory behind it.
+                this.pump.take();
+                #[cfg(target_os = "linux")]
+                this.shared_frame.take();
+                this.page.take();
                 // The last frame a closed preview painted would otherwise sit
                 // in the sprite atlas for as long as the window lives.
                 if let Some(frame) = this.frame.take()
