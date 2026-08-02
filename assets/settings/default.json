@@ -588,7 +588,7 @@
     "render_scale": null,
     // Where a search typed into the preview's address bar is sent. The words
     // typed replace `{query}`.
-    "search_engine": "https://www.google.com/search?q={query}",
+    "search_engine": "https://www.google.com/search?q={query}&hl=en&gl=us",
   },
   // Scrollbar related settings
   "scrollbar": {

@@ -17,7 +17,9 @@ pub struct HtmlPreviewSettings {
 const SENSIBLE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
 
 /// Where a search goes when the reader has not said otherwise.
-const SEARCH: &str = "https://www.google.com/search?q={query}";
+/// Google reads `hl` as the language to answer in and `gl` as the country to
+/// answer for; without them it guesses both from where the request came from.
+const SEARCH: &str = "https://www.google.com/search?q={query}&hl=en&gl=us";
 
 impl HtmlPreviewSettings {
     /// Where to send what the reader typed: the address itself if it is one,
@@ -112,7 +114,7 @@ mod tests {
             settings
                 .where_to_go("how tall is a giraffe")
                 .map(|url| url.to_string()),
-            Some("https://www.google.com/search?q=how+tall+is+a+giraffe".to_string())
+            Some("https://www.google.com/search?q=how+tall+is+a+giraffe&hl=en&gl=us".to_string())
         );
         // A word with no dot is a search, not a host.
         assert!(

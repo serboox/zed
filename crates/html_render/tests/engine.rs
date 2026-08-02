@@ -430,6 +430,8 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         the_page_can_be_taken_somewhere(cx);
         the_page_can_be_searched(cx);
+        the_page_knows_how_wide_it_is(cx);
+        the_page_is_laid_out_the_way_it_asks_to_be(cx);
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
@@ -867,7 +869,7 @@ fn the_page_can_be_searched(cx: &mut gpui::App) {
     );
 
     let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let mut look = |page: &mut HtmlPage, query: &str, forward: bool| {
+    let look = |page: &mut HtmlPage, query: &str, forward: bool| {
         page.find(query, forward, {
             let answer = answer.clone();
             move |at, total| *answer.borrow_mut() = Some((at, total))
@@ -909,5 +911,111 @@ fn the_page_can_be_searched(cx: &mut gpui::App) {
     assert_eq!(
         total, 3,
         "part of a word should find the words it is part of"
+    );
+}
+
+/// What the page believes about the room it has. A page laid out for a wider
+/// window than it is shown in puts everything to the left of what the reader
+/// sees, so this is checked at both resolutions.
+fn the_page_knows_how_wide_it_is(cx: &mut gpui::App) {
+    for scale in [1., 2.] {
+        let mut page = page(
+            &document("margin:0;background:#fff", ""),
+            500.,
+            320.,
+            scale,
+            cx,
+        )
+        .expect("the engine started once already");
+        wait_for_colour(&mut page, [255, 255, 255], "a page to measure itself");
+        let said = ask_selection_probe(
+            &mut page,
+            "[window.innerWidth, window.innerHeight, window.devicePixelRatio,\
+             document.documentElement.clientWidth].join(',')",
+        );
+        let numbers: Vec<f32> = said
+            .split(',')
+            .filter_map(|part| part.trim().parse::<f32>().ok())
+            .collect();
+        assert_eq!(numbers.len(), 4, "the page should have answered: {said:?}");
+        println!("VIEWPORT: at {scale}x the page says {said} for a view of 500x320 editor pixels");
+        assert!(
+            (numbers[0] - 500.).abs() <= 1.,
+            "the page should be as wide as the view it is shown in, not {}",
+            numbers[0]
+        );
+        assert!(
+            (numbers[1] - 320.).abs() <= 1.,
+            "the page should be as tall as the view it is shown in, not {}",
+            numbers[1]
+        );
+        assert!(
+            (numbers[2] - scale).abs() < 0.01,
+            "the page should know the resolution it is drawn at, not {}",
+            numbers[2]
+        );
+        assert!(
+            (numbers[3] - 500.).abs() <= 1.,
+            "the document should have the whole width to lay itself out in, not {}",
+            numbers[3]
+        );
+    }
+}
+
+/// A page built on a grid, laid out as a grid. The engine keeps several parts of
+/// CSS behind switches of its own, all off by default, and a page built on any
+/// of them comes out as one block under another against the left edge instead --
+/// which is what the whole web looks like without this.
+fn the_page_is_laid_out_the_way_it_asks_to_be(cx: &mut gpui::App) {
+    let grid = "<div style=\"display:grid;grid-template-columns:1fr 1fr;width:400px\">\
+         <div id=\"left\" style=\"height:40px;background:rgb(255,0,0)\"></div>\
+         <div id=\"right\" style=\"height:40px;background:rgb(0,0,255)\"></div></div>";
+    let mut page = page(
+        &document("margin:0;background:#fff", grid),
+        500.,
+        320.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page laid out on a grid");
+
+    let placed = ask_selection_probe(
+        &mut page,
+        "(function(){var r=document.getElementById('right').getBoundingClientRect();\
+         return [Math.round(r.left), Math.round(r.top)].join(',');})()",
+    );
+    let numbers: Vec<f32> = placed
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .collect();
+    assert_eq!(
+        numbers.len(),
+        2,
+        "the page should have answered: {placed:?}"
+    );
+    // Beside its neighbour, not underneath it: two columns of a four hundred
+    // pixel grid put the second one at two hundred.
+    assert!(
+        (numbers[0] - 200.).abs() <= 2.,
+        "the second column should stand beside the first, at 200, not at {}",
+        numbers[0]
+    );
+    assert!(
+        numbers[1] <= 2.,
+        "the second column should be level with the first, not {} below it",
+        numbers[1]
+    );
+
+    // And the pixels agree: red on the left half, blue on the right.
+    assert_eq!(
+        colour_at(&page, 100, 20),
+        Some([255, 0, 0]),
+        "the first column should be drawn on the left"
+    );
+    assert_eq!(
+        colour_at(&page, 300, 20),
+        Some([0, 0, 255]),
+        "the second column should be drawn beside it"
     );
 }

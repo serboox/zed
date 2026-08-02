@@ -118,6 +118,11 @@ pub struct HtmlPreviewView {
     /// engine's own.
     #[cfg(feature = "servo")]
     answer_from_the_page: std::rc::Rc<std::cell::Cell<Option<(usize, usize)>>>,
+    /// Kept so a change to the reading theme reaches this preview at once. The
+    /// page would otherwise hear about it on the pump's next turn, which is why
+    /// the button looked as though it took two presses.
+    #[cfg(feature = "servo")]
+    _appearance: Subscription,
 }
 
 impl HtmlPreviewView {
@@ -342,6 +347,8 @@ impl HtmlPreviewView {
                 found: (0, 0),
                 #[cfg(feature = "servo")]
                 answer_from_the_page: std::rc::Rc::new(std::cell::Cell::new(None)),
+                #[cfg(feature = "servo")]
+                _appearance: workspace::preview_appearance::observe_preview_appearance(cx),
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -1433,6 +1440,16 @@ impl Render for HtmlPreviewView {
         #[cfg(feature = "servo")]
         {
             self.on_screen = true;
+        }
+        #[cfg(feature = "servo")]
+        {
+            // Applied here rather than only on the pump's next turn: the reading
+            // theme is chosen with a button, and a button should take effect
+            // when it is pressed.
+            let dark = reading_in_the_dark(cx);
+            if let Some(page) = self.page.as_mut() {
+                page.set_dark(dark);
+            }
         }
         let live_page = self.showing_live_page();
         let root = div()

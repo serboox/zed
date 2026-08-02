@@ -110,6 +110,22 @@ mod engine {
     /// a preview is laid out again on every keystroke in the source.
     fn preferences() -> servo::Preferences {
         let mut preferences = servo::Preferences::default();
+        // The engine keeps several parts of CSS behind switches of its own, all
+        // off. A page built on any of them -- and a grid is how most pages are
+        // built now -- falls back to laying everything out one block under
+        // another against the left edge, which is not what a preview is for.
+        preferences.layout_grid_enabled = true;
+        preferences.layout_columns_enabled = true;
+        preferences.layout_container_queries_enabled = true;
+        preferences.layout_writing_mode_enabled = true;
+        preferences.layout_variable_fonts_enabled = true;
+        preferences.layout_css_attr_enabled = true;
+        // Pages are asked for in American English, whatever the machine's own
+        // locale: this sets both what `navigator.language` says and the
+        // Accept-Language every request carries. Which country a site thinks the
+        // reader is in is another matter -- that is read from the address the
+        // request comes from, and no header changes it.
+        preferences.intl_locale_override = "en-US".to_string();
         preferences.gfx_subpixel_text_antialiasing_enabled = false;
         let cores = std::thread::available_parallelism()
             .map(|cores| cores.get())
@@ -120,13 +136,23 @@ mod engine {
         if std::env::var("ZED_HTML_SUBPIXEL_TEXT").as_deref() == Ok("1") {
             preferences.gfx_subpixel_text_antialiasing_enabled = true;
         }
+        // A site's idea of where the reader is comes from the address its
+        // requests arrive from. Somewhere to send them through is the only thing
+        // that changes it, so the reader may name one.
+        if let Ok(through) = std::env::var("ZED_HTML_PROXY")
+            && !through.trim().is_empty()
+        {
+            preferences.network_http_proxy_uri = through.trim().to_string();
+            preferences.network_https_proxy_uri = through.trim().to_string();
+            log::info!("the engine reaches the network through {}", through.trim());
+        }
         if let Ok(threads) = std::env::var("ZED_HTML_LAYOUT_THREADS")
             && let Ok(threads) = threads.parse::<i64>()
         {
             preferences.layout_threads = threads;
         }
         log::info!(
-            "the engine lays pages out on {} threads, text edges {}",
+            "the engine lays pages out on {} threads with grids and columns, text edges {}",
             preferences.layout_threads,
             if preferences.gfx_subpixel_text_antialiasing_enabled {
                 "coloured"
