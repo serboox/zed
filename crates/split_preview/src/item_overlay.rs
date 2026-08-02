@@ -69,7 +69,7 @@ fn render_layout_switch(
             .child(
                 div()
                     .debug_selector(|| "preview-zoom".into())
-                    .child(render_zoom_button(pane, cx)),
+                    .child(render_zoom_button(pane)),
             )
             .into_any_element(),
     )
@@ -77,18 +77,16 @@ fn render_layout_switch(
 
 /// Fills the window with whatever is being read, and gives the rest of the
 /// editor back when pressed again.
-fn render_zoom_button(pane: &Entity<Pane>, cx: &mut App) -> impl IntoElement {
-    let zoomed = pane.read(cx).is_zoomed();
+///
+/// Whether the pane is filling the window already is not shown here. This runs
+/// while the pane is being updated, and asking it anything at that moment is
+/// what `register_item_overlay` warns against -- the editor stops there and
+/// then. The handler below runs later, when asking is allowed.
+fn render_zoom_button(pane: &Entity<Pane>) -> impl IntoElement {
     let pane = pane.clone();
     IconButton::new("preview-zoom", IconName::Maximize)
         .icon_size(IconSize::Small)
-        .toggle_state(zoomed)
-        .selected_icon(IconName::Minimize)
-        .tooltip(Tooltip::text(if zoomed {
-            "Give the rest of the editor back"
-        } else {
-            "Fill the window with this"
-        }))
+        .tooltip(Tooltip::text("Fill the window with this, or give it back"))
         .on_click(move |_, window, cx| {
             pane.update(cx, |pane, cx| {
                 pane.toggle_zoom(&workspace::ToggleZoom, window, cx);

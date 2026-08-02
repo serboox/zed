@@ -797,6 +797,7 @@ impl HtmlPreviewView {
         let holding = self.page_pressed.clone();
         let view = cx.entity().downgrade();
         let scroll = self.page_scroll.clone();
+        let focus = self.focus_handle.clone();
         div()
             .size_full()
             .relative()
@@ -868,17 +869,19 @@ impl HtmlPreviewView {
                                     return;
                                 };
                                 holding.set(Some(event.button));
-                                view.update(cx, |view, cx| {
+                                view.update(cx, |view, _| {
                                     if let Some(page) = view.page.as_ref() {
                                         page.mouse_down(page_point(event.position), button);
                                     }
-                                    // Whoever is clicked on is who types next. A
-                                    // page that takes the mouse but leaves the
-                                    // keyboard with the source is a page the
-                                    // reader cannot type into.
-                                    view.focus_handle.focus(window, cx);
                                 })
                                 .ok();
+                                // Whoever is clicked on is who types next: a page
+                                // that takes the mouse but leaves the keyboard
+                                // with the source cannot be typed into. Asked for
+                                // outside the update above, so that whatever
+                                // focusing sets off does not arrive in the middle
+                                // of it.
+                                focus.focus(window, cx);
                             }
                         });
                         window.on_mouse_event({
