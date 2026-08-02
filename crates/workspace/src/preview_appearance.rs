@@ -43,6 +43,17 @@ impl PreviewAppearance {
         }
     }
 
+    /// A letter for the control, since there is no icon for a palette and three
+    /// positions cannot be told apart by a pressed state alone. `E` follows the
+    /// editor, `L` is light, `D` is dark.
+    pub fn initial(self) -> &'static str {
+        match self {
+            Self::Match => "E",
+            Self::Light => "L",
+            Self::Dark => "D",
+        }
+    }
+
     /// Whether the choice differs from the editor's own theme, which is what a
     /// toggle control shows as "on".
     pub fn overrides_editor(self) -> bool {
@@ -97,6 +108,10 @@ pub fn set_preview_appearance(appearance: PreviewAppearance, cx: &mut App) {
     let global = cx.default_global::<GlobalPreviewAppearance>();
     global.appearance = appearance;
     global.chosen = true;
+    // The control that sets this is painted over a document rather than owned by
+    // a view that observes it, so nothing would redraw it: the choice would
+    // change and the button would go on showing the old one.
+    cx.refresh_windows();
     let store = KeyValueStore::global(cx);
     cx.background_spawn(async move {
         store

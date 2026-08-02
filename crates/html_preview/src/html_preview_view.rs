@@ -20,8 +20,10 @@ use markdown::{
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 use settings::Settings;
 use theme_settings::ThemeSettings;
+#[cfg(feature = "servo")]
+use ui::Tooltip;
 use ui::utils::WithRemSize;
-use ui::{Tooltip, WithScrollbar, prelude::*};
+use ui::{WithScrollbar, prelude::*};
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
@@ -1166,6 +1168,12 @@ impl HtmlPreviewView {
         });
         self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    /// Nothing to show above a page there is no engine for.
+    #[cfg(not(feature = "servo"))]
+    fn render_address_bar(&self, _: &mut Window, _: &mut Context<Self>) -> gpui::AnyElement {
+        div().into_any_element()
     }
 
     #[cfg(not(feature = "servo"))]
