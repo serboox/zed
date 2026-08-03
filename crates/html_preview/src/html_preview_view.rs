@@ -1014,6 +1014,17 @@ impl HtmlPreviewView {
                     })),
             )
             .child(
+                IconButton::new("html-preview-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Reload this page"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(page) = view.page.as_ref() {
+                            page.refresh();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w_0()

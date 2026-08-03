@@ -316,6 +316,12 @@ mod engine {
             self.engine.nudge();
         }
 
+        /// Fetches the page again, as a browser's refresh does.
+        pub fn refresh(&self) {
+            self.webview.reload();
+            self.engine.nudge();
+        }
+
         /// A step back through the pages the reader has been to, and forward
         /// again.
         pub fn go_back(&self) {
