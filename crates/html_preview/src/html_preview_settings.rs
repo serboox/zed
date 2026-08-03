@@ -10,6 +10,10 @@ pub struct HtmlPreviewSettings {
     /// Where words typed into the address bar are sent when they are not an
     /// address. `{query}` is where they go.
     pub search_engine: std::sync::Arc<str>,
+    /// Where the engine answers a browser's own developer tools.
+    pub devtools_port: Option<u16>,
+    /// Somewhere to send the page's requests through.
+    pub proxy: Option<std::sync::Arc<str>>,
 }
 
 /// A page drawn smaller than a tenth of the display, or larger than four times
@@ -74,6 +78,16 @@ impl Settings for HtmlPreviewSettings {
                 .filter(|engine| engine.contains("{query}"))
                 .unwrap_or(SEARCH)
                 .into(),
+            devtools_port: content
+                .html_preview
+                .as_ref()
+                .and_then(|preview| preview.devtools_port),
+            proxy: content
+                .html_preview
+                .as_ref()
+                .and_then(|preview| preview.proxy.as_deref())
+                .filter(|proxy| !proxy.trim().is_empty())
+                .map(Into::into),
         }
     }
 }
@@ -86,6 +100,8 @@ mod tests {
         HtmlPreviewSettings {
             render_scale: None,
             search_engine: engine.into(),
+            devtools_port: None,
+            proxy: None,
         }
     }
 

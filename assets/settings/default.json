@@ -589,6 +589,14 @@
     // Where a search typed into the preview's address bar is sent. The words
     // typed replace `{query}`.
     "search_engine": "https://www.google.com/search?q={query}&hl=en&gl=us",
+    // Where the engine answers a browser's own developer tools, as Firefox's do.
+    // Point Firefox at `127.0.0.1:<port>` through "Remote Debugging". Anything on
+    // this machine can speak to that port, so it is off unless a port is named.
+    "devtools_port": null,
+    // Somewhere to send the page's requests through, as `http://host:port`.
+    // Which country a site believes the reader is in is read from the address its
+    // requests arrive from, and this is the only thing that changes it.
+    "proxy": null,
   },
   // Scrollbar related settings
   "scrollbar": {

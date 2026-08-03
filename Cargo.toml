@@ -824,7 +824,9 @@ keyboard_types = { package = "keyboard-types", version = "0.8" }
 # servo-script pins p521 to a release candidate that will not build against the
 # stable primeorder cargo picks on its own, so the pin has to be stated here.
 primeorder = "=0.14.0-rc.14"
-servo = "0.4"
+# Media is behind a feature of its own: without it the engine links a stub
+# backend and every <video> and <audio> is silent.
+servo = { version = "0.4", features = ["media-gstreamer"] }
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 smol = "2.0"
 sqlformat = "0.2"

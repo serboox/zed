@@ -410,6 +410,7 @@ impl HtmlPreviewView {
             true => bounds.size,
             false => gpui::size(gpui::px(900.), gpui::px(700.)),
         };
+        pass_engine_options(cx);
         match html_render::HtmlPage::open_at(going, size, page_scale(window, cx), cx) {
             Ok(page) => {
                 self.page = Some(page);
@@ -542,6 +543,7 @@ impl HtmlPreviewView {
             // resized as soon as there is.
             false => gpui::size(gpui::px(900.), gpui::px(700.)),
         };
+        pass_engine_options(cx);
         match html_render::HtmlPage::open(
             contents,
             base_directory.as_deref(),
@@ -969,6 +971,7 @@ impl HtmlPreviewView {
     /// like one and a search if it does not.
     #[cfg(feature = "servo")]
     fn render_address_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let loading = self.page.as_ref().and_then(|page| page.how_far_loaded());
         let (behind, ahead) = self
             .page
             .as_ref()
@@ -1099,6 +1102,18 @@ impl HtmlPreviewView {
                                 cx.listener(|view, _, window, cx| view.stop_looking(window, cx)),
                             ),
                     )
+            }))
+            // A page on its way says so along the bottom of the bar. The engine
+            // reports three stages and no more, so the strip moves in steps
+            // rather than pretending to know how much is left.
+            .children(loading.map(|far| {
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w(gpui::relative(far))
+                    .h(gpui::px(2.))
+                    .bg(cx.theme().colors().text_accent)
             }))
             .into_any_element()
     }
@@ -1574,13 +1589,13 @@ impl Item for HtmlPreviewView {
             .as_ref()
             .map(|editor_state| {
                 let buffer = editor_state.editor.read(cx).buffer().read(cx);
-                format!("Preview {}", buffer.title(cx)).into()
+                format!("Browser {}", buffer.title(cx)).into()
             })
-            .unwrap_or_else(|| SharedString::from("HTML Preview"))
+            .unwrap_or_else(|| SharedString::from("Browser Page"))
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
-        Some("HTML Preview Opened")
+        Some("Browser Page Opened")
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
@@ -1595,6 +1610,19 @@ fn address_bar(window: &mut Window, cx: &mut App) -> Entity<Editor> {
         editor.set_placeholder_text("Address, or something to search for", window, cx);
         editor
     })
+}
+
+/// Hands the engine what it is to be set up with, before it is started. Only
+/// what is said before then counts: there is one engine for the life of the
+/// editor and Servo takes these when it starts.
+#[cfg(feature = "servo")]
+fn pass_engine_options(cx: &mut App) {
+    let settings = crate::html_preview_settings::HtmlPreviewSettings::get_global(cx);
+    let options = html_render::EngineOptions {
+        devtools_port: settings.devtools_port,
+        proxy: settings.proxy.as_deref().map(str::to_string),
+    };
+    html_render::set_engine_options(options, cx);
 }
 
 /// Whether a page should read as dark. The reader's choice for previews comes

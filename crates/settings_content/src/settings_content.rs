@@ -516,8 +516,21 @@ pub struct HtmlPreviewSettingsContent {
     /// Where a search typed into the preview's address bar is sent. The words
     /// typed replace `{query}`.
     ///
-    /// Default: "https://www.google.com/search?q={query}"
+    /// Default: "https://www.google.com/search?q={query}&hl=en&gl=us"
     pub search_engine: Option<String>,
+    /// Where the engine answers a browser's own developer tools, as Firefox's
+    /// do. Point Firefox at `127.0.0.1:<port>` through "Remote Debugging".
+    /// Anything on this machine can speak to that port, so it is off unless a
+    /// port is named.
+    ///
+    /// Default: null
+    pub devtools_port: Option<u16>,
+    /// Somewhere to send the page's requests through, as `http://host:port`.
+    /// Which country a site believes the reader is in is read from the address
+    /// its requests arrive from, and this is the only thing that changes it.
+    ///
+    /// Default: null
+    pub proxy: Option<String>,
 }
 
 /// Configuration of audio in Zed.

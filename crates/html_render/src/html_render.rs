@@ -37,12 +37,53 @@ mod engine {
     };
     use smallvec::SmallVec;
 
+    /// What the engine tells a page it is. Sites read this to decide what to
+    /// send, and one they do not recognise gets the treatment reserved for
+    /// browsers nobody has heard of: an older layout, a warning, or a refusal.
+    /// This is what Firefox's own nightly builds send on this platform.
+    const FIREFOX_NIGHTLY: &str = if cfg!(target_os = "windows") {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+    } else if cfg!(target_os = "macos") {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0"
+    } else {
+        "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
+    };
+
     /// The largest page surface kept in memory, in device pixels.
     const MAX_SURFACE: u32 = 8_000;
 
     struct GlobalHtmlEngine(Rc<HtmlEngine>);
 
     impl Global for GlobalHtmlEngine {}
+
+    /// What the engine is set up with. Read once, when it starts: Servo takes
+    /// these at build time and there is one engine for the life of the editor,
+    /// so a change to them is worth nothing until the editor is opened again.
+    #[derive(Clone, Default)]
+    pub struct EngineOptions {
+        /// Where the engine's debugging server listens, so a browser's own
+        /// developer tools can attach to the page. Absent means no server.
+        pub devtools_port: Option<u16>,
+        /// Somewhere to send requests through, when the reader wants the web to
+        /// see them arriving from elsewhere.
+        pub proxy: Option<String>,
+    }
+
+    struct GlobalEngineOptions(EngineOptions);
+
+    impl Global for GlobalEngineOptions {}
+
+    /// Says how the engine should be set up. Only what is said before the engine
+    /// starts counts.
+    pub fn set_engine_options(options: EngineOptions, cx: &mut App) {
+        cx.set_global(GlobalEngineOptions(options));
+    }
+
+    fn engine_options(cx: &App) -> EngineOptions {
+        cx.try_global::<GlobalEngineOptions>()
+            .map(|global| global.0.clone())
+            .unwrap_or_default()
+    }
 
     /// The engine itself. One per process: Servo keeps global state and starts
     /// its own thread pool, so a second instance is neither cheap nor safe.
@@ -75,10 +116,11 @@ mod engine {
             // One is enough: a second pending wake-up says nothing the first
             // one did not, so the sender drops it rather than queueing work.
             let (tell, woken) = async_channel::bounded(1);
+            let options = engine_options(cx);
             let engine = Rc::new(Self {
                 servo: RefCell::new(Some(
                     ServoBuilder::default()
-                        .preferences(preferences())
+                        .preferences(preferences(&options))
                         .event_loop_waker(Box::new(Waker(tell.clone())))
                         .build(),
                 )),
@@ -141,7 +183,7 @@ mod engine {
     /// only looks right on a display whose pixels are arranged the way it
     /// assumes. Layout is given as many threads as the machine will spare, since
     /// a preview is laid out again on every keystroke in the source.
-    fn preferences() -> servo::Preferences {
+    fn preferences(options: &EngineOptions) -> servo::Preferences {
         let mut preferences = servo::Preferences::default();
         // The engine keeps several parts of CSS behind switches of its own, all
         // off. A page built on any of them -- and a grid is how most pages are
@@ -159,6 +201,11 @@ mod engine {
         // reader is in is another matter -- that is read from the address the
         // request comes from, and no header changes it.
         preferences.intl_locale_override = "en-US".to_string();
+        // What the page is told it is talking to. Servo's own string says Servo
+        // as well as Firefox, and a good many sites read that and serve
+        // something older or refuse outright; this is the string Firefox's own
+        // nightly builds send.
+        preferences.user_agent = FIREFOX_NIGHTLY.to_string();
         preferences.gfx_subpixel_text_antialiasing_enabled = false;
         let cores = std::thread::available_parallelism()
             .map(|cores| cores.get())
@@ -172,12 +219,24 @@ mod engine {
         // A site's idea of where the reader is comes from the address its
         // requests arrive from. Somewhere to send them through is the only thing
         // that changes it, so the reader may name one.
-        if let Ok(through) = std::env::var("ZED_HTML_PROXY")
-            && !through.trim().is_empty()
-        {
-            preferences.network_http_proxy_uri = through.trim().to_string();
-            preferences.network_https_proxy_uri = through.trim().to_string();
-            log::info!("the engine reaches the network through {}", through.trim());
+        let through = options
+            .proxy
+            .clone()
+            .or_else(|| std::env::var("ZED_HTML_PROXY").ok())
+            .map(|through| through.trim().to_string())
+            .filter(|through| !through.is_empty());
+        if let Some(through) = through {
+            preferences.network_http_proxy_uri = through.clone();
+            preferences.network_https_proxy_uri = through.clone();
+            log::info!("the engine reaches the network through {through}");
+        }
+        // The engine can answer a browser's own developer tools over the wire, as
+        // Firefox's do. Off unless the reader asks for it: it is a port anything
+        // on the machine could speak to.
+        if let Some(port) = options.devtools_port.filter(|port| *port > 0) {
+            preferences.devtools_server_enabled = true;
+            preferences.devtools_server_listen_address = format!("127.0.0.1:{port}");
+            log::info!("the engine answers developer tools on 127.0.0.1:{port}");
         }
         if let Ok(threads) = std::env::var("ZED_HTML_LAYOUT_THREADS")
             && let Ok(threads) = threads.parse::<i64>()
@@ -501,6 +560,18 @@ mod engine {
 
         pub fn is_loading(&self) -> bool {
             self.delegate.load_status.get() != LoadStatus::Complete
+        }
+
+        /// How far along the page is, as a fraction. The engine says only three
+        /// things -- asked for, head parsed, all of it -- so this is coarse on
+        /// purpose: a bar that moves in three steps is honest, one that crawls
+        /// smoothly to ninety per cent is a lie.
+        pub fn how_far_loaded(&self) -> Option<f32> {
+            match self.delegate.load_status.get() {
+                LoadStatus::Started => Some(0.15),
+                LoadStatus::HeadParsed => Some(0.6),
+                LoadStatus::Complete => None,
+            }
         }
 
         /// Called on every turn: a page that has finished loading no longer
@@ -887,7 +958,7 @@ mod engine {
 }
 
 #[cfg(feature = "servo")]
-pub use engine::{HtmlEngine, HtmlPage};
+pub use engine::{EngineOptions, HtmlEngine, HtmlPage, set_engine_options};
 #[cfg(feature = "servo")]
 pub use servo::MouseButton;
 

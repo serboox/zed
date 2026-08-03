@@ -432,6 +432,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_can_be_searched(cx);
         the_page_knows_how_wide_it_is(cx);
         the_page_is_laid_out_the_way_it_asks_to_be(cx);
+        the_engine_can_play_media(cx);
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
@@ -1017,5 +1018,38 @@ fn the_page_is_laid_out_the_way_it_asks_to_be(cx: &mut gpui::App) {
         colour_at(&page, 300, 20),
         Some([0, 0, 255]),
         "the second column should be drawn beside it"
+    );
+}
+
+/// Whether there is anything behind `<video>` and `<audio>` at all. Servo keeps
+/// its media backend behind a feature of its own, and without it links a stub
+/// that reports every format unplayable -- which is exactly what this asks.
+fn the_engine_can_play_media(cx: &mut gpui::App) {
+    let mut page = page(
+        &document("margin:0;background:#fff", ""),
+        300.,
+        200.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page to ask about media");
+
+    let answer = ask_selection_probe(
+        &mut page,
+        "(function(){var v=document.createElement('video');\
+         return ['mp4=' + v.canPlayType('video/mp4'),\
+         'h264=' + v.canPlayType('video/mp4; codecs=\"avc1.42E01E\"'),\
+         'webm=' + v.canPlayType('video/webm'),\
+         'vp8=' + v.canPlayType('video/webm; codecs=\"vp8, vorbis\"'),\
+         'vp9=' + v.canPlayType('video/webm; codecs=\"vp9\"'),\
+         'ogg=' + v.canPlayType('video/ogg'),\
+         'mp3=' + v.canPlayType('audio/mpeg'),\
+         'wav=' + v.canPlayType('audio/wav')].join(' ');})()",
+    );
+    println!("MEDIA: {answer}");
+    assert!(
+        answer.contains("maybe") || answer.contains("probably"),
+        "the engine should have a media backend behind it, not a stub: it answered {answer:?}"
     );
 }
