@@ -16,8 +16,9 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -125,6 +126,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    shared_frames_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -322,6 +324,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let shared_frames_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "shared_frames",
+            "shared_frame_vertex",
+            "shared_frame_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +354,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            shared_frames_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1475,7 +1486,6 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1493,38 +1503,94 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
-
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
             if next_offset > instance_buffer.size {
                 return false;
+            }
+
+            // A buffer already in the window's own colour order only has to be
+            // placed. A capture that arrives as brightness and colour apart is
+            // put together instead, which is what the other pipeline is for.
+            //
+            // The textures made here are held by the encoder for as long as the
+            // draw is outstanding, so letting go of the CoreVideo wrappers at
+            // the end of the turn does not take the pixels away.
+            if surface.image_buffer.get_pixel_format() == kCVPixelFormatType_32BGRA {
+                let frame = self.core_video_texture_cache.create_texture_from_image(
+                    surface.image_buffer.as_concrete_TypeRef(),
+                    None,
+                    MTLPixelFormat::BGRA8Unorm,
+                    // A buffer with one plane answers nothing about planes, so
+                    // its own width and height are what to ask for.
+                    surface.image_buffer.get_width(),
+                    surface.image_buffer.get_height(),
+                    0,
+                );
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(status) => {
+                        // Nothing is drawn for this one. Whoever lent it is told
+                        // so, and goes back to handing over pixels.
+                        log::warn!("a lent frame cannot be drawn: CoreVideo said {status}");
+                        if let Some(lent) = surface.lent.as_ref() {
+                            lent.refuse();
+                        }
+                        continue;
+                    }
+                };
+                command_encoder.set_render_pipeline_state(&self.shared_frames_pipeline_state);
+                let bottom_up = u32::from(surface.lent.as_ref().is_some_and(|lent| lent.bottom_up));
+                command_encoder.set_vertex_bytes(
+                    SurfaceInputIndex::BottomUp as u64,
+                    mem::size_of_val(&bottom_up) as u64,
+                    &bottom_up as *const u32 as *const _,
+                );
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(frame.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+            } else {
+                assert_eq!(
+                    surface.image_buffer.get_pixel_format(),
+                    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                );
+
+                let y_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::R8Unorm,
+                        surface.image_buffer.get_width_of_plane(0),
+                        surface.image_buffer.get_height_of_plane(0),
+                        0,
+                    )
+                    .unwrap();
+                let cb_cr_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::RG8Unorm,
+                        surface.image_buffer.get_width_of_plane(1),
+                        surface.image_buffer.get_height_of_plane(1),
+                        1,
+                    )
+                    .unwrap();
+
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex::CbCrTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
             }
 
             command_encoder.set_vertex_buffer(
@@ -1537,15 +1603,6 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
@@ -1744,6 +1801,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    BottomUp = 6,
 }
 
 #[repr(C)]
@@ -1795,5 +1853,152 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_foundation::{base::CFType, dictionary::CFDictionary, string::CFString};
+    use core_video::pixel_buffer::CVPixelBuffer;
+    use gpui::SharedFrame;
+
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 32;
+    /// Blue, green, red and alpha, which is the order a 32BGRA buffer holds.
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const RED: [u8; 4] = [0, 0, 255, 255];
+
+    /// A buffer of the kind something else would lend the window: pixels in the
+    /// window's own colour order, held by an `IOSurface` so that the graphics
+    /// card can read them where they lie.
+    ///
+    /// The first half of its rows is blue and the second half red, so which way
+    /// up the renderer read it can be told from the picture alone.
+    fn lent_buffer() -> Option<CVPixelBuffer> {
+        // Without this the buffer is ordinary memory, and a texture cannot be
+        // made from ordinary memory.
+        let backed_by_a_surface = CFDictionary::from_CFType_pairs(&[(
+            CFString::from(core_video::pixel_buffer::CVPixelBufferKeys::IOSurfaceProperties),
+            CFDictionary::<CFString, CFType>::from_CFType_pairs(&[]).as_CFType(),
+        )]);
+        let buffer = CVPixelBuffer::new(
+            kCVPixelFormatType_32BGRA,
+            WIDTH,
+            HEIGHT,
+            Some(&backed_by_a_surface),
+        )
+        .ok()?;
+
+        if buffer.lock_base_address(0) != core_video::r#return::kCVReturnSuccess {
+            return None;
+        }
+        let stride = buffer.get_bytes_per_row();
+        let rows = unsafe {
+            std::slice::from_raw_parts_mut(buffer.get_base_address() as *mut u8, stride * HEIGHT)
+        };
+        for row in 0..HEIGHT {
+            let colour = if row < HEIGHT / 2 { BLUE } else { RED };
+            for column in 0..WIDTH {
+                let at = row * stride + column * 4;
+                rows[at..at + 4].copy_from_slice(&colour);
+            }
+        }
+        buffer.unlock_base_address(0);
+        Some(buffer)
+    }
+
+    /// Draws a lent buffer over the whole of a small window and gives back what
+    /// came out, as red, green and blue at a point.
+    fn drawn(bottom_up: bool) -> Option<impl Fn(u32, u32) -> [u8; 3]> {
+        if metal::Device::system_default().is_none() {
+            // A machine with no graphics device cannot answer the question this
+            // asks, and saying so is worth more than a test that passes without
+            // having drawn anything.
+            println!("RENDERER: no graphics device here, so nothing was drawn");
+            return None;
+        }
+        let image_buffer = lent_buffer()?;
+        let frame = Arc::new(SharedFrame {
+            image_buffer: image_buffer.clone(),
+            width: WIDTH as u32,
+            height: HEIGHT as u32,
+            stride: image_buffer.get_bytes_per_row() as u32,
+            bottom_up,
+            refused: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bounds = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer,
+            lent: Some(frame.clone()),
+        });
+        scene.finish();
+
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(WIDTH as i32), DevicePixels(HEIGHT as i32)),
+            )
+            .expect("a scene with one lent frame in it should draw");
+        assert!(
+            !frame.is_refused(),
+            "the renderer should have drawn the buffer rather than refusing it"
+        );
+        println!(
+            "RENDERER: a lent frame was drawn, {}",
+            if bottom_up {
+                "bottom row first"
+            } else {
+                "top row first"
+            }
+        );
+        Some(move |x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y).0;
+            [pixel[0], pixel[1], pixel[2]]
+        })
+    }
+
+    /// What the buffer holds is what is drawn, and the way up the frame says it
+    /// is laid out is the way up it is read. A frame drawn the wrong way round is
+    /// this test failing rather than a reader noticing.
+    #[test]
+    fn a_lent_frame_is_drawn_the_way_up_it_says_it_is() {
+        let Some(bottom_first) = drawn(true) else {
+            return;
+        };
+        assert_eq!(
+            bottom_first(WIDTH as u32 / 2, 4),
+            [255, 0, 0],
+            "the buffer's last rows are the top of the picture when it is bottom up"
+        );
+        assert_eq!(
+            bottom_first(WIDTH as u32 / 2, HEIGHT as u32 - 5),
+            [0, 0, 255],
+            "the buffer's first rows are the bottom of the picture when it is bottom up"
+        );
+
+        let Some(top_first) = drawn(false) else {
+            return;
+        };
+        assert_eq!(
+            top_first(WIDTH as u32 / 2, 4),
+            [0, 0, 255],
+            "the buffer's first rows are the top of the picture when it is top down"
+        );
+        assert_eq!(
+            top_first(WIDTH as u32 / 2, HEIGHT as u32 - 5),
+            [255, 0, 0],
+            "the buffer's last rows are the bottom of the picture when it is top down"
+        );
     }
 }

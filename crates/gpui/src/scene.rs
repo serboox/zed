@@ -771,6 +771,11 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// Who lent this buffer, when it was lent rather than captured. The pixels
+    /// come from `image_buffer` either way; this is how the renderer learns which
+    /// way up they are, and how it says back that it cannot draw them.
+    #[cfg(target_os = "macos")]
+    pub lent: Option<std::sync::Arc<crate::SharedFrame>>,
     /// A frame the graphics card already holds, shared with this process rather
     /// than copied into it.
     #[cfg(target_os = "linux")]

@@ -308,6 +308,23 @@ jobs:
           path: target/Zed-macos-${{ matrix.target.arch }}.app.zip
           if-no-files-found: error
 
+      # The other half of drawing a lent frame: whether the window's own renderer
+      # puts one on the screen, and the right way up. It draws offscreen, so this
+      # asks for a graphics device but neither a window nor anybody logged in --
+      # which the crate's other tests, the pasteboard among them, cannot say.
+      - name: Test the window's own renderer
+        run: |
+          set -o pipefail
+          cargo test --profile release-fast --package gpui_macos --lib \
+            metal_renderer::tests -- --nocapture 2>&1 | tee renderer-test.log
+          # A filter that matches nothing would otherwise pass without having run
+          # anything at all.
+          grep -q 'test result: ok\. 1 passed' renderer-test.log
+
+      - name: Say whether a lent frame was drawn here
+        if: always()
+        run: grep -m1 '^RENDERER:' renderer-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
       - name: Test the HTML engine
         if: steps.engine.outcome == 'success'
         run: |

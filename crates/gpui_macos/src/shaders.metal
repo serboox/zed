@@ -899,6 +899,40 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+// A frame the graphics card already holds, lent to the window by something else
+// that drew it -- an embedded web engine, for instance. There is one texture,
+// already in the window's own colour order, so this only places it.
+
+vertex SurfaceVertexOutput shared_frame_vertex(
+    uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
+    constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SurfaceInputIndex_ViewportSize)]],
+    constant uint *bottom_up [[buffer(SurfaceInputIndex_BottomUp)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  SurfaceBounds surface = surfaces[surface_id];
+  float4 device_position =
+      to_device_position(unit_vertex, surface.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
+                                                 surface.content_mask.bounds);
+  // OpenGL counts rows from the bottom, so a buffer it drew into arrives with
+  // the bottom of the picture first and has to be read the other way up.
+  float2 texture_position =
+      *bottom_up != 0 ? float2(unit_vertex.x, 1.0 - unit_vertex.y) : unit_vertex;
+  return SurfaceVertexOutput{
+      device_position,
+      texture_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 shared_frame_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> frame
+                                      [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return frame.sample(texture_sampler, input.texture_position);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

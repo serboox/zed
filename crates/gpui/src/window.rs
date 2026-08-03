@@ -4305,6 +4305,33 @@ impl Window {
         });
     }
 
+    /// Paint a frame the graphics card already holds into the scene for the next
+    /// frame at the current z-index. The frame is sampled where it is; nothing is
+    /// copied through this process's memory.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_shared_frame(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        frame: std::sync::Arc<crate::SharedFrame>,
+    ) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            image_buffer: frame.image_buffer.clone(),
+            lent: Some(frame),
+        });
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -4321,6 +4348,7 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+            lent: None,
         });
     }
 
