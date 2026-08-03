@@ -96,10 +96,18 @@ jobs:
       - name: Install the editor's build dependencies
         run: script/linux
 
-      - name: Install the packaging and headless-graphics tools
+      # The engine plays media through GStreamer, and the crate that binds it
+      # asks pkg-config where the libraries are. Nothing here had them: the
+      # engine's build only ever got past that step because a kept build-script
+      # answer stood in for the libraries themselves, and the first run with a
+      # cold cache said so.
+      - name: Install the packaging, headless-graphics and media tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base
+          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav
           sudo gem install --no-document fpm
 
       - run: rustup show
@@ -241,6 +249,17 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+
+      # Same reason as the Linux job: the engine's media backend is bound to
+      # GStreamer through pkg-config, and the runner carries neither.
+      - name: Install the media libraries
+        if: needs.plan.outputs.engine != ''
+        run: |
+          set -euo pipefail
+          command -v pkg-config >/dev/null || brew install pkgconf
+          brew install gstreamer
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+            >> "$GITHUB_ENV"
 
       - run: rustup show
 
