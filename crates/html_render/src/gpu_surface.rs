@@ -98,6 +98,7 @@ struct Face {
     shared: Option<SharedBuffer>,
     /// The frame the window is handed for this face, made once and handed out
     /// every time this face comes round again.
+    #[cfg(target_os = "linux")]
     frame: RefCell<Option<Arc<SharedFrame>>>,
 }
 
@@ -254,6 +255,7 @@ impl Face {
             texture,
             framebuffer,
             shared: shared.map(|(_, buffer)| buffer),
+            #[cfg(target_os = "linux")]
             frame: RefCell::new(None),
         })
     }
