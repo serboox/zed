@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AnyElement, App, Context, FocusHandle, Focusable as _, Window};
 use ui::{CommonAnimationExt, ProgressBar, prelude::*};
@@ -23,12 +23,14 @@ const WHILE_WAITING: Duration = Duration::from_millis(250);
 pub(crate) struct LoadingReport {
     focus_handle: Option<FocusHandle>,
     watching: bool,
-    /// Set once [`BEFORE_SAYING_ANYTHING`] has passed with work still in flight.
-    speaking: bool,
+    /// When the work in flight began. Whether to say anything is read from this
+    /// rather than set by whatever refreshes the panel: the first unit of work is
+    /// registered while the workspace is still being built, and a refresher armed
+    /// from there would have no drawn window to bring up to date.
+    began_at: Option<Instant>,
     /// The reader asked to be let through. Holds until this load finishes, so
     /// the panel does not come back a moment later.
     waved_through: bool,
-    waited: Duration,
 }
 
 impl LoadingReport {
@@ -51,22 +53,28 @@ impl LoadingReport {
     }
 
     /// Begins a load, from a state that may be a finished one.
-    pub(crate) fn start_over(&mut self) {
-        self.speaking = false;
+    pub(crate) fn start_over(&mut self, now: Instant) {
+        self.began_at = Some(now);
         self.waved_through = false;
-        self.waited = Duration::ZERO;
+    }
+
+    fn waited(&self, now: Instant) -> Duration {
+        self.began_at
+            .map(|began_at| now.saturating_duration_since(began_at))
+            .unwrap_or_default()
     }
 }
 
 impl Workspace {
-    /// Starts watching, unless something is already being watched. Called for
-    /// every unit of start-up work, of which there are many.
-    pub(crate) fn watch_the_loading(&mut self, cx: &mut Context<Self>) {
+    /// Keeps the panel refreshed while work is in flight. Armed from drawing
+    /// rather than from registering work: the first unit of work is registered
+    /// while the workspace is still being built, and a task spawned from there
+    /// has no drawn window to bring up to date.
+    fn refresh_while_loading(&mut self, cx: &mut Context<Self>) {
         if self.loading.watching {
             return;
         }
         self.loading.watching = true;
-        self.loading.waited = Duration::ZERO;
         // Detached rather than held in a field: the loop below is what clears
         // `watching`, and a task that dropped itself to do so could never.
         cx.spawn(async move |workspace, cx| {
@@ -74,18 +82,14 @@ impl Workspace {
                 cx.background_executor().timer(WHILE_WAITING).await;
                 // Noticing that the work is done and standing down happen in the
                 // same update as each other, so a load that begins in between
-                // cannot find `watching` still set with nothing watching: either
-                // it is seen here and watching continues, or it arms its own.
+                // cannot find `watching` still set with nothing refreshing:
+                // either it is seen here and refreshing continues, or the next
+                // frame arms it again.
                 let watching = workspace.update(cx, |workspace, cx| {
                     if workspace.active_load_phase().is_none() {
                         workspace.loading.forget();
                         cx.notify();
                         return false;
-                    }
-                    let loading = &mut workspace.loading;
-                    loading.waited += WHILE_WAITING;
-                    if !loading.speaking && loading.waited >= BEFORE_SAYING_ANYTHING {
-                        loading.speaking = true;
                     }
                     cx.notify();
                     true
@@ -102,8 +106,10 @@ impl Workspace {
     /// Whether the panel is up. Asked again inside every deferred callback: a
     /// modal can open, the work can finish and the reader can wave the panel
     /// through, all between a frame and the end of its effect cycle.
-    fn is_reporting(&self) -> bool {
-        self.active_load_phase().is_some() && self.loading.speaking && !self.loading.waved_through
+    fn is_reporting(&self, cx: &App) -> bool {
+        self.active_load_phase().is_some()
+            && !self.loading.waved_through
+            && self.loading.waited(cx.background_executor().now()) >= BEFORE_SAYING_ANYTHING
     }
 
     /// What fraction of the start-up work is done. Every phase counts the same,
@@ -145,7 +151,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.is_reporting() {
+        // Armed on every frame that has work in flight, so the panel comes up
+        // even when nothing else would ask for a redraw.
+        if self.active_load_phase().is_some() && !self.loading.waved_through {
+            self.refresh_while_loading(cx);
+        }
+        if !self.is_reporting(cx) {
             // The panel took focus and is no longer drawn, so give it back rather
             // than leave the window focused on an element nobody can see and a
             // keyboard that does nothing until the reader clicks somewhere.
@@ -166,7 +177,7 @@ impl Workspace {
                         .focus_handle
                         .as_ref()
                         .is_some_and(|focus_handle| focus_handle.is_focused(window));
-                    if workspace.is_reporting() || !ours_still_has_it {
+                    if workspace.is_reporting(cx) || !ours_still_has_it {
                         return;
                     }
                     let pane = workspace.active_pane.focus_handle(cx);
@@ -194,7 +205,7 @@ impl Workspace {
                     // Focusing an undrawn panel then would leave the keyboard
                     // dead, and taking focus from a modal would leave the load
                     // waiting on an answer nobody can give.
-                    if !workspace.is_reporting() || workspace.has_active_modal(window, cx) {
+                    if !workspace.is_reporting(cx) || workspace.has_active_modal(window, cx) {
                         return;
                     }
                     window.focus(&focus_handle, cx);
@@ -205,7 +216,10 @@ impl Workspace {
         let colors = cx.theme().colors();
         let done = self.how_far_loaded();
         let files_found = self.files_found(cx);
-        let waited = self.loading.waited.as_secs();
+        let waited = self
+            .loading
+            .waited(cx.background_executor().now())
+            .as_secs();
 
         let phases = WorkspaceLoadPhase::ALL.map(|phase| {
             let left = self.load_phase_counts[phase as usize];
@@ -217,6 +231,9 @@ impl Workspace {
         let card =
             v_flex()
                 .w(px(420.))
+                // A window can be narrower than the card wants to be, and the
+                // reader would rather read part of it than have it cut off.
+                .max_w(relative(0.9))
                 .p_5()
                 .gap_3()
                 .rounded_lg()

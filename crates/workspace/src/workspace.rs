@@ -8657,14 +8657,13 @@ impl Workspace {
         // to a live project -- is a new load, and must not inherit the last
         // one's waiting or the last one's having been waved through.
         if self.active_load_phase().is_none() {
-            self.loading.start_over();
+            self.loading.start_over(cx.background_executor().now());
         }
         let count = &mut self.load_phase_counts[phase as usize];
         *count += 1;
         let count = *count;
         let total = &mut self.load_phase_totals[phase as usize];
         *total = (*total).max(count);
-        self.watch_the_loading(cx);
         cx.notify();
     }
 
@@ -17908,6 +17907,34 @@ mod tests {
                 "focus has to come back, or the keyboard does nothing afterwards"
             );
         });
+    }
+
+    /// The shape the real editor has: the first unit of work is registered while
+    /// the workspace is still being constructed, before the window has drawn
+    /// anything. What decides whether the panel is up must survive that, which a
+    /// flag set by a task spawned from the constructor does not.
+    #[gpui::test]
+    async fn test_loading_report_covers_a_window_whose_work_began_as_it_was_built(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (_workspace, cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::test_new(project.clone(), window, cx);
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            workspace
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("loading-report").is_some(),
+            "work begun while the window was being built still has to be reported"
+        );
     }
 
     #[gpui::test]
