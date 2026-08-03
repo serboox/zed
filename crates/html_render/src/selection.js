@@ -561,6 +561,165 @@
     return looking.at + 1 + "," + total;
   }
 
+
+  // What a developer's panel asks the page about itself: the tree it is made of,
+  // what its scripts have said, and what it fetched. All of it is read from the
+  // page as it stands -- there is no protocol here and nothing is left running.
+  var said = [];
+  var MOST_SAID = 300;
+
+  function remember(level, args) {
+    var parts = [];
+    for (var i = 0; i < args.length; i++) {
+      var piece = args[i];
+      try {
+        parts.push(
+          typeof piece === "string" ? piece : JSON.stringify(piece) || String(piece)
+        );
+      } catch (whatever) {
+        parts.push(String(piece));
+      }
+    }
+    said.push({ level: level, text: parts.join(" ") });
+    if (said.length > MOST_SAID) {
+      said.shift();
+    }
+  }
+
+  ["log", "info", "warn", "error", "debug"].forEach(function (level) {
+    var was = console[level];
+    console[level] = function () {
+      remember(level, arguments);
+      if (was) {
+        was.apply(console, arguments);
+      }
+    };
+  });
+  window.addEventListener("error", function (event) {
+    remember("error", [event.message + " (" + (event.filename || "") + ":" + (event.lineno || 0) + ")"]);
+  });
+
+  /// One line per element, deep first, with a number to ask about it again. The
+  /// depth is bounded: a page can be forty levels deep and nobody reads that in a
+  /// panel.
+  function tree(deepest) {
+    var rows = [];
+    var numbered = [];
+    var walk = function (node, depth) {
+      if (rows.length >= 2000 || depth > deepest) {
+        return;
+      }
+      if (node.nodeType !== 1 || node.getAttribute("data-zed-selection")) {
+        return;
+      }
+      var name = node.nodeName.toLowerCase();
+      var mark = node.id ? "#" + node.id : "";
+      var classes = node.className && typeof node.className === "string"
+        ? "." + node.className.trim().split(/\s+/).slice(0, 3).join(".")
+        : "";
+      numbered.push(node);
+      rows.push({
+        at: numbered.length - 1,
+        depth: depth,
+        text: name + mark + (classes === "." ? "" : classes),
+        children: node.children ? node.children.length : 0,
+      });
+      for (var i = 0; i < node.children.length; i++) {
+        walk(node.children[i], depth + 1);
+      }
+    };
+    walk(document.documentElement, 0);
+    window.__zedNumbered = numbered;
+    return JSON.stringify(rows);
+  }
+
+  /// Everything about one element that a panel shows: where it is, how big, and
+  /// the properties worth reading.
+  function about(at) {
+    var node = (window.__zedNumbered || [])[at];
+    if (!node) {
+      return "{}";
+    }
+    var box = node.getBoundingClientRect();
+    var style = window.getComputedStyle(node);
+    var wanted = [
+      "display", "position", "width", "height", "margin", "padding", "border",
+      "color", "background-color", "font", "flex", "grid-template-columns",
+      "overflow", "z-index", "opacity",
+    ];
+    var styles = {};
+    for (var i = 0; i < wanted.length; i++) {
+      styles[wanted[i]] = style.getPropertyValue(wanted[i]);
+    }
+    return JSON.stringify({
+      tag: node.nodeName.toLowerCase(),
+      box: {
+        left: Math.round(box.left),
+        top: Math.round(box.top),
+        width: Math.round(box.width),
+        height: Math.round(box.height),
+      },
+      html: (node.outerHTML || "").slice(0, 400),
+      styles: styles,
+    });
+  }
+
+  var outline = null;
+
+  /// Draws a frame around an element, the way a browser's inspector does.
+  function highlight(at) {
+    var node = (window.__zedNumbered || [])[at];
+    if (!outline) {
+      outline = document.createElement("div");
+      outline.setAttribute("data-zed-selection", "outline");
+      outline.style.cssText =
+        "position:fixed;pointer-events:none;z-index:2147483646;" +
+        "border:2px solid rgba(64,138,240,0.9);background:rgba(64,138,240,0.12)";
+      document.body.appendChild(outline);
+    }
+    if (!node) {
+      outline.style.display = "none";
+      return "";
+    }
+    var box = node.getBoundingClientRect();
+    outline.style.display = "block";
+    outline.style.left = box.left + "px";
+    outline.style.top = box.top + "px";
+    outline.style.width = box.width + "px";
+    outline.style.height = box.height + "px";
+    return "";
+  }
+
+  /// What the page fetched, as the page itself recorded it.
+  function fetched() {
+    if (!window.performance || !performance.getEntriesByType) {
+      return "[]";
+    }
+    var entries = performance.getEntriesByType("resource").slice(-200);
+    return JSON.stringify(
+      entries.map(function (entry) {
+        return {
+          name: entry.name,
+          kind: entry.initiatorType || "",
+          ms: Math.round(entry.duration),
+          size: entry.transferSize || entry.encodedBodySize || 0,
+        };
+      })
+    );
+  }
+
+  window.__zedTools = {
+    said: function () {
+      var out = JSON.stringify(said);
+      said = [];
+      return out;
+    },
+    tree: tree,
+    about: about,
+    highlight: highlight,
+    fetched: fetched,
+  };
+
   window.__zedSelection = {
     text: selectedText,
     find: find,

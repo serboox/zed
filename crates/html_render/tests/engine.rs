@@ -433,6 +433,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_knows_how_wide_it_is(cx);
         the_page_is_laid_out_the_way_it_asks_to_be(cx);
         the_engine_can_play_media(cx);
+        the_page_answers_the_developer_tools(cx);
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
@@ -1051,5 +1052,76 @@ fn the_engine_can_play_media(cx: &mut gpui::App) {
     assert!(
         answer.contains("maybe") || answer.contains("probably"),
         "the engine should have a media backend behind it, not a stub: it answered {answer:?}"
+    );
+}
+
+/// What the panel in the dock asks the page, and what it gets back. Everything
+/// there is read out of the page itself, so if the page stops answering any of
+/// these the panel goes blank without a word.
+fn the_page_answers_the_developer_tools(cx: &mut gpui::App) {
+    let body = "<div id=\"outer\"><p class=\"inner\">Some words</p></div>\
+         <script>console.log('hello from the page'); console.error('and a complaint');</script>";
+    let mut page = page(
+        &document("margin:0;background:#fff", body),
+        400.,
+        260.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page to inspect");
+    pump_for(&mut page, Duration::from_millis(400));
+
+    let ask = |page: &mut HtmlPage, question: &str| {
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        page.ask_tools(question, {
+            let answer = answer.clone();
+            move |text| *answer.borrow_mut() = Some(text)
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer.borrow_mut().take().expect("the page said nothing")
+    };
+
+    // What the page is made of, one row per element.
+    let tree = ask(&mut page, "tree(12)");
+    assert!(
+        tree.contains("div#outer") && tree.contains("p.inner"),
+        "the tree should name the page's own elements: {tree}"
+    );
+
+    // What its scripts have said, and of what kind.
+    let said = ask(&mut page, "said()");
+    assert!(
+        said.contains("hello from the page") && said.contains("and a complaint"),
+        "the console should have kept what the page said: {said}"
+    );
+    assert!(
+        said.contains("\"error\""),
+        "a complaint should be marked as one: {said}"
+    );
+    // Taken once and not again: the panel reads them off as they come.
+    let said_again = ask(&mut page, "said()");
+    assert!(
+        !said_again.contains("hello from the page"),
+        "what has been read should not come back: {said_again}"
+    );
+
+    // One element in full: where it is, how big, and how it is painted.
+    let about = ask(&mut page, "about(1)");
+    assert!(
+        about.contains("\"box\"") && about.contains("\"styles\"") && about.contains("display"),
+        "an element should come with its box and its styles: {about}"
+    );
+
+    // And what the page fetched. A page of its own text fetched nothing, so an
+    // empty list is the right answer -- but it must be a list.
+    let fetched = ask(&mut page, "fetched()");
+    assert!(
+        fetched.starts_with('['),
+        "what was fetched should come back as a list: {fetched}"
     );
 }

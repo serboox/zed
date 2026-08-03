@@ -803,6 +803,10 @@ fn initialize_panels(
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
         let api_client_panel = ApiClientPanel::load(workspace_handle.clone(), cx.clone());
+        let browser_tools_panel = html_preview::browser_tools_panel::BrowserToolsPanel::load(
+            workspace_handle.clone(),
+            cx.clone(),
+        );
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -858,6 +862,11 @@ fn initialize_panels(
                     add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
                     add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
                     add_panel_when_ready(api_client_panel, workspace_handle.clone(), cx.clone()),
+                    add_panel_when_ready(
+                        browser_tools_panel,
+                        workspace_handle.clone(),
+                        cx.clone()
+                    ),
                     initialize_agent_panel(workspace_handle.clone(), cx.clone())
                         .map(|r| r.log_err()),
                 );

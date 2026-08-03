@@ -1423,6 +1423,7 @@
     "context": "HtmlPreview",
     "bindings": {
       "ctrl-f": "html::FindInPage",
+      "ctrl-shift-i": "browser_tools::ToggleFocus",
       "ctrl-g": "html::FindNextInPage",
       "ctrl-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",

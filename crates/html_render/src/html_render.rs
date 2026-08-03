@@ -729,6 +729,17 @@ mod engine {
             );
         }
 
+        /// Asks the page a question a developer's panel needs answering: the
+        /// tree it is made of, what its scripts have said, what it fetched, or
+        /// what one element is. The answer is whatever the page returned, as
+        /// text, on a later turn.
+        pub fn ask_tools(&self, question: &str, deliver: impl FnOnce(String) + 'static) {
+            self.evaluate(
+                &format!("window.__zedTools ? window.__zedTools.{question} : ''"),
+                deliver,
+            );
+        }
+
         /// Asks the page for the text the reader has selected.
         pub fn selected_text(&self, deliver: impl FnOnce(String) + 'static) {
             self.evaluate(
@@ -863,8 +874,11 @@ mod engine {
                     Some(base) => format!("<base href=\"{base}\">\n{html}"),
                     None => html.to_string(),
                 };
-            // Last, so the document it works on is already built.
-            let document = format!("{document}\n<script>{SELECTION_SHIM}</script>\n");
+            // First, so that what the page's own scripts say as they run is kept:
+            // the shim hooks the console, and anything said before it is in
+            // place is said to nobody. It touches no element until the page has
+            // loaded, so being ahead of the document costs it nothing.
+            let document = format!("<script>{SELECTION_SHIM}</script>\n{document}");
             std::fs::write(&path, document).context("writing the page for the engine to load")?;
             Ok(Self {
                 _directory: directory,

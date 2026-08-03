@@ -249,6 +249,13 @@ impl HtmlPreviewView {
             .and_then(|view| pane.index_for_item(&view))
     }
 
+    /// The live page, for whoever needs to ask it something -- the developer's
+    /// tools in the dock, and nothing else.
+    #[cfg(feature = "servo")]
+    pub fn page(&self) -> Option<&html_render::HtmlPage> {
+        self.page.as_ref()
+    }
+
     /// A page with nothing behind it: the reader types where to go. It is the
     /// same preview in every other way -- the same engine, the same address bar,
     /// the same page -- only without a document of the editor's to follow.

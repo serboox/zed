@@ -3,6 +3,8 @@ use workspace::Workspace;
 
 pub mod html_preview_settings;
 #[cfg(feature = "servo")]
+pub mod browser_tools_panel;
+#[cfg(feature = "servo")]
 pub mod page_scroll;
 pub mod html_preview_view;
 

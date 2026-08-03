@@ -1492,6 +1492,7 @@
     "context": "HtmlPreview",
     "bindings": {
       "cmd-f": "html::FindInPage",
+      "cmd-shift-i": "browser_tools::ToggleFocus",
       "cmd-g": "html::FindNextInPage",
       "cmd-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",
