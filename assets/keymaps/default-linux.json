@@ -726,6 +726,7 @@
       "ctrl-shift-d": "debug_panel::ToggleFocus",
       "ctrl-alt-8": "database_panel::ToggleFocus",
       "ctrl-alt-9": "api_client_panel::ToggleFocus",
+      "ctrl-shift-i": "browser_tools::ToggleFocus",
       "ctrl-?": "agent::ToggleFocus",
       "alt-save": "workspace::SaveAll",
       "ctrl-alt-s": "workspace::SaveAll",
@@ -1401,7 +1402,6 @@
     "context": "HtmlPreview",
     "bindings": {
       "ctrl-f": "html::FindInPage",
-      "ctrl-shift-i": "browser_tools::ToggleFocus",
       "ctrl-g": "html::FindNextInPage",
       "ctrl-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",

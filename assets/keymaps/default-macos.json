@@ -777,6 +777,7 @@
       "cmd-shift-d": "debug_panel::ToggleFocus",
       "cmd-alt-8": "database_panel::ToggleFocus",
       "cmd-alt-9": "api_client_panel::ToggleFocus",
+      "cmd-shift-i": "browser_tools::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
@@ -1492,7 +1493,6 @@
     "context": "HtmlPreview",
     "bindings": {
       "cmd-f": "html::FindInPage",
-      "cmd-shift-i": "browser_tools::ToggleFocus",
       "cmd-g": "html::FindNextInPage",
       "cmd-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",
