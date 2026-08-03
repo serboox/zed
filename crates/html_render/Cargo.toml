@@ -32,6 +32,7 @@ servo = [
     "dep:smallvec",
     "dep:tempfile",
     "dep:url",
+    "dep:windows",
 ]
 
 [dependencies]
@@ -63,7 +64,16 @@ smallvec = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
+# The page's own frame buffer is a Direct3D texture there, made on the device
+# surfman already draws through and opened again by the window. Opt-in with the
+# rest of the engine, so a build without it stays as small as it was.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, optional = true }
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 libc.workspace = true
 keyboard_types.workspace = true
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows.workspace = true

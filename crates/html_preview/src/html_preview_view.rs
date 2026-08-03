@@ -173,7 +173,7 @@ pub struct HtmlPreviewView {
     frame: Option<std::sync::Arc<gpui::RenderImage>>,
     /// The page's own buffer, when the window can draw it where it lies. While
     /// this is set, no frame is ever copied through memory.
-    #[cfg(all(feature = "servo", target_os = "linux"))]
+    #[cfg(all(feature = "servo", any(target_os = "linux", target_os = "windows")))]
     shared_frame: Option<std::sync::Arc<gpui::SharedFrame>>,
     #[cfg(feature = "servo")]
     pump: Option<Task<()>>,
@@ -450,7 +450,7 @@ impl HtmlPreviewView {
                 page: None,
                 #[cfg(feature = "servo")]
                 frame: None,
-                #[cfg(all(feature = "servo", target_os = "linux"))]
+                #[cfg(all(feature = "servo", any(target_os = "linux", target_os = "windows")))]
                 shared_frame: None,
                 #[cfg(feature = "servo")]
                 pump: None,
@@ -491,7 +491,7 @@ impl HtmlPreviewView {
                 // is going, and the window must let go of the page's buffer
                 // before the page lets go of the memory behind it.
                 this.pump.take();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 this.shared_frame.take();
                 this.page.take();
                 // The last frame a closed preview painted would otherwise sit
@@ -807,7 +807,7 @@ impl HtmlPreviewView {
                             }
                         });
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     if view
                         .shared_frame
                         .as_ref()
@@ -817,7 +817,7 @@ impl HtmlPreviewView {
                         // all, and the page has gone back to copying frames.
                         view.shared_frame = None;
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     if painted && let Some(shared) = page.shared_frame() {
                         view.shared_frame = Some(shared);
                         // What was copied before is not what is drawn now.
@@ -867,7 +867,7 @@ impl HtmlPreviewView {
             if self.frame.is_some() {
                 return true;
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             if self.shared_frame.is_some() {
                 return true;
             }
@@ -1026,9 +1026,9 @@ impl HtmlPreviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let shared = self.shared_frame.clone();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let shared: Option<()> = None;
         let frame = self.frame.clone();
         let bounds_cell = self.page_bounds.clone();
@@ -1045,7 +1045,7 @@ impl HtmlPreviewView {
                 move |painted_bounds, _, window, _| {
                     // The page's own buffer, drawn where the graphics card
                     // already holds it.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     if let Some(shared) = shared.clone() {
                         window.paint_shared_frame(painted_bounds, shared);
                     }
