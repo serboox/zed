@@ -53,6 +53,20 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// Frames the page lent this window, opened as textures of its own. Opening
+    /// one is cheap but not free, and the same two come back frame after frame, so
+    /// each is opened once and kept until it stops arriving.
+    shared_frames: collections::HashMap<usize, HeldFrame>,
+}
+
+/// A frame the page lent, as this window holds it.
+struct HeldFrame {
+    imported: crate::shared_frame_import::ImportedFrame,
+    /// The frame it was opened from, held so that the page's texture outlives the
+    /// window's name for it. It is also how the cache knows the frame is still in
+    /// use: when nobody else holds it, this entry is the last one and can go.
+    frame: Arc<SharedFrame>,
 }
 
 /// Direct3D objects
@@ -91,6 +105,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    shared_frames: PipelineState<SharedFrameSprite>,
 }
 
 struct DirectXGlobalElements {
@@ -192,6 +207,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            shared_frames: collections::HashMap::default(),
         })
     }
 
@@ -316,6 +332,10 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        // The names this window had for the page's textures belonged to the device
+        // that has gone; the textures themselves are the page's and are opened
+        // again on the new one.
+        self.shared_frames.clear();
         Ok(())
     }
 
@@ -380,6 +400,7 @@ impl DirectXRenderer {
                 )
             })?;
         }
+        self.forget_frames_nobody_lends();
         self.present()
     }
 
@@ -725,11 +746,80 @@ impl DirectXRenderer {
         )
     }
 
+    /// Draws frames the page lent, sampling each where the graphics card already
+    /// holds it: nothing is read back and nothing is uploaded. A frame that cannot
+    /// be opened here is simply not drawn, and the page is told so it can go back
+    /// to handing over pixels.
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let devices = self.devices.as_ref().context("devices missing")?.clone();
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let viewport = resources.viewport;
+
+        let mut sprites = Vec::with_capacity(surfaces.len());
+        let mut views = Vec::with_capacity(surfaces.len());
+        for surface in surfaces {
+            let key = Arc::as_ptr(&surface.frame) as usize;
+            if let collections::hash_map::Entry::Vacant(slot) = self.shared_frames.entry(key) {
+                let Some(imported) = crate::shared_frame_import::import_shared_frame(
+                    &devices.device,
+                    &surface.frame,
+                ) else {
+                    surface.frame.refuse();
+                    continue;
+                };
+                slot.insert(HeldFrame {
+                    imported,
+                    frame: surface.frame.clone(),
+                });
+            }
+            let Some(held) = self.shared_frames.get(&key) else {
+                continue;
+            };
+            let across = surface.frame.width as f32
+                / surface.frame.buffer_width.max(surface.frame.width) as f32;
+            sprites.push(SharedFrameSprite {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask.bounds,
+                bottom_up: surface.frame.bottom_up as u32,
+                across,
+                padding: [0; 2],
+            });
+            views.push(Some(held.imported.view.clone()));
+        }
+        if sprites.is_empty() {
+            return Ok(());
+        }
+
+        self.pipelines
+            .shared_frames
+            .update_buffer(&devices.device, &devices.device_context, &sprites)?;
+        // One at a time, because each frame is a texture of its own and the
+        // texture is what a draw call is set up with.
+        for (at, view) in views.iter().enumerate() {
+            self.pipelines.shared_frames.draw_range_with_texture(
+                &devices.device,
+                &devices.device_context,
+                slice::from_ref(view),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                at as u32,
+                1,
+            )?;
+        }
         Ok(())
+    }
+
+    /// Lets go of frames the page no longer lends. This runs every frame rather
+    /// than only when one is drawn: a preview that is closed stops putting its
+    /// frame in the scene, and its texture -- several megabytes of graphics
+    /// memory -- would otherwise be held until the window closed.
+    fn forget_frames_nobody_lends(&mut self) {
+        self.shared_frames
+            .retain(|_, held| Arc::strong_count(&held.frame) > 1);
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
@@ -910,6 +1000,14 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
 
+        let shared_frames = PipelineState::new(
+            device,
+            "shared_frame_pipeline",
+            ShaderModule::SharedFrame,
+            2,
+            create_blend_state(device)?,
+        )?;
+
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
@@ -919,6 +1017,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            shared_frames,
         })
     }
 }
@@ -1173,6 +1272,20 @@ impl<T> PipelineState<T> {
         }
         Ok(())
     }
+}
+
+/// Where a lent frame goes, and how much of the texture is the picture.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SharedFrameSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    /// Whether the texture's first row is the bottom of the picture, as OpenGL
+    /// hands it over.
+    bottom_up: u32,
+    /// How much of each row is the picture rather than the producer's padding.
+    across: f32,
+    padding: [u32; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -1631,6 +1744,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        SharedFrame,
         EmojiRasterization,
     }
 
@@ -1704,6 +1818,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::SharedFrame => match target {
+                    ShaderTarget::Vertex => SHARED_FRAME_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SHARED_FRAME_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1795,6 +1913,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::SharedFrame => "shared_frame",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

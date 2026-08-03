@@ -1256,3 +1256,55 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Shared frames
+**
+*/
+
+// A frame the graphics card already holds, lent to the window by something else
+// that drew it -- the embedded web engine. There is one texture, already in the
+// order the window reads, so this only places it.
+struct SharedFrameSprite {
+    Bounds bounds;
+    Bounds content_mask;
+    // Whether the texture's first row is the bottom of the picture, which is how
+    // OpenGL hands one over.
+    uint bottom_up;
+    // How much of each row is the picture rather than the producer's padding.
+    float across;
+    uint2 pad;
+};
+
+struct SharedFrameVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct SharedFrameFragmentInput {
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+};
+
+StructuredBuffer<SharedFrameSprite> shared_frame_sprites: register(t1);
+
+SharedFrameVertexOutput shared_frame_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    SharedFrameSprite sprite = shared_frame_sprites[sprite_id];
+
+    SharedFrameVertexOutput output;
+    output.position = to_device_position(unit_vertex, sprite.bounds);
+    output.texture_position = float2(
+        unit_vertex.x * sprite.across,
+        sprite.bottom_up != 0u ? 1.0 - unit_vertex.y : unit_vertex.y
+    );
+    output.clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
+                                                  sprite.content_mask);
+    return output;
+}
+
+float4 shared_frame_fragment(SharedFrameFragmentInput input): SV_Target {
+    return t_sprite.Sample(s_sprite, input.texture_position);
+}
