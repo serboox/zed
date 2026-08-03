@@ -803,6 +803,8 @@ fn initialize_panels(
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
         let api_client_panel = ApiClientPanel::load(workspace_handle.clone(), cx.clone());
+        // The panel is part of the web engine, which a build may leave out.
+        #[cfg(feature = "servo")]
         let browser_tools_panel = html_preview::browser_tools_panel::BrowserToolsPanel::load(
             workspace_handle.clone(),
             cx.clone(),
@@ -866,7 +868,7 @@ fn initialize_panels(
 
         // One unit of the phase per panel, so what the reader is shown moves as
         // each one lands instead of sitting still until the last of them does.
-        let panel_loads: Vec<futures::future::LocalBoxFuture<'static, ()>> = vec![
+        let mut panel_loads: Vec<futures::future::LocalBoxFuture<'static, ()>> = vec![
             in_the_panels_phase(project_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(outline_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(git_panel, workspace_handle.clone(), cx.clone()),
@@ -874,23 +876,28 @@ fn initialize_panels(
             in_the_panels_phase(debug_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(database_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(api_client_panel, workspace_handle.clone(), cx.clone()),
-            in_the_panels_phase(browser_tools_panel, workspace_handle.clone(), cx.clone()),
-            {
-                let workspace_handle = workspace_handle.clone();
-                let mut cx = cx.clone();
-                async move {
-                    initialize_agent_panel(workspace_handle.clone(), cx.clone())
-                        .map(|r| r.log_err())
-                        .await;
-                    workspace_handle
-                        .update(&mut cx, |workspace, cx| {
-                            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
-                        })
-                        .log_err();
-                }
-                .boxed_local()
-            },
         ];
+        #[cfg(feature = "servo")]
+        panel_loads.push(in_the_panels_phase(
+            browser_tools_panel,
+            workspace_handle.clone(),
+            cx.clone(),
+        ));
+        panel_loads.push({
+            let workspace_handle = workspace_handle.clone();
+            let mut cx = cx.clone();
+            async move {
+                initialize_agent_panel(workspace_handle.clone(), cx.clone())
+                    .map(|r| r.log_err())
+                    .await;
+                workspace_handle
+                    .update(&mut cx, |workspace, cx| {
+                        workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+                    })
+                    .log_err();
+            }
+            .boxed_local()
+        });
 
         let other_panels_load = {
             let workspace_handle = workspace_handle.clone();
