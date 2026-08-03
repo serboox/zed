@@ -648,6 +648,12 @@
     },
   },
   {
+    "context": "LoadingReport",
+    "bindings": {
+      "escape": "workspace::DismissLoadingReport",
+    },
+  },
+  {
     "context": "Workspace",
     "bindings": {
       // Move focus between the major regions of the window (editor, open

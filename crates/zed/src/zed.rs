@@ -840,6 +840,20 @@ fn initialize_panels(
                 .log_err();
         }
 
+        fn in_the_panels_phase(
+            panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
+            workspace_handle: WeakEntity<Workspace>,
+            cx: gpui::AsyncWindowContext,
+        ) -> futures::future::LocalBoxFuture<'static, ()> {
+            add_panel_when_ready_in_phase(
+                panel_task,
+                WorkspaceLoadPhase::LoadingPanels,
+                workspace_handle,
+                cx,
+            )
+            .boxed_local()
+        }
+
         // The terminal panel is tracked apart from the rest so that once the
         // quick panels are in, the indicator names the one slow thing left --
         // restoring a terminal spawns the user's real login shell.
@@ -850,31 +864,51 @@ fn initialize_panels(
             cx.clone(),
         );
 
+        // One unit of the phase per panel, so what the reader is shown moves as
+        // each one lands instead of sitting still until the last of them does.
+        let panel_loads: Vec<futures::future::LocalBoxFuture<'static, ()>> = vec![
+            in_the_panels_phase(project_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(outline_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(git_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(channels_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(debug_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(database_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(api_client_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(browser_tools_panel, workspace_handle.clone(), cx.clone()),
+            {
+                let workspace_handle = workspace_handle.clone();
+                let mut cx = cx.clone();
+                async move {
+                    initialize_agent_panel(workspace_handle.clone(), cx.clone())
+                        .map(|r| r.log_err())
+                        .await;
+                    workspace_handle
+                        .update(&mut cx, |workspace, cx| {
+                            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+                        })
+                        .log_err();
+                }
+                .boxed_local()
+            },
+        ];
+
         let other_panels_load = {
             let workspace_handle = workspace_handle.clone();
             let mut cx = cx.clone();
             async move {
-                futures::join!(
-                    add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(api_client_panel, workspace_handle.clone(), cx.clone()),
-                    add_panel_when_ready(
-                        browser_tools_panel,
-                        workspace_handle.clone(),
-                        cx.clone()
-                    ),
-                    initialize_agent_panel(workspace_handle.clone(), cx.clone())
-                        .map(|r| r.log_err()),
-                );
+                let panels = panel_loads.len();
+                // The unit opened before this task was spawned stands in for all
+                // of them until they can be counted, so the phase is never empty
+                // in between and the panel does not blink out of the report.
                 workspace_handle
                     .update(&mut cx, |workspace, cx| {
+                        for _ in 0..panels {
+                            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+                        }
                         workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
                     })
                     .log_err();
+                futures::future::join_all(panel_loads).await;
             }
         };
 

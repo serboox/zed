@@ -3,6 +3,7 @@ pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
 pub mod item;
+mod loading_report;
 mod modal_layer;
 mod multi_workspace;
 #[cfg(test)]
@@ -77,6 +78,7 @@ pub use item::{
 };
 use itertools::Itertools;
 use language::{Buffer, LanguageRegistry, Rope, language_settings::all_language_settings};
+use loading_report::LoadingReport;
 pub use modal_layer::*;
 use node_runtime::NodeRuntime;
 use notifications::{
@@ -286,6 +288,9 @@ actions!(
         CloseWindow,
         /// Closes the current project.
         CloseProject,
+        /// Lets the reader use the editor while the project is still opening,
+        /// putting away the panel that reports the work in flight.
+        DismissLoadingReport,
         /// Opens the feedback dialog.
         Feedback,
         /// Follows the next collaborator in the session.
@@ -1540,6 +1545,10 @@ pub struct Workspace {
     /// finishes -- otherwise the first to complete would hide it while another
     /// is still running. A loading window must not be mistaken for an idle one.
     load_phase_counts: [usize; WorkspaceLoadPhase::COUNT],
+    /// The most units of work any one phase has held since it last went idle,
+    /// which is what turns "something is happening" into "four of nine done".
+    load_phase_totals: [usize; WorkspaceLoadPhase::COUNT],
+    loading: LoadingReport,
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
@@ -1988,6 +1997,7 @@ impl Workspace {
         center.mark_positions(cx);
 
         let load_phase_counts = [0usize; WorkspaceLoadPhase::COUNT];
+        let load_phase_totals = [0usize; WorkspaceLoadPhase::COUNT];
 
         let mut workspace = Workspace {
             weak_self: weak_handle.clone(),
@@ -2049,6 +2059,8 @@ impl Workspace {
             last_open_dock_positions: Vec::new(),
             removing: false,
             load_phase_counts,
+            load_phase_totals,
+            loading: LoadingReport::default(),
             _project_scan_task: None,
             sidebar_focus_handle: None,
             multi_workspace,
@@ -8546,13 +8558,30 @@ impl Workspace {
     /// Registers one more in-flight unit of work for `phase`, making it visible
     /// to [`Self::active_load_phase`] until a matching [`Self::end_load_phase`].
     pub fn begin_load_phase(&mut self, phase: WorkspaceLoadPhase, cx: &mut Context<Self>) {
-        self.load_phase_counts[phase as usize] += 1;
+        // A window that has finished loading and starts again -- a folder added
+        // to a live project -- is a new load, and must not inherit the last
+        // one's waiting or the last one's having been waved through.
+        if self.active_load_phase().is_none() {
+            self.loading.start_over();
+        }
+        let count = &mut self.load_phase_counts[phase as usize];
+        *count += 1;
+        let count = *count;
+        let total = &mut self.load_phase_totals[phase as usize];
+        *total = (*total).max(count);
+        self.watch_the_loading(cx);
         cx.notify();
     }
 
     pub fn end_load_phase(&mut self, phase: WorkspaceLoadPhase, cx: &mut Context<Self>) {
         let count = &mut self.load_phase_counts[phase as usize];
         *count = count.saturating_sub(1);
+        // A phase with nothing outstanding starts counting from nothing next
+        // time. Keeping the old high-water mark would report the first unit of
+        // the next round as four of five and walk the bar backwards.
+        if *count == 0 {
+            self.load_phase_totals[phase as usize] = 0;
+        }
         cx.notify();
     }
 
@@ -9716,6 +9745,11 @@ impl Render for Workspace {
                     })
                     .child(self.toast_layer.clone()),
             )
+            .on_action(cx.listener(|workspace, _: &DismissLoadingReport, _, cx| {
+                workspace.loading.wave_through();
+                cx.notify();
+            }))
+            .children(self.render_loading_report(window, cx))
     }
 }
 
@@ -17287,6 +17321,201 @@ mod tests {
         );
         workspace.update(cx, |workspace, _| {
             assert_eq!(workspace.active_load_phase(), None);
+        });
+    }
+
+    /// The panel is what the reader sees instead of an empty window, so what is
+    /// asserted here is what is painted, not what the workspace believes.
+    #[gpui::test]
+    async fn test_loading_report_waits_a_moment_then_covers_the_window(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        // Focus starts where the reader left it, so that losing it to the panel
+        // is something the test can actually see happen.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let pane = workspace.active_pane.focus_handle(cx);
+            window.focus(&pane, cx);
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("loading-report").is_none(),
+            "work that has only just started must not flash a panel over the window"
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                workspace
+                    .active_pane
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "nothing has been reported yet, so the pane still has the keyboard"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("loading-report")
+            .expect("work still in flight after a moment has to be reported");
+        assert!(
+            bounds.size.width > px(0.) && bounds.size.height > px(0.),
+            "the panel is painted at {:?}, so the reader sees nothing",
+            bounds.size
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                !workspace
+                    .active_pane
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "the panel blocks, so the pane behind it must not be holding focus"
+            );
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("loading-report").is_none(),
+            "the panel has to go away the moment the work does"
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                workspace
+                    .active_pane
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "focus has to come back, or the keyboard does nothing afterwards"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_loading_report_lets_the_reader_past_it(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("loading-report").is_some());
+
+        cx.dispatch_action(DismissLoadingReport);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("loading-report").is_none(),
+            "a scan that never ends must not lock the editor for good"
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.active_load_phase().is_some()),
+            "being waved through changes nothing about the work itself"
+        );
+
+        // Waved through once is waved through for this load: a panel that came
+        // back a quarter of a second later would be worse than one that stayed.
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("loading-report").is_none());
+
+        // The next load is a different question, though. Adding a folder to a
+        // live project starts one, and it has to be reported on its own terms
+        // rather than inherit an answer given about the last one.
+        workspace.update(cx, |workspace, cx| {
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("loading-report").is_some(),
+            "a later load must be reported even though an earlier one was waved through"
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+        });
+    }
+
+    /// The bar is meant to be measurable, which means a phase counted in nine
+    /// pieces has to move it nine times, and no phase may own more of its travel
+    /// than any other.
+    #[gpui::test]
+    async fn test_loading_report_measures_every_phase_the_same(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.how_far_loaded(), 1.0);
+
+            for _ in 0..4 {
+                workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            }
+            assert_eq!(
+                workspace.how_far_loaded(),
+                0.75,
+                "one of four phases outstanding leaves a quarter of the travel"
+            );
+
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(
+                workspace.how_far_loaded(),
+                0.8125,
+                "one panel of four is a quarter of that phase's quarter"
+            );
+
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            assert_eq!(
+                workspace.how_far_loaded(),
+                0.5625,
+                "a phase that starts later still counts the same as the rest"
+            );
+
+            for _ in 0..3 {
+                workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            }
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            assert_eq!(workspace.how_far_loaded(), 1.0);
+            assert_eq!(workspace.active_load_phase(), None);
+
+            // A phase that finished and starts again counts from nothing. Held
+            // over, its old four would make the first unit of the next round
+            // read as three of four done and walk the bar backwards.
+            workspace.begin_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            workspace.begin_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
+            assert_eq!(workspace.how_far_loaded(), 0.5);
+
+            workspace.end_load_phase(WorkspaceLoadPhase::ScanningProject, cx);
+            workspace.end_load_phase(WorkspaceLoadPhase::LoadingPanels, cx);
         });
     }
 

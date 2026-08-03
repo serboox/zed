@@ -646,6 +646,13 @@
     },
   },
   {
+    "context": "LoadingReport",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "workspace::DismissLoadingReport",
+    },
+  },
+  {
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {

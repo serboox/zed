@@ -27,13 +27,17 @@ impl SessionRestoreIndicator {
 
 impl Render for SessionRestoreIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_phase = self
+        let reported = self
             .workspace
-            .read_with(cx, |workspace, _| workspace.active_load_phase())
+            .read_with(cx, |workspace, _| {
+                workspace
+                    .active_load_phase()
+                    .map(|phase| (phase, workspace.how_far_loaded()))
+            })
             .ok()
             .flatten();
 
-        let Some(active_phase) = active_phase else {
+        let Some((active_phase, done)) = reported else {
             return Empty.into_any_element();
         };
 
@@ -47,6 +51,15 @@ impl Render for SessionRestoreIndicator {
             )
             .child(
                 Label::new(active_phase.label())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            // A spinner says only that something is happening. A number says how
+            // much of it is left, which is what the reader actually wanted to
+            // know -- and it is the same number the panel over the window shows,
+            // so the two never disagree.
+            .child(
+                Label::new(format!("{}%", (done * 100.0).round() as u32))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
