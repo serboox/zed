@@ -79,7 +79,10 @@ use zed::{
 
 use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
 
-#[cfg(feature = "mimalloc")]
+// The web engine brings a global allocator of its own, and a binary may only
+// have one, so asking for both -- which `--all-features` does -- must pick one
+// rather than fail to link. The engine's is the one that cannot be given up.
+#[cfg(all(feature = "mimalloc", not(feature = "servo")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
