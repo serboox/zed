@@ -9,6 +9,7 @@ mod multi_workspace;
 #[cfg(test)]
 mod multi_workspace_tests;
 pub mod notifications;
+pub mod opening_item_view;
 pub mod pane;
 pub mod pane_group;
 pub mod path_list {
@@ -60,7 +61,7 @@ use futures::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    future::{Shared, try_join_all},
+    future::{Either, Shared, try_join_all},
 };
 use gpui::{
     Action, AnyElement, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis,
@@ -85,6 +86,7 @@ use notifications::{
     DetachAndPromptErr, Notifications, dismiss_app_notification,
     simple_message_notification::MessageNotification,
 };
+use opening_item_view::OpeningItemView;
 pub use pane::*;
 pub use pane_group::{
     ActivePaneDecorator, HANDLE_HITBOX_SIZE, Member, PaneAxis, PaneGroup, PaneRenderContext,
@@ -1012,6 +1014,12 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
 
 /// Vertical room a pane keeps free for the controls painted over its item.
 pub const ITEM_OVERLAY_RESERVED_HEIGHT: Pixels = px(28.);
+
+/// How long a file may take to read before its pane gets a stand-in tab.
+/// Below roughly a fifth of a second a click still reads as instant, so a file
+/// that opens promptly never flashes a tab the reader did not ask to see; above
+/// it the editor would look like it had ignored the click.
+pub const OPENING_TAB_DELAY: Duration = Duration::from_millis(200);
 
 type ItemOverlayRenderer =
     Box<dyn Fn(&dyn ItemHandle, &Entity<Pane>, &mut Window, &mut App) -> Option<AnyElement>>;
@@ -4902,22 +4910,109 @@ impl Workspace {
         });
 
         let project_path = path.into();
+        let total_bytes = self
+            .project
+            .read(cx)
+            .entry_for_path(&project_path, cx)
+            .filter(|entry| entry.is_file())
+            .map(|entry| entry.size);
         let task = self.load_path(project_path.clone(), window, cx);
         window.spawn(cx, async move |cx| {
-            let (project_entry_id, build_item) = task.await?;
+            let load = Box::pin(task);
+            let delay = Box::pin(cx.background_executor().timer(OPENING_TAB_DELAY));
+
+            let mut placeholder = None;
+            let loaded = match futures::future::select(load, delay).await {
+                Either::Left((loaded, _)) => loaded,
+                Either::Right((_, load)) => {
+                    placeholder = pane
+                        .update_in(cx, |pane, window, cx| {
+                            let view = cx.new(|cx| {
+                                OpeningItemView::new(project_path.clone(), total_bytes, cx)
+                            });
+                            let opened = pane.open_item(
+                                None,
+                                project_path.clone(),
+                                focus_item,
+                                allow_preview,
+                                activate,
+                                None,
+                                window,
+                                cx,
+                                Box::new({
+                                    let view = view.clone();
+                                    move |_: &mut Pane, _: &mut Window, _: &mut Context<Pane>| {
+                                        Box::new(view) as Box<dyn ItemHandle>
+                                    }
+                                }),
+                            );
+                            // The file may already have a tab, in which case
+                            // `open_item` activated that one and never built
+                            // the stand-in.
+                            (opened.item_id() == view.item_id()).then_some(view)
+                        })
+                        .log_err()
+                        .flatten();
+                    load.await
+                }
+            };
+
+            let (project_entry_id, build_item) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    if let Some(placeholder) = placeholder {
+                        pane.update_in(cx, |pane, window, cx| {
+                            pane.remove_item(placeholder.item_id(), false, false, window, cx);
+                        })
+                        .log_err();
+                    }
+                    return Err(error);
+                }
+            };
 
             pane.update_in(cx, |pane, window, cx| {
-                pane.open_item(
+                let placeholder_slot = placeholder.as_ref().and_then(|placeholder| {
+                    let index = pane.index_for_item(placeholder)?;
+                    Some((index, index == pane.active_item_index()))
+                });
+                let (suggested_position, take_placeholder_activation) =
+                    match (&placeholder, placeholder_slot) {
+                        (None, _) => (None, true),
+                        (Some(_), Some((index, was_active))) => (Some(index), was_active),
+                        // The reader closed the stand-in while the file was
+                        // still being read, so the real item may not take the
+                        // tab they are looking at now.
+                        (Some(_), None) => (None, false),
+                    };
+                // A pane tracks its active tab by index, and inserting an item
+                // before that index does not move it along, so remember which
+                // item the reader chose and hand activation back by identity.
+                let restore_active = (!take_placeholder_activation)
+                    .then(|| pane.active_item())
+                    .flatten();
+
+                let item = pane.open_item(
                     project_entry_id,
                     project_path,
-                    focus_item,
+                    focus_item && take_placeholder_activation,
                     allow_preview,
                     activate,
-                    None,
+                    suggested_position,
                     window,
                     cx,
                     build_item,
-                )
+                );
+
+                if let Some(placeholder) = placeholder {
+                    pane.remove_item(placeholder.item_id(), false, false, window, cx);
+                }
+                if let Some(restore_active) = restore_active
+                    && let Some(index) = pane.index_for_item(restore_active.as_ref())
+                {
+                    pane.activate_item(index, false, false, window, cx);
+                }
+
+                item
             })
         })
     }
@@ -16864,6 +16959,420 @@ mod tests {
                 })
                 .await;
             assert!(handle.is_err());
+        }
+    }
+
+    mod opening_tab_tests {
+        use super::*;
+        use crate::opening_item_view::OpeningItemView;
+
+        /// How long a `.slow` file takes to open, far longer than the delay
+        /// before the pane is given a stand-in tab.
+        const SLOW_LOAD: Duration = Duration::from_secs(5);
+
+        const BIG_FILE_CONTENTS: &str = "a big file that takes its time to open";
+
+        struct DelayedProjectItem {
+            entry_id: Option<ProjectEntryId>,
+            project_path: ProjectPath,
+        }
+
+        impl project::ProjectItem for DelayedProjectItem {
+            fn try_open(
+                project: &Entity<Project>,
+                path: &ProjectPath,
+                cx: &mut App,
+            ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
+                let delay = match path.path.extension()? {
+                    "slow" => Some(SLOW_LOAD),
+                    "fast" => None,
+                    _ => return None,
+                };
+                let entry_id = project
+                    .read(cx)
+                    .entry_for_path(path, cx)
+                    .map(|entry| entry.id);
+                let project_path = path.clone();
+                Some(cx.spawn(async move |cx| {
+                    if let Some(delay) = delay {
+                        cx.background_executor().timer(delay).await;
+                    }
+                    Ok(cx.new(|_| DelayedProjectItem {
+                        entry_id,
+                        project_path,
+                    }))
+                }))
+            }
+
+            fn entry_id(&self, _: &App) -> Option<ProjectEntryId> {
+                self.entry_id
+            }
+
+            fn project_path(&self, _: &App) -> Option<ProjectPath> {
+                Some(self.project_path.clone())
+            }
+
+            fn is_dirty(&self) -> bool {
+                false
+            }
+        }
+
+        struct DelayedItemView {
+            project_item: Entity<DelayedProjectItem>,
+            focus_handle: FocusHandle,
+        }
+
+        impl Item for DelayedItemView {
+            type Event = ();
+
+            fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+                format!(
+                    "opened:{}",
+                    self.project_item.read(cx).project_path.path.as_unix_str()
+                )
+                .into()
+            }
+
+            fn buffer_kind(&self, _: &App) -> ItemBufferKind {
+                ItemBufferKind::Singleton
+            }
+
+            fn for_each_project_item(
+                &self,
+                cx: &App,
+                f: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
+            ) {
+                f(self.project_item.entity_id(), self.project_item.read(cx))
+            }
+        }
+
+        impl EventEmitter<()> for DelayedItemView {}
+
+        impl Focusable for DelayedItemView {
+            fn focus_handle(&self, _: &App) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+
+        impl Render for DelayedItemView {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                gpui::div()
+                    .size_full()
+                    .track_focus(&self.focus_handle(cx))
+                    .debug_selector(|| "opened-item-body".into())
+            }
+        }
+
+        impl ProjectItem for DelayedItemView {
+            type Item = DelayedProjectItem;
+
+            fn for_project_item(
+                _project: Entity<Project>,
+                _pane: Option<&Pane>,
+                project_item: Entity<Self::Item>,
+                _: &mut Window,
+                cx: &mut Context<Self>,
+            ) -> Self {
+                Self {
+                    project_item,
+                    focus_handle: cx.focus_handle(),
+                }
+            }
+        }
+
+        fn draw(cx: &mut VisualTestContext) {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+
+        async fn set_up(
+            cx: &mut TestAppContext,
+        ) -> (Entity<Workspace>, WorktreeId, &mut VisualTestContext) {
+            init_test(cx);
+            cx.update(|cx| register_project_item::<DelayedItemView>(cx));
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/root"),
+                json!({
+                    "big.slow": BIG_FILE_CONTENTS,
+                    "small.fast": "small",
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            let worktree_id = project.update(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            });
+
+            (workspace, worktree_id, cx)
+        }
+
+        fn tab_texts(pane: &Entity<Pane>, cx: &mut VisualTestContext) -> Vec<String> {
+            pane.read_with(cx, |pane, cx| {
+                pane.items()
+                    .map(|item| item.tab_content_text(0, cx).to_string())
+                    .collect()
+            })
+        }
+
+        #[gpui::test]
+        async fn test_slow_open_shows_a_tab_before_the_file_arrives(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("big.slow")), None, true, window, cx)
+            });
+
+            cx.run_until_parked();
+            assert_eq!(
+                tab_texts(&pane, cx),
+                Vec::<String>::new(),
+                "a file that has only just been asked for must not flash a tab"
+            );
+
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 2);
+            cx.run_until_parked();
+            draw(cx);
+
+            assert_eq!(
+                tab_texts(&pane, cx),
+                vec!["big.slow".to_string()],
+                "the tab has to carry the name of the file that is opening"
+            );
+            let body = cx
+                .debug_bounds("opening-item-body")
+                .expect("the stand-in has to paint over the pane");
+            assert!(
+                body.size.width > px(0.) && body.size.height > px(0.),
+                "the stand-in painted an empty box: {:?}",
+                body.size
+            );
+            assert!(
+                cx.debug_bounds("opening-item-progress")
+                    .is_some_and(|bar| bar.size.width > px(0.)),
+                "the progress bar has to paint inside the stand-in"
+            );
+
+            let stand_in =
+                pane.read_with(cx, |pane, _| pane.items_of_type::<OpeningItemView>().next());
+            let stand_in = stand_in.expect("the tab has to be held by a stand-in");
+            assert_eq!(
+                stand_in.read_with(cx, |stand_in, _| stand_in.total_bytes()),
+                Some(BIG_FILE_CONTENTS.len() as u64),
+                "the stand-in has to report the file's real size on disk"
+            );
+
+            cx.executor().advance_clock(SLOW_LOAD * 2);
+            open.await.expect("the file has to open in the end");
+        }
+
+        #[gpui::test]
+        async fn test_slow_open_replaces_the_stand_in_at_its_own_tab(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+            // An item to the left of the stand-in, so a tab index of one is a
+            // real claim rather than the only possible answer.
+            let first = cx.new(|cx| {
+                let mut item = TestItem::new(cx).with_project_items(&[TestProjectItem::new(
+                    999,
+                    "first.txt",
+                    cx,
+                )]);
+                item.tab_descriptions = Some(vec!["first.txt"]);
+                item
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(first.clone()), None, true, window, cx);
+            });
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("big.slow")), None, true, window, cx)
+            });
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 2);
+            cx.run_until_parked();
+
+            let stand_in_index = pane.read_with(cx, |pane, _| pane.active_item_index());
+            assert_eq!(stand_in_index, 1);
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane
+                    .items_of_type::<OpeningItemView>()
+                    .count()),
+                1
+            );
+
+            cx.executor().advance_clock(SLOW_LOAD * 2);
+            let opened = open.await.expect("the file has to open in the end");
+            cx.run_until_parked();
+            draw(cx);
+
+            assert_eq!(
+                tab_texts(&pane, cx),
+                vec!["first.txt".to_string(), "opened:big.slow".to_string()],
+                "the file has to take the tab the stand-in was holding"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane
+                    .items_of_type::<OpeningItemView>()
+                    .count()),
+                0,
+                "no stand-in may be left behind"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.active_item_index()),
+                stand_in_index,
+                "the file has to become active where the stand-in was"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.active_item().map(|item| item.item_id())),
+                Some(opened.item_id())
+            );
+            assert!(
+                cx.debug_bounds("opening-item-body").is_none(),
+                "the stand-in must stop painting once the file is open"
+            );
+            assert!(
+                cx.debug_bounds("opened-item-body")
+                    .is_some_and(|body| body.size.width > px(0.) && body.size.height > px(0.)),
+                "the file itself has to be the thing painting over the pane now"
+            );
+        }
+
+        #[gpui::test]
+        async fn test_quick_open_never_shows_a_stand_in(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+            // Every tab this pane is ever handed, so a stand-in that comes and
+            // goes inside a single run of the scheduler is caught too.
+            let tabs_ever_added = Rc::new(RefCell::new(Vec::new()));
+            let watching_tabs = cx.update(|_window, cx| {
+                let tabs_ever_added = tabs_ever_added.clone();
+                cx.subscribe(&pane, move |_, event: &pane::Event, cx| {
+                    if let pane::Event::AddItem { item } = event {
+                        tabs_ever_added
+                            .borrow_mut()
+                            .push(item.tab_content_text(0, cx).to_string());
+                    }
+                })
+            });
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (worktree_id, rel_path("small.fast")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            });
+
+            // `run_until_parked` never moves the clock on, so the delay before a
+            // stand-in appears cannot elapse here: a file that opens within it
+            // has to go straight into its tab.
+            cx.run_until_parked();
+            open.await.expect("the file has to open");
+
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 10);
+            cx.run_until_parked();
+            draw(cx);
+            drop(watching_tabs);
+
+            assert_eq!(
+                *tabs_ever_added.borrow(),
+                vec!["opened:small.fast".to_string()],
+                "a file that opens promptly must never be given a stand-in tab, \
+                 not even for a single frame"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane
+                    .items_of_type::<OpeningItemView>()
+                    .count()),
+                0,
+                "a file that opened promptly must never grow a stand-in"
+            );
+            assert_eq!(tab_texts(&pane, cx), vec!["opened:small.fast".to_string()]);
+            assert!(cx.debug_bounds("opening-item-body").is_none());
+        }
+
+        #[gpui::test]
+        async fn test_slow_open_keeps_the_tab_the_reader_moved_to(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+            let elsewhere = cx.new(|cx| {
+                TestItem::new(cx).with_project_items(&[TestProjectItem::new(
+                    999,
+                    "elsewhere.txt",
+                    cx,
+                )])
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(elsewhere.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("big.slow")), None, true, window, cx)
+            });
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 2);
+            cx.run_until_parked();
+
+            let stand_in_index = pane.read_with(cx, |pane, _| pane.active_item_index());
+            assert_eq!(
+                stand_in_index, 1,
+                "the stand-in takes the tab it was asked to"
+            );
+
+            // The reader gives up waiting and goes back to the other tab.
+            pane.update_in(cx, |pane, window, cx| {
+                pane.activate_item(0, true, true, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.active_item().map(|item| item.item_id())),
+                Some(elsewhere.item_id())
+            );
+
+            cx.executor().advance_clock(SLOW_LOAD * 2);
+            let opened = open.await.expect("the file has to open in the end");
+            cx.run_until_parked();
+
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.active_item().map(|item| item.item_id())),
+                Some(elsewhere.item_id()),
+                "the file arriving must not pull the reader out of the tab they chose"
+            );
+            let elsewhere_focused =
+                cx.update(|window, cx| elsewhere.focus_handle(cx).is_focused(window));
+            assert!(
+                elsewhere_focused,
+                "the file arriving must not take the focus away either"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.index_for_item(opened.as_ref())),
+                Some(stand_in_index),
+                "the file still has to land on the tab the stand-in was holding"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane
+                    .items_of_type::<OpeningItemView>()
+                    .count()),
+                0,
+                "no stand-in may be left behind"
+            );
         }
     }
 
