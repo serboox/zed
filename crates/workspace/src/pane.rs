@@ -4197,14 +4197,15 @@ impl Pane {
     }
 }
 
+/// The buttons at the right end of the tab bar are drawn whether or not the pane
+/// has focus: clicking into a panel or into a preview's own contents takes focus
+/// off the pane, and a control that leaves the moment it is not being used reads
+/// as something that broke rather than something that yielded.
 fn default_render_tab_bar_buttons(
     pane: &mut Pane,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
-        return (None, None);
-    }
     let (can_clone, can_split_move) = match pane.active_item() {
         Some(active_item) if active_item.can_split(cx) => (true, false),
         Some(_) => (false, pane.items_len() > 1),
@@ -4997,6 +4998,7 @@ mod tests {
     use super::*;
     use crate::{
         Member,
+        dock::{DockPosition, test::TestPanel},
         item::test::{TestItem, TestProjectItem},
     };
     use gpui::{
@@ -8918,6 +8920,48 @@ mod tests {
             pane.activate_next_item(&ActivateNextItem { wrap_around: false }, window, cx);
         });
         assert_item_labels(&pane, ["A", "B", "C*"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_tab_bar_buttons_stay_when_focus_leaves_the_pane(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        add_labeled_item(&pane, "A", false, cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace
+                .right_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ICON-Plus").is_some(),
+            "the tab bar's New… button is missing while the pane has focus"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        pane.update_in(cx, |pane, window, cx| {
+            assert!(
+                !pane.has_focus(window, cx),
+                "the panel was supposed to take focus off the pane"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ICON-Plus").is_some(),
+            "the tab bar's New… button vanished once focus moved into a panel"
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) {
