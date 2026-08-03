@@ -188,11 +188,63 @@ jobs:
           shared-key: fork-bundle-${{ runner.os }}
           cache-on-failure: true
 
+      # Whether this window can be handed a frame at all is about the window's own
+      # graphics device and not about the engine, so it is asked first: the answer
+      # is worth having even from a run where nothing else builds.
+      - name: Test what the window can be lent
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --profile release-fast --package gpui_windows -- --nocapture 2>&1 |
+            tee window-test.log
+
+      - name: Say what the window found
+        if: always()
+        shell: bash
+        run: grep -m1 '^SHARED:' window-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      # As an artifact as well as in the summary: an artifact can be fetched while
+      # the rest of the run is still going, and a summary can only be looked at.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-window-test-log
+          path: window-test.log
+          if-no-files-found: ignore
+
+      # Without colour, so that what went wrong can be picked out of the log
+      # rather than read by eye once the run has finished.
       - name: Build with the HTML engine
         id: engine
         if: needs.plan.outputs.engine != ''
         continue-on-error: true
-        run: cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }}
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }} 2>&1 |
+            tee engine-build.log
+
+      # A build that fails here is followed by a whole build without the engine,
+      # and a job's log can only be read once the job has finished -- so what
+      # stopped it goes in the summary, which can be read while the rest runs.
+      - name: Say what stopped the engine building
+        if: always() && steps.engine.outcome == 'failure'
+        shell: bash
+        run: |
+          {
+            echo '```'
+            grep -E '^error' -A 12 engine-build.log | head -150
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.engine.outcome == 'failure'
+        with:
+          name: windows-engine-build-log
+          path: engine-build.log
+          if-no-files-found: ignore
 
       - name: Build without the HTML engine
         if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
@@ -218,17 +270,31 @@ jobs:
           path: target/release-fast/zed.exe
           if-no-files-found: error
 
+      # Under bash, so that a failing test fails the step: PowerShell's own
+      # pipeline swallows the exit code of whatever wrote into it, and merging
+      # cargo's stderr there turns every progress line into an error.
       - name: Test the HTML engine
         if: steps.engine.outcome == 'success'
+        shell: bash
         run: |
-          cargo test --profile release-fast --package html_render --features servo -- --nocapture 2>&1 |
-            Tee-Object -FilePath engine-test.log
+          set -o pipefail
+          cargo test --profile release-fast --package html_render \
+            --features servo -- --nocapture 2>&1 | tee engine-test.log
 
       - name: Say whether the engine ran here
         if: always() && steps.engine.outcome == 'success'
+        shell: bash
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Last, so the editor and its artifact still come out of a run where the
+      # engine would not compile -- but the run says so instead of passing
+      # quietly with an editor that has no engine in it.
+      - name: Insist the engine compiled
+        if: needs.plan.outputs.engine != '' && steps.engine.outcome != 'success'
+        shell: bash
         run: |
-          $line = Select-String -Path engine-test.log -Pattern '^HTML_ENGINE:' | Select-Object -First 1
-          if ($line) { Add-Content $env:GITHUB_STEP_SUMMARY $line.Line }
+          echo "the HTML engine did not compile here; the editor above was built without it" >&2
+          exit 1
 
   macos:
     needs: plan
