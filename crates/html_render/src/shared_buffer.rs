@@ -322,6 +322,12 @@ impl SharedBuffers {
             (self.destroy_buffer)(buffer.buffer);
         }
     }
+
+    /// What the page's textures have to be bound as on this machine. An EGL
+    /// image goes on an ordinary two-dimensional texture.
+    pub(crate) fn texture_target(&self) -> u32 {
+        gleam::gl::TEXTURE_2D
+    }
 }
 
 impl Drop for SharedBuffers {

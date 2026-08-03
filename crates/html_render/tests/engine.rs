@@ -437,6 +437,8 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
+        #[cfg(target_os = "macos")]
+        the_page_lends_its_own_surface(cx);
 
         if std::env::var("ZED_HTML_BENCH").is_ok() {
             for scale in [1., 1.5, 2.] {
@@ -730,6 +732,207 @@ fn the_page_lends_its_own_memory(cx: &mut gpui::App) {
         } else {
             "the top of the page"
         }
+    );
+
+    a_refused_buffer_goes_back_to_copying(&mut lent, &frame);
+}
+
+/// The page draws into a surface the window reads where it lies. What matters is
+/// that the page is really in there, so it is read back through the very surface
+/// the window is handed -- locked and addressed the way anyone reading an
+/// `IOSurface` has to.
+#[cfg(target_os = "macos")]
+fn the_page_lends_its_own_surface(cx: &mut gpui::App) {
+    use core_foundation::base::TCFType as _;
+    use std::ffi::c_void;
+
+    /// Read only, so the graphics card is not told the pixels are about to
+    /// change.
+    const READ_ONLY: u32 = 1;
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        fn CVPixelBufferGetIOSurface(buffer: *const c_void) -> *mut c_void;
+    }
+
+    #[link(name = "IOSurface", kind = "framework")]
+    unsafe extern "C" {
+        fn IOSurfaceLock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
+        fn IOSurfaceUnlock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
+        fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
+        fn IOSurfaceGetBytesPerRow(surface: *mut c_void) -> usize;
+        fn IOSurfaceGetWidth(surface: *mut c_void) -> usize;
+        fn IOSurfaceGetHeight(surface: *mut c_void) -> usize;
+        fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
+    }
+
+    // Two halves, so which way up the surface is laid out can be told apart:
+    // OpenGL draws from the bottom, and whoever reads a buffer starts at the top.
+    let mut lent = page(
+        &document(
+            "margin:0",
+            "<div style=\"height:32px;background:rgb(255,0,0)\"></div>\
+             <div style=\"height:32px;background:rgb(0,0,255)\"></div>",
+        ),
+        // A width that is not a round number of anything, so that a machine whose
+        // allocator lengthens the rows is the case being read here: the row
+        // length has to come from the surface and not from the width.
+        100.,
+        64.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && colour_at(&lent, 32, 8) != Some([255, 0, 0]) {
+        lent.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        colour_at(&lent, 32, 8),
+        Some([255, 0, 0]),
+        "the copied frame should have the red half at the top"
+    );
+
+    let Some(frame) = lent.shared_frame() else {
+        println!("SHARED: this machine copies frames");
+        return;
+    };
+    assert_eq!(
+        (frame.width, frame.height),
+        (100, 64),
+        "the picture should be the size of the page"
+    );
+
+    let surface =
+        unsafe { CVPixelBufferGetIOSurface(frame.image_buffer.as_concrete_TypeRef() as *const _) };
+    assert!(
+        !surface.is_null(),
+        "a frame that is lent has to be a surface, or the window has nothing to \
+         read where it lies"
+    );
+    let (width, height, stride, length) = unsafe {
+        (
+            IOSurfaceGetWidth(surface),
+            IOSurfaceGetHeight(surface),
+            IOSurfaceGetBytesPerRow(surface),
+            IOSurfaceGetAllocSize(surface),
+        )
+    };
+    assert_eq!(
+        (width, height),
+        (frame.width as usize, frame.height as usize),
+        "the frame should say the size the surface itself is"
+    );
+    assert_eq!(
+        frame.stride as usize, stride,
+        "the window works out where a row starts from what the frame says, so a \
+         frame that reports a different row length from the surface would be read \
+         crooked"
+    );
+    assert!(
+        frame.stride >= frame.width * 4,
+        "a row cannot be shorter than the pixels in it"
+    );
+
+    // The graphics card may not have finished the frame the moment it is handed
+    // over, so this is asked for until the two halves of the page are there.
+    let read_the_halves = || {
+        let mut seed = 0;
+        if unsafe { IOSurfaceLock(surface, READ_ONLY, &mut seed) } != 0 {
+            return None;
+        }
+        let base = unsafe { IOSurfaceGetBaseAddress(surface) };
+        if base.is_null() {
+            unsafe { IOSurfaceUnlock(surface, READ_ONLY, &mut seed) };
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, length) };
+        // Blue, green, red and alpha is the order a surface of this format holds,
+        // so the colour is read back to front.
+        let read_row = |row: usize| {
+            let at = row * stride + 32 * 4;
+            bytes
+                .get(at..at + 3)
+                .map(|pixel| [pixel[2], pixel[1], pixel[0]])
+        };
+        let halves = read_row(8).zip(read_row(56));
+        unsafe { IOSurfaceUnlock(surface, READ_ONLY, &mut seed) };
+        halves
+    };
+    let mut halves = None;
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        halves = read_the_halves();
+        if let Some((start, end)) = halves
+            && !close_to(start, end)
+        {
+            break;
+        }
+        lent.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let Some((near_the_start, near_the_end)) = halves else {
+        panic!("the page's surface is lent but it would not be locked and read");
+    };
+
+    println!(
+        "SHARED: the surface is {width}x{height} in rows of {stride} bytes; it starts with \
+         {near_the_start:?} and ends with {near_the_end:?}; the page is red on top and blue below"
+    );
+    assert!(
+        !close_to(near_the_start, near_the_end),
+        "the two halves of the page should have come out different colours; the \
+         surface holds {near_the_start:?} throughout"
+    );
+    let starts_at_the_bottom = close_to(near_the_start, [0, 0, 255]);
+    assert!(
+        starts_at_the_bottom || close_to(near_the_start, [255, 0, 0]),
+        "the lent surface should hold the page the engine drew, blue first in \
+         memory as the format it is handed over under says; it starts with \
+         {near_the_start:?}"
+    );
+    // The window draws the surface the way the frame says it is laid out, so what
+    // is measured here has to be what is claimed. A page shown upside down is
+    // this assertion going unmade.
+    assert_eq!(
+        frame.bottom_up,
+        starts_at_the_bottom,
+        "the frame says its first row is {}, and the surface starts with \
+         {near_the_start:?} where the page is red on top and blue below",
+        if frame.bottom_up {
+            "the bottom of the page"
+        } else {
+            "the top of the page"
+        }
+    );
+
+    a_refused_buffer_goes_back_to_copying(&mut lent, &frame);
+}
+
+/// A window that looks at the page's buffer and cannot draw it says so on the
+/// frame, and the page has to go back to copying rather than showing nothing
+/// ever again. A page at rest has nothing more to draw of its own accord, which
+/// is the case this is about: what has to arrive is a copied frame.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_refused_buffer_goes_back_to_copying(
+    page: &mut HtmlPage,
+    frame: &std::sync::Arc<gpui::SharedFrame>,
+) {
+    frame.refuse();
+    assert!(
+        page.shared_frame().is_none(),
+        "a buffer the window has refused should not be offered again"
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && colour_at(page, 32, 8) != Some([255, 0, 0]) {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        colour_at(page, 32, 8),
+        Some([255, 0, 0]),
+        "the page should copy frames again once its buffer has been refused"
     );
 }
 

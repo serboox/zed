@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use dpi::PhysicalSize;
 use euclid::Size2D;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use gpui::SharedFrame;
 
 #[cfg(target_os = "linux")]
 use crate::dma_buf_export::DmaBufExporter;
 #[cfg(target_os = "linux")]
 use crate::shared_buffer::{SharedBuffer, SharedBuffers};
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+use crate::shared_surface::{SharedBuffer, SharedBuffers};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use nothing::{SharedBuffer, SharedBuffers};
 use servo::{DeviceIntRect, RenderingContext, RgbaImage};
 use surfman::{
@@ -46,7 +48,7 @@ pub(crate) struct GpuSurface {
     /// driver has no way to hand a buffer over, and then frames are copied.
     #[cfg(target_os = "linux")]
     exporter: Option<DmaBufExporter>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     /// Whether handing frames over has already been found impossible on this
     /// machine. Asking again every frame costs an image each time and the answer
     /// does not change until the page is resized.
@@ -98,7 +100,7 @@ struct Face {
     shared: Option<SharedBuffer>,
     /// The frame the window is handed for this face, made once and handed out
     /// every time this face comes round again.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     frame: RefCell<Option<Arc<SharedFrame>>>,
 }
 
@@ -199,16 +201,17 @@ impl Face {
                 buffers.discard(buffer);
             }
         };
+        let target = buffers.map_or(gleam::gl::TEXTURE_2D, SharedBuffers::texture_target);
         let textures = gl.gen_textures(1);
         let Some(&texture) = textures.first() else {
             give_up(&shared);
             return None;
         };
-        gl.bind_texture(gleam::gl::TEXTURE_2D, texture);
+        gl.bind_texture(target, texture);
         match &shared {
             Some((buffers, buffer)) => buffers.bind_to_texture(buffer),
             None => gl.tex_image_2d(
-                gleam::gl::TEXTURE_2D,
+                target,
                 0,
                 gleam::gl::RGBA8 as i32,
                 size.width as i32,
@@ -226,7 +229,7 @@ impl Face {
             (gleam::gl::TEXTURE_WRAP_S, gleam::gl::CLAMP_TO_EDGE),
             (gleam::gl::TEXTURE_WRAP_T, gleam::gl::CLAMP_TO_EDGE),
         ] {
-            gl.tex_parameter_i(gleam::gl::TEXTURE_2D, name, value as i32);
+            gl.tex_parameter_i(target, name, value as i32);
         }
 
         let framebuffers = gl.gen_framebuffers(1);
@@ -239,7 +242,7 @@ impl Face {
         gl.framebuffer_texture_2d(
             gleam::gl::FRAMEBUFFER,
             gleam::gl::COLOR_ATTACHMENT0,
-            gleam::gl::TEXTURE_2D,
+            target,
             texture,
             0,
         );
@@ -255,7 +258,7 @@ impl Face {
             texture,
             framebuffer,
             shared: shared.map(|(_, buffer)| buffer),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             frame: RefCell::new(None),
         })
     }
@@ -378,7 +381,7 @@ impl GpuSurface {
             buffers,
             #[cfg(target_os = "linux")]
             exporter,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             cannot_share: Cell::new(false),
             read_format: Cell::new(None),
             sealed: Cell::new(std::ptr::null()),
@@ -392,7 +395,7 @@ impl GpuSurface {
     /// This is the face the page has just finished, not the one it is drawing
     /// into now. Each face keeps its own, so the two are handed out by turns and
     /// the window has them both.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn shared_frame(&self) -> Option<Arc<SharedFrame>> {
         if let Some(shared) = self.target.borrow().drawn().frame.borrow().as_ref() {
             return Some(shared.clone());
@@ -408,17 +411,19 @@ impl GpuSurface {
             return None;
         }
         let size = self.size.get();
-        let frame = match self.lend_own_memory(size) {
-            Some(frame) => frame,
-            // Nothing was allocated to be shared, but a driver that lays its own
-            // textures out plainly can still hand this one over.
-            None => match self.export_the_texture(size) {
-                Some(frame) => frame,
-                None => {
-                    self.cannot_share.set(true);
-                    return None;
-                }
-            },
+        // Nothing may have been allocated to be shared. A Linux driver that lays
+        // its own textures out plainly can still hand one of those over; there is
+        // nothing of the sort to ask for on macOS, where a surface the page did
+        // not draw into is not one the window will read.
+        #[cfg(target_os = "linux")]
+        let frame = self
+            .lend_own_memory(size)
+            .or_else(|| self.export_the_texture(size));
+        #[cfg(target_os = "macos")]
+        let frame = self.lend_own_memory();
+        let Some(frame) = frame else {
+            self.cannot_share.set(true);
+            return None;
         };
         let frame = Arc::new(frame);
         *self.target.borrow().drawn().frame.borrow_mut() = Some(frame.clone());
@@ -459,6 +464,24 @@ impl GpuSurface {
             // The page is drawn with OpenGL, which starts at the bottom.
             bottom_up: true,
             modifier: 0,
+            refused: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    /// The page's own surface. The window is handed the very surface the page
+    /// goes on drawing into; both sides name the same pixels, and the surface
+    /// itself is what says how far apart its rows are.
+    fn lend_own_memory(&self) -> Option<SharedFrame> {
+        let target = self.target.borrow();
+        let buffer = target.drawn().shared.as_ref()?;
+        Some(SharedFrame {
+            image_buffer: buffer.image_buffer.clone(),
+            width: buffer.width,
+            height: buffer.height,
+            stride: buffer.stride,
+            // The page is drawn with OpenGL, which starts at the bottom.
+            bottom_up: true,
             refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -800,7 +823,7 @@ impl RenderingContext for GpuSurface {
         previous.discard(&self.gleam_gl, self.buffers.as_ref());
         // What the window was lent belonged to the old textures, and new ones
         // deserve a fresh attempt at handing them over.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.cannot_share.set(false);
         self.size.set(size);
     }
@@ -908,10 +931,11 @@ fn physical(size: PhysicalSize<u32>) -> Size2D<i32, euclid::UnknownUnit> {
     Size2D::new(size.width as i32, size.height as i32)
 }
 
-/// Sharing the page's memory with the window is a Linux arrangement. Elsewhere
-/// there is nothing to allocate and nothing to lend, and these stand in so the
-/// rest of this file does not have to ask which machine it is on.
-#[cfg(not(target_os = "linux"))]
+/// Sharing the page's memory with the window is something Linux and macOS each
+/// have their own way of. Elsewhere there is nothing to allocate and nothing to
+/// lend, and these stand in so the rest of this file does not have to ask which
+/// machine it is on.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod nothing {
     pub(crate) enum SharedBuffers {}
     pub(crate) enum SharedBuffer {}
@@ -931,5 +955,9 @@ mod nothing {
         pub(crate) fn bind_to_texture(&self, _buffer: &SharedBuffer) {}
 
         pub(crate) fn discard(&self, _buffer: &SharedBuffer) {}
+
+        pub(crate) fn texture_target(&self) -> u32 {
+            gleam::gl::TEXTURE_2D
+        }
     }
 }

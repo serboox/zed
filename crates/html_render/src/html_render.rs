@@ -18,6 +18,8 @@ mod dma_buf_export;
 mod gpu_surface;
 #[cfg(all(feature = "servo", target_os = "linux"))]
 mod shared_buffer;
+#[cfg(all(feature = "servo", target_os = "macos"))]
+mod shared_surface;
 
 #[cfg(feature = "servo")]
 mod engine {
@@ -513,7 +515,7 @@ mod engine {
 
         /// The frame the window can draw without a copy, when this machine
         /// allows it. `None` means the frame has to be handed over as pixels.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
             if self.refused {
                 return None;
@@ -526,6 +528,7 @@ mod engine {
                 if self.shared {
                     log::info!("the page's memory is no longer lent, so frames are copied");
                     self.shared = false;
+                    self.copy_the_page_again();
                 }
                 return None;
             };
@@ -535,6 +538,7 @@ mod engine {
                 log::info!("the window will not draw the page's buffer, so frames are copied");
                 self.refused = true;
                 self.shared = false;
+                self.copy_the_page_again();
                 return None;
             }
             if !self.shared {
@@ -546,6 +550,18 @@ mod engine {
                 self.rendering_context.stop_reading_back();
             }
             Some(frame)
+        }
+
+        /// Asks for the page to be drawn again, so that there is a frame to copy.
+        ///
+        /// Nothing has been copied since the buffer was lent, and a page at rest
+        /// draws only when something asks it to. Going back to copying without
+        /// this would leave the reader looking at an empty pane until they
+        /// happened to scroll.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        fn copy_the_page_again(&self) {
+            self.delegate.frame_waiting.set(true);
+            self.engine.nudge();
         }
 
         /// Makes this page's surface the one the engine draws into and reads

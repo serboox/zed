@@ -9923,6 +9923,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "core-foundation 0.10.0",
+ "core-video",
  "dpi",
  "euclid",
  "gleam",

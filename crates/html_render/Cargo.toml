@@ -63,6 +63,12 @@ smallvec = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
+# The page's own frame lives in an IOSurface here, which is asked for with a
+# dictionary of properties and handed to the window wrapped as a pixel buffer.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+core-video.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 libc.workspace = true
