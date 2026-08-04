@@ -13,7 +13,49 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// that fails to start is a failure rather than a note.
 const REQUIRE: &str = "ZED_REQUIRE_HTML_ENGINE";
 
+/// Puts the engine's own log on the terminal.
+///
+/// A machine nobody can sit at is the only place some of these run -- the
+/// graphics stack of a macOS runner is not one anybody here has -- and which
+/// adapter the engine settled for, or why it settled for none, is said in the
+/// log and nowhere else.
+///
+/// Only what the engine says for itself, never its workings: the glyph
+/// rasterizer alone writes some thirty-five thousand debug lines while it builds
+/// a gamma table, which buries the handful of lines this is here for and did for
+/// the run that first switched the log on.
+struct Printed;
+
+impl log::Log for Printed {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        println!(
+            "LOG {} {}: {}",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {}
+}
+
+fn print_the_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Something else may have claimed the log already, and there is only one
+        // to claim.
+        if log::set_logger(&Printed).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    });
+}
+
 fn page(html: &str, width: f32, height: f32, scale: f32, cx: &mut App) -> Option<HtmlPage> {
+    print_the_log();
     match HtmlPage::open(
         html.to_string().into(),
         None,
