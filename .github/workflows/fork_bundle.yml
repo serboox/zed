@@ -179,6 +179,63 @@ jobs:
       - name: Add NASM to the path
         run: Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
 
+      # The engine's media backend is built against GStreamer, and its bindings
+      # ask pkg-config for the real library rather than taking the feature's word
+      # for it -- so without this the engine does not compile here at all. It only
+      # ever seemed to: a warm cache carried the already-built bindings from run
+      # to run, and the first build on a branch of its own found nothing and
+      # stopped at `glib-sys`.
+      #
+      # Both packages are needed and neither is redundant: the runtime one brings
+      # the libraries and pkg-config itself, the development one the headers and
+      # the `.pc` files that describe them. Nothing else has to be installed --
+      # in particular no pkg-config from anywhere else, which is worth knowing,
+      # since the usual one fetches itself over plain HTTP with no checksum.
+      - name: Install GStreamer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.26.6'
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$version/msvc"
+          foreach ($msi in "gstreamer-1.0-msvc-x86_64-$version.msi",
+                           "gstreamer-1.0-devel-msvc-x86_64-$version.msi") {
+            $file = Join-Path $env:RUNNER_TEMP $msi
+            Invoke-WebRequest -Uri "$base/$msi" -OutFile $file
+            $log = "$file.log"
+            $run = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+              '/i', "`"$file`"", '/qn', '/norestart', 'ADDLOCAL=ALL', '/l*v', "`"$log`""
+            if ($run.ExitCode -ne 0) {
+              if (Test-Path $log) { Get-Content $log -Tail 40 }
+              throw "$msi would not install: exit code $($run.ExitCode)"
+            }
+          }
+
+          # Found rather than assumed: the installer roots its own tree, and a
+          # guessed path would fail much later inside a build script instead.
+          $described = @('C:\gstreamer', "$env:ProgramFiles\gstreamer",
+                         "${env:ProgramFiles(x86)}\gstreamer") |
+            Where-Object { Test-Path $_ } |
+            ForEach-Object {
+              Get-ChildItem $_ -Recurse -Filter 'gstreamer-1.0.pc' -ErrorAction SilentlyContinue
+            } | Select-Object -First 1
+          if (-not $described) { throw 'GStreamer installed but describes nothing to pkg-config' }
+          $pkgconfig = $described.Directory.FullName
+          $root = Split-Path (Split-Path $pkgconfig)
+          $exe = Join-Path $root 'bin\pkg-config.exe'
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem (Join-Path $root 'bin') -Filter '*pkg*' | ForEach-Object { $_.Name }
+            throw "GStreamer brought no pkg-config: nothing at $exe"
+          }
+
+          # Asked here rather than left for the build to discover: this is the one
+          # question the whole engine build rests on, and the answer costs seconds.
+          $env:PKG_CONFIG_PATH = $pkgconfig
+          & $exe --modversion glib-2.0 gstreamer-1.0 gstreamer-play-1.0
+          if ($LASTEXITCODE -ne 0) { throw "pkg-config cannot describe GStreamer from $pkgconfig" }
+
+          "PKG_CONFIG_PATH=$pkgconfig" | Add-Content $env:GITHUB_ENV
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" | Add-Content $env:GITHUB_ENV
+          Add-Content $env:GITHUB_PATH (Join-Path $root 'bin')
+
       - run: rustup show
 
       # Same reason as the Linux job: the engine's crates are identical from run
