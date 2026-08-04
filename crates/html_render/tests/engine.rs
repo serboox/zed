@@ -474,13 +474,18 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_can_be_searched(cx);
         the_page_knows_how_wide_it_is(cx);
         the_page_is_laid_out_the_way_it_asks_to_be(cx);
-        the_engine_can_play_media(cx);
-        the_page_answers_the_developer_tools(cx);
 
+        // Before the media backend is asked for anything. That backend starts a
+        // whole library of its own, and a machine whose copy of it will not load
+        // takes the process down rather than answering -- which would leave the
+        // one thing these last two are about unsaid.
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
         #[cfg(target_os = "macos")]
         the_page_lends_its_own_surface(cx);
+
+        the_engine_can_play_media(cx);
+        the_page_answers_the_developer_tools(cx);
 
         if std::env::var("ZED_HTML_BENCH").is_ok() {
             for scale in [1., 1.5, 2.] {
