@@ -77,7 +77,9 @@ use zed::{
     handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
 };
 
-use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
+use crate::zed::{
+    CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme, launchpad::Launchpad,
+};
 
 // The web engine brings a global allocator of its own, and a binary may only
 // have one, so asking for both -- which `--all-features` does -- must pick one
@@ -1514,48 +1516,54 @@ pub(crate) async fn restore_or_create_workspace(
         // stays 0 and the toast fallback above does not trigger. Without this
         // check, Zed would exit silently.
         if cx.update(|cx| cx.windows().is_empty()) {
-            cx.update(|cx| {
-                workspace::open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
-                )
-            })
-            .await?;
+            open_nothing_in_particular(app_state.clone(), cx).await?;
         }
     } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
         cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
     } else {
-        cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
-            )
-        })
-        .await?;
+        open_nothing_in_particular(app_state, cx).await?;
     }
 
     Ok(())
+}
+
+/// Opens whatever a launch with nothing to restore should leave the reader
+/// looking at: the launchpad, or an editor window with one empty file in it.
+async fn open_nothing_in_particular(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
+    let launchpad = cx.update(|cx| {
+        matches!(
+            WorkspaceSettings::get_global(cx).restore_on_startup,
+            workspace::RestoreOnStartupBehavior::Launchpad
+        )
+    });
+
+    // Whether a window is already up is `Launchpad::open`'s to answer, not this
+    // one's: it reads the history first, and a path from the command line or a
+    // reopened workspace can arrive during that wait. Declining there means
+    // declining here too -- an empty workspace opened as a consolation would be
+    // a second window over the one that answered the launch.
+    if launchpad {
+        cx.update(|cx| Launchpad::open(app_state, cx)).await?;
+        return Ok(());
+    }
+
+    cx.update(|cx| {
+        workspace::open_new(
+            Default::default(),
+            app_state,
+            cx,
+            |workspace, window, cx| {
+                let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
+                match restore_on_startup {
+                    workspace::RestoreOnStartupBehavior::Launchpad => {}
+                    _ => {
+                        Editor::new_file(workspace, &Default::default(), window, cx);
+                    }
+                }
+            },
+        )
+    })
+    .await
 }
 
 async fn restorable_workspaces(
