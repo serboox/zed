@@ -5,22 +5,15 @@ use std::time::Duration;
 use editor::Editor;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
-    Window, actions,
+    Window,
 };
 use serde::Deserialize;
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
+use crate::ToggleFocus;
 use crate::html_preview_view::HtmlPreviewView;
-
-actions!(
-    browser_tools,
-    [
-        /// Shows or hides the developer tools for the page being read.
-        ToggleFocus
-    ]
-);
 
 /// How often the page is asked what its scripts have said and what it fetched.
 /// Only while the panel is showing, and only for the tab that is open.

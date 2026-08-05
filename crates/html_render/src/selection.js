@@ -723,6 +723,19 @@
   window.__zedSelection = {
     text: selectedText,
     find: find,
+    // The whole page, as a drag from the first word to the last would give.
+    // Anything the reader had picked before is replaced.
+    selectAll: function () {
+      var list = wrapWords();
+      if (!list.length) {
+        return 0;
+      }
+      var last = list.length - 1;
+      anchor = { index: 0, offset: 0 };
+      head = { index: last, offset: list[last].text.length };
+      paintHighlight();
+      return list.length;
+    },
     stopLooking: function () {
       looking = { query: null, at: -1, found: [] };
       anchor = null;

@@ -5,25 +5,24 @@ use std::time::Duration;
 use anyhow::Result;
 use editor::{Editor, EditorEvent, MultiBufferOffset};
 use gpui::{
-    App, Entity, EventEmitter, FocusHandle, Focusable, ImageSource, Resource, RetainAllImageCache,
-    ScrollHandle, SharedUri, Subscription, Task, WeakEntity,
+    App, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
+    MouseButton, MouseDownEvent, Pixels, Point, Resource, RetainAllImageCache, ScrollHandle,
+    SharedUri, Subscription, Task, WeakEntity, anchored, canvas, deferred,
 };
 use html5ever::driver::ParseOpts;
 use html5ever::parse_document;
 use html5ever::serialize::SerializeOpts;
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::TreeBuilderOpts;
-use language::LanguageRegistry;
+use language::{Buffer, LanguageRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
 };
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 use settings::Settings;
 use theme_settings::ThemeSettings;
-#[cfg(feature = "servo")]
-use ui::Tooltip;
 use ui::utils::WithRemSize;
-use ui::{WithScrollbar, prelude::*};
+use ui::{ContextMenu, Tooltip, WithScrollbar, prelude::*};
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
 
@@ -46,6 +45,100 @@ const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
 #[cfg(feature = "servo")]
 const WHERE_THE_PAGE_STANDS: Duration = Duration::from_millis(100);
 
+/// What the page's own menu offers. Named here because the tests look the items
+/// up by the words the reader sees.
+const OPEN_LINK: &str = "Open Link in New Browser Tab";
+const COPY_LINK: &str = "Copy Link Address";
+const OPEN_IMAGE: &str = "Open Image in New Browser Tab";
+const COPY_IMAGE: &str = "Copy Image Address";
+const COPY_SELECTION: &str = "Copy";
+const SEARCH_THE_WEB: &str = "Search the Web for the Selection";
+const SELECT_ALL: &str = "Select All";
+const SAVE_PAGE: &str = "Save Page As…";
+const VIEW_SOURCE: &str = "View Page Source";
+const INSPECT: &str = "Inspect";
+
+/// What the tab holding a page's own HTML is called.
+const SOURCE_TITLE: &str = "Page Source";
+
+/// What a saved page is called when the reader has not said otherwise.
+const SAVED_PAGE: &str = "page.html";
+
+/// How the area the page is drawn in is found when its painted bounds are being
+/// measured. A no-op outside a test build.
+const PAGE_AREA: &str = "html-preview-page-area";
+
+/// What the page has under the pointer, as the page itself reports it. Every
+/// field is absent when there is nothing of that kind there, which is what
+/// decides whether the menu offers anything about it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+struct PageTarget {
+    /// The address of the nearest link the pointer is inside.
+    #[serde(default)]
+    link: Option<String>,
+    /// The address of the image under the pointer.
+    #[serde(default)]
+    image: Option<String>,
+    /// What the reader has picked in the page, as much of it as is worth
+    /// carrying. The whole of it is asked for again when it is copied.
+    #[serde(default)]
+    selection: Option<String>,
+}
+
+impl PageTarget {
+    /// What the page answered. Anything empty is read as nothing at all: a link
+    /// with no address is not a link.
+    #[cfg(any(test, feature = "servo"))]
+    fn parse(answer: &str) -> Self {
+        let target = match serde_json::from_str::<Self>(answer) {
+            Ok(target) => target,
+            Err(error) => {
+                log::warn!("the page did not say what is under the pointer: {error:#}");
+                Self::default()
+            }
+        };
+        let something = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
+        Self {
+            link: something(target.link),
+            image: something(target.image),
+            selection: something(target.selection),
+        }
+    }
+}
+
+/// Where the page's own HTML is headed, once the page has handed it over. The
+/// page answers on a later turn, by which time nothing else says what it was
+/// asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceGoes {
+    /// Into an editor tab, to be read and searched.
+    ToATab,
+    /// Onto disk, wherever the reader says.
+    ToAFile,
+}
+
+/// What a menu item asks of the page. Only the engine can carry any of these
+/// out, so they are named here and handed over in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageRequest {
+    GoBack,
+    GoForward,
+    Reload,
+    SelectAll,
+    CopySelection,
+}
+
+/// What the page would answer if there were one. No engine starts in a test --
+/// it needs a rendering surface and there is none -- so the answers a right
+/// click depends on are seeded here instead of asked for.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct PageStandIn {
+    under: PageTarget,
+    behind_and_ahead: (bool, bool),
+    source: String,
+}
+
 struct EditorState {
     editor: Entity<Editor>,
     _subscription: Subscription,
@@ -60,6 +153,17 @@ pub struct HtmlPreviewView {
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
+    /// Where the page is painted, so a click can be told where it landed and a
+    /// resize can be passed on to the engine.
+    page_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// The menu the reader opened on the page, and the window position they
+    /// opened it at, so it is drawn where they clicked.
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// What the page answered about the point last right-clicked, and where
+    /// that click was. The engine answers on a later turn of its own loop, so
+    /// the menu is opened from here rather than where it was asked for.
+    #[cfg(any(test, feature = "servo"))]
+    what_is_under_the_pointer: std::rc::Rc<std::cell::RefCell<Option<(Point<Pixels>, PageTarget)>>>,
     /// The live page, when this build has an engine: a real document that lays
     /// itself out, runs its scripts and answers the mouse. Without one the
     /// Markdown rendering below is what the reader sees.
@@ -73,10 +177,6 @@ pub struct HtmlPreviewView {
     shared_frame: Option<std::sync::Arc<gpui::SharedFrame>>,
     #[cfg(feature = "servo")]
     pump: Option<Task<()>>,
-    /// Where the page is painted, so a click can be told where it landed and a
-    /// resize can be passed on to the engine.
-    #[cfg(feature = "servo")]
-    page_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Which button, if any, was pressed on the page and is still down. A drag
     /// that began elsewhere belongs to whoever started it, and a button let go
     /// is only the one that was held.
@@ -92,6 +192,10 @@ pub struct HtmlPreviewView {
     /// answers on a later turn of its own loop, so the answer is left here.
     #[cfg(feature = "servo")]
     pending_copy: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    /// The page's own HTML, once it has handed it over, and where it is headed.
+    /// Left here for the same reason as the text above.
+    #[cfg(feature = "servo")]
+    page_source: std::rc::Rc<std::cell::RefCell<Option<(SourceGoes, String)>>>,
     /// Where the page stands, for the scrollbar to show and for a drag of its
     /// thumb to change. The engine scrolls the page itself, so this is the only
     /// thing the editor knows about it.
@@ -125,6 +229,18 @@ pub struct HtmlPreviewView {
     /// the button looked as though it took two presses.
     #[cfg(feature = "servo")]
     _appearance: Subscription,
+    /// Stands in for the page in tests, where no engine can start.
+    #[cfg(test)]
+    stand_in: Option<PageStandIn>,
+    /// What the menu asked of the page, for a test to look at. Only the seam
+    /// above ever puts anything here.
+    #[cfg(test)]
+    asked_of_the_page: std::rc::Rc<std::cell::RefCell<Vec<PageRequest>>>,
+    /// The point in the page's own coordinates that the last right click was
+    /// turned into, so a test can check the conversion the engine would be
+    /// given.
+    #[cfg(test)]
+    asked_about_the_point: std::rc::Rc<std::cell::Cell<Option<Point<Pixels>>>>,
 }
 
 impl HtmlPreviewView {
@@ -326,6 +442,10 @@ impl HtmlPreviewView {
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 pending_update_task: None,
+                page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
+                context_menu: None,
+                #[cfg(any(test, feature = "servo"))]
+                what_is_under_the_pointer: std::rc::Rc::new(std::cell::RefCell::new(None)),
                 #[cfg(feature = "servo")]
                 page: None,
                 #[cfg(feature = "servo")]
@@ -335,13 +455,13 @@ impl HtmlPreviewView {
                 #[cfg(feature = "servo")]
                 pump: None,
                 #[cfg(feature = "servo")]
-                page_bounds: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default())),
-                #[cfg(feature = "servo")]
                 page_pressed: std::rc::Rc::new(std::cell::Cell::new(None)),
                 #[cfg(feature = "servo")]
                 on_screen: true,
                 #[cfg(feature = "servo")]
                 pending_copy: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                #[cfg(feature = "servo")]
+                page_source: std::rc::Rc::new(std::cell::RefCell::new(None)),
                 #[cfg(feature = "servo")]
                 page_scroll: crate::page_scroll::PageScrollHandle::default(),
                 #[cfg(feature = "servo")]
@@ -358,6 +478,12 @@ impl HtmlPreviewView {
                 answer_from_the_page: std::rc::Rc::new(std::cell::Cell::new(None)),
                 #[cfg(feature = "servo")]
                 _appearance: workspace::preview_appearance::observe_preview_appearance(cx),
+                #[cfg(test)]
+                stand_in: None,
+                #[cfg(test)]
+                asked_of_the_page: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                #[cfg(test)]
+                asked_about_the_point: std::rc::Rc::new(std::cell::Cell::new(None)),
             };
             #[cfg(feature = "servo")]
             cx.on_release_in(window, |this: &mut Self, window, _| {
@@ -386,7 +512,6 @@ impl HtmlPreviewView {
 
     /// The same preview with no document behind it, for a page the reader goes
     /// to rather than one the editor holds.
-    #[cfg(feature = "servo")]
     pub fn new_empty(
         workspace: WeakEntity<Workspace>,
         language_registry: Arc<LanguageRegistry>,
@@ -656,7 +781,31 @@ impl HtmlPreviewView {
                     if let Some(text) = view.pending_copy.borrow_mut().take()
                         && !text.is_empty()
                     {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    // The same goes for what a right click asked about and for
+                    // the page's own HTML: both are answers to a script, and
+                    // both belong to every path through this loop. Both are
+                    // acted on once this update is over -- opening the menu
+                    // takes the view, and opening a tab tells this one it has
+                    // been left, neither of which can happen from inside here.
+                    take_what_is_under_the_pointer(&view.what_is_under_the_pointer, window, cx);
+                    let source = view.page_source.borrow_mut().take();
+                    if let Some((goes, source)) = source {
+                        let workspace = view.workspace.clone();
+                        // Deferred without the view: a new tab tells the one it
+                        // replaces that it has been left, and this preview may
+                        // well be that one.
+                        window.defer(cx, move |window, cx| match goes {
+                            SourceGoes::ToATab => {
+                                show_the_page_source(&workspace, source, window, cx)
+                            }
+                            SourceGoes::ToAFile => {
+                                if let Some(files) = the_projects_files(&workspace, cx) {
+                                    save_the_page_source(source, files, cx);
+                                }
+                            }
+                        });
                     }
                     #[cfg(target_os = "linux")]
                     if view
@@ -708,19 +857,36 @@ impl HtmlPreviewView {
     }
 
     /// Whether the engine's page is what the reader is looking at.
-    #[cfg(all(feature = "servo", target_os = "linux"))]
     fn showing_live_page(&self) -> bool {
-        self.frame.is_some() || self.shared_frame.is_some()
-    }
-
-    #[cfg(all(feature = "servo", not(target_os = "linux")))]
-    fn showing_live_page(&self) -> bool {
-        self.frame.is_some()
-    }
-
-    #[cfg(not(feature = "servo"))]
-    fn showing_live_page(&self) -> bool {
+        #[cfg(test)]
+        if self.stand_in.is_some() {
+            return true;
+        }
+        #[cfg(feature = "servo")]
+        {
+            if self.frame.is_some() {
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            if self.shared_frame.is_some() {
+                return true;
+            }
+        }
         false
+    }
+
+    /// Whether there is anywhere behind where the page is now, and anywhere
+    /// ahead of it.
+    fn can_go(&self) -> (bool, bool) {
+        #[cfg(test)]
+        if let Some(stand_in) = self.stand_in.as_ref() {
+            return stand_in.behind_and_ahead;
+        }
+        #[cfg(feature = "servo")]
+        if let Some(page) = self.page.as_ref() {
+            return page.can_go();
+        }
+        (false, false)
     }
 
     /// Typing reaches the page from the element that holds focus. A handler on
@@ -792,185 +958,410 @@ impl HtmlPreviewView {
 
     /// The live page when the engine has one, and the Markdown rendering of the
     /// document otherwise.
+    fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.showing_live_page() {
+            return self.page_area(window, cx);
+        }
+        #[cfg(feature = "servo")]
+        if self.page.is_some() {
+            // The engine has the document and is drawing it. Showing the
+            // Markdown rendering of the source in the meantime, and replacing it
+            // with the page a moment later, looks like two previews arriving one
+            // after the other; an empty pane is what a browser shows while a
+            // page is on its way.
+            return div()
+                .size_full()
+                .bg(cx.theme().colors().editor_background)
+                .into_any_element();
+        }
+        self.render_markdown_element(window, cx).into_any_element()
+    }
+
+    /// The area the page is drawn in, and everything the pointer does over it.
     ///
     /// The page's own input is delivered through window-level listeners rather
     /// than the element's: an element only hears about the mouse while it is
     /// hovered, and a drag -- which is how text is selected -- is exactly the
-    /// case where that stops being true.
+    /// case where that stops being true. The right button is the exception. Its
+    /// click is the editor's own menu, so it is taken from the element, where a
+    /// menu that has opened over the page can occlude it.
+    fn page_area(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let bounds_cell = self.page_bounds.clone();
+        let area = div()
+            .size_full()
+            .relative()
+            .debug_selector(|| PAGE_AREA.into())
+            // The area's own bounds are what a click is measured against, and a
+            // div does not report its own: they are read from a child that fills
+            // it. An absolutely positioned child is used so that nothing here
+            // takes room from the picture.
+            .child(
+                canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| ())
+                    .absolute()
+                    .size_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    view.right_clicked_on_the_page(event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        #[cfg(feature = "servo")]
+        let area = self.with_page_mouse(area, window, cx);
+        #[cfg(not(feature = "servo"))]
+        let area = {
+            let _ = window;
+            area.into_any_element()
+        };
+        area
+    }
+
+    /// The picture the engine painted, and the window-level listeners that hand
+    /// the pointer to it.
     #[cfg(feature = "servo")]
-    fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn with_page_mouse(
+        &self,
+        area: gpui::Div,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         #[cfg(target_os = "linux")]
         let shared = self.shared_frame.clone();
         #[cfg(not(target_os = "linux"))]
         let shared: Option<()> = None;
         let frame = self.frame.clone();
-        if frame.is_none() && shared.is_none() {
-            if self.page.is_some() {
-                // The engine has the document and is drawing it. Showing the
-                // Markdown rendering of the source in the meantime, and
-                // replacing it with the page a moment later, looks like two
-                // previews arriving one after the other; an empty pane is what
-                // a browser shows while a page is on its way.
-                return div()
-                    .size_full()
-                    .bg(cx.theme().colors().editor_background)
-                    .into_any_element();
-            }
-            return self.render_markdown_element(window, cx).into_any_element();
-        }
         let bounds_cell = self.page_bounds.clone();
         let holding = self.page_pressed.clone();
         let view = cx.entity().downgrade();
         let scroll = self.page_scroll.clone();
         let focus = self.focus_handle.clone();
-        div()
-            .size_full()
-            .relative()
-            // The picture's own bounds are what a click is measured against: an
-            // absolutely positioned overlay has no size of its own to offer, and
-            // a hit test against nothing lets nothing through.
-            .on_children_prepainted({
-                let bounds_cell = bounds_cell.clone();
-                move |children, _, _| {
-                    if let Some(page) = children.first() {
-                        bounds_cell.set(*page);
+        area.when_some(frame, |this, frame| {
+            this.child(gpui::img(gpui::ImageSource::Render(frame)).size_full())
+        })
+        .child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |painted_bounds, _, window, _| {
+                    // The page's own buffer, drawn where the graphics card
+                    // already holds it.
+                    #[cfg(target_os = "linux")]
+                    if let Some(shared) = shared.clone() {
+                        window.paint_shared_frame(painted_bounds, shared);
                     }
+                    let bounds = bounds_cell.get();
+                    let page_point = move |position: gpui::Point<gpui::Pixels>| {
+                        gpui::point(position.x - bounds.origin.x, position.y - bounds.origin.y)
+                    };
+                    let inside = move |position: gpui::Point<gpui::Pixels>| {
+                        // Before the first paint there is nothing to measure
+                        // against, and a page that hears nothing is worse
+                        // than one that hears too much.
+                        bounds.size.width <= gpui::px(1.) || bounds.contains(&position)
+                    };
+
+                    window.on_mouse_event({
+                        let view = view.clone();
+                        let holding = holding.clone();
+                        move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            // A drag that started on the page keeps steering it
+                            // even when the pointer wanders off the edge, which
+                            // is what selecting to the end of a line does. A
+                            // drag that started elsewhere is somebody else's.
+                            if !inside(event.position) && holding.get().is_none() {
+                                return;
+                            }
+                            view.update(cx, |view, _| {
+                                if let Some(page) = view.page.as_ref() {
+                                    page.mouse_moved(page_point(event.position));
+                                }
+                            })
+                            .ok();
+                        }
+                    });
+                    window.on_mouse_event({
+                        let view = view.clone();
+                        let holding = holding.clone();
+                        move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                                return;
+                            }
+                            let Some(button) = servo_button(event.button) else {
+                                return;
+                            };
+                            holding.set(Some(event.button));
+                            view.update(cx, |view, _| {
+                                if let Some(page) = view.page.as_ref() {
+                                    page.mouse_down(page_point(event.position), button);
+                                }
+                            })
+                            .ok();
+                            // Whoever is clicked on is who types next: a page
+                            // that takes the mouse but leaves the keyboard
+                            // with the source cannot be typed into. Asked for
+                            // outside the update above, so that whatever
+                            // focusing sets off does not arrive in the middle
+                            // of it.
+                            focus.focus(window, cx);
+                        }
+                    });
+                    window.on_mouse_event({
+                        let view = view.clone();
+                        let holding = holding.clone();
+                        move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let Some(button) = servo_button(event.button) else {
+                                return;
+                            };
+                            // Only the button the page itself is holding is
+                            // released to it, and only that button: a drag
+                            // held with one button and let go with another
+                            // would otherwise leave the first one down for
+                            // ever. A click that began in the editor must not
+                            // finish inside the page either.
+                            let held = holding.get() == Some(event.button);
+                            if held {
+                                holding.set(None);
+                            } else if !inside(event.position) {
+                                return;
+                            }
+                            view.update(cx, |view, _| {
+                                if let Some(page) = view.page.as_ref() {
+                                    page.mouse_up(page_point(event.position), button);
+                                }
+                            })
+                            .ok();
+                        }
+                    });
+                    window.on_mouse_event({
+                        move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                                return;
+                            }
+                            let delta = event.delta.pixel_delta(window.line_height());
+                            view.update(cx, |view, _| {
+                                if let Some(page) = view.page.as_ref() {
+                                    page.scrolled(page_point(event.position), delta);
+                                }
+                            })
+                            .ok();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+        // The page scrolls inside the engine, so there is no scroll
+        // container here to hang a scrollbar on. This one is a decoration
+        // over the picture: it shows where the page says it stands, and a
+        // drag of its thumb asks the page to go elsewhere.
+        .custom_scrollbars(
+            ui::Scrollbars::for_settings::<PageScrollbarSetting>()
+                .show_along(ui::ScrollAxes::Vertical)
+                .id("html-preview-page")
+                .tracked_scroll_handle(&scroll),
+            window,
+            cx,
+        )
+        .into_any_element()
+    }
+
+    /// The page was right-clicked. What the menu should offer depends on what is
+    /// under the pointer, and only the page knows that, so nothing opens here:
+    /// the page is asked, and the menu opens when the answer arrives.
+    fn right_clicked_on_the_page(
+        &mut self,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Measured against the area the page is drawn in, the same way every
+        // other click the page is told about is.
+        let bounds = self.page_bounds.get();
+        let in_the_page = gpui::point(at.x - bounds.origin.x, at.y - bounds.origin.y);
+        #[cfg(test)]
+        if let Some(stand_in) = self.stand_in.clone() {
+            self.asked_about_the_point.set(Some(in_the_page));
+            // The engine's answer would arrive on a later turn; this one is to
+            // hand, and goes through the same place the engine's would.
+            *self.what_is_under_the_pointer.borrow_mut() = Some((at, stand_in.under));
+            take_what_is_under_the_pointer(&self.what_is_under_the_pointer, window, cx);
+            return;
+        }
+        #[cfg(feature = "servo")]
+        if let Some(page) = self.page.as_ref() {
+            let waiting = self.what_is_under_the_pointer.clone();
+            page.what_is_under(in_the_page, move |answer| {
+                *waiting.borrow_mut() = Some((at, PageTarget::parse(&answer)));
+            });
+            return;
+        }
+        let _ = (in_the_page, window, cx);
+    }
+
+    /// Puts the page's menu on screen where the reader clicked, offering what
+    /// belongs to whatever the page has there.
+    fn deploy_page_menu(
+        &mut self,
+        at: Point<Pixels>,
+        target: PageTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (behind, ahead) = self.can_go();
+        let view = cx.entity().downgrade();
+        let context = self.focus_handle.clone();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let menu = menu
+                .context(context)
+                .custom_row({
+                    let view = view.clone();
+                    move |_, _| navigation_row(&view, behind, ahead)
+                })
+                .separator();
+            let menu = match target.link {
+                Some(link) => {
+                    let copying = link.clone();
+                    menu.entry(OPEN_LINK, None, {
+                        let view = view.clone();
+                        move |window, cx| open_a_browser_tab(&view, &link, window, cx)
+                    })
+                    .entry(COPY_LINK, None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copying.clone()))
+                    })
+                    .separator()
+                }
+                None => menu,
+            };
+            let menu = match target.image {
+                Some(image) => {
+                    let copying = image.clone();
+                    menu.entry(OPEN_IMAGE, None, {
+                        let view = view.clone();
+                        move |window, cx| open_a_browser_tab(&view, &image, window, cx)
+                    })
+                    .entry(COPY_IMAGE, None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copying.clone()))
+                    })
+                    .separator()
+                }
+                None => menu,
+            };
+            let menu = match target.selection {
+                Some(selection) => menu
+                    .entry(COPY_SELECTION, None, {
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |view, cx| {
+                                view.tell_the_page(PageRequest::CopySelection, cx);
+                            })
+                            .ok();
+                        }
+                    })
+                    .entry(SEARCH_THE_WEB, None, {
+                        let view = view.clone();
+                        move |window, cx| search_the_web_for(&view, &selection, window, cx)
+                    })
+                    .separator(),
+                None => menu,
+            };
+            menu.entry(SELECT_ALL, None, {
+                let view = view.clone();
+                move |_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.tell_the_page(PageRequest::SelectAll, cx);
+                    })
+                    .ok();
                 }
             })
-            .when_some(frame, |this, frame| {
-                this.child(gpui::img(gpui::ImageSource::Render(frame)).size_full())
+            .separator()
+            .entry(SAVE_PAGE, None, {
+                let view = view.clone();
+                move |window, cx| {
+                    ask_the_page_for_its_source(&view, SourceGoes::ToAFile, window, cx)
+                }
             })
-            .child(
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |painted_bounds, _, window, _| {
-                        // The page's own buffer, drawn where the graphics card
-                        // already holds it.
-                        #[cfg(target_os = "linux")]
-                        if let Some(shared) = shared.clone() {
-                            window.paint_shared_frame(painted_bounds, shared);
-                        }
-                        let bounds = bounds_cell.get();
-                        let page_point = move |position: gpui::Point<gpui::Pixels>| {
-                            gpui::point(position.x - bounds.origin.x, position.y - bounds.origin.y)
-                        };
-                        let inside = move |position: gpui::Point<gpui::Pixels>| {
-                            // Before the first paint there is nothing to measure
-                            // against, and a page that hears nothing is worse
-                            // than one that hears too much.
-                            bounds.size.width <= gpui::px(1.) || bounds.contains(&position)
-                        };
+            .entry(VIEW_SOURCE, None, move |window, cx| {
+                ask_the_page_for_its_source(&view, SourceGoes::ToATab, window, cx)
+            })
+            .action(INSPECT, Box::new(crate::ToggleFocus))
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |view, _, _: &DismissEvent, cx| {
+            view.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, at, subscription));
+        cx.notify();
+    }
 
-                        window.on_mouse_event({
-                            let view = view.clone();
-                            let holding = holding.clone();
-                            move |event: &gpui::MouseMoveEvent, phase, _, cx| {
-                                if phase != gpui::DispatchPhase::Bubble {
-                                    return;
-                                }
-                                // A drag that started on the page keeps steering it
-                                // even when the pointer wanders off the edge, which
-                                // is what selecting to the end of a line does. A
-                                // drag that started elsewhere is somebody else's.
-                                if !inside(event.position) && holding.get().is_none() {
-                                    return;
-                                }
-                                view.update(cx, |view, _| {
-                                    if let Some(page) = view.page.as_ref() {
-                                        page.mouse_moved(page_point(event.position));
-                                    }
-                                })
-                                .ok();
-                            }
-                        });
-                        window.on_mouse_event({
-                            let view = view.clone();
-                            let holding = holding.clone();
-                            move |event: &gpui::MouseDownEvent, phase, window, cx| {
-                                if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
-                                    return;
-                                }
-                                let Some(button) = servo_button(event.button) else {
-                                    return;
-                                };
-                                holding.set(Some(event.button));
-                                view.update(cx, |view, _| {
-                                    if let Some(page) = view.page.as_ref() {
-                                        page.mouse_down(page_point(event.position), button);
-                                    }
-                                })
-                                .ok();
-                                // Whoever is clicked on is who types next: a page
-                                // that takes the mouse but leaves the keyboard
-                                // with the source cannot be typed into. Asked for
-                                // outside the update above, so that whatever
-                                // focusing sets off does not arrive in the middle
-                                // of it.
-                                focus.focus(window, cx);
-                            }
-                        });
-                        window.on_mouse_event({
-                            let view = view.clone();
-                            let holding = holding.clone();
-                            move |event: &gpui::MouseUpEvent, phase, _, cx| {
-                                if phase != gpui::DispatchPhase::Bubble {
-                                    return;
-                                }
-                                let Some(button) = servo_button(event.button) else {
-                                    return;
-                                };
-                                // Only the button the page itself is holding is
-                                // released to it, and only that button: a drag
-                                // held with one button and let go with another
-                                // would otherwise leave the first one down for
-                                // ever. A click that began in the editor must not
-                                // finish inside the page either.
-                                let held = holding.get() == Some(event.button);
-                                if held {
-                                    holding.set(None);
-                                } else if !inside(event.position) {
-                                    return;
-                                }
-                                view.update(cx, |view, _| {
-                                    if let Some(page) = view.page.as_ref() {
-                                        page.mouse_up(page_point(event.position), button);
-                                    }
-                                })
-                                .ok();
-                            }
-                        });
-                        window.on_mouse_event({
-                            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                                if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
-                                    return;
-                                }
-                                let delta = event.delta.pixel_delta(window.line_height());
-                                view.update(cx, |view, _| {
-                                    if let Some(page) = view.page.as_ref() {
-                                        page.scrolled(page_point(event.position), delta);
-                                    }
-                                })
-                                .ok();
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .size_full(),
+    /// The menu, drawn over everything else at the point it was opened at.
+    ///
+    /// Anchored to the window rather than to the element it hangs from, so it
+    /// lands where the reader clicked however far whatever holds this preview
+    /// has been scrolled.
+    fn render_page_menu(&self) -> Option<gpui::AnyElement> {
+        let (menu, at, _) = self.context_menu.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(*at)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(menu.clone()),
             )
-            // The page scrolls inside the engine, so there is no scroll
-            // container here to hang a scrollbar on. This one is a decoration
-            // over the picture: it shows where the page says it stands, and a
-            // drag of its thumb asks the page to go elsewhere.
-            .custom_scrollbars(
-                ui::Scrollbars::for_settings::<PageScrollbarSetting>()
-                    .show_along(ui::ScrollAxes::Vertical)
-                    .id("html-preview-page")
-                    .tracked_scroll_handle(&scroll),
-                window,
-                cx,
-            )
-            .into_any_element()
+            .with_priority(3)
+            .into_any_element(),
+        )
+    }
+
+    /// Takes the page's menu away and gives the keyboard back to the page.
+    fn dismiss_page_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Hands a request to the page. Only the engine can carry any of these out,
+    /// so a build without one has nothing to do.
+    fn tell_the_page(&mut self, request: PageRequest, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.asked_of_the_page.borrow_mut().push(request);
+        #[cfg(feature = "servo")]
+        if let Some(page) = self.page.as_ref() {
+            match request {
+                PageRequest::GoBack => page.go_back(),
+                PageRequest::GoForward => page.go_forward(),
+                PageRequest::Reload => page.refresh(),
+                PageRequest::SelectAll => page.select_all(),
+                PageRequest::CopySelection => {
+                    // The page answers on a turn of its own, and the driver puts
+                    // what comes back on the clipboard.
+                    let waiting = self.pending_copy.clone();
+                    page.selected_text(move |text| {
+                        *waiting.borrow_mut() = Some(text);
+                    });
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "servo")))]
+        let _ = request;
+        cx.notify();
+    }
+
+    /// Sends this preview's page to an address, when the build has an engine to
+    /// send it with.
+    fn go_to(&mut self, going: url::Url, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "servo")]
+        self.open_the_page(Some(going), window, cx);
+        #[cfg(not(feature = "servo"))]
+        let _ = (going, window, cx);
     }
 
     /// The line above the page: where it is, where it has been, and where the
@@ -979,11 +1370,7 @@ impl HtmlPreviewView {
     #[cfg(feature = "servo")]
     fn render_address_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let loading = self.page.as_ref().and_then(|page| page.how_far_loaded());
-        let (behind, ahead) = self
-            .page
-            .as_ref()
-            .map(|page| page.can_go())
-            .unwrap_or((false, false));
+        let (behind, ahead) = self.can_go();
         let colors = cx.theme().colors();
         h_flex()
             .id("html-preview-address")
@@ -1224,11 +1611,6 @@ impl HtmlPreviewView {
         div().into_any_element()
     }
 
-    #[cfg(not(feature = "servo"))]
-    fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        self.render_markdown_element(window, cx).into_any_element()
-    }
-
     fn render_markdown_element(
         &self,
         window: &mut Window,
@@ -1267,6 +1649,256 @@ impl HtmlPreviewView {
                 }
             })
     }
+}
+
+/// The row across the top of the page's menu, as a browser has: back, forward,
+/// and fetch this page again.
+fn navigation_row(
+    view: &WeakEntity<HtmlPreviewView>,
+    behind: bool,
+    ahead: bool,
+) -> gpui::AnyElement {
+    h_flex()
+        .gap_1()
+        .px_1()
+        .py_0p5()
+        .child(navigation_button(
+            "page-menu-back",
+            IconName::ArrowLeft,
+            "Back",
+            !behind,
+            view,
+            PageRequest::GoBack,
+        ))
+        .child(navigation_button(
+            "page-menu-forward",
+            IconName::ArrowRight,
+            "Forward",
+            !ahead,
+            view,
+            PageRequest::GoForward,
+        ))
+        .child(navigation_button(
+            "page-menu-reload",
+            IconName::RotateCw,
+            "Reload this page",
+            false,
+            view,
+            PageRequest::Reload,
+        ))
+        .into_any_element()
+}
+
+fn navigation_button(
+    id: &'static str,
+    icon: IconName,
+    tooltip: &'static str,
+    disabled: bool,
+    view: &WeakEntity<HtmlPreviewView>,
+    request: PageRequest,
+) -> impl IntoElement {
+    let view = view.clone();
+    div()
+        .debug_selector(move || format!("PAGE_MENU-{id}"))
+        .child(
+            IconButton::new(id, icon)
+                .icon_size(IconSize::Small)
+                .disabled(disabled)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.tell_the_page(request, cx);
+                        view.dismiss_page_menu(window, cx);
+                    })
+                    .ok();
+                }),
+        )
+}
+
+/// Opens an address in a browser tab of its own, beside the page it came from.
+fn open_a_browser_tab(
+    view: &WeakEntity<HtmlPreviewView>,
+    address: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Ok(going) = url::Url::parse(address) else {
+        log::warn!("the page offered an address the editor cannot read: {address}");
+        return;
+    };
+    let Some(preview) = view.upgrade() else {
+        return;
+    };
+    let Some(workspace) = preview.read(cx).workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        let languages = workspace.project().read(cx).languages().clone();
+        let tab = HtmlPreviewView::new_empty(workspace.weak_handle(), languages, window, cx);
+        tab.update(cx, |tab, cx| tab.go_to(going, window, cx));
+        workspace.active_pane().update(cx, |pane, cx| {
+            pane.add_item(Box::new(tab), true, true, None, window, cx);
+        });
+    });
+}
+
+/// Asks the page for its own HTML, and says where it should end up. The engine
+/// answers on a later turn and the page's driver takes it from there; only a
+/// page standing in for one, in a test, has the answer to hand.
+fn ask_the_page_for_its_source(
+    view: &WeakEntity<HtmlPreviewView>,
+    goes: SourceGoes,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(preview) = view.upgrade() else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        let seeded = {
+            let preview = preview.read(cx);
+            preview
+                .stand_in
+                .as_ref()
+                .map(|stand_in| (preview.workspace.clone(), stand_in.source.clone()))
+        };
+        if let Some((workspace, source)) = seeded {
+            match goes {
+                SourceGoes::ToATab => show_the_page_source(&workspace, source, window, cx),
+                SourceGoes::ToAFile => {
+                    if let Some(files) = the_projects_files(&workspace, cx) {
+                        save_the_page_source(source, files, cx);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    #[cfg(feature = "servo")]
+    {
+        let preview = preview.read(cx);
+        if let Some(page) = preview.page.as_ref() {
+            let waiting = preview.page_source.clone();
+            page.evaluate("document.documentElement.outerHTML", move |source| {
+                *waiting.borrow_mut() = Some((goes, source));
+            });
+        }
+    }
+    let _ = (preview, goes, window, cx);
+}
+
+/// Opens the menu once the page has said what is under the pointer. The answer
+/// lands on a turn of the engine's own loop, so it is collected by whoever drives
+/// the page rather than by the click that asked.
+///
+/// Takes the answer alone rather than the view: the loop that drives the page
+/// holds the page mutably while this runs, and borrowing the whole view there
+/// would not be allowed. Opening the menu is deferred for the same reason.
+fn take_what_is_under_the_pointer(
+    asked: &std::rc::Rc<std::cell::RefCell<Option<(Point<Pixels>, PageTarget)>>>,
+    window: &mut Window,
+    cx: &mut Context<HtmlPreviewView>,
+) {
+    let answer = asked.borrow_mut().take();
+    if let Some((at, target)) = answer {
+        cx.defer_in(window, move |view, window, cx| {
+            view.deploy_page_menu(at, target, window, cx);
+        });
+    }
+}
+
+/// Writes the page's own HTML wherever the reader says. The dialog is the
+/// platform's, so nothing here knows whether it was answered until it is.
+///
+/// The writing goes through the project's own file system rather than straight
+/// to disk: that is the one the editor is holding, and it is the only way the
+/// write is observable from a test -- a bare `smol::fs::write` lands on a thread
+/// pool the test scheduler does not drive, so the file appears some time after
+/// the test has finished looking for it.
+fn save_the_page_source(source: String, fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    let where_to = cx.prompt_for_new_path(paths::home_dir(), Some(SAVED_PAGE));
+    cx.background_spawn(async move {
+        let chosen = match where_to.await {
+            Ok(Ok(chosen)) => chosen,
+            Ok(Err(error)) => {
+                log::error!("the editor could not ask where to save the page: {error:#}");
+                return;
+            }
+            // The dialog was closed without an answer, which is a reader
+            // changing their mind rather than anything going wrong.
+            Err(_) => return,
+        };
+        let Some(chosen) = chosen else {
+            return;
+        };
+        if let Err(error) = fs.write(&chosen, source.as_bytes()).await {
+            log::error!("the page could not be saved to {chosen:?}: {error:#}");
+        }
+    })
+    .detach();
+}
+
+/// The file system the editor is holding, which is a real one in the editor and
+/// a stand-in under test.
+fn the_projects_files(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<Arc<dyn fs::Fs>> {
+    let workspace = workspace.upgrade()?;
+    Some(workspace.read(cx).project().read(cx).fs().clone())
+}
+
+/// Opens a page's HTML as a read-only editor tab, so it can be read and searched
+/// the way any other file is. A page is not a file, so this is a buffer of its
+/// own rather than something on disk.
+fn show_the_page_source(
+    workspace: &WeakEntity<Workspace>,
+    source: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        let languages = workspace.project().read(cx).languages().clone();
+        let buffer = cx.new(|cx| Buffer::local(source, cx));
+        // The tab opens now; the colouring appears once the grammar is in.
+        cx.spawn({
+            let buffer = buffer.clone();
+            async move |_, cx| match languages.language_for_name("HTML").await {
+                Ok(html) => {
+                    buffer.update(cx, |buffer, cx| buffer.set_language(Some(html), cx));
+                }
+                Err(error) => log::warn!("the page's source cannot be coloured: {error:#}"),
+            }
+        })
+        .detach();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_buffer(buffer, None, window, cx);
+            editor.set_read_only(true);
+            editor
+                .buffer()
+                .update(cx, |buffer, cx| buffer.set_title(SOURCE_TITLE.into(), cx));
+            editor
+        });
+        let pane = workspace.active_pane().clone();
+        workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+    });
+}
+
+/// Looks the selection up wherever the reader has said searches go, in a browser
+/// tab of its own.
+fn search_the_web_for(
+    view: &WeakEntity<HtmlPreviewView>,
+    selection: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(going) =
+        crate::html_preview_settings::HtmlPreviewSettings::get_global(cx).where_to_go(selection)
+    else {
+        return;
+    };
+    open_a_browser_tab(view, going.as_str(), window, cx);
 }
 
 fn sanitize_html(raw: &str) -> String {
@@ -1486,13 +2118,16 @@ fn asks_to_copy(keystroke: &gpui::Keystroke) -> bool {
 /// has no name for is not passed on at all: a back or forward button announced
 /// to a page as a left click starts selecting text from wherever the pointer
 /// happens to be.
+///
+/// The right button is deliberately among those the page never hears. Its click
+/// opens the editor's own menu, and a page that also sees it can open a second
+/// one of its own over the top.
 #[cfg(feature = "servo")]
-fn servo_button(button: gpui::MouseButton) -> Option<html_render::MouseButton> {
+fn servo_button(button: MouseButton) -> Option<html_render::MouseButton> {
     match button {
-        gpui::MouseButton::Left => Some(html_render::MouseButton::Left),
-        gpui::MouseButton::Right => Some(html_render::MouseButton::Right),
-        gpui::MouseButton::Middle => Some(html_render::MouseButton::Middle),
-        gpui::MouseButton::Navigate(_) => None,
+        MouseButton::Left => Some(html_render::MouseButton::Left),
+        MouseButton::Middle => Some(html_render::MouseButton::Middle),
+        MouseButton::Right | MouseButton::Navigate(_) => None,
     }
 }
 
@@ -1559,6 +2194,9 @@ impl Render for HtmlPreviewView {
                                 .child(self.render_page(window, cx)),
                         ),
                 )
+                // Hung from the root rather than from the page's own area, so
+                // nothing the page draws is ever over the menu.
+                .children(self.render_page_menu())
                 .into_any_element();
         }
         root.child(
@@ -1663,4 +2301,492 @@ fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
     use crate::html_preview_settings::HtmlPreviewSettings;
 
     HtmlPreviewSettings::get_global(cx).scale_in(window.scale_factor())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Bounds, Modifiers, TestAppContext, VisualTestContext, point, px};
+    use project::Project;
+    use workspace::AppState;
+
+    const A_LINK: &str = "https://example.com/somewhere";
+    const AN_IMAGE: &str = "https://example.com/picture.png";
+    const A_SELECTION: &str = "how tall is a giraffe";
+    const A_SOURCE: &str = "<html><body><p>Hello</p></body></html>";
+
+    /// The preview inside something that scrolls, because chrome drawn over a
+    /// page has to land where the reader clicked at any scroll offset, not only
+    /// at rest.
+    struct PageFrame {
+        preview: Entity<HtmlPreviewView>,
+        workspace: Entity<Workspace>,
+        scroll: ScrollHandle,
+    }
+
+    impl Render for PageFrame {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("page-frame")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .child(div().w(px(900.)).h(px(600.)).child(self.preview.clone()))
+                // Something below the preview, so the frame can really scroll.
+                .child(div().w(px(900.)).h(px(1500.)))
+        }
+    }
+
+    fn a_page_showing(under: PageTarget) -> PageStandIn {
+        PageStandIn {
+            under,
+            behind_and_ahead: (false, false),
+            source: A_SOURCE.to_string(),
+        }
+    }
+
+    fn nothing_in_particular() -> PageTarget {
+        PageTarget::default()
+    }
+
+    async fn a_page_frame(
+        stand_in: PageStandIn,
+        cx: &mut TestAppContext,
+    ) -> (Entity<PageFrame>, &mut VisualTestContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            editor::init(cx);
+            app_state
+        });
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (frame, cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::test_new(project.clone(), window, cx));
+            let languages = workspace.read(cx).project().read(cx).languages().clone();
+            let preview = HtmlPreviewView::new_empty(workspace.downgrade(), languages, window, cx);
+            preview.update(cx, |preview, _| preview.stand_in = Some(stand_in));
+            PageFrame {
+                preview,
+                workspace,
+                scroll: ScrollHandle::new(),
+            }
+        });
+        cx.run_until_parked();
+        draw(cx);
+        (frame, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+    }
+
+    fn painted(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was expected to have been painted"))
+    }
+
+    fn right_click(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        draw(cx);
+    }
+
+    /// Right-clicks the middle of the page and hands back where that was.
+    fn right_click_the_page(cx: &mut VisualTestContext) -> Point<Pixels> {
+        let page = painted(cx, PAGE_AREA);
+        assert!(
+            page.size.width > px(1.) && page.size.height > px(1.),
+            "the page has to occupy real screen area, not {:?}",
+            page.size
+        );
+        let at = page.center();
+        right_click(cx, at);
+        at
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let at = painted(cx, selector).center();
+        cx.simulate_click(at, Modifiers::none());
+        draw(cx);
+    }
+
+    /// How far from the click the menu's own first row may sit. Enough for the
+    /// menu's padding, and far short of the distance to the page's own corner,
+    /// which is where a menu positioned by its parent instead of by the click
+    /// would land.
+    const BESIDE_THE_CLICK: Pixels = px(64.);
+
+    /// Checks that the menu is really on screen, and where the reader clicked.
+    fn menu_is_at(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        let first = painted(cx, "PAGE_MENU-page-menu-back");
+        assert!(
+            first.size.width > px(1.) && first.size.height > px(1.),
+            "the menu has to occupy real screen area, not {:?}",
+            first.size
+        );
+        assert!(
+            first.origin.x >= at.x && first.origin.x - at.x < BESIDE_THE_CLICK,
+            "the menu has to open beside the click at {at:?}, not at {:?}",
+            first.origin
+        );
+        assert!(
+            first.origin.y >= at.y && first.origin.y - at.y < BESIDE_THE_CLICK,
+            "the menu has to open below the click at {at:?}, not at {:?}",
+            first.origin
+        );
+        let item = painted(cx, "MENU_ITEM-Select All");
+        assert!(
+            item.size.width > px(1.) && item.size.height > px(1.),
+            "the menu's items have to occupy real screen area, not {:?}",
+            item.size
+        );
+    }
+
+    #[gpui::test]
+    async fn a_right_click_over_the_page_opens_a_menu_where_it_was_clicked(
+        cx: &mut TestAppContext,
+    ) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        let page = painted(cx, PAGE_AREA);
+        let at = right_click_the_page(cx);
+        menu_is_at(cx, at);
+
+        // What the page would have been asked about is the click measured
+        // against the area the page is drawn in, not the window.
+        let asked = frame
+            .read_with(cx, |frame, cx| {
+                frame.preview.read(cx).asked_about_the_point.get()
+            })
+            .expect("the page has to be asked what is under the pointer");
+        let expected = point(at.x - page.origin.x, at.y - page.origin.y);
+        assert!(
+            f32::from(asked.x - expected.x).abs() < 1.
+                && f32::from(asked.y - expected.y).abs() < 1.,
+            "the page has to be asked about {expected:?} in its own coordinates, not {asked:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_link_under_the_pointer_is_offered(cx: &mut TestAppContext) {
+        let (_frame, cx) = a_page_frame(
+            a_page_showing(PageTarget {
+                link: Some(A_LINK.to_string()),
+                ..PageTarget::default()
+            }),
+            cx,
+        )
+        .await;
+
+        right_click_the_page(cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Link in New Browser Tab")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Link Address").is_some());
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Copy Image Address").is_none(),
+            "there is no image under the pointer, so nothing about one belongs in the menu"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Copy").is_none(),
+            "nothing is selected, so there is nothing to copy"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_image_under_the_pointer_is_offered(cx: &mut TestAppContext) {
+        let (_frame, cx) = a_page_frame(
+            a_page_showing(PageTarget {
+                image: Some(AN_IMAGE.to_string()),
+                ..PageTarget::default()
+            }),
+            cx,
+        )
+        .await;
+
+        right_click_the_page(cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Image in New Browser Tab")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Image Address").is_some());
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Copy Link Address").is_none(),
+            "there is no link under the pointer, so nothing about one belongs in the menu"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_selection_is_offered_for_copying_and_searching(cx: &mut TestAppContext) {
+        let (_frame, cx) = a_page_frame(
+            a_page_showing(PageTarget {
+                selection: Some(A_SELECTION.to_string()),
+                ..PageTarget::default()
+            }),
+            cx,
+        )
+        .await;
+
+        right_click_the_page(cx);
+
+        assert!(cx.debug_bounds("MENU_ITEM-Copy").is_some());
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Search the Web for the Selection")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Link Address").is_none());
+    }
+
+    #[gpui::test]
+    async fn a_page_with_nothing_under_the_pointer_offers_only_the_page(cx: &mut TestAppContext) {
+        let (_frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        right_click_the_page(cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Link in New Browser Tab")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Link Address").is_none());
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Image in New Browser Tab")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Image Address").is_none());
+        assert!(cx.debug_bounds("MENU_ITEM-Copy").is_none());
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Search the Web for the Selection")
+                .is_none()
+        );
+        // What is always there, whatever the pointer is over.
+        assert!(cx.debug_bounds("MENU_ITEM-Select All").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Save Page As…").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-View Page Source").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Inspect").is_some());
+        assert!(cx.debug_bounds("PAGE_MENU-page-menu-back").is_some());
+        assert!(cx.debug_bounds("PAGE_MENU-page-menu-forward").is_some());
+        assert!(cx.debug_bounds("PAGE_MENU-page-menu-reload").is_some());
+    }
+
+    #[gpui::test]
+    async fn the_menu_lands_where_it_was_clicked_with_the_view_scrolled(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        let at_rest = painted(cx, PAGE_AREA);
+        frame.read_with(cx, |frame, _| {
+            frame.scroll.set_offset(point(px(0.), px(-200.)));
+        });
+        draw(cx);
+        let scrolled = painted(cx, PAGE_AREA);
+        assert!(
+            scrolled.origin.y < at_rest.origin.y,
+            "the frame has to have really scrolled: {:?} then {:?}",
+            at_rest.origin,
+            scrolled.origin
+        );
+
+        let at = scrolled.center();
+        right_click(cx, at);
+        menu_is_at(cx, at);
+    }
+
+    #[gpui::test]
+    async fn the_menu_goes_away_when_the_reader_clicks_elsewhere(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        let page = painted(cx, PAGE_AREA);
+        right_click_the_page(cx);
+        assert!(cx.debug_bounds("MENU_ITEM-Select All").is_some());
+
+        // The menu opened in the middle of the page, so its top left corner is
+        // well clear of it.
+        cx.simulate_click(page.origin + point(px(8.), px(8.)), Modifiers::none());
+        draw(cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Select All").is_none(),
+            "a click away from the menu has to close it"
+        );
+        assert!(
+            frame.read_with(cx, |frame, cx| frame
+                .preview
+                .read(cx)
+                .context_menu
+                .is_none()),
+            "the closed menu has to be let go of, not just left unpainted"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_row_of_buttons_takes_the_page_back(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(
+            PageStandIn {
+                under: nothing_in_particular(),
+                behind_and_ahead: (true, true),
+                source: A_SOURCE.to_string(),
+            },
+            cx,
+        )
+        .await;
+
+        right_click_the_page(cx);
+        click(cx, "PAGE_MENU-page-menu-back");
+
+        assert_eq!(
+            frame.read_with(cx, |frame, cx| frame
+                .preview
+                .read(cx)
+                .asked_of_the_page
+                .borrow()
+                .clone()),
+            vec![PageRequest::GoBack]
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Select All").is_none(),
+            "a button in the row has to close the menu, as every other item does"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_page_with_nowhere_to_go_back_to_does_not_go_back(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        right_click_the_page(cx);
+        click(cx, "PAGE_MENU-page-menu-back");
+
+        assert!(
+            frame.read_with(cx, |frame, cx| frame
+                .preview
+                .read(cx)
+                .asked_of_the_page
+                .borrow()
+                .is_empty()),
+            "a page with nothing behind it must not be sent back"
+        );
+    }
+
+    #[gpui::test]
+    async fn choosing_select_all_asks_the_page_for_it(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        right_click_the_page(cx);
+        click(cx, "MENU_ITEM-Select All");
+
+        assert_eq!(
+            frame.read_with(cx, |frame, cx| frame
+                .preview
+                .read(cx)
+                .asked_of_the_page
+                .borrow()
+                .clone()),
+            vec![PageRequest::SelectAll]
+        );
+    }
+
+    #[gpui::test]
+    async fn copying_a_link_address_puts_it_on_the_clipboard(cx: &mut TestAppContext) {
+        let (_frame, cx) = a_page_frame(
+            a_page_showing(PageTarget {
+                link: Some(A_LINK.to_string()),
+                ..PageTarget::default()
+            }),
+            cx,
+        )
+        .await;
+
+        right_click_the_page(cx);
+        click(cx, "MENU_ITEM-Copy Link Address");
+
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(copied, Some(A_LINK.to_string()));
+    }
+
+    #[gpui::test]
+    async fn viewing_the_source_opens_it_in_an_editor_tab(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        right_click_the_page(cx);
+        click(cx, "MENU_ITEM-View Page Source");
+        cx.run_until_parked();
+
+        let opened = frame.read_with(cx, |frame, cx| {
+            frame
+                .workspace
+                .read(cx)
+                .active_pane()
+                .read(cx)
+                .items_of_type::<Editor>()
+                .next()
+        });
+        let opened = opened.expect("the page's source has to open in an editor tab");
+        assert_eq!(
+            opened.read_with(cx, |editor, cx| editor.text(cx)),
+            A_SOURCE.to_string()
+        );
+    }
+
+    #[gpui::test]
+    async fn saving_the_page_writes_its_html_where_the_reader_says(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+        let files = frame.read_with(cx, |frame, cx| {
+            frame.workspace.read(cx).project().read(cx).fs().clone()
+        });
+
+        right_click_the_page(cx);
+        click(cx, "MENU_ITEM-Save Page As…");
+
+        let somewhere = tempfile::tempdir().expect("a directory to save into");
+        let saved = somewhere.path().join("saved.html");
+        cx.simulate_new_path_selection({
+            let saved = saved.clone();
+            move |_| Some(saved)
+        });
+        cx.run_until_parked();
+
+        // Read back through the file system the editor was given, which is the
+        // one it wrote to: a real read would race a write the test scheduler
+        // does not drive.
+        let written = files
+            .load(&saved)
+            .await
+            .expect("the page has to reach the file the reader chose");
+        assert_eq!(
+            written, A_SOURCE,
+            "the page's own HTML has to reach the file the reader chose"
+        );
+    }
+
+    #[test]
+    fn what_the_page_answers_is_read_as_what_is_under_the_pointer() {
+        let target = PageTarget::parse(
+            "{\"link\":\"https://example.com/a\",\"image\":null,\"selection\":\"a giraffe\"}",
+        );
+        assert_eq!(
+            target,
+            PageTarget {
+                link: Some("https://example.com/a".to_string()),
+                image: None,
+                selection: Some("a giraffe".to_string()),
+            }
+        );
+
+        // A link with no address is not a link, and neither is a page that
+        // answered nothing at all.
+        assert_eq!(
+            PageTarget::parse("{\"link\":\"\",\"image\":\"  \",\"selection\":\"\"}"),
+            PageTarget::default()
+        );
+        assert_eq!(PageTarget::parse(""), PageTarget::default());
+    }
 }

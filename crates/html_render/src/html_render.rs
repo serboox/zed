@@ -748,6 +748,44 @@ mod engine {
             );
         }
 
+        /// Picks the whole page, as a drag from its first word to its last.
+        pub fn select_all(&self) {
+            self.evaluate(
+                "window.__zedSelection ? window.__zedSelection.selectAll() : 0, ''",
+                |_| {},
+            );
+        }
+
+        /// Asks the page what it has under a point: the address of the nearest
+        /// link, the address of the image, and what the reader has selected, as
+        /// JSON. The answer comes back on a later turn.
+        ///
+        /// One script rather than three, because each answer arrives on a turn
+        /// of the engine's own and three of them would arrive in any order --
+        /// and a menu built from parts of two different clicks is worse than no
+        /// menu at all. The nearest ancestor is asked for rather than the
+        /// element itself: the page's own words are wrapped in spans for
+        /// selection, so what is under the pointer inside a link is a span.
+        pub fn what_is_under(&self, point: Point<Pixels>, deliver: impl FnOnce(String) + 'static) {
+            let (x, y) = self.css_point(point);
+            self.evaluate(
+                &format!(
+                    "(function(){{\
+                       var at = document.elementFromPoint({x}, {y});\
+                       var link = at && at.closest ? at.closest('a[href]') : null;\
+                       var image = at && at.closest ? at.closest('img[src]') : null;\
+                       var picked = window.__zedSelection ? window.__zedSelection.text() : '';\
+                       return JSON.stringify({{\
+                         link: link ? link.href : null,\
+                         image: image ? (image.currentSrc || image.src) : null,\
+                         selection: picked ? picked.slice(0, 500) : null\
+                       }});\
+                     }})()"
+                ),
+                deliver,
+            );
+        }
+
         /// Tells the page whether the editor is dark or light, so a page that
         /// asks -- through `prefers-color-scheme` -- is answered the same way
         /// the rest of the window is dressed.
@@ -797,6 +835,21 @@ mod engine {
             (
                 ratio(self.size.width, self.viewport.width),
                 ratio(self.size.height, self.viewport.height),
+            )
+        }
+
+        /// Where a position in editor pixels lands in the page's own CSS
+        /// pixels, which is what a script asking about a point is answered in.
+        ///
+        /// Normally the same number, since the page is laid out at the scale the
+        /// surface is drawn at. The two part company where the surface hit its
+        /// ceiling: then the picture is stretched over the view and the page is
+        /// smaller than it looks.
+        fn css_point(&self, point: Point<Pixels>) -> (f32, f32) {
+            let (horizontal, vertical) = self.painted_scale();
+            (
+                f32::from(point.x).max(0.) * horizontal / self.scale,
+                f32::from(point.y).max(0.) * vertical / self.scale,
             )
         }
 
