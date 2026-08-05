@@ -5,7 +5,7 @@ pub use fs_watcher::requires_poll_watcher;
 use parking_lot::Mutex;
 use slotmap::{KeyData, SlotMap};
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use util::maybe;
 
@@ -92,6 +92,134 @@ impl From<PathEvent> for PathBuf {
     fn from(event: PathEvent) -> Self {
         event.path
     }
+}
+
+/// Reads shorter than this are left untracked. A few megabytes are off the disk
+/// well inside the delay the pane waits before it puts up a stand-in tab, so a
+/// counter for them would never be drawn even once.
+pub const MIN_TRACKED_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How far a single file read has got, shared between the task doing the
+/// reading and whoever is drawing the wait.
+///
+/// The reader runs on a background task that holds no `App`, so this cannot be
+/// a gpui global or an entity event; it is plain shared state, and the drawing
+/// side polls it.
+///
+/// It lives in `fs` rather than in `worktree`, which is where the reading
+/// happens, because `workspace` draws the wait and depends on `fs` but not on
+/// `worktree`.
+#[derive(Debug)]
+pub struct FileReadProgress {
+    total_bytes: u64,
+    bytes_read: AtomicU64,
+    finished: AtomicBool,
+}
+
+impl FileReadProgress {
+    /// The size the file had when the read began.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Whether the last byte is in. The work that turns those bytes into an
+    /// editor carries on afterwards, so this is what tells the two apart.
+    ///
+    /// Acquire, against the release in [`Self::mark_finished`]. That pairing is
+    /// what makes "finished, so the count beside it is the final one" true:
+    /// the per-chunk store is relaxed and on its own promises no such thing.
+    /// Read this before [`Self::bytes_read`], not after, or the edge is lost.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Called once per chunk. Relaxed on purpose: this is the hot path, and
+    /// [`Self::mark_finished`] is what publishes the final count.
+    pub fn set_bytes_read(&self, bytes_read: u64) {
+        self.bytes_read.store(bytes_read, Ordering::Relaxed);
+    }
+
+    pub fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+}
+
+/// Nothing stops the same file being read twice at once, and the two reads are
+/// separate counts, so a path holds every read that is live rather than only
+/// the newest.
+static FILE_READS_IN_FLIGHT: std::sync::LazyLock<
+    Mutex<collections::HashMap<PathBuf, Vec<Arc<FileReadProgress>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Keeps a read in [`file_read_progress`] for as long as it is held. Dropping
+/// it takes the read back out, so an error partway through cannot leave the
+/// editor claiming a read that is no longer running.
+pub struct FileReadProgressGuard {
+    path: PathBuf,
+    progress: Arc<FileReadProgress>,
+}
+
+impl std::ops::Deref for FileReadProgressGuard {
+    type Target = FileReadProgress;
+
+    fn deref(&self) -> &FileReadProgress {
+        &self.progress
+    }
+}
+
+impl Drop for FileReadProgressGuard {
+    fn drop(&mut self) {
+        let mut reads = FILE_READS_IN_FLIGHT.lock();
+        let Some(reads_of_path) = reads.get_mut(&self.path) else {
+            return;
+        };
+
+        // By identity, so that ending this read never takes down another read
+        // of the same file that is still going.
+        reads_of_path.retain(|progress| !Arc::ptr_eq(progress, &self.progress));
+        if reads_of_path.is_empty() {
+            reads.remove(&self.path);
+        }
+    }
+}
+
+/// Announces a file read so that a tab waiting on it can say how far it has
+/// got. Reads too small to be worth drawing are not announced at all.
+pub fn track_file_read(path: &Path, total_bytes: u64) -> Option<FileReadProgressGuard> {
+    if total_bytes < MIN_TRACKED_READ_BYTES {
+        return None;
+    }
+
+    let path = path.to_path_buf();
+    let progress = Arc::new(FileReadProgress {
+        total_bytes,
+        bytes_read: AtomicU64::new(0),
+        finished: AtomicBool::new(false),
+    });
+    FILE_READS_IN_FLIGHT
+        .lock()
+        .entry(path.clone())
+        .or_default()
+        .push(progress.clone());
+
+    Some(FileReadProgressGuard { path, progress })
+}
+
+/// How far the read of this file has got, if one is running. When the same file
+/// is being read more than once, the one still bringing bytes in is the one
+/// worth drawing; if they have all delivered, the newest is the freshest answer.
+pub fn file_read_progress(path: &Path) -> Option<Arc<FileReadProgress>> {
+    let reads = FILE_READS_IN_FLIGHT.lock();
+    let reads_of_path = reads.get(path)?;
+    reads_of_path
+        .iter()
+        .find(|progress| !progress.is_finished())
+        .or_else(|| reads_of_path.last())
+        .cloned()
 }
 
 #[async_trait::async_trait]

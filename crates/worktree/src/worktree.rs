@@ -8,8 +8,8 @@ use clock::ReplicaId;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use encoding_rs::Encoding;
 use fs::{
-    Fs, MTime, PathEvent, PathEventKind, RemoveOptions, TrashId, Watcher, copy_recursive,
-    read_dir_items,
+    FileReadProgress, Fs, MTime, PathEvent, PathEventKind, RemoveOptions, TrashId, Watcher,
+    copy_recursive, read_dir_items, track_file_read,
 };
 use futures::{
     FutureExt as _, Stream, StreamExt,
@@ -1668,7 +1668,15 @@ impl LocalWorktree {
             {
                 anyhow::bail!("File is too large to load");
             }
-            let (text, encoding, has_bom) = decode_file_text(fs.as_ref(), &abs_path).await?;
+            // Held across the read only, so that a tab waiting on this file can
+            // say how far it has got. Dropping it, including on the `?` below,
+            // takes the read back out of the registry.
+            let read_progress = track_file_read(
+                &abs_path,
+                metadata.as_ref().map_or(0, |metadata| metadata.len),
+            );
+            let (text, encoding, has_bom) =
+                decode_file_text(fs.as_ref(), &abs_path, read_progress.as_deref()).await?;
             let is_writable = metadata.is_some_and(|metadata| metadata.is_writable);
 
             let worktree = this.upgrade().context("worktree was dropped")?;
@@ -7069,6 +7077,7 @@ impl fs::Watcher for NullWatcher {
 async fn decode_file_text(
     fs: &dyn Fs,
     abs_path: &Path,
+    progress: Option<&FileReadProgress>,
 ) -> Result<(String, &'static Encoding, bool)> {
     let mut file = fs
         .open_sync(&abs_path)
@@ -7092,6 +7101,9 @@ async fn decode_file_text(
             break;
         }
         file_first_bytes.extend_from_slice(&buf[..n]);
+        if let Some(progress) = progress {
+            progress.set_bytes_read(file_first_bytes.len() as u64);
+        }
     }
     let (bom_encoding, byte_content) = decode_byte_header(&file_first_bytes);
     anyhow::ensure!(
@@ -7111,9 +7123,28 @@ async fn decode_file_text(
                 break;
             }
             content.extend_from_slice(&buf[..n]);
+            if let Some(progress) = progress {
+                progress.set_bytes_read(content.len() as u64);
+            }
         }
     }
+    if let Some(progress) = progress {
+        progress.mark_finished();
+    }
     decode_byte_full(content, bom_encoding, byte_content)
+}
+
+/// Runs a real file read against a progress entry the caller owns, which is the
+/// only seam a test has on the byte accounting above: this crate's lib is built
+/// with `test = false`, and every other route into the read hands the entry back
+/// to the registry before a test can look at it.
+#[cfg(feature = "test-support")]
+pub async fn decode_file_text_for_tests(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    progress: Option<&FileReadProgress>,
+) -> Result<(String, &'static Encoding, bool)> {
+    decode_file_text(fs, abs_path, progress).await
 }
 
 fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteContent) {

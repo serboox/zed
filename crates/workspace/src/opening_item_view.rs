@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fs::FileReadProgress;
 use gpui::{EventEmitter, FocusHandle, Focusable, Task};
 use project::ProjectPath;
 use ui::prelude::*;
@@ -17,10 +20,69 @@ const SWEEP_PERIOD: Duration = Duration::from_millis(1400);
 /// The share of the track the sweeping segment covers.
 const SWEEP_WIDTH: f32 = 0.3;
 
+/// Which part of the wait the reader is sitting in. Taken once per frame, so
+/// the words, the bar and the byte count cannot disagree about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningStep {
+    /// Bytes are still coming off the disk.
+    Reading { bytes_read: u64, total_bytes: u64 },
+    /// Every byte is in, and the work that turns them into an editor is not
+    /// finished. Also what is said when nothing reports the read at all.
+    PreparingEditor,
+}
+
+impl OpeningStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reading { .. } => "Reading…",
+            Self::PreparingEditor => "Preparing the editor…",
+        }
+    }
+
+    /// What the card says about size, beside the elapsed time.
+    pub fn size_line(self, file_bytes: Option<u64>) -> Option<String> {
+        match self {
+            Self::Reading {
+                bytes_read,
+                total_bytes,
+            } => Some(format!(
+                "{} of {}",
+                format_file_size(bytes_read, false),
+                format_file_size(total_bytes, false)
+            )),
+            Self::PreparingEditor => file_bytes.map(|bytes| format_file_size(bytes, false)),
+        }
+    }
+
+    /// How much of the track is filled in. A wait that reports no size gets
+    /// nothing here, and is drawn with the sweeping segment instead.
+    pub fn fraction_read(self) -> Option<f32> {
+        match self {
+            Self::Reading {
+                bytes_read,
+                total_bytes,
+            } if total_bytes > 0 => {
+                Some((bytes_read as f64 / total_bytes as f64).clamp(0.0, 1.0) as f32)
+            }
+            _ => None,
+        }
+    }
+
+    fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Reading { .. } => "opening-item-step-reading",
+            Self::PreparingEditor => "opening-item-step-preparing",
+        }
+    }
+}
+
 /// Holds the tab of a file that is still being read, so clicking a big file
 /// never looks like the editor ignored the click.
 pub struct OpeningItemView {
     path: ProjectPath,
+    /// Where the file sits on disk, which is the key the reader publishes its
+    /// byte count under.
+    abs_path: Option<PathBuf>,
     /// The file's size on disk, when the worktree has already scanned it.
     total_bytes: Option<u64>,
     started_at: Instant,
@@ -29,7 +91,12 @@ pub struct OpeningItemView {
 }
 
 impl OpeningItemView {
-    pub fn new(path: ProjectPath, total_bytes: Option<u64>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: ProjectPath,
+        abs_path: Option<PathBuf>,
+        total_bytes: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let started_at = cx.background_executor().now();
         let redraw = cx.spawn(async move |this, cx| {
             loop {
@@ -42,10 +109,31 @@ impl OpeningItemView {
 
         Self {
             path,
+            abs_path,
             total_bytes,
             started_at,
             focus_handle: cx.focus_handle(),
             _redraw: redraw,
+        }
+    }
+
+    /// The read of this file, while it is still bringing bytes in. A read that
+    /// has delivered its last byte is left out: what is waited on after that is
+    /// the editor being built, which is a different thing to say.
+    fn read_in_flight(&self) -> Option<Arc<FileReadProgress>> {
+        self.abs_path
+            .as_deref()
+            .and_then(fs::file_read_progress)
+            .filter(|read| !read.is_finished())
+    }
+
+    pub fn step(&self) -> OpeningStep {
+        match self.read_in_flight() {
+            Some(read) => OpeningStep::Reading {
+                bytes_read: read.bytes_read(),
+                total_bytes: read.total_bytes(),
+            },
+            None => OpeningStep::PreparingEditor,
         }
     }
 
@@ -70,10 +158,31 @@ impl OpeningItemView {
             .saturating_duration_since(self.started_at)
     }
 
-    /// The track and its sweeping segment. Nothing between
-    /// `Workspace::load_path` and the `Fs` trait reports how many bytes it has
-    /// read, so the segment sweeps rather than claiming a percentage.
-    fn progress_track(&self, elapsed: Duration, cx: &App) -> Div {
+    fn track(cx: &App) -> Div {
+        h_flex()
+            .w_full()
+            .h(px(4.))
+            .rounded_full()
+            .overflow_hidden()
+            .bg(cx.theme().colors().element_background)
+    }
+
+    /// The track filled to how much of the file is in.
+    fn filled_track(fraction_read: f32, cx: &App) -> Div {
+        Self::track(cx).child(
+            div()
+                .flex_none()
+                .w(relative(fraction_read))
+                .h_full()
+                .rounded_full()
+                .bg(cx.theme().colors().text_accent)
+                .debug_selector(|| "opening-item-progress-fill".into()),
+        )
+    }
+
+    /// The track and its sweeping segment, for a wait whose length nothing
+    /// reports. The segment sweeps rather than claiming a percentage.
+    fn sweeping_track(elapsed: Duration, cx: &App) -> Div {
         let phase = (elapsed.as_secs_f32() / SWEEP_PERIOD.as_secs_f32()).fract() * 2.0;
         let travel = 1.0 - SWEEP_WIDTH;
         let offset = if phase <= 1.0 {
@@ -82,12 +191,7 @@ impl OpeningItemView {
             (2.0 - phase) * travel
         };
 
-        h_flex()
-            .w_full()
-            .h(px(4.))
-            .rounded_full()
-            .overflow_hidden()
-            .bg(cx.theme().colors().element_background)
+        Self::track(cx)
             .child(div().flex_none().w(relative(offset)))
             .child(
                 div()
@@ -131,6 +235,14 @@ impl Focusable for OpeningItemView {
 impl Render for OpeningItemView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let elapsed = self.elapsed(cx);
+        let step = self.step();
+        let step_selector = step.debug_selector();
+        let size_line = step.size_line(self.total_bytes);
+        let track = match step.fraction_read() {
+            Some(fraction_read) => Self::filled_track(fraction_read, cx),
+            None => Self::sweeping_track(elapsed, cx),
+        };
+
         let colors = cx.theme().colors();
         let card_border = colors.border;
         let card_background = colors.elevated_surface_background;
@@ -158,9 +270,16 @@ impl Render for OpeningItemView {
                         .bg(card_background)
                         .child(Label::new(self.file_name()))
                         .child(
-                            self.progress_track(elapsed, cx)
-                                .debug_selector(|| "opening-item-progress".into()),
+                            h_flex()
+                                .w_full()
+                                .debug_selector(move || step_selector.into())
+                                .child(
+                                    Label::new(step.label())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
                         )
+                        .child(track.debug_selector(|| "opening-item-progress".into()))
                         .child(
                             h_flex()
                                 .justify_between()
@@ -169,11 +288,15 @@ impl Render for OpeningItemView {
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
-                                .when_some(self.total_bytes, |row, total_bytes| {
+                                .when_some(size_line, |row, size_line| {
                                     row.child(
-                                        Label::new(format_file_size(total_bytes, false))
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                        h_flex()
+                                            .debug_selector(|| "opening-item-size".into())
+                                            .child(
+                                                Label::new(size_line)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
                                     )
                                 }),
                         ),

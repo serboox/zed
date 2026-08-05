@@ -4916,6 +4916,9 @@ impl Workspace {
             .entry_for_path(&project_path, cx)
             .filter(|entry| entry.is_file())
             .map(|entry| entry.size);
+        // Resolved here, where the project is at hand, because it is the key
+        // the read publishes its byte count under.
+        let abs_path = self.project.read(cx).absolute_path(&project_path, cx);
         let task = self.load_path(project_path.clone(), window, cx);
         window.spawn(cx, async move |cx| {
             let load = Box::pin(task);
@@ -4928,7 +4931,12 @@ impl Workspace {
                     placeholder = pane
                         .update_in(cx, |pane, window, cx| {
                             let view = cx.new(|cx| {
-                                OpeningItemView::new(project_path.clone(), total_bytes, cx)
+                                OpeningItemView::new(
+                                    project_path.clone(),
+                                    abs_path.clone(),
+                                    total_bytes,
+                                    cx,
+                                )
                             });
                             let opened = pane.open_item(
                                 None,
@@ -16963,7 +16971,7 @@ mod tests {
 
     mod opening_tab_tests {
         use super::*;
-        use crate::opening_item_view::OpeningItemView;
+        use crate::opening_item_view::{OpeningItemView, OpeningStep};
 
         /// How long a `.slow` file takes to open, far longer than the delay
         /// before the pane is given a stand-in tab.
@@ -17097,6 +17105,11 @@ mod tests {
                 path!("/root"),
                 json!({
                     "big.slow": BIG_FILE_CONTENTS,
+                    // The read registry is keyed by path and shared by the
+                    // whole test binary, so tests that publish a read into it
+                    // each need a file nobody else is reading.
+                    "reading.slow": BIG_FILE_CONTENTS,
+                    "steps.slow": BIG_FILE_CONTENTS,
                     "small.fast": "small",
                 }),
             )
@@ -17372,6 +17385,190 @@ mod tests {
                 0,
                 "no stand-in may be left behind"
             );
+        }
+
+        /// Big enough to be worth drawing, and round enough that quarters of it
+        /// come out exact.
+        const TRACKED_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+        fn abs_path_of(
+            workspace: &Entity<Workspace>,
+            project_path: &ProjectPath,
+            cx: &mut VisualTestContext,
+        ) -> PathBuf {
+            workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).absolute_path(project_path, cx)
+                })
+                .expect("the file has to have a place on disk")
+        }
+
+        #[track_caller]
+        fn assert_bar_filled_to(cx: &mut VisualTestContext, expected: f32) {
+            let track = cx
+                .debug_bounds("opening-item-progress")
+                .expect("the progress bar has to paint inside the stand-in");
+            let fill = cx.debug_bounds("opening-item-progress-fill").expect(
+                "a read that reports its size has to paint a filled bar, not a sweeping one",
+            );
+            assert!(
+                track.size.width > px(0.) && fill.size.height > px(0.),
+                "the bar painted an empty box: track {:?}, fill {:?}",
+                track.size,
+                fill.size
+            );
+
+            let filled = f32::from(fill.size.width) / f32::from(track.size.width);
+            assert!(
+                (filled - expected).abs() < 0.01,
+                "the bar has to be filled to {expected} of its track, but it was filled to {filled}"
+            );
+        }
+
+        #[gpui::test]
+        async fn test_the_stand_in_shows_how_much_of_the_file_is_in(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+            let project_path: ProjectPath = (worktree_id, rel_path("reading.slow")).into();
+            let abs_path = abs_path_of(&workspace, &project_path, cx);
+
+            let read = fs::track_file_read(&abs_path, TRACKED_TOTAL_BYTES)
+                .expect("a read this big has to be tracked");
+            read.set_bytes_read(TRACKED_TOTAL_BYTES / 4);
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path(project_path.clone(), None, true, window, cx)
+            });
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 2);
+            cx.run_until_parked();
+            draw(cx);
+
+            let stand_in = pane
+                .read_with(cx, |pane, _| pane.items_of_type::<OpeningItemView>().next())
+                .expect("the tab has to be held by a stand-in");
+            assert_eq!(
+                stand_in.read_with(cx, |stand_in, _| stand_in.step()),
+                OpeningStep::Reading {
+                    bytes_read: TRACKED_TOTAL_BYTES / 4,
+                    total_bytes: TRACKED_TOTAL_BYTES,
+                },
+                "the stand-in has to pick up the byte count the reader publishes"
+            );
+            assert_eq!(
+                stand_in.read_with(cx, |stand_in, _| stand_in
+                    .step()
+                    .size_line(stand_in.total_bytes())),
+                Some("16.0MiB of 64.0MiB".to_string()),
+                "the card has to say how much of the file is in, not only how big it is"
+            );
+            assert!(
+                cx.debug_bounds("opening-item-size")
+                    .is_some_and(|size| size.size.width > px(0.) && size.size.height > px(0.)),
+                "the byte count has to be painted, not merely worked out"
+            );
+            assert_bar_filled_to(cx, 0.25);
+
+            read.set_bytes_read(TRACKED_TOTAL_BYTES * 3 / 4);
+            draw(cx);
+            assert_eq!(
+                stand_in.read_with(cx, |stand_in, _| stand_in
+                    .step()
+                    .size_line(stand_in.total_bytes())),
+                Some("48.0MiB of 64.0MiB".to_string()),
+                "the count has to follow the read rather than stay where it started"
+            );
+            assert_bar_filled_to(cx, 0.75);
+
+            drop(read);
+            cx.executor().advance_clock(SLOW_LOAD * 2);
+            open.await.expect("the file has to open in the end");
+        }
+
+        #[gpui::test]
+        async fn test_the_stand_in_says_which_step_the_wait_is_in(cx: &mut TestAppContext) {
+            let (workspace, worktree_id, cx) = set_up(cx).await;
+            let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+            let project_path: ProjectPath = (worktree_id, rel_path("steps.slow")).into();
+            let abs_path = abs_path_of(&workspace, &project_path, cx);
+
+            let read = fs::track_file_read(&abs_path, TRACKED_TOTAL_BYTES)
+                .expect("a read this big has to be tracked");
+            read.set_bytes_read(TRACKED_TOTAL_BYTES / 2);
+
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path(project_path.clone(), None, true, window, cx)
+            });
+            cx.executor().advance_clock(OPENING_TAB_DELAY * 2);
+            cx.run_until_parked();
+            draw(cx);
+
+            assert!(
+                cx.debug_bounds("opening-item-step-reading")
+                    .is_some_and(|step| step.size.width > px(0.) && step.size.height > px(0.)),
+                "while bytes are still coming in the card has to say it is reading"
+            );
+            assert!(
+                cx.debug_bounds("opening-item-step-preparing").is_none(),
+                "the card must not send the reader looking at the wrong step"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, cx| pane
+                    .items_of_type::<OpeningItemView>()
+                    .next()
+                    .map(|stand_in| stand_in.read(cx).step().label())),
+                Some("Reading…")
+            );
+
+            // The last byte is in, and the file still has not reached the pane.
+            read.mark_finished();
+            draw(cx);
+            assert!(
+                cx.debug_bounds("opening-item-step-preparing")
+                    .is_some_and(|step| step.size.width > px(0.) && step.size.height > px(0.)),
+                "once the read is over the card has to name the step that is still running"
+            );
+            assert!(
+                cx.debug_bounds("opening-item-step-reading").is_none(),
+                "the card must not still claim to be reading after the last byte is in"
+            );
+            assert!(
+                cx.debug_bounds("opening-item-progress-fill").is_none(),
+                "a wait that nothing measures must not be drawn as a measured one"
+            );
+            assert!(
+                cx.debug_bounds("opening-item-progress")
+                    .is_some_and(|bar| bar.size.width > px(0.)),
+                "the sweeping bar has to take the measured one's place"
+            );
+
+            // And the same once the read has left the registry altogether,
+            // which is what the reader actually sees: the guard is dropped as
+            // soon as the reading task returns.
+            drop(read);
+            draw(cx);
+            assert_eq!(
+                pane.read_with(cx, |pane, cx| pane
+                    .items_of_type::<OpeningItemView>()
+                    .next()
+                    .map(|stand_in| stand_in.read(cx).step())),
+                Some(OpeningStep::PreparingEditor),
+                "a read the registry no longer knows about is a read that is over"
+            );
+            assert_eq!(
+                pane.read_with(cx, |pane, cx| pane
+                    .items_of_type::<OpeningItemView>()
+                    .next()
+                    .map(|stand_in| stand_in.read(cx).step().label())),
+                Some("Preparing the editor…")
+            );
+            assert!(
+                cx.debug_bounds("opening-item-step-preparing").is_some(),
+                "a read that has left the registry still has an editor being prepared behind it"
+            );
+            assert!(cx.debug_bounds("opening-item-step-reading").is_none());
+
+            cx.executor().advance_clock(SLOW_LOAD * 2);
+            open.await.expect("the file has to open in the end");
         }
     }
 

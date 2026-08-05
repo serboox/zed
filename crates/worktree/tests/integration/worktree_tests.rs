@@ -2,7 +2,9 @@ mod worktree_settings_tests;
 
 use anyhow::Result;
 use encoding_rs;
-use fs::{FakeFs, Fs, PathEventKind, RealFs, RemoveOptions};
+use fs::{
+    FakeFs, Fs, MIN_TRACKED_READ_BYTES, PathEventKind, RealFs, RemoveOptions, track_file_read,
+};
 use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
 use gpui::{AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Task, TestAppContext};
 use parking_lot::Mutex;
@@ -5838,4 +5840,42 @@ async fn test_deferred_watch_symlinks_pointing_outside(cx: &mut TestAppContext) 
         })
     })
     .await;
+}
+
+#[gpui::test]
+async fn test_reading_a_file_publishes_how_many_bytes_are_in(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    // Over the size at which a read is worth tracking, so the read under test
+    // can be handed a registry entry rather than an invented one, and well over
+    // the sniffing prefix, so both of the read's loops run.
+    let contents = "abcdefgh".repeat(MIN_TRACKED_READ_BYTES as usize / 8 + 1);
+    let expected_bytes = contents.len() as u64;
+    assert!(expected_bytes > MIN_TRACKED_READ_BYTES);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "big.txt": contents }))
+        .await;
+
+    let abs_path = Path::new(path!("/root/big.txt"));
+    let read = track_file_read(abs_path, expected_bytes)
+        .expect("a file this big has to be worth tracking");
+    assert_eq!(read.bytes_read(), 0);
+    assert!(!read.is_finished());
+
+    let (text, _, _) = worktree::decode_file_text_for_tests(fs.as_ref(), abs_path, Some(&read))
+        .await
+        .expect("the file has to decode");
+
+    assert_eq!(text.len() as u64, expected_bytes);
+    assert_eq!(
+        read.bytes_read(),
+        expected_bytes,
+        "the read has to publish every byte it took off the disk"
+    );
+    assert!(
+        read.is_finished(),
+        "a read that has handed over its last byte has to say so, \
+         or the tab goes on claiming the file is still being read"
+    );
 }

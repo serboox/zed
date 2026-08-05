@@ -1120,3 +1120,175 @@ async fn test_realfs_watch_stress_reports_missed_paths(
         missed_paths.len()
     );
 }
+
+/// The registry is process-wide, so every test below reads and writes under a
+/// path of its own.
+#[test]
+fn test_a_running_read_is_visible_by_path() {
+    let path = Path::new(path!("/read-registry/running.bin"));
+    let total_bytes = MIN_TRACKED_READ_BYTES * 2;
+
+    assert!(
+        file_read_progress(path).is_none(),
+        "a file nobody is reading must not be in the registry"
+    );
+
+    let read = track_file_read(path, total_bytes).expect("a read this big has to be tracked");
+    let published = file_read_progress(path).expect("a running read has to be findable by path");
+
+    assert_eq!(published.total_bytes(), total_bytes);
+    assert_eq!(published.bytes_read(), 0);
+    assert!(!published.is_finished());
+
+    read.set_bytes_read(total_bytes / 4);
+    assert_eq!(
+        published.bytes_read(),
+        total_bytes / 4,
+        "what the reader publishes has to be what a lookup sees"
+    );
+
+    read.set_bytes_read(total_bytes / 2);
+    assert_eq!(
+        published.bytes_read(),
+        total_bytes / 2,
+        "the count has to keep moving as more of the file comes in"
+    );
+
+    read.set_bytes_read(total_bytes);
+    read.mark_finished();
+    assert!(
+        published.is_finished(),
+        "the reader has to be able to say the last byte is in"
+    );
+
+    drop(read);
+    assert!(
+        file_read_progress(path).is_none(),
+        "a read that has ended must not be left in the registry"
+    );
+}
+
+#[test]
+fn test_a_read_that_fails_partway_leaves_nothing_behind() {
+    let path = Path::new(path!("/read-registry/failing.bin"));
+    let total_bytes = MIN_TRACKED_READ_BYTES * 2;
+
+    fn read_and_fail(path: &Path, total_bytes: u64) -> anyhow::Result<()> {
+        let read = track_file_read(path, total_bytes);
+        if let Some(read) = read.as_deref() {
+            read.set_bytes_read(total_bytes / 2);
+        }
+
+        let next_chunk: anyhow::Result<u64> = Err(anyhow::anyhow!("the disk gave up halfway"));
+        // Stands in for the `?` on a chunk read: it walks out while the read is
+        // still registered.
+        let read_so_far = next_chunk?;
+        if let Some(read) = read.as_deref() {
+            read.set_bytes_read(read_so_far);
+        }
+        Ok(())
+    }
+
+    let error = read_and_fail(path, total_bytes).expect_err("the read has to fail");
+    assert!(error.to_string().contains("gave up halfway"));
+    assert!(
+        file_read_progress(path).is_none(),
+        "a read abandoned partway must not leave the editor waiting on a phantom"
+    );
+}
+
+#[test]
+fn test_reads_too_small_to_draw_are_not_tracked() {
+    let path = Path::new(path!("/read-registry/small.bin"));
+
+    assert!(
+        track_file_read(path, MIN_TRACKED_READ_BYTES - 1).is_none(),
+        "a read that is over before anything could be drawn must not be tracked"
+    );
+    assert!(file_read_progress(path).is_none());
+
+    let read = track_file_read(path, MIN_TRACKED_READ_BYTES)
+        .expect("a read at the threshold has to be tracked");
+    assert!(file_read_progress(path).is_some());
+    drop(read);
+}
+
+#[test]
+fn test_a_read_survives_a_later_read_of_the_same_file_ending_first() {
+    let path = Path::new(path!("/read-registry/overlapping.bin"));
+    let total_bytes = MIN_TRACKED_READ_BYTES * 2;
+
+    let first = track_file_read(path, total_bytes).expect("the first read has to be tracked");
+    let second = track_file_read(path, total_bytes * 3).expect("the second read has to be tracked");
+    first.set_bytes_read(total_bytes / 2);
+
+    // The later read finishes first. Holding one registration per path, this
+    // is the order that carries the older read out of the registry with it and
+    // leaves the tab saying the file is no longer being read.
+    drop(second);
+
+    let published =
+        file_read_progress(path).expect("the read that is still going has to stay findable");
+    assert_eq!(
+        published.total_bytes(),
+        total_bytes,
+        "the read still bringing bytes in is the one to answer with"
+    );
+    assert_eq!(published.bytes_read(), total_bytes / 2);
+
+    drop(first);
+    assert!(file_read_progress(path).is_none());
+}
+
+#[test]
+fn test_the_lookup_answers_with_the_read_that_is_still_going() {
+    let path = Path::new(path!("/read-registry/two-at-once.bin"));
+    let delivered_bytes = MIN_TRACKED_READ_BYTES * 2;
+    let running_bytes = MIN_TRACKED_READ_BYTES * 5;
+
+    let delivered = track_file_read(path, delivered_bytes).expect("a read this big is tracked");
+    let running = track_file_read(path, running_bytes).expect("a read this big is tracked");
+
+    delivered.set_bytes_read(delivered_bytes);
+    delivered.mark_finished();
+    running.set_bytes_read(MIN_TRACKED_READ_BYTES);
+
+    let published = file_read_progress(path).expect("a running read has to be findable");
+    assert_eq!(
+        published.total_bytes(),
+        running_bytes,
+        "a read that has delivered everything must not stand in for one that has not"
+    );
+    assert_eq!(published.bytes_read(), MIN_TRACKED_READ_BYTES);
+
+    drop(running);
+    assert_eq!(
+        file_read_progress(path).map(|published| published.total_bytes()),
+        Some(delivered_bytes),
+        "with nothing left running, the read that is still registered is the answer"
+    );
+
+    drop(delivered);
+    assert!(file_read_progress(path).is_none());
+}
+
+#[test]
+fn test_a_second_read_of_the_same_file_keeps_its_own_entry() {
+    let path = Path::new(path!("/read-registry/twice.bin"));
+    let total_bytes = MIN_TRACKED_READ_BYTES * 2;
+
+    let first = track_file_read(path, total_bytes).expect("the first read has to be tracked");
+    let second = track_file_read(path, total_bytes * 3).expect("the second read has to be tracked");
+
+    drop(first);
+    let published = file_read_progress(path)
+        .expect("the read that is still running has to stay in the registry");
+    assert_eq!(
+        published.total_bytes(),
+        total_bytes * 3,
+        "the older read ending must not carry off the newer read's entry"
+    );
+
+    drop(second);
+    assert!(file_read_progress(path).is_none());
+}
