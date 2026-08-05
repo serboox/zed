@@ -151,15 +151,15 @@ jobs:
           sudo dpkg -r zed-fork
 
       - name: Test the HTML engine
-        if: steps.engine.outcome == 'success'
+        if: needs.plan.outputs.engine != ''
         run: |
           set -o pipefail
           xvfb-run -a cargo test --profile release-fast --package html_render \
             --features servo -- --nocapture 2>&1 | tee engine-test.log
 
       - name: Say whether the engine ran here
-        if: always() && steps.engine.outcome == 'success'
-        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+        if: always() && needs.plan.outputs.engine != ''
+        run: grep -m1 'HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
 
   windows:
     needs: plan
@@ -227,15 +227,15 @@ jobs:
           if-no-files-found: error
 
       - name: Test the HTML engine
-        if: steps.engine.outcome == 'success'
+        if: needs.plan.outputs.engine != ''
         run: |
           cargo test --profile release-fast --package html_render --features servo -- --nocapture 2>&1 |
             Tee-Object -FilePath engine-test.log
 
       - name: Say whether the engine ran here
-        if: always() && steps.engine.outcome == 'success'
+        if: always() && needs.plan.outputs.engine != ''
         run: |
-          $line = Select-String -Path engine-test.log -Pattern '^HTML_ENGINE:' | Select-Object -First 1
+          $line = Select-String -Path engine-test.log -Pattern 'HTML_ENGINE:' | Select-Object -First 1
           if ($line) { Add-Content $env:GITHUB_STEP_SUMMARY $line.Line }
 
   macos:
@@ -345,7 +345,7 @@ jobs:
         run: grep -m1 '^RENDERER:' renderer-test.log >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Test the HTML engine
-        if: steps.engine.outcome == 'success'
+        if: needs.plan.outputs.engine != ''
         run: |
           set -o pipefail
           # Cargo points a test binary's fallback library path at its own target
