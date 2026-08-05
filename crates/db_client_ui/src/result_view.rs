@@ -6,10 +6,10 @@ use db_client::{
 use editor::{CompletionContext, CompletionProvider, Editor, EditorEvent, MinimapVisibility};
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    actions, uniform_list,
+    Focusable, FontWeight, IntoElement, KeyDownEvent, ListSizingBehavior, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Subscription, Task, TextStyleRefinement, UniformListScrollHandle,
+    WeakEntity, Window, actions, uniform_list,
 };
 use language::language_settings::SoftWrap;
 use language::{Buffer, CodeLabel, ToOffset};
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ui::{
-    Button, ButtonCommon, ButtonStyle, Checkbox, Color, CommonAnimationExt, ContextMenu,
+    Button, ButtonCommon, ButtonStyle, Checkbox, Chip, Color, CommonAnimationExt, ContextMenu,
     CopyButton, Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu,
     ScrollableHandle, Tooltip, prelude::*, right_click_menu,
 };
@@ -184,6 +184,167 @@ const ROW_GUTTER_WIDTH: f32 = 48.0;
 // "Query execution failed".
 pub(crate) fn format_query_error(err: &anyhow::Error) -> String {
     format!("{err:?}")
+}
+
+/// The pieces of a failed query the results panel presents separately: the one
+/// sentence the database itself said, the machine identifiers that belong
+/// beside it, and the verbatim driver output kept as secondary detail.
+struct QueryErrorParts {
+    /// The deepest cause in the chain with every framing layer peeled off.
+    headline: String,
+    /// The driver's own numeric code, e.g. MySQL's 1146.
+    vendor_code: Option<String>,
+    /// The five-character standard error class, e.g. 42S02.
+    sqlstate: Option<String>,
+    /// The unmodified text, present only when it says more than `headline`
+    /// already does, so the panel never shows the same sentence twice.
+    detail: Option<String>,
+}
+
+const SQLSTATE_LEN: usize = 5;
+
+/// The failure sentence is bounded so a pathological multi-kilobyte message
+/// cannot push the driver detail off the panel; the rest scrolls in place.
+const ERROR_MESSAGE_MAX_LINES: usize = 8;
+
+// sqlx wraps the database's own words in its own framing before anyhow adds the
+// "Query execution failed" context on top. Neither layer tells a reader
+// anything the message below it does not.
+const DRIVER_NOISE_PREFIXES: [&str; 2] = [
+    "error returned from database: ",
+    "error communicating with database: ",
+];
+
+fn parse_query_error(text: &str) -> QueryErrorParts {
+    let verbatim = text.trim();
+    let causes = caused_by_entries(text);
+    let deepest = causes.last().copied().unwrap_or(verbatim);
+    let stripped = strip_driver_framing(deepest);
+    let headline = if stripped.is_empty() {
+        verbatim.to_string()
+    } else {
+        stripped
+    };
+    let (vendor_code, sqlstate) = extract_error_codes(text);
+    // A single-line original adds nothing next to the headline: the only thing
+    // stripped from it is the code pair, which the header shows as chips.
+    let detail =
+        (verbatim.lines().count() > 1 && verbatim != headline).then(|| verbatim.to_string());
+    QueryErrorParts {
+        headline,
+        vendor_code,
+        sqlstate,
+        detail,
+    }
+}
+
+// The lines anyhow's `Debug` prints under "Caused by:", outermost first, with
+// the `N: ` numbering it adds for chains longer than one link removed.
+fn caused_by_entries(text: &str) -> Vec<&str> {
+    let mut lines = text.lines();
+    if !lines.any(|line| line.trim() == "Caused by:") {
+        return Vec::new();
+    }
+    lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(strip_chain_index)
+        .collect()
+}
+
+// anyhow numbers the links of a chain from zero, so an index is one or two
+// digits. Longer digit runs are left alone: a driver message can legitimately
+// open with its own four-digit error number, and eating that would hide it.
+const MAX_CHAIN_INDEX_DIGITS: usize = 2;
+
+fn strip_chain_index(line: &str) -> &str {
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > MAX_CHAIN_INDEX_DIGITS {
+        return line;
+    }
+    line.get(digits..)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(line)
+}
+
+// MySQL and MariaDB drivers report `<code> (<sqlstate>): <message>`; Postgres
+// and SQLite report neither. The pair is searched for anywhere in the chain so
+// it is found whether the driver put it in the outermost message or in a nested
+// cause. Both the digits in front of the parentheses and the colon after them
+// are required, because a message can legitimately contain a five-character
+// parenthesised word.
+fn extract_error_codes(text: &str) -> (Option<String>, Option<String>) {
+    for (open, _) in text.char_indices().filter(|(_, ch)| *ch == '(') {
+        let Some(rest) = text.get(open + 1..) else {
+            continue;
+        };
+        let sqlstate: String = rest
+            .chars()
+            .take(SQLSTATE_LEN)
+            .take_while(|ch| ch.is_ascii_digit() || ch.is_ascii_uppercase())
+            .collect();
+        if sqlstate.len() != SQLSTATE_LEN {
+            continue;
+        }
+        if !rest
+            .get(SQLSTATE_LEN..)
+            .is_some_and(|tail| tail.starts_with("):"))
+        {
+            continue;
+        }
+        let Some(before) = text.get(..open) else {
+            continue;
+        };
+        let digits: Vec<char> = before
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            continue;
+        }
+        return (Some(digits.into_iter().rev().collect()), Some(sqlstate));
+    }
+    (None, None)
+}
+
+// Peels the layers the driver stack puts in front of the database's own words:
+// sqlx's wrapper text and the `<code> (<sqlstate>): ` prefix, which the panel
+// shows as chips instead of repeating inside the sentence.
+fn strip_driver_framing(message: &str) -> String {
+    let mut message = message.trim();
+    loop {
+        let before = message;
+        for prefix in DRIVER_NOISE_PREFIXES {
+            if let Some(rest) = message.strip_prefix(prefix) {
+                message = rest.trim_start();
+            }
+        }
+        if let Some(rest) = strip_code_prefix(message) {
+            message = rest.trim_start();
+        }
+        if message == before {
+            return message.to_string();
+        }
+    }
+}
+
+fn strip_code_prefix(message: &str) -> Option<&str> {
+    let digits = message.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = message.get(digits..)?.trim_start().strip_prefix('(')?;
+    let sqlstate: String = rest
+        .chars()
+        .take(SQLSTATE_LEN)
+        .take_while(|ch| ch.is_ascii_digit() || ch.is_ascii_uppercase())
+        .collect();
+    if sqlstate.len() != SQLSTATE_LEN {
+        return None;
+    }
+    rest.get(SQLSTATE_LEN..)?.strip_prefix("):")
 }
 
 // A lively rotating loading indicator. A short rotation period reads as active
@@ -926,6 +1087,18 @@ pub enum ResultViewEvent {
     ResultChanged,
 }
 
+// The prepared failure state: the parsed pieces plus the read-only editors that
+// hold them. Text lives in editors rather than labels because a label cannot be
+// selected, and reading part of an error out of the panel is the whole point.
+struct QueryErrorView {
+    // The exact text these editors were built for; they are rebuilt whenever a
+    // different failure arrives.
+    source: String,
+    parts: QueryErrorParts,
+    message: Entity<Editor>,
+    detail: Option<Entity<Editor>>,
+}
+
 pub struct ResultView {
     focus_handle: FocusHandle,
     title: SharedString,
@@ -1155,6 +1328,8 @@ pub struct ResultView {
     // older, slower request that resolves after a newer one was dispatched
     // loses the race instead of overwriting the newer result.
     active_request: u64,
+    // Lazily-built editors backing the failure state, kept in sync with `error`.
+    error_view: Option<QueryErrorView>,
 }
 
 // Which buffer an inline edit writes into when committed.
@@ -1382,6 +1557,7 @@ impl ResultView {
             mongo_documents_view: None,
             mongo_documents_built_for: None,
             active_request: 0,
+            error_view: None,
         }
     }
 
@@ -5824,37 +6000,202 @@ impl ResultView {
             )
     }
 
-    fn render_error(&self, error: &str) -> impl IntoElement {
+    // Builds (once per distinct failure) the read-only editors the error state
+    // renders. Runs in render(), where a Window is available, mirroring
+    // `sync_special_view`.
+    fn sync_error_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.error.clone() else {
+            self.error_view = None;
+            return;
+        };
+        if self
+            .error_view
+            .as_ref()
+            .is_none_or(|view| view.source != error)
+        {
+            let parts = parse_query_error(&error);
+            let message = cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, ERROR_MESSAGE_MAX_LINES, window, cx);
+                editor.set_show_gutter(false, cx);
+                editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                editor.set_show_indent_guides(false, cx);
+                editor.disable_mouse_wheel_zoom();
+                editor.set_text(parts.headline.as_str(), window, cx);
+                editor.set_read_only(true);
+                editor
+            });
+            let detail = parts.detail.as_deref().map(|text| {
+                cx.new(|cx| {
+                    let mut editor = Editor::multi_line(window, cx);
+                    editor.set_show_gutter(false, cx);
+                    editor.disable_expand_excerpt_buttons(cx);
+                    editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                    editor.set_show_indent_guides(false, cx);
+                    editor.disable_mouse_wheel_zoom();
+                    editor.set_text(text, window, cx);
+                    editor.set_read_only(true);
+                    editor
+                })
+            });
+            self.error_view = Some(QueryErrorView {
+                source: error,
+                parts,
+                message,
+                detail,
+            });
+        }
+        let Some((message, detail)) = self
+            .error_view
+            .as_ref()
+            .map(|view| (view.message.clone(), view.detail.clone()))
+        else {
+            return;
+        };
+        // An editor caches its style refinement, so these are re-applied every
+        // frame: set once at build time they would keep the colors of whichever
+        // theme happened to be active then.
+        let muted = Color::Muted.color(cx);
+        message.update(cx, |editor, _cx| {
+            editor.set_text_style_refinement(TextStyleRefinement {
+                font_weight: Some(FontWeight::MEDIUM),
+                ..Default::default()
+            });
+        });
+        if let Some(detail) = detail {
+            detail.update(cx, |editor, _cx| {
+                editor.set_text_style_refinement(TextStyleRefinement {
+                    color: Some(muted),
+                    ..Default::default()
+                });
+            });
+        }
+    }
+
+    // The failure state. Laid out as the panel's other states are -- a header
+    // row over a top-left aligned body -- so a rejected query reads as
+    // information the panel is reporting rather than as an exception screen.
+    // The error color marks the state (the header icon, the rule beside the
+    // message) and never the prose, which stays at full reading contrast.
+    fn render_error(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
+        let Some(view) = self.error_view.as_ref() else {
+            return v_flex()
+                .size_full()
+                .p_3()
+                .child(Label::new(error.to_string()).color(Color::Error))
+                .into_any_element();
+        };
+        let border = cx.theme().colors().border;
+        let status_mark = cx.theme().status().error;
+        let detail_background = cx.theme().colors().editor_background;
+
         v_flex()
             .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .p_4()
-            .child(Icon::new(IconName::Warning).color(Color::Error))
+            .debug_selector(|| "query-error".to_string())
             .child(
-                v_flex()
-                    .gap_1()
-                    .items_end()
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        Icon::new(IconName::XCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        Label::new("Query failed")
+                            .size(LabelSize::Small)
+                            .single_line(),
+                    )
+                    .when_some(view.parts.vendor_code.clone(), |el, code| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .debug_selector({
+                                    let code = code.clone();
+                                    move || format!("query-error-code:{code}")
+                                })
+                                .child(Chip::new(format!("Error {code}"))),
+                        )
+                    })
+                    .when_some(view.parts.sqlstate.clone(), |el, sqlstate| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .debug_selector({
+                                    let sqlstate = sqlstate.clone();
+                                    move || format!("query-error-sqlstate:{sqlstate}")
+                                })
+                                .child(Chip::new(format!("SQLSTATE {sqlstate}"))),
+                        )
+                    })
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("query-error-copy-hitbox")
+                            .flex_none()
                             .debug_selector(|| "query-error-copy".to_string())
-                            .child(CopyButton::new("query-error-copy", error.to_string())),
-                    )
-                    .child(
-                        div()
-                            .id("query-error")
-                            .max_w(px(560.))
-                            .max_h(px(240.))
-                            .overflow_y_scroll()
                             .child(
-                                Label::new(error.to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Error),
+                                CopyButton::new("query-error-copy", view.source.clone())
+                                    .tooltip_label("Copy the full error"),
                             ),
                     ),
             )
+            .child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .min_w_0()
+                    .px_3()
+                    .pt_3()
+                    .pb_2()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .border_l_2()
+                            .border_color(status_mark)
+                            .pl_2p5()
+                            .debug_selector(|| "query-error-message".to_string())
+                            .child(view.message.clone()),
+                    ),
+            )
+            .when_some(view.detail.clone(), |el, detail| {
+                el.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .min_w_0()
+                        .px_3()
+                        .pb_3()
+                        .gap_1()
+                        .child(
+                            Label::new("Driver details")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .min_w_0()
+                                .p_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(detail_background)
+                                .debug_selector(|| "query-error-detail".to_string())
+                                .child(detail),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     // Builds ONE grid row (by absolute index), horizontally virtualized: only the
@@ -10530,6 +10871,7 @@ impl Render for ResultView {
         self.sync_value_editor(window, cx);
         self.sync_special_view(window, cx);
         self.sync_mongo_documents_view(window, cx);
+        self.sync_error_view(window, cx);
         let filter_bar = self.render_filter_bar(cx);
         let content = if self.is_loading {
             div()
@@ -10543,7 +10885,7 @@ impl Render for ResultView {
                 ))
                 .into_any_element()
         } else if let Some(error) = self.error.clone() {
-            self.render_error(&error).into_any_element()
+            self.render_error(&error, cx)
         } else if self.result.is_some() {
             if self.active_special() != SpecialResult::None {
                 self.render_special_view(cx).into_any_element()
@@ -11020,6 +11362,191 @@ mod tests {
         assert_eq!(
             clipboard, error_message,
             "the copy button must put the full error text on the clipboard, not a truncated preview"
+        );
+    }
+
+    #[test]
+    fn parse_query_error_pulls_the_database_sentence_out_of_the_chain() {
+        let parts = parse_query_error(MYSQL_MISSING_TABLE_ERROR);
+        assert_eq!(parts.headline, MYSQL_MISSING_TABLE_SENTENCE);
+        assert_eq!(parts.vendor_code.as_deref(), Some("1146"));
+        assert_eq!(parts.sqlstate.as_deref(), Some("42S02"));
+        assert_eq!(parts.detail.as_deref(), Some(MYSQL_MISSING_TABLE_ERROR));
+    }
+
+    #[test]
+    fn parse_query_error_keeps_a_message_that_carries_no_driver_codes() {
+        let parts = parse_query_error("relation \"public.orders\" does not exist");
+        assert_eq!(parts.headline, "relation \"public.orders\" does not exist");
+        assert_eq!(parts.vendor_code, None);
+        assert_eq!(parts.sqlstate, None);
+        assert_eq!(
+            parts.detail, None,
+            "a single-line message says nothing more as detail than it does as the headline"
+        );
+    }
+
+    #[test]
+    fn parse_query_error_ignores_a_parenthesised_word_that_is_not_a_sqlstate() {
+        let parts = parse_query_error("Incorrect value 12345 (SCALE) for column 'ratio'");
+        assert_eq!(parts.vendor_code, None);
+        assert_eq!(parts.sqlstate, None);
+        assert_eq!(
+            parts.headline,
+            "Incorrect value 12345 (SCALE) for column 'ratio'"
+        );
+    }
+
+    #[gpui::test]
+    fn query_error_message_area_paints_real_area(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = error_window(cx, MYSQL_MISSING_TABLE_ERROR);
+
+        let message = cx
+            .debug_bounds("query-error-message")
+            .expect("the failure message area should render");
+        assert!(
+            message.size.height > px(14.),
+            "the message area collapsed to {}px instead of painting a real line of text",
+            f32::from(message.size.height)
+        );
+        let panel = cx
+            .debug_bounds("query-error")
+            .expect("the failure state root should render");
+        assert!(
+            message.size.width > panel.size.width - px(64.),
+            "the message area should span the panel: {}px inside a {}px panel",
+            f32::from(message.size.width),
+            f32::from(panel.size.width)
+        );
+
+        let detail = cx
+            .debug_bounds("query-error-detail")
+            .expect("the driver detail area should render for a chained error");
+        assert!(
+            detail.size.height > px(14.),
+            "the driver detail area collapsed to {}px",
+            f32::from(detail.size.height)
+        );
+        assert!(
+            detail.origin.y > message.origin.y + message.size.height,
+            "the driver detail belongs below the message, not on top of it"
+        );
+    }
+
+    #[gpui::test]
+    fn query_error_header_shows_the_vendor_code_and_sqlstate(cx: &mut gpui::TestAppContext) {
+        let (_window, _view, mut cx) = error_window(cx, MYSQL_MISSING_TABLE_ERROR);
+
+        let code = cx
+            .debug_bounds("query-error-code:1146")
+            .expect("the header should carry the driver's own error code");
+        assert!(code.size.width > px(0.) && code.size.height > px(0.));
+
+        let sqlstate = cx
+            .debug_bounds("query-error-sqlstate:42S02")
+            .expect("the header should carry the SQLSTATE");
+        assert!(sqlstate.size.width > px(0.) && sqlstate.size.height > px(0.));
+    }
+
+    #[gpui::test]
+    fn query_error_message_drops_the_driver_framing_and_keeps_it_as_detail(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_window, view, mut cx) = error_window(cx, MYSQL_MISSING_TABLE_ERROR);
+
+        let message = error_message_editor(&view, &mut cx);
+        assert_eq!(
+            message.update(&mut cx, |editor, cx| editor.text(cx)),
+            MYSQL_MISSING_TABLE_SENTENCE,
+            "the message area must show what the database said, not the layers wrapped around it"
+        );
+
+        let detail = error_detail_editor(&view, &mut cx)
+            .expect("a chained error keeps its verbatim chain as detail");
+        assert_eq!(
+            detail.update(&mut cx, |editor, cx| editor.text(cx)),
+            MYSQL_MISSING_TABLE_ERROR,
+            "the detail area must be the unmodified driver output, matching what Copy yields"
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_across_the_query_error_message_selects_only_what_was_dragged_over(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_window, view, mut cx) = error_window(cx, MYSQL_MISSING_TABLE_ERROR);
+        let message = error_message_editor(&view, &mut cx);
+        let bounds = cx
+            .debug_bounds("query-error-message")
+            .expect("the failure message area should render");
+
+        drag_across_error_message(&mut cx, bounds, px(30.), px(80.));
+        let short = selected_error_text(&message, &mut cx);
+        drag_across_error_message(&mut cx, bounds, px(30.), px(200.));
+        let long = selected_error_text(&message, &mut cx);
+
+        assert!(
+            !short.is_empty(),
+            "dragging across part of the message selected nothing"
+        );
+        assert!(
+            MYSQL_MISSING_TABLE_SENTENCE.contains(short.as_str()),
+            "the selection {short:?} is not part of the rendered message"
+        );
+        assert_ne!(
+            long, MYSQL_MISSING_TABLE_SENTENCE,
+            "a partial drag must not select the whole message"
+        );
+        assert!(
+            long.starts_with(short.as_str()),
+            "both drags began at the same point, so the wider one must extend the shorter: \
+             {short:?} then {long:?}"
+        );
+        assert!(
+            long.len() > short.len(),
+            "the selection did not follow the mouse: {short:?} and {long:?} cover the same text"
+        );
+    }
+
+    #[gpui::test]
+    fn a_very_long_error_wraps_instead_of_widening_the_panel(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = error_window(cx, "Table 'x' doesn't exist");
+        let one_line = cx
+            .debug_bounds("query-error-message")
+            .expect("the failure message area should render")
+            .size
+            .height;
+
+        let columns = ["column_name_that_does_not_exist"; 70].join(", ");
+        let long = format!("Unknown columns {columns} in 'field list'");
+        assert!(long.len() >= 2000, "the fixture should be a long one line");
+        view.update(&mut cx, |view, cx| view.set_error(long, cx));
+        draw_result_view(window, &mut cx);
+        draw_result_view(window, &mut cx);
+
+        let wrapped = cx
+            .debug_bounds("query-error-message")
+            .expect("the failure message area should still render");
+        let panel = cx
+            .debug_bounds("query-error")
+            .expect("the failure state root should render");
+        assert!(
+            wrapped.size.width <= panel.size.width,
+            "a 2000-character message widened the message area ({}px) past the panel ({}px)",
+            f32::from(wrapped.size.width),
+            f32::from(panel.size.width)
+        );
+        assert!(
+            f32::from(panel.size.width) <= ERROR_PANEL_WIDTH,
+            "the failure state pushed the panel past its {ERROR_PANEL_WIDTH}px frame: {}px",
+            f32::from(panel.size.width)
+        );
+        assert!(
+            wrapped.size.height > one_line * 3.,
+            "a 2000-character message stayed {}px tall next to a one-line {}px: it was clipped \
+             instead of wrapped",
+            f32::from(wrapped.size.height),
+            f32::from(one_line)
         );
     }
 
@@ -12409,6 +12936,113 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         draw_result_view_frame(window, &mut cx);
         (window, view, cx)
+    }
+
+    // The real shape a MySQL failure has by the time it reaches the panel:
+    // anyhow's generic context over sqlx's wrapper over the server's own
+    // sentence, repeated once per link of the chain.
+    const MYSQL_MISSING_TABLE_ERROR: &str = concat!(
+        "Query execution failed\n\nCaused by:\n",
+        "    0: error returned from database: 1146 (42S02): ",
+        "Table 'instruments.icon_objects_1' doesn't exist\n",
+        "    1: 1146 (42S02): Table 'instruments.icon_objects_1' doesn't exist"
+    );
+    const MYSQL_MISSING_TABLE_SENTENCE: &str = "Table 'instruments.icon_objects_1' doesn't exist";
+
+    // A window root whose size is `auto` is stretched to fill the window, so
+    // hosting the view as the root gives the panel a known 700x500 and makes
+    // the geometry assertions in the failure-state tests mean something.
+    const ERROR_PANEL_WIDTH: f32 = 700.;
+
+    fn error_window(
+        cx: &mut gpui::TestAppContext,
+        error: &str,
+    ) -> (
+        gpui::WindowHandle<ResultView>,
+        Entity<ResultView>,
+        gpui::VisualTestContext,
+    ) {
+        init_result_view_test(cx);
+        let error = error.to_string();
+        let window = cx.open_window(
+            gpui::size(px(ERROR_PANEL_WIDTH), px(500.)),
+            move |_window, cx| {
+                let mut view = ResultView::new("query", cx);
+                view.set_error(error, cx);
+                view
+            },
+        );
+        let view = window
+            .root(cx)
+            .expect("test window should contain a result view");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut cx);
+        (window, view, cx)
+    }
+
+    fn error_message_editor(
+        view: &Entity<ResultView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<Editor> {
+        view.update(cx, |view, _cx| {
+            view.error_view
+                .as_ref()
+                .expect("the failure state should be prepared during render")
+                .message
+                .clone()
+        })
+    }
+
+    fn error_detail_editor(
+        view: &Entity<ResultView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<Entity<Editor>> {
+        view.update(cx, |view, _cx| {
+            view.error_view
+                .as_ref()
+                .and_then(|error_view| error_view.detail.clone())
+        })
+    }
+
+    fn selected_error_text(editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext) -> String {
+        use editor::ToOffset as _;
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let selection = editor.selections.newest_anchor();
+            let start = selection.start.to_offset(&snapshot).0;
+            let end = selection.end.to_offset(&snapshot).0;
+            let text = editor.text(cx);
+            text.get(start.min(end)..start.max(end))
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+
+    // A real press-drag-release along the middle of `bounds`, with both x
+    // offsets measured from its left edge.
+    fn drag_across_error_message(
+        cx: &mut gpui::VisualTestContext,
+        bounds: gpui::Bounds<Pixels>,
+        from_x: Pixels,
+        to_x: Pixels,
+    ) {
+        let y = bounds.origin.y + bounds.size.height * 0.5;
+        cx.simulate_mouse_down(
+            gpui::point(bounds.origin.x + from_x, y),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(bounds.origin.x + to_x, y),
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(bounds.origin.x + to_x, y),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
     }
 
     fn plain_result_window(
