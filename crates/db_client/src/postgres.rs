@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::{Column as _, Row as _};
+use sqlx::{Column as _, Row as _, ValueRef as _};
 use std::time::Instant;
 
 use crate::MAX_RESULT_ROWS;
@@ -63,16 +63,21 @@ impl PostgresProvider {
         Ok(Self { pool })
     }
 
+    /// Renders one cell as the text a reader sees, which is the text `psql` shows
+    /// for the same value.
+    ///
+    /// Rows are read over the simple query protocol, the one `psql` uses, so the
+    /// server has already rendered every value with its own output function: a
+    /// `numeric` keeps its declared digits, a `bytea` comes as `\x…`, a boolean
+    /// as `t` or `f`, a list as `{1,2,3}`, an interval as `1 day 02:00:00`, money
+    /// with the server's own currency format. Taking that text as it stands is
+    /// both exact and free of a per-type rule here to get wrong.
     fn extract_cell(row: &sqlx::postgres::PgRow, index: usize) -> Option<String> {
-        row.try_get::<Option<String>, _>(index)
-            .ok()
-            .flatten()
-            .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
-            .or_else(|| row.try_get::<i32, _>(index).ok().map(|v| v.to_string()))
-            .or_else(|| row.try_get::<i16, _>(index).ok().map(|v| v.to_string()))
-            .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
-            .or_else(|| row.try_get::<f32, _>(index).ok().map(|v| v.to_string()))
-            .or_else(|| row.try_get::<bool, _>(index).ok().map(|v| v.to_string()))
+        let value = row.try_get_raw(index).ok()?;
+        if value.is_null() {
+            return None;
+        }
+        value.as_str().ok().map(str::to_string)
     }
 }
 
@@ -238,7 +243,7 @@ impl DbProvider for PostgresProvider {
         );
 
         if is_read_query {
-            let mut stream = sqlx::query(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
+            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
             let mut columns: Vec<String> = Vec::new();
             let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
 
@@ -327,7 +332,7 @@ impl DbProvider for PostgresProvider {
         // whole point of "execute to file" is exporting result sets too large
         // for the grid. Cells are still capped for safety against a single
         // multi-megabyte value, but the row count itself is unbounded.
-        let mut stream = sqlx::query(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
+        let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
         let mut columns: Vec<String> = Vec::new();
         let mut row_count: u64 = 0;
 
@@ -575,10 +580,12 @@ impl DbProvider for PostgresProvider {
     }
 
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
-        sqlx::query(AssertSqlSafe(rename_table_sql(database, old_name, new_name)))
-            .execute(&self.pool)
-            .await
-            .context("Failed to rename table")?;
+        sqlx::query(AssertSqlSafe(rename_table_sql(
+            database, old_name, new_name,
+        )))
+        .execute(&self.pool)
+        .await
+        .context("Failed to rename table")?;
         Ok(())
     }
 }
@@ -730,6 +737,72 @@ mod integration_tests {
         assert_eq!(
             result.rows[0][1], None,
             "a NULL integer column must decode to None, not Some(\"0\")"
+        );
+    }
+
+    /// What the grid shows has to be what `psql` shows. Every expected string
+    /// here was taken from that client, run against the same values.
+    #[tokio::test]
+    #[ignore]
+    async fn test_cells_read_the_way_the_psql_client_prints_them() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        let result = provider
+            .execute_query(
+                "public",
+                "SELECT '\\xd41d8cd98f00b204e9800998ecf8427e'::bytea AS a_bytea, \
+                        '0b4bd6cb-2b8f-4b0a-9d4c-6d5f1a2b3c4d'::uuid AS an_id, \
+                        true AS yes, false AS no, \
+                        12345678901234.567890::numeric(20,6) AS exact, \
+                        1e30::double precision AS large, \
+                        '2026-08-02'::date AS a_day, \
+                        '16:28:50'::time AS an_hour, \
+                        '2026-08-02 16:28:50'::timestamp AS a_moment, \
+                        '2026-08-02 16:28:50+00'::timestamptz AS a_moment_somewhere, \
+                        '1 day 2 hours'::interval AS a_span, \
+                        '{\"a\": 1}'::jsonb AS a_document, \
+                        ARRAY[1,2,3] AS numbers, \
+                        ARRAY['x','has space'] AS words, \
+                        '192.168.0.1'::inet AS an_address, \
+                        1234.56::money AS an_amount, \
+                        NULL::text AS nothing",
+            )
+            .await
+            .expect("Failed to execute query");
+
+        let rendered: Vec<String> = result.rows[0]
+            .iter()
+            .map(|cell| cell.clone().unwrap_or_else(|| "<absent>".to_string()))
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "\\xd41d8cd98f00b204e9800998ecf8427e".to_string(),
+                "0b4bd6cb-2b8f-4b0a-9d4c-6d5f1a2b3c4d".to_string(),
+                "t".to_string(),
+                "f".to_string(),
+                "12345678901234.567890".to_string(),
+                "1e+30".to_string(),
+                "2026-08-02".to_string(),
+                "16:28:50".to_string(),
+                "2026-08-02 16:28:50".to_string(),
+                "2026-08-02 16:28:50+00".to_string(),
+                "1 day 02:00:00".to_string(),
+                "{\"a\": 1}".to_string(),
+                "{1,2,3}".to_string(),
+                "{x,\"has space\"}".to_string(),
+                "192.168.0.1".to_string(),
+                "$1,234.56".to_string(),
+                // Only a real absence reads as absent: everything above has to
+                // arrive as text, not fall through to nothing.
+                "<absent>".to_string(),
+            ],
+            "every value reads the way the psql client prints it"
         );
     }
 

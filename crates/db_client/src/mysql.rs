@@ -4,7 +4,7 @@ use futures::TryStreamExt as _;
 use smol::lock::Mutex as AsyncMutex;
 use sqlx::AssertSqlSafe;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
-use sqlx::{Column as _, Row as _};
+use sqlx::{Column as _, Row as _, TypeInfo as _};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -267,28 +267,64 @@ impl MySqlProvider {
     }
 }
 
-/// Renders one cell as the text a reader sees. The order is load-bearing.
+/// Renders one cell as the text a reader sees, which is the text the `mysql`
+/// client shows for the same value.
 ///
-/// MySQL has no boolean type of its own -- `BOOL` is an alias for `TINYINT(1)`
-/// -- and sqlx accepts a `bool` decode for *every* integer width, unsigned
-/// included, while refusing an `i64` decode for an unsigned column. A `bool`
-/// attempt anywhere before the unsigned integers therefore renders every
-/// unsigned number, `smallint unsigned` counters and `bigint unsigned` ids
-/// alike, as `true`/`false`. Since a number cannot be told apart from a flag
-/// here, a number is always shown as a number.
+/// Rows arrive over the text protocol -- the one that client uses -- so the
+/// server has already rendered every value: a `decimal` keeps the digits it was
+/// declared with, a `double` comes as `1e30`, a moment comes as
+/// `2026-08-02 16:28:50`. Read as text, that is exactly right, and it needs no
+/// per-type formatting here to go wrong. It is read *unchecked* because sqlx
+/// otherwise refuses the string on the column's declared type -- deliberately,
+/// since decoding a `decimal` into a float would lose digits -- and every one of
+/// those refusals used to leave the cell reading as absent.
 fn cell_to_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<String> {
-    row.try_get::<Option<String>, _>(index)
+    // A binary column is bytes, not characters, and the client prints its bytes
+    // as hex. Read as text, an md5 comes out as the mojibake it looks like.
+    if is_binary_column(column_type_name(row, index)) {
+        return cell_bytes(row, index).map(|bytes| written_hex(&bytes));
+    }
+
+    row.try_get_unchecked::<Option<String>, _>(index)
         .ok()
         .flatten()
-        .or_else(|| row.try_get::<i64, _>(index).ok().map(|v| v.to_string()))
-        .or_else(|| row.try_get::<u64, _>(index).ok().map(|v| v.to_string()))
-        .or_else(|| row.try_get::<f64, _>(index).ok().map(|v| v.to_string()))
-        .or_else(|| {
-            row.try_get::<Option<Vec<u8>>, _>(index)
-                .ok()
-                .flatten()
-                .map(bytes_to_string)
-        })
+        .or_else(|| cell_bytes(row, index).map(|bytes| written_hex(&bytes)))
+}
+
+fn cell_bytes(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<Vec<u8>> {
+    row.try_get_unchecked::<Option<Vec<u8>>, _>(index)
+        .ok()
+        .flatten()
+}
+
+/// The columns whose values the client writes as hex rather than as characters.
+/// `TEXT` and `BLOB` share a wire type and are told apart by their collation,
+/// which is why sqlx reports them under different names.
+fn is_binary_column(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "BINARY"
+            | "VARBINARY"
+            | "BLOB"
+            | "TINYBLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+            | "BIT"
+            | "GEOMETRY"
+    )
+}
+
+/// Hex in the form the client uses, `0x` and upper case, so a value can be
+/// compared with what that client prints and pasted back into a query.
+fn written_hex(bytes: &[u8]) -> String {
+    let digits: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+    format!("0x{digits}")
+}
+
+fn column_type_name(row: &sqlx::mysql::MySqlRow, index: usize) -> &str {
+    row.columns()
+        .get(index)
+        .map_or("", |column| column.type_info().name())
 }
 
 // MySQL reports string columns from SHOW/information_schema with a binary
@@ -552,10 +588,13 @@ impl DbProvider for MySqlProvider {
             // connection, so a silent death here must not hang forever holding
             // `op_lock` and wedge every later query.
             let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool))
-                .await
-                .context("Timed out switching database -- the connection stalled")?
-                .context("Failed to switch database")?;
+            tokio::time::timeout(
+                ROW_FETCH_TIMEOUT,
+                sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool),
+            )
+            .await
+            .context("Timed out switching database -- the connection stalled")?
+            .context("Failed to switch database")?;
         }
 
         let start = Instant::now();
@@ -699,10 +738,13 @@ impl DbProvider for MySqlProvider {
             // Bounded for the same reason as in `execute_query`: a silent
             // connection death here must not hang forever holding `op_lock`.
             let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(ROW_FETCH_TIMEOUT, sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool))
-                .await
-                .context("Timed out switching database -- the connection stalled")?
-                .context("Failed to switch database")?;
+            tokio::time::timeout(
+                ROW_FETCH_TIMEOUT,
+                sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool),
+            )
+            .await
+            .context("Timed out switching database -- the connection stalled")?
+            .context("Failed to switch database")?;
         }
 
         let trimmed_upper = sql.trim().to_uppercase();
@@ -937,10 +979,12 @@ impl DbProvider for MySqlProvider {
     async fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> Result<()> {
         let _guard = self.op_lock.lock().await;
         let pool = self.current_pool();
-        sqlx::query(AssertSqlSafe(rename_table_sql(database, old_name, new_name)))
-            .execute(&pool)
-            .await
-            .context("Failed to rename table")?;
+        sqlx::query(AssertSqlSafe(rename_table_sql(
+            database, old_name, new_name,
+        )))
+        .execute(&pool)
+        .await
+        .context("Failed to rename table")?;
         Ok(())
     }
 }
@@ -953,6 +997,52 @@ fn rename_table_sql(database: &str, old_name: &str, new_name: &str) -> String {
         database.replace('`', "``"),
         new_name.replace('`', "``")
     )
+}
+
+#[cfg(test)]
+mod cell_tests {
+    use super::{is_binary_column, written_hex};
+
+    #[test]
+    fn a_hash_is_written_the_way_the_client_writes_it() {
+        let md5 = [
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e,
+        ];
+        assert_eq!(written_hex(&md5), "0xD41D8CD98F00B204E9800998ECF8427E");
+    }
+
+    #[test]
+    fn bytes_that_read_as_text_are_still_written_as_hex() {
+        assert_eq!(
+            written_hex(b"utf8mb4_unicode_ci"),
+            "0x757466386D62345F756E69636F64655F6369"
+        );
+    }
+
+    /// A `text` column and a `blob` share a wire type and are told apart by
+    /// their collation. Treating text as bytes would turn every long string in
+    /// the grid into hex.
+    #[test]
+    fn only_binary_columns_are_written_as_hex() {
+        for binary in [
+            "BINARY",
+            "VARBINARY",
+            "BLOB",
+            "TINYBLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "BIT",
+            "GEOMETRY",
+        ] {
+            assert!(is_binary_column(binary), "{binary} holds bytes");
+        }
+        for text in [
+            "VARCHAR", "CHAR", "TEXT", "TINYTEXT", "LONGTEXT", "ENUM", "JSON",
+        ] {
+            assert!(!is_binary_column(text), "{text} holds characters");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1097,6 +1187,110 @@ mod integration_tests {
                 ],
             ],
             "every number has to read as a number, flags included"
+        );
+    }
+
+    /// What the grid shows has to be what the `mysql` client shows. Before this,
+    /// a hash came out as mojibake, and a moment, a bit string and a decimal came
+    /// out as nothing at all -- on columns that cannot even be null.
+    ///
+    /// The expected strings here were taken from that client, run against the
+    /// same rows with `--binary-as-hex`, which is what it does on a terminal.
+    #[tokio::test]
+    #[ignore]
+    async fn test_cells_read_the_way_the_mysql_client_prints_them() {
+        let config =
+            test_config_from_env().expect("MYSQL_TEST_URL env var required for integration tests");
+        let provider = MySqlProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        provider
+            .execute_query("", "DROP TABLE IF EXISTS zed_moment_probe")
+            .await
+            .expect("failed to drop the probe table");
+        provider
+            .execute_query(
+                "",
+                "CREATE TABLE zed_moment_probe (\
+                   id int unsigned NOT NULL PRIMARY KEY,\
+                   md5 binary(16) DEFAULT NULL,\
+                   blobbed varbinary(32) DEFAULT NULL,\
+                   a_bit bit(8) DEFAULT NULL,\
+                   money decimal(20,6) DEFAULT NULL,\
+                   made_at timestamp NOT NULL,\
+                   exactly datetime(6) DEFAULT NULL,\
+                   the_day date DEFAULT NULL,\
+                   the_hour time DEFAULT NULL\
+                 )",
+            )
+            .await
+            .expect("failed to create the probe table");
+        provider
+            .execute_query(
+                "",
+                "INSERT INTO zed_moment_probe \
+                 (id, md5, blobbed, a_bit, money, made_at, exactly, the_day, the_hour) VALUES \
+                 (1, UNHEX('d41d8cd98f00b204e9800998ecf8427e'), 'utf8mb4_unicode_ci', \
+                  b'10101010', 12345678901234.567890, \
+                  '2026-08-02 16:28:50', '2026-08-02 16:28:50.004500', '2026-08-02', '16:28:50'), \
+                 (2, NULL, NULL, NULL, NULL, '2026-08-02 16:28:51', NULL, NULL, NULL)",
+            )
+            .await
+            .expect("failed to seed the probe table");
+
+        let result = provider
+            .execute_query(
+                "",
+                "SELECT id, md5, blobbed, a_bit, money, made_at, exactly, the_day, the_hour \
+                 FROM zed_moment_probe ORDER BY id",
+            )
+            .await
+            .expect("failed to read the probe table");
+
+        provider
+            .execute_query("", "DROP TABLE zed_moment_probe")
+            .await
+            .expect("failed to drop the probe table");
+
+        let rendered: Vec<Vec<String>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.clone().unwrap_or_else(|| "NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                vec![
+                    "1".to_string(),
+                    "0xD41D8CD98F00B204E9800998ECF8427E".to_string(),
+                    "0x757466386D62345F756E69636F64655F6369".to_string(),
+                    "0xAA".to_string(),
+                    "12345678901234.567890".to_string(),
+                    "2026-08-02 16:28:50".to_string(),
+                    "2026-08-02 16:28:50.004500".to_string(),
+                    "2026-08-02".to_string(),
+                    "16:28:50".to_string(),
+                ],
+                vec![
+                    "2".to_string(),
+                    "NULL".to_string(),
+                    "NULL".to_string(),
+                    "NULL".to_string(),
+                    "NULL".to_string(),
+                    "2026-08-02 16:28:51".to_string(),
+                    "NULL".to_string(),
+                    "NULL".to_string(),
+                    "NULL".to_string(),
+                ],
+            ],
+            "every value reads the way the mysql client prints it, and only a \
+             real absence reads as absent"
         );
     }
 
