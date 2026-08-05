@@ -355,6 +355,13 @@ jobs:
           # was built against, every plugin fails to load, and the engine's media
           # backend takes the whole process down with it.
           export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/lib:$HOME/lib:/usr/local/lib:/usr/lib"
+          # Where the plugins themselves live. Finding the glib they were built
+          # against is not enough: the scanner is given no directory to scan on a
+          # Homebrew install, so it reports every plugin as failing to load and
+          # the media backend takes the process down at the first page that wants
+          # it.
+          export GST_PLUGIN_SYSTEM_PATH="$(brew --prefix)/lib/gstreamer-1.0"
+          export GST_PLUGIN_SCANNER="$(brew --prefix)/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner"
           cargo test --profile release-fast --package html_render \
             --features servo -- --nocapture 2>&1 | tee engine-test.log
 
