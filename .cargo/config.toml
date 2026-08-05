@@ -11,7 +11,9 @@ perf-compare = ["run", "--profile", "release-fast", "-p", "perf", "--config", "t
 [target.'cfg(target_os = "windows")']
 rustflags = [
     "--cfg",
-    "windows_slim_errors", # This cfg will reduce the size of `windows::core::Error` from 16 bytes to 4 bytes
+    "windows_slim_errors",        # This cfg will reduce the size of `windows::core::Error` from 16 bytes to 4 bytes
+    "-C",
+    "target-feature=+crt-static", # This fixes the linking issue when compiling livekit on Windows
 ]
 
 # We need lld to link libwebrtc.a successfully on aarch64-linux
