@@ -12,6 +12,7 @@ use gpui::{
 use platform_title_bar::PlatformTitleBar;
 use recent_projects::{RecentProjectEntry, get_recent_projects};
 use serde::{Deserialize, Serialize};
+use theme::SystemAppearance;
 use theme_settings::setup_ui_font;
 use ui::{ButtonLike, KeyBinding, ListItem, ListItemSpacing, WithScrollbar, prelude::*};
 use util::{ResultExt, paths::PathExt};
@@ -290,7 +291,10 @@ impl Launchpad {
             cx.new(|cx| Launchpad::new(recents, app_state, window, cx))
         })?;
         handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, _| {
+                window.set_window_title("Zed");
+                window.activate_window();
+            })
             .log_err();
         Ok(handle)
     }
@@ -315,6 +319,15 @@ impl Launchpad {
             }),
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.remember_bounds(window, cx);
+            }),
+            // Only a window can say which appearance it was given, and the
+            // application-wide guess can differ from it. An editor window settles
+            // this the same way; without it the launchpad opens light in front of
+            // a dark editor.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                *SystemAppearance::global_mut(cx) = SystemAppearance(window.appearance().into());
+                theme_settings::reload_theme(cx);
+                theme_settings::reload_icon_theme(cx);
             }),
         ];
 
@@ -1188,6 +1201,28 @@ mod tests {
             cx.update(|cx| cx.windows().len()),
             1,
             "the launch added a window to the one that had already answered it"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_the_launchpad_takes_its_appearance_from_the_window(cx: &mut TestAppContext) {
+        let app_state = init_launchpad_test(cx);
+        // The application-wide guess left disagreeing with what a window reports,
+        // which is the state an editor window corrects for itself on open.
+        let reported = cx.update(|cx| theme::Appearance::from(cx.window_appearance()));
+        let disagreeing = match reported {
+            theme::Appearance::Light => theme::Appearance::Dark,
+            theme::Appearance::Dark => theme::Appearance::Light,
+        };
+        cx.update(|cx| *SystemAppearance::global_mut(cx) = SystemAppearance(disagreeing));
+
+        open_launchpad_with(vec![recent("zed", "/projects/zed", 1)], app_state, cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| SystemAppearance::global(cx).0),
+            reported,
+            "the launchpad kept a guess its own window disagrees with"
         );
     }
 
