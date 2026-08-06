@@ -1485,6 +1485,13 @@
     },
   },
   {
+    "context": "Launchpad",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-n": "workspace::NewFile"
+    }
+  },
+  {
     "context": "Welcome",
     "use_key_equivalents": true,
     "bindings": {
