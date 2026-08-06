@@ -842,8 +842,8 @@ impl Render for Launchpad {
                         .key_context("Launchpad")
                         .track_focus(&self.focus_handle)
                         .size_full()
-                        .p_4()
-                        .gap_3()
+                        .p(cyberpunk::SPACE_22)
+                        .gap(cyberpunk::SPACE_18)
                         // The traffic lights float over the top-left corner of a
                         // transparent titlebar, where the heading would otherwise be.
                         .when(cfg!(target_os = "macos"), |content| content.pt_8())
@@ -1246,10 +1246,11 @@ mod tests {
             let mark = visual
                 .debug_bounds("launchpad-mark")
                 .expect("the mark was painted");
-            let root = visual
-                .debug_bounds("launchpad")
-                .expect("the launchpad was painted");
-            let off_centre = f32::from(mark.center().x) - f32::from(root.center().x);
+            // Against the window itself rather than the content inside it: the
+            // two agree only while the padding is symmetric, and it is the
+            // window the mark is supposed to be centred in.
+            let viewport = visual.update(|window, _| window.viewport_size());
+            let off_centre = f32::from(mark.center().x) - f32::from(viewport.width) / 2.;
             assert!(
                 off_centre.abs() < 1.,
                 "at a width of {width:?} the mark painted {off_centre} from the centre"
