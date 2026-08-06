@@ -14,7 +14,7 @@ use recent_projects::{RecentProjectEntry, get_recent_projects};
 use serde::{Deserialize, Serialize};
 use theme::{PlayerColor, SystemAppearance};
 use theme_settings::setup_ui_font;
-use ui::{ButtonLike, ButtonStyle, KeyBinding, WithScrollbar, cyberpunk, prelude::*};
+use ui::{ButtonLike, ButtonSize, ButtonStyle, KeyBinding, WithScrollbar, cyberpunk, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use uuid::Uuid;
 use workspace::{
@@ -720,12 +720,19 @@ impl Launchpad {
         ButtonLike::new(id)
             .style(ButtonStyle::OutlinedCustom(cyberpunk::border_raised()))
             .square()
+            // The default height leaves an outline too tight to read as a button
+            // among elements laid out on a 14-and-up rhythm.
+            .size(ButtonSize::Large)
             .when(full_width, |button| button.full_width())
             .child(
                 h_flex()
                     .w_full()
+                    .px(cyberpunk::SPACE_4)
                     .gap(cyberpunk::SPACE_8)
                     .justify_between()
+                    // The button component sets its own font, which would leave
+                    // these three the only proportional text in the window.
+                    .cyberpunk_monospace(cx)
                     .child(Label::new(label).color(Color::Custom(cyberpunk::text_secondary())))
                     .child(keybinding),
             )
