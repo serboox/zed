@@ -1428,8 +1428,7 @@ mod tests {
     ) {
         init_test(cx, |_| {});
 
-        let mut cx =
-            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
 
         cx.set_state(indoc! {"
             let vˇariable = 1;
@@ -1437,9 +1436,8 @@ mod tests {
         let screen_coord = cx.editor(|editor, _, cx| editor.pixel_position_of_cursor(cx));
 
         cx.update_editor(|editor, _window, _cx| {
-            editor.set_semantics_provider(Some(
-                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
-            ));
+            editor.set_semantics_provider(Some(std::rc::Rc::new(CandidateOnlyProvider)
+                as std::rc::Rc<dyn crate::SemanticsProvider>));
         });
         cx.run_until_parked();
 
@@ -1477,8 +1475,7 @@ mod tests {
     ) {
         init_test(cx, |_| {});
 
-        let mut cx =
-            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
 
         cx.set_state(indoc! {"
             let vˇariable = 1;
@@ -1488,9 +1485,8 @@ mod tests {
             .unwrap();
 
         cx.update_editor(|editor, _window, _cx| {
-            editor.set_semantics_provider(Some(
-                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
-            ));
+            editor.set_semantics_provider(Some(std::rc::Rc::new(CandidateOnlyProvider)
+                as std::rc::Rc<dyn crate::SemanticsProvider>));
         });
         cx.run_until_parked();
 
@@ -1552,8 +1548,7 @@ mod tests {
     ) {
         init_test(cx, |_| {});
 
-        let mut cx =
-            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
 
         cx.set_state(indoc! {"
             https://exaˇmple.com
@@ -1563,9 +1558,8 @@ mod tests {
             .unwrap();
 
         cx.update_editor(|editor, _window, _cx| {
-            editor.set_semantics_provider(Some(
-                std::rc::Rc::new(CandidateOnlyProvider) as std::rc::Rc<dyn crate::SemanticsProvider>,
-            ));
+            editor.set_semantics_provider(Some(std::rc::Rc::new(CandidateOnlyProvider)
+                as std::rc::Rc<dyn crate::SemanticsProvider>));
         });
         cx.run_until_parked();
 
