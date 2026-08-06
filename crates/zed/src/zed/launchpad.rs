@@ -563,12 +563,18 @@ impl Launchpad {
     /// The one element of the window that carries the accent. No glow: a box
     /// shadow behind a glyph lights the box rather than the glyph, which reads
     /// as a smudge instead of a halo.
+    ///
+    /// Centred by a full-width row rather than by a margin, so it stays centred
+    /// as the window is resized instead of at whatever width it opened.
     fn render_mark(&self) -> impl IntoElement + use<> {
-        svg()
-            .path("images/zed_logo.svg")
-            .size(MARK_SIZE)
-            .flex_none()
-            .text_color(cyberpunk::Accent::Cyan.border())
+        h_flex().w_full().justify_center().child(
+            svg()
+                .path("images/zed_logo.svg")
+                .debug_selector(|| "launchpad-mark".into())
+                .size(MARK_SIZE)
+                .flex_none()
+                .text_color(cyberpunk::Accent::Cyan.border()),
+        )
     }
 
     /// The filter drawn with this window's own palette rather than the theme's:
@@ -1224,6 +1230,31 @@ mod tests {
             .detach();
         });
         left_with_nothing
+    }
+
+    #[gpui::test]
+    async fn test_the_mark_stays_centred_as_the_window_is_resized(cx: &mut TestAppContext) {
+        let app_state = init_launchpad_test(cx);
+        let window = open_launchpad_with(vec![recent("zed", "/projects/zed", 1)], app_state, cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        for width in [px(640.), px(900.), px(500.)] {
+            visual.simulate_resize(size(width, px(520.)));
+            draw(&mut visual);
+
+            let mark = visual
+                .debug_bounds("launchpad-mark")
+                .expect("the mark was painted");
+            let root = visual
+                .debug_bounds("launchpad")
+                .expect("the launchpad was painted");
+            let off_centre = f32::from(mark.center().x) - f32::from(root.center().x);
+            assert!(
+                off_centre.abs() < 1.,
+                "at a width of {width:?} the mark painted {off_centre} from the centre"
+            );
+        }
     }
 
     #[gpui::test]
