@@ -45,7 +45,7 @@ const MIN_WINDOW_SIZE: Size<Pixels> = size(px(420.), px(320.));
 const PROJECT_ROW_HEIGHT: Pixels = px(48.);
 
 /// The mark at the top of the window.
-const MARK_SIZE: Pixels = px(40.);
+const MARK_SIZE: Pixels = px(120.);
 
 /// The stripe that marks the row Enter would open. A single thick edge rather
 /// than a box around the row, which is the terminal-output motif this chrome is
