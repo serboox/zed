@@ -432,7 +432,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_can_be_searched(cx);
         the_page_knows_how_wide_it_is(cx);
         the_page_is_laid_out_the_way_it_asks_to_be(cx);
-        the_engine_can_play_media(cx);
+        the_engine_plays_no_media(cx);
         the_page_answers_the_developer_tools(cx);
 
         #[cfg(target_os = "linux")]
@@ -1022,10 +1022,12 @@ fn the_page_is_laid_out_the_way_it_asks_to_be(cx: &mut gpui::App) {
     );
 }
 
-/// Whether there is anything behind `<video>` and `<audio>` at all. Servo keeps
-/// its media backend behind a feature of its own, and without it links a stub
-/// that reports every format unplayable -- which is exactly what this asks.
-fn the_engine_can_play_media(cx: &mut gpui::App) {
+/// Whether there is anything behind `<video>` and `<audio>`. There should not
+/// be: the engine is built without a media backend on purpose, because the one
+/// on offer takes the whole editor down on a machine whose plugins fail to
+/// load. An engine that answers it can play something has had that backend put
+/// back, which is a decision to make deliberately rather than discover.
+fn the_engine_plays_no_media(cx: &mut gpui::App) {
     let mut page = page(
         &document("margin:0;background:#fff", ""),
         300.,
@@ -1050,8 +1052,8 @@ fn the_engine_can_play_media(cx: &mut gpui::App) {
     );
     println!("MEDIA: {answer}");
     assert!(
-        answer.contains("maybe") || answer.contains("probably"),
-        "the engine should have a media backend behind it, not a stub: it answered {answer:?}"
+        !answer.contains("maybe") && !answer.contains("probably"),
+        "a media backend is linked again: the engine answered {answer:?}"
     );
 }
 
