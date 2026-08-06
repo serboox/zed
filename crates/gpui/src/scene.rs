@@ -773,7 +773,7 @@ pub struct PaintSurface {
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     /// A frame the graphics card already holds, shared with this process rather
     /// than copied into it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub frame: std::sync::Arc<crate::SharedFrame>,
 }
 

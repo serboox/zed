@@ -1,22 +1,35 @@
-use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{DevicePixels, Size, size};
+
+/// How the buffer behind a shared frame is named to the other graphics API.
+///
+/// On Linux it is a file descriptor the graphics driver hands out, and it is
+/// owned: dropping it is how the window gives the buffer up.
+#[cfg(target_os = "linux")]
+pub type SharedFrameHandle = std::os::fd::OwnedFd;
+
+/// How the buffer behind a shared frame is named to the other graphics API.
+///
+/// On Windows it is a Direct3D share handle, which belongs to the texture it
+/// names rather than to whoever was handed it. The window opens it and closes
+/// nothing; the producer keeps the texture alive.
+#[cfg(target_os = "windows")]
+pub type SharedFrameHandle = isize;
 
 /// A frame that already lives in graphics memory, lent to the window rather than
 /// copied into it.
 ///
 /// Something else -- an embedded web engine, a video decoder -- drew this and
-/// handed over the buffer it drew into, as a file descriptor the graphics driver
-/// understands. The renderer wraps that descriptor as a texture and samples it
-/// where it stands. Nothing is read back, nothing is uploaded.
+/// handed over the buffer it drew into, under a name the graphics driver
+/// understands. The renderer wraps that name as a texture and samples it where it
+/// stands. Nothing is read back, nothing is uploaded.
 ///
-/// The descriptor is closed when the last reference to this is dropped, so the
-/// producer must keep the buffer alive for as long as it may still be drawn.
+/// The producer must keep the buffer alive for as long as it may still be drawn.
 #[derive(Debug)]
 pub struct SharedFrame {
     /// The buffer itself, as the graphics driver hands it out.
-    pub descriptor: OwnedFd,
+    pub descriptor: SharedFrameHandle,
     /// How wide the picture is, in device pixels.
     pub width: u32,
     /// How tall the frame is, in device pixels.
@@ -25,7 +38,9 @@ pub struct SharedFrame {
     /// the left of it: a producer may hand over a wider buffer so that both
     /// sides work out the same distance between rows.
     pub buffer_width: u32,
-    /// Bytes from the start of one row of pixels to the start of the next.
+    /// Bytes from the start of one row of pixels to the start of the next. Only
+    /// meaningful where the window has to walk the memory itself; a producer
+    /// handing over a texture the driver describes reports the picture's own row.
     pub stride: u32,
     /// Where the first row starts within the buffer.
     pub offset: u32,
