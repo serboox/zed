@@ -533,6 +533,9 @@ pub struct EditorStyle {
     pub edit_prediction_styles: EditPredictionStyles,
     pub unnecessary_code_fade: f32,
     pub show_underlines: bool,
+    /// Overrides the theme's placeholder colour. Set by a surface that paints
+    /// from a fixed palette, where the theme's colour can land unreadable.
+    pub placeholder: Option<Hsla>,
 }
 
 impl Default for EditorStyle {
@@ -557,6 +560,7 @@ impl Default for EditorStyle {
             },
             unnecessary_code_fade: Default::default(),
             show_underlines: true,
+            placeholder: None,
         }
     }
 }
@@ -10941,6 +10945,7 @@ impl Editor {
             edit_prediction_styles: make_suggestion_styles(cx),
             unnecessary_code_fade: settings.unnecessary_code_fade,
             show_underlines: self.diagnostics_enabled(),
+            placeholder: None,
         }
     }
 

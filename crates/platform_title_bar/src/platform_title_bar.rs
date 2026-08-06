@@ -33,6 +33,9 @@ pub struct PlatformTitleBar {
     system_window_tabs: Entity<SystemWindowTabs>,
     button_layout: Option<WindowButtonLayout>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    /// Set by a window that paints from a fixed palette rather than the active
+    /// theme, so the bar does not sit on it as a strip of another colour.
+    background: Option<Hsla>,
 }
 
 impl PlatformTitleBar {
@@ -48,6 +51,7 @@ impl PlatformTitleBar {
             system_window_tabs,
             button_layout: None,
             multi_workspace: None,
+            background: None,
         }
     }
 
@@ -60,7 +64,15 @@ impl PlatformTitleBar {
         self.multi_workspace = Some(multi_workspace);
     }
 
+    pub fn background(mut self, background: Hsla) -> Self {
+        self.background = Some(background);
+        self
+    }
+
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
+        if let Some(background) = self.background {
+            return background;
+        }
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background

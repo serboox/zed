@@ -3116,7 +3116,9 @@ impl EditorElement {
         // Show the placeholder when the editor is empty
         if snapshot.is_empty() {
             let font_size = style.text.font_size.to_pixels(window.rem_size());
-            let placeholder_color = cx.theme().colors().text_placeholder;
+            let placeholder_color = style
+                .placeholder
+                .unwrap_or_else(|| cx.theme().colors().text_placeholder);
             let placeholder_text = snapshot.placeholder_text();
 
             let placeholder_lines = placeholder_text
@@ -5589,9 +5591,14 @@ impl EditorElement {
                 ) {
                     window
                         .set_cursor_style(CursorStyle::DragCopy, &layout.position_map.text_hitbox);
-                } else if editor.hovered_link_state.as_ref().is_some_and(|hovered_link_state| {
-                    !hovered_link_state.links.is_empty() || hovered_link_state.symbol_range.is_some()
-                }) {
+                } else if editor
+                    .hovered_link_state
+                    .as_ref()
+                    .is_some_and(|hovered_link_state| {
+                        !hovered_link_state.links.is_empty()
+                            || hovered_link_state.symbol_range.is_some()
+                    })
+                {
                     window.set_cursor_style(
                         CursorStyle::PointingHand,
                         &layout.position_map.text_hitbox,

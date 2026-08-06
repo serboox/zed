@@ -2,19 +2,19 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use db::kvp::KeyValueStore;
-use editor::{Editor, EditorEvent};
+use editor::{Editor, EditorElement, EditorEvent, EditorStyle};
 use fuzzy_nucleo::{StringMatchCandidate, match_strings};
 use gpui::{
-    Action, AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable, PathPromptOptions,
-    Pixels, ScrollHandle, Size, Subscription, Task, Window, WindowBounds, WindowHandle, point, px,
-    size,
+    Action, AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable, FontStyle,
+    FontWeight, PathPromptOptions, Pixels, ScrollHandle, Size, Subscription, Task, TextStyle,
+    Window, WindowBounds, WindowHandle, point, px, relative, size, svg,
 };
 use platform_title_bar::PlatformTitleBar;
 use recent_projects::{RecentProjectEntry, get_recent_projects};
 use serde::{Deserialize, Serialize};
-use theme::SystemAppearance;
+use theme::{PlayerColor, SystemAppearance};
 use theme_settings::setup_ui_font;
-use ui::{ButtonLike, KeyBinding, ListItem, ListItemSpacing, WithScrollbar, prelude::*};
+use ui::{ButtonLike, ButtonStyle, KeyBinding, WithScrollbar, cyberpunk, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use uuid::Uuid;
 use workspace::{
@@ -43,6 +43,14 @@ const MIN_WINDOW_SIZE: Size<Pixels> = size(px(420.), px(320.));
 
 /// Height of one project row: the folder name with its path beneath.
 const PROJECT_ROW_HEIGHT: Pixels = px(48.);
+
+/// The mark at the top of the window.
+const MARK_SIZE: Pixels = px(40.);
+
+/// The stripe that marks the row Enter would open. A single thick edge rather
+/// than a box around the row, which is the terminal-output motif this chrome is
+/// built from.
+const SELECTED_EDGE: Pixels = px(3.);
 
 /// How many rows the list shows before it scrolls. Past this the filter field is
 /// the way to find a project, not the scrollbar.
@@ -341,8 +349,11 @@ impl Launchpad {
 
         Self {
             app_state,
-            title_bar: (!cfg!(target_os = "macos"))
-                .then(|| cx.new(|cx| PlatformTitleBar::new("launchpad-title-bar", cx))),
+            title_bar: (!cfg!(target_os = "macos")).then(|| {
+                cx.new(|cx| {
+                    PlatformTitleBar::new("launchpad-title-bar", cx).background(cyberpunk::canvas())
+                })
+            }),
             focus_handle: cx.focus_handle(),
             filter,
             projects,
@@ -549,6 +560,54 @@ impl Launchpad {
         window.remove_window();
     }
 
+    /// The one element of the window that carries the accent. No glow: a box
+    /// shadow behind a glyph lights the box rather than the glyph, which reads
+    /// as a smudge instead of a halo.
+    fn render_mark(&self) -> impl IntoElement + use<> {
+        svg()
+            .path("images/zed_logo.svg")
+            .size(MARK_SIZE)
+            .flex_none()
+            .text_color(cyberpunk::Accent::Cyan.border())
+    }
+
+    /// The filter drawn with this window's own palette rather than the theme's:
+    /// an editor otherwise paints itself in whatever colours are active, which
+    /// on a light theme would put white text in a near-black field.
+    fn render_filter(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let gpui::Font {
+            family,
+            features,
+            fallbacks,
+            ..
+        } = theme::theme_settings(cx).buffer_font(cx).clone();
+        let accent = cyberpunk::Accent::Cyan.border();
+        EditorElement::new(
+            &self.filter,
+            EditorStyle {
+                background: cyberpunk::surface(),
+                local_player: PlayerColor {
+                    cursor: accent,
+                    selection: accent.opacity(0.25),
+                    background: cyberpunk::surface(),
+                },
+                placeholder: Some(cyberpunk::text_tertiary()),
+                text: TextStyle {
+                    color: cyberpunk::text_primary(),
+                    font_family: family,
+                    font_features: features,
+                    font_fallbacks: fallbacks,
+                    font_size: px(14.).into(),
+                    font_weight: FontWeight::MEDIUM,
+                    font_style: FontStyle::Normal,
+                    line_height: relative(1.3),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
     fn render_project(
         &self,
         row: usize,
@@ -556,24 +615,46 @@ impl Launchpad {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let project = self.projects.get(project_index)?;
+        let selected = row == self.selected;
         Some(
-            ListItem::new(row)
-                .toggle_state(row == self.selected)
-                .inset(true)
-                .spacing(ListItemSpacing::Sparse)
+            h_flex()
+                .id(("launchpad-project", row))
+                .w_full()
+                .h(PROJECT_ROW_HEIGHT)
+                .items_center()
+                .when(selected, |row| row.bg(cyberpunk::surface()))
+                .hover(|row| row.bg(cyberpunk::surface()))
+                .active(|row| row.bg(cyberpunk::border_dim()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.select(row, cx);
                     this.confirm(window, cx);
                 }))
+                // A single thick edge rather than a box around the row: it marks
+                // what Enter will open without adding another rectangle.
+                .child(
+                    div()
+                        .w(SELECTED_EDGE)
+                        .h_full()
+                        .when(selected, |edge| edge.bg(cyberpunk::Accent::Cyan.border())),
+                )
                 .child(
                     v_flex()
                         .w_full()
                         .min_w_0()
-                        .child(Label::new(project.entry.name.clone()).truncate())
+                        // The edge is part of the row's own left inset, so that a
+                        // name starts on the same line as the filter above it
+                        // rather than three pixels to its right.
+                        .pl(cyberpunk::SPACE_14 - SELECTED_EDGE)
+                        .pr(cyberpunk::SPACE_14)
+                        .child(
+                            Label::new(project.entry.name.clone())
+                                .color(Color::Custom(cyberpunk::text_primary()))
+                                .truncate(),
+                        )
                         .child(
                             Label::new(project.path.clone())
                                 .size(LabelSize::Small)
-                                .color(Color::Muted)
+                                .color(Color::Custom(cyberpunk::text_tertiary()))
                                 .truncate(),
                         ),
                 )
@@ -597,7 +678,7 @@ impl Launchpad {
                 .items_center()
                 .child(
                     Label::new("No project matches that.")
-                        .color(Color::Muted)
+                        .color(Color::Custom(cyberpunk::text_tertiary()))
                         .size(LabelSize::Small),
                 )
                 .into_any_element();
@@ -626,14 +707,20 @@ impl Launchpad {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let keybinding = KeyBinding::for_action_in(action.as_ref(), &self.focus_handle, cx);
+        // Outlined rather than filled, and square rather than rounded, since both
+        // are what the chrome around it is built from. Still a `ButtonLike`: a
+        // hand-drawn row loses the button role, the keyboard activation and the
+        // pressed state that assistive technology and the reader both rely on.
         ButtonLike::new(id)
+            .style(ButtonStyle::OutlinedCustom(cyberpunk::border_raised()))
+            .square()
             .when(full_width, |button| button.full_width())
             .child(
                 h_flex()
                     .w_full()
-                    .gap_2()
+                    .gap(cyberpunk::SPACE_8)
                     .justify_between()
-                    .child(Label::new(label).color(Color::Muted))
+                    .child(Label::new(label).color(Color::Custom(cyberpunk::text_secondary())))
                     .child(keybinding),
             )
             .on_click(cx.listener(move |_, _, window, cx| {
@@ -644,21 +731,21 @@ impl Launchpad {
     fn render_ways_in(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let new_file = self.render_way_in(
             "launchpad-new-file",
-            "New File",
+            "NEW FILE",
             workspace::NewFile.boxed_clone(),
             stacked,
             cx,
         );
         let open_folder = self.render_way_in(
             "launchpad-open-folder",
-            "Open a Folder…",
+            "OPEN A FOLDER",
             workspace::Open::default().boxed_clone(),
             stacked,
             cx,
         );
         let open_file = self.render_way_in(
             "launchpad-open-file",
-            "Open a File…",
+            "OPEN A FILE",
             workspace::OpenFiles.boxed_clone(),
             stacked,
             cx,
@@ -695,33 +782,20 @@ impl Render for Launchpad {
         // A window without a workspace does not otherwise pick up the reader's
         // interface font.
         let ui_font = setup_ui_font(window, cx);
-        // Copied out in one go rather than held as a borrow: the sections below
-        // build their own elements from `cx`, which a live borrow of the theme
-        // would rule out.
-        let (background, text, border, border_variant, editor_background) = {
-            let colors = cx.theme().colors();
-            (
-                colors.background,
-                colors.text,
-                colors.border,
-                colors.border_variant,
-                colors.editor_background,
-            )
-        };
         let has_no_history = self.has_no_history();
 
         let body = if has_no_history {
             v_flex()
-                .gap_3()
+                .gap(cyberpunk::SPACE_14)
                 .child(
                     Label::new("No projects yet. Open a folder or a file to make one.")
-                        .color(Color::Muted),
+                        .color(Color::Custom(cyberpunk::text_secondary())),
                 )
                 .child(self.render_ways_in(true, cx))
                 .into_any_element()
         } else {
             v_flex()
-                .gap_2()
+                .gap(cyberpunk::SPACE_14)
                 .flex_1()
                 .min_h_0()
                 .child(
@@ -731,12 +805,14 @@ impl Render for Launchpad {
                         // row that sizes itself to it would paint a sliver.
                         .h_9()
                         .flex_none()
-                        .px_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(editor_background)
-                        .child(div().flex_1().child(self.filter.clone())),
+                        .px(cyberpunk::SPACE_14)
+                        .cyberpunk_surface()
+                        .child(div().flex_1().child(self.render_filter(cx))),
+                )
+                .child(
+                    Label::new("RECENT")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Custom(cyberpunk::text_tertiary())),
                 )
                 .child(self.render_projects(window, cx))
                 .into_any_element()
@@ -746,8 +822,12 @@ impl Render for Launchpad {
             v_flex()
                 .size_full()
                 .font(ui_font)
-                .bg(background)
-                .text_color(text)
+                // The palette is fixed rather than read from the active theme:
+                // the whole point of the style is a near-black surface with one
+                // accent, which a light theme would undo.
+                .cyberpunk_monospace(cx)
+                .bg(cyberpunk::canvas())
+                .text_color(cyberpunk::text_primary())
                 .children(self.title_bar.clone())
                 .child(
                     v_flex()
@@ -820,15 +900,15 @@ impl Render for Launchpad {
                                 cx,
                             );
                         }))
-                        .child(Label::new("Zed").size(LabelSize::Large))
+                        .child(self.render_mark())
                         .child(body)
                         .when(!has_no_history, |content| {
                             content.child(
                                 v_flex()
-                                    .gap_2()
-                                    .pt_2()
+                                    .gap(cyberpunk::SPACE_14)
+                                    .pt(cyberpunk::SPACE_14)
                                     .border_t_1()
-                                    .border_color(border_variant)
+                                    .border_color(cyberpunk::border_dim())
                                     .child(self.render_ways_in(false, cx)),
                             )
                         }),
