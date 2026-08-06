@@ -560,9 +560,10 @@ impl Launchpad {
         window.remove_window();
     }
 
-    /// The one element of the window that carries the accent. No glow: a box
-    /// shadow behind a glyph lights the box rather than the glyph, which reads
-    /// as a smudge instead of a halo.
+    /// Deliberately not in the accent. The accent belongs to whatever the reader
+    /// has to find, and here that is the project they came to open -- a mark this
+    /// size in cyan pulls the eye away from the list every time it is opened. It
+    /// is a mark, not a thing to read: quiet enough to look past.
     ///
     /// Centred by a full-width row rather than by a margin, so it stays centred
     /// as the window is resized instead of at whatever width it opened.
@@ -573,7 +574,7 @@ impl Launchpad {
                 .debug_selector(|| "launchpad-mark".into())
                 .size(MARK_SIZE)
                 .flex_none()
-                .text_color(cyberpunk::Accent::Cyan.border()),
+                .text_color(cyberpunk::text_tertiary()),
         )
     }
 
