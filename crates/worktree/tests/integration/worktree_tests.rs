@@ -5879,3 +5879,112 @@ async fn test_reading_a_file_publishes_how_many_bytes_are_in(cx: &mut TestAppCon
          or the tab goes on claiming the file is still being read"
     );
 }
+
+/// The law this fork holds its tree to: whatever is in the directory is in the
+/// tree, with nothing left out for being hidden, ignored, generated or big.
+///
+/// A path left out of the scan is not merely absent from the panel -- it is
+/// absent from project search, from go-to-file and from git status as well, and
+/// that is a far worse surprise than a scan that takes longer. This pins the
+/// empty exclusion list to mean exactly what it says, so that a default list
+/// arriving from upstream cannot quietly start hiding things again.
+///
+/// A directory git ignores is listed but not read until it is opened, which is
+/// what keeps a `node_modules` from being walked for nothing. It is still
+/// there, and opening it still shows what is inside -- the second half of this
+/// checks exactly that, since "visible" would mean little if the folder could
+/// never be opened.
+#[gpui::test]
+async fn test_an_empty_exclusion_list_leaves_nothing_out(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(Vec::new());
+                settings.project.worktree.file_scan_inclusions = Some(Vec::new());
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": { "HEAD": "ref: refs/heads/main\n" },
+            ".gitignore": "dist\nnode_modules\n",
+            ".hidden-file": "",
+            ".hidden-dir": { "inside": "" },
+            "dist": { "built.js": "" },
+            "node_modules": { "package.json": "{}" },
+            "vendor": { "library.py": "" },
+            "target": { "debug": { "binary": "" } },
+            "readable.txt": "",
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new(path!("/root")),
+        true,
+        fs,
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        let seen = tree
+            .entries(true, 0)
+            .map(|entry| entry.path.as_ref())
+            .collect::<Vec<_>>();
+        for wanted in [
+            ".git",
+            ".git/HEAD",
+            ".gitignore",
+            ".hidden-file",
+            ".hidden-dir",
+            ".hidden-dir/inside",
+            "dist",
+            "node_modules",
+            "vendor",
+            "vendor/library.py",
+            "target",
+            "target/debug",
+            "target/debug/binary",
+            "readable.txt",
+        ] {
+            assert!(
+                seen.contains(&rel_path(wanted)),
+                "{wanted} is on disk and not in the tree; what was scanned was {seen:?}"
+            );
+        }
+    });
+
+    let ignored_dir = tree.read_with(cx, |tree, _| {
+        tree.entry_for_path(rel_path("dist"))
+            .expect("an ignored directory is still in the tree")
+            .id
+    });
+    tree.update(cx, |tree, cx| tree.expand_entry(ignored_dir, cx))
+        .expect("a directory can be opened")
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        let seen = tree
+            .entries(true, 0)
+            .map(|entry| entry.path.as_ref())
+            .collect::<Vec<_>>();
+        assert!(
+            seen.contains(&rel_path("dist/built.js")),
+            "opening an ignored directory has to show what is inside it; \
+             what was scanned was {seen:?}"
+        );
+    })
+}
