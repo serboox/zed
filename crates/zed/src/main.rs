@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod reliability;
+mod startup_timing;
 mod zed;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
@@ -471,9 +472,18 @@ fn main() {
         if let Some(app_state) = AppState::try_global(cx) {
             cx.spawn({
                 async move |cx| {
+                    startup_timing::mark_since(
+                        "about to open what the launch asked for",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
                     if let Err(e) = restore_or_create_workspace(app_state, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
+                    startup_timing::mark_since(
+                        "the window the launch asked for is open",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
+                    startup_timing::report();
                 }
             })
             .detach();
@@ -481,6 +491,7 @@ fn main() {
     });
 
     app.run(move |cx| {
+        startup_timing::mark_since("reached the app's own start", *STARTUP_TIME.get().unwrap());
         cx.set_global(app_db);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
@@ -670,7 +681,12 @@ fn main() {
             cx,
         );
 
+        startup_timing::mark_since(
+            "before loading every bundled theme",
+            *STARTUP_TIME.get().unwrap(),
+        );
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+        startup_timing::mark_since("loaded every bundled theme", *STARTUP_TIME.get().unwrap());
         eager_load_active_theme_and_icon_theme(fs.clone(), cx);
         theme_extension::init(
             extension_host_proxy,
@@ -874,6 +890,10 @@ fn main() {
             }
         }
 
+        startup_timing::mark_since(
+            "finished every subsystem's init",
+            *STARTUP_TIME.get().unwrap(),
+        );
         initialize_workspace(app_state.clone(), cx);
 
         cx.activate(true);
@@ -934,9 +954,18 @@ fn main() {
             Some(request) if request.is_focus_app_only() => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
+                    startup_timing::mark_since(
+                        "about to open what the launch asked for",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
                     if let Err(e) = restore_or_create_workspace(app_state, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
+                    startup_timing::mark_since(
+                        "the window the launch asked for is open",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
+                    startup_timing::report();
                 }
             }),
             Some(request) => {
@@ -946,9 +975,18 @@ fn main() {
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
+                    startup_timing::mark_since(
+                        "about to open what the launch asked for",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
                     if let Err(e) = restore_or_create_workspace(app_state, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
+                    startup_timing::mark_since(
+                        "the window the launch asked for is open",
+                        *STARTUP_TIME.get().unwrap(),
+                    );
+                    startup_timing::report();
                 }
             }),
         };
@@ -1264,6 +1302,10 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             cx,
         );
         task = Some(cx.spawn(async move |cx| {
+            crate::startup_timing::mark_since(
+                "about to open the paths named on the command line",
+                *STARTUP_TIME.get().unwrap(),
+            );
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
             let (_window, results) = open_paths_with_positions(
@@ -1283,6 +1325,11 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     log::error!("Error opening path: {err:#}");
                 }
             }
+            crate::startup_timing::mark_since(
+                "the window for the paths named is open",
+                *STARTUP_TIME.get().unwrap(),
+            );
+            crate::startup_timing::report();
             anyhow::Ok(())
         }));
     }
