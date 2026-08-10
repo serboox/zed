@@ -12,6 +12,7 @@ mod display;
 mod events;
 mod keyboard;
 mod platform;
+mod shared_frame_import;
 mod system_notifications;
 mod system_settings;
 mod util;

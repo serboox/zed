@@ -46,7 +46,7 @@ pub mod profiler;
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod shared_frame;
 mod shared_uri;
 mod style;
@@ -145,7 +145,7 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use shared_frame::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};

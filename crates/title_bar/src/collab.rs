@@ -359,7 +359,10 @@ impl TitleBar {
         let muted_by_user = room.muted_by_user();
         let is_deafened = room.is_deafened().unwrap_or(false);
         let is_screen_sharing = room.is_sharing_screen();
-        let can_use_microphone = room.can_use_microphone();
+        // The room's own answer is about the reader's role. On a platform with no
+        // real client behind the call there is nothing to send whatever the role,
+        // and a control that does nothing reads as one that broke.
+        let can_use_microphone = room.can_use_microphone() && livekit_client::CAN_CARRY_A_CALL;
         let can_share_projects = room.can_share_projects();
         let screen_sharing_supported = cx.is_screen_capture_supported();
 
@@ -483,39 +486,41 @@ impl TitleBar {
                     .on_click(move |_, _window, cx| toggle_mute(cx)),
                 )
             })
-            .child(
-                IconButton::new(
-                    "mute-sound",
-                    if is_deafened {
-                        IconName::AudioOff
-                    } else {
-                        IconName::AudioOn
-                    },
+            .when(livekit_client::CAN_CARRY_A_CALL, |this| {
+                this.child(
+                    IconButton::new(
+                        "mute-sound",
+                        if is_deafened {
+                            IconName::AudioOff
+                        } else {
+                            IconName::AudioOn
+                        },
+                    )
+                    .selected_style(ButtonStyle::Tinted(TintColor::Error))
+                    .icon_size(IconSize::Small)
+                    .toggle_state(is_deafened)
+                    .tooltip(move |_window, cx| {
+                        if is_deafened {
+                            let label = "Unmute Audio";
+
+                            if !muted_by_user {
+                                Tooltip::with_meta(label, None, "Microphone will be unmuted", cx)
+                            } else {
+                                Tooltip::simple(label, cx)
+                            }
+                        } else {
+                            let label = "Mute Audio";
+
+                            if !muted_by_user {
+                                Tooltip::with_meta(label, None, "Microphone will be muted", cx)
+                            } else {
+                                Tooltip::simple(label, cx)
+                            }
+                        }
+                    })
+                    .on_click(move |_, _, cx| toggle_deafen(cx)),
                 )
-                .selected_style(ButtonStyle::Tinted(TintColor::Error))
-                .icon_size(IconSize::Small)
-                .toggle_state(is_deafened)
-                .tooltip(move |_window, cx| {
-                    if is_deafened {
-                        let label = "Unmute Audio";
-
-                        if !muted_by_user {
-                            Tooltip::with_meta(label, None, "Microphone will be unmuted", cx)
-                        } else {
-                            Tooltip::simple(label, cx)
-                        }
-                    } else {
-                        let label = "Mute Audio";
-
-                        if !muted_by_user {
-                            Tooltip::with_meta(label, None, "Microphone will be muted", cx)
-                        } else {
-                            Tooltip::simple(label, cx)
-                        }
-                    }
-                })
-                .on_click(move |_, _, cx| toggle_deafen(cx)),
-            )
+            })
             .when(
                 is_local && can_share_projects && !is_connecting_to_project,
                 |this| {

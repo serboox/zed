@@ -572,6 +572,14 @@ impl ButtonLike {
         self
     }
 
+    /// Leaves every corner square. For surfaces whose whole look rests on sharp
+    /// edges; the rounding type itself is this crate's, so a caller outside it
+    /// has no other way to ask.
+    pub fn square(mut self) -> Self {
+        self.rounding = None;
+        self
+    }
+
     pub fn on_right_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,

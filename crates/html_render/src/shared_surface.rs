@@ -38,12 +38,21 @@ pub(crate) struct SharedBuffer {
     pub(crate) stride: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// Always zero: a surface begins at its own origin, where a Linux buffer can
+    /// sit at a distance into a larger allocation. Carried so that lending a
+    /// frame is the same piece of code on every platform.
+    pub(crate) offset: u32,
 }
 
 /// Pixels row after row, four bytes each, blue first. This is what OpenGL writes
 /// through the binding below and what the window's own renderer reads, so both
 /// sides are talking about the same bytes.
 const BYTES_PER_PIXEL: i32 = 4;
+
+/// The same four-bytes-a-pixel, blue-first layout the other platforms name. The
+/// window's own renderer here reads the layout out of the pixel buffer instead of
+/// this, so it is carried only so that a lent frame says what it holds.
+pub(crate) const FORMAT_ABGR8888: u32 = 0x3432_4241;
 
 /// What a surface has to be bound as. Rectangle textures are the only kind an
 /// `IOSurface` can be bound to, so the page's own framebuffer is built round one
@@ -53,6 +62,15 @@ const GL_RGBA: u32 = 0x1908;
 const GL_BGRA: u32 = 0x80E1;
 const GL_UNSIGNED_INT_8_8_8_8_REV: u32 = 0x8367;
 const NO_CGL_ERROR: c_int = 0;
+
+impl SharedBuffer {
+    /// Hands the window a reference of its own. Cloning a `CVPixelBuffer` takes
+    /// another count on the same surface, which is what lending means here:
+    /// nothing is copied, and the page goes on drawing into it.
+    pub(crate) fn share(&self) -> Option<gpui::SharedFrameHandle> {
+        Some(self.image_buffer.clone())
+    }
+}
 
 impl SharedBuffers {
     /// Whether this machine will let the page draw where the window can read it.
@@ -182,6 +200,7 @@ impl SharedBuffers {
                 stride: IOSurfaceGetBytesPerRow(surface) as u32,
                 width,
                 height,
+                offset: 0,
             })
         }
     }

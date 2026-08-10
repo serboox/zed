@@ -1,5 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+pub mod launchpad;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -3027,7 +3028,7 @@ mod tests {
         open_new, open_paths, pane,
     };
 
-    async fn flush_workspace_serialization(
+    pub(crate) async fn flush_workspace_serialization(
         window: &WindowHandle<MultiWorkspace>,
         cx: &mut TestAppContext,
     ) {
@@ -5743,6 +5744,7 @@ mod tests {
                 "activity_indicator",
                 "agent",
                 "agents_sidebar",
+                "api_client_panel",
                 "app_menu",
                 "assistant",
                 "assistant2",
@@ -5750,6 +5752,7 @@ mod tests {
                 "branch_picker",
                 "bedrock",
                 "branches",
+                "browser_tools",
                 "buffer_search",
                 "channel_modal",
                 "cli",
@@ -5761,6 +5764,11 @@ mod tests {
                 "context_server",
                 "copilot",
                 "csv",
+                "database_panel",
+                "db_compare_data",
+                "db_ddl_source",
+                "db_result_view",
+                "db_schema_diff",
                 "debug_panel",
                 "debugger",
                 "dev",
@@ -5768,6 +5776,7 @@ mod tests {
                 "edit_prediction",
                 "editor",
                 "encoding_selector",
+                "erd_view",
                 "feedback",
                 "file_finder",
                 "git",
@@ -5777,6 +5786,7 @@ mod tests {
                 "git_picker",
                 "go_to_line",
                 "highlights_tree_view",
+                "html",
                 "icon_theme_selector",
                 "image_viewer",
                 "inline_assistant",
@@ -5798,6 +5808,7 @@ mod tests {
                 "pane",
                 "panel",
                 "picker",
+                "preview",
                 "project_panel",
                 "project_search",
                 "project_symbols",

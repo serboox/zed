@@ -279,16 +279,16 @@ impl MySqlProvider {
 /// since decoding a `decimal` into a float would lose digits -- and every one of
 /// those refusals used to leave the cell reading as absent.
 fn cell_to_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<String> {
-    // A binary column is bytes, not characters, and the client prints its bytes
-    // as hex. Read as text, an md5 comes out as the mojibake it looks like.
-    if is_binary_column(column_type_name(row, index)) {
+    // A column of bytes is not a column of characters, and the client prints its
+    // bytes as hex: read as text, an md5 comes out as mojibake.
+    if holds_bytes(column_type_name(row, index)) {
         return cell_bytes(row, index).map(|bytes| written_hex(&bytes));
     }
 
     row.try_get_unchecked::<Option<String>, _>(index)
         .ok()
         .flatten()
-        .or_else(|| cell_bytes(row, index).map(|bytes| written_hex(&bytes)))
+        .or_else(|| cell_bytes(row, index).map(|bytes| written_bytes_or_text(&bytes)))
 }
 
 fn cell_bytes(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<Vec<u8>> {
@@ -297,21 +297,32 @@ fn cell_bytes(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// The columns whose values the client writes as hex rather than as characters.
-/// `TEXT` and `BLOB` share a wire type and are told apart by their collation,
-/// which is why sqlx reports them under different names.
-fn is_binary_column(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "BINARY"
-            | "VARBINARY"
-            | "BLOB"
-            | "TINYBLOB"
-            | "MEDIUMBLOB"
-            | "LONGBLOB"
-            | "BIT"
-            | "GEOMETRY"
-    )
+/// The columns that certainly hold bytes rather than characters: a fixed-width
+/// one holds a hash or an id, and a bit string is bits.
+///
+/// The client decides this by the value's character set -- hex when that set is
+/// the binary one -- but sqlx keeps the set to itself and names the type from the
+/// column's binary *flag*, which MySQL also sets for a perfectly ordinary text
+/// column declared with a `_bin` collation. Going by the name alone therefore
+/// turns a name like `--crypto` in a `varchar(512) collate utf8mb4_bin` into hex,
+/// so only the fixed-width kinds are decided here and the rest are decided by
+/// what their bytes turn out to be.
+fn holds_bytes(type_name: &str) -> bool {
+    matches!(type_name, "BINARY" | "BIT")
+}
+
+/// Bytes from a column that may hold either. Text reads as text, which is what
+/// the client does for every character column whatever its collation; anything
+/// that is not text reads as hex, which is what it does for bytes.
+///
+/// The one place this parts company with the client: a variable-width binary
+/// column holding text -- a `varbinary` with a word in it -- reads as that word
+/// here and as hex there. Unreadable names in the grid are the worse error.
+fn written_bytes_or_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => written_hex(bytes),
+    }
 }
 
 /// Hex in the form the client uses, `0x` and upper case, so a value can be
@@ -1001,7 +1012,7 @@ fn rename_table_sql(database: &str, old_name: &str, new_name: &str) -> String {
 
 #[cfg(test)]
 mod cell_tests {
-    use super::{is_binary_column, written_hex};
+    use super::{holds_bytes, written_bytes_or_text, written_hex};
 
     #[test]
     fn a_hash_is_written_the_way_the_client_writes_it() {
@@ -1020,28 +1031,48 @@ mod cell_tests {
         );
     }
 
-    /// A `text` column and a `blob` share a wire type and are told apart by
-    /// their collation. Treating text as bytes would turn every long string in
-    /// the grid into hex.
+    /// MySQL sets a column's binary flag for a `_bin` collation as well as for
+    /// real bytes, and sqlx names the type from that flag, so the name alone
+    /// cannot say whether a value is characters. Only the fixed-width kinds may
+    /// be decided by it.
     #[test]
-    fn only_binary_columns_are_written_as_hex() {
-        for binary in [
-            "BINARY",
+    fn only_the_fixed_width_kinds_are_decided_by_the_type_name() {
+        for bytes in ["BINARY", "BIT"] {
+            assert!(holds_bytes(bytes), "{bytes} holds bytes whatever is in it");
+        }
+        for maybe in [
             "VARBINARY",
             "BLOB",
             "TINYBLOB",
-            "MEDIUMBLOB",
             "LONGBLOB",
-            "BIT",
-            "GEOMETRY",
+            "VARCHAR",
+            "CHAR",
+            "TEXT",
+            "ENUM",
+            "JSON",
         ] {
-            assert!(is_binary_column(binary), "{binary} holds bytes");
+            assert!(
+                !holds_bytes(maybe),
+                "{maybe} has to be decided by its own bytes"
+            );
         }
-        for text in [
-            "VARCHAR", "CHAR", "TEXT", "TINYTEXT", "LONGTEXT", "ENUM", "JSON",
-        ] {
-            assert!(!is_binary_column(text), "{text} holds characters");
-        }
+    }
+
+    /// The case that broke: `varchar(512) character set utf8mb4 collate
+    /// utf8mb4_bin` is a column of names, and MySQL's own client prints them as
+    /// names. sqlx calls its type `VARBINARY`, which is not enough to go on.
+    #[test]
+    fn a_name_in_a_column_with_a_binary_collation_stays_a_name() {
+        assert_eq!(written_bytes_or_text(b"--crypto"), "--crypto");
+        assert_eq!(
+            written_bytes_or_text(b"1000000_exchange"),
+            "1000000_exchange"
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_are_still_written_as_hex() {
+        assert_eq!(written_bytes_or_text(&[0xff, 0xfe, 0x00]), "0xFFFE00");
     }
 }
 
@@ -1216,6 +1247,7 @@ mod integration_tests {
                    id int unsigned NOT NULL PRIMARY KEY,\
                    md5 binary(16) DEFAULT NULL,\
                    blobbed varbinary(32) DEFAULT NULL,\
+                   named varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\
                    a_bit bit(8) DEFAULT NULL,\
                    money decimal(20,6) DEFAULT NULL,\
                    made_at timestamp NOT NULL,\
@@ -1230,11 +1262,12 @@ mod integration_tests {
             .execute_query(
                 "",
                 "INSERT INTO zed_moment_probe \
-                 (id, md5, blobbed, a_bit, money, made_at, exactly, the_day, the_hour) VALUES \
-                 (1, UNHEX('d41d8cd98f00b204e9800998ecf8427e'), 'utf8mb4_unicode_ci', \
+                 (id, md5, blobbed, named, a_bit, money, made_at, exactly, the_day, the_hour) \
+                 VALUES \
+                 (1, UNHEX('d41d8cd98f00b204e9800998ecf8427e'), 'utf8mb4_unicode_ci', '--crypto', \
                   b'10101010', 12345678901234.567890, \
                   '2026-08-02 16:28:50', '2026-08-02 16:28:50.004500', '2026-08-02', '16:28:50'), \
-                 (2, NULL, NULL, NULL, NULL, '2026-08-02 16:28:51', NULL, NULL, NULL)",
+                 (2, NULL, NULL, NULL, NULL, NULL, '2026-08-02 16:28:51', NULL, NULL, NULL)",
             )
             .await
             .expect("failed to seed the probe table");
@@ -1242,7 +1275,8 @@ mod integration_tests {
         let result = provider
             .execute_query(
                 "",
-                "SELECT id, md5, blobbed, a_bit, money, made_at, exactly, the_day, the_hour \
+                "SELECT id, md5, blobbed, named, a_bit, money, made_at, exactly, the_day, \
+                        the_hour \
                  FROM zed_moment_probe ORDER BY id",
             )
             .await
@@ -1269,7 +1303,8 @@ mod integration_tests {
                 vec![
                     "1".to_string(),
                     "0xD41D8CD98F00B204E9800998ECF8427E".to_string(),
-                    "0x757466386D62345F756E69636F64655F6369".to_string(),
+                    "utf8mb4_unicode_ci".to_string(),
+                    "--crypto".to_string(),
                     "0xAA".to_string(),
                     "12345678901234.567890".to_string(),
                     "2026-08-02 16:28:50".to_string(),
@@ -1279,6 +1314,7 @@ mod integration_tests {
                 ],
                 vec![
                     "2".to_string(),
+                    "NULL".to_string(),
                     "NULL".to_string(),
                     "NULL".to_string(),
                     "NULL".to_string(),

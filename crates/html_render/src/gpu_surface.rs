@@ -5,16 +5,18 @@ use std::sync::Arc;
 
 use dpi::PhysicalSize;
 use euclid::Size2D;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use gpui::SharedFrame;
 
 #[cfg(target_os = "linux")]
 use crate::dma_buf_export::DmaBufExporter;
 #[cfg(target_os = "linux")]
-use crate::shared_buffer::{SharedBuffer, SharedBuffers};
+use crate::shared_buffer::{FORMAT_ABGR8888, SharedBuffer, SharedBuffers};
 #[cfg(target_os = "macos")]
-use crate::shared_surface::{SharedBuffer, SharedBuffers};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use crate::shared_surface::{FORMAT_ABGR8888, SharedBuffer, SharedBuffers};
+#[cfg(target_os = "windows")]
+use crate::shared_texture::{FORMAT_ABGR8888, SharedBuffer, SharedBuffers};
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use nothing::{SharedBuffer, SharedBuffers};
 use servo::{DeviceIntRect, RenderingContext, RgbaImage};
 use surfman::{
@@ -48,7 +50,7 @@ pub(crate) struct GpuSurface {
     /// driver has no way to hand a buffer over, and then frames are copied.
     #[cfg(target_os = "linux")]
     exporter: Option<DmaBufExporter>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Whether handing frames over has already been found impossible on this
     /// machine. Asking again every frame costs an image each time and the answer
     /// does not change until the page is resized.
@@ -100,7 +102,7 @@ struct Face {
     shared: Option<SharedBuffer>,
     /// The frame the window is handed for this face, made once and handed out
     /// every time this face comes round again.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     frame: RefCell<Option<Arc<SharedFrame>>>,
 }
 
@@ -157,6 +159,13 @@ impl RenderTarget {
         &self.faces[at]
     }
 
+    /// Whether the page has drawn into a face and moved on from it. Until it has,
+    /// the face the window would be handed is the one still being drawn into.
+    #[cfg(target_os = "windows")]
+    fn nothing_turned_yet(&self) -> bool {
+        self.faces.len() > 1 && self.drawn.get() == self.drawing.get()
+    }
+
     /// Says the page has been drawn: what was being drawn into is what the
     /// window is handed, and the next frame goes somewhere else.
     fn turn(&self) {
@@ -209,7 +218,13 @@ impl Face {
         };
         gl.bind_texture(target, texture);
         match &shared {
-            Some((buffers, buffer)) => buffers.bind_to_texture(buffer),
+            Some((buffers, buffer)) => {
+                if !buffers.bind_to_texture(buffer, texture) {
+                    gl.delete_textures(&[texture]);
+                    give_up(&shared);
+                    return None;
+                }
+            }
             None => gl.tex_image_2d(
                 target,
                 0,
@@ -258,15 +273,19 @@ impl Face {
             texture,
             framebuffer,
             shared: shared.map(|(_, buffer)| buffer),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             frame: RefCell::new(None),
         })
     }
 
     fn discard(&self, gl: &Rc<dyn gleam::gl::Gl>, buffers: Option<&SharedBuffers>) {
         gl.delete_framebuffers(&[self.framebuffer]);
-        gl.delete_textures(&[self.texture]);
+        // Before the texture goes: where a driver pairs an OpenGL texture with one
+        // of its own, that pair has to be broken while both halves still exist.
+        // Giving the memory up first is safe either way -- a texture made from a
+        // shared image keeps the image's contents once the image itself has gone.
         self.discard_shared(buffers);
+        gl.delete_textures(&[self.texture]);
     }
 
     fn discard_shared(&self, buffers: Option<&SharedBuffers>) {
@@ -362,12 +381,16 @@ impl GpuSurface {
         // The surfman surface exists so the context has something to be current
         // with; the page is drawn into a texture of our own, beside it.
         let address = |name: &str| device.get_proc_address(&context, name);
-        let buffers = SharedBuffers::new(&address, &gleam_gl);
+        let buffers = SharedBuffers::new(&address, &gleam_gl, &device);
         let target = RenderTarget::new(&gleam_gl, size, buffers.as_ref()).ok_or(Error::Failed)?;
         #[cfg(target_os = "linux")]
         let exporter = DmaBufExporter::new(address);
         #[cfg(target_os = "linux")]
         if exporter.is_none() && buffers.is_none() {
+            log::info!("this driver cannot hand frames over, so they will be copied");
+        }
+        #[cfg(target_os = "windows")]
+        if buffers.is_none() {
             log::info!("this driver cannot hand frames over, so they will be copied");
         }
 
@@ -381,7 +404,7 @@ impl GpuSurface {
             buffers,
             #[cfg(target_os = "linux")]
             exporter,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             cannot_share: Cell::new(false),
             read_format: Cell::new(None),
             sealed: Cell::new(std::ptr::null()),
@@ -395,7 +418,7 @@ impl GpuSurface {
     /// This is the face the page has just finished, not the one it is drawing
     /// into now. Each face keeps its own, so the two are handed out by turns and
     /// the window has them both.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn shared_frame(&self) -> Option<Arc<SharedFrame>> {
         if let Some(shared) = self.target.borrow().drawn().frame.borrow().as_ref() {
             return Some(shared.clone());
@@ -409,6 +432,16 @@ impl GpuSurface {
             log::info!("frame sharing is switched off, so frames are copied");
             self.cannot_share.set(true);
             return None;
+        }
+        // Where the two APIs take turns holding a texture, the window may not be
+        // handed one OpenGL still holds -- and until the page has moved on from a
+        // face, the face it would be handed is the one it is drawing into.
+        #[cfg(target_os = "windows")]
+        {
+            let nothing_turned_yet = self.target.borrow().nothing_turned_yet();
+            if nothing_turned_yet {
+                self.turn_the_page();
+            }
         }
         let size = self.size.get();
         // Nothing may have been allocated to be shared. A Linux driver that lays
@@ -438,29 +471,41 @@ impl GpuSurface {
     /// Says the page has been drawn, so the next frame goes into the other face
     /// and the one just finished is what the window is handed.
     pub(crate) fn turn_the_page(&self) {
-        self.target.borrow().turn();
+        let target = self.target.borrow();
+        // Where a face is a texture two graphics APIs share, which of them may
+        // touch it is a lock rather than a convention: the one just drawn goes to
+        // the window, and the one about to be drawn comes back to OpenGL.
+        #[cfg(target_os = "windows")]
+        if let Some(buffers) = self.buffers.as_ref() {
+            if let Some(buffer) = target.drawing().shared.as_ref() {
+                buffers.lend(buffer);
+            }
+            target.turn();
+            if let Some(buffer) = target.drawing().shared.as_ref()
+                && !buffers.take_back(buffer)
+            {
+                log::warn!("the page has nowhere to draw its next frame");
+            }
+            return;
+        }
+        target.turn();
     }
 
-    #[cfg(target_os = "linux")]
-    /// The page's own buffer, when it was allocated to be shared. The window
-    /// gets a descriptor of its own for it; the page keeps drawing into the
-    /// memory both now name.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    /// The page's own memory, when it was allocated to be shared. The window is
+    /// given a name of its own for it; the page keeps drawing into the memory
+    /// both now name.
     fn lend_own_memory(&self, size: PhysicalSize<u32>) -> Option<SharedFrame> {
         let target = self.target.borrow();
         let buffer = target.drawn().shared.as_ref()?;
-        let descriptor = buffer
-            .descriptor
-            .try_clone()
-            .inspect_err(|error| log::warn!("the page's buffer would not be lent: {error}"))
-            .ok()?;
         Some(SharedFrame {
-            descriptor,
+            descriptor: buffer.share()?,
             width: size.width,
             height: size.height,
             buffer_width: buffer.width,
             stride: buffer.stride,
             offset: buffer.offset,
-            format: crate::shared_buffer::FORMAT_ABGR8888,
+            format: FORMAT_ABGR8888,
             // The page is drawn with OpenGL, which starts at the bottom.
             bottom_up: true,
             modifier: 0,
@@ -468,22 +513,11 @@ impl GpuSurface {
         })
     }
 
-    #[cfg(target_os = "macos")]
-    /// The page's own surface. The window is handed the very surface the page
-    /// goes on drawing into; both sides name the same pixels, and the surface
-    /// itself is what says how far apart its rows are.
-    fn lend_own_memory(&self) -> Option<SharedFrame> {
-        let target = self.target.borrow();
-        let buffer = target.drawn().shared.as_ref()?;
-        Some(SharedFrame {
-            image_buffer: buffer.image_buffer.clone(),
-            width: buffer.width,
-            height: buffer.height,
-            stride: buffer.stride,
-            // The page is drawn with OpenGL, which starts at the bottom.
-            bottom_up: true,
-            refused: std::sync::atomic::AtomicBool::new(false),
-        })
+    /// Windows has nothing to export: a face there is already a texture the
+    /// window can open, so a face without one means the driver would not make it.
+    #[cfg(target_os = "windows")]
+    fn export_the_texture(&self, _size: PhysicalSize<u32>) -> Option<SharedFrame> {
+        None
     }
 
     #[cfg(target_os = "linux")]
@@ -823,7 +857,7 @@ impl RenderingContext for GpuSurface {
         previous.discard(&self.gleam_gl, self.buffers.as_ref());
         // What the window was lent belonged to the old textures, and new ones
         // deserve a fresh attempt at handing them over.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         self.cannot_share.set(false);
         self.size.set(size);
     }
@@ -931,11 +965,11 @@ fn physical(size: PhysicalSize<u32>) -> Size2D<i32, euclid::UnknownUnit> {
     Size2D::new(size.width as i32, size.height as i32)
 }
 
-/// Sharing the page's memory with the window is something Linux and macOS each
-/// have their own way of. Elsewhere there is nothing to allocate and nothing to
-/// lend, and these stand in so the rest of this file does not have to ask which
-/// machine it is on.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Linux, macOS and Windows each have their own way of handing the page's memory
+/// to the window. Elsewhere there is nothing to allocate and nothing to lend, and
+/// these stand in so the rest of this file does not have to ask which machine it
+/// is on.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod nothing {
     pub(crate) enum SharedBuffers {}
     pub(crate) enum SharedBuffer {}
@@ -944,6 +978,7 @@ mod nothing {
         pub(crate) fn new(
             _address: &dyn Fn(&str) -> *const std::ffi::c_void,
             _gl: &std::rc::Rc<dyn gleam::gl::Gl>,
+            _device: &surfman::Device,
         ) -> Option<Self> {
             None
         }
@@ -952,7 +987,9 @@ mod nothing {
             None
         }
 
-        pub(crate) fn bind_to_texture(&self, _buffer: &SharedBuffer) {}
+        pub(crate) fn bind_to_texture(&self, _buffer: &SharedBuffer, _texture: u32) -> bool {
+            false
+        }
 
         pub(crate) fn discard(&self, _buffer: &SharedBuffer) {}
 

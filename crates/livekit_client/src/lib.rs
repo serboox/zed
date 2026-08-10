@@ -9,12 +9,19 @@ use rodio::DeviceTrait as _;
 mod record;
 pub use record::CaptureInput;
 
+/// Whether a call on this platform can carry anything. Where the real client
+/// cannot be linked, the mock stands in for it and the microphone, audio and
+/// screen sharing controls have nothing behind them: better absent than present
+/// and inert. This reads the platform rather than which client is compiled in,
+/// so tests, which use the mock everywhere, still exercise those controls.
+pub const CAN_CARRY_A_CALL: bool = !cfg!(any(target_os = "windows", target_os = "freebsd"));
+
 #[cfg(any(
     rust_analyzer,
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -24,7 +31,7 @@ mod livekit_client;
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -35,7 +42,7 @@ pub use livekit_client::*;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
@@ -45,7 +52,7 @@ mod mock_client;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
@@ -55,7 +62,7 @@ pub mod test;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]

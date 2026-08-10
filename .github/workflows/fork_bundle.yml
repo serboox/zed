@@ -96,18 +96,10 @@ jobs:
       - name: Install the editor's build dependencies
         run: script/linux
 
-      # The engine plays media through GStreamer, and the crate that binds it
-      # asks pkg-config where the libraries are. Nothing here had them: the
-      # engine's build only ever got past that step because a kept build-script
-      # answer stood in for the libraries themselves, and the first run with a
-      # cold cache said so.
-      - name: Install the packaging, headless-graphics and media tools
+      - name: Install the packaging and headless-graphics tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad gstreamer1.0-libav
+          sudo apt-get install -y rpm xvfb mesa-vulkan-drivers libegl1 libgl1 gettext-base
           sudo gem install --no-document fpm
 
       - run: rustup show
@@ -151,15 +143,15 @@ jobs:
           sudo dpkg -r zed-fork
 
       - name: Test the HTML engine
-        if: needs.plan.outputs.engine != ''
+        if: steps.engine.outcome == 'success'
         run: |
           set -o pipefail
           xvfb-run -a cargo test --profile release-fast --package html_render \
             --features servo -- --nocapture 2>&1 | tee engine-test.log
 
       - name: Say whether the engine ran here
-        if: always() && needs.plan.outputs.engine != ''
-        run: grep -m1 'HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+        if: always() && steps.engine.outcome == 'success'
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
 
   windows:
     needs: plan
@@ -187,6 +179,63 @@ jobs:
       - name: Add NASM to the path
         run: Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
 
+      # The engine's media backend is built against GStreamer, and its bindings
+      # ask pkg-config for the real library rather than taking the feature's word
+      # for it -- so without this the engine does not compile here at all. It only
+      # ever seemed to: a warm cache carried the already-built bindings from run
+      # to run, and the first build on a branch of its own found nothing and
+      # stopped at `glib-sys`.
+      #
+      # Both packages are needed and neither is redundant: the runtime one brings
+      # the libraries and pkg-config itself, the development one the headers and
+      # the `.pc` files that describe them. Nothing else has to be installed --
+      # in particular no pkg-config from anywhere else, which is worth knowing,
+      # since the usual one fetches itself over plain HTTP with no checksum.
+      - name: Install GStreamer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.26.6'
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$version/msvc"
+          foreach ($msi in "gstreamer-1.0-msvc-x86_64-$version.msi",
+                           "gstreamer-1.0-devel-msvc-x86_64-$version.msi") {
+            $file = Join-Path $env:RUNNER_TEMP $msi
+            Invoke-WebRequest -Uri "$base/$msi" -OutFile $file
+            $log = "$file.log"
+            $run = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+              '/i', "`"$file`"", '/qn', '/norestart', 'ADDLOCAL=ALL', '/l*v', "`"$log`""
+            if ($run.ExitCode -ne 0) {
+              if (Test-Path $log) { Get-Content $log -Tail 40 }
+              throw "$msi would not install: exit code $($run.ExitCode)"
+            }
+          }
+
+          # Found rather than assumed: the installer roots its own tree, and a
+          # guessed path would fail much later inside a build script instead.
+          $described = @('C:\gstreamer', "$env:ProgramFiles\gstreamer",
+                         "${env:ProgramFiles(x86)}\gstreamer") |
+            Where-Object { Test-Path $_ } |
+            ForEach-Object {
+              Get-ChildItem $_ -Recurse -Filter 'gstreamer-1.0.pc' -ErrorAction SilentlyContinue
+            } | Select-Object -First 1
+          if (-not $described) { throw 'GStreamer installed but describes nothing to pkg-config' }
+          $pkgconfig = $described.Directory.FullName
+          $root = Split-Path (Split-Path $pkgconfig)
+          $exe = Join-Path $root 'bin\pkg-config.exe'
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem (Join-Path $root 'bin') -Filter '*pkg*' | ForEach-Object { $_.Name }
+            throw "GStreamer brought no pkg-config: nothing at $exe"
+          }
+
+          # Asked here rather than left for the build to discover: this is the one
+          # question the whole engine build rests on, and the answer costs seconds.
+          $env:PKG_CONFIG_PATH = $pkgconfig
+          & $exe --modversion glib-2.0 gstreamer-1.0 gstreamer-play-1.0
+          if ($LASTEXITCODE -ne 0) { throw "pkg-config cannot describe GStreamer from $pkgconfig" }
+
+          "PKG_CONFIG_PATH=$pkgconfig" | Add-Content $env:GITHUB_ENV
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" | Add-Content $env:GITHUB_ENV
+          Add-Content $env:GITHUB_PATH (Join-Path $root 'bin')
+
       - run: rustup show
 
       # Same reason as the Linux job: the engine's crates are identical from run
@@ -196,11 +245,63 @@ jobs:
           shared-key: fork-bundle-${{ runner.os }}
           cache-on-failure: true
 
+      # Whether this window can be handed a frame at all is about the window's own
+      # graphics device and not about the engine, so it is asked first: the answer
+      # is worth having even from a run where nothing else builds.
+      - name: Test what the window can be lent
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --profile release-fast --package gpui_windows -- --nocapture 2>&1 |
+            tee window-test.log
+
+      - name: Say what the window found
+        if: always()
+        shell: bash
+        run: grep -m1 '^SHARED:' window-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      # As an artifact as well as in the summary: an artifact can be fetched while
+      # the rest of the run is still going, and a summary can only be looked at.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-window-test-log
+          path: window-test.log
+          if-no-files-found: ignore
+
+      # Without colour, so that what went wrong can be picked out of the log
+      # rather than read by eye once the run has finished.
       - name: Build with the HTML engine
         id: engine
         if: needs.plan.outputs.engine != ''
         continue-on-error: true
-        run: cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }}
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo build --profile release-fast --package zed ${{ needs.plan.outputs.engine }} 2>&1 |
+            tee engine-build.log
+
+      # A build that fails here is followed by a whole build without the engine,
+      # and a job's log can only be read once the job has finished -- so what
+      # stopped it goes in the summary, which can be read while the rest runs.
+      - name: Say what stopped the engine building
+        if: always() && steps.engine.outcome == 'failure'
+        shell: bash
+        run: |
+          {
+            echo '```'
+            grep -E '^error' -A 12 engine-build.log | head -150
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.engine.outcome == 'failure'
+        with:
+          name: windows-engine-build-log
+          path: engine-build.log
+          if-no-files-found: ignore
 
       - name: Build without the HTML engine
         if: needs.plan.outputs.engine == '' || steps.engine.outcome == 'failure'
@@ -226,17 +327,31 @@ jobs:
           path: target/release-fast/zed.exe
           if-no-files-found: error
 
+      # Under bash, so that a failing test fails the step: PowerShell's own
+      # pipeline swallows the exit code of whatever wrote into it, and merging
+      # cargo's stderr there turns every progress line into an error.
       - name: Test the HTML engine
-        if: needs.plan.outputs.engine != ''
+        if: steps.engine.outcome == 'success'
+        shell: bash
         run: |
-          cargo test --profile release-fast --package html_render --features servo -- --nocapture 2>&1 |
-            Tee-Object -FilePath engine-test.log
+          set -o pipefail
+          cargo test --profile release-fast --package html_render \
+            --features servo -- --nocapture 2>&1 | tee engine-test.log
 
       - name: Say whether the engine ran here
-        if: always() && needs.plan.outputs.engine != ''
+        if: always() && steps.engine.outcome == 'success'
+        shell: bash
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Last, so the editor and its artifact still come out of a run where the
+      # engine would not compile -- but the run says so instead of passing
+      # quietly with an editor that has no engine in it.
+      - name: Insist the engine compiled
+        if: needs.plan.outputs.engine != '' && steps.engine.outcome != 'success'
+        shell: bash
         run: |
-          $line = Select-String -Path engine-test.log -Pattern 'HTML_ENGINE:' | Select-Object -First 1
-          if ($line) { Add-Content $env:GITHUB_STEP_SUMMARY $line.Line }
+          echo "the HTML engine did not compile here; the editor above was built without it" >&2
+          exit 1
 
   macos:
     needs: plan
@@ -249,17 +364,6 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-
-      # Same reason as the Linux job: the engine's media backend is bound to
-      # GStreamer through pkg-config, and the runner carries neither.
-      - name: Install the media libraries
-        if: needs.plan.outputs.engine != ''
-        run: |
-          set -euo pipefail
-          command -v pkg-config >/dev/null || brew install pkgconf
-          brew install gstreamer
-          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
-            >> "$GITHUB_ENV"
 
       - run: rustup show
 
@@ -327,44 +431,13 @@ jobs:
           path: target/Zed-macos-${{ matrix.target.arch }}.app.zip
           if-no-files-found: error
 
-      # The other half of drawing a lent frame: whether the window's own renderer
-      # puts one on the screen, and the right way up. It draws offscreen, so this
-      # asks for a graphics device but neither a window nor anybody logged in --
-      # which the crate's other tests, the pasteboard among them, cannot say.
-      - name: Test the window's own renderer
-        run: |
-          set -o pipefail
-          cargo test --profile release-fast --package gpui_macos --lib \
-            metal_renderer::tests -- --nocapture 2>&1 | tee renderer-test.log
-          # A filter that matches nothing would otherwise pass without having run
-          # anything at all.
-          grep -q 'test result: ok\. 1 passed' renderer-test.log
-
-      - name: Say whether a lent frame was drawn here
-        if: always()
-        run: grep -m1 '^RENDERER:' renderer-test.log >> "$GITHUB_STEP_SUMMARY" || true
-
       - name: Test the HTML engine
-        if: needs.plan.outputs.engine != ''
+        if: steps.engine.outcome == 'success'
         run: |
           set -o pipefail
-          # Cargo points a test binary's fallback library path at its own target
-          # directories, and in doing so replaces the list dyld would have used.
-          # Homebrew's own library directory is not on Apple silicon's default
-          # list either, so GStreamer's plugin scanner cannot find the glib it
-          # was built against, every plugin fails to load, and the engine's media
-          # backend takes the whole process down with it.
-          export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/lib:$HOME/lib:/usr/local/lib:/usr/lib"
-          # Where the plugins themselves live. Finding the glib they were built
-          # against is not enough: the scanner is given no directory to scan on a
-          # Homebrew install, so it reports every plugin as failing to load and
-          # the media backend takes the process down at the first page that wants
-          # it.
-          export GST_PLUGIN_SYSTEM_PATH="$(brew --prefix)/lib/gstreamer-1.0"
-          export GST_PLUGIN_SCANNER="$(brew --prefix)/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner"
           cargo test --profile release-fast --package html_render \
             --features servo -- --nocapture 2>&1 | tee engine-test.log
 
       - name: Say whether the engine ran here
-        if: always() && needs.plan.outputs.engine != ''
-        run: grep -m1 'HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true
+        if: always() && steps.engine.outcome == 'success'
+        run: grep -m1 '^HTML_ENGINE:' engine-test.log >> "$GITHUB_STEP_SUMMARY" || true

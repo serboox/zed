@@ -483,8 +483,10 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_lends_its_own_memory(cx);
         #[cfg(target_os = "macos")]
         the_page_lends_its_own_surface(cx);
+        #[cfg(target_os = "windows")]
+        the_page_lends_its_own_texture(cx);
 
-        the_engine_can_play_media(cx);
+        the_engine_plays_no_media(cx);
         the_page_answers_the_developer_tools(cx);
 
         if std::env::var("ZED_HTML_BENCH").is_ok() {
@@ -852,7 +854,7 @@ fn the_page_lends_its_own_surface(cx: &mut gpui::App) {
     );
 
     let surface =
-        unsafe { CVPixelBufferGetIOSurface(frame.image_buffer.as_concrete_TypeRef() as *const _) };
+        unsafe { CVPixelBufferGetIOSurface(frame.descriptor.as_concrete_TypeRef() as *const _) };
     assert!(
         !surface.is_null(),
         "a frame that is lent has to be a surface, or the window has nothing to \
@@ -1272,10 +1274,12 @@ fn the_page_is_laid_out_the_way_it_asks_to_be(cx: &mut gpui::App) {
     );
 }
 
-/// Whether there is anything behind `<video>` and `<audio>` at all. Servo keeps
-/// its media backend behind a feature of its own, and without it links a stub
-/// that reports every format unplayable -- which is exactly what this asks.
-fn the_engine_can_play_media(cx: &mut gpui::App) {
+/// Whether there is anything behind `<video>` and `<audio>`. There should not
+/// be: the engine is built without a media backend on purpose, because the one
+/// on offer takes the whole editor down on a machine whose plugins fail to
+/// load. An engine that answers it can play something has had that backend put
+/// back, which is a decision to make deliberately rather than discover.
+fn the_engine_plays_no_media(cx: &mut gpui::App) {
     let mut page = page(
         &document("margin:0;background:#fff", ""),
         300.,
@@ -1300,8 +1304,8 @@ fn the_engine_can_play_media(cx: &mut gpui::App) {
     );
     println!("MEDIA: {answer}");
     assert!(
-        answer.contains("maybe") || answer.contains("probably"),
-        "the engine should have a media backend behind it, not a stub: it answered {answer:?}"
+        !answer.contains("maybe") && !answer.contains("probably"),
+        "a media backend is linked again: the engine answered {answer:?}"
     );
 }
 
@@ -1373,5 +1377,205 @@ fn the_page_answers_the_developer_tools(cx: &mut gpui::App) {
     assert!(
         fetched.starts_with('['),
         "what was fetched should come back as a list: {fetched}"
+    );
+}
+
+/// The same page, lent the same way, on a machine whose graphics driver reflects
+/// Direct3D textures into OpenGL. The page draws with OpenGL into a texture the
+/// window can open on its own device, so what matters is that the page is really
+/// in there -- and it is read back through the very handle the window is given.
+#[cfg(target_os = "windows")]
+fn the_page_lends_its_own_texture(cx: &mut gpui::App) {
+    use windows::Win32::Foundation::{HANDLE, HMODULE};
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
+        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    // Two halves, so which way up the texture is laid out can be told apart:
+    // OpenGL draws from the bottom, and whoever reads a picture starts at the top.
+    let mut lent = page(
+        &document(
+            "margin:0",
+            "<div style=\"height:32px;background:rgb(255,0,0)\"></div>\
+             <div style=\"height:32px;background:rgb(0,0,255)\"></div>",
+        ),
+        100.,
+        64.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && colour_at(&lent, 32, 8) != Some([255, 0, 0]) {
+        lent.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        colour_at(&lent, 32, 8),
+        Some([255, 0, 0]),
+        "the copied frame should have the red half at the top"
+    );
+
+    let Some(frame) = lent.shared_frame() else {
+        println!("SHARED: this machine copies frames");
+        return;
+    };
+    assert_eq!(
+        (frame.width, frame.height),
+        (100, 64),
+        "the picture should be the size of the page"
+    );
+    assert!(
+        frame.buffer_width >= frame.width,
+        "the texture cannot be narrower than the picture in it"
+    );
+    assert_eq!(
+        frame.stride,
+        frame.buffer_width * 4,
+        "the window works a row's length out from the texture's width alone, so \
+         a texture whose rows are any longer than that cannot be drawn"
+    );
+    assert_eq!(frame.offset, 0, "the picture starts where the texture does");
+
+    // A device of this test's own, on the adapter surfman also asks for, so that
+    // what is read here is read the way the window would read it.
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    for kind in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+        #[allow(unsafe_code)]
+        let made = unsafe {
+            D3D11CreateDevice(
+                None,
+                kind,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        };
+        if made.is_ok() && device.is_some() {
+            break;
+        }
+    }
+    let (Some(device), Some(context)) = (device, context) else {
+        println!("SHARED: the page's texture is lent but nothing here can open it");
+        return;
+    };
+
+    #[allow(unsafe_code)]
+    let opened = unsafe {
+        let mut opened: Option<ID3D11Texture2D> = None;
+        if device
+            .OpenSharedResource(
+                HANDLE(frame.descriptor as *mut std::ffi::c_void),
+                &mut opened,
+            )
+            .is_err()
+        {
+            println!(
+                "SHARED: the page's texture is lent but this device would not open it, \
+                 so its contents are the window's word"
+            );
+            return;
+        }
+        opened.expect("an opened texture")
+    };
+
+    // What the frame claims about the texture, against what the texture says of
+    // itself. The window places the picture from the frame's numbers alone, so a
+    // page shown stretched or upside down is one of these assertions going unmade.
+    #[allow(unsafe_code)]
+    let description = unsafe {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        opened.GetDesc(&mut description);
+        description
+    };
+    assert_eq!(
+        (description.Width, description.Height),
+        (frame.buffer_width, frame.height),
+        "the texture should be the size the frame says it is"
+    );
+    assert_eq!(
+        description.Format, DXGI_FORMAT_R8G8B8A8_UNORM,
+        "the frame is handed over red first, and the texture should hold it that way"
+    );
+
+    // Read through a copy, because the page's own texture is one the processor may
+    // not touch. The copy's rows are as far apart as the driver chose, which is
+    // exactly why the frame publishes the picture's own row and not a layout.
+    let staging = D3D11_TEXTURE2D_DESC {
+        Width: description.Width,
+        Height: description.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    #[allow(unsafe_code)]
+    let (near_the_start, near_the_end, row_pitch) = unsafe {
+        let mut copy = None;
+        device
+            .CreateTexture2D(&staging, None, Some(&mut copy))
+            .expect("a texture to copy the page into");
+        let copy: ID3D11Texture2D = copy.expect("a staging texture");
+        context.CopyResource(&copy, &opened);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context
+            .Map(&copy, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .expect("the copy should be readable");
+        let bytes = std::slice::from_raw_parts(
+            mapped.pData as *const u8,
+            (mapped.RowPitch * description.Height) as usize,
+        );
+        let read_row = |row: u32| {
+            let at = (row * mapped.RowPitch + 32 * 4) as usize;
+            [bytes[at], bytes[at + 1], bytes[at + 2]]
+        };
+        let read = (read_row(8), read_row(56), mapped.RowPitch);
+        context.Unmap(&copy, 0);
+        read
+    };
+
+    println!(
+        "SHARED: the texture starts with {near_the_start:?} and ends with {near_the_end:?}, \
+         its copy has {row_pitch}-byte rows; the page is red on top and blue below"
+    );
+    assert!(
+        !close_to(near_the_start, near_the_end),
+        "the two halves of the page should have come out different colours; the \
+         texture holds {near_the_start:?} throughout"
+    );
+    let starts_at_the_bottom = close_to(near_the_start, [0, 0, 255]);
+    assert!(
+        starts_at_the_bottom || close_to(near_the_start, [255, 0, 0]),
+        "the lent texture should hold the page the engine drew, red first, as the \
+         format it is handed over under says; it starts with {near_the_start:?}"
+    );
+    // The window draws the texture the way the frame says it is laid out, so what
+    // is measured here has to be what is claimed.
+    assert_eq!(
+        frame.bottom_up,
+        starts_at_the_bottom,
+        "the frame says its first row is {}, and the texture starts with \
+         {near_the_start:?} where the page is red on top and blue below",
+        if frame.bottom_up {
+            "the bottom of the page"
+        } else {
+            "the top of the page"
+        }
     );
 }

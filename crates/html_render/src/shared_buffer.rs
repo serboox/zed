@@ -70,11 +70,22 @@ pub(crate) struct SharedBuffer {
     image: *mut c_void,
     /// The buffer as the window is given it. It is duplicated for each frame
     /// handed over, so this one stays valid for as long as the page draws here.
-    pub(crate) descriptor: OwnedFd,
+    descriptor: OwnedFd,
     pub(crate) stride: u32,
     pub(crate) offset: u32,
     /// How wide the buffer really is. The page sits at the left of it.
     pub(crate) width: u32,
+}
+
+impl SharedBuffer {
+    /// The buffer under a name of the window's own, so that this one stays valid
+    /// for as long as the page draws here.
+    pub(crate) fn share(&self) -> Option<gpui::SharedFrameHandle> {
+        self.descriptor
+            .try_clone()
+            .inspect_err(|error| log::warn!("the page's buffer would not be lent: {error}"))
+            .ok()
+    }
 }
 
 impl SharedBuffers {
@@ -87,6 +98,7 @@ impl SharedBuffers {
     pub(crate) fn new(
         address: &dyn Fn(&str) -> *const c_void,
         gl: &Rc<dyn gleam::gl::Gl>,
+        _device: &surfman::Device,
     ) -> Option<Self> {
         let library = allocator_library()?;
         let symbol = |name: &str| {
@@ -308,11 +320,13 @@ impl SharedBuffers {
     }
 
     /// Makes the texture currently bound to `TEXTURE_2D` this buffer's memory.
-    pub(crate) fn bind_to_texture(&self, buffer: &SharedBuffer) {
+    /// `_texture` is that texture's name, which EGL does not need to be told.
+    pub(crate) fn bind_to_texture(&self, buffer: &SharedBuffer, _texture: u32) -> bool {
         #[allow(unsafe_code)]
         unsafe {
             (self.image_to_texture)(gleam::gl::TEXTURE_2D, buffer.image);
         }
+        true
     }
 
     pub(crate) fn discard(&self, buffer: &SharedBuffer) {

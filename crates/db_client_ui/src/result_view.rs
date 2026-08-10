@@ -780,7 +780,8 @@ fn heatmap_ratio(value: f64, min: f64, max: f64) -> f32 {
 // boolean, and answering "false" where the row holds 0 states something the
 // database never said. Without a type, the number is shown as it is.
 fn column_is_boolean(data_type: Option<&str>) -> bool {
-    data_type.is_some_and(|data_type| matches!(column_editor_kind(data_type), CellEditorKind::Boolean))
+    data_type
+        .is_some_and(|data_type| matches!(column_editor_kind(data_type), CellEditorKind::Boolean))
 }
 
 fn is_valid_date(text: &str) -> bool {
@@ -1016,6 +1017,30 @@ fn sql_effective_start(sql: &str) -> &str {
         } else {
             return rest;
         }
+    }
+}
+
+/// Whether a statement came back without a result set at all -- a `CREATE`, an
+/// `ALTER`, a `GRANT`, an `INSERT`. Such a statement has no columns; a query
+/// that merely matched nothing still names the columns it looked at.
+fn returns_no_result_set(result: &QueryResult) -> bool {
+    result.columns.is_empty()
+}
+
+/// What to say about such a statement, as a headline and a line beneath it.
+///
+/// Reporting it as "0 rows" is what makes it look like a failure: a reader takes
+/// that as a query that found nothing, when the truth is there was never
+/// anything to find and the statement did what it was asked.
+fn statement_outcome(result: &QueryResult) -> (String, String) {
+    let elapsed = format!("{} ms", result.execution_time_ms);
+    match result.rows_affected {
+        0 => (
+            "Statement completed".to_string(),
+            format!("It returns no rows · {elapsed}"),
+        ),
+        1 => ("1 row affected".to_string(), elapsed),
+        affected => (format!("{affected} rows affected"), elapsed),
     }
 }
 
@@ -5777,13 +5802,21 @@ impl ResultView {
         let total_cols = result.columns.len();
         let ms = result.execution_time_ms;
 
-        let row_summary = format!(
-            "{} row{} · {} col{}",
-            total_rows,
-            if total_rows == 1 { "" } else { "s" },
-            total_cols,
-            if total_cols == 1 { "" } else { "s" },
-        );
+        // The bar is drawn outside the choice of body, so it has to answer for a
+        // statement with no result set too, or it goes on counting rows that were
+        // never asked for.
+        let row_summary = if returns_no_result_set(result) {
+            let (headline, _) = statement_outcome(result);
+            headline
+        } else {
+            format!(
+                "{} row{} · {} col{}",
+                total_rows,
+                if total_rows == 1 { "" } else { "s" },
+                total_cols,
+                if total_cols == 1 { "" } else { "s" },
+            )
+        };
         let elapsed_label = format!("{ms}ms");
         let timing_bar = result
             .timing
@@ -5980,6 +6013,35 @@ impl ResultView {
                         })),
                 ),
         )
+    }
+
+    /// The whole panel for a statement that returns no rows. An empty grid under
+    /// "0 rows" reads as a query that found nothing; there is nothing to put in a
+    /// grid here, so none is drawn.
+    fn render_statement_outcome(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(result) = self.result.as_ref() else {
+            return div().into_any_element();
+        };
+        let (headline, detail) = statement_outcome(result);
+        v_flex()
+            .id("statement-outcome")
+            .debug_selector(|| "STATEMENT_OUTCOME".to_string())
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Medium)
+                    .color(Color::Success),
+            )
+            .child(Label::new(headline).size(LabelSize::Default))
+            .child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
     }
 
     fn render_empty_state(&self) -> impl IntoElement {
@@ -10886,6 +10948,8 @@ impl Render for ResultView {
                 .into_any_element()
         } else if let Some(error) = self.error.clone() {
             self.render_error(&error, cx)
+        } else if self.result.as_ref().is_some_and(returns_no_result_set) {
+            self.render_statement_outcome(cx)
         } else if self.result.is_some() {
             if self.active_special() != SpecialResult::None {
                 self.render_special_view(cx).into_any_element()
@@ -12620,6 +12684,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_statement_without_a_result_set_draws_no_grid(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_window, cx| {
+            let mut view = ResultView::new("statement", cx);
+            view.set_result(statement_result(0), cx);
+            view
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        draw_result_view(window, &mut visual);
+
+        let outcome = visual
+            .debug_bounds("STATEMENT_OUTCOME")
+            .expect("a statement that returns no rows has to say what it did");
+        assert!(
+            outcome.size.width > px(0.) && outcome.size.height > px(0.),
+            "the panel painted {:?}, which is no area at all",
+            outcome.size
+        );
+    }
+
+    #[gpui::test]
     fn open_export_dialog_toggles_state(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             let settings = settings::SettingsStore::test(cx);
@@ -13095,6 +13184,60 @@ mod tests {
         assert!(
             cx.debug_bounds("ENV_ACCENT_BAR").is_none(),
             "env accent bar must not render without a color"
+        );
+    }
+
+    fn statement_result(rows_affected: u64) -> QueryResult {
+        QueryResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected,
+            execution_time_ms: 860,
+            timing: None,
+            raw_documents: None,
+        }
+    }
+
+    #[test]
+    fn a_statement_without_a_result_set_is_told_apart_from_a_query_that_found_nothing() {
+        use super::returns_no_result_set;
+        assert!(
+            returns_no_result_set(&statement_result(0)),
+            "a CREATE names no columns, so there is no result set to show"
+        );
+        let found_nothing = QueryResult {
+            columns: vec!["id".to_string()],
+            rows: vec![],
+            rows_affected: 0,
+            execution_time_ms: 1,
+            timing: None,
+            raw_documents: None,
+        };
+        assert!(
+            !returns_no_result_set(&found_nothing),
+            "a query that matched no rows still names the column it looked at, \
+             and belongs in a grid with a header and no rows"
+        );
+    }
+
+    #[test]
+    fn a_statement_is_reported_by_what_it_did_and_never_as_zero_rows() {
+        use super::statement_outcome;
+        let (headline, detail) = statement_outcome(&statement_result(0));
+        assert_eq!(headline, "Statement completed");
+        assert!(
+            !headline.contains("row") && !headline.contains("0"),
+            "a CREATE reported as rows reads as a query that found none: {headline:?}"
+        );
+        assert!(
+            detail.contains("860 ms"),
+            "the time it took is worth keeping"
+        );
+
+        assert_eq!(statement_outcome(&statement_result(1)).0, "1 row affected");
+        assert_eq!(
+            statement_outcome(&statement_result(20_000)).0,
+            "20000 rows affected"
         );
     }
 

@@ -4285,7 +4285,7 @@ impl Window {
     ///
     /// This method should only be called as part of the paint phase of element
     /// drawing.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn paint_shared_frame(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -4327,7 +4327,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer: frame.image_buffer.clone(),
+            image_buffer: frame.descriptor.clone(),
             lent: Some(frame),
         });
     }

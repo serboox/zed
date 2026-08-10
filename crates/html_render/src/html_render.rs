@@ -20,6 +20,8 @@ mod gpu_surface;
 mod shared_buffer;
 #[cfg(all(feature = "servo", target_os = "macos"))]
 mod shared_surface;
+#[cfg(all(feature = "servo", target_os = "windows"))]
+mod shared_texture;
 
 #[cfg(feature = "servo")]
 mod engine {
@@ -515,7 +517,7 @@ mod engine {
 
         /// The frame the window can draw without a copy, when this machine
         /// allows it. `None` means the frame has to be handed over as pixels.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
             if self.refused {
                 return None;
