@@ -1346,7 +1346,10 @@ impl Render for ConnectionView {
                                     })),
                             )
                             .child(
-                                Button::new("connect", "Connect")
+                                // Saving is all this does: the connection is
+                                // written down and the pane closes. Nothing is
+                                // dialled until the reader opens it.
+                                Button::new("save", "Save")
                                     .style(ButtonStyle::Filled)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some(config) = this.build_config(cx) {
