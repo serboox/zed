@@ -47,17 +47,14 @@ pub struct SharedFrame {
     /// How wide the buffer holding it is, in device pixels. The picture sits at
     /// the left of it: a producer may hand over a wider buffer so that both
     /// sides work out the same distance between rows.
-    #[cfg(target_os = "linux")]
     pub buffer_width: u32,
     /// Bytes from the start of one row of pixels to the start of the next. Only
     /// meaningful where the window has to walk the memory itself; a producer
     /// handing over a texture the driver describes reports the picture's own row.
     pub stride: u32,
     /// Where the first row starts within the buffer.
-    #[cfg(target_os = "linux")]
     pub offset: u32,
     /// The pixel layout, as a DRM fourcc code.
-    #[cfg(target_os = "linux")]
     pub format: u32,
     /// Whether the first row in the buffer is the bottom of the picture. A
     /// producer that draws with OpenGL hands over a buffer this way round, since
@@ -68,7 +65,6 @@ pub struct SharedFrame {
     /// Only a linear arrangement can be shared without an extension the window's
     /// own device does not ask for, so a producer should hand over linear
     /// buffers.
-    #[cfg(target_os = "linux")]
     pub modifier: u64,
     /// Set by the renderer when it turns out it cannot draw this buffer after
     /// all. A producer is expected to look, and to go back to handing over
