@@ -1020,11 +1020,27 @@ fn sql_effective_start(sql: &str) -> &str {
     }
 }
 
-/// Whether a statement came back without a result set at all -- a `CREATE`, an
-/// `ALTER`, a `GRANT`, an `INSERT`. Such a statement has no columns; a query
-/// that merely matched nothing still names the columns it looked at.
-fn returns_no_result_set(result: &QueryResult) -> bool {
-    result.columns.is_empty()
+/// Whether the statement is one that comes back with rows, judged by the word it
+/// starts with.
+fn statement_returns_rows(sql: &str) -> bool {
+    const RETURNING: [&str; 9] = [
+        "SELECT", "WITH", "SHOW", "EXPLAIN", "VALUES", "TABLE", "DESCRIBE", "DESC", "PRAGMA",
+    ];
+    let start = sql_effective_start(sql).to_ascii_uppercase();
+    RETURNING.iter().any(|word| start.starts_with(word))
+}
+
+/// Whether to report what a statement did instead of drawing a grid for it -- a
+/// `CREATE`, an `ALTER`, a `GRANT`.
+///
+/// Having no columns is not enough on its own: a provider that learns the column
+/// names from the first row has none to report when a query matched nothing, and
+/// a `SELECT` answered with "statement completed" hides the very rows the reader
+/// went looking for. So the statement must also be one that was never going to
+/// return any. Anything unrecognised, or a result with no statement behind it,
+/// keeps the grid.
+fn returns_no_result_set(result: &QueryResult, sql: Option<&str>) -> bool {
+    result.columns.is_empty() && sql.is_some_and(|sql| !statement_returns_rows(sql))
 }
 
 /// What to say about such a statement, as a headline and a line beneath it.
@@ -5805,7 +5821,7 @@ impl ResultView {
         // The bar is drawn outside the choice of body, so it has to answer for a
         // statement with no result set too, or it goes on counting rows that were
         // never asked for.
-        let row_summary = if returns_no_result_set(result) {
+        let row_summary = if returns_no_result_set(result, self.base_sql.as_deref()) {
             let (headline, _) = statement_outcome(result);
             headline
         } else {
@@ -10948,7 +10964,11 @@ impl Render for ResultView {
                 .into_any_element()
         } else if let Some(error) = self.error.clone() {
             self.render_error(&error, cx)
-        } else if self.result.as_ref().is_some_and(returns_no_result_set) {
+        } else if self
+            .result
+            .as_ref()
+            .is_some_and(|result| returns_no_result_set(result, self.base_sql.as_deref()))
+        {
             self.render_statement_outcome(cx)
         } else if self.result.is_some() {
             if self.active_special() != SpecialResult::None {
@@ -12692,6 +12712,9 @@ mod tests {
         });
         let window = cx.add_window(|_window, cx| {
             let mut view = ResultView::new("statement", cx);
+            // The statement matters as much as the result: without it a result
+            // with no columns is taken for a query that found nothing.
+            view.base_sql = Some("CREATE TABLE t (id int)".to_string());
             view.set_result(statement_result(0), cx);
             view
         });
@@ -13202,8 +13225,8 @@ mod tests {
     fn a_statement_without_a_result_set_is_told_apart_from_a_query_that_found_nothing() {
         use super::returns_no_result_set;
         assert!(
-            returns_no_result_set(&statement_result(0)),
-            "a CREATE names no columns, so there is no result set to show"
+            returns_no_result_set(&statement_result(0), Some("CREATE TABLE t (id int)")),
+            "a CREATE names no columns and was never going to return any"
         );
         let found_nothing = QueryResult {
             columns: vec!["id".to_string()],
@@ -13214,9 +13237,30 @@ mod tests {
             raw_documents: None,
         };
         assert!(
-            !returns_no_result_set(&found_nothing),
-            "a query that matched no rows still names the column it looked at, \
-             and belongs in a grid with a header and no rows"
+            !returns_no_result_set(&found_nothing, Some("SELECT id FROM t")),
+            "a query that matched no rows belongs in a grid with a header and no rows"
+        );
+        // The regression this guards: a provider that learns its columns from the
+        // first row has none to report for a query that matched nothing, and that
+        // query must still be shown as a query.
+        assert!(
+            !returns_no_result_set(&statement_result(0), Some("SELECT * FROM t")),
+            "a SELECT is a SELECT even when it comes back with neither rows nor columns"
+        );
+        for query in [
+            "  select * from t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "SHOW TABLES",
+            "EXPLAIN SELECT 1",
+        ] {
+            assert!(
+                !returns_no_result_set(&statement_result(0), Some(query)),
+                "{query} asks for rows"
+            );
+        }
+        assert!(
+            !returns_no_result_set(&statement_result(0), None),
+            "with no statement to judge, a grid is the safe answer"
         );
     }
 

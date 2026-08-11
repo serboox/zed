@@ -47,7 +47,116 @@ pub(crate) fn postgres_connect_options(config: &ConnectionConfig) -> PgConnectOp
     opts
 }
 
+/// Quotes an identifier the way the server would, doubling any quote inside it
+/// so that a name holding one cannot end the quoting early.
+fn quoted(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Quotes a string literal for `COMMENT ON`, doubling any apostrophe inside it.
+fn quoted_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Puts the pieces the catalogue gave back together into one statement, then the
+/// indexes and comments after it. Kept apart from the reading so that what it
+/// writes can be checked without a server.
+fn render_table_ddl(
+    schema: &str,
+    table: &str,
+    columns: &[(String, String, bool, Option<String>, Option<String>)],
+    constraints: &[(String, String)],
+    indexes: &[(String,)],
+    table_comment: Option<&str>,
+) -> String {
+    let qualified = format!("{}.{}", quoted(schema), quoted(table));
+    let mut lines: Vec<String> = Vec::with_capacity(columns.len() + constraints.len());
+
+    for (name, kind, not_null, default, _comment) in columns {
+        let mut line = format!("  {} {}", quoted(name), kind);
+        if let Some(default) = default {
+            line.push_str(&format!(" DEFAULT {default}"));
+        }
+        if *not_null {
+            line.push_str(" NOT NULL");
+        }
+        lines.push(line);
+    }
+    for (name, definition) in constraints {
+        lines.push(format!("  CONSTRAINT {} {}", quoted(name), definition));
+    }
+
+    let mut ddl = format!("CREATE TABLE {qualified} (\n{}\n);\n", lines.join(",\n"));
+
+    if !indexes.is_empty() {
+        ddl.push('\n');
+        for (definition,) in indexes {
+            ddl.push_str(definition);
+            ddl.push_str(";\n");
+        }
+    }
+
+    let commented: Vec<String> = std::iter::once(table_comment.map(|comment| {
+        format!(
+            "COMMENT ON TABLE {qualified} IS {};",
+            quoted_literal(comment)
+        )
+    }))
+    .chain(columns.iter().map(|(name, _, _, _, comment)| {
+        comment.as_deref().map(|comment| {
+            format!(
+                "COMMENT ON COLUMN {qualified}.{} IS {};",
+                quoted(name),
+                quoted_literal(comment)
+            )
+        })
+    }))
+    .flatten()
+    .collect();
+    if !commented.is_empty() {
+        ddl.push('\n');
+        ddl.push_str(&commented.join("\n"));
+        ddl.push('\n');
+    }
+
+    ddl
+}
+
 impl PostgresProvider {
+    /// The schema and table as the catalogue actually spells them, or nothing if
+    /// it holds no such table.
+    ///
+    /// A name reaches here however the reader wrote it. Postgres folds an
+    /// unquoted identifier to lower case as it parses it, so a name copied out of
+    /// a query that runs perfectly well -- `ciqestimatenumericData` -- is not the
+    /// name stored against the table; and a table created with quotes keeps a
+    /// spelling nobody will type back exactly. Matching without regard to case
+    /// answers both, and an exact match still wins, so two tables differing only
+    /// in case each find themselves.
+    async fn stored_table_name(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<(String, String)>> {
+        let found = sqlx::query_as::<_, (String, String)>(
+            "-- name: ResolveTableName :one
+             SELECT table_schema, table_name
+             FROM information_schema.tables
+             WHERE lower(table_schema) = lower($1)
+               AND lower(table_name) = lower($2)
+             ORDER BY (table_schema = $1 AND table_name = $2) DESC,
+                      table_schema,
+                      table_name
+             LIMIT 1",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to look up the table")?;
+        Ok(found)
+    }
+
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
         let opts = postgres_connect_options(config);
         // Single connection: `execute_query` relies on `SET search_path`
@@ -136,6 +245,12 @@ impl DbProvider for PostgresProvider {
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<Vec<ColumnInfo>> {
+        // Same reason as the DDL: the name arrives spelled however it was
+        // written, and the catalogue holds one spelling.
+        let (schema, table) = self
+            .stored_table_name(schema, table)
+            .await?
+            .unwrap_or_else(|| (schema.to_string(), table.to_string()));
         let rows = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
             "-- name: DescribeTable :many
              SELECT column_name, data_type, is_nullable, column_default, ''
@@ -143,8 +258,8 @@ impl DbProvider for PostgresProvider {
              WHERE table_schema = $1 AND table_name = $2
              ORDER BY ordinal_position",
         )
-        .bind(schema)
-        .bind(table)
+        .bind(&schema)
+        .bind(&table)
         .fetch_all(&self.pool)
         .await
         .context("Failed to describe table")?;
@@ -163,37 +278,113 @@ impl DbProvider for PostgresProvider {
             .collect())
     }
 
+    /// The table as the server itself describes it: exact types, every
+    /// constraint, every index and every comment.
+    ///
+    /// Read from the system catalogue rather than `information_schema`, which
+    /// cannot say what a column's type really is -- it reports `numeric` for a
+    /// `numeric(32,9)`, splitting the precision into columns of its own -- and
+    /// knows nothing of indexes. The catalogue's own functions print each
+    /// definition the way the server would, so nothing here is reassembled by
+    /// hand and nothing is guessed.
     async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String> {
-        let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "-- name: GetTableDDL :many
-             SELECT column_name, data_type, is_nullable, column_default
-             FROM information_schema.columns
-             WHERE table_schema = $1 AND table_name = $2
-             ORDER BY ordinal_position",
+        let Some((schema, table)) = self.stored_table_name(schema, table).await? else {
+            anyhow::bail!("there is no table \"{schema}\".\"{table}\" in this database");
+        };
+
+        let columns = sqlx::query_as::<_, (String, String, bool, Option<String>, Option<String>)>(
+            "-- name: GetTableColumnsForDDL :many
+             SELECT attribute.attname,
+                    format_type(attribute.atttypid, attribute.atttypmod),
+                    attribute.attnotnull,
+                    pg_get_expr(fallback.adbin, fallback.adrelid),
+                    col_description(attribute.attrelid, attribute.attnum)
+             FROM pg_attribute attribute
+             JOIN pg_class relation ON relation.oid = attribute.attrelid
+             JOIN pg_namespace space ON space.oid = relation.relnamespace
+             LEFT JOIN pg_attrdef fallback
+                    ON fallback.adrelid = attribute.attrelid
+                   AND fallback.adnum = attribute.attnum
+             WHERE space.nspname = $1
+               AND relation.relname = $2
+               AND attribute.attnum > 0
+               AND NOT attribute.attisdropped
+             ORDER BY attribute.attnum",
         )
-        .bind(schema)
-        .bind(table)
+        .bind(&schema)
+        .bind(&table)
         .fetch_all(&self.pool)
         .await
-        .context("Failed to get table structure for DDL")?;
+        .context("Failed to read the table's columns")?;
 
-        let mut ddl = format!("CREATE TABLE \"{}\".\"{}\" (\n", schema, table);
-        let last = rows.len().saturating_sub(1);
-        for (i, (col, dtype, nullable, default)) in rows.into_iter().enumerate() {
-            let null_str = if nullable == "NO" { " NOT NULL" } else { "" };
-            let default_str = if let Some(d) = default {
-                format!(" DEFAULT {}", d)
-            } else {
-                String::new()
-            };
-            let comma = if i < last { "," } else { "" };
-            ddl.push_str(&format!(
-                "  \"{}\" {}{}{}{}\n",
-                col, dtype, default_str, null_str, comma
-            ));
-        }
-        ddl.push(')');
-        Ok(ddl)
+        // Printed by the server, so a check expression or a foreign key reads
+        // exactly as it would in a dump. Primary key first, then unique, then
+        // foreign keys, then checks -- the order a reader expects.
+        let constraints = sqlx::query_as::<_, (String, String)>(
+            "-- name: GetTableConstraintsForDDL :many
+             SELECT constraint_.conname, pg_get_constraintdef(constraint_.oid)
+             FROM pg_constraint constraint_
+             JOIN pg_class relation ON relation.oid = constraint_.conrelid
+             JOIN pg_namespace space ON space.oid = relation.relnamespace
+             WHERE space.nspname = $1 AND relation.relname = $2
+             ORDER BY CASE constraint_.contype
+                        WHEN 'p' THEN 0 WHEN 'u' THEN 1
+                        WHEN 'f' THEN 2 ELSE 3
+                      END,
+                      constraint_.conname",
+        )
+        .bind(&schema)
+        .bind(&table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read the table's constraints")?;
+
+        // An index that exists only to enforce a constraint is left out: it is
+        // already stated by the constraint above, and repeating it would read as
+        // a second index that is not there.
+        let indexes = sqlx::query_as::<_, (String,)>(
+            "-- name: GetTableIndexesForDDL :many
+             SELECT pg_get_indexdef(index_.indexrelid)
+             FROM pg_index index_
+             JOIN pg_class relation ON relation.oid = index_.indrelid
+             JOIN pg_class index_relation ON index_relation.oid = index_.indexrelid
+             JOIN pg_namespace space ON space.oid = relation.relnamespace
+             WHERE space.nspname = $1
+               AND relation.relname = $2
+               AND NOT EXISTS (
+                     SELECT 1 FROM pg_constraint constraint_
+                     WHERE constraint_.conindid = index_.indexrelid
+                   )
+             ORDER BY index_relation.relname",
+        )
+        .bind(&schema)
+        .bind(&table)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read the table's indexes")?;
+
+        let table_comment = sqlx::query_as::<_, (Option<String>,)>(
+            "-- name: GetTableCommentForDDL :one
+             SELECT obj_description(relation.oid)
+             FROM pg_class relation
+             JOIN pg_namespace space ON space.oid = relation.relnamespace
+             WHERE space.nspname = $1 AND relation.relname = $2",
+        )
+        .bind(&schema)
+        .bind(&table)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to read the table's comment")?
+        .and_then(|(comment,)| comment);
+
+        Ok(render_table_ddl(
+            &schema,
+            &table,
+            &columns,
+            &constraints,
+            &indexes,
+            table_comment.as_deref(),
+        ))
     }
 
     async fn get_database_ddl(&self, database: &str) -> Result<String> {
@@ -671,6 +862,115 @@ mod connect_options_tests {
     }
 }
 
+#[cfg(test)]
+mod ddl_rendering_tests {
+    use super::render_table_ddl;
+
+    fn column(
+        name: &str,
+        kind: &str,
+        not_null: bool,
+        default: Option<&str>,
+        comment: Option<&str>,
+    ) -> (String, String, bool, Option<String>, Option<String>) {
+        (
+            name.to_string(),
+            kind.to_string(),
+            not_null,
+            default.map(str::to_string),
+            comment.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn a_column_keeps_the_precision_its_type_was_declared_with() {
+        let ddl = render_table_ddl(
+            "public",
+            "prices",
+            &[column("amount", "numeric(32,9)", false, None, None)],
+            &[],
+            &[],
+            None,
+        );
+        assert!(
+            ddl.contains("\"amount\" numeric(32,9)"),
+            "a type without its precision is a different type: {ddl}"
+        );
+    }
+
+    #[test]
+    fn constraints_and_indexes_both_appear_and_each_in_its_place() {
+        let ddl = render_table_ddl(
+            "public",
+            "prices",
+            &[column("id", "integer", true, None, None)],
+            &[("pk_prices".to_string(), "PRIMARY KEY (id)".to_string())],
+            &[("CREATE INDEX idx_prices_id ON public.prices USING btree (id)".to_string(),)],
+            None,
+        );
+        let statement_ends = ddl.find(");").expect("the table statement is closed");
+        let constraint = ddl.find("CONSTRAINT").expect("the constraint is stated");
+        let index = ddl.find("CREATE INDEX").expect("the index is stated");
+        assert!(
+            constraint < statement_ends,
+            "a constraint belongs inside the table statement: {ddl}"
+        );
+        assert!(
+            index > statement_ends,
+            "an index is its own statement, after the table: {ddl}"
+        );
+    }
+
+    #[test]
+    fn comments_are_written_as_their_own_statements_and_quoted() {
+        let ddl = render_table_ddl(
+            "public",
+            "prices",
+            &[column("id", "integer", true, None, Some("what it's for"))],
+            &[],
+            &[],
+            Some("a table"),
+        );
+        assert!(ddl.contains("COMMENT ON TABLE \"public\".\"prices\" IS 'a table';"));
+        assert!(
+            ddl.contains("IS 'what it''s for';"),
+            "an apostrophe has to be doubled or the statement ends early: {ddl}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_nothing_extra_still_reads_as_one_statement() {
+        let ddl = render_table_ddl(
+            "public",
+            "plain",
+            &[column("id", "integer", false, None, None)],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            ddl,
+            "CREATE TABLE \"public\".\"plain\" (\n  \"id\" integer\n);\n"
+        );
+    }
+
+    #[test]
+    fn a_name_holding_a_quote_cannot_end_its_own_quoting() {
+        let ddl = render_table_ddl(
+            "public",
+            "od\"d",
+            &[column("id", "integer", false, None, None)],
+            &[],
+            &[],
+            None,
+        );
+        assert!(
+            ddl.contains("\"od\"\"d\""),
+            "the quote in the name has to be doubled: {ddl}"
+        );
+    }
+}
+
 /// Set POSTGRES_TEST_URL=postgres://user:password@host:port/dbname before
 /// running, then use `cargo test -p db_client -- --include-ignored` to
 /// execute. Mirrors the MySQL provider's integration_tests convention.
@@ -854,6 +1154,116 @@ mod integration_tests {
             .expect("Failed to clean up scratch schema");
 
         result
+    }
+
+    /// What Ctrl-clicking a table has to answer with: the table found however it
+    /// was spelled, and described in full.
+    ///
+    /// Postgres folds an unquoted identifier to lower case, so a name copied out
+    /// of a query that runs perfectly well can be spelled in a way the catalogue
+    /// has never heard of. Before, that produced an empty `CREATE TABLE ( )` --
+    /// which reads as a table with no columns rather than as a table not found.
+    #[tokio::test]
+    #[ignore]
+    async fn test_table_ddl_is_found_whatever_the_spelling_and_says_everything() {
+        let config = test_config_from_env()
+            .expect("POSTGRES_TEST_URL env var required for integration tests");
+        let provider = PostgresProvider::connect(&config)
+            .await
+            .expect("Failed to connect");
+
+        with_scratch_schema(&provider, async |provider, schema| {
+            provider
+                .execute_query(
+                    "public",
+                    &format!(
+                        "CREATE TABLE \"{schema}\".estimates (
+                             consensus_id integer NOT NULL,
+                             amount numeric(32,9),
+                             note text,
+                             CONSTRAINT pk_estimates PRIMARY KEY (consensus_id)
+                         )"
+                    ),
+                )
+                .await
+                .expect("the table was created");
+            provider
+                .execute_query(
+                    "public",
+                    &format!(
+                        "CREATE INDEX idx_estimates_amount ON \"{schema}\".estimates (amount)"
+                    ),
+                )
+                .await
+                .expect("the index was created");
+            provider
+                .execute_query(
+                    "public",
+                    &format!("COMMENT ON TABLE \"{schema}\".estimates IS 'what is expected'"),
+                )
+                .await
+                .expect("the comment was set");
+
+            // However it is spelled, it is the same table.
+            for spelling in ["estimates", "Estimates", "ESTIMATES", "eStImAtEs"] {
+                let found = provider.get_table_ddl(&schema, spelling).await;
+                assert!(
+                    found.is_ok(),
+                    "{spelling} has to find the table: {:?}",
+                    found.err()
+                );
+            }
+            // And a table the catalogue holds in mixed case is found by a name
+            // written in none of it, which is how anyone would type it back.
+            provider
+                .execute_query(
+                    "public",
+                    &format!("CREATE TABLE \"{schema}\".\"MixedCase\" (id integer)"),
+                )
+                .await
+                .expect("the mixed case table was created");
+            let mixed = provider
+                .get_table_ddl(&schema, "mixedcase")
+                .await
+                .expect("a mixed case table is found by a lower case name");
+            assert!(
+                mixed.contains("\"MixedCase\""),
+                "the name it is stored under is the name to print: {mixed}"
+            );
+
+            let ddl = provider
+                .get_table_ddl(&schema, "Estimates")
+                .await
+                .expect("a table spelled in another case is still that table");
+
+            assert!(
+                ddl.contains("\"amount\" numeric(32,9)"),
+                "the type has to keep the precision it was declared with: {ddl}"
+            );
+            assert!(
+                ddl.contains("PRIMARY KEY"),
+                "the primary key is part of what the table is: {ddl}"
+            );
+            assert!(
+                ddl.contains("CREATE INDEX idx_estimates_amount"),
+                "an index of its own has to be shown: {ddl}"
+            );
+            assert!(
+                ddl.contains("IS 'what is expected'"),
+                "a comment is worth more than most of the rest: {ddl}"
+            );
+            assert!(
+                !ddl.contains("pk_estimates ON"),
+                "the index behind the primary key is already stated by the key: {ddl}"
+            );
+
+            let missing = provider.get_table_ddl(&schema, "no_such_table").await;
+            assert!(
+                missing.is_err(),
+                "a table that is not there has to say so, not come back as an empty shell"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
