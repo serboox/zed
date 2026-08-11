@@ -444,19 +444,18 @@ impl GpuSurface {
             }
         }
         let size = self.size.get();
-        // Nothing may have been allocated to be shared. A Linux driver that lays
-        // its own textures out plainly can still hand one of those over; there is
-        // nothing of the sort to ask for on macOS, where a surface the page did
-        // not draw into is not one the window will read.
-        #[cfg(target_os = "linux")]
-        let frame = self
+        // Nothing may have been allocated to be shared. A driver that lays its own
+        // textures out plainly can still hand one of those over, which only Linux
+        // has; the others answer with nothing and fall through to copying.
+        let frame = match self
             .lend_own_memory(size)
-            .or_else(|| self.export_the_texture(size));
-        #[cfg(target_os = "macos")]
-        let frame = self.lend_own_memory();
-        let Some(frame) = frame else {
-            self.cannot_share.set(true);
-            return None;
+            .or_else(|| self.export_the_texture(size))
+        {
+            Some(frame) => frame,
+            None => {
+                self.cannot_share.set(true);
+                return None;
+            }
         };
         let frame = Arc::new(frame);
         *self.target.borrow().drawn().frame.borrow_mut() = Some(frame.clone());
@@ -516,6 +515,13 @@ impl GpuSurface {
     /// Windows has nothing to export: a face there is already a texture the
     /// window can open, so a face without one means the driver would not make it.
     #[cfg(target_os = "windows")]
+    fn export_the_texture(&self, _size: PhysicalSize<u32>) -> Option<SharedFrame> {
+        None
+    }
+
+    /// macOS has nothing to export either: a surface the page did not draw into
+    /// is not one the window will read.
+    #[cfg(target_os = "macos")]
     fn export_the_texture(&self, _size: PhysicalSize<u32>) -> Option<SharedFrame> {
         None
     }

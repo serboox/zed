@@ -517,7 +517,7 @@ mod engine {
 
         /// The frame the window can draw without a copy, when this machine
         /// allows it. `None` means the frame has to be handed over as pixels.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         pub fn shared_frame(&mut self) -> Option<Arc<gpui::SharedFrame>> {
             if self.refused {
                 return None;
@@ -560,7 +560,6 @@ mod engine {
         /// draws only when something asks it to. Going back to copying without
         /// this would leave the reader looking at an empty pane until they
         /// happened to scroll.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         fn copy_the_page_again(&self) {
             self.delegate.frame_waiting.set(true);
             self.engine.nudge();

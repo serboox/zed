@@ -87,6 +87,12 @@ impl SharedBuffer {
 }
 
 impl SharedBuffers {
+    /// What the page's textures have to be bound as on this machine. A shared
+    /// Direct3D texture goes on an ordinary two-dimensional one.
+    pub(crate) fn texture_target(&self) -> u32 {
+        gleam::gl::TEXTURE_2D
+    }
+
     /// Looks up the extension surfman is already using, and takes a reference to
     /// the device it opened. `address` is the driver's own function lookup, which
     /// answers for the context that is current -- surfman's, by the time this is
