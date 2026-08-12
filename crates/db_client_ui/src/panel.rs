@@ -19723,8 +19723,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let center_items_before =
-            workspace.read_with(cx, |workspace, cx| workspace.active_pane().read(cx).items_len());
+        let center_items_before = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
+        });
 
         workspace.update_in(cx, |workspace, window, cx| {
             let view = cx.new(|cx| ResultView::new("public.users — Search", cx));
@@ -19743,8 +19744,9 @@ mod tests {
             "the result table must open as a tab in the bottom dock's pane"
         );
 
-        let center_items_after =
-            workspace.read_with(cx, |workspace, cx| workspace.active_pane().read(cx).items_len());
+        let center_items_after = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
+        });
         assert_eq!(
             center_items_after, center_items_before,
             "nothing may be added to the center pane, which is for consoles and documents"
