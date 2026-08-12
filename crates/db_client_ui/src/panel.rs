@@ -351,6 +351,7 @@ pub(crate) fn init(cx: &mut App) {
                 return;
             }
             if console_connection_for_editor(&editor, &store, cx).is_none() {
+                install_console_features_once_connections_load(editor, store, cx);
                 return;
             }
             let Some(workspace) = editor.read(cx).workspace() else {
@@ -360,6 +361,71 @@ pub(crate) fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+// A console path only resolves to a connection once `DatabaseStore` holds that
+// connection, and the store fills itself asynchronously from disk and the
+// credential store. A console restored with the session is therefore routinely
+// observed while `connections()` is still empty, so "no connection for this path"
+// means "not yet", not "not a console" -- the answer has to be asked again when
+// the store announces its connections.
+fn install_console_features_once_connections_load(
+    editor: Entity<Editor>,
+    store: Entity<DatabaseStore>,
+    cx: &mut App,
+) {
+    editor.update(cx, |editor_state, cx| {
+        if editor_state.addon::<PendingConsoleFeatures>().is_some() {
+            return;
+        }
+        let subscription = cx.subscribe(&store, |editor_state, store, event, cx| {
+            if !matches!(event, DatabaseStoreEvent::ConnectionsChanged) {
+                return;
+            }
+            if editor_state.addon::<DbQueryEditorAddon>().is_some() {
+                return;
+            }
+            if console_connection_for_console_editor(editor_state, &store, cx).is_none() {
+                return;
+            }
+            let Some(workspace) = editor_state.workspace() else {
+                return;
+            };
+            let editor = cx.entity();
+            let store = store.downgrade();
+            let workspace = workspace.downgrade();
+            cx.defer(move |cx| {
+                // The install is deferred because the editor is still leased
+                // here, so a second announcement can land before it runs.
+                if editor.read(cx).addon::<DbQueryEditorAddon>().is_some() {
+                    return;
+                }
+                install_db_editor_features(editor.clone(), store, workspace, cx);
+                // Dropping the addon here drops the subscription with it, which is
+                // safe only because this runs after the callback that scheduled it
+                // has returned.
+                editor.update(cx, |editor_state, _| {
+                    editor_state.unregister_addon::<PendingConsoleFeatures>();
+                });
+            });
+        });
+        editor_state.register_addon(PendingConsoleFeatures {
+            _subscription: subscription,
+        });
+    });
+}
+
+// Keeps the wait for the store's connections tied to the editor's own lifetime:
+// the store is global, so a detached subscription would outlive every console it
+// was waiting for.
+struct PendingConsoleFeatures {
+    _subscription: Subscription,
+}
+
+impl editor::Addon for PendingConsoleFeatures {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // Carries the connection a SQL console editor is bound to, so Ctrl+Enter runs
@@ -2624,11 +2690,21 @@ fn console_connection_for_editor(
     store: &Entity<DatabaseStore>,
     cx: &App,
 ) -> Option<ConnectionId> {
-    if let Some(addon) = editor.read(cx).addon::<DbQueryEditorAddon>() {
+    console_connection_for_console_editor(editor.read(cx), store, cx)
+}
+
+// Takes the editor by reference so it can also be called while the editor is
+// leased -- reading the entity from inside one of its own callbacks panics.
+fn console_connection_for_console_editor(
+    editor: &Editor,
+    store: &Entity<DatabaseStore>,
+    cx: &App,
+) -> Option<ConnectionId> {
+    if let Some(addon) = editor.addon::<DbQueryEditorAddon>() {
         return Some(addon.connection_id);
     }
 
-    let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+    let buffer = editor.buffer().read(cx).as_singleton()?;
     let abs_path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
     let known_ids: Vec<ConnectionId> = store
         .read(cx)
@@ -16247,6 +16323,121 @@ mod tests {
             editor.read_with(cx, |editor, _| editor.semantics_provider().is_some()),
             "console editor must carry the DbSemanticsProvider so Ctrl+click resolves DDL"
         );
+    }
+
+    // Reproduces the startup order a restored console actually goes through: the
+    // editor is observed and added to the workspace while the store is still
+    // loading its connections from disk and the credential store, so the console
+    // path resolves to no connection on the first look. Pre-fix the one-shot check
+    // gave up there for good and Ctrl+click opened no DDL for the whole session.
+    #[gpui::test]
+    async fn a_restored_console_gets_its_features_once_connections_finish_loading(
+        cx: &mut TestAppContext,
+    ) {
+        let config = db_client::ConnectionConfig {
+            label: "console".to_string(),
+            driver: DatabaseDriver::MySQL,
+            auto_connect: false,
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let console_path =
+            connection_query_path(connection_id, &config.label, DatabaseDriver::MySQL);
+        let queries_dir = console_path
+            .parent()
+            .expect("console path has a parent")
+            .to_path_buf();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let mut queries_tree = serde_json::Map::new();
+        queries_tree.insert(
+            console_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("console file name is utf8")
+                .to_string(),
+            serde_json::Value::String("SELECT * FROM instruments.splits".to_string()),
+        );
+        fs.insert_tree(
+            queries_dir.as_path(),
+            serde_json::Value::Object(queries_tree),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [queries_dir.as_path()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        // The store is deliberately left empty: this is the window in which the
+        // workspace restores its tabs but the connections have not arrived yet.
+        let store = cx.new(DatabaseStore::new);
+        cx.update(|_window, cx| cx.set_global(crate::store::GlobalDatabaseStore(store.clone())));
+        cx.run_until_parked();
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(console_path.as_path(), cx)
+            })
+            .await
+            .expect("console buffer opens");
+        let buffer_handle = buffer.clone();
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        cx.run_until_parked();
+
+        // A project-backed editor always has *a* semantics provider -- the
+        // project itself -- so presence proves nothing here. `link_candidate_range`
+        // is the discriminator: only the console's provider implements it, and it
+        // is the very hook Ctrl+click uses to resolve a SQL entity.
+        assert_eq!(
+            console_link_candidate(&editor, &buffer_handle, "splits", cx),
+            None,
+            "nothing can be installed while the console's connection is still unknown"
+        );
+
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            console_link_candidate(&editor, &buffer_handle, "splits", cx).as_deref(),
+            Some("splits"),
+            "once the connections load, the restored console must get the \
+             DbSemanticsProvider so Ctrl+click resolves DDL"
+        );
+    }
+
+    // Asks the editor's *own* semantics provider for the underline candidate at a
+    // token, which is what a real Ctrl+click consults. Returns None when the
+    // editor still carries the plain project provider, since that one leaves the
+    // hook at its default.
+    fn console_link_candidate(
+        editor: &Entity<Editor>,
+        buffer: &Entity<Buffer>,
+        token: &str,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        let provider = editor.read_with(cx, |editor, _| editor.semantics_provider())?;
+        let text = buffer.read_with(cx, |buffer, _| buffer.text());
+        let offset = text.find(token).expect("token present") + 1;
+        let anchor = buffer.read_with(cx, |buffer, _| buffer.snapshot().anchor_before(offset));
+        let range = cx.update(|_, cx| provider.link_candidate_range(buffer, anchor, cx))?;
+        let (start, end) = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            (
+                snapshot.offset_for_anchor(&range.start),
+                snapshot.offset_for_anchor(&range.end),
+            )
+        });
+        text.get(start..end).map(str::to_string)
     }
 
     // End-to-end guard for the resilient console highlighting: a statement with
