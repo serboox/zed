@@ -1382,7 +1382,7 @@ impl HtmlPreviewView {
             .flex_none()
             .gap_1()
             .px_1p5()
-            .py_1()
+            .py_0p5()
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.toolbar_background)

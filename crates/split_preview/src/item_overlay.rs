@@ -1,6 +1,6 @@
 use editor::Editor;
 use gpui::{AnyElement, App, Entity, Window};
-use ui::{Tooltip, prelude::*};
+use ui::{TintColor, Tooltip, prelude::*};
 use workspace::Pane;
 use workspace::item::ItemHandle;
 use workspace::preview_appearance::{preview_appearance, set_preview_appearance};
@@ -8,17 +8,15 @@ use workspace::preview_appearance::{preview_appearance, set_preview_appearance};
 use crate::open_split_preview;
 use crate::split_preview_view::{PreviewLayout, SplitPreviewView};
 
-/// How visible the floating layout switch is when the pointer is elsewhere.
-const RESTING_SWITCH_OPACITY: f32 = 0.35;
-
 pub fn init(cx: &mut App) {
     workspace::register_item_overlay(cx, render_layout_switch);
 }
 
-/// The three-way layout switch, floating over the document it applies to. A
-/// document this editor can preview -- Markdown, HTML, an OpenAPI contract --
-/// offers the choice from the page it is being edited on, so a reader does not
-/// have to know that a command exists in order to find the preview at all.
+/// The three-way layout switch, carried at the right end of the tab bar of the
+/// pane it applies to. A document this editor can preview -- Markdown, HTML, an
+/// OpenAPI contract -- offers the choice from the page it is being edited on, so
+/// a reader does not have to know that a command exists in order to find the
+/// preview at all.
 fn render_layout_switch(
     item: &dyn ItemHandle,
     pane: &Entity<Pane>,
@@ -32,18 +30,7 @@ fn render_layout_switch(
         h_flex()
             .id("preview-layout-switch")
             .debug_selector(|| "preview-layout-switch".into())
-            .p_0p5()
             .gap_px()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().elevated_surface_background)
-            .shadow_sm()
-            // The switch floats over the document, so it stays faint until the
-            // pointer is on it -- present enough to be found, quiet enough not
-            // to sit on top of the text being read.
-            .opacity(RESTING_SWITCH_OPACITY)
-            .hover(|style| style.opacity(1.0))
             .children(PreviewLayout::ALL.map(|layout| {
                 let target = target.clone();
                 div()
@@ -52,6 +39,12 @@ fn render_layout_switch(
                         IconButton::new(("preview-layout", layout.to_db() as usize), layout.icon())
                             .icon_size(IconSize::Small)
                             .toggle_state(layout == selected)
+                            // Which layout is in force has to be visible at rest.
+                            // `toggle_state` alone leaves a `ButtonLike` looking
+                            // exactly as it did, so the chosen one is named in
+                            // both the icon's color and a filled background.
+                            .selected_icon_color(Color::Selected)
+                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                             .tooltip(Tooltip::text(layout.label()))
                             .on_click(move |_, window, cx| target.choose(layout, window, cx)),
                     )
@@ -63,35 +56,8 @@ fn render_layout_switch(
                     .debug_selector(|| "preview-appearance".into())
                     .child(render_appearance_button(cx)),
             )
-            // Reading something in full takes two steps otherwise: choose the
-            // preview alone, then zoom the pane it sits in. This is the second
-            // of them, put where the first one is.
-            .child(
-                div()
-                    .debug_selector(|| "preview-zoom".into())
-                    .child(render_zoom_button(pane)),
-            )
             .into_any_element(),
     )
-}
-
-/// Fills the window with whatever is being read, and gives the rest of the
-/// editor back when pressed again.
-///
-/// Whether the pane is filling the window already is not shown here. This runs
-/// while the pane is being updated, and asking it anything at that moment is
-/// what `register_item_overlay` warns against -- the editor stops there and
-/// then. The handler below runs later, when asking is allowed.
-fn render_zoom_button(pane: &Entity<Pane>) -> impl IntoElement {
-    let pane = pane.clone();
-    IconButton::new("preview-zoom", IconName::Maximize)
-        .icon_size(IconSize::Small)
-        .tooltip(Tooltip::text("Fill the window with this, or give it back"))
-        .on_click(move |_, window, cx| {
-            pane.update(cx, |pane, cx| {
-                pane.toggle_zoom(&workspace::ToggleZoom, window, cx);
-            });
-        })
 }
 
 fn render_appearance_button(cx: &mut App) -> impl IntoElement {
@@ -160,7 +126,7 @@ impl SwitchTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, px};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, px, size};
     use language::{Buffer, Language, LanguageConfig, LanguageMatcher};
     use project::Project;
     use serde_json::json;
@@ -450,38 +416,73 @@ mod tests {
         );
     }
 
+    // The switch rides in the pane's tab bar, so it costs the window no row of its
+    // own and covers no line of the document. Measured against the tab bar it sits
+    // in and against the document below it, since "above the document" is the
+    // whole point: a row over the first line is what this placement replaced.
     #[gpui::test]
-    async fn the_switch_sits_at_the_top_left_of_the_document(cx: &mut TestAppContext) {
+    async fn the_switch_rides_in_the_tab_bar_above_the_document(cx: &mut TestAppContext) {
         let (_, cx) = workspace_with_file("spec.yaml", CONTRACT, yaml_language(), cx).await;
 
-        let document = cx
-            .debug_bounds("pane-item-area")
-            .expect("the document area is painted");
         let switch = cx
             .debug_bounds("preview-layout-switch")
             .expect("the switch is painted");
+        let document = cx
+            .debug_bounds("pane-item-area")
+            .expect("the document area is painted");
 
-        assert!(
-            document.size.width > px(0.) && document.size.height > px(0.),
-            "wrapping the document must not collapse it: {:?}",
-            document.size
-        );
-        assert!(
-            switch.origin.y >= document.origin.y,
-            "the switch belongs inside the document, not over the toolbar above it"
-        );
-        assert!(
-            switch.origin.y < document.origin.y + document.size.height / 2.,
-            "the switch belongs in the upper half of the document"
-        );
-        assert!(
-            switch.origin.x < document.origin.x + document.size.width / 2.,
-            "the switch belongs in the left half of the document"
-        );
         assert!(
             switch.size.width > px(0.) && switch.size.height > px(0.),
             "the switch has to occupy real screen area to be clickable"
         );
+        assert!(
+            document.size.width > px(0.) && document.size.height > px(0.),
+            "the document must keep real area of its own: {:?}",
+            document.size
+        );
+        assert!(
+            switch.origin.y + switch.size.height <= document.origin.y,
+            "the switch belongs above the document, covering none of it, \
+             got {switch:?} against {document:?}"
+        );
+        assert!(
+            switch.origin.x > document.origin.x + document.size.width / 2.,
+            "the switch belongs at the right end of the row, got {switch:?}"
+        );
+    }
+
+    // The tab bar's end section does not shrink, and these controls are added
+    // ahead of the pane's own New / Split / Zoom. On a narrow pane that is how a
+    // button ends up past the edge, where it cannot be clicked at all -- so the
+    // whole group is measured against the window at a deliberately narrow width.
+    #[gpui::test]
+    async fn a_narrow_pane_keeps_every_tab_bar_button_reachable(cx: &mut TestAppContext) {
+        let (_, cx) = workspace_with_file("spec.yaml", CONTRACT, yaml_language(), cx).await;
+
+        for width in [px(900.), px(600.), px(420.)] {
+            cx.simulate_resize(size(width, px(700.)));
+            cx.run_until_parked();
+
+            let viewport = cx.update(|window, _| window.viewport_size());
+            let switch = cx
+                .debug_bounds("preview-layout-switch")
+                .expect("the switch is painted");
+            let buttons = cx
+                .debug_bounds("pane-tab-bar-buttons")
+                .expect("the pane's own buttons are painted");
+
+            assert!(
+                buttons.origin.x >= px(0.)
+                    && buttons.origin.x + buttons.size.width <= viewport.width,
+                "at a width of {width:?} the tab bar's buttons painted {buttons:?}, \
+                 past the {viewport:?} window"
+            );
+            assert!(
+                switch.origin.x >= px(0.) && switch.origin.x + switch.size.width <= viewport.width,
+                "at a width of {width:?} the switch painted {switch:?}, \
+                 past the {viewport:?} window"
+            );
+        }
     }
 
     #[gpui::test]

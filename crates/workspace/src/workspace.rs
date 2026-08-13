@@ -1012,9 +1012,6 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
     cx.default_global::<ProjectItemRegistry>().register::<I>();
 }
 
-/// Vertical room a pane keeps free for the controls painted over its item.
-pub const ITEM_OVERLAY_RESERVED_HEIGHT: Pixels = px(28.);
-
 /// How long a file may take to read before its pane gets a stand-in tab.
 /// Below roughly a fifth of a second a click still reads as instant, so a file
 /// that opens promptly never flashes a tab the reader did not ask to see; above
@@ -1029,15 +1026,14 @@ pub struct ItemOverlayRegistry(Vec<ItemOverlayRenderer>);
 
 impl Global for ItemOverlayRegistry {}
 
-/// Registers controls painted over the active item of a pane, floating in the
-/// top left corner of the document. Registered from outside this crate so a
-/// document kind can offer controls of its own without [`Pane`] knowing about
-/// it.
+/// Registers controls for the active item of a pane, carried at the right end of
+/// that pane's tab bar. Registered from outside this crate so a document kind can
+/// offer controls of its own without [`Pane`] knowing about it.
 ///
-/// The renderer is handed the pane the controls are painted into, so that acting
-/// on them can target that pane rather than whichever one happens to be active.
-/// It runs while that pane is being updated though, so the handle must only be
-/// read from the event handlers it builds, never while rendering.
+/// The renderer is handed the pane the controls belong to, so that acting on them
+/// can target that pane rather than whichever one happens to be active. It runs
+/// while that pane is being rendered though, so the handle must only be read from
+/// the event handlers it builds, never while rendering.
 pub fn register_item_overlay(
     cx: &mut App,
     render: impl Fn(&dyn ItemHandle, &Entity<Pane>, &mut Window, &mut App) -> Option<AnyElement>
@@ -1066,6 +1062,10 @@ impl ItemOverlayRegistry {
         })
     }
 
+    /// The controls for `item`, laid out for the right end of the pane's tab bar.
+    /// They live there rather than over the item because a row of their own cost
+    /// the window a row, and floating them over the document put them on top of
+    /// its first line.
     pub(crate) fn render_for(
         item: &dyn ItemHandle,
         pane: &Entity<Pane>,
@@ -1076,14 +1076,7 @@ impl ItemOverlayRegistry {
         if overlays.is_empty() {
             return None;
         }
-        Some(
-            h_flex()
-                .absolute()
-                .top_0p5()
-                .left_3()
-                .gap_1()
-                .children(overlays),
-        )
+        Some(h_flex().gap_1().children(overlays))
     }
 }
 
