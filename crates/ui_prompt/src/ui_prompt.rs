@@ -7,7 +7,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
 use theme::ClientDecorationsExt;
 use theme_settings::ThemeSettings;
-use ui::{ElevationIndex, FluentBuilder, cyberpunk, prelude::*};
+use ui::{ButtonLike, ButtonSize, ElevationIndex, FluentBuilder, cyberpunk, prelude::*};
 use workspace::WorkspaceSettings;
 
 pub fn init(cx: &mut App) {
@@ -110,7 +110,6 @@ impl ZedPromptRenderer {
 
 impl Render for ZedPromptRenderer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = ThemeSettings::get_global(cx);
         let accent = cyberpunk::accent_for_prompt_level(self.level);
 
         let dialog = v_flex()
@@ -123,34 +122,65 @@ impl Render for ZedPromptRenderer {
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
-            .w_80()
-            .p_4()
-            .gap_4()
+            .w(px(400.))
             .cyberpunk_surface()
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .overflow_hidden()
-            .font_family(settings.ui_font.family.clone())
-            .child(div().w_full().child(MarkdownElement::new(
-                self.message.clone(),
-                markdown_style(true, window, cx),
-            )))
-            .children(self.detail.clone().map(|detail| {
-                div().w_full().text_xs().child(MarkdownElement::new(
-                    detail,
-                    markdown_style(false, window, cx),
-                ))
-            }))
+            .cyberpunk_monospace(cx)
+            // The bar across the top says what kind of answer is being asked for
+            // before the sentence is read: red for anything with consequences,
+            // cyan for a routine notice.
+            .child(div().w_full().h(px(2.)).bg(accent.border()))
             .child(
                 v_flex()
-                    .gap_1()
+                    .p(cyberpunk::SPACE_18)
+                    .gap(cyberpunk::SPACE_14)
+                    .child(div().w_full().child(MarkdownElement::new(
+                        self.message.clone(),
+                        markdown_style(true, window, cx),
+                    )))
+                    .children(self.detail.clone().map(|detail| {
+                        div().w_full().text_xs().child(MarkdownElement::new(
+                            detail,
+                            markdown_style(false, window, cx),
+                        ))
+                    })),
+            )
+            .child(
+                v_flex()
+                    .p(cyberpunk::SPACE_18)
+                    .pt_0()
+                    .gap(cyberpunk::SPACE_4)
                     .children(self.actions.iter().enumerate().map(|(ix, action)| {
-                        Button::new(ix, action.clone())
-                            .full_width()
-                            .style(ButtonStyle::Outlined)
-                            .when(ix == self.active_action_id, |s| {
-                                s.style(ButtonStyle::OutlinedCustom(accent.border()))
+                        let selected = ix == self.active_action_id;
+                        // A `ButtonLike` rather than hand-drawn rows: the button
+                        // role, keyboard activation and pressed state all come
+                        // with it. Square and outlined, like the rest of this
+                        // chrome, and sized up because the default outline reads
+                        // as cramped against an 18-point rhythm.
+                        ButtonLike::new(ix)
+                            .style(if selected {
+                                ButtonStyle::OutlinedCustom(accent.border())
+                            } else {
+                                ButtonStyle::OutlinedCustom(cyberpunk::border_raised())
                             })
+                            .square()
+                            .size(ButtonSize::Large)
+                            .full_width()
                             .tab_index(ix as isize)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_center()
+                                    .cyberpunk_monospace(cx)
+                                    .child(Label::new(action.to_uppercase()).color(Color::Custom(
+                                        if selected {
+                                            accent.bright()
+                                        } else {
+                                            cyberpunk::text_secondary()
+                                        },
+                                    ))),
+                            )
                             .on_click(cx.listener(move |_, _, _window, cx| {
                                 cx.emit(PromptResponse(ix));
                             }))
@@ -194,7 +224,10 @@ fn markdown_style(main_message: bool, window: &Window, cx: &App) -> MarkdownStyl
     };
 
     base_text_style.refine(&TextStyleRefinement {
-        font_family: Some(settings.ui_font.family.clone()),
+        // The buffer font rather than the interface one: the message is the only
+        // text in this dialog, and proportional type here is what made it read as
+        // a system alert dropped into the editor.
+        font_family: Some(theme::theme_settings(cx).buffer_font(cx).family.clone()),
         font_size: Some(font_size),
         color: Some(color),
         ..Default::default()
