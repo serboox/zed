@@ -718,28 +718,32 @@ impl Launchpad {
         // are what the chrome around it is built from. Still a `ButtonLike`: a
         // hand-drawn row loses the button role, the keyboard activation and the
         // pressed state that assistive technology and the reader both rely on.
-        ButtonLike::new(id)
-            .style(ButtonStyle::OutlinedCustom(cyberpunk::border_raised()))
-            .square()
-            // The default height leaves an outline too tight to read as a button
-            // among elements laid out on a 14-and-up rhythm.
-            .size(ButtonSize::Large)
-            .when(full_width, |button| button.full_width())
-            .child(
-                h_flex()
-                    .w_full()
-                    .px(cyberpunk::SPACE_4)
-                    .gap(cyberpunk::SPACE_8)
-                    .justify_between()
-                    // The button component sets its own font, which would leave
-                    // these three the only proportional text in the window.
-                    .cyberpunk_monospace(cx)
-                    .child(Label::new(label).color(Color::Custom(cyberpunk::text_secondary())))
-                    .child(keybinding),
-            )
-            .on_click(cx.listener(move |_, _, window, cx| {
-                window.dispatch_action(action.boxed_clone(), cx);
-            }))
+        // The wrapper carries the debug selector a `ButtonLike` cannot, which is
+        // how a test measures where each button actually landed.
+        div().debug_selector(|| id.to_string()).child(
+            ButtonLike::new(id)
+                .style(ButtonStyle::OutlinedCustom(cyberpunk::border_raised()))
+                .square()
+                // The default height leaves an outline too tight to read as a button
+                // among elements laid out on a 14-and-up rhythm.
+                .size(ButtonSize::Large)
+                .when(full_width, |button| button.full_width())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px(cyberpunk::SPACE_4)
+                        .gap(cyberpunk::SPACE_8)
+                        .justify_between()
+                        // The button component sets its own font, which would leave
+                        // these three the only proportional text in the window.
+                        .cyberpunk_monospace(cx)
+                        .child(Label::new(label).color(Color::Custom(cyberpunk::text_secondary())))
+                        .child(keybinding),
+                )
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    window.dispatch_action(action.boxed_clone(), cx);
+                })),
+        )
     }
 
     fn render_ways_in(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -849,7 +853,13 @@ impl Render for Launchpad {
                         .debug_selector(|| "launchpad".into())
                         .key_context("Launchpad")
                         .track_focus(&self.focus_handle)
-                        .size_full()
+                        .w_full()
+                        // The room left over once the title bar above has taken
+                        // its own: `size_full` here would ask for the window's
+                        // whole height a second time and push this column's last
+                        // child past the bottom edge by the title bar's height.
+                        .flex_1()
+                        .min_h_0()
                         .p(cyberpunk::SPACE_22)
                         .gap(cyberpunk::SPACE_18)
                         // The traffic lights float over the top-left corner of a
@@ -1262,6 +1272,79 @@ mod tests {
             assert!(
                 off_centre.abs() < 1.,
                 "at a width of {width:?} the mark painted {off_centre} from the centre"
+            );
+        }
+    }
+
+    // A full history and a window short enough that the rows cannot all fit:
+    // whatever gives way, it may not be the row of buttons. Pre-fix the content
+    // column asked for the window's whole height on top of the title bar's, so
+    // the buttons were laid out past the bottom edge by the title bar's height
+    // and painted cropped -- clickable nowhere. Each button is measured, not just
+    // the row around them: a row that fits can still crop what it holds.
+    #[gpui::test]
+    async fn test_the_ways_in_stay_inside_a_short_window(cx: &mut TestAppContext) {
+        let app_state = init_launchpad_test(cx);
+        let recents = (1..=ROWS_BEFORE_SCROLLING as i64)
+            .map(|id| {
+                recent(
+                    &format!("project-{id}"),
+                    &format!("/projects/project-{id}"),
+                    id,
+                )
+            })
+            .collect();
+        let window = open_launchpad_with(recents, app_state, cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        for height in [px(560.), px(460.), px(380.)] {
+            visual.simulate_resize(size(px(720.), height));
+            draw(&mut visual);
+
+            let viewport = visual.update(|window, _| window.viewport_size());
+            let window_area = Bounds {
+                origin: point(px(0.), px(0.)),
+                size: viewport,
+            };
+            let ways_in = visual
+                .debug_bounds("launchpad-ways-in")
+                .expect("the ways in were painted");
+            let list = visual
+                .debug_bounds("launchpad-projects")
+                .expect("the project list was painted");
+
+            assert!(
+                fits_inside(ways_in, window_area),
+                "at a height of {height:?} the ways in painted {ways_in:?}, \
+                 outside the {viewport:?} window"
+            );
+            for id in [
+                "launchpad-new-file",
+                "launchpad-open-folder",
+                "launchpad-open-file",
+            ] {
+                let button = visual
+                    .debug_bounds(id)
+                    .unwrap_or_else(|| panic!("{id} was painted"));
+                assert!(
+                    fits_inside(button, window_area),
+                    "at a height of {height:?} {id} painted {button:?}, \
+                     outside the {viewport:?} window"
+                );
+                assert!(
+                    button.size.height > px(0.) && button.size.width > px(0.),
+                    "at a height of {height:?} {id} painted {:?}, no area to click",
+                    button.size
+                );
+            }
+            assert!(
+                list.size.height > px(0.),
+                "at a height of {height:?} the list gave up all of its area"
+            );
+            assert!(
+                list.bottom() <= ways_in.origin.y,
+                "at a height of {height:?} the list painted over the ways in"
             );
         }
     }
