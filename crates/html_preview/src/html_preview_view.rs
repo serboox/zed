@@ -270,7 +270,15 @@ impl HtmlPreviewView {
         workspace.register_action(move |workspace, _: &NewBrowserTab, window, cx| {
             let view = Self::create_browser_tab(workspace, window, cx);
             workspace.active_pane().update(cx, |pane, cx| {
-                pane.add_item(Box::new(view), true, true, None, window, cx);
+                pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
+            });
+            // The tab is shown before the page is asked for. Starting the engine
+            // is the slow part and it happens on this thread, so opening first
+            // left the window still for long enough that the press looked lost.
+            window.defer(cx, move |window, cx| {
+                view.update(cx, |view, cx| {
+                    view.start_a_browser_tab(window, cx);
+                });
             });
             cx.notify();
         });
@@ -388,15 +396,18 @@ impl HtmlPreviewView {
     ) -> Entity<Self> {
         let language_registry = workspace.project().read(cx).languages().clone();
         let weak = workspace.weak_handle();
-        let view = Self::new_empty(weak, language_registry, window, cx);
-        view.update(cx, |view, cx| {
-            // Sent straight to the engine rather than through the address bar's
-            // own reading of what is typed, which would have searched for the
-            // address as words.
-            view.open_the_page(url::Url::parse(NEW_TAB_PAGE).ok(), window, cx);
-            view.address.focus_handle(cx).focus(window, cx);
-        });
-        view
+        Self::new_empty(weak, language_registry, window, cx)
+    }
+
+    /// Sends a fresh browser tab to its first page. Kept apart from building the
+    /// tab so the tab can be on screen before the engine is asked for anything.
+    #[cfg(feature = "servo")]
+    fn start_a_browser_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Sent straight to the engine rather than through the address bar's own
+        // reading of what is typed, which would have searched for the address as
+        // words.
+        self.open_the_page(url::Url::parse(NEW_TAB_PAGE).ok(), window, cx);
+        self.address.focus_handle(cx).focus(window, cx);
     }
 
     pub fn new(
