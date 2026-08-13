@@ -56,7 +56,9 @@ impl RenderOnce for Popover {
                 this.child(
                     v_flex()
                         .elevation_2(cx)
-                        .bg(cx.theme().colors().surface_background)
+                        // A step darker than the popover proper, which is what
+                        // keeps the aside readable as a separate column.
+                        .bg(crate::cyberpunk::canvas())
                         .px_1()
                         .child(aside),
                 )
