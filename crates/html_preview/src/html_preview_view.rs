@@ -31,6 +31,11 @@ use crate::{FindInPage, FindNextInPage, FindPreviousInPage, NewBrowserTab, StopF
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Where a new browser tab starts. The language and the region are named in the
+/// address rather than left to the search engine's guess from the address the
+/// request arrives from, which is how the same tab comes up in a different
+/// language in every country.
+const NEW_TAB_PAGE: &str = "https://www.google.com/webhp?hl=en&gl=us";
 /// How long the page's driver waits before looking anyway. The engine says when
 /// it has work, so this is only a safety net -- for a wake-up that was missed,
 /// and for a view that was resized without the page hearing about it.
@@ -385,10 +390,10 @@ impl HtmlPreviewView {
         let weak = workspace.weak_handle();
         let view = Self::new_empty(weak, language_registry, window, cx);
         view.update(cx, |view, cx| {
-            // A page of nothing, so the engine is up and the reader has only to
-            // type. Sending this through the address bar's own reading of what
-            // is typed would have searched for the words "about:blank".
-            view.open_the_page(url::Url::parse("about:blank").ok(), window, cx);
+            // Sent straight to the engine rather than through the address bar's
+            // own reading of what is typed, which would have searched for the
+            // address as words.
+            view.open_the_page(url::Url::parse(NEW_TAB_PAGE).ok(), window, cx);
             view.address.focus_handle(cx).focus(window, cx);
         });
         view

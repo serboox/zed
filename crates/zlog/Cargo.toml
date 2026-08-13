@@ -17,7 +17,11 @@ default = []
 [dependencies]
 collections.workspace = true
 chrono.workspace = true
-log.workspace = true
+# `std` because `try_init` propagates `log`'s SetLoggerError with `?`, and that
+# error only implements std::error::Error when the feature is on. Without it this
+# crate does not build on its own, only inside a graph where something else asks
+# for the feature.
+log = { workspace = true, features = ["std"] }
 anyhow.workspace = true
 
 [dev-dependencies]

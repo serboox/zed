@@ -43,6 +43,11 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     // can happen a lot with the SVG preview
     ("usvg::parser", log::LevelFilter::Error),
     ("pet", log::LevelFilter::Warn),
+    // The web engine's cookie store logs every cookie it sends, at info level and
+    // in full. Two reasons that must not reach the log: the values are session
+    // credentials, and a busy page writes a line per request, which is paid for in
+    // formatting and a file write while the page is trying to draw.
+    ("net::cookie_storage", log::LevelFilter::Warn),
 ];
 
 pub fn init_env_filter(filter: env_config::EnvFilter) {
@@ -538,6 +543,40 @@ mod tests {
         assert_eq!(
             map.is_enabled(&scope_from_scope_str("q.r.s.t"), None, Level::Warn),
             EnabledStatus::Disabled
+        );
+    }
+
+    // The web engine's cookie store logs every cookie it sends at info level, in
+    // full. It has to be off by default -- those values are session credentials
+    // and a busy page writes a line per request -- while a reader who asks for it
+    // explicitly still gets it.
+    #[test]
+    fn the_engines_cookie_log_is_off_by_default_and_can_still_be_asked_for() {
+        use log::Level;
+        let unused = scope_from_scope_str("__unused__");
+
+        let quiet =
+            ScopeMap::new_from_settings_and_env(&HashMap::default(), None, super::DEFAULT_FILTERS);
+        assert_eq!(
+            quiet.is_enabled(&unused, Some("net::cookie_storage"), Level::Info),
+            EnabledStatus::Disabled,
+            "cookies must not reach the log by default"
+        );
+        assert_eq!(
+            quiet.is_enabled(&unused, Some("net::cookie_storage"), Level::Warn),
+            EnabledStatus::Enabled,
+            "a real problem in the cookie store still has to be reported"
+        );
+
+        let asked_for: HashMap<String, String> =
+            [("net::cookie_storage".to_string(), "info".to_string())]
+                .into_iter()
+                .collect();
+        let loud = ScopeMap::new_from_settings_and_env(&asked_for, None, super::DEFAULT_FILTERS);
+        assert_eq!(
+            loud.is_enabled(&unused, Some("net::cookie_storage"), Level::Info),
+            EnabledStatus::Enabled,
+            "a setting naming this module has to win over the default"
         );
     }
 

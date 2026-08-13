@@ -19,6 +19,10 @@ pub enum PreviewKind {
 /// Which preview, if any, can render the document the editor is showing.
 /// The language decides for Markdown and HTML; an OpenAPI contract is a plain
 /// YAML or JSON file, so its content has to be inspected as well.
+/// How much of a document is read to tell whether it is an OpenAPI contract.
+/// Matches the limit the check itself applies.
+const SNIFF_CHARS: usize = 8 * 1024;
+
 pub fn preview_kind_for(editor: &Entity<Editor>, cx: &App) -> Option<PreviewKind> {
     let multi_buffer = editor.read(cx).buffer().read(cx);
     let buffer = multi_buffer.as_singleton()?;
@@ -28,7 +32,11 @@ pub fn preview_kind_for(editor: &Entity<Editor>, cx: &App) -> Option<PreviewKind
         Some("Markdown") => Some(PreviewKind::Markdown),
         Some("HTML") => Some(PreviewKind::Html),
         Some("YAML") | Some("JSON") | Some("JSONC") => {
-            looks_like_openapi(&buffer.read(cx).text()).then_some(PreviewKind::OpenApi)
+            // Only the head of the file: the check itself reads no further, and
+            // this runs from a render, where copying a whole document out of the
+            // buffer costs that much on every frame.
+            let head: String = buffer.read(cx).chars_at(0).take(SNIFF_CHARS).collect();
+            looks_like_openapi(&head).then_some(PreviewKind::OpenApi)
         }
         _ => None,
     }

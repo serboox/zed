@@ -1026,9 +1026,9 @@ pub struct ItemOverlayRegistry(Vec<ItemOverlayRenderer>);
 
 impl Global for ItemOverlayRegistry {}
 
-/// Registers controls for the active item of a pane, carried at the right end of
-/// that pane's tab bar. Registered from outside this crate so a document kind can
-/// offer controls of its own without [`Pane`] knowing about it.
+/// Registers controls floating over the top left of a pane's active item.
+/// Registered from outside this crate so a document kind can offer controls of
+/// its own without [`Pane`] knowing about it.
 ///
 /// The renderer is handed the pane the controls belong to, so that acting on them
 /// can target that pane rather than whichever one happens to be active. It runs
@@ -1062,10 +1062,9 @@ impl ItemOverlayRegistry {
         })
     }
 
-    /// The controls for `item`, laid out for the right end of the pane's tab bar.
-    /// They live there rather than over the item because a row of their own cost
-    /// the window a row, and floating them over the document put them on top of
-    /// its first line.
+    /// The controls for `item`, floating over the top left of it. No row is kept
+    /// free beneath them: a row of their own cost the window a row of chrome for
+    /// controls that are already faint until the pointer arrives.
     pub(crate) fn render_for(
         item: &dyn ItemHandle,
         pane: &Entity<Pane>,
@@ -1076,7 +1075,14 @@ impl ItemOverlayRegistry {
         if overlays.is_empty() {
             return None;
         }
-        Some(h_flex().gap_1().children(overlays))
+        Some(
+            h_flex()
+                .absolute()
+                .top_0p5()
+                .left_3()
+                .gap_1()
+                .children(overlays),
+        )
     }
 }
 

@@ -4203,7 +4203,7 @@ impl Pane {
 /// as something that broke rather than something that yielded.
 fn default_render_tab_bar_buttons(
     pane: &mut Pane,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
     let (can_clone, can_split_move) = match pane.active_item() {
@@ -4211,19 +4211,12 @@ fn default_render_tab_bar_buttons(
         Some(_) => (false, pane.items_len() > 1),
         None => (false, false),
     };
-    // The active item's own controls, ahead of the pane's: they belong to what is
-    // being read, and putting them here is what saves the window the row they
-    // used to be given.
-    let item_controls = pane.active_item().and_then(|item| {
-        crate::ItemOverlayRegistry::render_for(item.as_ref(), &cx.entity(), window, cx)
-    });
     // Ideally we would return a vec of elements here to pass directly to the [TabBar]'s
     // `end_slot`, but due to needing a view here that isn't possible.
     let right_children = h_flex()
         .debug_selector(|| "pane-tab-bar-buttons".into())
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
-        .children(item_controls)
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
@@ -4505,6 +4498,12 @@ impl Render for Pane {
                     })
                     .map(|div| {
                         if let Some(item) = self.active_item() {
+                            let overlay = crate::ItemOverlayRegistry::render_for(
+                                item.as_ref(),
+                                &cx.entity(),
+                                window,
+                                cx,
+                            );
                             div.id("pane_placeholder")
                                 .v_flex()
                                 .size_full()
@@ -4512,10 +4511,14 @@ impl Render for Pane {
                                 .child(self.toolbar.clone())
                                 .child(
                                     v_flex()
+                                        .relative()
                                         .size_full()
                                         .min_h_0()
                                         .debug_selector(|| "pane-item-area".into())
-                                        .child(item.to_any_view()),
+                                        .child(item.to_any_view())
+                                        // Last, so a floating control is never
+                                        // painted under what it controls.
+                                        .children(overlay),
                                 )
                         } else {
                             let placeholder = div

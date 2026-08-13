@@ -54,6 +54,11 @@ mod engine {
     /// The largest page surface kept in memory, in device pixels.
     const MAX_SURFACE: u32 = 8_000;
 
+    /// The locale every page is read in, whatever the machine's own. Language
+    /// negotiation follows this, so a site answers in English in every country
+    /// rather than in the language of wherever the reader happens to be.
+    const READING_LOCALE: &str = "en-US";
+
     struct GlobalHtmlEngine(Rc<HtmlEngine>);
 
     impl Global for GlobalHtmlEngine {}
@@ -218,6 +223,10 @@ mod engine {
         if std::env::var("ZED_HTML_SUBPIXEL_TEXT").as_deref() == Ok("1") {
             preferences.gfx_subpixel_text_antialiasing_enabled = true;
         }
+        // Pages are read in English wherever the machine happens to be. Without
+        // this the engine negotiates language from the system locale, so the same
+        // site answers in a different language in every country.
+        preferences.intl_locale_override = READING_LOCALE.to_string();
         // A site's idea of where the reader is comes from the address its
         // requests arrive from. Somewhere to send them through is the only thing
         // that changes it, so the reader may name one.
