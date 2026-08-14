@@ -1414,6 +1414,15 @@
     },
   },
   {
+    "context": "PdfView",
+    "bindings": {
+      "ctrl-=": "pdf::PdfZoomIn",
+      "ctrl-+": "pdf::PdfZoomIn",
+      "ctrl--": "pdf::PdfZoomOut",
+      "ctrl-0": "pdf::PdfZoomReset",
+    },
+  },
+  {
     "context": "MarkdownPreview",
     "bindings": {
       "pageup": "markdown::ScrollPageUp",

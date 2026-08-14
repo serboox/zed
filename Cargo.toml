@@ -203,6 +203,7 @@ members = [
     "crates/sqlez_macros",
     "crates/streaming_diff",
     "crates/sum_tree",
+    "crates/pdf_preview",
     "crates/svg_preview",
     "crates/system_specs",
     "crates/syntax_theme",
@@ -413,6 +414,7 @@ lsp_locations = { path = "crates/lsp_locations" }
 markdown = { path = "crates/markdown" }
 markdown_preview = { path = "crates/markdown_preview" }
 mermaid_render = { path = "crates/mermaid_render" }
+pdf_preview = { path = "crates/pdf_preview" }
 svg_preview = { path = "crates/svg_preview" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
@@ -559,7 +561,10 @@ async-std = { version = "1.12", features = ["unstable"] }
 async-tar = "0.6"
 async-task = "4.7"
 async-trait = "0.1"
-async-tungstenite = "0.31.0"
+# One version across the workspace: `repl` hands a socket from
+# jupyter-websocket-client to its own type, and two versions of this crate make
+# those two different types however alike they look.
+async-tungstenite = "0.34.1"
 async-process = "2.5.0"
 async_zip = { version = "0.0.18", features = ["deflate", "deflate64"] }
 aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
@@ -688,6 +693,7 @@ linkify = "0.10.0"
 libwebrtc = "0.3.26"
 livekit = { version = "0.7.32", features = ["tokio", "rustls-tls-native-roots"] }
 log = { version = "0.4.16", features = ["serde"] }
+pdfium-render = "0.9.3"
 lru = "0.16"
 lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "f4dfa89a21ca35cd929b70354b1583fabae325f8" }
 mach2 = "0.5"

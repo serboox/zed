@@ -199,6 +199,7 @@ smol.workspace = true
 split_preview.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
+pdf_preview.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true

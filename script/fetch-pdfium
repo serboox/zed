@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Puts Google's PDF engine where the editor looks for it, and does nothing at all
+# when it is already there. The library is a binary of a fixed release, so "there"
+# is decided by that release's tag: a cache holding the tag we ask for is the
+# library we want, and nothing is fetched.
+#
+# Prints the directory holding the library, so a caller can pass it on.
+set -euo pipefail
+
+# The release the editor is built against. Bumping this is what makes every
+# machine fetch a new library; nothing else does.
+PDFIUM_RELEASE="${PDFIUM_RELEASE:-chromium/7999}"
+
+case "$(uname -s)" in
+    Linux)  asset=pdfium-linux-x64; library=libpdfium.so ;;
+    Darwin)
+        case "$(uname -m)" in
+            arm64) asset=pdfium-mac-arm64 ;;
+            *)     asset=pdfium-mac-x64 ;;
+        esac
+        library=libpdfium.dylib
+        ;;
+    MINGW*|MSYS*|CYGWIN*) asset=pdfium-win-x64; library=pdfium.dll ;;
+    *) echo "fetch-pdfium: no PDF engine published for $(uname -s)" >&2; exit 1 ;;
+esac
+
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/zed/pdfium"
+# The tag carries a slash, which would otherwise become a directory level.
+cache_dir="$cache_root/${PDFIUM_RELEASE//\//-}"
+
+if [ -f "$cache_dir/$library" ]; then
+    echo "$cache_dir"
+    exit 0
+fi
+
+url="https://github.com/bblanchon/pdfium-binaries/releases/download/$PDFIUM_RELEASE/$asset.tgz"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+echo "fetch-pdfium: getting $PDFIUM_RELEASE for $asset" >&2
+curl -fsSL --retry 3 --retry-delay 2 -o "$work/pdfium.tgz" "$url"
+tar -xzf "$work/pdfium.tgz" -C "$work"
+
+found="$(find "$work" -name "$library" -type f | head -1)"
+if [ -z "$found" ]; then
+    echo "fetch-pdfium: $library is not in $asset.tgz" >&2
+    exit 1
+fi
+
+# Into place in one move, so a reader that looks while this runs sees either the
+# old state or a complete library, never half of one.
+mkdir -p "$cache_dir"
+mv "$found" "$cache_dir/$library.partial"
+mv "$cache_dir/$library.partial" "$cache_dir/$library"
+
+echo "$cache_dir"
