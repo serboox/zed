@@ -12,7 +12,9 @@ actions!(
         /// Renders the document smaller.
         PdfZoomOut,
         /// Returns the document to the size it opened at.
-        PdfZoomReset
+        PdfZoomReset,
+        /// Copies the text under the selection.
+        PdfCopy
     ]
 );
 

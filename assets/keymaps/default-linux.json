@@ -1420,6 +1420,7 @@
       "ctrl-+": "pdf::PdfZoomIn",
       "ctrl--": "pdf::PdfZoomOut",
       "ctrl-0": "pdf::PdfZoomReset",
+      "ctrl-c": "pdf::PdfCopy",
     },
   },
   {

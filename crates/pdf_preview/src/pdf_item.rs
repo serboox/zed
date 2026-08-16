@@ -21,13 +21,38 @@ pub fn is_pdf_extension(extension: Option<&str>) -> bool {
     extension.is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+/// The extension to judge a path by. A file opened on its own -- from the command
+/// line, say -- becomes a worktree of itself, and then the path inside that
+/// worktree is empty and carries no extension at all. The worktree's own path is
+/// the file in that case, so it answers instead.
+fn extension_to_judge_by<'a>(
+    path_in_project: Option<&'a str>,
+    worktree_path: Option<&'a str>,
+) -> Option<&'a str> {
+    path_in_project.or(worktree_path)
+}
+
 impl ProjectItem for PdfItem {
     fn try_open(
         project: &Entity<Project>,
         path: &ProjectPath,
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
-        if !is_pdf_extension(path.path.extension()) {
+        let worktree_extension = project
+            .read(cx)
+            .worktree_for_id(path.worktree_id, cx)
+            .and_then(|worktree| {
+                worktree
+                    .read(cx)
+                    .abs_path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_owned)
+            });
+        if !is_pdf_extension(extension_to_judge_by(
+            path.path.extension(),
+            worktree_extension.as_deref(),
+        )) {
             return None;
         }
         let project = project.clone();
@@ -65,6 +90,24 @@ mod tests {
         assert!(is_pdf_extension(Some("pdf")));
         assert!(is_pdf_extension(Some("PDF")));
         assert!(is_pdf_extension(Some("PdF")));
+    }
+
+    #[test]
+    fn a_file_opened_on_its_own_is_judged_by_the_worktree_it_became() {
+        // Nothing inside the worktree, because the worktree is the file: this is
+        // what opening `zed report.pdf` from a shell looks like.
+        assert_eq!(
+            extension_to_judge_by(None, Some("pdf")),
+            Some("pdf"),
+            "a file that is its own worktree has to be judged by that worktree"
+        );
+        // A file inside a folder answers for itself, whatever the folder is named.
+        assert_eq!(
+            extension_to_judge_by(Some("pdf"), Some("git")),
+            Some("pdf"),
+            "the path inside the project comes first"
+        );
+        assert_eq!(extension_to_judge_by(None, None), None);
     }
 
     #[test]
