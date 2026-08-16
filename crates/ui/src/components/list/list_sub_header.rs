@@ -57,7 +57,7 @@ impl RenderOnce for ListSubHeader {
                     .h_5()
                     .when(self.inset, |this| this.px_2())
                     .when(self.selected, |this| {
-                        this.bg(cx.theme().colors().ghost_element_selected)
+                        this.bg(crate::cyberpunk::row_chosen())
                     })
                     .flex()
                     .flex_1()

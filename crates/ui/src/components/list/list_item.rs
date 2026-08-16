@@ -313,11 +313,11 @@ impl RenderOnce for ListItem {
                     }
                 })
                 .when(self.selectable && !self.disabled, |this| {
-                    this.hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                        .active(|style| style.bg(cx.theme().colors().ghost_element_active))
+                    this.hover(|style| style.bg(crate::cyberpunk::row_hovered()))
+                        .active(|style| style.bg(crate::cyberpunk::row_pressed()))
                         .when(self.outlined, |this| this.rounded_sm())
                         .when(self.selected, |this| {
-                            this.bg(cx.theme().colors().ghost_element_selected)
+                            this.bg(crate::cyberpunk::row_chosen())
                         })
                 })
             })
@@ -370,10 +370,10 @@ impl RenderOnce for ListItem {
                             }
                         })
                         .when(self.selectable && !self.disabled, |this| {
-                            this.hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                                .active(|style| style.bg(cx.theme().colors().ghost_element_active))
+                            this.hover(|style| style.bg(crate::cyberpunk::row_hovered()))
+                                .active(|style| style.bg(crate::cyberpunk::row_pressed()))
                                 .when(self.selected, |this| {
-                                    this.bg(cx.theme().colors().ghost_element_selected)
+                                    this.bg(crate::cyberpunk::row_chosen())
                                 })
                         })
                     })

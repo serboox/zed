@@ -106,6 +106,21 @@ pub fn accent_for_danger(is_dangerous: bool) -> Accent {
     }
 }
 
+/// How a row says it is under the pointer, being pressed, or chosen. One accent
+/// at three strengths rather than three greys: a list inside this chrome has to
+/// answer in the same colour as everything else in it.
+pub fn row_hovered() -> Hsla {
+    Accent::Cyan.border().opacity(0.10)
+}
+
+pub fn row_pressed() -> Hsla {
+    Accent::Cyan.border().opacity(0.20)
+}
+
+pub fn row_chosen() -> Hsla {
+    Accent::Cyan.border().opacity(0.16)
+}
+
 /// A soft outer glow for the one focal element of a view. Kept low-alpha per
 /// the source design doc: glow needs to read as a lit edge, not fog.
 pub fn focal_glow(accent: Accent) -> Vec<BoxShadow> {
