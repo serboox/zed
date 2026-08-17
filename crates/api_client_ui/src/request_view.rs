@@ -14,8 +14,9 @@ use api_client::{
 };
 use editor::{Editor, EditorEvent, HighlightKey};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
-    ScrollHandle, Subscription, WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, MouseButton,
+    MouseDownEvent, Pixels, Point, Render, ScrollHandle, Size, Subscription, WeakEntity, Window,
+    point, px,
 };
 use std::sync::Arc;
 use ui::{
@@ -418,6 +419,8 @@ pub struct RequestView {
     send_state: SendState,
     /// The shape the code window was last opened on.
     code_snippet_shape: Snippet,
+    /// Where the code window was left, so it opens there again.
+    code_snippet_place: Option<(Point<Pixels>, Size<Pixels>)>,
     response_tab: ResponseTab,
     pretty_body_editor: Entity<Editor>,
     raw_body_editor: Entity<Editor>,
@@ -726,6 +729,7 @@ impl RequestView {
             jwt_query_param_key_editor,
             send_state: SendState::Idle,
             code_snippet_shape: Snippet::Curl,
+            code_snippet_place: None,
             response_tab: ResponseTab::Pretty,
             pretty_body_editor,
             raw_body_editor,
@@ -1796,16 +1800,29 @@ impl RequestView {
         let languages = workspace.read(cx).app_state().languages.clone();
         let store = self.store.clone();
         let shown = self.code_snippet_shape;
+        let was_left_at = self.code_snippet_place;
         let view = cx.entity().downgrade();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                let modal = CodeSnippetModal::new(request, store, languages, shown, window, cx);
-                // What the reader picked is remembered, so the window opens on it
-                // next time rather than back on cURL.
+                let modal = CodeSnippetModal::new(
+                    request,
+                    store,
+                    languages,
+                    shown,
+                    was_left_at,
+                    window,
+                    cx,
+                );
+                // What the reader picked, and where they left the window, are
+                // remembered: it opens on that shape, in that place, at that size.
                 cx.observe_release(&cx.entity(), move |_, modal: &mut CodeSnippetModal, cx| {
                     let shown = modal.shown();
-                    view.update(cx, |view, _| view.code_snippet_shape = shown)
-                        .ok();
+                    let was_left_at = modal.was_left_at();
+                    view.update(cx, |view, _| {
+                        view.code_snippet_shape = shown;
+                        view.code_snippet_place = Some(was_left_at);
+                    })
+                    .log_err();
                 })
                 .detach();
                 modal
@@ -4297,7 +4314,35 @@ pub(crate) struct CodeSnippetModal {
     store: Entity<ApiClientStore>,
     languages: Arc<language::LanguageRegistry>,
     shown: Snippet,
+    /// Where its top-left corner sits in the window, and how big it is. The reader
+    /// moves and resizes it, so neither is fixed.
+    place: Point<Pixels>,
+    size: Size<Pixels>,
+    held: Option<Held>,
 }
+
+/// What the pointer is doing to the window while a button is down.
+#[derive(Clone, Copy)]
+enum Held {
+    /// Moving it: the pointer holds the window at this offset from its corner, so
+    /// the corner keeps its distance from the pointer however far it travels.
+    Moving { at: Point<Pixels> },
+    /// Resizing from the bottom-right corner: where the pointer started, and how
+    /// big the window was then.
+    Resizing {
+        from: Point<Pixels>,
+        was: Size<Pixels>,
+    },
+}
+
+/// Small enough to still be usable, large enough to still be a window.
+const NARROWEST_SNIPPET_WINDOW: Pixels = px(420.);
+const SHORTEST_SNIPPET_WINDOW: Pixels = px(220.);
+/// What it opens as the first time, before the reader has resized it.
+const SNIPPET_WINDOW_SIZE: Size<Pixels> = Size {
+    width: px(760.),
+    height: px(520.),
+};
 
 impl CodeSnippetModal {
     pub(crate) fn new(
@@ -4305,6 +4350,7 @@ impl CodeSnippetModal {
         store: Entity<ApiClientStore>,
         languages: Arc<language::LanguageRegistry>,
         shown: Snippet,
+        was_left_at: Option<(Point<Pixels>, Size<Pixels>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -4313,6 +4359,10 @@ impl CodeSnippetModal {
             editor.set_read_only(true);
             editor
         });
+        let (place, size) = was_left_at.unwrap_or_else(|| {
+            let size = SNIPPET_WINDOW_SIZE;
+            (Self::first_place_of(size, window), size)
+        });
         let mut modal = Self {
             focus_handle: cx.focus_handle(),
             code_editor,
@@ -4320,7 +4370,11 @@ impl CodeSnippetModal {
             store,
             languages,
             shown,
+            place,
+            size,
+            held: None,
         };
+        modal.keep_inside_the_window(window);
         modal.show(shown, window, cx);
         modal
     }
@@ -4329,6 +4383,147 @@ impl CodeSnippetModal {
     /// on cURL again.
     pub(crate) fn shown(&self) -> Snippet {
         self.shown
+    }
+
+    /// Where it was left, so it opens there again instead of jumping back to the
+    /// middle every time.
+    pub(crate) fn was_left_at(&self) -> (Point<Pixels>, Size<Pixels>) {
+        (self.place, self.size)
+    }
+
+    /// Across the window and a little down from its top: near the request it came
+    /// from, and clear of the tab bar.
+    fn first_place_of(size: Size<Pixels>, window: &Window) -> Point<Pixels> {
+        let viewport = window.viewport_size();
+        point(
+            ((viewport.width - size.width) / 2.).max(px(0.)),
+            (viewport.height * 0.08).max(px(0.)),
+        )
+    }
+
+    /// Nothing may hang past the edge of the window: a title bar dragged out of
+    /// reach cannot be dragged back.
+    fn keep_inside_the_window(&mut self, window: &Window) {
+        let viewport = window.viewport_size();
+        let widest = viewport.width.max(NARROWEST_SNIPPET_WINDOW);
+        let tallest = viewport.height.max(SHORTEST_SNIPPET_WINDOW);
+        self.size.width = self
+            .size
+            .width
+            .clamp(NARROWEST_SNIPPET_WINDOW.min(widest), widest);
+        self.size.height = self
+            .size
+            .height
+            .clamp(SHORTEST_SNIPPET_WINDOW.min(tallest), tallest);
+        self.place.x = self
+            .place
+            .x
+            .clamp(px(0.), (viewport.width - self.size.width).max(px(0.)));
+        self.place.y = self
+            .place
+            .y
+            .clamp(px(0.), (viewport.height - self.size.height).max(px(0.)));
+    }
+
+    fn take_hold(&mut self, held: Held, cx: &mut Context<Self>) {
+        self.held = Some(held);
+        cx.notify();
+    }
+
+    /// The pointer moved while the window was held.
+    fn dragged_to(&mut self, pointer: Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        match self.held {
+            Some(Held::Moving { at }) => {
+                self.place = point(pointer.x - at.x, pointer.y - at.y);
+            }
+            Some(Held::Resizing { from, was }) => {
+                self.size = Size {
+                    width: was.width + (pointer.x - from.x),
+                    height: was.height + (pointer.y - from.y),
+                };
+            }
+            None => return,
+        }
+        self.keep_inside_the_window(window);
+        cx.notify();
+    }
+
+    fn let_go(&mut self, cx: &mut Context<Self>) {
+        if self.held.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// While the window is held, the pointer is followed wherever it goes --
+    /// including outside the window's own bounds, which an element's own mouse
+    /// handlers never see.
+    fn follow_the_pointer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        gpui::canvas(
+            |_, _, _| (),
+            move |_, _, window, _cx| {
+                let moved = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    // The window is closed while it is being dragged often enough
+                    // that a gone entity is ordinary here, not a fault.
+                    moved
+                        .update(cx, |modal, cx| match event.pressed_button {
+                            Some(MouseButton::Left) => modal.dragged_to(event.position, window, cx),
+                            // Released where these listeners cannot see it -- outside
+                            // the editor's own window, or while the editor was not
+                            // the window in front. Without this the window would
+                            // stay stuck to the pointer afterwards.
+                            _ => modal.let_go(cx),
+                        })
+                        .ok();
+                });
+                let released = view;
+                window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _window, cx| {
+                    if phase == gpui::DispatchPhase::Bubble {
+                        released.update(cx, |modal, cx| modal.let_go(cx)).ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// The corner that resizes it.
+    fn render_grip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let was = self.size;
+        div()
+            .id("code-snippet-grip")
+            .debug_selector(|| "code-snippet-grip".to_string())
+            .absolute()
+            .bottom_0()
+            .right_0()
+            .w(px(16.))
+            .h(px(16.))
+            .cursor(gpui::CursorStyle::ResizeUpLeftDownRight)
+            .child(
+                Icon::new(IconName::ArrowDownRight)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |modal, event: &MouseDownEvent, _window, cx| {
+                    modal.take_hold(
+                        Held::Resizing {
+                            from: event.position,
+                            was,
+                        },
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
     }
 
     fn show(&mut self, snippet: Snippet, window: &mut Window, cx: &mut Context<Self>) {
@@ -4419,7 +4614,16 @@ fn language_of(snippet: Snippet) -> &'static str {
 }
 
 impl EventEmitter<gpui::DismissEvent> for CodeSnippetModal {}
-impl workspace::ModalView for CodeSnippetModal {}
+
+impl workspace::ModalView for CodeSnippetModal {
+    /// Rendered on its own rather than inside the modal layer's centred backdrop:
+    /// the backdrop is what closes a modal on a click anywhere else, and this
+    /// window has to stay open while the reader works beside it. Escape and its
+    /// own close button are the ways out.
+    fn render_bare(&self) -> bool {
+        true
+    }
+}
 
 impl Focusable for CodeSnippetModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -4432,7 +4636,14 @@ impl Render for CodeSnippetModal {
         v_flex()
             .key_context("CodeSnippetModal")
             .track_focus(&self.focus_handle)
-            .w(px(760.))
+            .id("code-snippet-window")
+            .debug_selector(|| "code-snippet-window".to_string())
+            .occlude()
+            .absolute()
+            .left(self.place.x)
+            .top(self.place.y)
+            .w(self.size.width)
+            .h(self.size.height)
             .p_3()
             .gap_3()
             .cyberpunk_surface()
@@ -4440,9 +4651,33 @@ impl Render for CodeSnippetModal {
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(gpui::DismissEvent)))
             .child(
                 h_flex()
+                    .id("code-snippet-title")
+                    .debug_selector(|| "code-snippet-title".to_string())
                     .w_full()
+                    .flex_none()
                     .justify_between()
                     .items_center()
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|modal, event: &MouseDownEvent, window, cx| {
+                            // Taking hold of the title also brings the window forward,
+                            // so Escape closes the window the reader just touched
+                            // rather than whatever had the focus before it.
+                            window.focus(&modal.focus_handle, cx);
+                            // Where the pointer took hold of the window, so it keeps
+                            // that distance from the corner for the whole drag.
+                            modal.take_hold(
+                                Held::Moving {
+                                    at: point(
+                                        event.position.x - modal.place.x,
+                                        event.position.y - modal.place.y,
+                                    ),
+                                },
+                                cx,
+                            );
+                        }),
+                    )
                     .child(
                         div()
                             .cyberpunk_monospace(cx)
@@ -4475,7 +4710,8 @@ impl Render for CodeSnippetModal {
                 div()
                     .id("code-snippet-editor-hitbox")
                     .debug_selector(|| "code-snippet-editor".to_string())
-                    .h(px(360.))
+                    .flex_1()
+                    .min_h_0()
                     .p_2()
                     .rounded_none()
                     .border_1()
@@ -4486,6 +4722,7 @@ impl Render for CodeSnippetModal {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_none()
                     .justify_between()
                     .items_center()
                     .child(
@@ -4504,6 +4741,10 @@ impl Render for CodeSnippetModal {
                             })),
                     ),
             )
+            .child(self.render_grip(cx))
+            .when(self.held.is_some(), |window| {
+                window.child(self.follow_the_pointer(cx))
+            })
     }
 }
 
@@ -5404,6 +5645,298 @@ mod tests {
         assert!(
             copied.contains("net/http"),
             "what is copied is the shape being shown:\n{copied}"
+        );
+    }
+
+    /// Opens the code window the way the reader does, and hands back the window
+    /// itself.
+    ///
+    /// Through a whole editor window rather than a bare `Workspace`, because the
+    /// modal layer -- where this window is painted -- only exists there.
+    async fn a_code_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<CodeSnippetModal>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let collection_id = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.url = "https://api.example.com/ping".to_string();
+            });
+        });
+        let request = store.read_with(cx, |store, _| {
+            store
+                .requests
+                .iter()
+                .find(|r| r.id == request_id)
+                .unwrap()
+                .clone()
+        });
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let multi_workspace = window.root(&mut cx).unwrap();
+        let workspace = multi_workspace.read_with(&cx, |multi, _| multi.workspace().clone());
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let workspace_handle = workspace.weak_handle();
+            let view = cx
+                .new(|cx| RequestView::new(&request, store.clone(), workspace_handle, window, cx));
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let code_button = debug_center(&mut cx, "request-copy-curl");
+        cx.simulate_click(code_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let modal = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_modal::<CodeSnippetModal>(cx)
+            })
+            .expect("the Code button should open the code window");
+        (workspace, modal, cx)
+    }
+
+    /// The window is dragged by its title, and what moves is the window on screen,
+    /// not merely a number in the struct.
+    #[gpui::test]
+    async fn the_code_window_is_dragged_by_its_title(cx: &mut TestAppContext) {
+        let (_workspace, _modal, mut cx) = a_code_window(cx).await;
+
+        let before = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is painted");
+        let title = debug_center(&mut cx, "code-snippet-title");
+
+        cx.simulate_mouse_down(title, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let moved_to = point(title.x - px(120.), title.y + px(60.));
+        cx.simulate_mouse_move(moved_to, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_up(moved_to, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let after = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is still painted");
+        assert_eq!(
+            (
+                after.origin.x - before.origin.x,
+                after.origin.y - before.origin.y
+            ),
+            (px(-120.), px(60.)),
+            "the window follows the pointer exactly, from {:?} to {:?}",
+            before.origin,
+            after.origin
+        );
+        assert_eq!(
+            after.size, before.size,
+            "dragging it must not resize it as well"
+        );
+    }
+
+    /// A window dragged towards the edge stops at it: a title bar out of reach
+    /// cannot be dragged back.
+    #[gpui::test]
+    async fn the_code_window_cannot_be_dragged_off_the_screen(cx: &mut TestAppContext) {
+        let (_workspace, _modal, mut cx) = a_code_window(cx).await;
+
+        let title = debug_center(&mut cx, "code-snippet-title");
+        cx.simulate_mouse_down(title, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_move(
+            point(px(-4000.), px(-4000.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_up(
+            point(px(-4000.), px(-4000.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let painted = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is still painted");
+        assert!(
+            painted.origin.x >= px(0.) && painted.origin.y >= px(0.),
+            "the window has to stay inside the editor's own window, not {:?}",
+            painted.origin
+        );
+    }
+
+    /// The corner resizes it, and the smallest it goes is still a window.
+    #[gpui::test]
+    async fn the_code_window_is_resized_by_its_corner(cx: &mut TestAppContext) {
+        let (_workspace, _modal, mut cx) = a_code_window(cx).await;
+
+        let before = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is painted");
+        let grip = debug_center(&mut cx, "code-snippet-grip");
+
+        cx.simulate_mouse_down(grip, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let pulled_to = point(grip.x - px(200.), grip.y - px(150.));
+        cx.simulate_mouse_move(pulled_to, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_up(pulled_to, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let after = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is still painted");
+        assert_eq!(
+            (after.size.width, after.size.height),
+            (before.size.width - px(200.), before.size.height - px(150.)),
+            "the corner resizes the window it belongs to"
+        );
+        assert_eq!(
+            after.origin, before.origin,
+            "resizing from the corner must leave the other corner where it was"
+        );
+
+        // Pulled far past the smallest it may be.
+        let grip = debug_center(&mut cx, "code-snippet-grip");
+        cx.simulate_mouse_down(grip, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_move(
+            point(px(0.), px(0.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_up(
+            point(px(0.), px(0.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let smallest = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is still painted");
+        assert!(
+            smallest.size.width >= NARROWEST_SNIPPET_WINDOW
+                && smallest.size.height >= SHORTEST_SNIPPET_WINDOW,
+            "it may not be squeezed into nothing: {:?}",
+            smallest.size
+        );
+    }
+
+    /// A button let go where the window cannot see it -- outside the editor, or
+    /// while another window was in front -- must not leave the window stuck to the
+    /// pointer for every move afterwards.
+    #[gpui::test]
+    async fn the_code_window_lets_go_when_the_button_is_no_longer_down(cx: &mut TestAppContext) {
+        let (_workspace, modal, mut cx) = a_code_window(cx).await;
+
+        let title = debug_center(&mut cx, "code-snippet-title");
+        cx.simulate_mouse_down(title, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let held_at = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is painted")
+            .origin;
+
+        // The pointer moves on with nothing held down: that is a button released
+        // somewhere these listeners never saw.
+        cx.simulate_mouse_move(
+            point(title.x + px(90.), title.y + px(90.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_move(
+            point(title.x + px(300.), title.y + px(240.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let after = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is still painted")
+            .origin;
+        assert_eq!(
+            after, held_at,
+            "the window must stay where it was once nothing is held down"
+        );
+        assert!(
+            modal.read_with(&cx, |modal, _| modal.held.is_none()),
+            "and it must not still think it is being dragged"
+        );
+    }
+
+    /// A click anywhere else is somebody working beside the window, not asking for
+    /// it to close. Escape is what closes it.
+    #[gpui::test]
+    async fn a_click_beside_the_code_window_leaves_it_open(cx: &mut TestAppContext) {
+        let (workspace, _modal, mut cx) = a_code_window(cx).await;
+
+        let painted = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is painted");
+        let beside = point(
+            painted.origin.x / 2.,
+            painted.origin.y + painted.size.height + px(80.),
+        );
+        cx.simulate_click(beside, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            workspace
+                .read_with(&cx, |workspace, cx| workspace
+                    .active_modal::<CodeSnippetModal>(cx))
+                .is_some(),
+            "a click beside the window must leave it open"
+        );
+
+        // Touching its title brings the window forward again, which is what makes
+        // Escape reach it.
+        let title = debug_center(&mut cx, "code-snippet-title");
+        cx.simulate_click(title, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(&cx, |workspace, cx| workspace
+                    .active_modal::<CodeSnippetModal>(cx))
+                .is_none(),
+            "and Escape is what closes it"
         );
     }
 
