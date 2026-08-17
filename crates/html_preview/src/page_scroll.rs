@@ -29,6 +29,12 @@ pub struct PageScroll {
 /// reader has put it.
 const UNTIL_THE_PAGE_CATCHES_UP: Duration = Duration::from_millis(400);
 
+/// The same after a turn of the wheel. Far shorter than after a drag: a wheel
+/// sends the page off gliding, and the only answers worth disbelieving are the
+/// ones already on their way when the wheel turned. Past that the page's own
+/// word is what keeps the bar with it.
+const UNTIL_THE_WHEEL_LANDS: Duration = Duration::from_millis(120);
+
 #[derive(Clone, Default)]
 pub struct PageScrollHandle {
     at: Rc<RefCell<PageScroll>>,
@@ -62,6 +68,33 @@ impl PageScrollHandle {
     /// is only worth asking the page once.
     pub fn take_request(&self) -> Option<f32> {
         self.asked_for.take()
+    }
+
+    /// Moves the bar by what the wheel just did, without waiting to be told.
+    ///
+    /// The page is asked where it stands ten times a second, which is often
+    /// enough for a thumb being dragged and far too seldom for a page gliding
+    /// under a wheel: the bar arrives in steps while the page moves smoothly.
+    /// Here the same distance the wheel sent to the page is applied at once, and
+    /// the page's own answer corrects it a moment later.
+    pub fn wheeled_by(&self, down_by: f32) {
+        let mut at = self.at.borrow_mut();
+        let furthest = (at.document - at.view).max(0.);
+        at.down = (at.down + down_by).clamp(0., furthest);
+        drop(at);
+        self.catching_up
+            .set(Some(Instant::now() + UNTIL_THE_WHEEL_LANDS));
+    }
+
+    /// Whether the page is on the move, and so worth asking where it stands on
+    /// every turn of the engine rather than ten times a second. A bar told ten
+    /// times a second where a gliding page is arrives in steps behind it.
+    pub fn moving(&self) -> bool {
+        self.dragging.get()
+            || self
+                .catching_up
+                .get()
+                .is_some_and(|until| Instant::now() < until)
     }
 
     /// Whether the page has anything to scroll at all.
@@ -151,6 +184,70 @@ mod tests {
         assert_eq!(handle.take_request(), Some(450.));
         // Asked once: the page is only worth telling the same thing once.
         assert_eq!(handle.take_request(), None);
+    }
+
+    #[test]
+    fn a_wheel_moves_the_bar_before_the_page_answers() {
+        let handle = standing_at(0., 3000., 1000.);
+        handle.wheeled_by(250.);
+
+        assert_eq!(
+            handle.offset().y,
+            px(-250.),
+            "the bar waits for nobody: the page is asked ten times a second and \
+             the wheel turns far more often than that"
+        );
+        assert!(
+            handle.moving(),
+            "a page under the wheel is worth asking about on every turn"
+        );
+
+        // An answer already on its way when the wheel turned says where the page
+        // was, not where it is going.
+        handle.stands_at(PageScroll {
+            down: 0.,
+            document: 3000.,
+            view: 1000.,
+        });
+        assert_eq!(
+            handle.offset().y,
+            px(-250.),
+            "a stale answer dragged the bar back to where the page had been"
+        );
+
+        std::thread::sleep(UNTIL_THE_WHEEL_LANDS + Duration::from_millis(30));
+        handle.stands_at(PageScroll {
+            down: 400.,
+            document: 3000.,
+            view: 1000.,
+        });
+        assert_eq!(
+            handle.offset().y,
+            px(-400.),
+            "once the wheel has landed the page's own word is what the bar shows"
+        );
+        assert!(
+            !handle.moving(),
+            "a page that has come to rest is asked about at the slower pace again"
+        );
+    }
+
+    #[test]
+    fn a_wheel_stops_at_both_ends_of_the_page() {
+        let handle = standing_at(0., 3000., 1000.);
+        handle.wheeled_by(-500.);
+        assert_eq!(
+            handle.offset().y,
+            px(0.),
+            "the page does not go above itself"
+        );
+
+        handle.wheeled_by(9000.);
+        assert_eq!(
+            handle.offset().y,
+            px(-2000.),
+            "nor past its end: 3000 tall with 1000 showing leaves 2000 to scroll"
+        );
     }
 
     #[test]

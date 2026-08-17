@@ -31,11 +31,12 @@ use crate::{FindInPage, FindNextInPage, FindPreviousInPage, NewBrowserTab, StopF
 use crate::{OpenPreview, OpenPreviewToTheSide};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
-/// Where a new browser tab starts. The language and the region are named in the
-/// address rather than left to the search engine's guess from the address the
-/// request arrives from, which is how the same tab comes up in a different
+/// Where a new browser tab starts. The search engine sends this straight on to
+/// its plain address, so that is what the address bar reads, and on the way it
+/// leaves behind the mark that stops it redirecting to whichever country the
+/// request came from -- which is how the same tab came up in a different
 /// language in every country.
-const NEW_TAB_PAGE: &str = "https://www.google.com/webhp?hl=en&gl=us";
+const NEW_TAB_PAGE: &str = "https://www.google.com/ncr";
 /// How long the page's driver waits before looking anyway. The engine says when
 /// it has work, so this is only a safety net -- for a wake-up that was missed,
 /// and for a view that was resized without the page hearing about it.
@@ -773,13 +774,19 @@ impl HtmlPreviewView {
                         page.scroll_to(down);
                     }
                     // Where the page stands is a script's answer, which arrives
-                    // on a later turn, so it is asked for at a pace of its own
-                    // rather than on every frame. Nothing has to be redrawn when
-                    // the answer lands: a page that is moving is painting, and a
-                    // page that is still has not moved.
+                    // on a later turn. A page on the move is asked on every turn:
+                    // told only ten times a second, the bar arrives in steps
+                    // behind a page gliding under the wheel. A page at rest has
+                    // not moved, so the slower pace is enough for it. Nothing has
+                    // to be redrawn when the answer lands: a page that is moving
+                    // is painting.
+                    let often_enough = match view.page_scroll.moving() {
+                        true => Duration::ZERO,
+                        false => WHERE_THE_PAGE_STANDS,
+                    };
                     let due = view
                         .asked_where
-                        .is_none_or(|asked| asked.elapsed() >= WHERE_THE_PAGE_STANDS);
+                        .is_none_or(|asked| asked.elapsed() >= often_enough);
                     if due {
                         view.asked_where = Some(std::time::Instant::now());
                         let scroll = view.page_scroll.clone();
@@ -1057,8 +1064,13 @@ impl HtmlPreviewView {
         })
         .child(
             gpui::canvas(
-                |_, _, _| (),
-                move |painted_bounds, _, window, _| {
+                // A hitbox of the page's own. The listeners below are hung from
+                // the window, so they hear every click in it, including the ones
+                // that land on whatever is drawn over the page -- its own menu,
+                // say. This is what they ask whether the pointer really is on
+                // the page rather than on something above it.
+                |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+                move |painted_bounds, page: gpui::Hitbox, window, _| {
                     // The page's own buffer, drawn where the graphics card
                     // already holds it.
                     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1079,7 +1091,8 @@ impl HtmlPreviewView {
                     window.on_mouse_event({
                         let view = view.clone();
                         let holding = holding.clone();
-                        move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                        let page = page.clone();
+                        move |event: &gpui::MouseMoveEvent, phase, window, cx| {
                             if phase != gpui::DispatchPhase::Bubble {
                                 return;
                             }
@@ -1087,7 +1100,8 @@ impl HtmlPreviewView {
                             // even when the pointer wanders off the edge, which
                             // is what selecting to the end of a line does. A
                             // drag that started elsewhere is somebody else's.
-                            if !inside(event.position) && holding.get().is_none() {
+                            let on_the_page = inside(event.position) && page.is_hovered(window);
+                            if !on_the_page && holding.get().is_none() {
                                 return;
                             }
                             view.update(cx, |view, _| {
@@ -1101,8 +1115,12 @@ impl HtmlPreviewView {
                     window.on_mouse_event({
                         let view = view.clone();
                         let holding = holding.clone();
+                        let page = page.clone();
                         move |event: &gpui::MouseDownEvent, phase, window, cx| {
-                            if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || !inside(event.position)
+                                || !page.is_hovered(window)
+                            {
                                 return;
                             }
                             let Some(button) = servo_button(event.button) else {
@@ -1127,7 +1145,8 @@ impl HtmlPreviewView {
                     window.on_mouse_event({
                         let view = view.clone();
                         let holding = holding.clone();
-                        move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                        let page = page.clone();
+                        move |event: &gpui::MouseUpEvent, phase, window, cx| {
                             if phase != gpui::DispatchPhase::Bubble {
                                 return;
                             }
@@ -1143,7 +1162,7 @@ impl HtmlPreviewView {
                             let held = holding.get() == Some(event.button);
                             if held {
                                 holding.set(None);
-                            } else if !inside(event.position) {
+                            } else if !inside(event.position) || !page.is_hovered(window) {
                                 return;
                             }
                             view.update(cx, |view, _| {
@@ -1155,8 +1174,14 @@ impl HtmlPreviewView {
                         }
                     });
                     window.on_mouse_event({
+                        // The wheel asks a question of its own: a scrollbar over
+                        // the page takes the pointer but still turns the page
+                        // under it.
                         move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                            if phase != gpui::DispatchPhase::Bubble || !inside(event.position) {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || !inside(event.position)
+                                || !page.should_handle_scroll(window)
+                            {
                                 return;
                             }
                             let delta = event.delta.pixel_delta(window.line_height());
@@ -1164,6 +1189,9 @@ impl HtmlPreviewView {
                                 if let Some(page) = view.page.as_ref() {
                                     page.scrolled(page_point(event.position), delta);
                                 }
+                                // The bar moves with the wheel rather than at the
+                                // next time the page is asked where it stands.
+                                view.page_scroll.wheeled_by(-f32::from(delta.y));
                             })
                             .ok();
                         }
@@ -2327,9 +2355,27 @@ mod tests {
     use workspace::AppState;
 
     const A_LINK: &str = "https://example.com/somewhere";
+
     const AN_IMAGE: &str = "https://example.com/picture.png";
     const A_SELECTION: &str = "how tall is a giraffe";
     const A_SOURCE: &str = "<html><body><p>Hello</p></body></html>";
+
+    #[test]
+    fn a_new_tab_starts_at_the_web_and_not_at_a_file_of_ours() {
+        let start = url::Url::parse(NEW_TAB_PAGE).expect("the new tab's address has to parse");
+        assert_eq!(
+            start.scheme(),
+            "https",
+            "a new tab that starts at a file shows a path in /tmp instead of a page"
+        );
+        assert_eq!(start.host_str(), Some("www.google.com"));
+        assert_eq!(
+            start.query(),
+            None,
+            "the address bar reads whatever we send the tab to, so it carries no settings"
+        );
+    }
+
 
     /// The preview inside something that scrolls, because chrome drawn over a
     /// page has to land where the reader clicked at any scroll offset, not only
@@ -2615,6 +2661,39 @@ mod tests {
         let at = scrolled.center();
         right_click(cx, at);
         menu_is_at(cx, at);
+    }
+
+    /// A press the page took would also take the keyboard from the menu, and a
+    /// menu that has lost the keyboard closes before the button is let go --
+    /// which is how every item in it stopped doing anything.
+    #[cfg(feature = "servo")]
+    #[gpui::test]
+    async fn a_press_on_the_menu_is_not_handed_to_the_page(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        right_click_the_page(cx);
+        let item = painted(cx, "MENU_ITEM-Select All").center();
+        cx.simulate_event(MouseDownEvent {
+            position: item,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        assert!(
+            frame.read_with(cx, |frame, cx| frame
+                .preview
+                .read(cx)
+                .page_pressed
+                .get()
+                .is_none()),
+            "a press on the menu belongs to the menu, not to the page under it"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Select All").is_some(),
+            "the menu has to still be there when the button is let go, or nothing in it can be chosen"
+        );
     }
 
     #[gpui::test]
