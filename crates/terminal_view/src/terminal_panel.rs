@@ -120,21 +120,17 @@ impl TerminalPanel {
     ) {
         let assistant_enabled = self.assistant_enabled;
         terminal_pane.update(cx, |pane, cx| {
-            pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
+            pane.set_render_tab_bar_buttons(cx, move |pane, _window, cx| {
                 let split_context = pane
                     .active_item()
                     .and_then(|item| item.downcast::<TerminalView>())
                     .map(|terminal_view| terminal_view.read(cx).focus_handle.clone());
-                let has_focused_rename_editor = pane
-                    .active_item()
-                    .and_then(|item| item.downcast::<TerminalView>())
-                    .is_some_and(|view| view.read(cx).rename_editor_is_focused(window, cx));
-                if !pane.has_focus(window, cx)
-                    && !pane.context_menu_focused(window, cx)
-                    && !has_focused_rename_editor
-                {
-                    return (None, None);
-                }
+                // Shown whether or not the terminal has the focus. A button that is
+                // only there once you have clicked into the panel cannot be found by
+                // somebody looking for it, and the corner it lives in is otherwise
+                // empty anyway. Whether the tab bar carries buttons at all is the
+                // `tab_bar.show_tab_bar_buttons` setting's business, checked by the
+                // pane itself.
                 let focus_handle = pane.focus_handle(cx);
                 let right_children = h_flex()
                     .gap(DynamicSpacing::Base02.rems(cx))
@@ -1717,6 +1713,11 @@ impl RenderOnce for InlineAssistTabBarButton {
             .on_click({
                 let focus_handle = focus_handle.clone();
                 move |_, window, cx| {
+                    // The assist is given to whatever holds the focus, so the
+                    // terminal this button belongs to has to hold it first: the
+                    // button is on screen while the focus is still in the editor
+                    // beside it, and without this the assist would open there.
+                    window.focus(&focus_handle, cx);
                     focus_handle.dispatch_action(&InlineAssist::default(), window, cx);
                 }
             })
@@ -2080,6 +2081,115 @@ mod tests {
             cx.debug_bounds("KEY_BINDING-enter").is_some(),
             "tooltip should show the InlineAssist keybinding resolved in the terminal's context"
         );
+    }
+
+    /// The buttons in the corner of the terminal's tab bar are there to be found,
+    /// so they cannot wait for the panel to be focused first: somebody looking for
+    /// "split this terminal" has to see it while their focus is still in the editor.
+    #[gpui::test]
+    async fn test_the_tab_bar_buttons_stay_while_the_focus_is_elsewhere(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Away from the panel, into the editor beside it, the way a reader who is
+        // writing code and glances at the terminal has it.
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let pane = workspace.active_pane().clone();
+                    window.focus(&pane.focus_handle(cx), cx);
+                });
+            })
+            .expect("the center pane can take the focus");
+        cx.run_until_parked();
+
+        terminal_panel.update_in(cx, |panel, window, cx| {
+            assert!(
+                !panel
+                    .active_pane
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "the terminal must not be the focused thing for this test to mean anything"
+            );
+        });
+
+        for button in ["ICON-Plus", "ICON-Split", "ICON-Maximize"] {
+            assert!(
+                cx.debug_bounds(button).is_some(),
+                "{button} has to stay in the corner while the focus is elsewhere"
+            );
+        }
+
+        // And still there once the terminal is focused, which is the case that
+        // always worked.
+        terminal_panel.update_in(cx, |panel, window, cx| {
+            let pane = panel.active_pane.clone();
+            window.focus(&pane.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        for button in ["ICON-Plus", "ICON-Split", "ICON-Maximize"] {
+            assert!(
+                cx.debug_bounds(button).is_some(),
+                "{button} has to be there with the terminal focused too"
+            );
+        }
+    }
+
+    /// The assist button is now on screen while the focus is elsewhere, and the
+    /// assist itself goes to whatever holds the focus -- so pressing the button has
+    /// to bring the focus to its own terminal first, or it would open an assist in
+    /// the editor beside it.
+    #[gpui::test]
+    async fn test_the_inline_assist_button_focuses_its_own_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        terminal_panel.update(cx, |panel, cx| panel.set_assistant_enabled(true, cx));
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let pane = workspace.active_pane().clone();
+                    window.focus(&pane.focus_handle(cx), cx);
+                });
+            })
+            .expect("the center pane can take the focus");
+        cx.run_until_parked();
+
+        let button = cx
+            .debug_bounds("ICON-ZedAssistant")
+            .expect("the assist button is in the corner while the focus is elsewhere");
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        terminal_panel.update_in(cx, |panel, window, cx| {
+            assert!(
+                panel
+                    .active_pane
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "pressing the button has to bring the focus to the terminal it belongs to"
+            );
+        });
     }
 
     async fn init_workspace_with_panel(
