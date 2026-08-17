@@ -124,6 +124,7 @@ mod engine {
             // one did not, so the sender drops it rather than queueing work.
             let (tell, woken) = async_channel::bounded(1);
             let options = engine_options(cx);
+            let started = std::time::Instant::now();
             let engine = Rc::new(Self {
                 servo: RefCell::new(Some(
                     ServoBuilder::default()
@@ -134,6 +135,7 @@ mod engine {
                 woken,
                 tell,
             });
+            log::info!("the HTML engine started in {:?}", started.elapsed());
             cx.set_global(GlobalHtmlEngine(engine.clone()));
             // Told to stop before the editor takes its windows down. Servo waits
             // for its own threads on the way out, and it cannot do that through
@@ -202,12 +204,6 @@ mod engine {
         preferences.layout_writing_mode_enabled = true;
         preferences.layout_variable_fonts_enabled = true;
         preferences.layout_css_attr_enabled = true;
-        // Pages are asked for in American English, whatever the machine's own
-        // locale: this sets both what `navigator.language` says and the
-        // Accept-Language every request carries. Which country a site thinks the
-        // reader is in is another matter -- that is read from the address the
-        // request comes from, and no header changes it.
-        preferences.intl_locale_override = "en-US".to_string();
         // What the page is told it is talking to. Servo's own string says Servo
         // as well as Firefox, and a good many sites read that and serve
         // something older or refuse outright; this is the string Firefox's own
@@ -223,9 +219,11 @@ mod engine {
         if std::env::var("ZED_HTML_SUBPIXEL_TEXT").as_deref() == Ok("1") {
             preferences.gfx_subpixel_text_antialiasing_enabled = true;
         }
-        // Pages are read in English wherever the machine happens to be. Without
-        // this the engine negotiates language from the system locale, so the same
-        // site answers in a different language in every country.
+        // Pages are asked for in American English, whatever the machine's own
+        // locale: this sets both what `navigator.language` says and the
+        // Accept-Language every request carries. Which country a site thinks the
+        // reader is in is another matter -- that is read from the address the
+        // request comes from, and no header changes it.
         preferences.intl_locale_override = READING_LOCALE.to_string();
         // A site's idea of where the reader is comes from the address its
         // requests arrive from. Somewhere to send them through is the only thing
@@ -298,9 +296,21 @@ mod engine {
         frame: Option<Arc<RenderImage>>,
         /// The document on disk. Servo loads by URL, and the file has to outlive
         /// the load.
-        document: PageFile,
+        document: Option<PageFile>,
         /// The document before it, until the new one has finished loading.
         previous: Option<PageFile>,
+    }
+
+    /// Where a page begins. A preview of a document of ours starts at a file we
+    /// wrote; a browser tab starts wherever it was pointed. Keeping them apart is
+    /// what stops a tab from loading a blank file first and showing its path in
+    /// /tmp while the page asked for is still on its way.
+    enum PageStart {
+        Document {
+            html: SharedString,
+            base_directory: Option<std::path::PathBuf>,
+        },
+        Address(url::Url),
     }
 
     impl HtmlPage {
@@ -309,6 +319,24 @@ mod engine {
         pub fn open(
             html: SharedString,
             base_directory: Option<&Path>,
+            size: Size<Pixels>,
+            scale: f32,
+            cx: &mut App,
+        ) -> Result<Self> {
+            Self::open_start(
+                PageStart::Document {
+                    html,
+                    base_directory: base_directory.map(Path::to_path_buf),
+                },
+                size,
+                scale,
+                cx,
+            )
+        }
+
+        /// Where a page begins: a document of ours, or somebody else's address.
+        fn open_start(
+            start: PageStart,
             size: Size<Pixels>,
             scale: f32,
             cx: &mut App,
@@ -327,15 +355,40 @@ mod engine {
                 .make_current()
                 .map_err(|error| anyhow!("the HTML surface refused to bind: {error:?}"))?;
 
-            let document = PageFile::write(&html, base_directory)?;
+            // A document of our own is written to a file for the engine to load;
+            // an address is loaded as it is. Sending a browser tab to a blank
+            // file first and only then to where it was asked for is what left a
+            // reader looking at a path in /tmp while the page they wanted was
+            // still on its way.
+            let document = match &start {
+                PageStart::Document {
+                    html,
+                    base_directory,
+                } => Some(PageFile::write(html, base_directory.as_deref())?),
+                PageStart::Address(_) => None,
+            };
+            let first_url = match (&start, &document) {
+                (PageStart::Address(url), _) => url.clone(),
+                (PageStart::Document { .. }, Some(document)) => document.url()?,
+                (PageStart::Document { .. }, None) => {
+                    return Err(anyhow!("a document was asked for but none was written"));
+                }
+            };
             let delegate = Rc::new(PageDelegate::default());
+            // A document of ours carries our script inside it. Somebody else's
+            // page does not, so it is put in once the page has settled -- without
+            // this the first page of a browser tab has no selection and nothing
+            // to search.
+            if matches!(start, PageStart::Address(_)) {
+                delegate.needs_the_shim.set(true);
+            }
             let webview = {
                 let servo = engine.servo.borrow();
                 let servo = servo
                     .as_ref()
                     .ok_or_else(|| anyhow!("the HTML engine has already stopped"))?;
                 WebViewBuilder::new(servo, rendering_context.clone())
-                    .url(document.url()?)
+                    .url(first_url)
                     .hidpi_scale_factor(euclid::Scale::new(scale))
                     .delegate(delegate.clone())
                     .build()
@@ -371,9 +424,7 @@ mod engine {
             scale: f32,
             cx: &mut App,
         ) -> Result<Self> {
-            let mut page = Self::open(SharedString::default(), None, size, scale, cx)?;
-            page.go_to(url);
-            Ok(page)
+            Self::open_start(PageStart::Address(url), size, scale, cx)
         }
 
         /// Takes the page to an address. Everything else about the page stays:
@@ -423,7 +474,7 @@ mod engine {
             // The old document is kept until the new one has arrived: a load is
             // not finished when it is asked for, and the page may still be
             // fetching a stylesheet or an image from beside the old file.
-            self.previous = Some(std::mem::replace(&mut self.document, document));
+            self.previous = std::mem::replace(&mut self.document, Some(document));
             Ok(())
         }
 
