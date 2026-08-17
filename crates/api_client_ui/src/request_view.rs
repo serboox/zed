@@ -247,6 +247,16 @@ gpui::actions!(
     ]
 );
 
+/// A row of a table that the reader cannot type into: an auto-generated header.
+/// `toggle` names the one they can still switch off; the two the transport works
+/// out for itself (`Content-Length`, `Host`) carry None.
+struct FixedRow {
+    key: SharedString,
+    value: SharedString,
+    enabled: bool,
+    toggle: Option<usize>,
+}
+
 /// The descriptions the rows hold now, by the key they belong to. The Bulk Edit
 /// text form has only two columns, so a description would otherwise be thrown
 /// away by a trip through it -- and a reader who went in to fix one value would
@@ -2914,89 +2924,53 @@ impl RequestView {
             .collect()
     }
 
-    /// The Postman-parity "auto-generated headers" section: a fixed set of
-    /// headers most HTTP clients send by default, each individually
-    /// toggleable but never editable/removable (unlike the user's own
-    /// headers below), plus two purely informational rows (Content-Length,
-    /// Host) that are never toggleable since they're always computed by the
-    /// HTTP transport from the final body/URL, not sent by us explicitly.
-    fn render_auto_headers(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut section = v_flex().gap_1().child(
-            div()
-                .id("hide-auto-headers-toggle")
-                .debug_selector(|| "hide-auto-headers-toggle".to_string())
-                .cursor_pointer()
-                .child(
-                    Label::new(if self.show_auto_headers {
-                        "Hide auto-generated headers"
-                    } else {
-                        "Show auto-generated headers"
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-                .on_click(cx.listener(|this, _, _window, cx| this.toggle_show_auto_headers(cx))),
-        );
+    /// The auto-generated headers as rows of the same table the reader's own
+    /// headers live in: what the request sends, read in one place, rather than a
+    /// list above a table.
+    ///
+    /// Each is switchable except the two the transport works out for itself
+    /// (`Content-Length`, `Host`), which are there to be read.
+    fn automatic_header_rows(&self) -> Vec<FixedRow> {
         if !self.show_auto_headers {
-            return section;
+            return Vec::new();
         }
-        for (index, (key, value)) in api_client::AUTO_HEADER_DEFAULTS.iter().enumerate() {
-            let enabled = self.auto_header_enabled.get(index).copied().unwrap_or(true);
-            section = section.child(
-                h_flex()
-                    .id(SharedString::from(format!("auto-header-row-{index}")))
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "auto-header-toggle-icon-{index}"
-                            )))
-                            .debug_selector(move || format!("auto-header-toggle-{key}"))
-                            .cursor_pointer()
-                            .child(
-                                Icon::new(if enabled {
-                                    IconName::Check
-                                } else {
-                                    IconName::Close
-                                })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            )
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.toggle_auto_header(index, cx);
-                            })),
-                    )
-                    .child(Label::new(*key).size(LabelSize::Small).color(Color::Muted))
-                    .child(
-                        Label::new(*value)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            );
+        let mut rows: Vec<FixedRow> = api_client::AUTO_HEADER_DEFAULTS
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| FixedRow {
+                key: SharedString::from(*key),
+                value: SharedString::from(*value),
+                enabled: self.auto_header_enabled.get(index).copied().unwrap_or(true),
+                toggle: Some(index),
+            })
+            .collect();
+        for key in ["Content-Length", "Host"] {
+            rows.push(FixedRow {
+                key: SharedString::from(key),
+                value: SharedString::from("<calculated when request is sent>"),
+                enabled: true,
+                toggle: None,
+            });
         }
-        for (key, placeholder) in [
-            ("Content-Length", "<calculated when request is sent>"),
-            ("Host", "<calculated when request is sent>"),
-        ] {
-            section = section.child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::Check)
-                            .size(IconSize::Small)
-                            .color(Color::Disabled),
-                    )
-                    .child(Label::new(key).size(LabelSize::Small).color(Color::Muted))
-                    .child(
-                        Label::new(placeholder)
-                            .size(LabelSize::Small)
-                            .color(Color::Disabled),
-                    ),
-            );
-        }
-        section
+        rows
+    }
+
+    /// The switch that shows or hides those rows.
+    fn render_auto_headers_switch(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("hide-auto-headers-toggle")
+            .debug_selector(|| "hide-auto-headers-toggle".to_string())
+            .cursor_pointer()
+            .child(
+                Label::new(match self.show_auto_headers {
+                    true => "Hide auto-generated headers",
+                    false => "Show auto-generated headers",
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, _window, cx| this.toggle_show_auto_headers(cx)))
+            .into_any_element()
     }
 
     fn render_bulk_edit_toggle(
@@ -3050,6 +3024,8 @@ impl RequestView {
     fn render_key_value_rows(
         rows: &[KeyValueRow],
         which: &'static str,
+        fixed: Vec<FixedRow>,
+        on_toggle_fixed: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         on_toggle: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         on_remove: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         cx: &mut Context<Self>,
@@ -3085,6 +3061,89 @@ impl RequestView {
                     }))
                     .child(div().w(px(26.)).flex_none()),
             );
+
+        for automatic in fixed {
+            let on_toggle_fixed = on_toggle_fixed.clone();
+            let key = automatic.key.clone();
+            let switchable = automatic.toggle;
+            table = table.child(
+                h_flex()
+                    .id(SharedString::from(format!("{which}-fixed-{key}")))
+                    .debug_selector({
+                        let key = key.clone();
+                        move || format!("{which}-fixed-{key}")
+                    })
+                    .w_full()
+                    .items_stretch()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{which}-fixed-toggle-{key}")))
+                            .w(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .debug_selector({
+                                let key = key.clone();
+                                move || format!("auto-header-toggle-{key}")
+                            })
+                            .when_some(switchable, |cell, index| {
+                                cell.cursor_pointer().on_click(cx.listener(
+                                    move |this, _, _window, cx| on_toggle_fixed(this, index, cx),
+                                ))
+                            })
+                            .child(
+                                Icon::new(match automatic.enabled {
+                                    true => IconName::Check,
+                                    false => IconName::Close,
+                                })
+                                .size(IconSize::XSmall)
+                                .color(match switchable {
+                                    // The two the transport works out for itself are
+                                    // told apart by being dimmer: they are there to
+                                    // be read, not switched.
+                                    None => Color::Disabled,
+                                    Some(_) => Color::Muted,
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_color(colors.border)
+                            .child(Label::new(automatic.key).color(Color::Muted)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_color(colors.border)
+                            .child(Label::new(automatic.value).color(match switchable {
+                                None => Color::Disabled,
+                                Some(_) => Color::Muted,
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_color(colors.border),
+                    )
+                    .child(div().w(px(26.)).flex_none()),
+            );
+        }
 
         for (index, row) in rows.iter().enumerate() {
             let on_toggle = on_toggle.clone();
@@ -3230,6 +3289,8 @@ impl RequestView {
                     Self::render_key_value_rows(
                         &self.param_rows,
                         "params",
+                        Vec::new(),
+                        Self::toggle_auto_header,
                         Self::toggle_param_row,
                         Self::remove_param_row,
                         cx,
@@ -3260,6 +3321,8 @@ impl RequestView {
                     Self::render_key_value_rows(
                         &self.header_rows,
                         "headers",
+                        self.automatic_header_rows(),
+                        Self::toggle_auto_header,
                         Self::toggle_header_row,
                         Self::remove_header_row,
                         cx,
@@ -3268,8 +3331,13 @@ impl RequestView {
                 };
                 v_flex()
                     .gap_2()
-                    .child(self.render_auto_headers(cx))
-                    .child(toggle)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(self.render_auto_headers_switch(cx))
+                            .child(toggle),
+                    )
                     .child(body)
                     .into_any_element()
             }
@@ -4396,26 +4464,53 @@ impl Render for RequestView {
             .child(self.render_environment_pin(cx))
             .child({
                 let is_sending = matches!(self.send_state, SendState::Sending);
+                // Sending is the one thing this view exists for, so it is the one
+                // bright thing in the row: a filled accent block with the dark
+                // ground showing through the letters, big enough to hit without
+                // aiming. Everything around it stays quiet.
+                let accent = cyberpunk::Accent::Cyan;
                 div()
                     .id("request-send-hitbox")
                     .debug_selector(|| "request-send".to_string())
+                    // A hand-built block still has to answer to a screen reader the
+                    // way a button does, which `ui::Button` gave for free.
+                    .role(gpui::accesskit::Role::Button)
+                    .aria_label(match is_sending {
+                        true => "Sending the request",
+                        false => "Send the request",
+                    })
+                    .h(px(36.))
+                    .w(px(140.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap_1p5()
+                    .border_1()
+                    .border_color(accent.bright())
+                    .bg(accent.border())
+                    .when(is_sending, |button| button.opacity(0.6))
+                    .when(!is_sending, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|style| style.bg(accent.bright()))
+                            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+                    })
                     .child(
-                        Button::new(
-                            "request-send-button",
-                            if is_sending { "Sending..." } else { "Send" },
-                        )
-                        // Sending is the one thing this view exists for: filled
-                        // rather than tinted, and wide enough to hit without
-                        // aiming, while everything around it stays quiet.
-                        .style(ButtonStyle::Filled)
-                        .size(ButtonSize::Large)
-                        .width(gpui::DefiniteLength::Absolute(
-                            gpui::AbsoluteLength::Pixels(px(112.)),
-                        ))
-                        .start_icon(Icon::new(IconName::PlayFilled).color(Color::Accent))
-                        .color(Color::Accent)
-                        .disabled(is_sending)
-                        .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+                        Icon::new(IconName::PlayFilled)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(cyberpunk::canvas())),
+                    )
+                    .child(
+                        div()
+                            .cyberpunk_monospace(cx)
+                            .font_weight(gpui::FontWeight::EXTRA_BOLD)
+                            .text_size(ui::HeadlineSize::XSmall.rems())
+                            .text_color(cyberpunk::canvas())
+                            .child(match is_sending {
+                                true => "SENDING",
+                                false => "SEND",
+                            }),
                     )
             });
 
@@ -4431,62 +4526,27 @@ impl Render for RequestView {
         });
 
         let active_tab = self.active_tab;
-        let tab_strip = h_flex()
-            .gap_2()
-            .child(Self::render_chip(
-                "Params",
-                active_tab == RequestTab::Params,
+        // Params, then Authorization: the address and what it takes to be let in
+        // are the two things a reader sets first.
+        let mut tab_strip = h_flex().gap_2();
+        for (label, tab) in [
+            ("Params", RequestTab::Params),
+            ("Authorization", RequestTab::Auth),
+            ("Headers", RequestTab::Headers),
+            ("Body", RequestTab::Body),
+            ("Scripts", RequestTab::Scripts),
+            ("Examples", RequestTab::Examples),
+        ] {
+            tab_strip = tab_strip.child(Self::render_chip(
+                label,
+                active_tab == tab,
                 cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Params;
-                    cx.notify();
-                },
-            ))
-            .child(Self::render_chip(
-                "Headers",
-                active_tab == RequestTab::Headers,
-                cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Headers;
-                    cx.notify();
-                },
-            ))
-            .child(Self::render_chip(
-                "Body",
-                active_tab == RequestTab::Body,
-                cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Body;
-                    cx.notify();
-                },
-            ))
-            .child(Self::render_chip(
-                "Authorization",
-                active_tab == RequestTab::Auth,
-                cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Auth;
-                    cx.notify();
-                },
-            ))
-            .child(Self::render_chip(
-                "Scripts",
-                active_tab == RequestTab::Scripts,
-                cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Scripts;
-                    cx.notify();
-                },
-            ))
-            .child(Self::render_chip(
-                "Examples",
-                active_tab == RequestTab::Examples,
-                cx,
-                |this, _, _, cx| {
-                    this.active_tab = RequestTab::Examples;
+                move |this, _, _, cx| {
+                    this.active_tab = tab;
                     cx.notify();
                 },
             ));
+        }
 
         let response_section = if self.response_shown_in_dock(cx) {
             self.render_response_dock_redirect(cx)
@@ -6499,6 +6559,144 @@ mod tests {
             second.origin.y,
             first.origin.y + first.size.height,
             "rows sit directly on top of one another, sharing their line"
+        );
+    }
+
+    /// Send is the one thing the view exists for, so it is the biggest, brightest
+    /// thing in its row -- and easy to hit without aiming.
+    #[gpui::test]
+    async fn send_is_the_largest_thing_in_the_row(cx: &mut TestAppContext) {
+        let (_store, _request_id, _view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let send = cx
+            .debug_bounds("request-send")
+            .expect("the Send button is painted");
+        assert!(
+            send.size.width >= px(136.) && send.size.height >= px(34.),
+            "Send has to be a block worth aiming at, not a chip: {:?}",
+            send.size
+        );
+
+        // Bigger than the quiet control beside it, which is the point of it being
+        // the bright one.
+        let code = cx
+            .debug_bounds("request-copy-curl")
+            .expect("the Code button is painted");
+        assert!(
+            send.size.width > code.size.width && send.size.height > code.size.height,
+            "Send {:?} has to stand out against Code {:?}",
+            send.size,
+            code.size
+        );
+    }
+
+    /// What a request is sent with is read right after where it is sent: the
+    /// Authorization tab follows Params.
+    #[gpui::test]
+    async fn authorization_is_the_second_tab(cx: &mut TestAppContext) {
+        let (_store, _request_id, _view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let places: Vec<(&str, gpui::Point<Pixels>)> = [
+            "Params",
+            "Authorization",
+            "Headers",
+            "Body",
+            "Scripts",
+            "Examples",
+        ]
+        .into_iter()
+        .map(|label| {
+            let chip = cx
+                .debug_bounds(format!("request-chip-{label}").leak())
+                .unwrap_or_else(|| panic!("the {label} tab is painted"));
+            (label, chip.origin)
+        })
+        .collect();
+
+        for pair in places.windows(2) {
+            let (before, at) = pair[0];
+            let (after, next) = pair[1];
+            assert!(
+                at.x < next.x,
+                "{before} has to be painted left of {after}: {at:?} against {next:?}"
+            );
+        }
+    }
+
+    /// The headers a request sends are read in one place: the ones this client adds
+    /// sit in the same table as the ones the reader wrote, under the same headings.
+    #[gpui::test]
+    async fn the_automatic_headers_are_rows_of_the_same_table(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, _window, cx| {
+            view.active_tab = RequestTab::Headers;
+            cx.notify();
+        });
+        draw(&mut cx);
+
+        let heading = cx
+            .debug_bounds("headers-heading-key")
+            .expect("the table has its headings");
+        let table = cx
+            .debug_bounds("headers-table")
+            .expect("the table itself is painted");
+
+        for key in [
+            "Cache-Control",
+            "User-Agent",
+            "Accept",
+            "Content-Length",
+            "Host",
+        ] {
+            let row = cx
+                .debug_bounds(format!("headers-fixed-{key}").leak())
+                .unwrap_or_else(|| panic!("{key} has to be a row of the table"));
+            assert!(
+                row.origin.x >= table.origin.x
+                    && row.origin.x + row.size.width <= table.origin.x + table.size.width + px(1.),
+                "{key} has to sit inside the table, not beside it: {:?} against {:?}",
+                row,
+                table
+            );
+            assert!(
+                row.origin.y > heading.origin.y,
+                "{key} belongs under the headings"
+            );
+            let switch = cx
+                .debug_bounds(format!("auto-header-toggle-{key}").leak())
+                .unwrap_or_else(|| panic!("{key} keeps its own switch"));
+            assert!(
+                switch.origin.x < heading.origin.x,
+                "the switch stays in the column left of Key"
+            );
+        }
+
+        // The row the reader types into is still the last thing in the table.
+        let blank = cx
+            .debug_bounds("headers-row-0")
+            .expect("the blank row is there too");
+        let last_automatic = cx
+            .debug_bounds("headers-fixed-Host")
+            .expect("Host is painted");
+        assert!(
+            blank.origin.y > last_automatic.origin.y,
+            "what the reader writes goes under what the client adds"
+        );
+
+        // Hidden away again, the table holds only the reader's own rows.
+        let switch = debug_center(&mut cx, "hide-auto-headers-toggle");
+        cx.simulate_click(switch, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("headers-fixed-Accept").is_none(),
+            "hiding them takes them out of the table"
+        );
+        assert!(
+            cx.debug_bounds("headers-row-0").is_some(),
+            "and leaves the rows the reader writes alone"
         );
     }
 
