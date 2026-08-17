@@ -8,7 +8,7 @@ use api_client::{
 ///
 /// Every one is built from `build_resolved_request`, the same call Send makes, so
 /// a snippet cannot drift from what the editor would actually send: the same
-/// variables resolved, the same auth, the same headers.
+/// variables resolved, the same auth, the same headers the reader set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Snippet {
     Curl,
@@ -62,9 +62,7 @@ impl Snippet {
 
 /// The request in the shape asked for.
 pub fn generate(snippet: Snippet, request: &Request, context: &VariableContext) -> String {
-    let dynamic = SystemDynamicVariableSource;
-    let resolver = |text: &str| resolve(text, context, &dynamic, ResolveMode::ForSend);
-    let resolved = build_resolved_request(request, &resolver);
+    let resolved = as_it_was_written(request, context);
     let body = resolved
         .body
         .as_ref()
@@ -72,7 +70,7 @@ pub fn generate(snippet: Snippet, request: &Request, context: &VariableContext) 
     let body = body.as_deref();
 
     match snippet {
-        Snippet::Curl => generate_curl(request, context),
+        Snippet::Curl => as_curl(&resolved, body),
         Snippet::HttpText => as_http_text(&resolved, body),
         Snippet::Go => as_go(&resolved, body),
         Snippet::Python => as_python(&resolved, body),
@@ -85,6 +83,34 @@ pub fn generate(snippet: Snippet, request: &Request, context: &VariableContext) 
         Snippet::Ruby => as_ruby(&resolved, body),
         Snippet::Wget => as_wget(&resolved, body),
     }
+}
+
+/// The request as the reader wrote it, with the variables resolved and the auth
+/// applied -- but without the headers this client adds for itself.
+///
+/// A snippet is for somebody else's tool, and that tool sends its own
+/// `User-Agent`, `Accept` and the rest. Carrying ours into it says the request
+/// needs headers it does not need, which is how a reader ends up copying
+/// `ZedApiClient/1.0` into a bug report. A header the reader set by hand is kept
+/// even when it happens to have the same name as one of ours.
+fn as_it_was_written(request: &Request, context: &VariableContext) -> ResolvedRequest {
+    let dynamic = SystemDynamicVariableSource;
+    let resolver = |text: &str| resolve(text, context, &dynamic, ResolveMode::ForSend);
+    let mut resolved = build_resolved_request(request, &resolver);
+    let written_by_hand: Vec<String> = request
+        .headers
+        .iter()
+        .filter(|header| header.enabled && !header.key.is_empty())
+        .map(|header| resolver(&header.key).trim().to_lowercase())
+        .collect();
+    resolved.headers.retain(|(key, _)| {
+        let name = key.trim().to_lowercase();
+        written_by_hand.contains(&name)
+            || !api_client::AUTO_HEADER_DEFAULTS
+                .iter()
+                .any(|(automatic, _)| automatic.eq_ignore_ascii_case(key.trim()))
+    });
+    resolved
 }
 
 /// The exchange as it goes over the wire, which is what a reader pastes into a
@@ -395,18 +421,22 @@ fn php_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// Generates a `curl` command line equivalent to sending `request`, after
-/// resolving `{{variable}}` tokens through `context`. Pure string
-/// templating -- no UI dependency -- so it is trivially unit-testable and
-/// reusable for a future "Copy as cURL" action anywhere in the UI.
-pub fn generate_curl(request: &Request, context: &VariableContext) -> String {
-    let dynamic = SystemDynamicVariableSource;
-    let resolver = |text: &str| resolve(text, context, &dynamic, ResolveMode::ForSend);
-    let resolved = build_resolved_request(request, &resolver);
-
+/// The request as a `curl` command line: the form every tool writes, so it can be
+/// pasted into a shell or a ticket and read by somebody who has never seen this
+/// editor.
+///
+/// `--location` because a redirect is followed when the request is sent here too.
+/// `--request` is written only where it is needed: `curl` sends a GET without it,
+/// and turns a request with `--data` into a POST on its own, so naming the method
+/// in those two cases is noise.
+fn as_curl(resolved: &ResolvedRequest, body: Option<&str>) -> String {
+    let method = resolved.method.to_uppercase();
+    let spelled_out = match (method.as_str(), body.is_some()) {
+        ("GET", false) | ("POST", true) => String::new(),
+        _ => format!("--request {method} "),
+    };
     let mut command = format!(
-        "curl --request {} {}",
-        resolved.method,
+        "curl --location {spelled_out}{}",
         shell_quote(&resolved.url)
     );
     for (key, value) in &resolved.headers {
@@ -415,9 +445,8 @@ pub fn generate_curl(request: &Request, context: &VariableContext) -> String {
             shell_quote(&format!("{key}: {value}"))
         ));
     }
-    if let Some(body) = &resolved.body {
-        let body_text = String::from_utf8_lossy(body);
-        command.push_str(&format!(" \\\n  --data {}", shell_quote(&body_text)));
+    if let Some(body) = body {
+        command.push_str(&format!(" \\\n  --data {}", shell_quote(body)));
     }
     command
 }
@@ -437,9 +466,9 @@ mod tests {
     use api_client::{Environment, Header, HttpMethod, RawBodyContentType, RequestBody};
     use uuid::Uuid;
 
-    /// Every auto-generated default header disabled, so a `generate_curl`
-    /// assertion only has to reason about the headers the test itself set --
-    /// auto-header inclusion is covered by `http_send`'s own tests.
+    /// Every auto-generated default header disabled. A snippet leaves them out
+    /// anyway; this keeps the older assertions honest about what they are
+    /// checking, which is the headers the test itself set.
     fn request_with_auto_headers_disabled(name: &str) -> Request {
         let mut request = Request::new(Uuid::new_v4(), name.to_string());
         request.settings.disabled_auto_headers = api_client::AUTO_HEADER_DEFAULTS
@@ -479,13 +508,20 @@ mod tests {
 
             // The raw form writes the host and the path on separate lines, as the
             // wire does; everything else writes the whole address.
-            for expected in ["POST", "api.example.com", "/v1/things", "X-Token", "sesame"] {
+            for expected in ["api.example.com", "/v1/things", "X-Token", "sesame"] {
                 assert!(
                     code.contains(expected),
                     "{} left out {expected}:\n{code}",
                     snippet.label()
                 );
             }
+            // `curl` turns a request with `--data` into a POST by itself, so
+            // naming the method there would only be noise.
+            let says_post = match snippet {
+                Snippet::Curl => code.contains("--data"),
+                _ => code.contains("POST"),
+            };
+            assert!(says_post, "{} left out POST:\n{code}", snippet.label());
             assert!(
                 code.contains("a\\\":1") || code.contains("a\":1"),
                 "{} left out the body:\n{code}",
@@ -585,6 +621,142 @@ mod tests {
         );
     }
 
+    fn a_request_named(name: &str, url: &str) -> Request {
+        let mut request = Request::new(Uuid::new_v4(), name.to_string());
+        request.url = url.to_string();
+        request
+    }
+
+    fn the_global_context(global: &Environment) -> VariableContext<'_> {
+        VariableContext {
+            environment: None,
+            collection: None,
+            global,
+        }
+    }
+
+    /// A snippet is for another tool, which sends its own `User-Agent`, `Accept`
+    /// and the rest. Ours have no business in it -- but a header of the same name
+    /// that the reader set by hand is theirs, and stays.
+    #[test]
+    fn the_headers_this_client_adds_for_itself_stay_out_of_a_snippet() {
+        let mut request = a_request_named("Balance sheet", "https://api.example.com/v1/things");
+        request.headers = vec![Header {
+            key: "Accept".to_string(),
+            value: "application/json".to_string(),
+            enabled: true,
+            description: None,
+        }];
+        let global = Environment::global();
+        let context = the_global_context(&global);
+
+        let curl = generate(Snippet::Curl, &request, &context);
+        assert_eq!(
+            curl,
+            "curl --location 'https://api.example.com/v1/things' \\\n  \
+             --header 'Accept: application/json'",
+            "only the reader's own header, and theirs wins over ours of the same name"
+        );
+
+        for snippet in Snippet::ALL {
+            let code = generate(snippet, &request, &context);
+            assert!(
+                !code.contains("ZedApiClient"),
+                "{:?} must not tell another tool to call itself this editor:\n{code}",
+                snippet
+            );
+            assert!(
+                !code.contains("keep-alive") && !code.contains("no-cache"),
+                "{:?} carries a header the reader never set:\n{code}",
+                snippet
+            );
+        }
+    }
+
+    /// The method is named only where `curl` would otherwise get it wrong: it
+    /// sends a GET by default, and `--data` makes it a POST on its own.
+    #[test]
+    fn the_method_is_named_only_where_curl_needs_it() {
+        let global = Environment::global();
+        let context = the_global_context(&global);
+        let with_a_body = |mut request: Request| {
+            request.body = RequestBody::Raw {
+                content_type: RawBodyContentType::Json,
+                text: "{\"a\":1}".to_string(),
+            };
+            request
+        };
+
+        let get = a_request_named("Read", "https://api.example.com/things");
+        assert_eq!(
+            generate(Snippet::Curl, &get, &context),
+            "curl --location 'https://api.example.com/things'"
+        );
+
+        let mut post = a_request_named("Create", "https://api.example.com/things");
+        post.method = HttpMethod::Post;
+        let post = with_a_body(post);
+        let written = generate(Snippet::Curl, &post, &context);
+        assert!(
+            written.starts_with("curl --location 'https://api.example.com/things'"),
+            "a POST with a body needs no --request: {written}"
+        );
+        assert!(written.contains("--data"), "{written}");
+
+        let mut put = a_request_named("Replace", "https://api.example.com/things/1");
+        put.method = HttpMethod::Put;
+        let put = with_a_body(put);
+        assert!(
+            generate(Snippet::Curl, &put, &context)
+                .starts_with("curl --location --request PUT 'https://api.example.com/things/1'"),
+            "every other method has to be named"
+        );
+
+        let mut delete = a_request_named("Remove", "https://api.example.com/things/1");
+        delete.method = HttpMethod::Delete;
+        assert!(
+            generate(Snippet::Curl, &delete, &context)
+                .starts_with("curl --location --request DELETE"),
+            "a DELETE without a body still has to be named"
+        );
+
+        let read_with_a_body =
+            with_a_body(a_request_named("Odd", "https://api.example.com/search"));
+        assert!(
+            generate(Snippet::Curl, &read_with_a_body, &context)
+                .starts_with("curl --location --request GET"),
+            "a GET that carries a body has to say so, or curl would send a POST"
+        );
+    }
+
+    /// What the reader sees for the request in front of them: a plain command, and
+    /// nothing that was not asked for.
+    #[test]
+    fn a_get_with_a_filled_in_path_is_one_plain_line() {
+        let mut request = a_request_named(
+            "Balance sheet",
+            "{{financials-api}}/v1/instruments/:instrument_id/balance-sheet",
+        );
+        request.params = vec![api_client::QueryParam {
+            key: ":instrument_id".to_string(),
+            value: "6408".to_string(),
+            enabled: true,
+            description: None,
+        }];
+        let mut global = Environment::global();
+        global.variables.push(api_client::Variable::new(
+            "financials-api".into(),
+            "http://financials.example.com".into(),
+        ));
+        let context = the_global_context(&global);
+
+        assert_eq!(
+            generate(Snippet::Curl, &request, &context),
+            "curl --location 'http://financials.example.com/v1/instruments/6408/balance-sheet'",
+            "nothing else belongs in it: no body, no headers of ours, no --request"
+        );
+    }
+
     #[test]
     fn a_simple_get_request_becomes_a_one_line_curl_command() {
         let mut request = request_with_auto_headers_disabled("Ping");
@@ -595,8 +767,8 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate_curl(&request, &ctx);
-        assert_eq!(curl, "curl --request GET 'https://api.example.com/ping'");
+        let curl = generate(Snippet::Curl, &request, &ctx);
+        assert_eq!(curl, "curl --location 'https://api.example.com/ping'");
     }
 
     #[test]
@@ -615,7 +787,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate_curl(&request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx);
         assert!(curl.contains("--header 'Accept: application/json'"));
     }
 
@@ -634,7 +806,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate_curl(&request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx);
         assert!(curl.contains(r#"--data '{"name":"O'\''Brien"}'"#));
     }
 
@@ -652,7 +824,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate_curl(&request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx);
         assert!(curl.contains("https://staging.example.com/ping"));
     }
 }

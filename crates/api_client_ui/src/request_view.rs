@@ -4700,9 +4700,11 @@ impl Render for CodeSnippetModal {
                             .child(
                                 IconButton::new("code-snippet-close", IconName::Close)
                                     .icon_size(IconSize::Small)
-                                    .on_click(cx.listener(|_, _, _window, cx| {
-                                        cx.emit(gpui::DismissEvent)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|_, _, _window, cx| {
+                                            cx.emit(gpui::DismissEvent)
+                                        }),
+                                    ),
                             ),
                     ),
             )
@@ -4726,9 +4728,12 @@ impl Render for CodeSnippetModal {
                     .justify_between()
                     .items_center()
                     .child(
-                        Label::new("The same request Send would make: the variables resolved, the auth applied.")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        Label::new(
+                            "The same request Send would make: your variables resolved, your auth \
+                             applied, your own headers. Another tool adds its own.",
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                     )
                     .child(
                         Button::new("code-snippet-copy", "Copy")
@@ -5617,7 +5622,7 @@ mod tests {
             .expect("the Code button should open the code window");
 
         let shown = modal.read_with(&cx, |modal, cx| modal.code_editor.read(cx).text(cx));
-        assert!(shown.contains("curl --request GET"), "{shown}");
+        assert!(shown.contains("curl --location"), "{shown}");
         assert!(shown.contains("https://api.example.com/ping"), "{shown}");
 
         // Another shape: the same request, written differently.
@@ -5631,7 +5636,7 @@ mod tests {
             "picking another shape has to write the same request in it:\n{as_go}"
         );
         assert!(
-            !as_go.contains("curl --request"),
+            !as_go.contains("curl --location"),
             "and it must not leave the shape before it behind:\n{as_go}"
         );
 
