@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -12,15 +13,16 @@ use gpui::{
 };
 use pdfium_render::prelude::PdfPageIndex;
 use smallvec::SmallVec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use ui::{ContextMenu, Tooltip, WithScrollbar, prelude::*};
 use workspace::{Item, ToolbarItemLocation, item::ItemEvent};
 
 use crate::{
-    PdfContents, PdfCopy, PdfFind, PdfFindNext, PdfFindPrevious, PdfFirstPage, PdfFitPage,
-    PdfFitWidth, PdfFullScreen, PdfGoToPage, PdfLastPage, PdfNextPage, PdfPreviousPage, PdfPrint,
-    PdfProperties, PdfRotate, PdfRotateBack, PdfSaveACopy, PdfSelectPage, PdfThumbnails, PdfZoomIn,
-    PdfZoomOut, PdfZoomReset, pdf_engine, pdf_item::PdfItem,
+    PdfBlackScreen, PdfContents, PdfCopy, PdfFind, PdfFindNext, PdfFindPrevious, PdfFirstPage,
+    PdfFitPage, PdfFitWidth, PdfFullScreen, PdfGoToPage, PdfLastPage, PdfNextPage, PdfNightMode,
+    PdfOnePage, PdfPresent, PdfPreviousPage, PdfPrint, PdfProperties, PdfRotate, PdfRotateBack,
+    PdfSaveACopy, PdfSelectPage, PdfTenPagesBack, PdfTenPagesOn, PdfThumbnails, PdfTwoAcross,
+    PdfWhiteScreen, PdfZoomIn, PdfZoomOut, PdfZoomReset, pdf_engine, pdf_item::PdfItem,
 };
 
 use project::Project;
@@ -36,6 +38,12 @@ const BASE_PAGE_WIDTH: f32 = 900.;
 /// reader wants to wait for.
 const ZOOM_STEP: f32 = 0.2;
 const ZOOM_MIN: f32 = 0.1;
+/// The sizes offered by name, the way a reader asks for them.
+const ZOOM_CHOICES: [f32; 8] = [0.5, 0.75, 1., 1.25, 1.5, 2., 3., 4.];
+
+/// How often the file itself is looked at, to notice a document rewritten under
+/// the reader. Often enough to feel immediate, seldom enough to cost nothing.
+const HOW_OFTEN_THE_FILE_IS_LOOKED_AT: Duration = Duration::from_secs(2);
 const ZOOM_MAX: f32 = 4.0;
 
 /// How many pages are rendered eagerly. The rest follow as they are scrolled to.
@@ -44,6 +52,18 @@ const PAGES_RENDERED_AT_ONCE: usize = 3;
 /// Room left around a page when it is scaled to the window, so a fitted page is
 /// not pressed against the edge.
 const FITTING_MARGIN: f32 = 32.;
+
+/// The most pixels a page is ever drawn across. A dense screen at a deep zoom
+/// would otherwise ask for a picture of tens of megabytes a page: an A4 page four
+/// times over on a screen with two pixels to a laid-out one is 7200 across and
+/// nearly 300MB. Past this the picture is scaled up instead, which is softer than
+/// drawing it again and far cheaper than holding it.
+const MOST_PIXELS_ACROSS: f32 = 3000.;
+
+/// How far from what the reader is looking at a drawn page is kept. Pages are
+/// held as pictures, and a long document read to the end would otherwise hold
+/// every one of them at once.
+const PAGES_KEPT_EITHER_SIDE: usize = 4;
 
 /// The width a page's picture in the side list is drawn at.
 const THUMBNAIL_WIDTH: u32 = 120;
@@ -72,6 +92,24 @@ enum Fit {
     Width,
     /// A whole page is in view.
     Page,
+}
+
+/// One place a search found what it was looking for: which page, and where on it
+/// in the points the page is laid out in.
+#[derive(Clone, Copy, Debug)]
+struct Found {
+    page: usize,
+    bottom: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+}
+
+/// A blank screen held up during a slideshow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Blank {
+    Black,
+    White,
 }
 
 /// What the side list shows, if anything.
@@ -113,22 +151,97 @@ impl Selection {
 
     /// The same rectangle in the points a page is laid out in, with the origin at
     /// its bottom left rather than its top.
-    fn on_page_points(&self, page: &pdf_engine::PageSize) -> (f32, f32, f32, f32) {
-        let (left, top, right, bottom) = self.corners();
-        (
-            (1. - bottom) * page.height,
-            left * page.width,
-            (1. - top) * page.height,
-            right * page.width,
-        )
-    }
-
-    /// A drag smaller than this covers no word worth reading, and asking the
-    /// engine for the text under it returns whatever sits beneath the pointer.
     fn is_worth_reading(&self) -> bool {
         let (left, top, right, bottom) = self.corners();
         right - left >= SMALLEST_SELECTION && bottom - top >= SMALLEST_SELECTION
     }
+}
+
+/// Where a point on the painted page sits on the page as the document lays it
+/// out, both as fractions from the top left. A turned page is painted with its
+/// sides swapped, and everything the engine knows about it is in its own
+/// unturned frame.
+fn as_the_document_lays_it_out(at: Point<f32>, quarter_turns: u8) -> Point<f32> {
+    match quarter_turns % 4 {
+        1 => point(at.y, 1. - at.x),
+        2 => point(1. - at.x, 1. - at.y),
+        3 => point(1. - at.y, at.x),
+        _ => at,
+    }
+}
+
+/// The way back: a place on the page as laid out, to where it is painted.
+fn as_it_is_painted(at: Point<f32>, quarter_turns: u8) -> Point<f32> {
+    match quarter_turns % 4 {
+        1 => point(1. - at.y, at.x),
+        2 => point(1. - at.x, 1. - at.y),
+        3 => point(at.y, 1. - at.x),
+        _ => at,
+    }
+}
+
+/// The character of `characters` nearest `at`, which is in page points. One the
+/// point is inside wins; otherwise the nearest by the distance to its box, so a
+/// drag through a margin still marks the line beside it.
+fn character_nearest(characters: &[pdf_engine::PageChar], at: (f32, f32)) -> Option<usize> {
+    let (x, y) = at;
+    let mut nearest = None;
+    let mut nearest_distance = f32::MAX;
+    for (index, character) in characters.iter().enumerate() {
+        let inside = x >= character.left
+            && x <= character.right
+            && y >= character.bottom
+            && y <= character.top;
+        if inside {
+            return Some(index);
+        }
+        let across = (character.left - x).max(x - character.right).max(0.);
+        let down = (character.bottom - y).max(y - character.top).max(0.);
+        // Along the line counts for less than across lines: a point to the right
+        // of a line's last word belongs to that line, not to the one below it.
+        let distance = down * down * 4. + across * across;
+        if distance < nearest_distance {
+            nearest_distance = distance;
+            nearest = Some(index);
+        }
+    }
+    nearest
+}
+
+/// The rectangles to mark a run of characters with, in page points: one for each
+/// line the run covers, since a selection over three lines is three bands and not
+/// one box around them all.
+fn bands_over(
+    characters: &[pdf_engine::PageChar],
+    covered: std::ops::Range<usize>,
+) -> Vec<(f32, f32, f32, f32)> {
+    let mut bands: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for character in characters
+        .get(covered)
+        .unwrap_or_default()
+        .iter()
+        .filter(|character| !character.character.is_whitespace())
+    {
+        let (bottom, left, top, right) = (
+            character.bottom,
+            character.left,
+            character.top,
+            character.right,
+        );
+        match bands.last_mut() {
+            // The same line, going by whether the two overlap up and down: a
+            // character's box is as tall as its line, and the next line's does
+            // not reach into it.
+            Some(band) if bottom < band.2 && top > band.0 => {
+                band.0 = band.0.min(bottom);
+                band.1 = band.1.min(left);
+                band.2 = band.2.max(top);
+                band.3 = band.3.max(right);
+            }
+            _ => bands.push((bottom, left, top, right)),
+        }
+    }
+    bands
 }
 
 pub struct PdfView {
@@ -154,6 +267,33 @@ pub struct PdfView {
     scroll: ScrollHandle,
     sidebar_scroll: ScrollHandle,
     opening: Option<Task<()>>,
+    /// Which reading of the document everything held belongs to. A document read
+    /// again -- rewritten under the reader, or opened with a password -- starts a
+    /// new one, and answers about the old reading are dropped rather than written
+    /// over the new document's pages.
+    reading: u64,
+    /// Each page's links, so a click on one can be followed.
+    links: HashMap<usize, Rc<Vec<pdf_engine::PageLink>>>,
+    links_asked_for: HashSet<usize>,
+    reading_links: Vec<Task<()>>,
+    /// Set when the document will not open without a password, with the field the
+    /// reader types it into.
+    asks_for_a_password: bool,
+    password_field: Entity<Editor>,
+    /// When the file was last changed, so a document rewritten under the reader is
+    /// read again.
+    last_changed: Option<std::time::SystemTime>,
+    _watching_the_file: Task<()>,
+    /// Whether pages are shown two across, as a book is read.
+    two_across: bool,
+    /// Where the pointer was when panning started, if it is panning.
+    panning: Option<Point<Pixels>>,
+    /// Each page's characters and where they sit, once read. Selecting text means
+    /// asking which character the pointer is over on every move, so this is held
+    /// rather than asked of the engine each time.
+    chars: HashMap<usize, Rc<Vec<pdf_engine::PageChar>>>,
+    chars_asked_for: HashSet<usize>,
+    reading_chars: Vec<Task<()>>,
     /// Pages already asked for, so a page is not rendered twice while the first
     /// answer is still on its way.
     asked_for: HashSet<usize>,
@@ -171,8 +311,20 @@ pub struct PdfView {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Quarter turns clockwise applied to every page.
     quarter_turns: u8,
-    /// What was searched for, and which pages hold it.
-    found_on_pages: Vec<usize>,
+    /// Whether the pages are shown with their colours turned over.
+    at_night: bool,
+    /// Whether the document is being shown as a slideshow, and what the reader
+    /// was looking at before it started, to be put back afterwards.
+    presenting: bool,
+    before_presenting: Option<(bool, Fit, Sidebar)>,
+    /// A blank screen over the slideshow, for taking the room's attention.
+    blanked: Option<Blank>,
+    /// What was searched for, and every place it was found, in document order.
+    found: Vec<Found>,
+    /// Whether the search minds the case of what was typed, and whether it only
+    /// counts whole words.
+    match_case: bool,
+    whole_words: bool,
     searched_for: Option<SharedString>,
     searching: Option<Task<()>>,
     /// The field the reader types what to look for into.
@@ -182,6 +334,10 @@ pub struct PdfView {
     at_match: usize,
     /// The field a page number is typed into.
     page_field: Entity<Editor>,
+    /// How many screen pixels there are to a laid-out one. Pages are drawn in
+    /// screen pixels and painted at their laid-out size, or a page on a dense
+    /// screen is drawn at half the size it is shown at and reads as a blur.
+    screen_pixels: f32,
     /// How pages are scaled to the window, and the window size that scaling was
     /// worked out for, so it is worked out again only when the window changes.
     fit: Fit,
@@ -265,6 +421,43 @@ impl PdfView {
                 view.go_to_typed_page(&typed, cx);
             });
 
+        let password_field = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Password", window, cx);
+            // What is typed is not shown: a document's password is a secret like
+            // any other, and this field sits in the middle of the window.
+            editor.set_masked(true, cx);
+            editor
+        });
+
+        // A document rewritten under the reader -- a report built again, a file
+        // synced -- is read again rather than left as it was.
+        let watched = path.clone();
+        let watching = cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(HOW_OFTEN_THE_FILE_IS_LOOKED_AT)
+                    .await;
+                let changed = smol::fs::metadata(&watched)
+                    .await
+                    .ok()
+                    .and_then(|file| file.modified().ok());
+                let carry_on = view
+                    .update(cx, |view, cx| match (changed, view.last_changed) {
+                        (Some(now), Some(before)) if now != before => {
+                            view.last_changed = Some(now);
+                            view.read_the_document(cx);
+                        }
+                        (Some(now), None) => view.last_changed = Some(now),
+                        _ => {}
+                    })
+                    .is_ok();
+                if !carry_on {
+                    return;
+                }
+            }
+        });
+
         let mut view = Self {
             path,
             title,
@@ -278,6 +471,19 @@ impl PdfView {
             scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
             opening: None,
+            reading: 0,
+            links: HashMap::default(),
+            links_asked_for: HashSet::default(),
+            reading_links: Vec::new(),
+            asks_for_a_password: false,
+            password_field,
+            last_changed: None,
+            _watching_the_file: watching,
+            two_across: false,
+            panning: None,
+            chars: HashMap::default(),
+            chars_asked_for: HashSet::default(),
+            reading_chars: Vec::new(),
             asked_for: HashSet::default(),
             given_another_go: HashSet::default(),
             rendering: Vec::new(),
@@ -287,13 +493,20 @@ impl PdfView {
             reading_text: None,
             context_menu: None,
             quarter_turns: 0,
-            found_on_pages: Vec::new(),
+            at_night: false,
+            presenting: false,
+            before_presenting: None,
+            blanked: None,
+            found: Vec::new(),
+            match_case: false,
+            whole_words: false,
             searched_for: None,
             searching: None,
             find_editor,
             searching_now: false,
             at_match: 0,
             page_field,
+            screen_pixels: 1.,
             fit: Fit::Free,
             fitted_for: None,
             sidebar: Sidebar::Hidden,
@@ -319,6 +532,10 @@ impl PdfView {
     /// are worth rendering is decided by what the reader is looking at.
     fn read_the_document(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
+        // Everything asked for about the document so far belongs to the reading
+        // before this one, and its answers are no longer wanted.
+        self.reading = self.reading.wrapping_add(1);
+        let reading = self.reading;
         self.opening = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
@@ -328,6 +545,9 @@ impl PdfView {
                 .await;
 
             view.update(cx, |view, cx| {
+                if view.reading != reading {
+                    return;
+                }
                 match read {
                     Ok(sizes) => {
                         view.pages = vec![None; sizes.len()];
@@ -337,6 +557,11 @@ impl PdfView {
                         view.page_sizes = sizes;
                         view.asked_for.clear();
                         view.given_another_go.clear();
+                        view.chars.clear();
+                        view.chars_asked_for.clear();
+                        view.links.clear();
+                        view.links_asked_for.clear();
+                        view.asks_for_a_password = false;
                         view.trouble = None;
                         // A fit worked out before the pages had been measured was
                         // worked out from nothing, and the window has not changed
@@ -347,8 +572,16 @@ impl PdfView {
                         view.ask_for_pages(0..PAGES_RENDERED_AT_ONCE, cx);
                     }
                     Err(error) => {
-                        log::error!("the PDF did not open: {error:#}");
-                        view.trouble = Some(format!("{error:#}").into());
+                        // A document that will not open without a password is not
+                        // a document that failed to open: the reader is asked for
+                        // one instead of being shown the engine's complaint.
+                        if pdf_engine::needs_a_password(&view.path) {
+                            view.asks_for_a_password = true;
+                            view.trouble = None;
+                        } else {
+                            log::error!("the PDF did not open: {error:#}");
+                            view.trouble = Some(format!("{error:#}").into());
+                        }
                     }
                 }
                 cx.notify();
@@ -370,10 +603,19 @@ impl PdfView {
             let path = self.path.clone();
             let at_zoom = self.zoom;
             let turns = self.quarter_turns;
+            let at_night = self.at_night;
+            let at_density = self.screen_pixels;
+            let reading = self.reading;
             self.rendering.push(cx.spawn(async move |view, cx| {
                 let drawn = cx
                     .background_spawn(async move {
-                        pdf_engine::render_page(&path, index as PdfPageIndex, width, turns)
+                        pdf_engine::render_page(
+                            &path,
+                            index as PdfPageIndex,
+                            width,
+                            turns,
+                            at_night,
+                        )
                     })
                     .await;
                 view.update(cx, |view, cx| {
@@ -381,7 +623,17 @@ impl PdfView {
                     // drawn. A page drawn for a size nobody is looking at any
                     // more would paint blurred, and one drawn the other way up
                     // would land on top of the page drawn since.
-                    if (view.zoom - at_zoom).abs() > f32::EPSILON || view.quarter_turns != turns {
+                    // Anything that decides what a page should look like may have
+                    // moved on while it was being drawn, and a page drawn for a
+                    // state nobody is in any more is worse than none: it paints
+                    // blurred, or the wrong way up, or over a page let go of.
+                    if view.reading != reading
+                        || (view.zoom - at_zoom).abs() > f32::EPSILON
+                        || view.quarter_turns != turns
+                        || view.at_night != at_night
+                        || (view.screen_pixels - at_density).abs() > 0.01
+                        || !view.asked_for.contains(&index)
+                    {
                         return;
                     }
                     match drawn {
@@ -410,6 +662,188 @@ impl PdfView {
         // Finished errands are dropped so the list does not grow with the
         // document; a task that has run holds nothing worth keeping.
         self.rendering.retain(|task| !task.is_ready());
+    }
+
+    /// Reads the characters of any of `wanted` not read yet. A page's worth is a
+    /// few thousand of them, so it is read off the interface thread and kept.
+    fn ask_for_chars(&mut self, wanted: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        for index in wanted.start..wanted.end.min(self.page_sizes.len()) {
+            if self.chars.contains_key(&index) || !self.chars_asked_for.insert(index) {
+                continue;
+            }
+            let path = self.path.clone();
+            let reading = self.reading;
+            self.reading_chars.push(cx.spawn(async move |view, cx| {
+                let read = cx
+                    .background_spawn(async move {
+                        pdf_engine::page_chars(&path, index as PdfPageIndex)
+                    })
+                    .await;
+                view.update(cx, |view, cx| {
+                    if view.reading != reading {
+                        return;
+                    }
+                    match read {
+                        Ok(characters) => {
+                            view.chars.insert(index, Rc::new(characters));
+                        }
+                        Err(error) => {
+                            // Left as asked for: putting it back on the list would
+                            // have it asked for again on the very next frame, and
+                            // a document whose text cannot be read at all would
+                            // spin. Turning the pages or opening it again asks.
+                            log::warn!("page {index} would not say what is on it: {error:#}");
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        self.reading_chars.retain(|task| !task.is_ready());
+    }
+
+    /// Takes the password the reader typed and opens the document with it.
+    fn try_the_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.password_field.read(cx).text(cx);
+        if typed.is_empty() {
+            return;
+        }
+        pdf_engine::remember_password(&self.path, &typed);
+        self.password_field.update(cx, |field, cx| {
+            // Not left lying in a field on screen once it has been used.
+            field.clear(window, cx);
+        });
+        self.asks_for_a_password = false;
+        self.read_the_document(cx);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The field a document's password is typed into, in place of the pages.
+    fn render_password_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Label::new("This document is locked."))
+            .child(
+                h_flex()
+                    .w(px(280.))
+                    .h(px(28.))
+                    .px_2()
+                    .border_1()
+                    .border_color(ui::cyberpunk::border_dim())
+                    .on_action(cx.listener(|view, _: &::menu::Confirm, window, cx| {
+                        view.try_the_password(window, cx)
+                    }))
+                    .child(div().flex_1().child(self.password_field.clone())),
+            )
+            .child(
+                Button::new("pdf-password-open", "Open")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|view, _, window, cx| view.try_the_password(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Shows the pages two across, as a book, or back to one.
+    fn show_two_across(&mut self, two_across: bool, cx: &mut Context<Self>) {
+        if self.two_across == two_across {
+            return;
+        }
+        self.two_across = two_across;
+        // Where the pages sit is about to change, and a fit worked out for one
+        // page across does not hold for two.
+        for cell in &self.page_bounds {
+            cell.set(Bounds::default());
+        }
+        self.fitted_for = None;
+        self.selection = None;
+        self.selected_text = None;
+        cx.notify();
+    }
+
+    /// Reads the links of any of `wanted` not read yet, so a click on one can be
+    /// followed.
+    fn ask_for_links(&mut self, wanted: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        for index in wanted.start..wanted.end.min(self.page_sizes.len()) {
+            if self.links.contains_key(&index) || !self.links_asked_for.insert(index) {
+                continue;
+            }
+            let path = self.path.clone();
+            let reading = self.reading;
+            self.reading_links.push(cx.spawn(async move |view, cx| {
+                let read = cx
+                    .background_spawn(async move {
+                        pdf_engine::page_links(&path, index as PdfPageIndex)
+                    })
+                    .await;
+                view.update(cx, |view, cx| {
+                    if view.reading != reading {
+                        return;
+                    }
+                    match read {
+                        Ok(links) => {
+                            view.links.insert(index, Rc::new(links));
+                        }
+                        // Left as asked for: putting it back would have it asked
+                        // for again on the very next frame.
+                        Err(error) => {
+                            log::warn!("page {index} would not say what it links to: {error:#}")
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        self.reading_links.retain(|task| !task.is_ready());
+    }
+
+    /// The link under a place on the page, if there is one.
+    fn link_under(&self, page: usize, at: Point<Pixels>) -> Option<&pdf_engine::PageLink> {
+        let bounds = self.page_bounds.get(page)?.get();
+        let page_size = self.page_sizes.get(page)?;
+        if bounds.size.width <= px(0.) || page_size.width <= 0. || page_size.height <= 0. {
+            return None;
+        }
+        let across = f32::from(at.x - bounds.origin.x) / f32::from(bounds.size.width);
+        let down = f32::from(at.y - bounds.origin.y) / f32::from(bounds.size.height);
+        let laid_out = as_the_document_lays_it_out(point(across, down), self.quarter_turns);
+        let x = laid_out.x * page_size.width;
+        let y = (1. - laid_out.y) * page_size.height;
+        self.links
+            .get(&page)?
+            .iter()
+            .find(|link| x >= link.left && x <= link.right && y >= link.bottom && y <= link.top)
+    }
+
+    /// Follows a link: to another page of this document, or out to whatever opens
+    /// addresses on this machine.
+    fn follow_the_link_at(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(page) = self.page_under(at) else {
+            return false;
+        };
+        let leads = match self.link_under(page, at).map(|link| &link.leads) {
+            Some(pdf_engine::LinkTarget::Page(page)) => Some(pdf_engine::LinkTarget::Page(*page)),
+            Some(pdf_engine::LinkTarget::Address(address)) => {
+                Some(pdf_engine::LinkTarget::Address(address.clone()))
+            }
+            None => None,
+        };
+        match leads {
+            Some(pdf_engine::LinkTarget::Page(page)) => {
+                self.show_page(page, cx);
+                true
+            }
+            Some(pdf_engine::LinkTarget::Address(address)) => {
+                cx.open_url(&address);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Which pages are on screen, going by where they were last painted, with one
@@ -447,10 +881,49 @@ impl PdfView {
         first.saturating_sub(1)..(last + 2).min(self.pages.len())
     }
 
-    /// The width pages are rendered at, which is the base width scaled by the
-    /// reader's zoom.
+    /// The width pages are drawn at: the base width scaled by the reader's zoom
+    /// and again by however many screen pixels there are to a laid-out one.
     fn render_width(&self) -> u32 {
-        (BASE_PAGE_WIDTH * self.zoom).round().max(1.) as u32
+        (BASE_PAGE_WIDTH * self.zoom * self.screen_pixels)
+            .min(MOST_PIXELS_ACROSS)
+            .round()
+            .max(1.) as u32
+    }
+
+    /// Lets go of the pages the reader is nowhere near. A page is a picture the
+    /// size of the screen it is shown on, and a document read from end to end
+    /// would hold every one of them.
+    fn let_go_of_distant_pages(&mut self, wanted: &std::ops::Range<usize>) {
+        let keep = wanted.start.saturating_sub(PAGES_KEPT_EITHER_SIDE)
+            ..(wanted.end + PAGES_KEPT_EITHER_SIDE).min(self.pages.len());
+        for index in 0..self.pages.len() {
+            if keep.contains(&index) || self.pages[index].is_none() {
+                continue;
+            }
+            self.pages[index] = None;
+            // Forgotten as drawn, so coming back to it draws it again rather than
+            // leaving a frame where the page was.
+            self.asked_for.remove(&index);
+            self.given_another_go.remove(&index);
+        }
+    }
+
+    /// Takes note of how dense the screen is. A window dragged to another screen
+    /// changes this, and every page held was drawn for the old one.
+    fn drawn_for_this_screen(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let now = window.scale_factor().max(1.);
+        if (self.screen_pixels - now).abs() < 0.01 {
+            return;
+        }
+        self.screen_pixels = now;
+        self.pages = vec![None; self.pages.len()];
+        self.asked_for.clear();
+        self.given_another_go.clear();
+        self.thumbnails = vec![None; self.thumbnails.len()];
+        self.thumbnails_asked_for.clear();
+        let wanted = self.pages_worth_rendering();
+        self.ask_for_pages(wanted, cx);
+        cx.notify();
     }
 
     fn zoom_by(&mut self, step: f32, cx: &mut Context<Self>) {
@@ -592,7 +1065,20 @@ impl PdfView {
         cx.notify();
     }
 
-    fn finish_selecting(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn finish_selecting(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        // A press and release in the same place is a click, and a click on a link
+        // follows it. Only then: a drag that happens to end over a link is the
+        // reader selecting text, not asking to go somewhere.
+        let a_click = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging && !selection.is_worth_reading());
+        if a_click && self.follow_the_link_at(event.position, cx) {
+            self.selection = None;
+            self.selected_text = None;
+            cx.notify();
+            return;
+        }
         let Some(selection) = self.selection.as_mut() else {
             return;
         };
@@ -676,14 +1162,14 @@ impl PdfView {
 
     /// Steps through the pages the words were found on.
     fn step_match(&mut self, by: isize, cx: &mut Context<Self>) {
-        if self.found_on_pages.is_empty() {
+        if self.found.is_empty() {
             return;
         }
-        let last = self.found_on_pages.len() as isize;
+        let last = self.found.len() as isize;
         let wanted = (self.at_match as isize + by).rem_euclid(last) as usize;
         self.at_match = wanted;
-        if let Some(page) = self.found_on_pages.get(wanted).copied() {
-            self.show_page(page, cx);
+        if let Some(found) = self.found.get(wanted).copied() {
+            self.show_page(found.page, cx);
         }
     }
 
@@ -734,33 +1220,54 @@ impl PdfView {
     fn find(&mut self, needle: SharedString, cx: &mut Context<Self>) {
         if needle.trim().is_empty() {
             self.searched_for = None;
-            self.found_on_pages.clear();
+            self.found.clear();
             self.at_match = 0;
             cx.notify();
             return;
         }
         let path = self.path.clone();
         let pages = self.pages.len();
-        let wanted = needle.to_lowercase();
+        let looking_for = needle.to_string();
+        let match_case = self.match_case;
+        let whole_words = self.whole_words;
         self.searched_for = Some(needle);
+        let reading = self.reading;
         self.searching = Some(cx.spawn(async move |view, cx| {
             let found = cx
                 .background_spawn(async move {
                     let mut found = Vec::new();
-                    for index in 0..pages {
-                        let text = pdf_engine::page_text(&path, index as PdfPageIndex)?;
-                        if text.to_lowercase().contains(&wanted) {
-                            found.push(index);
+                    for page in 0..pages {
+                        // Where each one sits, not merely which page holds it: a
+                        // reader looking for a word wants to see it marked on the
+                        // page, and to step from one to the next.
+                        let places = pdf_engine::places_found_on_page(
+                            &path,
+                            page as PdfPageIndex,
+                            &looking_for,
+                            match_case,
+                            whole_words,
+                        )?;
+                        for (bottom, left, top, right) in places {
+                            found.push(Found {
+                                page,
+                                bottom,
+                                left,
+                                top,
+                                right,
+                            });
                         }
                     }
                     anyhow::Ok(found)
                 })
                 .await;
             view.update(cx, |view, cx| {
+                if view.reading != reading {
+                    return;
+                }
                 match found {
                     Ok(found) => {
-                        let first = found.first().copied();
-                        view.found_on_pages = found;
+                        let first = found.first().map(|found| found.page);
+                        view.found = found;
                         view.at_match = 0;
                         if let Some(first) = first {
                             view.show_page(first, cx);
@@ -772,6 +1279,14 @@ impl PdfView {
             })
             .ok();
         }));
+    }
+
+    /// Searches again for what was last looked for, which is what changing how the
+    /// search is done has to do.
+    fn look_again(&mut self, cx: &mut Context<Self>) {
+        if let Some(needle) = self.searched_for.clone() {
+            self.find(needle, cx);
+        }
     }
 
     /// Hands the document to whatever prints on this machine. Printing is the
@@ -883,6 +1398,67 @@ impl PdfView {
 
     /// Turns between a column of pages and one page at a time. What was being
     /// read stays being read either way round.
+    /// Shows the document as a slideshow: one page at a time, the whole page in
+    /// view, the window given over to it and nothing else on screen.
+    fn present(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.presenting {
+            return;
+        }
+        self.before_presenting = Some((self.one_page_at_a_time, self.fit, self.sidebar));
+        self.presenting = true;
+        self.blanked = None;
+        self.sidebar = Sidebar::Hidden;
+        self.show_one_page_at_a_time(true, cx);
+        self.fit_to(Fit::Page, cx);
+        window.toggle_fullscreen();
+        cx.notify();
+    }
+
+    /// Puts back what the reader was looking at before the slideshow.
+    fn stop_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.presenting {
+            return;
+        }
+        self.presenting = false;
+        self.blanked = None;
+        if let Some((one_page, fit, sidebar)) = self.before_presenting.take() {
+            self.sidebar = sidebar;
+            self.show_one_page_at_a_time(one_page, cx);
+            self.fit_to(fit, cx);
+        }
+        window.toggle_fullscreen();
+        cx.notify();
+    }
+
+    fn blank_the_screen(&mut self, with: Blank, cx: &mut Context<Self>) {
+        if !self.presenting {
+            return;
+        }
+        // The same key again brings the slide back, which is how a presenter uses
+        // it: press to hide, press to carry on.
+        self.blanked = match self.blanked == Some(with) {
+            true => None,
+            false => Some(with),
+        };
+        cx.notify();
+    }
+
+    /// Turns the pages' colours over, or back.
+    fn read_at_night(&mut self, at_night: bool, cx: &mut Context<Self>) {
+        if self.at_night == at_night {
+            return;
+        }
+        self.at_night = at_night;
+        self.pages = vec![None; self.pages.len()];
+        self.asked_for.clear();
+        self.given_another_go.clear();
+        self.thumbnails = vec![None; self.thumbnails.len()];
+        self.thumbnails_asked_for.clear();
+        let wanted = self.pages_worth_rendering();
+        self.ask_for_pages(wanted, cx);
+        cx.notify();
+    }
+
     fn show_one_page_at_a_time(&mut self, one_at_a_time: bool, cx: &mut Context<Self>) {
         if self.one_page_at_a_time == one_at_a_time {
             return;
@@ -960,6 +1536,12 @@ impl PdfView {
             }
             let path = self.path.clone();
             let turns = self.quarter_turns;
+            let at_night = self.at_night;
+            let at_density = self.screen_pixels;
+            let reading = self.reading;
+            let thumbnail_width = (THUMBNAIL_WIDTH as f32 * self.screen_pixels)
+                .round()
+                .max(1.) as u32;
             self.drawing_thumbnails
                 .push(cx.spawn(async move |view, cx| {
                     let drawn = cx
@@ -967,15 +1549,21 @@ impl PdfView {
                             pdf_engine::render_page(
                                 &path,
                                 index as PdfPageIndex,
-                                THUMBNAIL_WIDTH,
+                                thumbnail_width,
                                 turns,
+                                at_night,
                             )
                         })
                         .await;
                     view.update(cx, |view, cx| {
-                        // Drawn the other way up from how the pages are now: it
-                        // would sit in the side list disagreeing with them.
-                        if view.quarter_turns != turns {
+                        // Drawn the other way up, or the other way round in
+                        // colour, from how the pages are now: it would sit in the
+                        // side list disagreeing with them.
+                        if view.reading != reading
+                            || view.quarter_turns != turns
+                            || view.at_night != at_night
+                            || (view.screen_pixels - at_density).abs() > 0.01
+                        {
                             return;
                         }
                         match drawn {
@@ -1024,50 +1612,48 @@ impl PdfView {
     /// Asks the engine for the text under the finished selection. Reading a page
     /// means opening the document again, so it happens off the interface thread
     /// like every other errand to the engine.
-    fn read_the_selected_text(&mut self, cx: &mut Context<Self>) {
-        let Some(selection) = self.selection.as_ref() else {
-            return;
+    /// The characters the selection covers, in the order the document holds them.
+    /// None while the page's characters have not been read, or when the drag was
+    /// nowhere near any text.
+    fn selected_characters(&self) -> Option<(usize, std::ops::Range<usize>)> {
+        let selection = self.selection.as_ref()?;
+        let characters = self.chars.get(&selection.page)?;
+        let page = self.page_sizes.get(selection.page)?;
+        if characters.is_empty() || page.width <= 0. || page.height <= 0. {
+            return None;
+        }
+        let in_points = |at: Point<f32>| {
+            let laid_out = as_the_document_lays_it_out(at, self.quarter_turns);
+            // Page points count up from the bottom; fractions count down from the
+            // top.
+            (laid_out.x * page.width, (1. - laid_out.y) * page.height)
         };
-        let Some(page_size) = self.page_sizes.get(selection.page) else {
-            return;
+        let from = character_nearest(characters, in_points(selection.from))?;
+        let to = character_nearest(characters, in_points(selection.to))?;
+        let (first, last) = match from <= to {
+            true => (from, to),
+            false => (to, from),
         };
-        let (bottom, left, top, right) = selection.on_page_points(page_size);
+        Some((selection.page, first..last + 1))
+    }
 
-        let path = self.path.clone();
-        let page_index = selection.page as PdfPageIndex;
-        let asked_for = (selection.page, selection.corners());
-        self.reading_text = Some(cx.spawn(async move |view, cx| {
-            let read = cx
-                .background_spawn(async move {
-                    pdf_engine::text_in_rect(&path, page_index, bottom, left, top, right)
-                })
-                .await;
-            view.update(cx, |view, cx| {
-                // The reader may have dragged again, or taken the mark off,
-                // while this was being read. Text belonging to a selection that
-                // is no longer there would be copied as though it were what is
-                // marked now.
-                let still_wanted = view
-                    .selection
-                    .as_ref()
-                    .is_some_and(|selection| (selection.page, selection.corners()) == asked_for);
-                if !still_wanted {
-                    return;
-                }
-                match read {
-                    Ok(text) if !text.trim().is_empty() => {
-                        view.selected_text = Some(text.into());
-                    }
-                    Ok(_) => view.selected_text = None,
-                    Err(error) => {
-                        log::warn!("the PDF's text could not be read: {error:#}");
-                        view.selected_text = None;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+    /// Takes the text the selection covers from the characters already read. No
+    /// errand: what is marked and what is copied then cannot disagree.
+    fn read_the_selected_text(&mut self, cx: &mut Context<Self>) {
+        let text = self.selected_characters().and_then(|(page, covered)| {
+            let characters = self.chars.get(&page)?;
+            let text: String = characters
+                .get(covered)?
+                .iter()
+                .map(|character| character.character)
+                .collect();
+            match text.trim().is_empty() {
+                true => None,
+                false => Some(SharedString::from(text)),
+            }
+        });
+        self.selected_text = text;
+        cx.notify();
     }
 
     fn copy_the_selection(&mut self, cx: &mut Context<Self>) {
@@ -1087,14 +1673,7 @@ impl PdfView {
         self.reading_text = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    pdf_engine::text_in_rect(
-                        &path,
-                        page as PdfPageIndex,
-                        0.,
-                        0.,
-                        height,
-                        width,
-                    )
+                    pdf_engine::text_in_rect(&path, page as PdfPageIndex, 0., 0., height, width)
                 })
                 .await;
             view.update(cx, |_view, cx| {
@@ -1177,7 +1756,7 @@ impl PdfView {
     /// buttons that change it.
     fn render_controls(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let pages = self.pages.len();
-        let matches = self.found_on_pages.len();
+        let matches = self.found.len();
         // Nothing has been painted before the first frame, and a strip that left
         // everything out then would flash on the second.
         let room = match f32::from(self.room_for_controls.get()) {
@@ -1197,6 +1776,9 @@ impl PdfView {
             .gap_1()
             .px_2()
             .py_1()
+            // The controls sit together in the middle of the strip: a row of them
+            // along one edge of a wide window reads as left over from something.
+            .justify_center()
             .overflow_x_hidden()
             .border_b_1()
             .border_color(ui::cyberpunk::border_dim())
@@ -1236,15 +1818,7 @@ impl PdfView {
                 cx.listener(|view, _, _, cx| view.zoom_by(-ZOOM_STEP, cx)),
             ))
             .when(zoom_label, |strip| {
-                strip.child(
-                    Button::new("pdf-zoom-reset", format!("{:.0}%", self.zoom * 100.))
-                        .label_size(LabelSize::Small)
-                        .tooltip(Tooltip::text("Actual size"))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.fit = Fit::Free;
-                            view.set_zoom(1., cx);
-                        })),
-                )
+                strip.child(self.render_zoom_choices(cx))
             })
             .child(self.tool(
                 "pdf-zoom-in",
@@ -1325,7 +1899,6 @@ impl PdfView {
                     cx.listener(move |view, _, _, cx| view.show_page(pages.saturating_sub(1), cx)),
                 ))
             })
-            .child(div().flex_1().min_w(px(8.)))
             .when(searching, |strip| {
                 strip
                     .child(
@@ -1359,6 +1932,70 @@ impl PdfView {
             })
             .child(self.divider())
             .child(self.render_more_menu(cx))
+            .into_any_element()
+    }
+
+    /// The zoom, and a list of the sizes a reader asks for by name. Typing a
+    /// number is not what anybody does here; picking 100% or "fit the page" is.
+    fn render_zoom_choices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let showing = format!("{:.0}%", self.zoom * 100.);
+        div()
+            .flex_none()
+            .debug_selector(|| "pdf-zoom".to_string())
+            .child(
+                ui::PopoverMenu::new("pdf-zoom-choices")
+                    .trigger(
+                        Button::new("pdf-zoom-reset", showing)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("The size pages are shown at")),
+                    )
+                    .menu({
+                        let view = cx.entity();
+                        move |window, cx| {
+                            let view = view.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, cx| {
+                                let fit = view.read(cx).fit;
+                                let width = view.clone();
+                                let page = view.clone();
+                                let mut menu = menu
+                                    .toggleable_entry(
+                                        "Fit the width",
+                                        fit == Fit::Width,
+                                        ui::IconPosition::Start,
+                                        None,
+                                        move |_, cx| {
+                                            width
+                                                .update(cx, |view, cx| view.fit_to(Fit::Width, cx));
+                                        },
+                                    )
+                                    .toggleable_entry(
+                                        "Fit the page",
+                                        fit == Fit::Page,
+                                        ui::IconPosition::Start,
+                                        None,
+                                        move |_, cx| {
+                                            page.update(cx, |view, cx| view.fit_to(Fit::Page, cx));
+                                        },
+                                    )
+                                    .separator();
+                                for at in ZOOM_CHOICES {
+                                    let view = view.clone();
+                                    menu = menu.entry(
+                                        format!("{:.0}%", at * 100.),
+                                        None,
+                                        move |_, cx| {
+                                            view.update(cx, |view, cx| {
+                                                view.fit = Fit::Free;
+                                                view.set_zoom(at, cx);
+                                            });
+                                        },
+                                    );
+                                }
+                                menu
+                            }))
+                        }
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1400,11 +2037,11 @@ impl PdfView {
     /// this a drag stops the moment it leaves the page -- which is where most
     /// drags end.
     fn follow_the_drag(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self
+        let dragging = self
             .selection
             .as_ref()
-            .is_some_and(|selection| selection.dragging)
-        {
+            .is_some_and(|selection| selection.dragging);
+        if !dragging && self.panning.is_none() {
             return None;
         }
         let view = cx.entity().downgrade();
@@ -1414,24 +2051,46 @@ impl PdfView {
                 move |_, _, window, _| {
                     let moving = view.clone();
                     window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                        if phase != gpui::DispatchPhase::Bubble
-                            || event.pressed_button != Some(MouseButton::Left)
-                        {
+                        if phase != gpui::DispatchPhase::Bubble {
                             return;
                         }
-                        moving
-                            .update(cx, |view, cx| view.keep_selecting(event, cx))
-                            .ok();
+                        match event.pressed_button {
+                            Some(MouseButton::Left) => {
+                                moving
+                                    .update(cx, |view, cx| view.keep_selecting(event, cx))
+                                    .ok();
+                            }
+                            // The middle button drags what is shown, the way a
+                            // hand on the page would.
+                            Some(MouseButton::Middle) => {
+                                moving
+                                    .update(cx, |view, cx| view.keep_panning(event, cx))
+                                    .ok();
+                            }
+                            _ => {}
+                        }
                     });
                     let letting_go = view;
                     window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-                        if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left
-                        {
+                        if phase != gpui::DispatchPhase::Bubble {
                             return;
                         }
-                        letting_go
-                            .update(cx, |view, cx| view.finish_selecting(event, cx))
-                            .ok();
+                        match event.button {
+                            MouseButton::Left => {
+                                letting_go
+                                    .update(cx, |view, cx| view.finish_selecting(event, cx))
+                                    .ok();
+                            }
+                            MouseButton::Middle => {
+                                letting_go
+                                    .update(cx, |view, cx| {
+                                        view.panning = None;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                            _ => {}
+                        }
                     });
                 },
             )
@@ -1441,6 +2100,19 @@ impl PdfView {
             .size_full()
             .into_any_element(),
         )
+    }
+
+    /// Drags what is shown under the pointer, which is what a hand on a page does.
+    fn keep_panning(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(was_at) = self.panning else {
+            return;
+        };
+        let moved = event.position - was_at;
+        self.panning = Some(event.position);
+        let at = self.scroll.offset();
+        self.scroll
+            .set_offset(point(at.x + moved.x, at.y + moved.y));
+        cx.notify();
     }
 
     /// What a reader reaches for rarely. Kept behind one button so the strip
@@ -1462,10 +2134,15 @@ impl PdfView {
                             let view = view.clone();
                             Some(ContextMenu::build(window, cx, move |menu, _, cx| {
                                 let one_at_a_time = view.read(cx).one_page_at_a_time;
+                                let at_night = view.read(cx).at_night;
+                                let two_across = view.read(cx).two_across;
                                 let find = view.clone();
                                 let fit_width = view.clone();
                                 let fit_page = view.clone();
                                 let one_page = view.clone();
+                                let book = view.clone();
+                                let night = view.clone();
+                                let present = view.clone();
                                 let onwards = view.clone();
                                 let backwards = view.clone();
                                 let turn = view.clone();
@@ -1508,6 +2185,33 @@ impl PdfView {
                                         });
                                     },
                                 )
+                                .toggleable_entry(
+                                    "Two pages across",
+                                    two_across,
+                                    ui::IconPosition::Start,
+                                    None,
+                                    move |_, cx| {
+                                        book.update(cx, |view, cx| {
+                                            let now = !view.two_across;
+                                            view.show_two_across(now, cx);
+                                        });
+                                    },
+                                )
+                                .toggleable_entry(
+                                    "Night mode",
+                                    at_night,
+                                    ui::IconPosition::Start,
+                                    None,
+                                    move |_, cx| {
+                                        night.update(cx, |view, cx| {
+                                            let now = !view.at_night;
+                                            view.read_at_night(now, cx);
+                                        });
+                                    },
+                                )
+                                .entry("Present as a slideshow", None, move |window, cx| {
+                                    present.update(cx, |view, cx| view.present(window, cx));
+                                })
                                 .separator()
                                 .entry("Next page", None, move |_, cx| {
                                     onwards.update(cx, |view, cx| view.step_page(1, cx));
@@ -1699,6 +2403,28 @@ impl PdfView {
             .border_color(ui::cyberpunk::border_dim())
             .child(div().flex_1().child(self.find_editor.clone()))
             .child(
+                IconButton::new("pdf-find-case", IconName::CaseSensitive)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(self.match_case)
+                    .tooltip(Tooltip::text("Mind the case"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.match_case = !view.match_case;
+                        view.look_again(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("pdf-find-words", IconName::WholeWord)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(self.whole_words)
+                    .tooltip(Tooltip::text("Whole words only"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.whole_words = !view.whole_words;
+                        view.look_again(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
                 IconButton::new("pdf-find-go", IconName::MagnifyingGlass)
                     .icon_size(IconSize::XSmall)
                     .tooltip(Tooltip::text("Find in document"))
@@ -1737,6 +2463,73 @@ impl PdfView {
 
     /// The rectangle being dragged, drawn inside the page it belongs to so it
     /// travels with the page rather than staying where the window was.
+    /// Marks every place the search found on this page, with the one the reader is
+    /// standing on marked more strongly. A search that shows only a count leaves
+    /// the reader hunting the page for the word themselves.
+    fn render_found_on(&self, page: usize) -> Option<AnyElement> {
+        if self.found.is_empty() {
+            return None;
+        }
+        let bounds = self.page_bounds.get(page)?.get();
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        let page_size = self.page_sizes.get(page)?;
+        if width <= 0. || height <= 0. || page_size.width <= 0. || page_size.height <= 0. {
+            return None;
+        }
+        let marks = self
+            .found
+            .iter()
+            .enumerate()
+            .filter(|(_, found)| found.page == page)
+            .map(|(at, found)| {
+                let corners = [
+                    point(
+                        found.left / page_size.width,
+                        1. - found.top / page_size.height,
+                    ),
+                    point(
+                        found.right / page_size.width,
+                        1. - found.bottom / page_size.height,
+                    ),
+                ]
+                .map(|at| as_it_is_painted(at, self.quarter_turns));
+                let from = point(
+                    corners[0].x.min(corners[1].x),
+                    corners[0].y.min(corners[1].y),
+                );
+                let to = point(
+                    corners[0].x.max(corners[1].x),
+                    corners[0].y.max(corners[1].y),
+                );
+                let standing_on = at == self.at_match;
+                div()
+                    .absolute()
+                    .left(px(from.x * width))
+                    .top(px(from.y * height))
+                    .w(px((to.x - from.x) * width))
+                    .h(px((to.y - from.y) * height))
+                    .bg(match standing_on {
+                        true => ui::cyberpunk::Accent::Red.border().opacity(0.45),
+                        false => ui::cyberpunk::Accent::Red.border().opacity(0.20),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if marks.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .size_full()
+                .children(marks)
+                .into_any_element(),
+        )
+    }
+
+    /// The mark over the text a drag covers: a band for each line of it. A box
+    /// around the whole drag would cover what is not selected and would not show
+    /// where a line ends.
     fn render_selection_on(&self, page: usize) -> Option<AnyElement> {
         let selection = self.selection.as_ref()?;
         if selection.page != page {
@@ -1748,24 +2541,71 @@ impl PdfView {
         if width <= 0. || height <= 0. {
             return None;
         }
-        let (left, top, right, bottom) = selection.corners();
+        let page_size = self.page_sizes.get(page)?;
+        if page_size.width <= 0. || page_size.height <= 0. {
+            return None;
+        }
+        let (_, covered) = self.selected_characters()?;
+        let characters = self.chars.get(&page)?;
+        let bands = bands_over(characters, covered);
+        if bands.is_empty() {
+            return None;
+        }
+        let marked = bands.into_iter().map(|(bottom, left, top, right)| {
+            // Page points to fractions of the page as laid out, then to fractions
+            // of the page as painted, then to where that lands on screen.
+            let corners = [
+                point(left / page_size.width, 1. - top / page_size.height),
+                point(right / page_size.width, 1. - bottom / page_size.height),
+            ]
+            .map(|at| as_it_is_painted(at, self.quarter_turns));
+            let from = point(
+                corners[0].x.min(corners[1].x),
+                corners[0].y.min(corners[1].y),
+            );
+            let to = point(
+                corners[0].x.max(corners[1].x),
+                corners[0].y.max(corners[1].y),
+            );
+            div()
+                .absolute()
+                .left(px(from.x * width))
+                .top(px(from.y * height))
+                .w(px((to.x - from.x) * width))
+                .h(px((to.y - from.y) * height))
+                .bg(ui::cyberpunk::Accent::Cyan.border().opacity(0.32))
+        });
         Some(
             div()
                 .absolute()
-                .left(px(left * width))
-                .top(px(top * height))
-                .w(px((right - left) * width))
-                .h(px((bottom - top) * height))
-                .bg(ui::cyberpunk::Accent::Cyan.border().opacity(0.18))
-                .border_1()
-                .border_color(ui::cyberpunk::Accent::Cyan.border())
+                .size_full()
+                .children(marked)
                 .into_any_element(),
         )
     }
 }
 
-/// A page's pixels as the window holds them. They already come back blue first,
-/// which is the order `RenderImage` is uploaded in.
+/// Lays a document's pages out two across, the way a book is read.
+fn in_rows_of_two(pages: Vec<AnyElement>) -> Vec<AnyElement> {
+    let mut rows = Vec::new();
+    let mut pages = pages.into_iter();
+    loop {
+        let left = pages.next();
+        let right = pages.next();
+        match (left, right) {
+            (None, _) => return rows,
+            (Some(left), right) => rows.push(
+                h_flex()
+                    .items_start()
+                    .gap_4()
+                    .child(left)
+                    .children(right)
+                    .into_any_element(),
+            ),
+        }
+    }
+}
+
 /// A file size the way a reader reads one.
 fn in_kilobytes(bytes: u64) -> String {
     match bytes {
@@ -1793,6 +2633,7 @@ impl Render for PdfView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Going by where things landed last time: the first frame of a document
         // shows frames, and the one after it has the pages the reader can see.
+        self.drawn_for_this_screen(window, cx);
         self.keep_the_fit(cx);
         if let Some(page) = self.bring_into_view {
             // Every page: until the whole column has been laid out the page
@@ -1808,7 +2649,10 @@ impl Render for PdfView {
             }
         }
         let wanted = self.pages_worth_rendering();
-        self.ask_for_pages(wanted, cx);
+        self.let_go_of_distant_pages(&wanted);
+        self.ask_for_pages(wanted.clone(), cx);
+        self.ask_for_chars(wanted.clone(), cx);
+        self.ask_for_links(wanted, cx);
         if self.sidebar == Sidebar::Thumbnails {
             let showing = self.page_in_view();
             let around = showing.saturating_sub(10)..(showing + 20).min(self.pages.len());
@@ -1835,6 +2679,7 @@ impl Render for PdfView {
                             .into_any_element(),
                         None => self.render_page_placeholder(index),
                     })
+                    .children(self.render_found_on(index))
                     .children(self.render_selection_on(index))
                     // Where this page ended up, recorded without taking any room:
                     // a position in the window means nothing until it can be told
@@ -1856,9 +2701,16 @@ impl Render for PdfView {
 
         let viewport = self.viewport.clone();
         let last_page = self.pages.len().saturating_sub(1);
+        let mut keys = gpui::KeyContext::new_with_defaults();
+        keys.add("PdfView");
+        if self.presenting {
+            // A slideshow is driven by plain keys -- space, the arrows, b and w --
+            // which would be typing anywhere else.
+            keys.add("presenting");
+        }
         v_flex()
             .id("pdf-view")
-            .key_context("PdfView")
+            .key_context(keys)
             .track_focus(&self.focus)
             .on_action(cx.listener(|view, _: &PdfZoomIn, _, cx| view.zoom_by(ZOOM_STEP, cx)))
             .on_action(cx.listener(|view, _: &PdfZoomOut, _, cx| view.zoom_by(-ZOOM_STEP, cx)))
@@ -1890,6 +2742,32 @@ impl Render for PdfView {
             .on_action(
                 cx.listener(|view, _: &PdfContents, _, cx| view.show_sidebar(Sidebar::Outline, cx)),
             )
+            .on_action(cx.listener(|view, _: &PdfOnePage, _, cx| {
+                let one_at_a_time = !view.one_page_at_a_time;
+                view.show_one_page_at_a_time(one_at_a_time, cx);
+            }))
+            .on_action(cx.listener(|view, _: &PdfNightMode, _, cx| {
+                let at_night = !view.at_night;
+                view.read_at_night(at_night, cx);
+            }))
+            .on_action(cx.listener(|view, _: &PdfTenPagesOn, _, cx| view.step_page(10, cx)))
+            .on_action(cx.listener(|view, _: &PdfTenPagesBack, _, cx| view.step_page(-10, cx)))
+            .on_action(
+                cx.listener(|view, _: &PdfPresent, window, cx| match view.presenting {
+                    true => view.stop_presenting(window, cx),
+                    false => view.present(window, cx),
+                }),
+            )
+            .on_action(cx.listener(|view, _: &PdfBlackScreen, _, cx| {
+                view.blank_the_screen(Blank::Black, cx)
+            }))
+            .on_action(cx.listener(|view, _: &PdfWhiteScreen, _, cx| {
+                view.blank_the_screen(Blank::White, cx)
+            }))
+            .on_action(cx.listener(|view, _: &PdfTwoAcross, _, cx| {
+                let two_across = !view.two_across;
+                view.show_two_across(two_across, cx);
+            }))
             .on_action(cx.listener(|view, _: &PdfGoToPage, window, cx| {
                 view.page_field.focus_handle(cx).focus(window, cx);
                 cx.notify();
@@ -1899,7 +2777,17 @@ impl Render for PdfView {
                 view.find_editor.focus_handle(cx).focus(window, cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|view, _: &::menu::Cancel, _, cx| {
+            .on_action(cx.listener(|view, _: &::menu::Cancel, window, cx| {
+                // A slideshow is what Escape leaves first: everything else it
+                // does can wait until the reader is back in the document.
+                if view.blanked.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+                if view.presenting {
+                    view.stop_presenting(window, cx);
+                    return;
+                }
                 view.dismiss_menu(cx);
                 view.clear_selection(cx);
                 if view.facts.take().is_some() {
@@ -1907,8 +2795,14 @@ impl Render for PdfView {
                 }
             }))
             .size_full()
-            .bg(ui::cyberpunk::surface())
-            .child(self.render_controls(window, cx))
+            .bg(match self.presenting {
+                true => gpui::black(),
+                false => ui::cyberpunk::surface(),
+            })
+            .children(match self.presenting {
+                true => None,
+                false => Some(self.render_controls(window, cx)),
+            })
             .child(
                 h_flex()
                     .flex_1()
@@ -1960,12 +2854,41 @@ impl Render for PdfView {
                                         }),
                                     )
                                     .on_mouse_down(
+                                        MouseButton::Middle,
+                                        cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                                            view.panning = Some(event.position);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(|view, event: &MouseDownEvent, window, cx| {
                                             view.open_menu(event, window, cx);
                                             cx.stop_propagation();
                                         }),
                                     )
+                                    // Held down, the wheel zooms rather than
+                                    // scrolls, as it does in every other reader.
+                                    .on_scroll_wheel(cx.listener(
+                                        |view, event: &gpui::ScrollWheelEvent, window, cx| {
+                                            if !event.modifiers.secondary() {
+                                                return;
+                                            }
+                                            let by =
+                                                event.delta.pixel_delta(window.line_height()).y;
+                                            if by == px(0.) {
+                                                return;
+                                            }
+                                            let step = match f32::from(by) > 0. {
+                                                true => ZOOM_STEP,
+                                                false => -ZOOM_STEP,
+                                            };
+                                            view.zoom_by(step, cx);
+                                            // Or the pages scroll under the zoom
+                                            // as well.
+                                            cx.stop_propagation();
+                                        },
+                                    ))
                                     .child(
                                         v_flex()
                                             .items_center()
@@ -1975,7 +2898,15 @@ impl Render for PdfView {
                                                     .color(Color::Error)
                                                     .into_any_element()
                                             }))
-                                            .children(pages),
+                                            .children(match self.asks_for_a_password {
+                                                true => vec![self.render_password_prompt(cx)],
+                                                // Two across, the way a book is
+                                                // read, or one under the other.
+                                                false => match self.two_across {
+                                                    true => in_rows_of_two(pages),
+                                                    false => pages,
+                                                },
+                                            }),
                                     )
                                     // Always shown rather than fading after a scroll: a
                                     // long document with no visible bar reads as one page.
@@ -1989,6 +2920,17 @@ impl Render for PdfView {
                     ),
             )
             .children(self.follow_the_drag(cx))
+            .children(self.blanked.map(|blank| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(match blank {
+                        Blank::Black => gpui::black(),
+                        Blank::White => gpui::white(),
+                    })
+            }))
             .children(self.render_properties(cx))
             .children(self.render_menu())
     }
@@ -2195,7 +3137,16 @@ mod tests {
     async fn stepping_through_what_was_found_comes_back_round(cx: &mut TestAppContext) {
         let view = a_reader_of(9, a_window_of(900., 600.), cx);
         view.update(cx, |view, _| {
-            view.found_on_pages = vec![1, 4, 7];
+            view.found = [1, 4, 7]
+                .into_iter()
+                .map(|page| Found {
+                    page,
+                    bottom: 700.,
+                    left: 100.,
+                    top: 712.,
+                    right: 160.,
+                })
+                .collect();
             view.searched_for = Some("something".into());
         });
 
@@ -2509,6 +3460,176 @@ mod tests {
         );
     }
 
+    /// Every key the reader offers has to reach something. An action named in the
+    /// keymap with no handler in the view is a key that quietly does nothing --
+    /// which is how `ctrl-alt-p` came to be advertised and ignored.
+    #[gpui::test]
+    async fn the_controls_sit_in_the_middle_of_the_strip(cx: &mut TestAppContext) {
+        a_working_editor(cx);
+        let window = cx.add_window(|window, cx| {
+            PdfView::open_path(PathBuf::from("/nowhere/document.pdf"), window, cx)
+        });
+        let view = window.root(cx).expect("the reader was built");
+        view.update(cx, |view, _| {
+            view.pages = vec![None; 6];
+            view.page_sizes = (0..6).map(|_| a4()).collect();
+            view.page_bounds = (0..6)
+                .map(|_| Rc::new(Cell::new(Bounds::default())))
+                .collect();
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        for width in [px(1600.), px(1200.), px(900.)] {
+            visual.simulate_resize(size(width, px(700.)));
+            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| window.draw(cx).clear());
+
+            let first = visual
+                .debug_bounds("pdf-thumbnails")
+                .expect("the first control was painted");
+            let last = visual
+                .debug_bounds("pdf-more")
+                .expect("the last control was painted");
+            let room_on_the_left = f32::from(first.origin.x);
+            let room_on_the_right = f32::from(width - (last.origin.x + last.size.width));
+            assert!(
+                (room_on_the_left - room_on_the_right).abs() < 4.,
+                "at a width of {width:?} the controls left {room_on_the_left} on the left \
+                 and {room_on_the_right} on the right"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn a_dense_screen_gets_a_page_drawn_at_its_own_size(cx: &mut TestAppContext) {
+        let view = a_reader_of(3, a_window_of(1000., 700.), cx);
+        let at_one_pixel = view.update(cx, |view, _| {
+            view.screen_pixels = 1.;
+            view.render_width()
+        });
+        let at_two_pixels = view.update(cx, |view, _| {
+            view.screen_pixels = 2.;
+            view.render_width()
+        });
+
+        assert_eq!(
+            at_two_pixels,
+            at_one_pixel * 2,
+            "a screen with two pixels to a laid-out one needs the page drawn twice \
+             as wide, or it is shown scaled up and reads as a blur"
+        );
+
+        // And never so wide that one page is tens of megabytes.
+        let at_a_deep_zoom = view.update(cx, |view, _| {
+            view.screen_pixels = 3.;
+            view.zoom = ZOOM_MAX;
+            view.render_width()
+        });
+        assert!(
+            at_a_deep_zoom as f32 <= MOST_PIXELS_ACROSS,
+            "a page drew {at_a_deep_zoom} pixels across, past the {MOST_PIXELS_ACROSS} cap"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_pages_far_from_the_reader_are_let_go_of(cx: &mut TestAppContext) {
+        let view = a_reader_of(40, a_window_of(1000., 700.), cx);
+        // As though every page had been drawn, which is what reading a long
+        // document from end to end would leave behind.
+        let held_at_first = view.update(cx, |view, _| {
+            for page in view.pages.iter_mut() {
+                *page = Some(Arc::new(RenderImage::new(smallvec::smallvec![
+                    image::Frame::new(image::RgbaImage::new(1, 1))
+                ])));
+            }
+            view.pages.iter().filter(|page| page.is_some()).count()
+        });
+        assert_eq!(held_at_first, 40);
+
+        let still_held = view.update(cx, |view, _| {
+            view.let_go_of_distant_pages(&(20..23));
+            view.pages.iter().filter(|page| page.is_some()).count()
+        });
+        assert!(
+            still_held <= 3 + PAGES_KEPT_EITHER_SIDE * 2,
+            "a reader at pages 20 to 23 still held {still_held} drawn pages"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.pages[21].is_some()),
+            "the page being read has to be one of the ones kept"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_hand_on_the_page_drags_what_is_shown(cx: &mut TestAppContext) {
+        use gpui::Modifiers;
+
+        let view = a_reader_of(5, a_window_of(1000., 700.), cx);
+        let moved = view.update(cx, |view, cx| {
+            view.scroll.set_offset(point(px(0.), px(-400.)));
+            view.panning = Some(point(px(500.), px(500.)));
+            view.keep_panning(
+                &MouseMoveEvent {
+                    position: point(px(500.), px(560.)),
+                    pressed_button: Some(MouseButton::Middle),
+                    modifiers: Modifiers::none(),
+                },
+                cx,
+            );
+            view.scroll.offset().y
+        });
+
+        assert_eq!(
+            moved,
+            px(-340.),
+            "dragging the page down by 60 has to bring what is above it into view"
+        );
+    }
+
+    #[gpui::test]
+    async fn every_key_the_keymap_offers_reaches_the_reader(cx: &mut TestAppContext) {
+        let keymap = include_str!("../../../assets/keymaps/default-linux.json");
+        let mut named: Vec<String> = keymap
+            .split("\"pdf::")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .map(|name| format!("pdf::{name}"))
+            .collect();
+        named.sort();
+        named.dedup();
+        assert!(
+            named.len() > 20,
+            "the keymap should offer the reader a good many keys, found {named:?}"
+        );
+
+        a_working_editor(cx);
+        let window = cx.add_window(|window, cx| {
+            PdfView::open_path(PathBuf::from("/nowhere/document.pdf"), window, cx)
+        });
+        let view = window.root(cx).expect("the reader was built");
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| window.focus(&view.focus, cx));
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+
+        let reachable: Vec<String> = visual.update(|window, cx| {
+            window
+                .available_actions(cx)
+                .into_iter()
+                .map(|action| action.name().to_string())
+                .collect()
+        });
+
+        let unreachable: Vec<&String> = named
+            .iter()
+            .filter(|name| !reachable.contains(name))
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "these keys are in the keymap but reach nothing: {unreachable:?}"
+        );
+    }
+
     #[gpui::test]
     async fn a_right_click_over_a_page_opens_the_menu(cx: &mut TestAppContext) {
         use gpui::Modifiers;
@@ -2662,43 +3783,150 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_selection_over_the_whole_page_covers_the_whole_page() {
-        let (bottom, left, top, right) = selection_over((0., 0.), (1., 1.)).on_page_points(&a4());
-
-        assert!((left - 0.).abs() < 0.01, "left edge, got {left}");
-        assert!((right - 595.).abs() < 0.01, "right edge, got {right}");
-        assert!((bottom - 0.).abs() < 0.01, "bottom edge, got {bottom}");
-        assert!((top - 842.).abs() < 0.01, "top edge, got {top}");
+    /// Three words on the first line, three on the second, laid out the way a
+    /// document does it: page points counting up from the bottom.
+    fn two_lines_of_text() -> Vec<pdf_engine::PageChar> {
+        let mut characters = Vec::new();
+        for (line, words) in [(800., "one two"), (760., "three four")] {
+            for (at, character) in words.chars().enumerate() {
+                let left = 100. + at as f32 * 10.;
+                characters.push(pdf_engine::PageChar {
+                    character,
+                    bottom: line,
+                    left,
+                    top: line + 12.,
+                    right: left + 9.,
+                });
+            }
+        }
+        characters
     }
 
-    // A page counts upwards from its bottom edge and a window downwards from its
-    // top, so a rectangle over the *top* of the page has to come back as the
-    // *higher* numbers. Getting this backwards returns text from the mirror image
-    // of what was selected, which nothing else would report.
-    #[test]
-    fn the_top_of_the_page_on_screen_is_the_top_of_the_page_in_points() {
-        let (bottom, _, top, _) = selection_over((0., 0.), (1., 0.25)).on_page_points(&a4());
+    /// Where the middle of the character at `index` is, as a fraction of the page
+    /// from its top left -- which is what a pointer over it would give.
+    fn over_character(characters: &[pdf_engine::PageChar], index: usize) -> Point<f32> {
+        let character = &characters[index];
+        point(
+            ((character.left + character.right) / 2.) / a4().width,
+            1. - ((character.bottom + character.top) / 2.) / a4().height,
+        )
+    }
 
-        assert!(
-            (top - 842.).abs() < 0.01,
-            "the top stays the top, got {top}"
-        );
-        assert!(
-            (bottom - 631.5).abs() < 0.5,
-            "a quarter down the page, got {bottom}"
+    #[gpui::test]
+    async fn a_drag_over_words_marks_the_words_it_covers(cx: &mut TestAppContext) {
+        let characters = two_lines_of_text();
+        let view = a_reader_of(1, a_window_of(1000., 700.), cx);
+        view.update(cx, |view, _| {
+            view.chars.insert(0, Rc::new(two_lines_of_text()));
+            view.selection = Some(Selection {
+                page: 0,
+                from: over_character(&characters, 0),
+                to: over_character(&characters, 2),
+                dragging: false,
+            });
+        });
+
+        let (page, covered) = view
+            .read_with(cx, |view, _| view.selected_characters())
+            .expect("a drag over text covers characters");
+        assert_eq!(page, 0);
+        assert_eq!(covered, 0..3, "from the first character to the third");
+
+        let copied = view.update(cx, |view, cx| {
+            view.read_the_selected_text(cx);
+            view.selected_text.clone()
+        });
+        assert_eq!(
+            copied.map(|text| text.to_string()),
+            Some("one".to_string()),
+            "what is copied has to be the characters the drag went over"
         );
     }
 
-    #[test]
-    fn a_selection_drawn_upwards_reads_the_same_as_one_drawn_downwards() {
-        let downwards = selection_over((0.2, 0.3), (0.6, 0.7)).on_page_points(&a4());
-        let upwards = selection_over((0.6, 0.7), (0.2, 0.3)).on_page_points(&a4());
+    #[gpui::test]
+    async fn a_drag_across_lines_is_marked_a_line_at_a_time(cx: &mut TestAppContext) {
+        let characters = two_lines_of_text();
+        let view = a_reader_of(1, a_window_of(1000., 700.), cx);
+        view.update(cx, |view, _| {
+            view.chars.insert(0, Rc::new(two_lines_of_text()));
+            view.selection = Some(Selection {
+                page: 0,
+                from: over_character(&characters, 1),
+                to: over_character(&characters, characters.len() - 2),
+                dragging: false,
+            });
+        });
+
+        let (_, covered) = view
+            .read_with(cx, |view, _| view.selected_characters())
+            .expect("the drag covers characters");
+        let bands = bands_over(&characters, covered);
+        assert_eq!(
+            bands.len(),
+            2,
+            "two lines are two bands, not one box around both: got {bands:?}"
+        );
+        assert!(
+            bands[0].0 > bands[1].0,
+            "the first band is the higher line: {bands:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn which_way_the_pointer_travelled_makes_no_difference(cx: &mut TestAppContext) {
+        let characters = two_lines_of_text();
+        let view = a_reader_of(1, a_window_of(1000., 700.), cx);
+        view.update(cx, |view, _| {
+            view.chars.insert(0, Rc::new(two_lines_of_text()));
+        });
+
+        let covered_both_ways: Vec<_> = [(1, 9), (9, 1)]
+            .into_iter()
+            .map(|(from, to)| {
+                view.update(cx, |view, _| {
+                    view.selection = Some(Selection {
+                        page: 0,
+                        from: over_character(&characters, from),
+                        to: over_character(&characters, to),
+                        dragging: false,
+                    });
+                });
+                view.read_with(cx, |view, _| view.selected_characters())
+                    .expect("the drag covers characters")
+                    .1
+            })
+            .collect();
 
         assert_eq!(
-            downwards, upwards,
-            "which way the pointer travelled must not change what is read"
+            covered_both_ways[0], covered_both_ways[1],
+            "dragging up must mark what dragging down marks"
         );
+    }
+
+    #[test]
+    fn a_turned_page_maps_a_point_back_to_where_the_document_holds_it() {
+        for quarter_turns in 0..4 {
+            for at in [
+                point(0., 0.),
+                point(1., 0.),
+                point(0.25, 0.8),
+                point(0.9, 0.1),
+            ] {
+                let there_and_back = as_it_is_painted(
+                    as_the_document_lays_it_out(at, quarter_turns),
+                    quarter_turns,
+                );
+                assert!(
+                    (there_and_back.x - at.x).abs() < 0.001
+                        && (there_and_back.y - at.y).abs() < 0.001,
+                    "at {quarter_turns} quarter turns {at:?} came back as {there_and_back:?}"
+                );
+            }
+        }
+        // And a turn really does move the point, or the mapping is doing nothing.
+        let upright = as_the_document_lays_it_out(point(0.1, 0.2), 0);
+        let turned = as_the_document_lays_it_out(point(0.1, 0.2), 1);
+        assert_ne!((upright.x, upright.y), (turned.x, turned.y));
     }
 
     #[test]

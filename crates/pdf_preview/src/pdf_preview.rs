@@ -54,7 +54,21 @@ actions!(
         /// Shows or hides the document's own contents.
         PdfContents,
         /// Reads one page at a time rather than a column of them.
-        PdfOnePage
+        PdfOnePage,
+        /// Shows the pages with their colours turned over.
+        PdfNightMode,
+        /// Moves ten pages on.
+        PdfTenPagesOn,
+        /// Moves ten pages back.
+        PdfTenPagesBack,
+        /// Shows the document as a slideshow, filling the screen.
+        PdfPresent,
+        /// Blanks the slideshow to black, to take the room's attention.
+        PdfBlackScreen,
+        /// Blanks the slideshow to white.
+        PdfWhiteScreen,
+        /// Shows the pages two across, as a book is read.
+        PdfTwoAcross
     ]
 );
 

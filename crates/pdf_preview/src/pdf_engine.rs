@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -116,6 +117,38 @@ fn bind() -> Result<Pdfium> {
     ))
 }
 
+/// Passwords the reader has given for documents that ask for one. Kept here so
+/// that every way of reading a document has it without carrying it through a
+/// dozen signatures, and so that it stays in this one place: it is never logged
+/// and never leaves the module.
+static PASSWORDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+/// Keeps the password for a document, for as long as the editor runs.
+pub fn remember_password(path: &Path, password: &str) {
+    let held = PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut held) = held.lock() {
+        held.insert(path.to_path_buf(), password.to_string());
+    }
+}
+
+fn password_for(path: &Path) -> Option<String> {
+    PASSWORDS
+        .get()?
+        .lock()
+        .ok()?
+        .get(path)
+        .map(|password| password.to_string())
+}
+
+/// Opens the document at `path`, with whatever password the reader has given for
+/// it. Every reading of a document goes through here.
+fn document_at<'a>(engine: &'a Pdfium, path: &Path) -> Result<PdfDocument<'a>> {
+    let password = password_for(path);
+    engine
+        .load_pdf_from_file(path, password.as_deref())
+        .with_context(|| format!("opening {}", path.display()))
+}
+
 /// One page of a document, rendered at a chosen width.
 pub struct RenderedPage {
     pub width: u32,
@@ -131,11 +164,10 @@ pub fn render_page(
     page_index: PdfPageIndex,
     width: u32,
     quarter_turns: u8,
+    at_night: bool,
 ) -> Result<RenderedPage> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         let page = document
             .pages()
             .get(page_index)
@@ -153,10 +185,17 @@ pub fn render_page(
             .into_rgba8();
         let (width, height) = (image.width(), image.height());
 
-        // RGBA out of the engine, BGRA into the editor.
+        // RGBA out of the engine, BGRA into the editor. At night the colours are
+        // turned over here as well: the editor paints a page as a picture, and a
+        // picture has no colours to restyle later.
         let mut pixels = image.into_raw();
         for pixel in pixels.chunks_exact_mut(4) {
             pixel.swap(0, 2);
+            if at_night {
+                pixel[0] = 255 - pixel[0];
+                pixel[1] = 255 - pixel[1];
+                pixel[2] = 255 - pixel[2];
+            }
         }
 
         Ok(RenderedPage {
@@ -180,14 +219,163 @@ fn rotation_of(quarter_turns: u8) -> PdfPageRenderRotation {
 /// The whole text of a page, for copying or searching.
 pub fn page_text(path: &Path, page_index: PdfPageIndex) -> Result<String> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         let page = document
             .pages()
             .get(page_index)
             .with_context(|| format!("page {page_index} of {}", path.display()))?;
         Ok(page.text().context("reading the page's text")?.all())
+    })
+}
+
+/// One character of a page, where it sits and what it is. Positions are in the
+/// points a PDF is laid out in, with the origin at the bottom left.
+///
+/// The whole page's worth is read at once and kept, because selecting text means
+/// asking "which character is under the pointer" on every mouse move, and asking
+/// the engine that would mean waiting on its lock a hundred times a second.
+pub struct PageChar {
+    pub character: char,
+    pub bottom: f32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+}
+
+pub fn page_chars(path: &Path, page_index: PdfPageIndex) -> Result<Vec<PageChar>> {
+    with_engine(|engine| {
+        let document = document_at(engine, path)?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
+        let text = page.text().context("reading the page's text")?;
+        let mut characters = Vec::new();
+        for character in text.chars().iter() {
+            let Some(unicode) = character.unicode_char() else {
+                continue;
+            };
+            // A character the engine knows nothing about the shape of cannot be
+            // pointed at, and a space has no shape worth marking.
+            let Ok(bounds) = character.loose_bounds() else {
+                continue;
+            };
+            characters.push(PageChar {
+                character: unicode,
+                bottom: bounds.bottom().value,
+                left: bounds.left().value,
+                top: bounds.top().value,
+                right: bounds.right().value,
+            });
+        }
+        Ok(characters)
+    })
+}
+
+/// Where a link sits on a page and where it leads.
+pub struct PageLink {
+    pub bottom: f32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub leads: LinkTarget,
+}
+
+pub enum LinkTarget {
+    /// Another page of this document.
+    Page(usize),
+    /// Somewhere else entirely.
+    Address(String),
+}
+
+/// The links of a page, so a click on one can be followed.
+pub fn page_links(path: &Path, page_index: PdfPageIndex) -> Result<Vec<PageLink>> {
+    with_engine(|engine| {
+        let document = document_at(engine, path)?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
+        let mut links = Vec::new();
+        for link in page.links().iter() {
+            let Ok(rect) = link.rect() else {
+                continue;
+            };
+            // Where it leads: another page of this document, or an address. A link
+            // to a file or an embedded document is left alone -- following it would
+            // mean opening something the reader has not asked for.
+            let leads = match link.action() {
+                Some(PdfAction::Uri(uri)) => match uri.uri() {
+                    Ok(address) => LinkTarget::Address(address),
+                    Err(_) => continue,
+                },
+                _ => match link
+                    .destination()
+                    .and_then(|destination| destination.page_index().ok())
+                {
+                    Some(page) => LinkTarget::Page(page as usize),
+                    None => continue,
+                },
+            };
+            links.push(PageLink {
+                bottom: rect.bottom().value,
+                left: rect.left().value,
+                top: rect.top().value,
+                right: rect.right().value,
+                leads,
+            });
+        }
+        Ok(links)
+    })
+}
+
+/// Whether the document at `path` will not open without a password.
+pub fn needs_a_password(path: &Path) -> bool {
+    with_engine(|engine| {
+        let password = password_for(path);
+        Ok(matches!(
+            engine.load_pdf_from_file(path, password.as_deref()),
+            Err(PdfiumError::PdfiumLibraryInternalError(
+                PdfiumInternalError::PasswordError
+            ))
+        ))
+    })
+    .unwrap_or(false)
+}
+
+/// Where a word was found on a page, in page points: one rectangle for each run
+/// of it that sits on its own line.
+pub fn places_found_on_page(
+    path: &Path,
+    page_index: PdfPageIndex,
+    needle: &str,
+    match_case: bool,
+    whole_words: bool,
+) -> Result<Vec<(f32, f32, f32, f32)>> {
+    with_engine(|engine| {
+        let document = document_at(engine, path)?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
+        let text = page.text().context("reading the page's text")?;
+        let options = PdfSearchOptions::new()
+            .match_case(match_case)
+            .match_whole_word(whole_words);
+        let mut places = Vec::new();
+        let search = text.search(needle, &options)?;
+        for segments in search.iter(PdfSearchDirection::SearchForward) {
+            for segment in segments.iter() {
+                let bounds = segment.bounds();
+                places.push((
+                    bounds.bottom().value,
+                    bounds.left().value,
+                    bounds.top().value,
+                    bounds.right().value,
+                ));
+            }
+        }
+        Ok(places)
     })
 }
 
@@ -201,9 +389,7 @@ pub struct PageSize {
 /// The size of every page, in order.
 pub fn page_sizes(path: &Path) -> Result<Vec<PageSize>> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         Ok(document
             .pages()
             .iter()
@@ -226,9 +412,7 @@ pub fn text_in_rect(
     right: f32,
 ) -> Result<String> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         let page = document
             .pages()
             .get(page_index)
@@ -250,9 +434,7 @@ pub struct Facts {
 
 pub fn facts(path: &Path) -> Result<Facts> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         let metadata = document.metadata();
         let tag = |which: PdfDocumentMetadataTagType| {
             metadata
@@ -287,9 +469,7 @@ pub struct OutlineEntry {
 /// it.
 pub fn outline(path: &Path) -> Result<Vec<OutlineEntry>> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         let mut lines = Vec::new();
         for bookmark in document.bookmarks().iter() {
             let Some(title) = bookmark.title().filter(|title| !title.trim().is_empty()) else {
@@ -323,9 +503,7 @@ pub fn outline(path: &Path) -> Result<Vec<OutlineEntry>> {
 /// How many pages the document at `path` holds.
 pub fn page_count(path: &Path) -> Result<PdfPageIndex> {
     with_engine(|engine| {
-        let document = engine
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let document = document_at(engine, path)?;
         Ok(document.pages().len())
     })
 }
@@ -414,13 +592,12 @@ mod tests {
                     threads.spawn(move || {
                         for round in 0..15 {
                             let asked_for = 80 + ((at * 15 + round) % 40) * 5;
-                            let drawn = match render_page(&written, 0, asked_for, 0) {
+                            let drawn = match render_page(&written, 0, asked_for, 0, false) {
                                 Ok(drawn) => drawn,
                                 Err(_) => return false,
                             };
                             if drawn.width != asked_for
-                                || drawn.pixels.len()
-                                    != (drawn.width * drawn.height * 4) as usize
+                                || drawn.pixels.len() != (drawn.width * drawn.height * 4) as usize
                             {
                                 return false;
                             }
