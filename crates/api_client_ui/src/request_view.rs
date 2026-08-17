@@ -237,6 +237,51 @@ fn json_body_is_invalid(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(trimmed).is_err()
 }
 
+gpui::actions!(
+    api_client,
+    [
+        /// Moves to the next cell of a params or headers table.
+        NextCell,
+        /// Moves to the previous cell of a params or headers table.
+        PreviousCell
+    ]
+);
+
+/// The descriptions the rows hold now, by the key they belong to. The Bulk Edit
+/// text form has only two columns, so a description would otherwise be thrown
+/// away by a trip through it -- and a reader who went in to fix one value would
+/// come back out having lost every note they had written.
+fn descriptions_by_key(rows: &[KeyValueRow], cx: &App) -> Vec<(String, String)> {
+    rows.iter()
+        .filter_map(|row| {
+            let description = row.description_editor.read(cx).text(cx);
+            match description.is_empty() {
+                true => None,
+                false => Some((row.key_editor.read(cx).text(cx), description)),
+            }
+        })
+        .collect()
+}
+
+/// Takes the description that belonged to `key`, so two rows with the same key
+/// each get their own rather than sharing the first one.
+fn take_description_of(kept: &mut Vec<(String, String)>, key: &str) -> String {
+    match kept.iter().position(|(theirs, _)| theirs == key) {
+        Some(at) => kept.remove(at).1,
+        None => String::new(),
+    }
+}
+
+/// What an editor says, or nothing at all when it says nothing -- a blank
+/// description is an absent description, not an empty string in the file.
+fn written_or_nothing(editor: &Entity<Editor>, cx: &App) -> Option<String> {
+    let text = editor.read(cx).text(cx);
+    match text.is_empty() {
+        true => None,
+        false => Some(text),
+    }
+}
+
 fn new_single_line_editor(
     placeholder: &'static str,
     initial_value: &str,
@@ -256,7 +301,58 @@ fn new_single_line_editor(
 struct KeyValueRow {
     key_editor: Entity<Editor>,
     value_editor: Entity<Editor>,
+    description_editor: Entity<Editor>,
     enabled: bool,
+}
+
+impl KeyValueRow {
+    /// A row nobody has written anything into. The table always keeps one of
+    /// these at the end to type the next row into, and it is not part of the
+    /// request until it says something.
+    /// Nothing at all was typed into it. Deliberately not `trim`: a cell holding a
+    /// space is a cell somebody typed in, and a row must never disappear because
+    /// what it holds looks like nothing.
+    fn is_blank(&self, cx: &App) -> bool {
+        self.key_editor.read(cx).text(cx).is_empty()
+            && self.value_editor.read(cx).text(cx).is_empty()
+            && self.description_editor.read(cx).text(cx).is_empty()
+    }
+
+    fn cell(&self, column: Column) -> &Entity<Editor> {
+        match column {
+            Column::Key => &self.key_editor,
+            Column::Value => &self.value_editor,
+            Column::Description => &self.description_editor,
+        }
+    }
+}
+
+/// The three columns of a params/headers table, in the order they are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Column {
+    Key,
+    Value,
+    Description,
+}
+
+impl Column {
+    const ALL: [Column; 3] = [Column::Key, Column::Value, Column::Description];
+
+    fn label(self) -> &'static str {
+        match self {
+            Column::Key => "Key",
+            Column::Value => "Value",
+            Column::Description => "Description",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Column::Key => "key",
+            Column::Value => "value",
+            Column::Description => "description",
+        }
+    }
 }
 
 /// Parses Postman-style Bulk Edit text, one row per line: `key: value` is an
@@ -295,6 +391,9 @@ fn parse_bulk_key_value_text(text: &str) -> Vec<(String, String, bool)> {
 /// being mistaken for the disabled-row marker.
 fn key_value_rows_to_bulk_text(rows: &[KeyValueRow], cx: &App) -> String {
     rows.iter()
+        // The row waiting to be typed into stands for nothing yet, and a `: ` line
+        // in the text form is how it would show up.
+        .filter(|row| !row.is_blank(cx))
         .map(|row| {
             let key = row.key_editor.read(cx).text(cx);
             let key = if key.starts_with("//") {
@@ -771,6 +870,7 @@ impl RequestView {
             this.push_param_row(
                 param.key.clone(),
                 param.value.clone(),
+                param.description.clone().unwrap_or_default(),
                 param.enabled,
                 window,
                 cx,
@@ -780,6 +880,7 @@ impl RequestView {
             this.push_header_row(
                 header.key.clone(),
                 header.value.clone(),
+                header.description.clone().unwrap_or_default(),
                 header.enabled,
                 window,
                 cx,
@@ -1009,50 +1110,107 @@ impl RequestView {
         &mut self,
         key: String,
         value: String,
+        description: String,
         enabled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key_editor = new_single_line_editor("Key", &key, window, cx);
-        let value_editor = new_single_line_editor("Value", &value, window, cx);
-        self.watch_editor(key_editor.clone(), window, cx, |this, _, cx| {
-            this.persist_params(cx);
-        });
-        self.watch_editor(value_editor.clone(), window, cx, |this, _, cx| {
-            this.persist_params(cx);
-        });
-        self.param_rows.push(KeyValueRow {
-            key_editor,
-            value_editor,
-            enabled,
-        });
+        let row = self.new_row("Key", key, value, description, enabled, window, cx);
+        for column in Column::ALL {
+            let editor = row.cell(column).clone();
+            self.watch_editor(editor, window, cx, |this, _, cx| {
+                this.persist_params(cx);
+            });
+        }
+        self.param_rows.push(row);
     }
 
     fn push_header_row(
         &mut self,
         key: String,
         value: String,
+        description: String,
         enabled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key_editor = new_single_line_editor("Header", &key, window, cx);
-        let value_editor = new_single_line_editor("Value", &value, window, cx);
-        self.watch_editor(key_editor.clone(), window, cx, |this, _, cx| {
-            this.persist_headers(cx);
-        });
-        self.watch_editor(value_editor.clone(), window, cx, |this, _, cx| {
-            this.persist_headers(cx);
-        });
-        self.header_rows.push(KeyValueRow {
-            key_editor,
-            value_editor,
-            enabled,
-        });
+        let row = self.new_row("Header", key, value, description, enabled, window, cx);
+        for column in Column::ALL {
+            let editor = row.cell(column).clone();
+            self.watch_editor(editor, window, cx, |this, _, cx| {
+                this.persist_headers(cx);
+            });
+        }
+        self.header_rows.push(row);
     }
 
+    fn new_row(
+        &mut self,
+        key_placeholder: &'static str,
+        key: String,
+        value: String,
+        description: String,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> KeyValueRow {
+        KeyValueRow {
+            key_editor: new_single_line_editor(key_placeholder, &key, window, cx),
+            value_editor: new_single_line_editor("Value", &value, window, cx),
+            description_editor: new_single_line_editor("Description", &description, window, cx),
+            enabled,
+        }
+    }
+
+    /// Keeps exactly one blank row at the end of both tables, which is the row the
+    /// next line is typed into -- the way a spreadsheet always has one more row
+    /// than it has content.
+    fn keep_a_row_to_type_into(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let params_need_one = self
+            .param_rows
+            .last()
+            .map(|row| !row.is_blank(cx))
+            .unwrap_or(true);
+        if params_need_one {
+            self.push_param_row(
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+                window,
+                cx,
+            );
+        }
+        let headers_need_one = self
+            .header_rows
+            .last()
+            .map(|row| !row.is_blank(cx))
+            .unwrap_or(true);
+        if headers_need_one {
+            self.push_header_row(
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Adds a blank row. The reader adds rows by typing into the blank one the
+    /// table keeps at its end; this is how a test seeds several rows at once
+    /// without typing into each of them.
+    #[cfg(test)]
     fn add_param_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.push_param_row(String::new(), String::new(), true, window, cx);
+        self.push_param_row(
+            String::new(),
+            String::new(),
+            String::new(),
+            true,
+            window,
+            cx,
+        );
         self.persist_params(cx);
         cx.notify();
     }
@@ -1073,8 +1231,16 @@ impl RequestView {
         }
     }
 
+    #[cfg(test)]
     fn add_header_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.push_header_row(String::new(), String::new(), true, window, cx);
+        self.push_header_row(
+            String::new(),
+            String::new(),
+            String::new(),
+            true,
+            window,
+            cx,
+        );
         self.persist_headers(cx);
         cx.notify();
     }
@@ -1099,11 +1265,12 @@ impl RequestView {
         let params: Vec<QueryParam> = self
             .param_rows
             .iter()
+            .filter(|row| !row.is_blank(cx))
             .map(|row| QueryParam {
                 key: row.key_editor.read(cx).text(cx),
                 value: row.value_editor.read(cx).text(cx),
                 enabled: row.enabled,
-                description: None,
+                description: written_or_nothing(&row.description_editor, cx),
             })
             .collect();
         let request_id = self.request_id;
@@ -1116,11 +1283,12 @@ impl RequestView {
         let headers: Vec<Header> = self
             .header_rows
             .iter()
+            .filter(|row| !row.is_blank(cx))
             .map(|row| Header {
                 key: row.key_editor.read(cx).text(cx),
                 value: row.value_editor.read(cx).text(cx),
                 enabled: row.enabled,
-                description: None,
+                description: written_or_nothing(&row.description_editor, cx),
             })
             .collect();
         let request_id = self.request_id;
@@ -1131,13 +1299,20 @@ impl RequestView {
 
     fn persist_params_from_bulk_text(&self, cx: &mut Context<Self>) {
         let text = self.param_bulk_editor.read(cx).text(cx);
+        let mut kept = descriptions_by_key(&self.param_rows, cx);
         let params: Vec<QueryParam> = parse_bulk_key_value_text(&text)
             .into_iter()
-            .map(|(key, value, enabled)| QueryParam {
-                key,
-                value,
-                enabled,
-                description: None,
+            .map(|(key, value, enabled)| {
+                let description = take_description_of(&mut kept, &key);
+                QueryParam {
+                    key,
+                    value,
+                    enabled,
+                    description: match description.is_empty() {
+                        true => None,
+                        false => Some(description),
+                    },
+                }
             })
             .collect();
         let request_id = self.request_id;
@@ -1148,13 +1323,20 @@ impl RequestView {
 
     fn persist_headers_from_bulk_text(&self, cx: &mut Context<Self>) {
         let text = self.header_bulk_editor.read(cx).text(cx);
+        let mut kept = descriptions_by_key(&self.header_rows, cx);
         let headers: Vec<Header> = parse_bulk_key_value_text(&text)
             .into_iter()
-            .map(|(key, value, enabled)| Header {
-                key,
-                value,
-                enabled,
-                description: None,
+            .map(|(key, value, enabled)| {
+                let description = take_description_of(&mut kept, &key);
+                Header {
+                    key,
+                    value,
+                    enabled,
+                    description: match description.is_empty() {
+                        true => None,
+                        false => Some(description),
+                    },
+                }
             })
             .collect();
         let request_id = self.request_id;
@@ -1172,9 +1354,11 @@ impl RequestView {
     fn toggle_params_bulk_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.params_bulk_edit {
             let text = self.param_bulk_editor.read(cx).text(cx);
+            let mut kept = descriptions_by_key(&self.param_rows, cx);
             self.param_rows.clear();
             for (key, value, enabled) in parse_bulk_key_value_text(&text) {
-                self.push_param_row(key, value, enabled, window, cx);
+                let description = take_description_of(&mut kept, &key);
+                self.push_param_row(key, value, description, enabled, window, cx);
             }
             self.persist_params(cx);
         } else {
@@ -1190,9 +1374,11 @@ impl RequestView {
     fn toggle_headers_bulk_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.headers_bulk_edit {
             let text = self.header_bulk_editor.read(cx).text(cx);
+            let mut kept = descriptions_by_key(&self.header_rows, cx);
             self.header_rows.clear();
             for (key, value, enabled) in parse_bulk_key_value_text(&text) {
-                self.push_header_row(key, value, enabled, window, cx);
+                let description = take_description_of(&mut kept, &key);
+                self.push_header_row(key, value, description, enabled, window, cx);
             }
             self.persist_headers(cx);
         } else {
@@ -1409,7 +1595,14 @@ impl RequestView {
                 });
             }
             None => {
-                self.push_header_row("Content-Type".into(), value.into(), true, window, cx);
+                self.push_header_row(
+                    "Content-Type".into(),
+                    value.into(),
+                    String::new(),
+                    true,
+                    window,
+                    cx,
+                );
             }
         }
         self.persist_headers(cx);
@@ -2850,88 +3043,174 @@ impl RequestView {
             .into_any_element()
     }
 
+    /// Params and headers as a table with lines, the way a spreadsheet shows rows:
+    /// a heading over each column, one row a line, and a blank row at the end to
+    /// type the next one into. Cells share their borders, so the table reads as a
+    /// grid rather than as a stack of separate boxes.
     fn render_key_value_rows(
         rows: &[KeyValueRow],
-        add_label: &'static str,
-        on_add: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        which: &'static str,
         on_toggle: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         on_remove: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static + Clone,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let mut list = v_flex().gap_2();
+        let last = rows.len().saturating_sub(1);
+        let mut table = v_flex()
+            .id(SharedString::from(format!("{which}-table")))
+            .debug_selector(move || format!("{which}-table"))
+            .key_context("ApiClientKeyValueTable")
+            .w_full()
+            .border_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .bg(colors.title_bar_background)
+                    .child(div().w(px(26.)).flex_none())
+                    .children(Column::ALL.map(|column| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_color(colors.border)
+                            .debug_selector(move || format!("{which}-heading-{}", column.name()))
+                            .child(
+                                Label::new(column.label())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                    }))
+                    .child(div().w(px(26.)).flex_none()),
+            );
+
         for (index, row) in rows.iter().enumerate() {
             let on_toggle = on_toggle.clone();
             let on_remove = on_remove.clone();
-            list = list.child(
+            let waiting_to_be_typed_into = index == last;
+            table = table.child(
                 h_flex()
-                    .id(SharedString::from(format!("kv-row-{index}")))
-                    .gap_2()
-                    .items_center()
+                    .id(SharedString::from(format!("{which}-row-{index}")))
+                    .debug_selector(move || format!("{which}-row-{index}"))
+                    .w_full()
+                    .items_stretch()
+                    .border_t_1()
+                    .border_color(colors.border)
                     .child(
                         div()
-                            .id(SharedString::from(format!("kv-row-toggle-{index}")))
-                            .cursor_pointer()
-                            .child(
-                                Icon::new(if row.enabled {
-                                    IconName::Check
-                                } else {
-                                    IconName::Close
-                                })
-                                .size(IconSize::Small),
-                            )
-                            .on_click(
-                                cx.listener(move |this, _, _window, cx| on_toggle(this, index, cx)),
-                            ),
+                            .id(SharedString::from(format!("{which}-toggle-{index}")))
+                            .w(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            // The blank row stands for nothing yet, so there is
+                            // nothing to switch off or throw away in it.
+                            .when(!waiting_to_be_typed_into, |cell| {
+                                cell.debug_selector(move || format!("{which}-toggle-{index}"))
+                                    .cursor_pointer()
+                                    .child(
+                                        Icon::new(match row.enabled {
+                                            true => IconName::Check,
+                                            false => IconName::Close,
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(match row
+                                            .enabled
+                                        {
+                                            true => Color::Accent,
+                                            false => Color::Muted,
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        on_toggle(this, index, cx)
+                                    }))
+                            }),
                     )
-                    .child(
+                    .children(Column::ALL.map(|column| {
                         div()
                             .flex_1()
+                            .min_w_0()
                             .px_2()
                             .py_1()
-                            .rounded_md()
-                            .border_1()
+                            .border_l_1()
                             .border_color(colors.border)
-                            .bg(colors.background)
-                            .child(row.key_editor.clone()),
-                    )
+                            .debug_selector(move || {
+                                format!("{which}-cell-{index}-{}", column.name())
+                            })
+                            .child(row.cell(column).clone())
+                    }))
                     .child(
                         div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.background)
-                            .child(row.value_editor.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("kv-row-remove-{index}")))
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::Trash).size(IconSize::Small))
-                            .on_click(
-                                cx.listener(move |this, _, _window, cx| on_remove(this, index, cx)),
-                            ),
+                            .id(SharedString::from(format!("{which}-remove-{index}")))
+                            .w(px(26.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!waiting_to_be_typed_into, |cell| {
+                                cell.debug_selector(move || format!("{which}-remove-{index}"))
+                                    .cursor_pointer()
+                                    .child(
+                                        Icon::new(IconName::Trash)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        on_remove(this, index, cx)
+                                    }))
+                            }),
                     ),
             );
         }
-        list.child(
-            div()
-                .id("kv-row-add")
-                .debug_selector(|| "kv-row-add".to_string())
-                .cursor_pointer()
-                .child(
-                    Label::new(add_label)
-                        .size(LabelSize::Small)
-                        .color(Color::Accent),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| on_add(this, window, cx))),
-        )
+        table
+    }
+
+    /// Moves the writing point to the next cell, and from the last cell of a row
+    /// to the first cell of the row below -- what a table does everywhere else.
+    fn step_through_the_cells(
+        &mut self,
+        forwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows: &[KeyValueRow] = match self.active_tab {
+            RequestTab::Params => &self.param_rows,
+            RequestTab::Headers => &self.header_rows,
+            _ => return,
+        };
+        let mut cells: Vec<Entity<Editor>> = Vec::with_capacity(rows.len() * Column::ALL.len());
+        for row in rows {
+            for column in Column::ALL {
+                cells.push(row.cell(column).clone());
+            }
+        }
+        let Some(at) = cells.iter().position(|editor| {
+            editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        }) else {
+            return;
+        };
+        let next = match forwards {
+            true => (at + 1) % cells.len(),
+            false => (at + cells.len() - 1) % cells.len(),
+        };
+        let handle = cells[next].read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
     }
 
     fn render_tab_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // A spreadsheet always has one more row than it has content, and that is
+        // where the next row is typed. Kept up to date here, since this is where
+        // the tables are about to be drawn.
+        if matches!(self.active_tab, RequestTab::Params | RequestTab::Headers) {
+            self.keep_a_row_to_type_into(window, cx);
+        }
         match self.active_tab {
             RequestTab::Params => {
                 let toggle = Self::render_bulk_edit_toggle(
@@ -2950,8 +3229,7 @@ impl RequestView {
                 } else {
                     Self::render_key_value_rows(
                         &self.param_rows,
-                        "Add Param",
-                        Self::add_param_row,
+                        "params",
                         Self::toggle_param_row,
                         Self::remove_param_row,
                         cx,
@@ -2981,8 +3259,7 @@ impl RequestView {
                 } else {
                     Self::render_key_value_rows(
                         &self.header_rows,
-                        "Add Header",
-                        Self::add_header_row,
+                        "headers",
                         Self::toggle_header_row,
                         Self::remove_header_row,
                         cx,
@@ -4222,6 +4499,12 @@ impl Render for RequestView {
                 .id("api-client-request-view")
                 .key_context("ApiClientRequestView")
                 .track_focus(&self.focus_handle)
+                .on_action(cx.listener(|this, _: &NextCell, window, cx| {
+                    this.step_through_the_cells(true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &PreviousCell, window, cx| {
+                    this.step_through_the_cells(false, window, cx)
+                }))
                 .on_action(cx.listener(
                     |this, _: &zed_actions::api_client_panel::SendRequest, window, cx| {
                         this.send(window, cx);
@@ -4282,6 +4565,12 @@ impl Render for RequestView {
             .debug_selector(|| "api-client-request-view".to_string())
             .key_context("ApiClientRequestView")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &NextCell, window, cx| {
+                this.step_through_the_cells(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousCell, window, cx| {
+                this.step_through_the_cells(false, window, cx)
+            }))
             .on_action(cx.listener(
                 |this, _: &zed_actions::api_client_panel::SendRequest, window, cx| {
                     this.send(window, cx);
@@ -4845,7 +5134,48 @@ mod tests {
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+            // The same two bindings `assets/keymaps/default-linux.json` ships, in
+            // the same context: what has to hold is that they reach a cell's editor
+            // at all, which a shorter context would fake.
+            cx.bind_keys([
+                gpui::KeyBinding::new("tab", NextCell, Some("ApiClientKeyValueTable > Editor")),
+                gpui::KeyBinding::new(
+                    "shift-tab",
+                    PreviousCell,
+                    Some("ApiClientKeyValueTable > Editor"),
+                ),
+            ]);
         });
+    }
+
+    /// A row's editors, borrowed for reading outside the view's own lease.
+    fn clone_row(row: &KeyValueRow) -> KeyValueRow {
+        KeyValueRow {
+            key_editor: row.key_editor.clone(),
+            value_editor: row.value_editor.clone(),
+            description_editor: row.description_editor.clone(),
+            enabled: row.enabled,
+        }
+    }
+
+    /// The rows that stand for something, which is every row but the blank one the
+    /// next line is typed into.
+    fn rows_that_say_something(
+        rows: &[KeyValueRow],
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, String, bool)> {
+        cx.update(|_, cx| {
+            rows.iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| {
+                    (
+                        row.key_editor.read(cx).text(cx),
+                        row.value_editor.read(cx).text(cx),
+                        row.enabled,
+                    )
+                })
+                .collect()
+        })
     }
 
     async fn build_request_view(
@@ -5973,34 +6303,247 @@ mod tests {
         });
     }
 
+    /// A row is added the way a row is added in a spreadsheet: by typing into the
+    /// blank one at the end, which then grows a new blank one under it. There is no
+    /// button to press first.
     #[gpui::test]
-    async fn adding_a_param_row_and_typing_persists_it_to_the_store(cx: &mut TestAppContext) {
+    async fn typing_into_the_last_row_adds_it_and_leaves_another_blank_one(
+        cx: &mut TestAppContext,
+    ) {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
         draw(&mut cx);
 
-        let add_button = debug_center(&mut cx, "kv-row-add");
-        cx.simulate_click(add_button, gpui::Modifiers::none());
-        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.param_rows.len()),
+            1,
+            "a table opens with one row to type into"
+        );
 
-        let key_editor = view.read_with(&cx, |view, _| view.param_rows[0].key_editor.clone());
-        let value_editor = view.read_with(&cx, |view, _| view.param_rows[0].value_editor.clone());
+        // Straight into the cells of that row, the way a click into them would.
+        let cell =
+            |view: &Entity<RequestView>, cx: &mut VisualTestContext, at: usize, column: Column| {
+                view.read_with(cx, |view, _| view.param_rows[at].cell(column).clone())
+            };
+        let key = cell(&view, &mut cx, 0, Column::Key);
         view.update_in(&mut cx, |_, window, cx| {
-            key_editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            key.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
         });
         cx.simulate_input("page");
         cx.run_until_parked();
+        let value = cell(&view, &mut cx, 0, Column::Value);
         view.update_in(&mut cx, |_, window, cx| {
-            value_editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            value.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
         });
         cx.simulate_input("1");
         cx.run_until_parked();
+        let description = cell(&view, &mut cx, 0, Column::Description);
+        view.update_in(&mut cx, |_, window, cx| {
+            description.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.simulate_input("which page to read");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.params.len(), 1, "only the row that says something");
+            assert_eq!(request.params[0].key, "page");
+            assert_eq!(request.params[0].value, "1");
+            assert_eq!(
+                request.params[0].description.as_deref(),
+                Some("which page to read"),
+                "the third column is kept with the request, like the other two"
+            );
+        });
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.param_rows.len()),
+            2,
+            "and another blank row is waiting under it"
+        );
+    }
+
+    /// The text form of a table has two columns and the table has three, so a trip
+    /// through Bulk Edit must not take the notes away with it.
+    #[gpui::test]
+    async fn a_trip_through_bulk_edit_keeps_the_descriptions(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        for (column, text) in [
+            (Column::Key, "page"),
+            (Column::Value, "1"),
+            (Column::Description, "which page to read"),
+        ] {
+            let cell = view.read_with(&cx, |view, _| view.param_rows[0].cell(column).clone());
+            view.update_in(&mut cx, |_, window, cx| {
+                cell.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            });
+            cx.simulate_input(text);
+            cx.run_until_parked();
+        }
+        draw(&mut cx);
+
+        // In to fix the value, and back out again.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_params_bulk_edit(window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(&mut cx, |view, window, cx| {
+            view.param_bulk_editor.update(cx, |editor, cx| {
+                editor.set_text("page: 2", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update_in(&mut cx, |view, window, cx| {
+            view.toggle_params_bulk_edit(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
 
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.params.len(), 1);
-            assert_eq!(request.params[0].key, "page");
-            assert_eq!(request.params[0].value, "1");
+            assert_eq!(
+                request.params[0].value, "2",
+                "the value the reader went in for"
+            );
+            assert_eq!(
+                request.params[0].description.as_deref(),
+                Some("which page to read"),
+                "and the note they never touched is still there"
+            );
         });
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.param_rows[0]
+                .description_editor
+                .read(cx)
+                .text(cx)),
+            "which page to read",
+            "the table shows it again too"
+        );
+    }
+
+    /// A cell holding a space is a cell somebody typed in. Rows are dropped for
+    /// being untouched, never for looking empty.
+    #[gpui::test]
+    async fn a_row_holding_only_a_space_is_still_a_row(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let key = view.read_with(&cx, |view, _| view.param_rows[0].key_editor.clone());
+        view.update_in(&mut cx, |_, window, cx| {
+            key.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.simulate_input(" ");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.params.len(),
+                1,
+                "what was typed is kept, whatever it looks like"
+            );
+            assert_eq!(request.params[0].key, " ");
+        });
+    }
+
+    /// The three columns are a table: each cell sits under its own heading, and the
+    /// rows line up with each other rather than each being its own little box.
+    #[gpui::test]
+    async fn the_columns_line_up_under_their_headings(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        // Two rows written the way a reader writes them: into the blank row at the
+        // end, which grows another one under it.
+        for (at, key, value) in [(0usize, "page", "1"), (1, "per_page", "50")] {
+            for (column, text) in [(Column::Key, key), (Column::Value, value)] {
+                let cell = view.read_with(&cx, |view, _| view.param_rows[at].cell(column).clone());
+                view.update_in(&mut cx, |_, window, cx| {
+                    cell.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+                });
+                cx.simulate_input(text);
+                cx.run_until_parked();
+            }
+            draw(&mut cx);
+        }
+
+        for column in Column::ALL {
+            let heading = cx
+                .debug_bounds(format!("params-heading-{}", column.name()).leak())
+                .unwrap_or_else(|| panic!("the {} column has to have a heading", column.name()));
+            for row in 0..2 {
+                let cell = cx
+                    .debug_bounds(format!("params-cell-{row}-{}", column.name()).leak())
+                    .unwrap_or_else(|| panic!("row {row} is missing its {} cell", column.name()));
+                assert_eq!(
+                    cell.origin.x,
+                    heading.origin.x,
+                    "row {row}'s {} cell has to start where its heading does",
+                    column.name()
+                );
+                assert_eq!(cell.size.width, heading.size.width, "and be as wide as it");
+                assert!(
+                    cell.size.height > px(1.),
+                    "and occupy real screen area: {:?}",
+                    cell.size
+                );
+            }
+        }
+
+        let first = cx.debug_bounds("params-row-0").expect("the first row");
+        let second = cx.debug_bounds("params-row-1").expect("the second row");
+        assert_eq!(
+            second.origin.y,
+            first.origin.y + first.size.height,
+            "rows sit directly on top of one another, sharing their line"
+        );
+    }
+
+    /// Tab walks the cells, which is how a table is filled in without reaching for
+    /// the mouse. The cell editor would otherwise take the tab for itself.
+    #[gpui::test]
+    async fn tab_walks_from_cell_to_cell(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        let cells: Vec<Entity<Editor>> = view.read_with(&cx, |view, _| {
+            Column::ALL
+                .iter()
+                .map(|column| view.param_rows[0].cell(*column).clone())
+                .collect()
+        });
+        view.update_in(&mut cx, |_, window, cx| {
+            cells[0].update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        for expected in [1usize, 2] {
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            let focused = view.update_in(&mut cx, |_, window, cx| {
+                cells
+                    .iter()
+                    .position(|editor| editor.read(cx).focus_handle(cx).is_focused(window))
+            });
+            assert_eq!(
+                focused,
+                Some(expected),
+                "tab has to move to the next cell, not indent inside the one it is in"
+            );
+        }
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        let focused = view.update_in(&mut cx, |_, window, cx| {
+            cells
+                .iter()
+                .position(|editor| editor.read(cx).focus_handle(cx).is_focused(window))
+        });
+        assert_eq!(focused, Some(1), "and shift-tab back again");
     }
 
     /// `apply_response` is the seam between the network call (real I/O,
@@ -6357,18 +6900,13 @@ mod tests {
         });
         cx.run_until_parked();
 
-        view.read_with(&cx, |view, cx| {
-            let rows: Vec<(String, String, bool)> = view
-                .param_rows
-                .iter()
-                .map(|row| {
-                    (
-                        row.key_editor.read(cx).text(cx),
-                        row.value_editor.read(cx).text(cx),
-                        row.enabled,
-                    )
-                })
-                .collect();
+        let rows = {
+            let param_rows = view.read_with(&cx, |view, _| {
+                view.param_rows.iter().map(clone_row).collect::<Vec<_>>()
+            });
+            rows_that_say_something(&param_rows, &mut cx)
+        };
+        {
             assert_eq!(
                 rows,
                 vec![
@@ -6383,7 +6921,7 @@ mod tests {
                 "key, value, and enabled state must all survive a round trip through Bulk Edit, \
                  including a key that itself starts with the disabled-row marker"
             );
-        });
+        }
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.params.len(), 3);
@@ -6473,7 +7011,15 @@ mod tests {
         draw(&mut cx);
 
         view.read_with(&cx, |view, cx| {
-            assert_eq!(view.header_rows.len(), 2);
+            assert_eq!(
+                view.header_rows.len(),
+                3,
+                "the two rows the text described, and the blank one to type the next into"
+            );
+            assert!(
+                view.header_rows[2].is_blank(cx),
+                "the last one is the blank"
+            );
             assert!(view.header_rows[0].enabled);
             assert_eq!(view.header_rows[0].key_editor.read(cx).text(cx), "Accept");
             assert!(

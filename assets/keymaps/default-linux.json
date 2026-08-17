@@ -805,6 +805,16 @@
     }
   },
   {
+    // A params/headers table is stepped through the way a spreadsheet is: the
+    // cell editor would otherwise swallow tab and indent inside the cell.
+    "context": "ApiClientKeyValueTable > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "tab": "api_client::NextCell",
+      "shift-tab": "api_client::PreviousCell"
+    }
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {
