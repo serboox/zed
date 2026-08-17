@@ -18,7 +18,7 @@ use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkS
 use collections::HashMap;
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
-    BackgroundExecutor, DismissEvent, Task, TaskExt, TestAppContext, UpdateGlobal,
+    BackgroundExecutor, DismissEvent, MouseUpEvent, Task, TaskExt, TestAppContext, UpdateGlobal,
     VisualTestContext, WindowBounds, WindowOptions, div,
 };
 use indoc::indoc;
@@ -1093,6 +1093,147 @@ fn test_toggle_breadcrumb_does_not_change_settings(cx: &mut TestAppContext) {
             ToolbarItemLocation::PrimaryLeft
         );
     });
+}
+
+/// A line the editor found something runnable on can also be offered as a run
+/// configuration -- that is what the gutter's own entry does. A line with nothing
+/// runnable offers nothing, or the menu would carry an entry that leads nowhere.
+#[gpui::test]
+async fn test_a_runnable_row_offers_itself_as_a_run_configuration(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("one\ntwo\nˇfunc main() {}\n");
+
+    let offered_where_nothing_runs =
+        cx.update_editor(|editor, _window, cx| editor.entry_point_offer_at_row(0, cx).is_some());
+    assert!(
+        !offered_where_nothing_runs,
+        "a line with nothing runnable on it must offer nothing"
+    );
+
+    seed_a_runnable_row(&mut cx, 2);
+
+    let offer = cx
+        .update_editor(|editor, _window, cx| editor.entry_point_offer_at_row(2, cx))
+        .expect("a runnable line offers itself");
+
+    assert_eq!(offer.command.as_deref(), Some("go"));
+    assert_eq!(
+        offer.args,
+        vec!["run".to_string(), ".".to_string()],
+        "what the editor would run is carried along, since it is known to work"
+    );
+    assert_eq!(offer.line, 3, "the line is counted the way a reader counts");
+}
+
+/// Leaves behind what the editor's own runnable detection would have left for a
+/// line, so a test does not need a language server or a tree-sitter query to have
+/// a runnable line to work with.
+fn seed_a_runnable_row(cx: &mut EditorTestContext, row: u32) {
+    cx.update_editor(|editor, _window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let (buffer, offset) = snapshot
+            .point_to_buffer_offset(language::Point::new(row, 0))
+            .expect("the row is in a buffer");
+        let buffer_id = buffer.remote_id();
+        let version = buffer.version().clone();
+        // Keyed by the row inside the buffer itself, the way the editor's own
+        // detection keys it.
+        let buffer_row = buffer.offset_to_point(offset.0).row;
+        editor.insert_runnables(
+            buffer_id,
+            version,
+            buffer_row,
+            RunnableTasks {
+                templates: vec![(
+                    project::TaskSourceKind::Language { name: "Go".into() },
+                    task::TaskTemplate {
+                        label: "go run .".to_string(),
+                        command: "go".to_string(),
+                        args: vec!["run".to_string(), ".".to_string()],
+                        ..task::TaskTemplate::default()
+                    },
+                )],
+                offset: snapshot.anchor_before(language::Point::new(row, 0)),
+                column: 0,
+                extra_variables: Default::default(),
+                context_range: multi_buffer::BufferOffset(0)..multi_buffer::BufferOffset(0),
+            },
+        );
+    });
+}
+
+/// A line is named by where it is in its own file. In a multibuffer the row on
+/// screen is somewhere else entirely, and a configuration that pointed there would
+/// send the reader to the wrong place.
+#[gpui::test]
+async fn test_an_offer_counts_the_line_inside_its_own_file(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new_multibuffer(
+        cx,
+        ["«one\ntwo\nthree\n»", "aaa\nbbb\nccc\n«func main() {}\n»"],
+    );
+
+    let text = cx.buffer_text();
+    let row = text
+        .lines()
+        .position(|line| line.contains("func main"))
+        .expect("the runnable line is somewhere in the multibuffer") as u32;
+    seed_a_runnable_row(&mut cx, row);
+
+    let offer = cx
+        .update_editor(|editor, _window, cx| editor.entry_point_offer_at_row(row, cx))
+        .expect("a runnable line offers itself");
+    assert_eq!(
+        offer.line, 4,
+        "the line is the one the file itself has, not the row it is shown on"
+    );
+    assert_ne!(
+        offer.line,
+        row + 1,
+        "and the two really do differ here, or this test would prove nothing"
+    );
+}
+
+/// The offer has to be reachable the way the reader reaches it: a right-click on
+/// the play icon the gutter already shows on a runnable line.
+#[gpui::test]
+async fn test_the_gutter_menu_offers_a_run_configuration_on_a_right_click(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("one\ntwo\nˇfunc main() {}\n");
+    seed_a_runnable_row(&mut cx, 2);
+    cx.run_until_parked();
+
+    let play = cx
+        .cx
+        .debug_bounds("ICON-PlayOutlined")
+        .expect("a runnable line shows a play icon in its gutter");
+    let at = play.center();
+    cx.cx.simulate_event(MouseDownEvent {
+        position: at,
+        button: MouseButton::Right,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.cx.simulate_event(MouseUpEvent {
+        position: at,
+        button: MouseButton::Right,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+
+    let entry = cx
+        .cx
+        .debug_bounds("MENU_ITEM-Create a run configuration...")
+        .expect("the gutter menu carries the offer");
+    assert!(
+        entry.size.width > px(1.) && entry.size.height > px(1.),
+        "the entry has to occupy real screen area, not {:?}",
+        entry.size
+    );
 }
 
 #[gpui::test]

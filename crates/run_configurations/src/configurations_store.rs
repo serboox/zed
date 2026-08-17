@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use project::Project;
@@ -113,10 +113,20 @@ impl ConfigurationsStore {
         self.of_kind(kind).configurations.get(at)
     }
 
-    /// Puts `entry` at `at`, or adds it to the end when `at` is None. The file is
-    /// read again immediately before writing, so an edit does not undo whatever
-    /// else was typed into the file in the meantime.
-    pub fn save(&self, kind: Kind, at: Option<usize>, entry: Value, cx: &App) -> Task<Result<()>> {
+    /// Puts `entry` in the file, replacing what `replacing` was read as, or adding
+    /// it to the end when there is nothing to replace.
+    ///
+    /// The file is read again immediately before writing, so an edit does not undo
+    /// whatever else was typed into the file in the meantime -- and the entry to
+    /// replace is looked for by what it says, since the reader may have moved it
+    /// since the view read it.
+    pub fn save(
+        &self,
+        kind: Kind,
+        replacing: Option<(usize, Value)>,
+        entry: Value,
+        cx: &App,
+    ) -> Task<Result<()>> {
         let Some(path) = self.file_path(kind) else {
             return Task::ready(Err(anyhow!(
                 "this project has nowhere to keep its configurations: it has no folder open"
@@ -126,21 +136,38 @@ impl ConfigurationsStore {
         let empty = kind.empty_file().to_string();
         cx.background_spawn(async move {
             let text = fs.load(&path).await.unwrap_or(empty);
+            let at = match replacing {
+                Some((at, original)) => Some(place_of(&text, at, &original, &path)?),
+                None => None,
+            };
             let written = configurations_file::text_with(&text, at, &entry);
             configurations_file::write(&fs, &path, &written).await
         })
     }
 
-    /// Takes the configuration at `at` out of its file.
-    pub fn remove(&self, kind: Kind, at: usize, cx: &App) -> Task<Result<()>> {
+    /// Takes the configuration that was read as `original` out of its file.
+    pub fn remove(&self, kind: Kind, at: usize, original: Value, cx: &App) -> Task<Result<()>> {
         let Some(path) = self.file_path(kind) else {
             return Task::ready(Err(anyhow!("there is no file to take it out of")));
         };
         let fs = self.fs.clone();
         cx.background_spawn(async move {
             let text = fs.load(&path).await.unwrap_or_default();
+            let at = place_of(&text, at, &original, &path)?;
             let written = configurations_file::text_without(&text, at);
             configurations_file::write(&fs, &path, &written).await
         })
     }
+}
+
+/// Where the configuration read as `original` is in `text` now. Nothing is written
+/// when it cannot be found: the file has been changed by hand since it was read,
+/// and writing by the old index would go over another configuration.
+fn place_of(text: &str, at: usize, original: &Value, path: &std::path::Path) -> Result<usize> {
+    configurations_file::place_of(text, at, original).with_context(|| {
+        format!(
+            "this configuration is no longer in {}, which was changed by hand. Nothing was written.",
+            path.display()
+        )
+    })
 }

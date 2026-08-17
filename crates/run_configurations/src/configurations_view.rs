@@ -9,9 +9,9 @@ use task::{DebugScenario, TaskTemplate};
 use ui::{Tooltip, WithScrollbar, prelude::*};
 use workspace::{Item, Workspace, item::ItemEvent};
 
-use crate::OpenRunConfigurations;
 use crate::configurations_file::{self, Configuration, Kind};
 use crate::configurations_store::{ConfigurationsChanged, ConfigurationsStore};
+use crate::{CreateFromEntryPoint, OpenRunConfigurations};
 
 actions!(
     run_configurations,
@@ -71,6 +71,22 @@ fn debugger_for(command: &str) -> &'static str {
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        // What the editor found on a line, asked for from its gutter. The offer
+        // itself was left in a global by the editor, which cannot depend on this
+        // crate.
+        workspace.register_action(|workspace, _: &CreateFromEntryPoint, window, cx| {
+            let offer = match cx.has_global::<zed_actions::run_configurations::EntryPointOffer>() {
+                true => cx.remove_global::<zed_actions::run_configurations::EntryPointOffer>(),
+                false => Default::default(),
+            };
+            let store = cx.new(|cx| ConfigurationsStore::new(workspace.project(), cx));
+            let handle = workspace.weak_handle();
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                crate::new_configuration_modal::NewConfigurationModal::new(
+                    offer, store, handle, window, cx,
+                )
+            });
+        });
         workspace.register_action(|workspace, _: &OpenRunConfigurations, window, cx| {
             let existing = workspace
                 .active_pane()
@@ -98,6 +114,41 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Runs `task` in the workspace, with the project's own variables filled in.
+/// Shared, because the window that offers a configuration for an entry point can
+/// also run it straight away.
+pub async fn run_a_task(
+    workspace: &WeakEntity<Workspace>,
+    task: TaskTemplate,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let Some(contexts) = workspace
+        .update_in(cx, |workspace, window, cx| {
+            tasks_ui::task_contexts(workspace, window, cx)
+        })
+        .ok()
+    else {
+        return;
+    };
+    let contexts = contexts.await;
+    let context = contexts.active_context().cloned().unwrap_or_default();
+    let comes_from = match contexts.worktree() {
+        Some(id) => project::TaskSourceKind::Worktree {
+            id,
+            directory_in_worktree: path::rel_path::RelPath::from_unix_str(".zed")
+                .expect("a relative path of our own")
+                .into_arc(),
+            id_base: "run configurations".into(),
+        },
+        None => project::TaskSourceKind::UserInput,
+    };
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.schedule_task(comes_from, &task, &context, false, window, cx);
+        })
+        .ok();
+}
+
 /// The project's run configurations: what the two files hold, in a form that can
 /// be clicked together instead of typed -- and written straight back into them.
 pub struct RunConfigurationsView {
@@ -106,6 +157,10 @@ pub struct RunConfigurationsView {
     focus: FocusHandle,
     /// Which configuration is being shown, by the file it is in and where in it.
     chosen: Option<(Kind, usize)>,
+    /// The chosen entry exactly as the file had it when the form was filled in.
+    /// Writing looks for this rather than trusting the place above, since the file
+    /// may have been rewritten by hand in the meantime.
+    as_read: Option<Value>,
     /// Set for a configuration that is not in a file yet.
     unsaved: bool,
     /// Set once the reader has typed something the file has not been told about.
@@ -202,6 +257,7 @@ impl RunConfigurationsView {
             workspace,
             focus: cx.focus_handle(),
             chosen: None,
+            as_read: None,
             unsaved: false,
             edited: false,
             changed_underneath: false,
@@ -247,6 +303,10 @@ impl RunConfigurationsView {
     /// Puts a configuration into the form.
     fn show(&mut self, configuration: &Configuration, window: &mut Window, cx: &mut Context<Self>) {
         self.chosen = Some((configuration.kind, configuration.at));
+        self.as_read = match configuration.as_written.is_null() {
+            true => None,
+            false => Some(configuration.as_written.clone()),
+        };
         self.unsaved = false;
         self.edited = false;
         self.changed_underneath = false;
@@ -456,11 +516,11 @@ impl RunConfigurationsView {
                 return;
             }
         };
-        let where_to = match self.unsaved {
+        let replacing = match self.unsaved {
             true => None,
-            false => Some(at),
+            false => self.as_read.clone().map(|as_read| (at, as_read)),
         };
-        let writing = self.store.read(cx).save(kind, where_to, entry, cx);
+        let writing = self.store.read(cx).save(kind, replacing, entry, cx);
         self.edited = false;
         self.changed_underneath = false;
         self.unsaved = false;
@@ -488,7 +548,12 @@ impl RunConfigurationsView {
             cx.notify();
             return;
         }
-        let removing = self.store.read(cx).remove(kind, at, cx);
+        let Some(original) = self.as_read.clone() else {
+            self.chosen = None;
+            cx.notify();
+            return;
+        };
+        let removing = self.store.read(cx).remove(kind, at, original, cx);
         self.chosen = None;
         cx.spawn(async move |view, cx| {
             if let Err(error) = removing.await {
@@ -513,6 +578,7 @@ impl RunConfigurationsView {
         });
         let at = self.store.read(cx).of_kind(kind).configurations.len();
         self.chosen = Some((kind, at));
+        self.as_read = None;
         self.unsaved = true;
         self.edited = true;
         cx.notify();
@@ -539,31 +605,9 @@ impl RunConfigurationsView {
     }
 
     fn run_the_task(&mut self, task: TaskTemplate, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let contexts = workspace.update(cx, |workspace, cx| {
-            tasks_ui::task_contexts(workspace, window, cx)
-        });
-        let workspace = workspace.downgrade();
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            let contexts = contexts.await;
-            let context = contexts.active_context().cloned().unwrap_or_default();
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    let comes_from = match contexts.worktree() {
-                        Some(id) => project::TaskSourceKind::Worktree {
-                            id,
-                            directory_in_worktree: path::rel_path::RelPath::from_unix_str(".zed")
-                                .expect("a relative path of our own")
-                                .into_arc(),
-                            id_base: "run configurations".into(),
-                        },
-                        None => project::TaskSourceKind::UserInput,
-                    };
-                    workspace.schedule_task(comes_from, &task, &context, false, window, cx);
-                })
-                .ok();
+            run_a_task(&workspace, task, cx).await;
         })
         .detach();
     }
@@ -1110,6 +1154,7 @@ mod tests {
             cx.set_global(settings);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+            crate::init(cx);
         });
     }
 
@@ -1149,6 +1194,219 @@ mod tests {
         });
         cx.run_until_parked();
         (view, fs, cx.clone())
+    }
+
+    /// The whole chain the gutter starts: what the editor found becomes a window
+    /// with the fields already filled in, and saving it puts it in the project's
+    /// own file.
+    #[gpui::test]
+    async fn an_entry_point_the_editor_found_becomes_a_configuration(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "cmd": { "api": { "main.go": "package main\n\nfunc main() {}\n" } } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // Through a whole window, because the actions a workspace registers are only
+        // listened for there -- which is where the editor's gutter dispatches this
+        // one too.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        // What the editor leaves behind when the reader asks its gutter.
+        cx.update(|_, cx| {
+            cx.set_global(zed_actions::run_configurations::EntryPointOffer {
+                language: Some("Go".to_string()),
+                file: Some(std::path::PathBuf::from(path!("/project/cmd/api/main.go"))),
+                line: 3,
+                label: Some("go run ./cmd/api".to_string()),
+                command: Some("go".to_string()),
+                args: vec!["run".to_string(), ".".to_string()],
+                cwd: Some("${ZED_DIRNAME}".to_string()),
+            });
+        });
+        let handled = cx.update(|window, cx| {
+            window
+                .available_actions(cx)
+                .iter()
+                .any(|action| action.as_any().is::<CreateFromEntryPoint>())
+        });
+        assert!(
+            handled,
+            "the workspace has to answer the action the editor's gutter dispatches"
+        );
+        cx.dispatch_action(CreateFromEntryPoint);
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+            })
+            .expect("asking the gutter opens the window");
+
+        let filled_in = modal.read_with(cx, |modal, cx| modal.task(cx));
+        assert_eq!(
+            filled_in.label, "go run ./cmd/api",
+            "the fields come filled in from what the editor already runs"
+        );
+        assert_eq!(filled_in.command, "go");
+        assert_eq!(filled_in.args, vec!["run".to_string(), ".".to_string()]);
+
+        modal.update_in(cx, |modal, window, cx| modal.save(false, window, cx));
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("saving writes the project's own file");
+        let read_back = crate::configurations_file::read(Kind::Task, &written);
+        assert_eq!(read_back.configurations.len(), 1);
+        assert_eq!(
+            read_back.configurations[0]
+                .task
+                .as_ref()
+                .expect("a task the editor can read back")
+                .command,
+            "go"
+        );
+    }
+
+    /// An offer is answered once. A later ask that comes from somewhere else -- the
+    /// keyboard, say -- must not be filled in from a line the reader looked at long
+    /// ago.
+    #[gpui::test]
+    async fn an_offer_is_only_answered_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // Through a whole window, because the actions a workspace registers are only
+        // listened for there -- which is where the editor's gutter dispatches this
+        // one too.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            cx.set_global(zed_actions::run_configurations::EntryPointOffer {
+                language: Some("Go".to_string()),
+                file: Some(std::path::PathBuf::from(path!("/project/cmd/api/main.go"))),
+                line: 3,
+                label: Some("go run ./cmd/api".to_string()),
+                command: Some("go".to_string()),
+                args: vec!["run".to_string(), ".".to_string()],
+                cwd: None,
+            });
+        });
+        cx.dispatch_action(CreateFromEntryPoint);
+        cx.run_until_parked();
+        workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+            })
+            .expect("the first ask opens the window")
+            .update_in(cx, |_, _window, cx| cx.emit(gpui::DismissEvent));
+        cx.run_until_parked();
+
+        cx.dispatch_action(CreateFromEntryPoint);
+        cx.run_until_parked();
+        let asked_again = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+            })
+            .expect("asking again opens the window");
+        let filled_in = asked_again.read_with(cx, |modal, cx| modal.task(cx));
+        assert_eq!(
+            filled_in.command, "",
+            "with nothing found, the window opens empty rather than repeating what \
+             was found before"
+        );
+    }
+
+    /// The list is written by index, and the file changes underneath it. An entry
+    /// that moved is still edited where it is now; one that is gone is not written
+    /// over whatever took its place.
+    #[gpui::test]
+    async fn an_entry_that_moved_in_the_file_is_still_the_one_edited(cx: &mut TestAppContext) {
+        let (view, fs, mut cx) = a_view_of(
+            Some(
+                r#"[
+                  { "label": "api server", "command": "go run ./cmd/api" },
+                  { "label": "unit tests", "command": "go test ./..." }
+                ]"#,
+            ),
+            cx,
+        )
+        .await;
+
+        view.update_in(&mut cx, |view, window, cx| {
+            let tests = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 1)
+                .cloned()
+                .expect("the second configuration");
+            view.show(&tests, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Somebody puts another configuration first, so what the view chose is now
+        // one further down.
+        fs.save(
+            path!("/project/.zed/tasks.json").as_ref(),
+            &r#"[
+                  { "label": "migrations", "command": "make migrate" },
+                  { "label": "api server", "command": "go run ./cmd/api" },
+                  { "label": "unit tests", "command": "go test ./..." }
+                ]"#
+            .into(),
+            Default::default(),
+        )
+        .await
+        .expect("the file can be written by hand");
+        cx.run_until_parked();
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.command.update(cx, |editor, cx| {
+                editor.set_text("go test -race ./...", window, cx);
+            });
+            view.save(cx);
+        });
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("the file is still there");
+        let read_back = crate::configurations_file::read(Kind::Task, &written);
+        let commands: Vec<_> = read_back
+            .configurations
+            .iter()
+            .map(|configuration| {
+                configuration
+                    .task
+                    .as_ref()
+                    .map(|task| task.command.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                "make migrate".to_string(),
+                "go run ./cmd/api".to_string(),
+                "go test -race ./...".to_string(),
+            ],
+            "the edit lands on the configuration that was chosen, wherever it sits now"
+        );
     }
 
     #[gpui::test]

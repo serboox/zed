@@ -1074,3 +1074,44 @@ pub mod git_panel {
         ]
     );
 }
+
+/// What the editor found on a line, and the way to ask for a run configuration
+/// for it.
+///
+/// The editor cannot depend on the surface that keeps run configurations, so it
+/// leaves what it found here and dispatches the action below. Whoever handles the
+/// action reads it. One offer at a time, because it is answered immediately.
+pub mod run_configurations {
+    use std::path::PathBuf;
+
+    gpui::actions!(
+        run_configurations,
+        [
+            /// Shows the project's run configurations.
+            OpenRunConfigurations,
+            /// Makes a run configuration for the entry point the editor found.
+            CreateFromEntryPoint
+        ]
+    );
+
+    /// An entry point worth a run configuration: where it is, what language it is
+    /// written in, and what the editor would already run for it.
+    #[derive(Clone, Debug, Default)]
+    pub struct EntryPointOffer {
+        /// The language of the file it was found in, as the editor names it.
+        pub language: Option<String>,
+        /// The file itself.
+        pub file: Option<PathBuf>,
+        /// The line it sits on, counted from one, for the name of the
+        /// configuration.
+        pub line: u32,
+        /// What the editor would run for it, when it has a task of its own for
+        /// this line: the best default there is, since it already works.
+        pub label: Option<String>,
+        pub command: Option<String>,
+        pub args: Vec<String>,
+        pub cwd: Option<String>,
+    }
+
+    impl gpui::Global for EntryPointOffer {}
+}

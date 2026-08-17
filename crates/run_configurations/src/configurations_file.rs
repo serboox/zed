@@ -213,6 +213,20 @@ pub fn text_with(text: &str, at: Option<usize>, entry: &Value) -> String {
     with_replacement(&text, range, &replacement)
 }
 
+/// Where the entry that was read as `original` sits in `text` now, if it is still
+/// there at all.
+///
+/// The index a view remembers is only a hint: the file may have been edited by
+/// hand since it was read, and writing by a stale index would put one
+/// configuration on top of another.
+pub fn place_of(text: &str, at: usize, original: &Value) -> Option<usize> {
+    let entries: Vec<Value> = parse_json_with_comments(text).ok()?;
+    if entries.get(at) == Some(original) {
+        return Some(at);
+    }
+    entries.iter().position(|entry| entry == original)
+}
+
 /// The text a file should hold once the entry at `at` is gone.
 pub fn text_without(text: &str, at: usize) -> String {
     let indent = infer_json_indent_size(text);
@@ -405,6 +419,31 @@ mod tests {
             "what is left moves up, and the places written back have to follow"
         );
         assert!(written.contains("// The project's tasks."));
+    }
+
+    /// A file changes while it is being looked at. An entry is found by what it
+    /// says, so an edit follows it when it moves and is refused when it is gone --
+    /// writing by the old place would go over somebody else's configuration.
+    #[test]
+    fn an_entry_is_found_by_what_it_says_rather_than_where_it_was() {
+        let read_back = read(Kind::Task, A_FILE);
+        let tests = read_back.configurations[1].as_written.clone();
+
+        assert_eq!(place_of(A_FILE, 1, &tests), Some(1));
+
+        let moved = text_without(A_FILE, 0);
+        assert_eq!(
+            place_of(&moved, 1, &tests),
+            Some(0),
+            "the entry moved up, and that is where the edit belongs now"
+        );
+
+        let gone = text_without(&moved, 0);
+        assert_eq!(
+            place_of(&gone, 1, &tests),
+            None,
+            "it is not in the file at all, so nothing may be written by its old place"
+        );
     }
 
     #[test]

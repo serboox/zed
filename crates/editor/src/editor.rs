@@ -4177,6 +4177,41 @@ impl Editor {
         breakpoint_display_points
     }
 
+    /// What this line offers as a run configuration, when the editor has found
+    /// something runnable on it -- an entry point, a test, a benchmark. None when
+    /// the line is ordinary: there is nothing to offer then.
+    ///
+    /// What the editor would already run for the line is carried along, because a
+    /// command that is known to work is a better default than any guess.
+    fn entry_point_offer_at_row(
+        &self,
+        row: u32,
+        cx: &App,
+    ) -> Option<zed_actions::run_configurations::EntryPointOffer> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let (buffer, offset) = snapshot.point_to_buffer_offset(Point::new(row, 0))?;
+        // The row inside its own buffer, which is what the runnables are keyed by:
+        // in a multibuffer the two differ.
+        let buffer_row = buffer.offset_to_point(offset.0).row;
+        let tasks = self.runnables.runnables((buffer.remote_id(), buffer_row))?;
+        let first = tasks.templates.first();
+        Some(zed_actions::run_configurations::EntryPointOffer {
+            language: buffer
+                .language()
+                .map(|language| language.name().to_string()),
+            file: buffer.file().map(|file| file.full_path(cx)),
+            // Counted inside the file itself, which is not the multibuffer's own
+            // row: an excerpt starts wherever it starts.
+            line: buffer_row + 1,
+            label: first.map(|(_, template)| template.label.clone()),
+            command: first.map(|(_, template)| template.command.clone()),
+            args: first
+                .map(|(_, template)| template.args.clone())
+                .unwrap_or_default(),
+            cwd: first.and_then(|(_, template)| template.cwd.clone()),
+        })
+    }
+
     fn gutter_context_menu(
         &self,
         anchor: Anchor,
@@ -4257,9 +4292,24 @@ impl Editor {
         let (anchor, breakpoint) =
             breakpoint.unwrap_or_else(|| (anchor, Arc::new(Breakpoint::new_standard())));
 
+        let entry_point_offer = self.entry_point_offer_at_row(row, cx);
+
         ContextMenu::build(window, cx, |menu, _, _cx| {
             menu.on_blur_subscription(Subscription::new(|| {}))
                 .context(focus_handle)
+                .when_some(entry_point_offer, |this, offer| {
+                    // The editor already knows this line can be run -- that is why
+                    // there is a play icon on it. Here it can also become a
+                    // configuration of the project's own, which is a thing the
+                    // reader keeps rather than a command they retype.
+                    this.entry("Create a run configuration...", None, move |window, cx| {
+                        cx.set_global(offer.clone());
+                        window.dispatch_action(
+                            zed_actions::run_configurations::CreateFromEntryPoint.boxed_clone(),
+                            cx,
+                        );
+                    })
+                })
                 .when(run_to_cursor, |this| {
                     let weak_editor = weak_editor.clone();
                     this.entry(

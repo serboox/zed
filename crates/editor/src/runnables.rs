@@ -672,7 +672,7 @@ impl Editor {
             }))
     }
 
-    fn insert_runnables(
+    pub(crate) fn insert_runnables(
         &mut self,
         buffer: BufferId,
         version: Global,
