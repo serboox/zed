@@ -1,3 +1,4 @@
+use crate::code_generator::Snippet;
 use crate::response_dock::{
     DockResponseEntry, ResponseDockPanel, SendGeneration, existing_response_tab,
     reveal_response_tab,
@@ -415,6 +416,8 @@ pub struct RequestView {
     jwt_add_to_query_param: bool,
     jwt_query_param_key_editor: Entity<Editor>,
     send_state: SendState,
+    /// The shape the code window was last opened on.
+    code_snippet_shape: Snippet,
     response_tab: ResponseTab,
     pretty_body_editor: Entity<Editor>,
     raw_body_editor: Entity<Editor>,
@@ -722,6 +725,7 @@ impl RequestView {
             jwt_add_to_query_param: jwt_config.add_to_query_param,
             jwt_query_param_key_editor,
             send_state: SendState::Idle,
+            code_snippet_shape: Snippet::Curl,
             response_tab: ResponseTab::Pretty,
             pretty_body_editor,
             raw_body_editor,
@@ -1773,7 +1777,9 @@ impl RequestView {
     /// shell syntax highlighting, so the author can look it over before
     /// deciding whether to copy it -- rather than silently placing it on
     /// the clipboard the instant the button is clicked.
-    fn copy_as_curl(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the request as code: whichever shape the reader last asked for, and a
+    /// picker for the rest. What is copied is the same request Send would make.
+    fn show_as_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(request) = self
             .store
             .read(cx)
@@ -1784,23 +1790,27 @@ impl RequestView {
         else {
             return;
         };
-        let store = self.store.read(cx);
-        let context = store.variable_context_for(&request);
-        let curl = crate::code_generator::generate_curl(&request, &context);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         let languages = workspace.read(cx).app_state().languages.clone();
-        let language_task = languages.language_for_name("Shell Script");
-        cx.spawn_in(window, async move |_, cx| {
-            let language = language_task.await.log_err();
-            workspace.update_in(cx, |workspace, window, cx| {
-                workspace.toggle_modal(window, cx, |window, cx| {
-                    CurlPreviewModal::new(curl, language, window, cx)
-                });
-            })
-        })
-        .detach_and_log_err(cx);
+        let store = self.store.clone();
+        let shown = self.code_snippet_shape;
+        let view = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                let modal = CodeSnippetModal::new(request, store, languages, shown, window, cx);
+                // What the reader picked is remembered, so the window opens on it
+                // next time rather than back on cURL.
+                cx.observe_release(&cx.entity(), move |_, modal: &mut CodeSnippetModal, cx| {
+                    let shown = modal.shown();
+                    view.update(cx, |view, _| view.code_snippet_shape = shown)
+                        .ok();
+                })
+                .detach();
+                modal
+            });
+        });
     }
 
     /// Looks up the workspace's shared response dock, if one is registered.
@@ -4081,13 +4091,15 @@ impl Render for RequestView {
                     .id("request-copy-curl-hitbox")
                     .debug_selector(|| "request-copy-curl".to_string())
                     .child(
-                        Button::new("request-copy-curl", "Copy as cURL")
+                        Button::new("request-copy-curl", "Code")
                             .style(ButtonStyle::Subtle)
+                            .start_icon(Icon::new(IconName::Code).size(IconSize::Small))
                             .on_click(
-                                cx.listener(|this, _, window, cx| this.copy_as_curl(window, cx)),
+                                cx.listener(|this, _, window, cx| this.show_as_code(window, cx)),
                             ),
                     ),
             )
+            .child(self.render_environment_pin(cx))
             .child({
                 let is_sending = matches!(self.send_state, SendState::Sending);
                 div()
@@ -4098,21 +4110,20 @@ impl Render for RequestView {
                             "request-send-button",
                             if is_sending { "Sending..." } else { "Send" },
                         )
-                        // Sending is the one thing this view exists for, so the
-                        // button carries the accent while everything around it
-                        // stays quiet.
-                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        // Sending is the one thing this view exists for: filled
+                        // rather than tinted, and wide enough to hit without
+                        // aiming, while everything around it stays quiet.
+                        .style(ButtonStyle::Filled)
                         .size(ButtonSize::Large)
+                        .width(gpui::DefiniteLength::Absolute(
+                            gpui::AbsoluteLength::Pixels(px(112.)),
+                        ))
                         .start_icon(Icon::new(IconName::PlayFilled).color(Color::Accent))
                         .color(Color::Accent)
                         .disabled(is_sending)
                         .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
             });
-
-        let environment_row = h_flex()
-            .w_full()
-            .child(div().ml_auto().child(self.render_environment_pin(cx)));
 
         let url_warning = self.url_looks_malformed.then(|| {
             div()
@@ -4226,7 +4237,6 @@ impl Render for RequestView {
             .gap_3()
             .child(url_row)
             .when_some(url_warning, |this, warning| this.child(warning))
-            .child(environment_row)
             .child(tab_strip)
             .child(div().child(tab_body));
 
@@ -4275,89 +4285,224 @@ impl Render for RequestView {
 /// whether to copy it -- the "Copy" button copies whatever text is currently
 /// in the editor, so an author who tweaks the command before copying gets
 /// their edited version, not the original.
-pub(crate) struct CurlPreviewModal {
+/// The request as code, in whichever shape the reader asks for.
+///
+/// The request itself is held rather than the generated text, so switching shape
+/// generates again from the same request -- what is shown is always this request,
+/// not whatever it looked like when the window opened.
+pub(crate) struct CodeSnippetModal {
     focus_handle: FocusHandle,
-    pub(crate) curl_editor: Entity<Editor>,
+    pub(crate) code_editor: Entity<Editor>,
+    request: api_client::Request,
+    store: Entity<ApiClientStore>,
+    languages: Arc<language::LanguageRegistry>,
+    shown: Snippet,
 }
 
-impl CurlPreviewModal {
+impl CodeSnippetModal {
     pub(crate) fn new(
-        curl: String,
-        language: Option<Arc<language::Language>>,
+        request: api_client::Request,
+        store: Entity<ApiClientStore>,
+        languages: Arc<language::LanguageRegistry>,
+        shown: Snippet,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let curl_editor = cx.new(|cx| {
+        let code_editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
-            editor.set_text(curl, window, cx);
+            editor.set_read_only(true);
             editor
         });
-        if let Some(language) = language {
-            if let Some(buffer) = curl_editor.read(cx).buffer().read(cx).as_singleton() {
-                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
-            }
-        }
-        Self {
+        let mut modal = Self {
             focus_handle: cx.focus_handle(),
-            curl_editor,
-        }
+            code_editor,
+            request,
+            store,
+            languages,
+            shown,
+        };
+        modal.show(shown, window, cx);
+        modal
+    }
+
+    /// The shape last asked for, so the window opens on it next time rather than
+    /// on cURL again.
+    pub(crate) fn shown(&self) -> Snippet {
+        self.shown
+    }
+
+    fn show(&mut self, snippet: Snippet, window: &mut Window, cx: &mut Context<Self>) {
+        self.shown = snippet;
+        let code = {
+            let store = self.store.read(cx);
+            let context = store.variable_context_for(&self.request);
+            crate::code_generator::generate(snippet, &self.request, &context)
+        };
+        self.code_editor.update(cx, |editor, cx| {
+            editor.set_read_only(false);
+            editor.set_text(code, window, cx);
+            editor.set_read_only(true);
+        });
+
+        // The colouring follows the shape, and the language has to be fetched, so
+        // it arrives a moment after the text.
+        let wanted = language_of(snippet);
+        let language = self.languages.language_for_name(wanted);
+        let editor = self.code_editor.clone();
+        cx.spawn(async move |_, cx| {
+            let Some(language) = language.await.log_err() else {
+                return;
+            };
+            editor.update(cx, |editor, cx| {
+                if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                    buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn copy(&self, cx: &mut Context<Self>) {
-        let text = self.curl_editor.read(cx).text(cx);
+        let text = self.code_editor.read(cx).text(cx);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = self.shown;
+        ui::PopoverMenu::new("code-snippet-shapes")
+            .trigger(
+                Button::new("code-snippet-shape", shown.label())
+                    .style(ButtonStyle::OutlinedCustom(
+                        cyberpunk::Accent::Cyan.border(),
+                    ))
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .menu({
+                let modal = cx.entity();
+                move |window, cx| {
+                    let modal = modal.clone();
+                    Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for snippet in Snippet::ALL {
+                            let modal = modal.clone();
+                            menu = menu.toggleable_entry(
+                                snippet.label(),
+                                snippet == shown,
+                                ui::IconPosition::Start,
+                                None,
+                                move |window, cx| {
+                                    modal.update(cx, |modal, cx| modal.show(snippet, window, cx));
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                }
+            })
     }
 }
 
-impl EventEmitter<gpui::DismissEvent> for CurlPreviewModal {}
-impl workspace::ModalView for CurlPreviewModal {}
+/// What each shape is written in, so the editor colours it.
+fn language_of(snippet: Snippet) -> &'static str {
+    match snippet {
+        Snippet::Curl | Snippet::Wget => "Shell Script",
+        Snippet::HttpText => "Plain Text",
+        Snippet::Go => "Go",
+        Snippet::Python => "Python",
+        Snippet::JavaScript | Snippet::NodeAxios => "JavaScript",
+        Snippet::Rust => "Rust",
+        Snippet::Php => "PHP",
+        Snippet::CSharp => "C#",
+        Snippet::Java => "Java",
+        Snippet::Ruby => "Ruby",
+    }
+}
 
-impl Focusable for CurlPreviewModal {
+impl EventEmitter<gpui::DismissEvent> for CodeSnippetModal {}
+impl workspace::ModalView for CodeSnippetModal {}
+
+impl Focusable for CodeSnippetModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for CurlPreviewModal {
+impl Render for CodeSnippetModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .key_context("CurlPreviewModal")
+            .key_context("CodeSnippetModal")
             .track_focus(&self.focus_handle)
-            .w(px(640.))
+            .w(px(760.))
             .p_3()
             .gap_3()
             .cyberpunk_surface()
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(gpui::DismissEvent)))
             .child(
-                div()
-                    .cyberpunk_monospace(cx)
-                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
-                    .text_size(ui::HeadlineSize::Small.rems())
-                    .text_color(cyberpunk::text_primary())
-                    .child("COPY AS CURL"),
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .cyberpunk_monospace(cx)
+                            .font_weight(gpui::FontWeight::EXTRA_BOLD)
+                            .text_size(ui::HeadlineSize::Small.rems())
+                            .text_color(cyberpunk::text_primary())
+                            .child("CODE SNIPPET"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(self.render_picker(cx))
+                            .child(
+                                IconButton::new("code-snippet-copy-icon", IconName::Copy)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Copy the code"))
+                                    .on_click(cx.listener(|this, _, _window, cx| this.copy(cx))),
+                            )
+                            .child(
+                                IconButton::new("code-snippet-close", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .on_click(cx.listener(|_, _, _window, cx| {
+                                        cx.emit(gpui::DismissEvent)
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
-                    .id("curl-preview-editor-hitbox")
-                    .max_h(px(320.))
+                    .id("code-snippet-editor-hitbox")
+                    .debug_selector(|| "code-snippet-editor".to_string())
+                    .h(px(360.))
                     .p_2()
                     .rounded_none()
                     .border_1()
                     .border_color(cyberpunk::border_dim())
                     .bg(cyberpunk::surface())
-                    .child(self.curl_editor.clone()),
+                    .child(self.code_editor.clone()),
             )
             .child(
-                h_flex().justify_end().gap_2().child(
-                    Button::new("curl-preview-copy", "Copy")
-                        .style(ButtonStyle::OutlinedCustom(
-                            cyberpunk::Accent::Cyan.border(),
-                        ))
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.copy(cx);
-                            cx.emit(gpui::DismissEvent);
-                        })),
-                ),
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new("The same request Send would make: the variables resolved, the auth applied.")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("code-snippet-copy", "Copy")
+                            .style(ButtonStyle::OutlinedCustom(
+                                cyberpunk::Accent::Cyan.border(),
+                            ))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.copy(cx);
+                                cx.emit(gpui::DismissEvent);
+                            })),
+                    ),
             )
     }
 }
@@ -5196,8 +5341,11 @@ mod tests {
         });
     }
 
+    /// The Code button opens a window rather than copying at once, the window shows
+    /// the request in the shape asked for, and Copy puts that shape on the
+    /// clipboard.
     #[gpui::test]
-    async fn clicking_copy_as_curl_opens_a_preview_and_its_copy_button_puts_the_command_on_the_clipboard(
+    async fn the_code_button_opens_a_window_and_its_copy_button_copies_that_shape(
         cx: &mut TestAppContext,
     ) {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
@@ -5208,13 +5356,13 @@ mod tests {
         });
         draw(&mut cx);
 
-        let copy_button = debug_center(&mut cx, "request-copy-curl");
-        cx.simulate_click(copy_button, gpui::Modifiers::none());
+        let code_button = debug_center(&mut cx, "request-copy-curl");
+        cx.simulate_click(code_button, gpui::Modifiers::none());
         cx.run_until_parked();
 
         assert!(
             cx.read_from_clipboard().is_none(),
-            "clicking Copy as cURL must open a preview, not copy immediately"
+            "the button opens the window; copying is what the window's own button does"
         );
 
         let workspace = view
@@ -5223,22 +5371,40 @@ mod tests {
             .expect("the workspace should still be alive");
         let modal = workspace
             .read_with(&cx, |workspace, cx| {
-                workspace.active_modal::<CurlPreviewModal>(cx)
+                workspace.active_modal::<CodeSnippetModal>(cx)
             })
-            .expect("Copy as cURL should open a preview modal");
-        let preview_text = modal.read_with(&cx, |modal, cx| modal.curl_editor.read(cx).text(cx));
-        assert!(preview_text.contains("curl --request GET"));
-        assert!(preview_text.contains("https://api.example.com/ping"));
+            .expect("the Code button should open the code window");
+
+        let shown = modal.read_with(&cx, |modal, cx| modal.code_editor.read(cx).text(cx));
+        assert!(shown.contains("curl --request GET"), "{shown}");
+        assert!(shown.contains("https://api.example.com/ping"), "{shown}");
+
+        // Another shape: the same request, written differently.
+        modal.update_in(&mut cx, |modal, window, cx| {
+            modal.show(Snippet::Go, window, cx)
+        });
+        cx.run_until_parked();
+        let as_go = modal.read_with(&cx, |modal, cx| modal.code_editor.read(cx).text(cx));
+        assert!(
+            as_go.contains("net/http") && as_go.contains("https://api.example.com/ping"),
+            "picking another shape has to write the same request in it:\n{as_go}"
+        );
+        assert!(
+            !as_go.contains("curl --request"),
+            "and it must not leave the shape before it behind:\n{as_go}"
+        );
 
         modal.update_in(&mut cx, |modal, _window, cx| modal.copy(cx));
         cx.run_until_parked();
 
-        let clipboard_text = cx
+        let copied = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
-            .expect("the preview's Copy button should place text on the clipboard");
-        assert!(clipboard_text.contains("curl --request GET"));
-        assert!(clipboard_text.contains("https://api.example.com/ping"));
+            .expect("the window's Copy button puts the code on the clipboard");
+        assert!(
+            copied.contains("net/http"),
+            "what is copied is the shape being shown:\n{copied}"
+        );
     }
 
     #[gpui::test]
