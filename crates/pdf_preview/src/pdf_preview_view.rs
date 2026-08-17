@@ -2521,7 +2521,10 @@ impl PdfView {
         Some(
             div()
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
+                .debug_selector(|| "pdf-found".to_string())
                 .children(marks)
                 .into_any_element(),
         )
@@ -2577,8 +2580,15 @@ impl PdfView {
         });
         Some(
             div()
+                // Pinned to the page's corner. Absolute with no corner named lands
+                // where it would have gone in the flow -- under the picture, off
+                // the bottom of the page -- and the marks are drawn where nobody
+                // can see them.
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
+                .debug_selector(|| "pdf-selection".to_string())
                 .children(marked)
                 .into_any_element(),
         )
@@ -3810,6 +3820,57 @@ mod tests {
             ((character.left + character.right) / 2.) / a4().width,
             1. - ((character.bottom + character.top) / 2.) / a4().height,
         )
+    }
+
+    /// The mark has to be painted over the page. A wrapper placed absolutely with
+    /// no corner named lands where it would have gone in the flow -- under the
+    /// page's picture, off the bottom of it -- and then the selection is correct in
+    /// every way except that nobody can see it.
+    #[gpui::test]
+    async fn the_mark_over_the_text_is_painted_on_the_page(cx: &mut TestAppContext) {
+        a_working_editor(cx);
+        let window = cx.add_window(|window, cx| {
+            PdfView::open_path(PathBuf::from("/nowhere/document.pdf"), window, cx)
+        });
+        let view = window.root(cx).expect("the reader was built");
+        let characters = two_lines_of_text();
+        view.update(cx, |view, _| {
+            view.pages = vec![None; 2];
+            view.page_sizes = (0..2).map(|_| a4()).collect();
+            view.page_bounds = (0..2)
+                .map(|_| Rc::new(Cell::new(Bounds::default())))
+                .collect();
+            view.chars.insert(0, Rc::new(two_lines_of_text()));
+            view.selection = Some(Selection {
+                page: 0,
+                from: over_character(&characters, 0),
+                to: over_character(&characters, characters.len() - 1),
+                dragging: false,
+            });
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1000.), px(900.)));
+        visual.run_until_parked();
+        for _ in 0..2 {
+            visual.update(|window, cx| window.draw(cx).clear());
+        }
+
+        let page = view.read_with(&mut visual, |view, _| view.page_bounds[0].get());
+        let mark = visual
+            .debug_bounds("pdf-selection")
+            .expect("the mark was painted");
+
+        assert!(
+            page.size.height > px(0.),
+            "the page has to have been painted for this to mean anything"
+        );
+        assert!(
+            (f32::from(mark.origin.y) - f32::from(page.origin.y)).abs() < 1.
+                && (f32::from(mark.origin.x) - f32::from(page.origin.x)).abs() < 1.,
+            "the mark was painted at {:?} while the page is at {:?}",
+            mark.origin,
+            page.origin
+        );
     }
 
     #[gpui::test]
