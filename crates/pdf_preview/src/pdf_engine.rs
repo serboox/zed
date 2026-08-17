@@ -49,30 +49,39 @@ fn library_file_name() -> &'static str {
     }
 }
 
-/// The engine this process reads PDFs through.
+/// Does something with the engine this process reads PDFs through, with nothing
+/// else doing anything with it at the same time.
 ///
-/// The library binds itself into a place of its own, once for the whole process:
-/// a second binding fails, whatever it was asked to bind to. Every errand used to
-/// bind for itself, so the first one won and the rest were told there was no
-/// engine -- which is why a document opened with its page count read and not one
-/// of its pages drawn. It is bound here once and lent out, and since the library
-/// is not one that can be called from two threads at a time, the calls it is lent
-/// for go through the crate's own lock.
-pub fn engine() -> Result<&'static Pdfium> {
+/// Two things about the library make this the only way to reach it. It binds
+/// itself into a place of its own, once for the whole process: a second binding
+/// fails whatever it is asked to bind to, so an errand that binds for itself gets
+/// an engine only if it is the first, and every other one is told there is none.
+/// And it must not be called from two threads at once -- the crate's
+/// `thread_safe` feature only says the engine may be *held* by several threads,
+/// leaving the serialising to whoever holds it, and pages are drawn on a pool of
+/// them. So it is bound once, kept, and lent out one caller at a time.
+pub fn with_engine<R>(errand: impl FnOnce(&Pdfium) -> Result<R>) -> Result<R> {
     static ENGINE: OnceLock<Mutex<Option<&'static Pdfium>>> = OnceLock::new();
     let held = ENGINE.get_or_init(|| Mutex::new(None));
     let mut held = held
         .lock()
         .map_err(|_| anyhow!("the PDF engine was left locked by a thread that failed"))?;
-    if let Some(engine) = *held {
-        return Ok(engine);
-    }
-    // Kept for as long as the process runs, which is what the library does with
-    // itself anyway; a failure leaves nothing behind, so a library put in place
-    // later is still found.
-    let bound: &'static Pdfium = Box::leak(Box::new(bind()?));
-    *held = Some(bound);
-    Ok(bound)
+    let engine = match *held {
+        Some(engine) => engine,
+        None => {
+            // Kept for as long as the process runs, which is what the library
+            // does with itself anyway; a failure leaves nothing behind, so a
+            // library put in place later is still found.
+            let bound: &'static Pdfium = Box::leak(Box::new(bind()?));
+            *held = Some(bound);
+            bound
+        }
+    };
+    // The lock is held for the whole errand, not merely for the lending: the
+    // document, its pages and everything read off them are the library's own
+    // state, and another thread in there at the same time gives wrong answers or
+    // brings the process down.
+    errand(engine)
 }
 
 /// Binds the library. Walks the places above and stops at the first that loads.
@@ -118,42 +127,43 @@ pub struct RenderedPage {
 /// Renders `page_index` of the document at `path` so that it is `width` wide.
 /// The height follows the page's own proportions.
 pub fn render_page(
-    engine: &Pdfium,
     path: &Path,
     page_index: PdfPageIndex,
     width: u32,
     quarter_turns: u8,
 ) -> Result<RenderedPage> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let page = document
-        .pages()
-        .get(page_index)
-        .with_context(|| format!("page {page_index} of {}", path.display()))?;
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
 
-    let config = PdfRenderConfig::new()
-        .set_target_width(width as i32)
-        .rotate(rotation_of(quarter_turns), true);
-    let bitmap = page
-        .render_with_config(&config)
-        .context("rendering the page")?;
-    let image = bitmap
-        .as_image()
-        .context("reading the rendered page")?
-        .into_rgba8();
-    let (width, height) = (image.width(), image.height());
+        let config = PdfRenderConfig::new()
+            .set_target_width(width as i32)
+            .rotate(rotation_of(quarter_turns), true);
+        let bitmap = page
+            .render_with_config(&config)
+            .context("rendering the page")?;
+        let image = bitmap
+            .as_image()
+            .context("reading the rendered page")?
+            .into_rgba8();
+        let (width, height) = (image.width(), image.height());
 
-    // RGBA out of the engine, BGRA into the editor.
-    let mut pixels = image.into_raw();
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
+        // RGBA out of the engine, BGRA into the editor.
+        let mut pixels = image.into_raw();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
 
-    Ok(RenderedPage {
-        width,
-        height,
-        pixels,
+        Ok(RenderedPage {
+            width,
+            height,
+            pixels,
+        })
     })
 }
 
@@ -168,15 +178,17 @@ fn rotation_of(quarter_turns: u8) -> PdfPageRenderRotation {
 }
 
 /// The whole text of a page, for copying or searching.
-pub fn page_text(engine: &Pdfium, path: &Path, page_index: PdfPageIndex) -> Result<String> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let page = document
-        .pages()
-        .get(page_index)
-        .with_context(|| format!("page {page_index} of {}", path.display()))?;
-    Ok(page.text().context("reading the page's text")?.all())
+pub fn page_text(path: &Path, page_index: PdfPageIndex) -> Result<String> {
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
+        Ok(page.text().context("reading the page's text")?.all())
+    })
 }
 
 /// A page's own size, in the points a PDF is laid out in. Screen positions are
@@ -187,24 +199,25 @@ pub struct PageSize {
 }
 
 /// The size of every page, in order.
-pub fn page_sizes(engine: &Pdfium, path: &Path) -> Result<Vec<PageSize>> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    Ok(document
-        .pages()
-        .iter()
-        .map(|page| PageSize {
-            width: page.width().value,
-            height: page.height().value,
-        })
-        .collect())
+pub fn page_sizes(path: &Path) -> Result<Vec<PageSize>> {
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        Ok(document
+            .pages()
+            .iter()
+            .map(|page| PageSize {
+                width: page.width().value,
+                height: page.height().value,
+            })
+            .collect())
+    })
 }
 
 /// The text of `page_index` inside the given rectangle, which is in page points
 /// with the origin at the bottom left, as PDF lays a page out.
 pub fn text_in_rect(
-    engine: &Pdfium,
     path: &Path,
     page_index: PdfPageIndex,
     bottom: f32,
@@ -212,15 +225,17 @@ pub fn text_in_rect(
     top: f32,
     right: f32,
 ) -> Result<String> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let page = document
-        .pages()
-        .get(page_index)
-        .with_context(|| format!("page {page_index} of {}", path.display()))?;
-    let text = page.text().context("reading the page's text")?;
-    Ok(text.inside_rect(PdfRect::new_from_values(bottom, left, top, right)))
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {page_index} of {}", path.display()))?;
+        let text = page.text().context("reading the page's text")?;
+        Ok(text.inside_rect(PdfRect::new_from_values(bottom, left, top, right)))
+    })
 }
 
 /// What a document says about itself, for the reader who asks.
@@ -233,27 +248,29 @@ pub struct Facts {
     pub first_page: Option<PageSize>,
 }
 
-pub fn facts(engine: &Pdfium, path: &Path) -> Result<Facts> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let metadata = document.metadata();
-    let tag = |which: PdfDocumentMetadataTagType| {
-        metadata
-            .get(which)
-            .map(|tag| tag.value().to_string())
-            .filter(|value| !value.trim().is_empty())
-    };
-    Ok(Facts {
-        pages: document.pages().len() as usize,
-        title: tag(PdfDocumentMetadataTagType::Title),
-        author: tag(PdfDocumentMetadataTagType::Author),
-        producer: tag(PdfDocumentMetadataTagType::Producer),
-        created: tag(PdfDocumentMetadataTagType::CreationDate),
-        first_page: document.pages().first().ok().map(|page| PageSize {
-            width: page.width().value,
-            height: page.height().value,
-        }),
+pub fn facts(path: &Path) -> Result<Facts> {
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let metadata = document.metadata();
+        let tag = |which: PdfDocumentMetadataTagType| {
+            metadata
+                .get(which)
+                .map(|tag| tag.value().to_string())
+                .filter(|value| !value.trim().is_empty())
+        };
+        Ok(Facts {
+            pages: document.pages().len() as usize,
+            title: tag(PdfDocumentMetadataTagType::Title),
+            author: tag(PdfDocumentMetadataTagType::Author),
+            producer: tag(PdfDocumentMetadataTagType::Producer),
+            created: tag(PdfDocumentMetadataTagType::CreationDate),
+            first_page: document.pages().first().ok().map(|page| PageSize {
+                width: page.width().value,
+                height: page.height().value,
+            }),
+        })
     })
 }
 
@@ -268,45 +285,49 @@ pub struct OutlineEntry {
 /// sits so the reader can see the shape of it. A line that leads nowhere -- some
 /// documents carry those -- is left out, since there would be nothing to do with
 /// it.
-pub fn outline(engine: &Pdfium, path: &Path) -> Result<Vec<OutlineEntry>> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let mut lines = Vec::new();
-    for bookmark in document.bookmarks().iter() {
-        let Some(title) = bookmark.title().filter(|title| !title.trim().is_empty()) else {
-            continue;
-        };
-        let Some(page) = bookmark
-            .destination()
-            .and_then(|destination| destination.page_index().ok())
-        else {
-            continue;
-        };
-        let mut depth = 0;
-        let mut above = bookmark.parent();
-        while let Some(parent) = above {
-            depth += 1;
-            if depth > 8 {
-                break;
+pub fn outline(path: &Path) -> Result<Vec<OutlineEntry>> {
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let mut lines = Vec::new();
+        for bookmark in document.bookmarks().iter() {
+            let Some(title) = bookmark.title().filter(|title| !title.trim().is_empty()) else {
+                continue;
+            };
+            let Some(page) = bookmark
+                .destination()
+                .and_then(|destination| destination.page_index().ok())
+            else {
+                continue;
+            };
+            let mut depth = 0;
+            let mut above = bookmark.parent();
+            while let Some(parent) = above {
+                depth += 1;
+                if depth > 8 {
+                    break;
+                }
+                above = parent.parent();
             }
-            above = parent.parent();
+            lines.push(OutlineEntry {
+                title,
+                page: page as usize,
+                depth,
+            });
         }
-        lines.push(OutlineEntry {
-            title,
-            page: page as usize,
-            depth,
-        });
-    }
-    Ok(lines)
+        Ok(lines)
+    })
 }
 
 /// How many pages the document at `path` holds.
-pub fn page_count(engine: &Pdfium, path: &Path) -> Result<PdfPageIndex> {
-    let document = engine
-        .load_pdf_from_file(path, None)
-        .with_context(|| format!("opening {}", path.display()))?;
-    Ok(document.pages().len())
+pub fn page_count(path: &Path) -> Result<PdfPageIndex> {
+    with_engine(|engine| {
+        let document = engine
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("opening {}", path.display()))?;
+        Ok(document.pages().len())
+    })
 }
 
 #[cfg(test)]
@@ -346,70 +367,84 @@ mod tests {
         );
     }
 
-    /// The library is bound into a place of its own, once for the whole process.
-    /// Binding it a second time fails, so what everything reads through has to be
-    /// the same instance -- which is what this pins. With a library to hand it
-    /// also draws a page, since "bound" and "able to draw" are not the same
-    /// claim.
+    /// The library is bound into a place of its own, once for the whole process,
+    /// and it must not be called from two threads at a time. Both are pinned
+    /// here: with a library to hand, pages are drawn from several threads at
+    /// once, which is how the editor draws them. Without the lock this does not
+    /// fail an assertion -- it brings the process down, which is what it did.
     #[test]
-    fn the_engine_is_lent_out_rather_than_bound_again() {
+    fn the_engine_serves_one_caller_at_a_time() {
         let library_at_hand = std::env::var("ZED_PDFIUM_PATH").is_ok()
             || candidate_directories()
                 .iter()
                 .any(|directory| directory.join(library_file_name()).exists());
 
-        let first = engine();
-        let second = engine();
-
         if !library_at_hand {
-            // Nothing to lend. Then both answers are errors rather than panics,
-            // and neither leaves anything behind that would stop a library put in
-            // place later from being found.
-            assert!(first.is_err() && second.is_err());
+            // Nothing to lend. Then the answer is an error rather than a panic,
+            // and asking again is still allowed, so a library put in place later
+            // is found.
+            assert!(with_engine(|_| Ok(())).is_err());
+            assert!(with_engine(|_| Ok(())).is_err());
             return;
         }
 
-        let first = first.expect("a library was there to bind");
-        let second = second.expect("the second asking gets the same engine");
-        assert!(
-            std::ptr::eq(first, second),
-            "each asking bound the library again, and every one after the first \
-             is told the library is already bound -- which reads as no engine"
-        );
-
-        // A document made here rather than read from the tree: what is being
-        // checked is that the engine works when it is lent out, not what any
+        // A document of our own making rather than one from the tree: what is
+        // being checked is the engine under several callers, not what any
         // particular file holds.
-        let made = first
-            .create_new_pdf()
-            .expect("the engine can make a document");
-        let bytes = {
-            let mut document = made;
+        let written = std::env::temp_dir().join("zed-pdf-engine-test.pdf");
+        let bytes = with_engine(|engine| {
+            let mut document = engine.create_new_pdf()?;
             document
                 .pages_mut()
-                .create_page_at_index(PdfPagePaperSize::a4(), 0)
-                .expect("a page can be added");
-            document.save_to_bytes().expect("the document can be saved")
-        };
-        let written = std::env::temp_dir().join("zed-pdf-engine-test.pdf");
+                .create_page_at_index(PdfPagePaperSize::a4(), 0)?;
+            Ok(document.save_to_bytes()?)
+        })
+        .expect("the engine can make a document");
         std::fs::write(&written, bytes).expect("the document can be written");
 
-        assert_eq!(
-            page_count(first, &written).expect("the pages can be counted"),
-            1
-        );
-        let drawn = render_page(first, &written, 0, 200, 0).expect("the page draws");
-        assert_eq!(drawn.width, 200);
+        assert_eq!(page_count(&written).expect("the pages are counted"), 1);
+
+        // Several threads, each asking for something different, over and over:
+        // what brings the library down is two of its calls overlapping, and one
+        // round of eight would have to be unlucky to catch it.
+        let went_well: Vec<bool> = std::thread::scope(|threads| {
+            (0..12)
+                .map(|at| {
+                    let written = written.clone();
+                    threads.spawn(move || {
+                        for round in 0..15 {
+                            let asked_for = 80 + ((at * 15 + round) % 40) * 5;
+                            let drawn = match render_page(&written, 0, asked_for, 0) {
+                                Ok(drawn) => drawn,
+                                Err(_) => return false,
+                            };
+                            if drawn.width != asked_for
+                                || drawn.pixels.len()
+                                    != (drawn.width * drawn.height * 4) as usize
+                            {
+                                return false;
+                            }
+                            if page_count(&written).is_err()
+                                || page_sizes(&written).is_err()
+                                || page_text(&written, 0).is_err()
+                                || facts(&written).is_err()
+                            {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().expect("no thread was lost"))
+                .collect()
+        });
+
         assert!(
-            drawn.height > 200,
-            "an A4 page is taller than it is wide: {} by {}",
-            drawn.width,
-            drawn.height
-        );
-        assert_eq!(
-            drawn.pixels.len(),
-            (drawn.width * drawn.height * 4) as usize,
-            "four bytes to a pixel, which is what the editor's image type takes"
+            went_well.iter().all(|went_well| *went_well),
+            "the engine gave a wrong or failed answer while several threads were \
+             in it at once"
         );
         std::fs::remove_file(&written).ok();
     }

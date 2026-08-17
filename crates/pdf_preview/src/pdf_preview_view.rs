@@ -322,8 +322,7 @@ impl PdfView {
         self.opening = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
-                    let sizes = pdf_engine::page_sizes(&engine, &path)?;
+                    let sizes = pdf_engine::page_sizes(&path)?;
                     anyhow::Ok(sizes)
                 })
                 .await;
@@ -374,8 +373,7 @@ impl PdfView {
             self.rendering.push(cx.spawn(async move |view, cx| {
                 let drawn = cx
                     .background_spawn(async move {
-                        let engine = pdf_engine::engine()?;
-                        pdf_engine::render_page(&engine, &path, index as PdfPageIndex, width, turns)
+                        pdf_engine::render_page(&path, index as PdfPageIndex, width, turns)
                     })
                     .await;
                 view.update(cx, |view, cx| {
@@ -748,10 +746,9 @@ impl PdfView {
         self.searching = Some(cx.spawn(async move |view, cx| {
             let found = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
                     let mut found = Vec::new();
                     for index in 0..pages {
-                        let text = pdf_engine::page_text(&engine, &path, index as PdfPageIndex)?;
+                        let text = pdf_engine::page_text(&path, index as PdfPageIndex)?;
                         if text.to_lowercase().contains(&wanted) {
                             found.push(index);
                         }
@@ -841,8 +838,7 @@ impl PdfView {
         self.reading_facts = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
-                    let facts = pdf_engine::facts(&engine, &path)?;
+                    let facts = pdf_engine::facts(&path)?;
                     let on_disk = std::fs::metadata(&path).map(|file| file.len()).ok();
                     anyhow::Ok((facts, on_disk, path))
                 })
@@ -927,8 +923,7 @@ impl PdfView {
         self.reading_outline = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
-                    let lines = pdf_engine::outline(&engine, &path)?;
+                    let lines = pdf_engine::outline(&path)?;
                     anyhow::Ok(
                         lines
                             .into_iter()
@@ -969,9 +964,7 @@ impl PdfView {
                 .push(cx.spawn(async move |view, cx| {
                     let drawn = cx
                         .background_spawn(async move {
-                            let engine = pdf_engine::engine()?;
                             pdf_engine::render_page(
-                                &engine,
                                 &path,
                                 index as PdfPageIndex,
                                 THUMBNAIL_WIDTH,
@@ -1046,8 +1039,7 @@ impl PdfView {
         self.reading_text = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
-                    pdf_engine::text_in_rect(&engine, &path, page_index, bottom, left, top, right)
+                    pdf_engine::text_in_rect(&path, page_index, bottom, left, top, right)
                 })
                 .await;
             view.update(cx, |view, cx| {
@@ -1095,9 +1087,7 @@ impl PdfView {
         self.reading_text = Some(cx.spawn(async move |view, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let engine = pdf_engine::engine()?;
                     pdf_engine::text_in_rect(
-                        &engine,
                         &path,
                         page as PdfPageIndex,
                         0.,
