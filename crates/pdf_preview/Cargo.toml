@@ -13,17 +13,23 @@ path = "src/pdf_preview.rs"
 
 [dependencies]
 anyhow.workspace = true
+editor.workspace = true
 image.workspace = true
 smallvec.workspace = true
 gpui.workspace = true
 log.workspace = true
+menu.workspace = true
 paths.workspace = true
 pdfium-render.workspace = true
 project.workspace = true
+smol.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

@@ -693,7 +693,10 @@ linkify = "0.10.0"
 libwebrtc = "0.3.26"
 livekit = { version = "0.7.32", features = ["tokio", "rustls-tls-native-roots"] }
 log = { version = "0.4.16", features = ["serde"] }
-pdfium-render = "0.9.3"
+# The library binds itself once for the whole process and is not safe to call
+# from two threads at once; this feature is what puts a lock around it, since the
+# pages are drawn on a pool of background threads.
+pdfium-render = { version = "0.9.3", features = ["thread_safe"] }
 lru = "0.16"
 lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "f4dfa89a21ca35cd929b70354b1583fabae325f8" }
 mach2 = "0.5"
