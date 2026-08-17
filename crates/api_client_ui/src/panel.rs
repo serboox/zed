@@ -3,13 +3,16 @@ use crate::store::{
     ApiClientStore, ApiClientStoreEvent, GlobalApiClientStore, RelativePosition, TreeItemRef,
 };
 use crate::text_prompt_modal::TextPromptModal;
-use api_client::{Collection, CollectionId, EnvironmentId, Folder, FolderId, Request, RequestId};
+use api_client::{
+    Collection, CollectionId, EnvironmentId, Folder, FolderId, Request, RequestId, TreeOrder,
+};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
     Render, ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window, div,
 };
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 use ui::{
@@ -109,50 +112,95 @@ fn build_tree(
     collections: &[Collection],
     folders: &[Folder],
     requests: &[Request],
+    order: TreeOrder,
 ) -> Vec<TreeNode> {
     fn build_children(
         collection_id: CollectionId,
         parent_id: Option<FolderId>,
         folders: &[Folder],
         requests: &[Request],
+        order: TreeOrder,
     ) -> Vec<TreeNode> {
         let mut folder_children: Vec<&Folder> = folders
             .iter()
             .filter(|f| f.collection_id == collection_id && f.parent_id == parent_id)
             .collect();
-        folder_children.sort_by_key(|f| f.order);
         let mut request_children: Vec<&Request> = requests
             .iter()
             .filter(|r| r.collection_id == collection_id && r.folder_id == parent_id)
             .collect();
-        request_children.sort_by_key(|r| r.order);
 
-        let mut nodes = Vec::new();
-        for folder in folder_children {
-            nodes.push((
-                folder.order,
-                TreeNode::Folder {
-                    folder: folder.clone(),
-                    children: build_children(collection_id, Some(folder.id), folders, requests),
-                },
-            ));
+        if order == TreeOrder::Manual {
+            folder_children.sort_by_key(|f| f.order);
+            request_children.sort_by_key(|r| r.order);
+            // One list ordered by the number both kinds carry, so a folder
+            // dragged between two requests stays there.
+            let mut dragged = Vec::new();
+            for folder in folder_children {
+                dragged.push((
+                    folder.order,
+                    TreeNode::Folder {
+                        folder: folder.clone(),
+                        children: build_children(
+                            collection_id,
+                            Some(folder.id),
+                            folders,
+                            requests,
+                            order,
+                        ),
+                    },
+                ));
+            }
+            for request in request_children {
+                dragged.push((request.order, TreeNode::Request(request.clone())));
+            }
+            dragged.sort_by_key(|(order, _)| *order);
+            return dragged.into_iter().map(|(_, node)| node).collect();
         }
-        for request in request_children {
-            nodes.push((request.order, TreeNode::Request(request.clone())));
-        }
-        nodes.sort_by_key(|(order, _)| *order);
-        nodes.into_iter().map(|(_, node)| node).collect()
+
+        folder_children.sort_by(|left, right| sort_by(order, &left.name, &right.name));
+        request_children.sort_by(|left, right| sort_by(order, &left.name, &right.name));
+        // Folders first, the way a tree of names reads everywhere else: a
+        // container is not a leaf, and mixing the two by name alone would scatter
+        // the folders through the requests.
+        let mut nodes: Vec<TreeNode> = folder_children
+            .into_iter()
+            .map(|folder| TreeNode::Folder {
+                folder: folder.clone(),
+                children: build_children(collection_id, Some(folder.id), folders, requests, order),
+            })
+            .collect();
+        nodes.extend(
+            request_children
+                .into_iter()
+                .map(|request| TreeNode::Request(request.clone())),
+        );
+        nodes
     }
 
     let mut ordered_collections: Vec<&Collection> = collections.iter().collect();
-    ordered_collections.sort_by_key(|collection| collection.order);
+    match order {
+        TreeOrder::Manual => ordered_collections.sort_by_key(|collection| collection.order),
+        _ => ordered_collections.sort_by(|left, right| sort_by(order, &left.name, &right.name)),
+    }
     ordered_collections
         .into_iter()
         .map(|collection| TreeNode::Collection {
             collection: collection.clone(),
-            children: build_children(collection.id, None, folders, requests),
+            children: build_children(collection.id, None, folders, requests, order),
         })
         .collect()
+}
+
+/// Two names under the chosen order, compared the way the project panel compares
+/// file names: case does not matter, punctuation counts where it is written, and a
+/// number is read as a number, so `V2` comes before `V10`. `Manual` never reaches
+/// here -- it has no names to compare, only the numbers things were dragged into.
+fn sort_by(order: TreeOrder, left: &str, right: &str) -> Ordering {
+    match order {
+        TreeOrder::NameReversed => util::paths::natural_sort(right, left),
+        _ => util::paths::natural_sort(left, right),
+    }
 }
 
 /// Flattens the tree into the same order it is painted, skipping the children
@@ -491,7 +539,12 @@ impl ApiClientPanel {
 
     fn navigable_entities(&self, cx: &Context<Self>) -> Vec<SelectedEntity> {
         let store = self.store.read(cx);
-        let nodes = build_tree(&store.collections, &store.folders, &store.requests);
+        let nodes = build_tree(
+            &store.collections,
+            &store.folders,
+            &store.requests,
+            store.tree_order,
+        );
         let query = self.search_query_text(cx);
         let nodes = if self.variable_search_query(&query).is_some() {
             Vec::new()
@@ -622,6 +675,13 @@ impl ApiClientPanel {
     /// coherent meaning (collections don't nest inside each other).
     fn handle_drop(&mut self, item: DraggedApiItem, target: ApiDropTarget, cx: &mut Context<Self>) {
         self.drag_target = None;
+        // Dropping a row between two others asks for a place, which only the
+        // dragged order can keep. Ordering by name would put the row straight
+        // back where it was, so the drag would read as broken.
+        if !matches!(target, ApiDropTarget::Folder(_)) {
+            self.store
+                .update(cx, |store, cx| store.set_tree_order(TreeOrder::Manual, cx));
+        }
         self.store.update(cx, |store, cx| match target {
             ApiDropTarget::Folder(id) => {
                 if let Some(item) = item.as_tree_item_ref() {
@@ -1903,6 +1963,53 @@ impl ApiClientPanel {
             .into_any_element()
     }
 
+    /// The order the tree is in, and the way to change it. Sits at the end of the
+    /// filter row rather than on a row of its own -- one control does not deserve
+    /// a line of the screen.
+    fn render_sort_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel = cx.entity();
+        let shown = self.store.read(cx).tree_order;
+        div()
+            .id("api-client-sort-trigger")
+            .debug_selector(|| "api-client-sort-trigger".to_string())
+            .child(
+                ui::PopoverMenu::new("api-client-sort-popover")
+                    // No tooltip on the trigger: it would be painted over the menu's
+                    // own first line the moment the menu opens. The menu says which
+                    // order is in force, with a tick against it.
+                    .trigger(
+                        IconButton::new("api-client-sort-button", IconName::ArrowDown10)
+                            .icon_size(IconSize::Small),
+                    )
+                    .menu(move |window, cx| {
+                        let panel = panel.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for order in
+                                [TreeOrder::Name, TreeOrder::NameReversed, TreeOrder::Manual]
+                            {
+                                let panel = panel.clone();
+                                menu = menu.toggleable_entry(
+                                    order.label(),
+                                    order == shown,
+                                    ui::IconPosition::Start,
+                                    None,
+                                    move |_window, cx| {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.store.update(cx, |store, cx| {
+                                                store.set_tree_order(order, cx)
+                                            });
+                                            cx.notify();
+                                        });
+                                    },
+                                );
+                            }
+                            menu
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// Header button offering every import/export action without requiring
     /// a right-click first.
     fn render_import_button(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2352,7 +2459,12 @@ impl Render for ApiClientPanel {
             let no_matches = results.is_empty();
             (Vec::new(), Some(results), no_matches)
         } else {
-            let nodes = build_tree(&store.collections, &store.folders, &store.requests);
+            let nodes = build_tree(
+                &store.collections,
+                &store.folders,
+                &store.requests,
+                store.tree_order,
+            );
             let filtered_nodes = filter_tree(nodes, &query_lowercase, &self.active_method_filters);
             let no_matches = filter_active && !is_empty && tree_has_no_requests(&filtered_nodes);
             (
@@ -2455,7 +2567,8 @@ impl Render for ApiClientPanel {
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .child(div().flex_1().child(self.search_editor.clone())),
+                            .child(div().flex_1().child(self.search_editor.clone()))
+                            .child(self.render_sort_control(cx)),
                     )
                     .when(variable_query.is_none(), |el| {
                         el.child(
@@ -3303,6 +3416,203 @@ mod tests {
         });
     }
 
+    /// The reader has to be able to change the order from the list itself, and the
+    /// rows have to move on screen when they do -- not merely in the store.
+    #[gpui::test]
+    async fn the_sort_control_moves_the_rows_on_screen(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+
+        let (zebra, apples) = store.update_in(&mut cx, |store, _window, cx| {
+            (
+                store.create_collection("Zebra".to_string(), cx),
+                store.create_collection("apples".to_string(), cx),
+            )
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let row_of = |cx: &mut VisualTestContext, id: CollectionId| {
+            debug_center(cx, format!("api-client-collection-row-{id}").leak()).y
+        };
+
+        assert!(
+            row_of(&mut cx, apples) < row_of(&mut cx, zebra),
+            "by name, `apples` is painted above `Zebra`: case is not a grouping"
+        );
+
+        // The way a reader changes it: the control at the end of the filter row.
+        let control = debug_center(&mut cx, "api-client-sort-trigger");
+        cx.simulate_click(control, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let backwards = debug_center(&mut cx, "MENU_ITEM-Name (Z-A)");
+        cx.simulate_click(backwards, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            row_of(&mut cx, zebra) < row_of(&mut cx, apples),
+            "and the rows really move when the order is changed"
+        );
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store.tree_order,
+                TreeOrder::NameReversed,
+                "the choice is the store's, so it is remembered for the next session"
+            );
+        });
+    }
+
+    /// The names a reader sees, top to bottom, however deep the tree goes.
+    fn shown_names(nodes: &[TreeNode]) -> Vec<String> {
+        let mut names = Vec::new();
+        for node in nodes {
+            match node {
+                TreeNode::Collection {
+                    collection,
+                    children,
+                } => {
+                    names.push(collection.name.clone());
+                    names.extend(shown_names(children));
+                }
+                TreeNode::Folder { folder, children } => {
+                    names.push(folder.name.clone());
+                    names.extend(shown_names(children));
+                }
+                TreeNode::Request(request) => names.push(request.name.clone()),
+            }
+        }
+        names
+    }
+
+    /// A list of names has to read the way a list of names reads: case is not a
+    /// grouping, punctuation counts where it is written, and a number is read as a
+    /// number. This is the order every other API client shows.
+    #[test]
+    fn collections_are_listed_the_way_a_list_of_names_reads() {
+        let named = |name: &str, order: i64| {
+            let mut collection = Collection::new(name.to_string());
+            collection.order = order;
+            collection
+        };
+        // Dragged into the file in an order of their own, so a by-name list cannot
+        // pass by accident.
+        let collections = vec![
+            named("finbox-service", 0),
+            named("App API", 1),
+            named("--Analyst--", 2),
+            named("ads", 3),
+            named("[Screener-V2] Collection", 4),
+            named("-- notes on the LLM", 5),
+            named("auth-gateway", 6),
+            named("coreModelsWrapper", 7),
+            named("---ElasticSearch---Search", 8),
+            named("companies", 9),
+            named("App API-News", 10),
+            named("Screener-V10", 11),
+            named("Screener-V2", 12),
+        ];
+
+        let by_name = shown_names(&build_tree(&collections, &[], &[], TreeOrder::Name));
+        assert_eq!(
+            by_name,
+            vec![
+                "-- notes on the LLM",
+                "---ElasticSearch---Search",
+                "--Analyst--",
+                "[Screener-V2] Collection",
+                "ads",
+                "App API",
+                "App API-News",
+                "auth-gateway",
+                "companies",
+                "coreModelsWrapper",
+                "finbox-service",
+                "Screener-V2",
+                "Screener-V10",
+            ],
+            "punctuation first, case ignored, and V2 before V10"
+        );
+
+        let backwards = shown_names(&build_tree(&collections, &[], &[], TreeOrder::NameReversed));
+        let mut expected_backwards = by_name;
+        expected_backwards.reverse();
+        assert_eq!(
+            backwards, expected_backwards,
+            "Z-A is the same list, read up"
+        );
+
+        let dragged = shown_names(&build_tree(&collections, &[], &[], TreeOrder::Manual));
+        assert_eq!(
+            dragged.first().map(String::as_str),
+            Some("finbox-service"),
+            "the dragged order is still there to go back to"
+        );
+    }
+
+    /// What is inside a collection is ordered by the same choice, with folders
+    /// ahead of requests -- a container is not a leaf.
+    #[test]
+    fn what_is_inside_a_collection_follows_the_same_order() {
+        let collection = Collection::new("things".to_string());
+        let folder =
+            |name: &str, order: i64| Folder::new(collection.id, name.to_string(), None, order);
+        let request = |name: &str, order: i64| {
+            let mut request = Request::new(collection.id, name.to_string());
+            request.order = order;
+            request
+        };
+        let folders = vec![folder("Zebra", 0), folder("apples", 1)];
+        let requests = vec![
+            request("delete one", 2),
+            request("Add one", 3),
+            request("list 10", 4),
+            request("list 2", 5),
+        ];
+
+        assert_eq!(
+            shown_names(&build_tree(
+                std::slice::from_ref(&collection),
+                &folders,
+                &requests,
+                TreeOrder::Name
+            )),
+            vec![
+                "things",
+                "apples",
+                "Zebra",
+                "Add one",
+                "delete one",
+                "list 2",
+                "list 10",
+            ]
+        );
+
+        assert_eq!(
+            shown_names(&build_tree(
+                &[collection],
+                &folders,
+                &requests,
+                TreeOrder::Manual
+            )),
+            vec![
+                "things",
+                "Zebra",
+                "apples",
+                "delete one",
+                "Add one",
+                "list 10",
+                "list 2",
+            ],
+            "the dragged order interleaves folders and requests as they were dropped"
+        );
+    }
+
     #[gpui::test]
     fn flatten_navigable_entities_matches_render_order_and_skips_collapsed_children(
         cx: &mut TestAppContext,
@@ -3332,7 +3642,7 @@ mod tests {
                 store.requests.clone(),
             )
         });
-        let nodes = build_tree(&collections, &folders, &requests);
+        let nodes = build_tree(&collections, &folders, &requests, TreeOrder::Name);
 
         // Everything starts collapsed by default: an empty expanded set must
         // only reveal the top-level collection, not its children.

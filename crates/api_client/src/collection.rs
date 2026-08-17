@@ -23,6 +23,32 @@ pub struct Collection {
     pub order: i64,
 }
 
+/// How a tree of collections is ordered on screen.
+///
+/// Remembered between sessions next to the collections themselves, the way the
+/// dragged order is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeOrder {
+    /// By name, from the start. The order a reader expects of a list of names.
+    #[default]
+    Name,
+    /// By name, from the end.
+    NameReversed,
+    /// Wherever things were dragged to.
+    Manual,
+}
+
+impl TreeOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            TreeOrder::Name => "Name (A-Z)",
+            TreeOrder::NameReversed => "Name (Z-A)",
+            TreeOrder::Manual => "Manually",
+        }
+    }
+}
+
 impl Collection {
     pub fn new(name: String) -> Self {
         Self {

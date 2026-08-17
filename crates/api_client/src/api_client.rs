@@ -16,7 +16,7 @@ pub mod scripting;
 pub mod variable_resolution;
 
 pub use aws_sigv4::{AwsSigV4Config, SignedAuthorization, format_amz_date, sign_request};
-pub use collection::{Collection, CollectionId};
+pub use collection::{Collection, CollectionId, TreeOrder};
 pub use environment::{Environment, EnvironmentId, GLOBAL_ENVIRONMENT_ID, Variable};
 pub use folder::{Folder, FolderId};
 pub use grpc_client::{GrpcTlsConfig, call_server_streaming, call_unary, connect_channel};

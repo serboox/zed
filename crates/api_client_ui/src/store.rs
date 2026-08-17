@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use api_client::{
     Collection, CollectionId, Environment, EnvironmentId, Folder, FolderId, HistoryEntry, Request,
-    RequestId,
+    RequestId, TreeOrder,
 };
 use credentials_provider::CredentialsProvider;
 use gpui::{App, AsyncApp, Context, Entity, EventEmitter, Global};
@@ -32,6 +32,12 @@ struct StoredCollections {
     folders: Vec<Folder>,
     #[serde(default)]
     requests: Vec<Request>,
+    /// How the tree is ordered on screen. A document written before this field
+    /// existed reads as by-name, which is how a list of names is expected to
+    /// read; the dragged order is kept in `order` either way, so switching back
+    /// to it loses nothing.
+    #[serde(default)]
+    tree_order: TreeOrder,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -282,6 +288,7 @@ pub enum RelativePosition {
 
 pub struct ApiClientStore {
     pub collections: Vec<Collection>,
+    pub tree_order: TreeOrder,
     pub folders: Vec<Folder>,
     pub requests: Vec<Request>,
     pub environments: Vec<Environment>,
@@ -317,6 +324,7 @@ impl ApiClientStore {
                     collections,
                     folders,
                     mut requests,
+                    tree_order,
                 } = collections;
                 let provider = cx.update(|cx| zed_credentials_provider::global(cx));
                 for request in &mut requests {
@@ -324,6 +332,7 @@ impl ApiClientStore {
                 }
                 this.update(cx, |store, cx| {
                     store.collections = collections;
+                    store.tree_order = tree_order;
                     store.folders = folders;
                     store.requests = requests;
                     store.environments = environments.environments;
@@ -338,6 +347,7 @@ impl ApiClientStore {
 
         Self {
             collections: Vec::new(),
+            tree_order: TreeOrder::default(),
             folders: Vec::new(),
             requests: Vec::new(),
             environments: Vec::new(),
@@ -360,6 +370,7 @@ impl ApiClientStore {
         let requests = self.requests.clone();
         let collections = self.collections.clone();
         let folders = self.folders.clone();
+        let tree_order = self.tree_order;
         cx.spawn(async move |_this, cx| {
             let provider = cx.update(|cx| zed_credentials_provider::global(cx));
             for request in &requests {
@@ -372,6 +383,7 @@ impl ApiClientStore {
                         collections,
                         folders,
                         requests: redacted,
+                        tree_order,
                     })
                     .log_err();
                 })
@@ -393,6 +405,17 @@ impl ApiClientStore {
                 save_environments_to_disk(&stored).log_err();
             })
             .detach();
+    }
+
+    /// Changes how the tree is ordered, and remembers it for the next session.
+    pub fn set_tree_order(&mut self, order: TreeOrder, cx: &mut Context<Self>) {
+        if self.tree_order == order {
+            return;
+        }
+        self.tree_order = order;
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        self.persist_collections(cx);
+        cx.notify();
     }
 
     // ----- Collections -----
