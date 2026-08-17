@@ -2479,6 +2479,7 @@ impl ShellExec {
                     command_label: command.clone(),
                     cwd,
                     env: HashMap::default(),
+                    env_file: None,
                     use_new_terminal: true,
                     allow_concurrent_runs: true,
                     reveal: RevealStrategy::NoFocus,

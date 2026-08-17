@@ -1353,6 +1353,7 @@ impl RunningState {
             command_label: title,
             cwd,
             env: envs,
+            env_file: None,
             use_new_terminal: true,
             allow_concurrent_runs: true,
             reveal: task::RevealStrategy::NoFocus,

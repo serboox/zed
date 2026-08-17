@@ -32,6 +32,13 @@ pub struct TaskTemplate {
     /// Env overrides for the command, will be appended to the terminal's environment from the settings.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// A file of `NAME=value` lines to read the environment from, such as a
+    /// project's `.env`. Read when the task is run, so editing the file changes
+    /// the next run without touching this configuration. Relative paths are taken
+    /// from the task's working directory. What `env` says wins over what the file
+    /// says, so one variable can be overridden without editing the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
     /// Current working directory to spawn the command into, defaults to current project root.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -154,6 +161,44 @@ impl TaskTemplates {
     }
 }
 
+/// The variables in the text of a `.env` file.
+///
+/// Deliberately plain: `NAME=value` a line, `#` starts a comment, blank lines are
+/// skipped, surrounding quotes are taken off a value, and a leading `export` is
+/// ignored so a file written to be sourced by a shell also works. Nothing else --
+/// no substitution, no multi-line values -- because a configuration that reads a
+/// file the reader can also `source` should agree with the shell about what it
+/// says.
+pub fn env_file_variables(text: &str) -> Vec<(String, String)> {
+    let mut variables = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        variables.push((name.to_string(), value.to_string()));
+    }
+    variables
+}
+
 impl TaskTemplate {
     /// Replaces all `VariableName` task variables in the task template string fields.
     ///
@@ -248,6 +293,16 @@ impl TaskTemplate {
             .log_err()?;
         let id = TaskId(format!("{id_base}_{task_hash}_{variables_hash}"));
 
+        let env_file = match self.env_file.as_deref() {
+            Some(env_file) => Some(substitute_all_template_variables_in_str(
+                env_file,
+                &task_variables,
+                &variable_names,
+                &mut substituted_variables,
+            )?),
+            None => None,
+        };
+
         let env = {
             // Start with the project environment as the base.
             let mut env = cx.project_env.clone();
@@ -289,6 +344,7 @@ impl TaskTemplate {
                 command: Some(command),
                 args: args_with_substitutions,
                 env,
+                env_file: env_file.map(PathBuf::from),
                 use_new_terminal: self.use_new_terminal,
                 allow_concurrent_runs: self.allow_concurrent_runs,
                 reveal: self.reveal,
@@ -511,6 +567,58 @@ fn substitute_all_template_variables_in_map(
 
 #[cfg(test)]
 mod tests {
+    /// The shape of a `.env` file as people actually write them. A parser that
+    /// disagrees with the shell about what the file says would give a task a
+    /// different environment than a `source .env` in the same terminal.
+    #[test]
+    fn an_env_file_is_read_the_way_a_shell_reads_one() {
+        let read = super::env_file_variables(
+            "\n# a comment\nPORT=8080\n  LOG = debug  \nexport TOKEN=\"a b\"\nQUOTED='c d'\n\
+             EMPTY=\nNOT_A_LINE\n=novalue\nURL=https://example.com/a?b=c\n",
+        );
+
+        assert_eq!(
+            read,
+            vec![
+                ("PORT".to_string(), "8080".to_string()),
+                ("LOG".to_string(), "debug".to_string()),
+                ("TOKEN".to_string(), "a b".to_string()),
+                ("QUOTED".to_string(), "c d".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("URL".to_string(), "https://example.com/a?b=c".to_string()),
+            ],
+            "comments, blank lines and lines without an `=` are skipped, `export` is \
+             ignored, quotes come off, and a value with its own `=` is kept whole"
+        );
+    }
+
+    #[test]
+    fn a_task_carries_its_env_file_through_to_what_is_spawned() {
+        let template = TaskTemplate {
+            label: "run".to_string(),
+            command: "./run".to_string(),
+            env_file: Some("$ZED_WORKTREE_ROOT/.env.local".to_string()),
+            ..TaskTemplate::default()
+        };
+        let mut variables = TaskVariables::default();
+        variables.insert(VariableName::WorktreeRoot, "/projects/thing".to_string());
+        let context = TaskContext {
+            task_variables: variables,
+            ..TaskContext::default()
+        };
+
+        let resolved = template
+            .resolve_task("test", &context)
+            .expect("the task resolves");
+
+        assert_eq!(
+            resolved.resolved.env_file.as_deref(),
+            Some(std::path::Path::new("/projects/thing/.env.local")),
+            "the file the task reads its environment from has to reach what is \
+             spawned, with its variables filled in"
+        );
+    }
+
     use std::{
         borrow::Cow,
         path::{Path, PathBuf},

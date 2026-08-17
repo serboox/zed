@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    #
+    # Extensions
+    # Tooling
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -91,18 +94,18 @@ members = [
     "crates/git_ui",
     "crates/go_to_line",
     "crates/google_ai",
-    "crates/grammars",
     "crates/gpui",
-    "crates/gpui_shared_string",
     "crates/gpui_linux",
     "crates/gpui_macos",
     "crates/gpui_macros",
     "crates/gpui_platform",
+    "crates/gpui_shared_string",
     "crates/gpui_tokio",
     "crates/gpui_util",
     "crates/gpui_web",
     "crates/gpui_wgpu",
     "crates/gpui_windows",
+    "crates/grammars",
     "crates/html_preview",
     "crates/html_render",
     "crates/html_to_markdown",
@@ -137,9 +140,9 @@ members = [
     "crates/lsp_locations",
     "crates/markdown",
     "crates/markdown_preview",
-    "crates/mermaid_render",
     "crates/media",
     "crates/menu",
+    "crates/mermaid_render",
     "crates/migrator",
     "crates/miniprofiler_ui",
     "crates/mistral",
@@ -150,16 +153,17 @@ members = [
     "crates/oauth_callback_server",
     "crates/ollama",
     "crates/onboarding",
-    "crates/opencode",
     "crates/open_ai",
     "crates/open_path_prompt",
     "crates/open_router",
     "crates/openapi_preview",
+    "crates/opencode",
     "crates/outline",
     "crates/outline_panel",
     "crates/panel",
     "crates/path",
     "crates/paths",
+    "crates/pdf_preview",
     "crates/picker",
     "crates/picker_preview",
     "crates/platform_title_bar",
@@ -181,6 +185,7 @@ members = [
     "crates/reqwest_client",
     "crates/rope",
     "crates/rpc",
+    "crates/run_configurations",
     "crates/sandbox",
     "crates/scheduler",
     "crates/schema_generator",
@@ -197,16 +202,15 @@ members = [
     "crates/snippet",
     "crates/snippet_provider",
     "crates/snippets_ui",
-    "crates/sql_semantic_tokens_lsp",
     "crates/split_preview",
+    "crates/sql_semantic_tokens_lsp",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",
     "crates/sum_tree",
-    "crates/pdf_preview",
     "crates/svg_preview",
-    "crates/system_specs",
     "crates/syntax_theme",
+    "crates/system_specs",
     "crates/tab_switcher",
     "crates/task",
     "crates/tasks_ui",
@@ -217,9 +221,9 @@ members = [
     "crates/text",
     "crates/theme",
     "crates/theme_extension",
-    "crates/theme_settings",
     "crates/theme_importer",
     "crates/theme_selector",
+    "crates/theme_settings",
     "crates/time_format",
     "crates/title_bar",
     "crates/toolchain_selector",
@@ -235,13 +239,13 @@ members = [
     "crates/web_search",
     "crates/web_search_providers",
     "crates/which_key",
+    "crates/windows_resources",
     "crates/workspace",
     "crates/worktree",
     "crates/worktree_benchmarks",
     "crates/x_ai",
     "crates/zed",
     "crates/zed_actions",
-    "crates/windows_resources",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/zeta_prompt",
@@ -249,20 +253,10 @@ members = [
     "crates/zlog_settings",
     "crates/ztracing",
     "crates/ztracing_macro",
-
-    #
-    # Extensions
-    #
-
     "extensions/glsl",
     "extensions/html",
     "extensions/proto",
     "extensions/test-extension",
-
-    #
-    # Tooling
-    #
-
     "tooling/compliance",
     "tooling/perf",
     "tooling/xtask",
@@ -459,6 +453,7 @@ repl = { path = "crates/repl" }
 reqwest_client = { path = "crates/reqwest_client" }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", features = ["wav", "playback", "wav_output", "recording"] }
 rope = { path = "crates/rope" }
+run_configurations = { path = "crates/run_configurations" }
 rpc = { path = "crates/rpc" }
 scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }

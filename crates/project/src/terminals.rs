@@ -136,9 +136,32 @@ impl Project {
             .map(|p| self.active_toolchain(p, LanguageName::new_static("Python"), cx))
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
+        let env_file = spawn_task.env_file.clone();
+        let env_file_from = spawn_task.cwd.clone();
+        let fs = self.fs.clone();
         cx.spawn(async move |project, cx| {
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            // A file of variables named by the configuration, read now rather than
+            // when the configuration was resolved: the reader edits the file and the
+            // next run picks it up. What the configuration itself says wins, so it
+            // is merged before `spawn_task.env` below.
+            if let Some(env_file) = env_file {
+                let env_file = match env_file.is_absolute() {
+                    true => env_file,
+                    false => match env_file_from.as_ref() {
+                        Some(from) => from.join(&env_file),
+                        None => env_file,
+                    },
+                };
+                match fs.load(&env_file).await {
+                    Ok(text) => env.extend(task::env_file_variables(&text)),
+                    Err(error) => log::warn!(
+                        "the environment file {} could not be read: {error}",
+                        env_file.display()
+                    ),
+                }
+            }
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {

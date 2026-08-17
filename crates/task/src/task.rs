@@ -24,7 +24,7 @@ pub use debug_format::{
 };
 pub use task_template::{
     DebugArgsRequest, HideStrategy, RevealStrategy, SaveStrategy, TaskHook, TaskTemplate,
-    TaskTemplates, substitute_variables_in_map, substitute_variables_in_str,
+    TaskTemplates, env_file_variables, substitute_variables_in_map, substitute_variables_in_str,
 };
 pub use util::shell::{Shell, ShellKind};
 pub use util::shell_builder::ShellBuilder;
@@ -57,6 +57,11 @@ pub struct SpawnInTerminal {
     pub cwd: Option<PathBuf>,
     /// Env overrides for the command, will be appended to the terminal's environment from the settings.
     pub env: HashMap<String, String>,
+    /// A file of `NAME=value` lines to read the environment from, read when the
+    /// task is spawned rather than when it is resolved: the file is on disk and
+    /// reading it belongs where the other environment work already happens.
+    /// Relative paths are taken from `cwd`.
+    pub env_file: Option<PathBuf>,
     /// Whether to use a new terminal tab or reuse the existing one to spawn the process.
     pub use_new_terminal: bool,
     /// Whether to allow multiple instances of the same task to be run, or rather wait for the existing ones to finish.

@@ -795,6 +795,7 @@ fn main() {
         split_preview::init(cx);
         csv_preview::init(cx);
         pdf_preview::init(cx);
+        run_configurations::init(cx);
         svg_preview::init(cx);
         html_preview::init(cx);
         onboarding::init(cx);
