@@ -57,9 +57,11 @@ fn next_response_tab(
         ResponseTab::TestResults => has_test_results,
         ResponseTab::Visualize => has_visualize_data,
         ResponseTab::Diff => false,
-        ResponseTab::Pretty | ResponseTab::Raw | ResponseTab::Headers | ResponseTab::Cookies => {
-            true
-        }
+        ResponseTab::Pretty
+        | ResponseTab::Raw
+        | ResponseTab::Headers
+        | ResponseTab::Cookies
+        | ResponseTab::Timing => true,
     };
     if tab_still_applies {
         current
@@ -154,10 +156,7 @@ pub fn focus_response_tab(
 }
 
 /// The response tab if it is already open, without opening one.
-pub fn existing_response_tab(
-    workspace: &Workspace,
-    cx: &App,
-) -> Option<Entity<ResponseDockPanel>> {
+pub fn existing_response_tab(workspace: &Workspace, cx: &App) -> Option<Entity<ResponseDockPanel>> {
     workspace
         .panel::<TerminalPanel>(cx)?
         .read(cx)
@@ -183,7 +182,6 @@ impl ResponseDockPanel {
             scroll_handle: ScrollHandle::new(),
         }
     }
-
 
     /// Switching tabs starts at the top: the offset left over from the tab
     /// before it belongs to content that is no longer on screen, and would hide
@@ -355,7 +353,9 @@ impl Render for ResponseDockPanel {
                 };
 
                 let summary_row = h_flex()
-                    .justify_between()
+                    .flex_none()
+                    .gap_3()
+                    .items_center()
                     .child(
                         h_flex()
                             .gap_3()
@@ -426,6 +426,14 @@ impl Render for ResponseDockPanel {
                             this.show_tab(ResponseTab::Cookies, cx);
                         },
                     ));
+                tab_strip = tab_strip.child(Self::render_tab_chip(
+                    "Timing",
+                    response_tab == ResponseTab::Timing,
+                    cx,
+                    |this, _, _, cx| {
+                        this.show_tab(ResponseTab::Timing, cx);
+                    },
+                ));
                 if !entry.test_results.is_empty() {
                     tab_strip = tab_strip.child(Self::render_tab_chip(
                         "Test Results",
@@ -542,51 +550,41 @@ impl Render for ResponseDockPanel {
                             )
                             .into_any_element()
                     }
-                    ResponseTab::Headers => {
-                        let mut list = v_flex().gap_1();
-                        for (key, value) in &entry.response.headers {
-                            list = list.child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Label::new(key.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(Label::new(value.clone()).size(LabelSize::Small)),
-                            );
-                        }
-                        list.into_any_element()
-                    }
-                    ResponseTab::Cookies => {
-                        if entry.response.cookies.is_empty() {
-                            Label::new("No cookies in this response.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .into_any_element()
-                        } else {
-                            let mut list = v_flex().gap_1();
-                            for cookie in &entry.response.cookies {
-                                list = list.child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Label::new(cookie.name.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Accent),
-                                        )
-                                        .child(
-                                            Label::new(cookie.value.clone()).size(LabelSize::Small),
-                                        )
-                                        .child(
-                                            Label::new(cookie.attributes.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                );
-                            }
-                            list.into_any_element()
-                        }
+                    ResponseTab::Headers => crate::response_view::render_pairs(
+                        "dock-header",
+                        "No headers in this response.",
+                        entry
+                            .response
+                            .headers
+                            .iter()
+                            .map(|(name, value)| crate::response_view::Pair {
+                                name: name.clone().into(),
+                                value: value.clone().into(),
+                                also: None,
+                            })
+                            .collect(),
+                        cx,
+                    ),
+                    ResponseTab::Cookies => crate::response_view::render_pairs(
+                        "dock-cookie",
+                        "No cookies in this response.",
+                        entry
+                            .response
+                            .cookies
+                            .iter()
+                            .map(|cookie| crate::response_view::Pair {
+                                name: cookie.name.clone().into(),
+                                value: cookie.value.clone().into(),
+                                also: match cookie.attributes.is_empty() {
+                                    true => None,
+                                    false => Some(cookie.attributes.clone().into()),
+                                },
+                            })
+                            .collect(),
+                        cx,
+                    ),
+                    ResponseTab::Timing => {
+                        crate::response_view::render_timing(entry.response.timings, cx)
                     }
                     ResponseTab::Diff => Label::new(
                         "Diff is only available from the request that produced the response.",
@@ -596,10 +594,18 @@ impl Render for ResponseDockPanel {
                     .into_any_element(),
                 };
 
+                // One row for the tabs and what the response was, rather than a
+                // row each: a row of chrome is a row of the response not shown.
                 let column = v_flex()
                     .gap_2()
-                    .child(summary_row)
-                    .child(tab_strip)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .justify_between()
+                            .child(tab_strip)
+                            .child(summary_row),
+                    )
                     .child(body);
                 // Held to the tab's height only when the body inside scrolls
                 // itself. A list has no scroller of its own, so it must be free
@@ -703,6 +709,7 @@ mod tests {
             headers: Vec::new(),
             body: b"{}".to_vec(),
             cookies: Vec::new(),
+            timings: api_client::Timings::default(),
         }
     }
 

@@ -28,7 +28,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+# `net` is what looks a host up before a request goes out, so the reader can see
+# what the lookup cost.
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }
 tokio-stream = "0.1.18"
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-reflection = "0.14"

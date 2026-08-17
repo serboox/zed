@@ -67,7 +67,12 @@ pub fn build_resolved_request(
         .filter(|param| param.enabled && !param.key.is_empty())
         .map(|param| (resolve(&param.key), resolve(&param.value)))
         .collect();
-    append_query_params(&mut url, &enabled_params);
+    // A parameter whose name matches a `:name` in the path fills that place in
+    // the path rather than being hung on the end as a query: a URL written
+    // `/v1/instruments/:instrument_id/balance-sheet` is asking for the value
+    // there, not for `?instrument_id=`.
+    let left_for_the_query = put_params_in_the_path(&mut url, &enabled_params);
+    append_query_params(&mut url, &left_for_the_query);
 
     let mut headers: Vec<(String, String)> = request
         .headers
@@ -212,6 +217,56 @@ fn sign_with_aws_sigv4(
     }
 }
 
+/// Fills each `:name` in the URL's path with the parameter of that name, and
+/// returns the parameters that were not used, which belong on the query string.
+///
+/// A parameter may be written with the colon (`:instrument_id`) or without
+/// (`instrument_id`); both fill `:instrument_id`. A place in the path with no
+/// parameter for it is left as it is, so the reader can see what is missing
+/// rather than sending a URL with a hole in it.
+fn put_params_in_the_path(url: &mut String, params: &[(String, String)]) -> Vec<(String, String)> {
+    // Only the path is looked at: a colon appears in `https://` and in a port,
+    // and a query string may hold one legitimately.
+    let after_scheme = url.find("://").map(|at| at + 3).unwrap_or(0);
+    let path_ends = url[after_scheme..]
+        .find(['?', '#'])
+        .map(|at| at + after_scheme)
+        .unwrap_or(url.len());
+    let mut path = url[after_scheme..path_ends].to_string();
+    let mut left_over = Vec::new();
+    let mut filled_any = false;
+
+    for (key, value) in params {
+        let name = key.strip_prefix(':').unwrap_or(key);
+        if name.is_empty() {
+            left_over.push((key.clone(), value.clone()));
+            continue;
+        }
+        let place = format!(":{name}");
+        // Whole segments only: `:id` must not be found inside `:instrument_id`.
+        let filled: Vec<String> = path
+            .split('/')
+            .map(|segment| match segment == place {
+                true => urlencoding::encode(value).into_owned(),
+                false => segment.to_string(),
+            })
+            .collect();
+        let filled = filled.join("/");
+        match filled == path {
+            true => left_over.push((key.clone(), value.clone())),
+            false => {
+                path = filled;
+                filled_any = true;
+            }
+        }
+    }
+
+    if filled_any {
+        url.replace_range(after_scheme..path_ends, &path);
+    }
+    left_over
+}
+
 fn append_query_params(url: &mut String, params: &[(String, String)]) {
     for (key, value) in params {
         let separator = if url.contains('?') { '&' } else { '?' };
@@ -232,6 +287,68 @@ pub struct HttpResponseSummary {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub elapsed_ms: u64,
+    pub timings: Timings,
+}
+
+/// Where a request's time went, in milliseconds.
+///
+/// Only what this transport can honestly measure is here. Looking the host up is
+/// measured because it is done here, before the request goes out. What follows --
+/// opening the connection, the handshake, sending, and the server's own thinking
+/// -- arrives as one number, because the client underneath reports nothing
+/// between them. Reading the body is measured separately, since that is where a
+/// large response spends its time and a reader needs to tell the two apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Looking the host up. None when there was no host to look up, or when the
+    /// lookup failed and the client was left to do it.
+    pub resolve_ms: Option<u64>,
+    /// From the request going out to its headers arriving.
+    pub wait_ms: u64,
+    /// Reading the body, once the headers were in.
+    pub download_ms: u64,
+    /// The whole exchange, which is what the reader sees beside the status.
+    pub total_ms: u64,
+}
+
+/// Looks up the host of `url`, and says how long it took. None when there is no
+/// host to look up or the lookup failed -- then the client does it itself and
+/// there is nothing honest to report.
+async fn look_the_host_up(url: &str) -> Option<u64> {
+    let host = host_of(url)?;
+    let started = Instant::now();
+    let found = crate::network_runtime::on_network_runtime(async move {
+        // Port zero: what is being timed is the name, not a connection.
+        let addresses = tokio::net::lookup_host((host.as_str(), 0u16)).await?;
+        anyhow::Ok(addresses.count())
+    })
+    .await;
+    match found {
+        Ok(count) if count > 0 => Some(started.elapsed().as_millis() as u64),
+        _ => None,
+    }
+}
+
+/// The host part of a URL, without the scheme, the credentials or the port.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    // A bracketed address holds colons of its own.
+    let host = match authority.starts_with('[') {
+        true => authority.split_once(']').map(|(host, _)| &host[1..])?,
+        false => authority.split(':').next()?,
+    };
+    match host.is_empty() {
+        true => None,
+        false => Some(host.to_string()),
+    }
 }
 
 /// Sends `resolved` and awaits the full response. Runs on the shared
@@ -252,9 +369,15 @@ pub async fn execute(
     }
 
     let started = Instant::now();
-    let (status, status_text, headers, body) =
+    // The host is looked up here, before the request goes out, so the reader can
+    // see what the lookup cost. The client would otherwise do it inside the send
+    // and report nothing about it.
+    let looked_up = look_the_host_up(&resolved.url).await;
+    let (status, status_text, headers, body, wait_ms, download_ms) =
         crate::network_runtime::on_network_runtime(async move {
+            let sent = Instant::now();
             let response = builder.send().await?;
+            let wait_ms = sent.elapsed().as_millis() as u64;
             let status = response.status();
             let status_text = status.canonical_reason().unwrap_or("").to_string();
             let headers = response
@@ -262,11 +385,26 @@ pub async fn execute(
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
                 .collect::<Vec<_>>();
+            let reading = Instant::now();
             let body = response.bytes().await?.to_vec();
-            anyhow::Ok((status.as_u16(), status_text, headers, body))
+            let download_ms = reading.elapsed().as_millis() as u64;
+            anyhow::Ok((
+                status.as_u16(),
+                status_text,
+                headers,
+                body,
+                wait_ms,
+                download_ms,
+            ))
         })
         .await?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    let timings = Timings {
+        resolve_ms: looked_up,
+        wait_ms,
+        download_ms,
+        total_ms: elapsed_ms,
+    };
 
     Ok(HttpResponseSummary {
         status,
@@ -274,6 +412,7 @@ pub async fn execute(
         headers,
         body,
         elapsed_ms,
+        timings,
     })
 }
 
@@ -331,6 +470,134 @@ mod tests {
             .map(|(key, _)| key.to_string())
             .collect();
         request
+    }
+
+    #[test]
+    fn the_host_is_picked_out_of_whatever_shape_the_url_has() {
+        for (url, expected) in [
+            ("https://api.example.com/v1/things", Some("api.example.com")),
+            ("https://api.example.com:8443/v1", Some("api.example.com")),
+            (
+                "http://user:secret@api.example.com/v1",
+                Some("api.example.com"),
+            ),
+            ("https://[2001:db8::1]:443/v1", Some("2001:db8::1")),
+            ("api.example.com/v1", Some("api.example.com")),
+            ("https:///v1/things", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                host_of(url).as_deref(),
+                expected,
+                "the host of {url} was read wrongly, and a lookup of the wrong name \
+                 is a timing that means nothing"
+            );
+        }
+    }
+
+    /// A parameter named after a place in the path fills that place. The value he
+    /// types has to reach the server as part of the path, not as a query he did
+    /// not ask for.
+    #[test]
+    fn a_parameter_named_in_the_path_fills_that_place_in_the_path() {
+        let mut request = base_request();
+        request.url =
+            "https://api.example.com/v1/instruments/:instrument_id/balance-sheet".to_string();
+        request.params = vec![
+            QueryParam {
+                key: ":instrument_id".into(),
+                value: "6408".into(),
+                enabled: true,
+                description: None,
+            },
+            QueryParam {
+                key: "period".into(),
+                value: "annual".into(),
+                enabled: true,
+                description: None,
+            },
+        ];
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.url, "https://api.example.com/v1/instruments/6408/balance-sheet?period=annual",
+            "the parameter belongs in the path, and only what is left belongs on \
+             the query string"
+        );
+    }
+
+    #[test]
+    fn a_place_in_the_path_is_filled_whether_or_not_the_parameter_carries_the_colon() {
+        for key in [":instrument_id", "instrument_id"] {
+            let mut request = base_request();
+            request.url = "https://api.example.com/v1/instruments/:instrument_id".to_string();
+            request.params = vec![QueryParam {
+                key: key.into(),
+                value: "6408".into(),
+                enabled: true,
+                description: None,
+            }];
+
+            let resolved = build_resolved_request(&request, &identity);
+
+            assert_eq!(
+                resolved.url, "https://api.example.com/v1/instruments/6408",
+                "a parameter written {key} has to fill :instrument_id"
+            );
+        }
+    }
+
+    #[test]
+    fn a_place_in_the_path_with_no_parameter_is_left_where_it_can_be_seen() {
+        let mut request = base_request();
+        request.url =
+            "https://api.example.com/v1/instruments/:instrument_id/balance-sheet".to_string();
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.url, "https://api.example.com/v1/instruments/:instrument_id/balance-sheet",
+            "an unfilled place stays visible rather than being quietly dropped"
+        );
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_place_in_the_path_is_left_alone() {
+        let mut request = base_request();
+        request.url = "https://api.example.com:8443/v1/things?filter=a:b".to_string();
+        request.params = vec![QueryParam {
+            key: "port".into(),
+            value: "9999".into(),
+            enabled: true,
+            description: None,
+        }];
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.url, "https://api.example.com:8443/v1/things?filter=a:b&port=9999",
+            "a port and a colon inside a query value are not places to fill"
+        );
+    }
+
+    #[test]
+    fn a_value_put_in_the_path_is_encoded_for_a_path() {
+        let mut request = base_request();
+        request.url = "https://api.example.com/v1/things/:name".to_string();
+        request.params = vec![QueryParam {
+            key: ":name".into(),
+            value: "a b/c".into(),
+            enabled: true,
+            description: None,
+        }];
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.url, "https://api.example.com/v1/things/a%20b%2Fc",
+            "a value with a space or a slash must not change which path is asked for"
+        );
     }
 
     #[test]

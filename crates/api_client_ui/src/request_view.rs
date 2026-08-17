@@ -3690,7 +3690,9 @@ impl RequestView {
                 let response_is_html = self.response_is_html;
 
                 let summary_row = h_flex()
-                    .justify_between()
+                    .flex_none()
+                    .gap_3()
+                    .items_center()
                     .child(
                         h_flex()
                             .gap_3()
@@ -3803,6 +3805,16 @@ impl RequestView {
                             cx.notify();
                         },
                     ));
+                tab_strip = tab_strip.child(Self::render_chip_scoped(
+                    "response-tab",
+                    "Timing",
+                    response_tab == ResponseTab::Timing,
+                    cx,
+                    |this, _, _, cx| {
+                        this.response_tab = ResponseTab::Timing;
+                        cx.notify();
+                    },
+                ));
                 let has_previous_response = self.previous_response.is_some();
                 if has_previous_response {
                     tab_strip = tab_strip.child(Self::render_chip_scoped(
@@ -3952,61 +3964,64 @@ impl RequestView {
                             )
                             .into_any_element()
                     }
-                    ResponseTab::Headers => {
-                        let mut list = v_flex().gap_1();
-                        for (key, value) in &headers {
-                            list = list.child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Label::new(key.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(Label::new(value.clone()).size(LabelSize::Small)),
-                            );
-                        }
-                        list.into_any_element()
+                    ResponseTab::Headers => crate::response_view::render_pairs(
+                        "response-header",
+                        "No headers in this response.",
+                        headers
+                            .iter()
+                            .map(|(name, value)| crate::response_view::Pair {
+                                name: name.clone().into(),
+                                value: value.clone().into(),
+                                also: None,
+                            })
+                            .collect(),
+                        cx,
+                    ),
+                    ResponseTab::Timing => {
+                        crate::response_view::render_timing(response.timings, cx)
                     }
-                    ResponseTab::Cookies => {
-                        if cookies.is_empty() {
-                            Label::new("No cookies in this response.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .into_any_element()
-                        } else {
-                            let mut list = v_flex().gap_1();
-                            for cookie in &cookies {
-                                list = list.child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Label::new(cookie.name.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Accent),
-                                        )
-                                        .child(
-                                            Label::new(cookie.value.clone()).size(LabelSize::Small),
-                                        )
-                                        .child(
-                                            Label::new(cookie.attributes.clone())
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                );
-                            }
-                            list.into_any_element()
-                        }
-                    }
+                    ResponseTab::Cookies => crate::response_view::render_pairs(
+                        "response-cookie",
+                        "No cookies in this response.",
+                        cookies
+                            .iter()
+                            .map(|cookie| crate::response_view::Pair {
+                                name: cookie.name.clone().into(),
+                                value: cookie.value.clone().into(),
+                                also: match cookie.attributes.is_empty() {
+                                    true => None,
+                                    false => Some(cookie.attributes.clone().into()),
+                                },
+                            })
+                            .collect(),
+                        cx,
+                    ),
                 };
 
                 v_flex()
-                    .pt_3()
+                    .pt_2()
                     .gap_2()
                     .border_t_1()
                     .border_color(border_variant)
-                    .child(summary_row)
-                    .child(tab_strip)
+                    // The tabs and what the response was share one row: a row of
+                    // its own for three short words is a row of the document the
+                    // reader does not see.
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .debug_selector(|| "response-tabs".to_string())
+                                    .child(tab_strip),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "response-summary".to_string())
+                                    .child(summary_row),
+                            ),
+                    )
                     .child(body)
                     .into_any_element()
             }
@@ -4548,6 +4563,38 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// What the response was -- the status, how long it took, how big it is -- sits
+    /// on the same row as the tabs. A row of its own for three short words is a row
+    /// of the response the reader does not see.
+    #[gpui::test]
+    async fn what_the_response_was_shares_a_row_with_the_tabs(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, "{}"), window, cx);
+        });
+        draw(&mut cx);
+
+        let tabs = cx
+            .debug_bounds("response-tabs")
+            .expect("the tabs were painted");
+        let summary = cx
+            .debug_bounds("response-summary")
+            .expect("what the response was got painted");
+
+        let apart = (f32::from(tabs.center().y) - f32::from(summary.center().y)).abs();
+        assert!(
+            apart < 4.,
+            "the tabs were painted at {:?} and the summary at {:?}: {apart}px apart, \
+             which is two rows rather than one",
+            tabs.center(),
+            summary.center()
+        );
+        assert!(
+            f32::from(summary.origin.x) > f32::from(tabs.origin.x + tabs.size.width),
+            "the summary belongs at the far end of the row, past the tabs"
+        );
+    }
+
     #[gpui::test]
     async fn typing_in_the_url_editor_persists_to_the_store(cx: &mut TestAppContext) {
         let (store, request_id, view, mut cx) = build_request_view(cx).await;
@@ -5004,6 +5051,7 @@ mod tests {
             headers: Vec::new(),
             body: br#"{"a":2}"#.to_vec(),
             elapsed_ms: 0,
+            timings: api_client::Timings::default(),
         };
         let diff_text = comparison_diff_text(&baseline, Ok(summary));
         assert!(
@@ -5235,6 +5283,7 @@ mod tests {
             ],
             body: body.as_bytes().to_vec(),
             elapsed_ms: 42,
+            timings: api_client::Timings::default(),
         })
     }
 
@@ -5732,6 +5781,7 @@ mod tests {
             )],
             body: body.as_bytes().to_vec(),
             elapsed_ms: 10,
+            timings: api_client::Timings::default(),
         })
     }
 
@@ -6103,6 +6153,7 @@ mod tests {
             headers: Vec::new(),
             body: b"{}".to_vec(),
             cookies: Vec::new(),
+            timings: api_client::Timings::default(),
         }
     }
 
@@ -6260,9 +6311,7 @@ mod tests {
     /// With no terminal panel there is no pane to put the tab in, so the reply
     /// stays in the request view rather than disappearing.
     #[gpui::test]
-    async fn without_a_terminal_panel_the_reply_stays_in_the_request_view(
-        cx: &mut TestAppContext,
-    ) {
+    async fn without_a_terminal_panel_the_reply_stays_in_the_request_view(cx: &mut TestAppContext) {
         let (_store, _workspace, view, mut cx) = build_request_view_in_workspace(cx).await;
 
         view.update_in(&mut cx, |view, window, cx| {

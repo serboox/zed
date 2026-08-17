@@ -1,4 +1,6 @@
 use api_client::ParsedCookie;
+use gpui::{AnyElement, App, ClipboardItem, SharedString};
+use ui::{ButtonStyle, IconButton, IconName, IconSize, Tooltip, prelude::*};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseTab {
@@ -8,6 +10,7 @@ pub enum ResponseTab {
     Headers,
     Cookies,
     Diff,
+    Timing,
     TestResults,
     Visualize,
 }
@@ -26,6 +29,8 @@ pub struct ResponseData {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub cookies: Vec<ParsedCookie>,
+    /// Where the time went, for the timing diagram.
+    pub timings: api_client::Timings,
 }
 
 impl ResponseData {
@@ -39,6 +44,7 @@ impl ResponseData {
             headers: summary.headers,
             body: summary.body,
             cookies,
+            timings: summary.timings,
         }
     }
 
@@ -61,6 +67,296 @@ pub enum SendState {
 /// Formats a byte count the way a response inspector should: plain bytes
 /// below 1 KB, otherwise one decimal of KB -- large enough to matter, small
 /// enough that a body under a kilobyte doesn't print a misleading "0.4 KB".
+/// One bar of the timing diagram: what it was, what it means, where it starts and
+/// how long it lasted, in milliseconds.
+pub struct Phase {
+    pub name: &'static str,
+    pub what_it_is: &'static str,
+    pub starts_ms: f32,
+    pub lasts_ms: f32,
+    pub colour: Color,
+}
+
+/// The phases of an exchange, in the order they happen, each starting where the
+/// one before it ended. What is left of the total after the measured phases is a
+/// phase of its own rather than being hidden, so the bars add up to the number
+/// shown beside the status.
+pub fn phases_of(timings: api_client::Timings) -> Vec<Phase> {
+    let mut phases = Vec::new();
+    let mut at = 0.;
+    if let Some(resolve) = timings.resolve_ms {
+        phases.push(Phase {
+            name: "Looking up the host",
+            what_it_is: "Turning the name into an address.",
+            starts_ms: at,
+            lasts_ms: resolve as f32,
+            colour: Color::Info,
+        });
+        at += resolve as f32;
+    }
+    phases.push(Phase {
+        name: "Waiting for the response",
+        what_it_is: "Connecting, the handshake if there is one, sending, and the \
+                     server's own thinking: the client underneath reports these as one.",
+        starts_ms: at,
+        lasts_ms: timings.wait_ms as f32,
+        colour: Color::Warning,
+    });
+    at += timings.wait_ms as f32;
+    phases.push(Phase {
+        name: "Reading the body",
+        what_it_is: "From the headers arriving to the last byte of the body.",
+        starts_ms: at,
+        lasts_ms: timings.download_ms as f32,
+        colour: Color::Success,
+    });
+    at += timings.download_ms as f32;
+    let unaccounted = timings.total_ms as f32 - at;
+    if unaccounted > 0.5 {
+        phases.push(Phase {
+            name: "Everything else",
+            what_it_is: "Building the request, and the moments between the phases above.",
+            starts_ms: at,
+            lasts_ms: unaccounted,
+            colour: Color::Muted,
+        });
+    }
+    phases
+}
+
+/// The diagram of where a request's time went: one bar a phase, on one axis, so
+/// the reader can see at a glance whether the wait was the network, the server or
+/// the size of what came back.
+pub fn render_timing(timings: api_client::Timings, cx: &mut App) -> AnyElement {
+    let total = timings.total_ms.max(1) as f32;
+    let border = cx.theme().colors().border_variant;
+    let phases = phases_of(timings);
+
+    let axis = h_flex()
+        .w_full()
+        .justify_between()
+        .children([0., 0.25, 0.5, 0.75, 1.].map(|part| {
+            Label::new(format!("{:.0} ms", total * part))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+        }));
+
+    let rows = phases.into_iter().enumerate().map(|(at_row, phase)| {
+        let (name, what_it_is, starts, lasts, colour) = (
+            phase.name,
+            phase.what_it_is,
+            phase.starts_ms,
+            phase.lasts_ms,
+            phase.colour,
+        );
+        {
+            let from = (starts / total).clamp(0., 1.);
+            // A phase of a millisecond still has to be visible, or a fast request
+            // shows an empty diagram.
+            let wide = (lasts / total).clamp(0.004, 1. - from);
+            h_flex()
+                .id(("timing-row", at_row))
+                .w_full()
+                .gap_2()
+                .py_0p5()
+                .items_center()
+                .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(180.))
+                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(
+                    div()
+                        .id(("timing-track", at_row))
+                        .relative()
+                        .flex_1()
+                        .h(px(14.))
+                        .border_b_1()
+                        .border_color(border.opacity(0.4))
+                        // The quarter marks, so a bar can be read against the axis
+                        // above rather than guessed at.
+                        .children([0.25, 0.5, 0.75].map(|part| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(gpui::relative(part))
+                                .w(px(1.))
+                                .h_full()
+                                .bg(border.opacity(0.5))
+                        }))
+                        .child(
+                            div()
+                                .id(("timing-bar", at_row))
+                                .absolute()
+                                .top(px(2.))
+                                .left(gpui::relative(from))
+                                .w(gpui::relative(wide))
+                                .h(px(10.))
+                                .bg(colour.color(cx))
+                                .tooltip(Tooltip::text(format!("{name}: {lasts:.0} ms"))),
+                        ),
+                )
+                .child(
+                    div().flex_none().w(px(72.)).child(
+                        Label::new(format!("{lasts:.0} ms"))
+                            .size(LabelSize::Small)
+                            .buffer_font(cx),
+                    ),
+                )
+                .child(
+                    div().flex_none().w(px(220.)).child(
+                        Label::new(what_it_is)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .into_any_element()
+        }
+    });
+
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_none().w(px(180.)))
+                .child(div().flex_1().child(axis))
+                .child(div().flex_none().w(px(72. + 220. + 8.))),
+        )
+        .children(rows)
+        .child(
+            Label::new(match timings.resolve_ms {
+                Some(_) => "The host was looked up here, before the request went out.",
+                None => {
+                    "The host was not looked up here: the client did it itself, and \
+                         its share is inside the wait."
+                }
+            })
+            .size(LabelSize::XSmall)
+            .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+/// One row of a table of names and values, as the response's headers and cookies
+/// are shown.
+pub struct Pair {
+    pub name: SharedString,
+    pub value: SharedString,
+    /// Anything else worth showing after the value, in a quieter colour -- a
+    /// cookie's attributes, say.
+    pub also: Option<SharedString>,
+}
+
+/// A table of names and values: aligned columns, a row under the pointer marked,
+/// and every value copyable -- by the row's own button, or the whole table at
+/// once. A list of label pairs reads as a paragraph; what a reader does with
+/// headers is look one up and copy it.
+pub fn render_pairs(
+    id: &'static str,
+    empty: &'static str,
+    pairs: Vec<Pair>,
+    cx: &mut App,
+) -> AnyElement {
+    if pairs.is_empty() {
+        return Label::new(empty)
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element();
+    }
+
+    let all_of_it = pairs
+        .iter()
+        .map(|pair| match &pair.also {
+            Some(also) => format!("{}: {} {}", pair.name, pair.value, also),
+            None => format!("{}: {}", pair.name, pair.value),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let border = cx.theme().colors().border_variant;
+    let count = pairs.len();
+
+    let rows =
+        pairs.into_iter().enumerate().map(|(at, pair)| {
+            let value = pair.value.clone();
+            h_flex()
+                .id((id, at))
+                .w_full()
+                .py_0p5()
+                .px_1()
+                .gap_2()
+                .items_start()
+                .when(at + 1 < count, |row| {
+                    row.border_b_1().border_color(border.opacity(0.4))
+                })
+                .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
+                .child(
+                    div()
+                        .flex_none()
+                        // A column wide enough for the names a server actually sends,
+                        // so the values line up and can be read down the page.
+                        .w(px(220.))
+                        .child(
+                            Label::new(pair.name.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .buffer_font(cx),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Label::new(pair.value.clone())
+                                .size(LabelSize::Small)
+                                .buffer_font(cx),
+                        )
+                        .children(pair.also.map(|also| {
+                            Label::new(also).size(LabelSize::Small).color(Color::Muted)
+                        })),
+                )
+                .child(
+                    IconButton::new((id, at), IconName::Copy)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Copy this value"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                        }),
+                )
+                .into_any_element()
+        });
+
+    v_flex()
+        .w_full()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    Label::new(format!("{count}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("{id}-copy-all")), "Copy all")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(all_of_it.clone()));
+                        }),
+                ),
+        )
+        .children(rows)
+        .into_any_element()
+}
+
 pub fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -207,6 +503,74 @@ fn unescape_html_entities(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The bars have to line up end to end and add up to the total, or the diagram
+    /// says the request took a different time than the number beside the status.
+    #[test]
+    fn the_phases_run_end_to_end_and_add_up_to_the_whole() {
+        let timings = api_client::Timings {
+            resolve_ms: Some(12),
+            wait_ms: 300,
+            download_ms: 40,
+            total_ms: 360,
+        };
+
+        let phases = super::phases_of(timings);
+        let names: Vec<&str> = phases.iter().map(|phase| phase.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Looking up the host",
+                "Waiting for the response",
+                "Reading the body",
+                "Everything else",
+            ],
+            "what was not measured is a phase of its own rather than being hidden"
+        );
+
+        let mut expected_start = 0.;
+        for phase in &phases {
+            assert!(
+                (phase.starts_ms - expected_start).abs() < 0.01,
+                "{} starts at {} rather than {expected_start}",
+                phase.name,
+                phase.starts_ms
+            );
+            expected_start += phase.lasts_ms;
+        }
+        assert!(
+            (expected_start - timings.total_ms as f32).abs() < 0.01,
+            "the phases add up to {expected_start}ms, not the {}ms the exchange took",
+            timings.total_ms
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_did_not_happen_here_gets_no_bar() {
+        let phases = super::phases_of(api_client::Timings {
+            resolve_ms: None,
+            wait_ms: 120,
+            download_ms: 5,
+            total_ms: 125,
+        });
+
+        assert!(
+            !phases.iter().any(|phase| phase.name.contains("Looking up")),
+            "a lookup nobody timed must not be drawn as though it were measured"
+        );
+        assert_eq!(phases.len(), 2, "and nothing is left over to explain");
+    }
+
+    #[test]
+    fn a_request_that_took_no_time_still_draws() {
+        let phases = super::phases_of(api_client::Timings::default());
+
+        assert!(!phases.is_empty());
+        assert!(
+            phases.iter().all(|phase| phase.lasts_ms >= 0.),
+            "no phase may last a negative time, whatever the numbers say"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -265,6 +629,7 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: b"{}".to_vec(),
             cookies: Vec::new(),
+            timings: api_client::Timings::default(),
         };
         assert_eq!(response.content_type(), "application/json");
     }
@@ -302,6 +667,7 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: body.as_bytes().to_vec(),
             cookies: Vec::new(),
+            timings: api_client::Timings::default(),
         }
     }
 
