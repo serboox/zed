@@ -124,6 +124,33 @@ pub fn phases_of(timings: api_client::Timings) -> Vec<Phase> {
     phases
 }
 
+/// Where a phase's bar starts on the axis and how wide it is, both as a part of
+/// the whole width.
+///
+/// Total over whatever the numbers turn out to be. A phase can start exactly at
+/// the end of the axis -- a body read in less than a millisecond leaves nothing
+/// after the wait -- and it can be given as lasting longer than the whole. Asking
+/// `clamp` for a smallest width larger than the room left brings the editor down,
+/// which is what it did.
+fn bar_of(starts_ms: f32, lasts_ms: f32, total_ms: f32) -> (f32, f32) {
+    /// The narrowest a bar may be drawn: a phase of a millisecond still has to be
+    /// visible, or a fast request shows an empty diagram.
+    const NARROWEST: f32 = 0.004;
+
+    let total = match total_ms.is_finite() && total_ms > 0. {
+        true => total_ms,
+        false => 1.,
+    };
+    let starts = starts_ms.max(0.);
+    let lasts = lasts_ms.max(0.);
+    // Kept far enough from the end that there is always room for the narrowest
+    // bar, so a phase at the very end is still drawn.
+    let from = (starts / total).clamp(0., 1. - NARROWEST);
+    let room = 1. - from;
+    let wide = (lasts / total).clamp(NARROWEST.min(room), room);
+    (from, wide)
+}
+
 /// The diagram of where a request's time went: one bar a phase, on one axis, so
 /// the reader can see at a glance whether the wait was the network, the server or
 /// the size of what came back.
@@ -150,10 +177,7 @@ pub fn render_timing(timings: api_client::Timings, cx: &mut App) -> AnyElement {
             phase.colour,
         );
         {
-            let from = (starts / total).clamp(0., 1.);
-            // A phase of a millisecond still has to be visible, or a fast request
-            // shows an empty diagram.
-            let wide = (lasts / total).clamp(0.004, 1. - from);
+            let (from, wide) = bar_of(starts, lasts, total);
             h_flex()
                 .id(("timing-row", at_row))
                 .w_full()
@@ -218,6 +242,10 @@ pub fn render_timing(timings: api_client::Timings, cx: &mut App) -> AnyElement {
 
     v_flex()
         .w_full()
+        // The same room the table gets: bars against the edge of the pane read as
+        // part of its frame.
+        .px_2()
+        .py_1()
         .gap_1()
         .child(
             h_flex()
@@ -285,10 +313,11 @@ pub fn render_pairs(
             let value = pair.value.clone();
             h_flex()
                 .id((id, at))
+                .debug_selector(move || format!("{id}-row-{at}"))
                 .w_full()
-                .py_0p5()
-                .px_1()
-                .gap_2()
+                .py_1()
+                .px_2()
+                .gap_4()
                 .items_start()
                 .when(at + 1 < count, |row| {
                     row.border_b_1().border_color(border.opacity(0.4))
@@ -321,28 +350,38 @@ pub fn render_pairs(
                         })),
                 )
                 .child(
-                    IconButton::new((id, at), IconName::Copy)
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Copy this value"))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-                        }),
+                    div().flex_none().mr_1().child(
+                        IconButton::new((id, at), IconName::Copy)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Copy this value"))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                            }),
+                    ),
                 )
                 .into_any_element()
         });
 
     v_flex()
         .w_full()
-        .gap_0p5()
+        // Room around the table: rows flush against the edges of the pane read as
+        // one block of text rather than as a table.
+        .px_2()
+        .py_1()
+        .gap_1()
         .child(
             h_flex()
+                .px_2()
                 .w_full()
                 .justify_between()
                 .items_center()
                 .child(
-                    Label::new(format!("{count}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(match count {
+                        1 => "1 line".to_string(),
+                        count => format!("{count} lines"),
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 )
                 .child(
                     Button::new(SharedString::from(format!("{id}-copy-all")), "Copy all")
@@ -503,6 +542,38 @@ fn unescape_html_entities(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The bar arithmetic has to hold for whatever the clock reports. A body read
+    /// in under a millisecond leaves the last phase starting exactly at the end of
+    /// the axis, and asking for a smallest width larger than the room left brought
+    /// the editor down.
+    #[test]
+    fn a_bar_can_be_drawn_wherever_the_numbers_land() {
+        for (starts, lasts, total) in [
+            (0., 0., 0.),
+            (0., 0., 1.),
+            // The one that panicked: the phases add up to the whole, so the last
+            // starts at the very end.
+            (4., 0., 4.),
+            (4., 0., 3.),
+            (1., 900., 2.),
+            (-1., -1., 5.),
+            (f32::MAX, f32::MAX, 1.),
+            (0., 1., f32::NAN),
+        ] {
+            let (from, wide) = super::bar_of(starts, lasts, total);
+
+            assert!(
+                (0. ..=1.).contains(&from),
+                "a bar starting at {from} of the way along, from {starts}/{total}"
+            );
+            assert!(
+                wide > 0. && from + wide <= 1.0001,
+                "a bar {wide} wide starting at {from}, from {lasts}/{total}: it has to \
+                 be visible and it has to stay on the axis"
+            );
+        }
+    }
+
     /// The bars have to line up end to end and add up to the total, or the diagram
     /// says the request took a different time than the number beside the status.
     #[test]

@@ -4563,6 +4563,37 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// The table of headers has room around it. Rows flush against the edges of
+    /// the pane read as one block of text, which is what he saw.
+    #[gpui::test]
+    async fn the_table_of_headers_is_not_flush_against_the_pane(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(fake_response(200, "{}"), window, cx);
+            view.response_tab = crate::response_view::ResponseTab::Headers;
+        });
+        draw(&mut cx);
+
+        let row = cx
+            .debug_bounds("response-header-row-0")
+            .expect("the first header row was painted");
+        let tabs = cx
+            .debug_bounds("response-tabs")
+            .expect("the tabs were painted, which is where the pane's own edge is");
+
+        let indented = f32::from(row.origin.x) - f32::from(tabs.origin.x);
+        assert!(
+            indented >= 6.,
+            "the row starts {indented}px in from where the tabs start: a table needs \
+             room of its own, not the pane's edge"
+        );
+        assert!(
+            f32::from(row.size.height) >= 20.,
+            "a row {}px tall is text on text, not a row",
+            f32::from(row.size.height)
+        );
+    }
+
     /// What the response was -- the status, how long it took, how big it is -- sits
     /// on the same row as the tabs. A row of its own for three short words is a row
     /// of the response the reader does not see.
