@@ -29,7 +29,8 @@ pub use grpc_reflection::discover_via_reflection;
 pub use history::HistoryEntry;
 pub use http_send::{
     AUTO_HEADER_DEFAULTS, HttpResponseSummary, ParsedCookie, ResolvedRequest, Timings,
-    build_resolved_request, execute, parse_set_cookie_headers,
+    build_resolved_request, execute, parse_set_cookie_headers, query_of, query_pairs,
+    url_with_query, url_without_query,
 };
 pub use jwt::sign_jwt;
 pub use oauth2::{

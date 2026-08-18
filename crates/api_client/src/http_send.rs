@@ -72,7 +72,15 @@ pub fn build_resolved_request(
     // `/v1/instruments/:instrument_id/balance-sheet` is asking for the value
     // there, not for `?instrument_id=`.
     let left_for_the_query = put_params_in_the_path(&mut url, &enabled_params);
-    append_query_params(&mut url, &left_for_the_query);
+    // A parameter the reader wrote into the address bar is already in the URL --
+    // the table below it shows the same one. Appending it again would send it
+    // twice.
+    let already_there = query_of(&url).map(query_pairs).unwrap_or_default();
+    let to_append: Vec<(String, String)> = left_for_the_query
+        .into_iter()
+        .filter(|pair| !already_there.contains(pair))
+        .collect();
+    append_query_params(&mut url, &to_append);
 
     let mut headers: Vec<(String, String)> = request
         .headers
@@ -267,6 +275,109 @@ fn put_params_in_the_path(url: &mut String, params: &[(String, String)]) -> Vec<
     left_over
 }
 
+/// Where the first of `wanted` sits after the scheme, skipping over any
+/// `{{variable}}` token: a `?` or a `#` inside a token is part of the token's
+/// name, not a delimiter of the URL.
+fn delimiter_after_the_scheme(url: &str, wanted: &[char]) -> Option<usize> {
+    let mut at = url.find("://").map(|scheme| scheme + 3).unwrap_or(0);
+    let bytes = url.as_bytes();
+    while at < url.len() {
+        if url[at..].starts_with("{{") {
+            match url[at..].find("}}") {
+                Some(closes) => {
+                    at += closes + 2;
+                    continue;
+                }
+                // An unclosed token runs to the end of the text, and everything in
+                // it is the token's own business.
+                None => return None,
+            }
+        }
+        let here = bytes[at] as char;
+        if wanted.contains(&here) {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The query string of `url`, without the `?`, and without any `#fragment`.
+///
+/// Plain text handling on purpose: a URL here may still hold `{{variable}}`
+/// tokens and `:name` places, so it is not a URL a parser would accept yet.
+pub fn query_of(url: &str) -> Option<&str> {
+    // The fragment goes first: a `?` after a `#` belongs to the fragment.
+    let ends = delimiter_after_the_scheme(url, &['#']).unwrap_or(url.len());
+    let before_fragment = &url[..ends];
+    let question = delimiter_after_the_scheme(before_fragment, &['?'])?;
+    Some(&before_fragment[question + 1..])
+}
+
+/// Everything before the query string, and the `#fragment` if there is one.
+pub fn url_without_query(url: &str) -> (&str, Option<&str>) {
+    let fragment = delimiter_after_the_scheme(url, &['#']).map(|at| &url[at + 1..]);
+    let ends = delimiter_after_the_scheme(url, &['?', '#']).unwrap_or(url.len());
+    (&url[..ends], fragment)
+}
+
+/// The `key=value` pairs a query string holds, exactly as written. A pair with no
+/// `=` is a key with an empty value, which is how a bare `?flag` reads.
+///
+/// Nothing is decoded here. What the address bar holds is what the table beside it
+/// shows, so a value that no decoder accepts (`%2G`, `%FF`) reads back the way it
+/// was written instead of coming home as `%252G`.
+pub fn query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// `url` with its query string replaced by `pairs`, keeping the fragment. No pairs
+/// means no `?` at all.
+pub fn url_with_query(url: &str, pairs: &[(String, String)]) -> String {
+    let (base, fragment) = url_without_query(url);
+    let mut written = base.to_string();
+    for (at, (key, value)) in pairs.iter().enumerate() {
+        written.push(match at {
+            0 => '?',
+            _ => '&',
+        });
+        written.push_str(&kept_from_breaking_the_query(key, true));
+        written.push('=');
+        written.push_str(&kept_from_breaking_the_query(value, false));
+    }
+    if let Some(fragment) = fragment {
+        written.push('#');
+        written.push_str(fragment);
+    }
+    written
+}
+
+/// `text` with only what would break a query string escaped: a space, an `&`, a
+/// `#`, and in a key an `=` as well.
+///
+/// A `%` is left as it stands, so an escape already in the address bar is not
+/// escaped a second time. Anything else the transport encodes on its way out.
+fn kept_from_breaking_the_query(text: &str, is_key: bool) -> String {
+    let mut written = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            ' ' => written.push_str("%20"),
+            '&' => written.push_str("%26"),
+            '#' => written.push_str("%23"),
+            '=' if is_key => written.push_str("%3D"),
+            _ => written.push(character),
+        }
+    }
+    written
+}
+
 fn append_query_params(url: &mut String, params: &[(String, String)]) {
     for (key, value) in params {
         let separator = if url.contains('?') { '&' } else { '?' };
@@ -452,6 +563,151 @@ pub fn parse_set_cookie_headers(headers: &[(String, String)]) -> Vec<ParsedCooki
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the reader typed after the `?` is read back exactly, tokens and all.
+    #[test]
+    fn a_query_string_is_read_pair_by_pair() {
+        let url = "{{financials-api}}/v1/instruments/:instrument_id/ratios?hello=world&page=2";
+        assert_eq!(query_of(url), Some("hello=world&page=2"));
+        assert_eq!(
+            query_pairs(query_of(url).expect("there is a query")),
+            vec![
+                ("hello".to_string(), "world".to_string()),
+                ("page".to_string(), "2".to_string()),
+            ]
+        );
+        assert_eq!(
+            url_without_query(url).0,
+            "{{financials-api}}/v1/instruments/:instrument_id/ratios"
+        );
+        assert_eq!(query_of("https://example.com/things"), None);
+        assert_eq!(
+            query_pairs("flag&name=a%20b"),
+            vec![
+                ("flag".to_string(), String::new()),
+                ("name".to_string(), "a%20b".to_string()),
+            ],
+            "a bare word is a key with nothing after it, and what is written is what is read"
+        );
+    }
+
+    /// A colon in `https://` or in a port is not a query, and a fragment is kept.
+    #[test]
+    fn the_query_is_found_where_the_query_is() {
+        assert_eq!(query_of("https://example.com:8080/things?a=1"), Some("a=1"));
+        assert_eq!(query_of("https://example.com/things#a?b"), None);
+        assert_eq!(
+            url_with_query(
+                "https://example.com/things?old=1#section",
+                &[("new".to_string(), "2".to_string())]
+            ),
+            "https://example.com/things?new=2#section"
+        );
+        assert_eq!(
+            url_with_query("https://example.com/things?old=1", &[]),
+            "https://example.com/things",
+            "nothing to write means no question mark at all"
+        );
+        assert_eq!(
+            url_with_query(
+                "https://example.com/things",
+                &[("q".to_string(), "a b&c".to_string())]
+            ),
+            "https://example.com/things?q=a%20b%26c",
+            "what would otherwise split the query is encoded"
+        );
+    }
+
+    /// A value the address bar holds comes back out of the table the way it went
+    /// in, whether or not any decoder would accept it.
+    #[test]
+    fn a_query_survives_the_trip_through_the_table() {
+        for query in [
+            "x=%2G",
+            "x=%FF",
+            "x=%20",
+            "name=a%20b&other=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82",
+            "=1",
+            "a=1&a=2",
+            "flag=",
+        ] {
+            let url = format!("https://example.com/things?{query}");
+            let pairs = query_pairs(query_of(&url).expect("there is a query"));
+            assert_eq!(
+                url_with_query(&url, &pairs),
+                url,
+                "`{query}` has to read back exactly as it was written"
+            );
+        }
+    }
+
+    /// A `?` or a `#` inside a `{{token}}` is part of the token's name. The address
+    /// bar holds tokens that have not been resolved yet, so they are stepped over
+    /// rather than read as the start of a query.
+    #[test]
+    fn a_token_is_not_a_delimiter() {
+        assert_eq!(query_of("{{base?part}}/v1/things"), None);
+        assert_eq!(
+            url_without_query("{{base#part}}/v1/things").0,
+            "{{base#part}}/v1/things"
+        );
+        assert_eq!(
+            query_of("{{base?part}}/v1/things?real=1"),
+            Some("real=1"),
+            "the query after the token is still found"
+        );
+        assert_eq!(
+            query_of("{{unclosed?/v1/things?real=1"),
+            None,
+            "an unclosed token runs to the end, and everything in it is its own"
+        );
+    }
+
+    /// Nothing in the table is dropped for sharing a key with the address bar --
+    /// only for being the very same pair, which would otherwise go over the wire
+    /// twice.
+    #[test]
+    fn the_same_key_with_another_value_is_still_sent() {
+        let mut request = Request::new(uuid::Uuid::new_v4(), "Ratios".to_string());
+        request.url = "https://example.com/v1/ratios?a=1".to_string();
+        request.params = vec![QueryParam {
+            key: "a".to_string(),
+            value: "2".to_string(),
+            enabled: true,
+            description: None,
+        }];
+
+        let resolved = build_resolved_request(&request, &|text: &str| text.to_string());
+        assert_eq!(resolved.url, "https://example.com/v1/ratios?a=1&a=2");
+    }
+
+    /// The table below the address bar shows the same parameters the address bar
+    /// holds, so sending must not put them in twice.
+    #[test]
+    fn a_parameter_already_in_the_url_is_not_sent_twice() {
+        let mut request = Request::new(uuid::Uuid::new_v4(), "Ratios".to_string());
+        request.url = "https://example.com/v1/ratios?hello=world".to_string();
+        request.params = vec![
+            QueryParam {
+                key: "hello".to_string(),
+                value: "world".to_string(),
+                enabled: true,
+                description: None,
+            },
+            QueryParam {
+                key: "page".to_string(),
+                value: "2".to_string(),
+                enabled: true,
+                description: None,
+            },
+        ];
+
+        let resolved = build_resolved_request(&request, &|text: &str| text.to_string());
+        assert_eq!(
+            resolved.url, "https://example.com/v1/ratios?hello=world&page=2",
+            "the one the address bar already carries stays as it is, the other is added"
+        );
+    }
     use crate::request::{ApiKeyPlacement, Header, HttpMethod, QueryParam};
     use uuid::Uuid;
 

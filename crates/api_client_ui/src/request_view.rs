@@ -552,6 +552,18 @@ pub struct RequestView {
     show_auto_headers: bool,
     response_fullscreen: bool,
     url_looks_malformed: bool,
+    /// Set when the address bar was typed in, or when the parameter table was.
+    /// The two hold the same query string, and whichever moved last decides the
+    /// other; `syncing` keeps a write from being read back as a fresh edit.
+    url_was_typed_in: bool,
+    params_were_typed_in: bool,
+    syncing: bool,
+    /// The address bar text this view wrote itself. An edit that matches it is that
+    /// write arriving back through the editor's subscription a moment later -- not
+    /// the reader typing -- and must not be read as a fresh edit. A flag cannot
+    /// tell the two apart: the subscription is delivered after the effect cycle
+    /// that wrote the text has already ended.
+    url_we_wrote: Option<String>,
     body_json_invalid: bool,
     /// Whether the most recent send successfully reached the shared
     /// response dock. When `false` (dock not registered, or the workspace is
@@ -870,6 +882,10 @@ impl RequestView {
             show_auto_headers: true,
             response_fullscreen: false,
             url_looks_malformed: false,
+            url_was_typed_in: false,
+            params_were_typed_in: false,
+            syncing: false,
+            url_we_wrote: None,
             body_json_invalid: false,
             dock_generation: None,
             dock_tab: None,
@@ -925,6 +941,10 @@ impl RequestView {
         this.watch_editor(this.url_editor.clone(), window, cx, |this, editor, cx| {
             let url = editor.read(cx).text(cx);
             this.url_looks_malformed = url_looks_malformed(&url);
+            match this.url_we_wrote.as_deref() == Some(url.as_str()) {
+                true => this.url_we_wrote = None,
+                false => this.url_was_typed_in = true,
+            }
             let request_id = this.request_id;
             this.store.update(cx, |store, cx| {
                 store.update_request(request_id, cx, |request| request.url = url);
@@ -1172,6 +1192,137 @@ impl RequestView {
         }
     }
 
+    /// The address bar and the parameter table hold one query string between them:
+    /// what is typed after the `?` shows up as rows, and what is written into the
+    /// rows shows up after the `?`. Whichever was typed in last decides.
+    ///
+    /// A row whose key names a place in the path (`:instrument_id`) is not a query
+    /// parameter and never goes into the query string.
+    fn keep_the_query_and_the_table_in_step(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.syncing || self.params_bulk_edit {
+            self.url_was_typed_in = false;
+            self.params_were_typed_in = false;
+            return;
+        }
+        let url_moved = std::mem::take(&mut self.url_was_typed_in);
+        let params_moved = std::mem::take(&mut self.params_were_typed_in);
+        // Nothing is written into the address bar while it is the thing being typed
+        // in. Building a row emits an edit of its own a moment later, and answering
+        // that by rewriting the address bar would put a `=` in front of the letter
+        // the reader is halfway through typing.
+        let reader_is_in_the_address_bar = self
+            .url_editor
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        self.syncing = true;
+        if url_moved {
+            self.take_the_query_from_the_url(window, cx);
+        } else if params_moved && !reader_is_in_the_address_bar {
+            self.write_the_query_into_the_url(window, cx);
+        }
+        self.syncing = false;
+    }
+
+    /// Rebuilds the query rows from the address bar, keeping what the table knows
+    /// that the address bar cannot say: whether a row is switched off, and its
+    /// description.
+    fn take_the_query_from_the_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.url_editor.read(cx).text(cx);
+        let pairs = api_client::query_of(&url)
+            .map(api_client::query_pairs)
+            .unwrap_or_default();
+        let known: Vec<(String, String, bool, String)> = self
+            .param_rows
+            .iter()
+            .filter(|row| !row.is_blank(cx))
+            .map(|row| {
+                (
+                    row.key_editor.read(cx).text(cx),
+                    row.value_editor.read(cx).text(cx),
+                    row.enabled,
+                    row.description_editor.read(cx).text(cx),
+                )
+            })
+            .collect();
+        if pairs
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .eq(known
+                .iter()
+                .filter(|(key, _, _, _)| !key.starts_with(':'))
+                .map(|(key, value, _, _)| (key.clone(), value.clone())))
+        {
+            return;
+        }
+
+        let places_in_the_path: Vec<(String, String, bool, String)> = known
+            .iter()
+            .filter(|(key, _, _, _)| key.starts_with(':'))
+            .cloned()
+            .collect();
+        self.param_rows.clear();
+        for (key, value, enabled, description) in places_in_the_path {
+            self.push_param_row(key, value, description, enabled, window, cx);
+        }
+        for (key, value) in pairs {
+            // A row the table already had keeps its switch and its note.
+            let remembered = known
+                .iter()
+                .find(|(theirs, _, _, _)| theirs == &key)
+                .map(|(_, _, enabled, description)| (*enabled, description.clone()));
+            let (enabled, description) = remembered.unwrap_or((true, String::new()));
+            self.push_param_row(key, value, description, enabled, window, cx);
+        }
+        self.write_params_to_the_store(cx);
+        // Building those rows emits edits of their own, which arrive after this
+        // effect cycle and would otherwise read as the reader editing the table.
+        cx.defer_in(window, |this, _window, _cx| {
+            this.params_were_typed_in = false;
+        });
+        cx.notify();
+    }
+
+    /// Writes the switched-on query rows back into the address bar, leaving the
+    /// path, its places and the fragment alone.
+    fn write_the_query_into_the_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pairs: Vec<(String, String)> = self
+            .param_rows
+            .iter()
+            .filter(|row| !row.is_blank(cx))
+            .filter(|row| row.enabled)
+            .map(|row| {
+                (
+                    row.key_editor.read(cx).text(cx),
+                    row.value_editor.read(cx).text(cx),
+                )
+            })
+            // A row with an empty key is still a row when something was typed into
+            // it -- `?=1` is a query somebody wrote on purpose. The row nobody has
+            // typed into is already gone, filtered out as blank above.
+            .filter(|(key, _)| !key.starts_with(':'))
+            .collect();
+        let url = self.url_editor.read(cx).text(cx);
+        let written = api_client::url_with_query(&url, &pairs);
+        if written == url {
+            return;
+        }
+        self.url_we_wrote = Some(written.clone());
+        self.url_editor.update(cx, |editor, cx| {
+            editor.set_text(written.clone(), window, cx);
+        });
+        self.url_looks_malformed = url_looks_malformed(&written);
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| request.url = written);
+        });
+        cx.notify();
+    }
+
     /// Keeps exactly one blank row at the end of both tables, which is the row the
     /// next line is typed into -- the way a spreadsheet always has one more row
     /// than it has content.
@@ -1271,7 +1422,14 @@ impl RequestView {
         }
     }
 
-    fn persist_params(&self, cx: &mut Context<Self>) {
+    fn persist_params(&mut self, cx: &mut Context<Self>) {
+        if !self.syncing {
+            self.params_were_typed_in = true;
+        }
+        self.write_params_to_the_store(cx);
+    }
+
+    fn write_params_to_the_store(&self, cx: &mut Context<Self>) {
         let params: Vec<QueryParam> = self
             .param_rows
             .iter()
@@ -4425,6 +4583,11 @@ impl Item for RequestView {
 
 impl Render for RequestView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The address bar and the parameter table are two views of one query
+        // string; whichever was typed in last brings the other along. Done here
+        // rather than in the editors' own callbacks, which have no window to build
+        // a row's editors with.
+        self.keep_the_query_and_the_table_in_step(window, cx);
         let border = cx.theme().colors().border;
         let background = cx.theme().colors().background;
         let editor_background = cx.theme().colors().editor_background;
@@ -6559,6 +6722,187 @@ mod tests {
             second.origin.y,
             first.origin.y + first.size.height,
             "rows sit directly on top of one another, sharing their line"
+        );
+    }
+
+    /// A query typed into the address bar shows up as rows below it, the way it
+    /// does in every other client: the two are one query string.
+    #[gpui::test]
+    async fn a_query_typed_into_the_address_bar_becomes_rows(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        draw(&mut cx);
+
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("{{financials-api}}/v1/instruments/:instrument_id/ratios?hello=world");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let rows = view.read_with(&cx, |view, cx| {
+            view.param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| {
+                    (
+                        row.key_editor.read(cx).text(cx),
+                        row.value_editor.read(cx).text(cx),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            rows,
+            vec![("hello".to_string(), "world".to_string())],
+            "what was typed after the `?` is a row of the table"
+        );
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.params.len(), 1);
+            assert_eq!(request.params[0].key, "hello");
+            assert_eq!(request.params[0].value, "world");
+        });
+        // And it is painted, not merely stored.
+        assert!(
+            cx.debug_bounds("params-cell-0-key").is_some(),
+            "the row has to be in the table on screen"
+        );
+
+        // A second one, typed on the end.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_input("&page=2");
+        cx.run_until_parked();
+        draw(&mut cx);
+        let rows = view.read_with(&cx, |view, cx| {
+            view.param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| row.key_editor.read(cx).text(cx))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(rows, vec!["hello".to_string(), "page".to_string()]);
+    }
+
+    /// The other way round: a row written into the table shows up after the `?`,
+    /// and switching a row off takes it out of the address bar. A row that names a
+    /// place in the path is not a query parameter and stays out of it.
+    #[gpui::test]
+    async fn a_row_written_into_the_table_shows_up_in_the_address_bar(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text(
+                    "https://example.com/v1/instruments/:instrument_id/ratios",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let type_into = |cx: &mut VisualTestContext,
+                         view: &Entity<RequestView>,
+                         at: usize,
+                         column: Column,
+                         text: &str| {
+            let cell = view.read_with(cx, |view, _| view.param_rows[at].cell(column).clone());
+            view.update_in(cx, |_, window, cx| {
+                cell.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            });
+            cx.simulate_input(text);
+            cx.run_until_parked();
+        };
+
+        type_into(&mut cx, &view, 0, Column::Key, ":instrument_id");
+        type_into(&mut cx, &view, 0, Column::Value, "6408");
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.url_editor.read(cx).text(cx)),
+            "https://example.com/v1/instruments/:instrument_id/ratios",
+            "a place in the path is filled at send time, not hung on the end as a query"
+        );
+
+        type_into(&mut cx, &view, 1, Column::Key, "hello");
+        type_into(&mut cx, &view, 1, Column::Value, "world");
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.url_editor.read(cx).text(cx)),
+            "https://example.com/v1/instruments/:instrument_id/ratios?hello=world",
+            "what is written in the table shows up after the question mark"
+        );
+
+        // Switched off, it leaves the address bar -- that is what switching it off
+        // means.
+        let switch = debug_center(&mut cx, "params-toggle-1");
+        cx.simulate_click(switch, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.url_editor.read(cx).text(cx)),
+            "https://example.com/v1/instruments/:instrument_id/ratios",
+            "a row that is switched off is not part of the request"
+        );
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .count()),
+            2,
+            "and it is still in the table, waiting to be switched back on"
+        );
+    }
+
+    /// `?=1` is a query somebody wrote on purpose. Writing another row must not
+    /// quietly take it out of the address bar.
+    #[gpui::test]
+    async fn a_parameter_with_no_name_is_left_where_it_was_written(cx: &mut TestAppContext) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text("https://example.com/things?=1", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| (
+                    row.key_editor.read(cx).text(cx),
+                    row.value_editor.read(cx).text(cx)
+                ))
+                .collect::<Vec<_>>()),
+            vec![(String::new(), "1".to_string())],
+            "a nameless parameter is still a row"
+        );
+
+        // Another row written under it, which is what makes the address bar be
+        // written again.
+        for (column, text) in [(Column::Key, "b"), (Column::Value, "2")] {
+            let cell = view.read_with(&cx, |view, _| view.param_rows[1].cell(column).clone());
+            view.update_in(&mut cx, |_, window, cx| {
+                cell.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            });
+            cx.simulate_input(text);
+            cx.run_until_parked();
+        }
+        draw(&mut cx);
+
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.url_editor.read(cx).text(cx)),
+            "https://example.com/things?=1&b=2",
+            "the nameless one stays where it was written"
         );
     }
 
