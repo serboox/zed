@@ -4464,10 +4464,10 @@ impl Render for RequestView {
             .child(self.render_environment_pin(cx))
             .child({
                 let is_sending = matches!(self.send_state, SendState::Sending);
-                // Sending is the one thing this view exists for, so it is the one
-                // bright thing in the row: a filled accent block with the dark
-                // ground showing through the letters, big enough to hit without
-                // aiming. Everything around it stays quiet.
+                // Sending is the one thing this view exists for, so it is the
+                // largest thing in the row -- but it wears the same accent as every
+                // other link here rather than a slab of colour, which at this size
+                // glares.
                 let accent = cyberpunk::Accent::Cyan;
                 div()
                     .id("request-send-hitbox")
@@ -4487,26 +4487,26 @@ impl Render for RequestView {
                     .justify_center()
                     .gap_1p5()
                     .border_1()
-                    .border_color(accent.bright())
-                    .bg(accent.border())
+                    .border_color(accent.border().opacity(0.55))
+                    .bg(accent.border().opacity(0.12))
                     .when(is_sending, |button| button.opacity(0.6))
                     .when(!is_sending, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|style| style.bg(accent.bright()))
+                            .hover(|style| style.bg(accent.border().opacity(0.28)))
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                     })
                     .child(
                         Icon::new(IconName::PlayFilled)
                             .size(IconSize::Small)
-                            .color(Color::Custom(cyberpunk::canvas())),
+                            .color(Color::Accent),
                     )
                     .child(
                         div()
                             .cyberpunk_monospace(cx)
                             .font_weight(gpui::FontWeight::EXTRA_BOLD)
                             .text_size(ui::HeadlineSize::XSmall.rems())
-                            .text_color(cyberpunk::canvas())
+                            .text_color(Color::Accent.color(cx))
                             .child(match is_sending {
                                 true => "SENDING",
                                 false => "SEND",

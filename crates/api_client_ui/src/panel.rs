@@ -2518,16 +2518,13 @@ impl Render for ApiClientPanel {
             .child(
                 h_flex()
                     .flex_none()
-                    .justify_between()
                     .items_center()
                     .p_2()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new("API Client")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    // No title over the buttons: the dock's own icon already says
+                    // which panel this is, and the row it took is the room the tree
+                    // gets instead.
                     .child(
                         h_flex()
                             .gap_2()
