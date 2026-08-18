@@ -280,24 +280,23 @@ fn put_params_in_the_path(url: &mut String, params: &[(String, String)]) -> Vec<
 /// name, not a delimiter of the URL.
 fn delimiter_after_the_scheme(url: &str, wanted: &[char]) -> Option<usize> {
     let mut at = url.find("://").map(|scheme| scheme + 3).unwrap_or(0);
-    let bytes = url.as_bytes();
     while at < url.len() {
-        if url[at..].starts_with("{{") {
-            match url[at..].find("}}") {
-                Some(closes) => {
-                    at += closes + 2;
-                    continue;
-                }
-                // An unclosed token runs to the end of the text, and everything in
-                // it is the token's own business.
-                None => return None,
-            }
+        let rest = &url[at..];
+        if rest.starts_with("{{") {
+            // An unclosed token runs to the end of the text, and everything in it
+            // is the token's own business.
+            let closes = rest.find("}}")?;
+            at += closes + 2;
+            continue;
         }
-        let here = bytes[at] as char;
-        if wanted.contains(&here) {
+        // Stepped a character at a time, never a byte: a URL may hold any letter
+        // somebody can type, and a byte step lands inside a multi-byte one -- which
+        // is a panic, not a mistake in the answer.
+        let character = rest.chars().next()?;
+        if wanted.contains(&character) {
             return Some(at);
         }
-        at += 1;
+        at += character.len_utf8();
     }
     None
 }
@@ -319,6 +318,28 @@ pub fn url_without_query(url: &str) -> (&str, Option<&str>) {
     let fragment = delimiter_after_the_scheme(url, &['#']).map(|at| &url[at + 1..]);
     let ends = delimiter_after_the_scheme(url, &['?', '#']).unwrap_or(url.len());
     (&url[..ends], fragment)
+}
+
+/// The `:name` places the path holds, in the order they appear, each with its
+/// colon.
+///
+/// Whole segments only, the same rule `put_params_in_the_path` fills them by: a
+/// colon inside a segment (`v1:beta`) is a colon somebody wrote, not a place. A
+/// `{{token}}` is stepped over -- what is inside it is the token's own.
+pub fn path_places(url: &str) -> Vec<String> {
+    let (path, _) = url_without_query(url);
+    let after_scheme = path.find("://").map(|scheme| scheme + 3).unwrap_or(0);
+    let mut places = Vec::new();
+    for segment in path[after_scheme..].split('/') {
+        if segment.starts_with("{{") || !segment.starts_with(':') || segment.len() < 2 {
+            continue;
+        }
+        let place = segment.to_string();
+        if !places.contains(&place) {
+            places.push(place);
+        }
+    }
+    places
 }
 
 /// The `key=value` pairs a query string holds, exactly as written. A pair with no
@@ -660,6 +681,74 @@ mod tests {
             query_of("{{unclosed?/v1/things?real=1"),
             None,
             "an unclosed token runs to the end, and everything in it is its own"
+        );
+    }
+
+    /// A `:name` written into the path is a place waiting for a value, and the table
+    /// beside the address bar is where that value is written.
+    #[test]
+    fn the_places_in_a_path_are_found_in_the_order_they_are_written() {
+        assert_eq!(
+            path_places("{{financials-api}}/v1/instruments/:instrument_id/ratios"),
+            vec![":instrument_id".to_string()]
+        );
+        assert_eq!(
+            path_places("https://example.com/:first/things/:second?:third=1"),
+            vec![":first".to_string(), ":second".to_string()],
+            "the query is not the path, whatever it holds"
+        );
+        assert_eq!(
+            path_places("https://example.com:8080/v1:beta/things"),
+            Vec::<String>::new(),
+            "a port and a colon inside a segment are not places"
+        );
+        assert_eq!(
+            path_places("https://example.com/:same/x/:same"),
+            vec![":same".to_string()],
+            "one place, however many times it is written"
+        );
+        assert_eq!(
+            path_places("https://example.com/:/x"),
+            Vec::<String>::new(),
+            "a bare colon names nothing"
+        );
+    }
+
+    /// Any letter somebody can type may end up in the address bar. Walking it a
+    /// byte at a time lands inside a multi-byte one, which is a panic rather than a
+    /// wrong answer.
+    #[test]
+    fn a_url_of_any_letters_is_read_without_panicking() {
+        for url in [
+            "https://пример.рф/путь?ключ=значение",
+            "{{база}}/v1/инструменты/:идентификатор/ratios",
+            "https://example.com/emoji/🙂?q=🙂#🙂",
+            "{{unclosed🙂/v1/things?a=1",
+            "приветбезсхемы?a=1",
+            "",
+            "?",
+            "#",
+            "{{",
+            "}}",
+        ] {
+            let query = query_of(url);
+            let (base, fragment) = url_without_query(url);
+            let pairs = query.map(query_pairs).unwrap_or_default();
+            let written = url_with_query(url, &pairs);
+            assert!(
+                base.len() <= url.len() && written.starts_with(base),
+                "`{url}` has to read back as itself: base `{base}`, fragment {fragment:?}, \
+                 written `{written}`"
+            );
+        }
+        assert_eq!(
+            query_of("https://пример.рф/путь?ключ=значение"),
+            Some("ключ=значение")
+        );
+        assert_eq!(
+            query_of("{{база}}/v1/инструменты/:идентификатор/ratios"),
+            None,
+            "a token of any letters is still stepped over"
         );
     }
 

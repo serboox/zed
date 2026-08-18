@@ -1228,11 +1228,16 @@ impl RequestView {
         self.syncing = false;
     }
 
-    /// Rebuilds the query rows from the address bar, keeping what the table knows
-    /// that the address bar cannot say: whether a row is switched off, and its
-    /// description.
+    /// Rebuilds the rows from the address bar: a row for every `:name` place the
+    /// path holds, then a row for every pair after the `?`.
+    ///
+    /// What the table knows and the address bar cannot say -- whether a row is
+    /// switched off, its value for a place, its description -- is carried across:
+    /// the places by their position, so renaming `:instrument_id` while typing keeps
+    /// the value beside it, and the query rows by their key.
     fn take_the_query_from_the_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.url_editor.read(cx).text(cx);
+        let places = api_client::path_places(&url);
         let pairs = api_client::query_of(&url)
             .map(api_client::query_pairs)
             .unwrap_or_default();
@@ -1249,29 +1254,35 @@ impl RequestView {
                 )
             })
             .collect();
-        if pairs
+
+        let (known_places, known_query): (Vec<_>, Vec<_>) = known
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .eq(known
+            .cloned()
+            .partition(|(key, _, _, _)| key.starts_with(':'));
+        let nothing_moved = places
+            .iter()
+            .eq(known_places.iter().map(|(key, _, _, _)| key))
+            && pairs
                 .iter()
-                .filter(|(key, _, _, _)| !key.starts_with(':'))
-                .map(|(key, value, _, _)| (key.clone(), value.clone())))
-        {
+                .map(|(key, value)| (key, value))
+                .eq(known_query.iter().map(|(key, value, _, _)| (key, value)));
+        if nothing_moved {
             return;
         }
 
-        let places_in_the_path: Vec<(String, String, bool, String)> = known
-            .iter()
-            .filter(|(key, _, _, _)| key.starts_with(':'))
-            .cloned()
-            .collect();
         self.param_rows.clear();
-        for (key, value, enabled, description) in places_in_the_path {
-            self.push_param_row(key, value, description, enabled, window, cx);
+        for (at, place) in places.iter().enumerate() {
+            // By position, so a place being renamed keeps what was written beside it.
+            let (value, enabled, description) = known_places
+                .get(at)
+                .map(|(_, value, enabled, description)| {
+                    (value.clone(), *enabled, description.clone())
+                })
+                .unwrap_or_else(|| (String::new(), true, String::new()));
+            self.push_param_row(place.clone(), value, description, enabled, window, cx);
         }
         for (key, value) in pairs {
-            // A row the table already had keeps its switch and its note.
-            let remembered = known
+            let remembered = known_query
                 .iter()
                 .find(|(theirs, _, _, _)| theirs == &key)
                 .map(|(_, _, enabled, description)| (*enabled, description.clone()));
@@ -6755,14 +6766,18 @@ mod tests {
         });
         assert_eq!(
             rows,
-            vec![("hello".to_string(), "world".to_string())],
-            "what was typed after the `?` is a row of the table"
+            vec![
+                (":instrument_id".to_string(), String::new()),
+                ("hello".to_string(), "world".to_string()),
+            ],
+            "the place in the path is a row waiting for a value, then what was typed \
+             after the `?`"
         );
         store.read_with(&cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
-            assert_eq!(request.params.len(), 1);
-            assert_eq!(request.params[0].key, "hello");
-            assert_eq!(request.params[0].value, "world");
+            assert_eq!(request.params.len(), 2);
+            assert_eq!(request.params[1].key, "hello");
+            assert_eq!(request.params[1].value, "world");
         });
         // And it is painted, not merely stored.
         assert!(
@@ -6786,7 +6801,14 @@ mod tests {
                 .map(|row| row.key_editor.read(cx).text(cx))
                 .collect::<Vec<_>>()
         });
-        assert_eq!(rows, vec!["hello".to_string(), "page".to_string()]);
+        assert_eq!(
+            rows,
+            vec![
+                ":instrument_id".to_string(),
+                "hello".to_string(),
+                "page".to_string()
+            ]
+        );
     }
 
     /// The other way round: a row written into the table shows up after the `?`,
@@ -6857,6 +6879,129 @@ mod tests {
                 .count()),
             2,
             "and it is still in the table, waiting to be switched back on"
+        );
+    }
+
+    /// A `:name` written into the path is a place waiting for a value, so it shows
+    /// up as a row of the table -- and the value written beside it survives the name
+    /// being typed out letter by letter.
+    #[gpui::test]
+    async fn a_place_in_the_path_becomes_a_row(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text(
+                    "{{financials-api}}/v1/instruments/instrument_id/ratios",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .count()),
+            0,
+            "a plain path holds no places"
+        );
+
+        // The colon put in front of it, the way the reader writes a place.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text(
+                    "{{financials-api}}/v1/instruments/:instrument_id/ratios",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| (
+                    row.key_editor.read(cx).text(cx),
+                    row.value_editor.read(cx).text(cx)
+                ))
+                .collect::<Vec<_>>()),
+            vec![(":instrument_id".to_string(), String::new())],
+            "the place is a row of its own, waiting for a value"
+        );
+        assert!(
+            cx.debug_bounds("params-cell-0-key").is_some(),
+            "and it is in the table on screen"
+        );
+
+        // The value written beside it.
+        let value = view.read_with(&cx, |view, _| view.param_rows[0].value_editor.clone());
+        view.update_in(&mut cx, |_, window, cx| {
+            value.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.simulate_input("6408");
+        cx.run_until_parked();
+        draw(&mut cx);
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(request.params[0].key, ":instrument_id");
+            assert_eq!(request.params[0].value, "6408");
+        });
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.url_editor.read(cx).text(cx)),
+            "{{financials-api}}/v1/instruments/:instrument_id/ratios",
+            "a place is filled at send time and never hung on the end as a query"
+        );
+
+        // The name typed out further: the value stays beside it rather than being
+        // thrown away and typed again.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text(
+                    "{{financials-api}}/v1/instruments/:instrument/ratios",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .map(|row| (
+                    row.key_editor.read(cx).text(cx),
+                    row.value_editor.read(cx).text(cx)
+                ))
+                .collect::<Vec<_>>()),
+            vec![(":instrument".to_string(), "6408".to_string())],
+            "renaming the place keeps what was written beside it"
+        );
+
+        // And taken out of the path, its row goes with it.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.url_editor.update(cx, |editor, cx| {
+                editor.set_text("{{financials-api}}/v1/instruments/6408/ratios", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view
+                .param_rows
+                .iter()
+                .filter(|row| !row.is_blank(cx))
+                .count()),
+            0,
+            "no place in the path, no row for one"
         );
     }
 
