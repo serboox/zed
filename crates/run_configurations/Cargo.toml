@@ -24,6 +24,7 @@ path.workspace = true
 project.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+sha2.workspace = true
 settings_json.workspace = true
 task.workspace = true
 tasks_ui.workspace = true
@@ -36,6 +37,8 @@ workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
+smol.workspace = true
+tempfile.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 editor = { workspace = true, features = ["test-support"] }
