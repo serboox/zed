@@ -27,7 +27,25 @@ desktop_file="$apps_dir/dev.zed.Zed-Dev.desktop"
 old_desktop_file="$apps_dir/dev.zed.Zed-Fast.desktop"
 
 mkdir -p "$bin_dir" "$apps_dir"
-ln -sf "$binary" "$link"
+
+# The shortcut must not depend on `target/`: that directory is deleted to reclaim
+# disk, and a shortcut pointing into it then leads nowhere -- which is what "the
+# editor refuses to start" looks like from the outside. The binary is linked into
+# ~/.local/lib instead, and the shortcut points there. A hard link costs nothing
+# on the same filesystem and keeps the binary alive even once `target/` is gone;
+# a copy is the fallback when they are on different filesystems.
+installed_dir="$HOME/.local/lib/zed-fast"
+installed="$installed_dir/zed"
+mkdir -p "$installed_dir"
+staging="$installed.installing"
+rm -f "$staging"
+ln "$binary" "$staging" 2>/dev/null || cp "$binary" "$staging"
+chmod +x "$staging"
+# Renamed over the old one rather than written in place: a running editor holds
+# its own binary open, and the rename leaves that instance on its own inode.
+mv -f "$staging" "$installed"
+
+ln -sf "$installed" "$link"
 rm -f "$old_desktop_file"
 
 cat > "$desktop_file" <<EOF
@@ -51,6 +69,6 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 echo "Installed:"
-echo "  binary symlink : $link -> $binary"
+echo "  binary symlink : $link -> $installed"
 echo "  app launcher   : $desktop_file"
 echo "Look for \"Zed (Fast/DB dev)\" in your app grid (distinct grey icon)."
