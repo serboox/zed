@@ -96,7 +96,8 @@ pub fn task_from(offer: &EntryPointOffer) -> TaskTemplate {
     TaskTemplate {
         label: offer
             .label
-            .clone()
+            .as_deref()
+            .and_then(|label| as_a_reader_reads_it(label, offer.file.as_deref()))
             .unwrap_or_else(|| format!("run {named_after}")),
         command: how.command,
         args: how.args,
@@ -104,6 +105,45 @@ pub fn task_from(offer: &EntryPointOffer) -> TaskTemplate {
         env: how.env,
         ..TaskTemplate::default()
     }
+}
+
+/// A label as a reader reads it. The label a language gives a runnable names
+/// variables -- `run $ZED_STEM` -- and a window that shows that says less than one
+/// that shows `run hello`, so what the file settles is put in.
+///
+/// Nothing comes back when a variable is left that only the language itself could
+/// settle, such as which Go package the line is in: the caller has a name made
+/// from the file for that, which is at least something a reader can read.
+fn as_a_reader_reads_it(label: &str, file: Option<&Path>) -> Option<String> {
+    if !label.contains('$') {
+        return Some(label.to_string());
+    }
+    let mut variables = task::TaskVariables::default();
+    if let Some(file) = file {
+        variables.insert(task::VariableName::File, file.to_string_lossy().to_string());
+        if let Some(name) = file.file_name() {
+            variables.insert(
+                task::VariableName::Filename,
+                name.to_string_lossy().to_string(),
+            );
+        }
+        if let Some(stem) = file.file_stem() {
+            variables.insert(task::VariableName::Stem, stem.to_string_lossy().to_string());
+        }
+        if let Some(folder) = file.parent() {
+            variables.insert(
+                task::VariableName::Dirname,
+                folder.to_string_lossy().to_string(),
+            );
+        }
+    }
+    let context = task::TaskContext {
+        cwd: None,
+        task_variables: variables,
+        project_env: HashMap::default(),
+    };
+    let said = task::substitute_variables_in_str(label, &context)?;
+    (!said.contains('$')).then_some(said)
 }
 
 /// The window that opens when the reader asks the gutter for a run configuration:
@@ -414,6 +454,40 @@ mod tests {
 
     /// What the editor already runs for the line beats any guess: it is known to
     /// work.
+    /// The label a language gives a runnable names variables. A window showing
+    /// `run $ZED_STEM` says less than one showing the file's own name.
+    #[test]
+    fn a_label_naming_the_file_is_read_as_the_file() {
+        let offer = EntryPointOffer {
+            language: Some("C".to_string()),
+            file: Some(PathBuf::from("/projects/thing/src/hello.c")),
+            line: 3,
+            label: Some("run $ZED_STEM".to_string()),
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), "true".to_string()],
+            cwd: None,
+        };
+
+        assert_eq!(task_from(&offer).label, "run hello");
+    }
+
+    /// And a variable only the language itself could settle is not left in the
+    /// label for the reader to puzzle over.
+    #[test]
+    fn a_label_nothing_here_can_settle_is_named_after_the_file() {
+        let offer = EntryPointOffer {
+            language: Some("Go".to_string()),
+            file: Some(PathBuf::from("/projects/thing/cmd/api/main.go")),
+            line: 9,
+            label: Some("go run $ZED_CUSTOM_GO_PACKAGE".to_string()),
+            command: Some("go".to_string()),
+            args: vec!["run".to_string(), ".".to_string()],
+            cwd: None,
+        };
+
+        assert_eq!(task_from(&offer).label, "run main");
+    }
+
     #[test]
     fn the_editors_own_task_is_preferred_to_a_guess() {
         let offer = EntryPointOffer {

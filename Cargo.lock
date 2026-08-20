@@ -18287,6 +18287,7 @@ name = "run_configurations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "editor",
  "fs",
  "futures 0.3.32",
@@ -18299,7 +18300,6 @@ dependencies = [
  "serde_json",
  "settings",
  "settings_json",
- "sha2 0.10.9",
  "smol",
  "task",
  "tasks_ui",
@@ -22828,6 +22828,8 @@ dependencies = [
  "serde_json_lenient",
  "sha2 0.10.9",
  "shellexpand",
+ "smol",
+ "tempfile",
  "util",
  "zed_actions",
 ]
