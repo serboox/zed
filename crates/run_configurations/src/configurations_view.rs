@@ -1010,6 +1010,7 @@ impl RunConfigurationsView {
         if !self.watching {
             self._watching_task = None;
             self.metrics = None;
+            self.watcher.forget();
             return;
         }
         self._watching_task = Some(cx.spawn(async move |view, cx| {
@@ -1017,42 +1018,57 @@ impl RunConfigurationsView {
                 let Ok(pid) = view.read_with(cx, |view, cx| view.process_of_a_run(cx)) else {
                     return;
                 };
-                match pid {
-                    Some(pid) => {
-                        let samples = cx
-                            .background_spawn(async move {
-                                crate::process_metrics::everything_running()
-                            })
-                            .await;
-                        let now = std::time::Instant::now();
-                        if view
-                            .update(cx, |view, cx| {
-                                view.metrics = Some(view.watcher.metrics_of(pid, &samples, now));
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                let samples = match pid {
+                    Some(_) => {
+                        cx.background_spawn(
+                            async move { crate::process_metrics::everything_running() },
+                        )
+                        .await
                     }
-                    None => {
-                        if view
-                            .update(cx, |view, cx| {
-                                if view.metrics.take().is_some() {
-                                    cx.notify();
-                                }
-                            })
-                            .is_err()
-                        {
-                            return;
+                    None => None,
+                };
+                let now = std::time::Instant::now();
+                if view
+                    .update(cx, |view, cx| {
+                        if view.read_the_run(pid, samples.as_deref(), now) {
+                            cx.notify();
                         }
-                    }
+                    })
+                    .is_err()
+                {
+                    return;
                 }
                 cx.background_executor()
                     .timer(crate::process_metrics::Watcher::HOW_OFTEN)
                     .await;
             }
         }));
+    }
+
+    /// One reading. `samples` is every process the machine talked about, or
+    /// nothing when it did not answer; `pid` is the run to look for among them.
+    /// Says whether the row changed.
+    ///
+    /// A run the machine has nothing to say about is over, and the row says so.
+    /// A machine that did not answer at all leaves the row as it was, rather than
+    /// reporting a running thing as gone.
+    fn read_the_run(
+        &mut self,
+        pid: Option<u32>,
+        samples: Option<&[crate::process_metrics::Sample]>,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(pid) = pid else {
+            self.watcher.forget();
+            return self.metrics.take().is_some();
+        };
+        let Some(samples) = samples else {
+            return false;
+        };
+        let read = self.watcher.metrics_of(pid, samples, now);
+        let changed = read != self.metrics;
+        self.metrics = read;
+        changed
     }
 
     /// What the run is using, in one line. A number nobody can measure says why
@@ -1118,7 +1134,7 @@ impl RunConfigurationsView {
 
         h_flex()
             .id("run-metrics")
-            .debug_selector(|| "run-metrics".to_string())
+            .debug_selector(|| "run-metrics-reading".to_string())
             .w_full()
             .gap_3()
             .items_center()
@@ -1133,10 +1149,7 @@ impl RunConfigurationsView {
             ))
             .child(said(
                 "RAM",
-                match metrics.memory {
-                    Some(bytes) => crate::process_metrics::as_memory(bytes),
-                    None => "--".to_string(),
-                },
+                crate::process_metrics::as_memory(metrics.memory),
             ))
             .child(said(
                 "network",
@@ -1724,6 +1737,96 @@ mod tests {
         assert!(
             cx.debug_bounds("run-metrics").is_some(),
             "and the row still says what it is doing"
+        );
+    }
+
+    /// A run that has ended leaves its terminal, and its pid, behind. The row
+    /// must go back to saying nothing is running rather than keep the pid of a
+    /// process that is gone.
+    #[gpui::test]
+    async fn the_row_lets_go_of_a_run_that_has_ended(cx: &mut TestAppContext) {
+        use crate::process_metrics::Sample;
+
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+        let watched = 4242;
+        let running = [Sample {
+            pid: watched,
+            parent: 1,
+            ticks: 10,
+            memory: 8 * 1024 * 1024,
+            started: 5_000,
+        }];
+        let at = std::time::Instant::now();
+
+        view.update(&mut cx, |view, _| {
+            assert!(view.read_the_run(Some(watched), Some(&running), at));
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("run-metrics-reading").is_some(),
+            "while it runs, the row shows the reading"
+        );
+
+        // The machine is asked again and says nothing about that process.
+        let gone = [Sample {
+            pid: 1,
+            parent: 0,
+            ticks: 3,
+            memory: 1024,
+            started: 1,
+        }];
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.read_the_run(
+                    Some(watched),
+                    Some(&gone),
+                    at + crate::process_metrics::Watcher::HOW_OFTEN
+                ),
+                "the row changed"
+            );
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("run-metrics-reading").is_none(),
+            "the reading is gone with the run"
+        );
+        assert!(
+            cx.debug_bounds("run-metrics").is_some(),
+            "and the row says there is nothing running"
+        );
+    }
+
+    /// A machine that does not answer is not a run that has ended: an answer with
+    /// no processes in it at all leaves the row as it was.
+    #[gpui::test]
+    async fn a_machine_that_says_nothing_does_not_end_the_run(cx: &mut TestAppContext) {
+        use crate::process_metrics::Sample;
+
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+        let watched = 4242;
+        let running = [Sample {
+            pid: watched,
+            parent: 1,
+            ticks: 10,
+            memory: 8 * 1024 * 1024,
+            started: 5_000,
+        }];
+        let at = std::time::Instant::now();
+        view.update(&mut cx, |view, _| {
+            view.read_the_run(Some(watched), Some(&running), at);
+            assert!(
+                !view.read_the_run(
+                    Some(watched),
+                    None,
+                    at + crate::process_metrics::Watcher::HOW_OFTEN
+                ),
+                "nothing to report from a reading that did not happen"
+            );
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("run-metrics-reading").is_some(),
+            "the row still shows the run it was showing"
         );
     }
 
