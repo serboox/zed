@@ -1,6 +1,7 @@
 //! Baseline interface of Tasks in Zed: all tasks in Zed are intended to use those for implementing their own logic.
 
 mod adapter_schema;
+pub mod compiled_one_off;
 mod debug_format;
 mod serde_helpers;
 pub mod static_source;

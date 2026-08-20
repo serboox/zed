@@ -95,11 +95,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         LanguageInfo {
             name: "c",
             adapters: vec![c_lsp_adapter.clone()],
+            context: Some(Arc::new(c::compiled_task_context("cc", c::C_MAIN))),
             ..Default::default()
         },
         LanguageInfo {
             name: "cpp",
             adapters: vec![c_lsp_adapter],
+            context: Some(Arc::new(c::compiled_task_context("c++", c::CPP_MAIN))),
             semantic_token_rules: Some(cpp::semantic_token_rules()),
             ..Default::default()
         },

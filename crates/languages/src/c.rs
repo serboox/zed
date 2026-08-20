@@ -6,11 +6,38 @@ use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_relea
 use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
 use lsp::{InitializeParams, LanguageServerBinary, LanguageServerName};
+use project::ContextProviderWithTasks;
 use project::lsp_store::clangd_ext;
 use serde_json::json;
 use smol::fs;
 use std::{env::consts, future::Future, path::PathBuf, sync::Arc};
+use task::{TaskTemplate, TaskTemplates, VariableName};
 use util::{ResultExt, fs::remove_matching, maybe, merge_json_value_into};
+
+/// What the gutter offers for a `main` in C or in C++: build it, then run what
+/// was built.
+///
+/// Neither language has a build system of its own, so this is a one-off -- one
+/// file, one compiler, one program -- and where the program goes is
+/// `task::compiled_one_off`'s to decide. A project with a Makefile or a CMake
+/// file of its own is run from that instead, through its own task.
+/// The tags the grammars' own runnable queries put on a `main`. A task tagged
+/// anything else is a gutter button that never appears.
+pub(super) const C_MAIN: &str = "c-main";
+pub(super) const CPP_MAIN: &str = "cpp-main";
+
+pub(super) fn compiled_task_context(compiler: &str, tag: &str) -> ContextProviderWithTasks {
+    let (command, args, env) = task::compiled_one_off::build_and_run(compiler);
+    ContextProviderWithTasks::new(TaskTemplates(vec![TaskTemplate {
+        label: format!("run {}", VariableName::Stem.template_value()),
+        command,
+        args,
+        env,
+        cwd: Some(VariableName::Dirname.template_value()),
+        tags: vec![tag.to_owned()],
+        ..TaskTemplate::default()
+    }]))
+}
 
 pub struct CLspAdapter;
 
@@ -416,10 +443,54 @@ async fn get_cached_server_binary(container_dir: PathBuf) -> Option<LanguageServ
 #[cfg(test)]
 mod tests {
     use gpui::{AppContext as _, BorrowAppContext, TestAppContext};
+    use language::ContextProvider as _;
     use language::{AutoindentMode, Buffer};
     use settings::SettingsStore;
     use std::num::NonZeroU32;
     use unindent::Unindent;
+
+    /// The gutter's play button on a `main` comes from a task tagged the way the
+    /// grammar's own query tags that line. A tag that does not match is a button
+    /// that never appears.
+    #[gpui::test]
+    async fn a_main_in_c_is_offered_a_way_to_run(cx: &mut TestAppContext) {
+        for (compiler, tag, grammar) in [
+            ("cc", crate::c::C_MAIN, "c"),
+            ("c++", crate::c::CPP_MAIN, "cpp"),
+        ] {
+            let query = std::fs::read_to_string(format!(
+                "{}/../grammars/src/{grammar}/runnables.scm",
+                env!("CARGO_MANIFEST_DIR"),
+            ))
+            .expect("the grammar says which lines can be run");
+            assert!(
+                query.contains(&format!("tag {tag}")),
+                "the grammar tags a main with {tag}: {query}"
+            );
+
+            let provider = crate::c::compiled_task_context(compiler, tag);
+            let templates = cx
+                .update(|cx| provider.associated_tasks(None, cx))
+                .await
+                .expect("the language offers tasks");
+            let template = templates
+                .0
+                .iter()
+                .find(|template| template.tags.iter().any(|theirs| theirs == tag))
+                .unwrap_or_else(|| panic!("a task tagged {tag}"));
+
+            assert_eq!(template.command, "sh");
+            assert!(
+                template.args.join(" ").contains(compiler),
+                "it is built with {compiler}: {:?}",
+                template.args
+            );
+            assert!(
+                template.env.contains_key(task::compiled_one_off::SOURCE),
+                "and the file it builds is read from the environment, not the command"
+            );
+        }
+    }
 
     #[gpui::test]
     async fn test_c_autoindent_basic(cx: &mut TestAppContext) {
