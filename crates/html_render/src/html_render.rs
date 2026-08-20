@@ -210,6 +210,12 @@ mod engine {
         // nightly builds send.
         preferences.user_agent = FIREFOX_NIGHTLY.to_string();
         preferences.gfx_subpixel_text_antialiasing_enabled = false;
+        // How long to wait for something to answer before saying it did not. The
+        // engine waits a quarter of a minute by default, which for a preview is
+        // long enough that a page reads as frozen rather than as slow -- and a
+        // page pulls a dozen things from the network, each waiting in its turn.
+        // A host that has not answered in this long is not going to.
+        preferences.network_connection_timeout = 8;
         let cores = std::thread::available_parallelism()
             .map(|cores| cores.get())
             .unwrap_or(4);

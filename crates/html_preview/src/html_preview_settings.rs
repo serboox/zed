@@ -16,6 +16,26 @@ pub struct HtmlPreviewSettings {
     pub proxy: Option<std::sync::Arc<str>>,
 }
 
+/// What `typed` names on this machine, if it names anything: an absolute path, a
+/// path from the reader's own folder, or one from where the editor was started.
+///
+/// Only a file that is really there comes back. A name that is not on the machine
+/// may well be a host, and guessing otherwise would send every mistyped address
+/// to a file that does not exist.
+fn as_a_file_on_this_machine(typed: &str) -> Option<url::Url> {
+    let path = match typed.strip_prefix("~/") {
+        Some(rest) => paths::home_dir().join(rest),
+        None => std::path::PathBuf::from(typed),
+    };
+    let path = match path.is_absolute() {
+        true => path,
+        false => std::env::current_dir().ok()?.join(path),
+    };
+    path.exists()
+        .then(|| url::Url::from_file_path(&path).ok())
+        .flatten()
+}
+
 /// A page drawn smaller than a tenth of the display, or larger than four times
 /// it, is a mistake rather than a preference.
 const SENSIBLE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
@@ -37,6 +57,13 @@ impl HtmlPreviewSettings {
             && !address.cannot_be_a_base()
         {
             return Some(address);
+        }
+        // Something on this machine, before anything is asked of the network. A
+        // path holds dots like a host does, so read as a host it becomes a site
+        // called `home` that nobody can reach and every attempt waits out the
+        // connection timeout before saying so.
+        if let Some(file) = as_a_file_on_this_machine(typed) {
+            return Some(file);
         }
         // A single word with a dot in it and nothing that looks like a sentence
         // is an address someone did not bother to spell out.
@@ -120,6 +147,49 @@ mod tests {
                 .where_to_go("example.com")
                 .map(|url| url.to_string()),
             Some("https://example.com/".to_string())
+        );
+    }
+
+    /// A path on this machine is a file, not a website. Read as a host, one that
+    /// starts at `/home` becomes a site called `home`, and every attempt to reach
+    /// it waits out the connection timeout before saying so.
+    #[test]
+    fn a_file_on_this_machine_is_opened_rather_than_asked_of_the_network() {
+        let settings = settings(SEARCH);
+        let folder = tempfile::tempdir().expect("somewhere to put a file");
+        let page = folder.path().join("bonds-2026-08-20.html");
+        std::fs::write(&page, "<p>hello</p>").expect("a page to open");
+
+        let went = settings
+            .where_to_go(&page.to_string_lossy())
+            .expect("it goes somewhere");
+        assert_eq!(went.scheme(), "file", "it is a file: {went}");
+        assert_eq!(
+            went.to_file_path().ok().as_deref(),
+            Some(page.as_path()),
+            "and it is that file"
+        );
+
+        // Spelled out, it is the same file.
+        let spelled = format!("file://{}", page.display());
+        assert_eq!(
+            settings
+                .where_to_go(&spelled)
+                .and_then(|went| went.to_file_path().ok()),
+            Some(page),
+        );
+    }
+
+    /// A path that names nothing may well be a host, and a host is what it is
+    /// taken for.
+    #[test]
+    fn a_path_to_nothing_is_still_read_as_a_host() {
+        let settings = settings(SEARCH);
+        assert_eq!(
+            settings
+                .where_to_go("example.com/nothing/here.html")
+                .map(|url| url.to_string()),
+            Some("https://example.com/nothing/here.html".to_string()),
         );
     }
 
