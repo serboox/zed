@@ -1114,6 +1114,10 @@ pub mod run_configurations {
         pub command: Option<String>,
         pub args: Vec<String>,
         pub cwd: Option<String>,
+        /// What that task needs in its environment. A task may keep something in
+        /// there that its command cannot do without, so an offer that dropped it
+        /// would offer a command that cannot run.
+        pub env: std::collections::HashMap<String, String>,
     }
 
     impl gpui::Global for EntryPointOffer {}

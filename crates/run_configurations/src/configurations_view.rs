@@ -1656,6 +1656,7 @@ mod tests {
                 command: Some("go".to_string()),
                 args: vec!["run".to_string(), ".".to_string()],
                 cwd: Some("${ZED_DIRNAME}".to_string()),
+                env: Default::default(),
             });
         });
         let handled = cx.update(|window, cx| {
@@ -2020,6 +2021,7 @@ mod tests {
                 command: Some("go".to_string()),
                 args: vec!["run".to_string(), ".".to_string()],
                 cwd: None,
+                env: Default::default(),
             });
         });
         cx.dispatch_action(RunFromEntryPoint);
@@ -2074,6 +2076,7 @@ mod tests {
                 command: None,
                 args: Vec::new(),
                 cwd: None,
+                env: Default::default(),
             });
         });
         cx.dispatch_action(RunFromEntryPoint);
@@ -2127,6 +2130,7 @@ mod tests {
                 command: Some("go".to_string()),
                 args: vec!["run".to_string(), ".".to_string()],
                 cwd: None,
+                env: Default::default(),
             });
         });
         cx.dispatch_action(CreateFromEntryPoint);

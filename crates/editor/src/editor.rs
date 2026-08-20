@@ -4209,6 +4209,9 @@ impl Editor {
                 .map(|(_, template)| template.args.clone())
                 .unwrap_or_default(),
             cwd: first.and_then(|(_, template)| template.cwd.clone()),
+            env: first
+                .map(|(_, template)| template.env.clone().into_iter().collect())
+                .unwrap_or_default(),
         })
     }
 

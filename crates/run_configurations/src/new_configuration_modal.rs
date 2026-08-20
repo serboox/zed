@@ -83,7 +83,7 @@ pub fn task_from(offer: &EntryPointOffer) -> TaskTemplate {
             command: command.to_string(),
             args: offer.args.clone(),
             cwd: offer.cwd.clone(),
-            env: HashMap::default(),
+            env: what_the_file_settles(&offer.env, offer.file.as_deref()),
         },
         _ => defaults_for(offer.language.as_deref(), offer.file.as_deref()),
     };
@@ -107,17 +107,25 @@ pub fn task_from(offer: &EntryPointOffer) -> TaskTemplate {
     }
 }
 
-/// A label as a reader reads it. The label a language gives a runnable names
-/// variables -- `run $ZED_STEM` -- and a window that shows that says less than one
-/// that shows `run hello`, so what the file settles is put in.
+/// The task's environment with what this file settles already filled in.
 ///
-/// Nothing comes back when a variable is left that only the language itself could
-/// settle, such as which Go package the line is in: the caller has a name made
-/// from the file for that, which is at least something a reader can read.
-fn as_a_reader_reads_it(label: &str, file: Option<&Path>) -> Option<String> {
-    if !label.contains('$') {
-        return Some(label.to_string());
-    }
+/// A run started from here is a one-off: it is not the editor's own task any
+/// more, so nothing is going to fill in `$ZED_FILE` for it later. What a file
+/// alone cannot settle is left as it stands, for whoever runs it.
+fn what_the_file_settles(
+    env: &std::collections::HashMap<String, String>,
+    file: Option<&Path>,
+) -> HashMap<String, String> {
+    let asked: HashMap<String, String> = env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    task::substitute_variables_in_map(&asked, &what_is_known_of(file)).unwrap_or(asked)
+}
+
+/// What a file alone says, for filling in a label or a value with no project to
+/// ask.
+fn what_is_known_of(file: Option<&Path>) -> task::TaskContext {
     let mut variables = task::TaskVariables::default();
     if let Some(file) = file {
         variables.insert(task::VariableName::File, file.to_string_lossy().to_string());
@@ -137,12 +145,25 @@ fn as_a_reader_reads_it(label: &str, file: Option<&Path>) -> Option<String> {
             );
         }
     }
-    let context = task::TaskContext {
+    task::TaskContext {
         cwd: None,
         task_variables: variables,
-        project_env: HashMap::default(),
-    };
-    let said = task::substitute_variables_in_str(label, &context)?;
+        project_env: std::collections::HashMap::default(),
+    }
+}
+
+/// A label as a reader reads it. The label a language gives a runnable names
+/// variables -- `run $ZED_STEM` -- and a window that shows that says less than one
+/// that shows `run hello`, so what the file settles is put in.
+///
+/// Nothing comes back when a variable is left that only the language itself could
+/// settle, such as which Go package the line is in: the caller has a name made
+/// from the file for that, which is at least something a reader can read.
+fn as_a_reader_reads_it(label: &str, file: Option<&Path>) -> Option<String> {
+    if !label.contains('$') {
+        return Some(label.to_string());
+    }
+    let said = task::substitute_variables_in_str(label, &what_is_known_of(file))?;
     (!said.contains('$')).then_some(said)
 }
 
@@ -454,6 +475,44 @@ mod tests {
 
     /// What the editor already runs for the line beats any guess: it is known to
     /// work.
+    /// A task may keep in its environment something its command cannot do
+    /// without -- the file it is to build, for one -- and a run started from here
+    /// is a one-off, so nothing will fill that in later.
+    #[test]
+    fn what_a_task_needs_in_its_environment_comes_with_it() {
+        let mut env = std::collections::HashMap::default();
+        env.insert(
+            task::compiled_one_off::SOURCE.to_string(),
+            "$ZED_FILE".to_string(),
+        );
+        env.insert("KEPT".to_string(), "as it is".to_string());
+        let offer = EntryPointOffer {
+            language: Some("C".to_string()),
+            file: Some(PathBuf::from("/projects/thing/src/hello.c")),
+            line: 3,
+            label: Some("run $ZED_STEM".to_string()),
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), "true".to_string()],
+            cwd: None,
+            env,
+        };
+
+        let task = task_from(&offer);
+
+        assert_eq!(
+            task.env
+                .get(task::compiled_one_off::SOURCE)
+                .map(String::as_str),
+            Some("/projects/thing/src/hello.c"),
+            "the file is settled here, since nothing else is going to settle it"
+        );
+        assert_eq!(
+            task.env.get("KEPT").map(String::as_str),
+            Some("as it is"),
+            "and everything else comes through as it stands"
+        );
+    }
+
     /// The label a language gives a runnable names variables. A window showing
     /// `run $ZED_STEM` says less than one showing the file's own name.
     #[test]
@@ -466,6 +525,7 @@ mod tests {
             command: Some("sh".to_string()),
             args: vec!["-c".to_string(), "true".to_string()],
             cwd: None,
+            env: Default::default(),
         };
 
         assert_eq!(task_from(&offer).label, "run hello");
@@ -483,6 +543,7 @@ mod tests {
             command: Some("go".to_string()),
             args: vec!["run".to_string(), ".".to_string()],
             cwd: None,
+            env: Default::default(),
         };
 
         assert_eq!(task_from(&offer).label, "run main");
@@ -498,6 +559,7 @@ mod tests {
             command: Some("go".to_string()),
             args: vec!["run".to_string(), "./cmd/api".to_string()],
             cwd: Some("/projects/thing".to_string()),
+            env: Default::default(),
         };
 
         let task = task_from(&offer);
