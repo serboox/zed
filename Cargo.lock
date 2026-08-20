@@ -18283,6 +18283,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad8388ea1a9e0ea807e442e8263a699e7edcb320ecbcd21b4fa8ff859acce3ba"
 
 [[package]]
+name = "run_configurations"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures 0.3.32",
+ "gpui",
+ "libc",
+ "log",
+ "menu",
+ "path",
+ "project",
+ "serde_json",
+ "settings",
+ "settings_json",
+ "sha2 0.10.9",
+ "smol",
+ "task",
+ "tasks_ui",
+ "tempfile",
+ "terminal",
+ "terminal_view",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "runtimelib"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28202,6 +28234,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "run_configurations",
  "sandbox",
  "search",
  "semver 1.0.27",
