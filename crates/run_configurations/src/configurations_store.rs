@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
+use collections::HashMap;
+use gpui::{App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Task};
 use project::Project;
 use serde_json::Value;
 
@@ -13,6 +14,35 @@ use task::TaskTemplate;
 /// Said whenever the files have been read again, so a view can keep up with what
 /// somebody typed into them by hand.
 pub struct ConfigurationsChanged;
+
+
+/// One store per project, so the window that lists configurations, the windows
+/// that run them and the switcher in the toolbar all read the same files -- read
+/// once, and warm by the time anything asks. A store made where it is needed is
+/// still empty when the surface it feeds is drawn.
+struct StoreForProject(HashMap<EntityId, Entity<ConfigurationsStore>>);
+
+impl Global for StoreForProject {}
+
+pub fn store_for(project: &Entity<Project>, cx: &mut App) -> Entity<ConfigurationsStore> {
+    let id = project.entity_id();
+    if let Some(store) = cx
+        .try_global::<StoreForProject>()
+        .and_then(|stores| stores.0.get(&id).cloned())
+    {
+        return store;
+    }
+    let store = cx.new(|cx| ConfigurationsStore::new(project, cx));
+    let mut stores = match cx.has_global::<StoreForProject>() {
+        true => cx.remove_global::<StoreForProject>(),
+        false => StoreForProject(HashMap::default()),
+    };
+    // A project that is gone takes its store with it.
+    stores.0.retain(|_, store| store.entity_id() != id);
+    stores.0.insert(id, store.clone());
+    cx.set_global(stores);
+    store
+}
 
 /// The project's run configurations, as its two files hold them.
 ///

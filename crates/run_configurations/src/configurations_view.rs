@@ -75,7 +75,7 @@ pub fn init(cx: &mut App) {
         // once and are already warm by the time a window asks what the project
         // knows. A store made inside an action would still be empty when the window
         // it feeds is drawn.
-        let store = cx.new(|cx| ConfigurationsStore::new(workspace.project(), cx));
+        let store = crate::configurations_store::store_for(workspace.project(), cx);
 
         // The run button in the gutter. Every way of running the line is offered;
         // with no way at all there is nothing to choose between, so the window that
@@ -101,7 +101,6 @@ pub fn init(cx: &mut App) {
             }
         });
         workspace.register_action({
-            let store = store.clone();
             move |workspace, _: &CreateFromEntryPoint, window, cx| {
                 let offer = taken_offer(cx);
                 let handle = workspace.weak_handle();
@@ -227,6 +226,22 @@ pub struct RunConfigurationsView {
     unsaved: bool,
     /// Set once the reader has typed something the file has not been told about.
     edited: bool,
+    /// A terminal of its own for every run, rather than the last one reused.
+    use_new_terminal: bool,
+    /// Several runs of this configuration at once, rather than the running one
+    /// being replaced.
+    several_at_once: bool,
+    /// What the running configuration is using, and the reading before it, which is
+    /// what makes a rate out of two numbers.
+    metrics: Option<crate::process_metrics::Metrics>,
+    watcher: crate::process_metrics::Watcher,
+    /// Whether the machine is being watched at all. Watching costs a reading a
+    /// second, which is nothing, but a reader who does not want the row can say so.
+    watching: bool,
+    _watching_task: Option<gpui::Task<()>>,
+    /// Whether the JSON that lands in the file is shown under the form. The files
+    /// are read and edited by hand, so what the form writes has to be checkable.
+    showing_json: bool,
     /// Said when the file changed under an edit, rather than quietly throwing the
     /// edit away.
     changed_underneath: bool,
@@ -254,7 +269,7 @@ impl RunConfigurationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let store = cx.new(|cx| ConfigurationsStore::new(&project, cx));
+        let store = crate::configurations_store::store_for(&project, cx);
         let mut subscriptions = vec![cx.subscribe_in(
             &store,
             window,
@@ -314,12 +329,19 @@ impl RunConfigurationsView {
             }));
         }
 
-        Self {
+        let mut view = Self {
             store,
             workspace,
             focus: cx.focus_handle(),
             chosen: None,
             as_read: None,
+            use_new_terminal: false,
+            several_at_once: false,
+            metrics: None,
+            watcher: crate::process_metrics::Watcher::default(),
+            watching: true,
+            _watching_task: None,
+            showing_json: false,
             unsaved: false,
             edited: false,
             changed_underneath: false,
@@ -336,7 +358,11 @@ impl RunConfigurationsView {
             list_scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
-        }
+        };
+        // Watching starts with the view: a run that is already going should be
+        // reported the moment this is opened, not a second after somebody clicks.
+        view.watch_the_run(cx);
+        view
     }
 
     /// The files were read again. What is being shown follows them, unless the
@@ -373,6 +399,14 @@ impl RunConfigurationsView {
         self.edited = false;
         self.changed_underneath = false;
         self.trouble = None;
+        self.use_new_terminal = configuration
+            .task
+            .as_ref()
+            .is_some_and(|task| task.use_new_terminal);
+        self.several_at_once = configuration
+            .task
+            .as_ref()
+            .is_some_and(|task| task.allow_concurrent_runs);
 
         let (label, command, args, cwd, env_file, env) = match &configuration.task {
             Some(task) => (
@@ -495,6 +529,8 @@ impl RunConfigurationsView {
         for (name, value) in task::env_file_variables(&text(&self.env)) {
             task.env.insert(name, value);
         }
+        task.use_new_terminal = self.use_new_terminal;
+        task.allow_concurrent_runs = self.several_at_once;
         // What the file said and the form does not show is kept: a configuration
         // may hold settings this form has no field for, and saving must not be a
         // way to lose them.
@@ -505,8 +541,6 @@ impl RunConfigurationsView {
                 .get(Kind::Task, at)
                 .and_then(|configuration| configuration.task.clone())
         {
-            task.use_new_terminal = existing.use_new_terminal;
-            task.allow_concurrent_runs = existing.allow_concurrent_runs;
             task.reveal = existing.reveal;
             task.reveal_target = existing.reveal_target;
             task.hide = existing.hide;
@@ -942,6 +976,314 @@ impl RunConfigurationsView {
             .into_any_element()
     }
 
+    /// The process a run of this project is going on in, if one is. The terminal
+    /// panel holds the runs; a task terminal is one that was started from a task,
+    /// which is what a configuration is.
+    fn process_of_a_run(&self, cx: &App) -> Option<u32> {
+        let workspace = self.workspace.upgrade()?;
+        let panel = workspace
+            .read(cx)
+            .panel::<terminal_view::terminal_panel::TerminalPanel>(cx)?;
+        let panel = panel.read(cx);
+        let mut newest = None;
+        for pane in panel.panes() {
+            for item in pane.read(cx).items() {
+                let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
+                    continue;
+                };
+                let terminal = view.read(cx).terminal().read(cx);
+                if terminal.task().is_some()
+                    && let Some(pid) = terminal.pid()
+                {
+                    newest = Some(pid.as_u32());
+                }
+            }
+        }
+        newest
+    }
+
+    /// Reads what the run is using, once a second, for as long as this view is on
+    /// screen and the reader wants it. The reading itself happens off the drawing
+    /// thread: `/proc` holds a few hundred files and none of that belongs in a
+    /// frame.
+    fn watch_the_run(&mut self, cx: &mut Context<Self>) {
+        if !self.watching {
+            self._watching_task = None;
+            self.metrics = None;
+            return;
+        }
+        self._watching_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                let Ok(pid) = view.read_with(cx, |view, cx| view.process_of_a_run(cx)) else {
+                    return;
+                };
+                match pid {
+                    Some(pid) => {
+                        let samples = cx
+                            .background_spawn(async move {
+                                crate::process_metrics::everything_running()
+                            })
+                            .await;
+                        let now = std::time::Instant::now();
+                        if view
+                            .update(cx, |view, cx| {
+                                view.metrics = Some(view.watcher.metrics_of(pid, &samples, now));
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    None => {
+                        if view
+                            .update(cx, |view, cx| {
+                                if view.metrics.take().is_some() {
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                cx.background_executor()
+                    .timer(crate::process_metrics::Watcher::HOW_OFTEN)
+                    .await;
+            }
+        }));
+    }
+
+    /// What the run is using, in one line. A number nobody can measure says why
+    /// rather than showing a zero, which would read as "it is using none".
+    fn render_metrics(&self, cx: &mut Context<Self>) -> AnyElement {
+        let said = |label: &'static str, value: String| {
+            h_flex()
+                .gap_1()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(value).size(LabelSize::XSmall))
+        };
+        let toggle = h_flex()
+            .id("metrics-toggle")
+            .debug_selector(|| "metrics-toggle".to_string())
+            .gap_1()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(|view, _, _window, cx| {
+                view.watching = !view.watching;
+                view.watch_the_run(cx);
+                cx.notify();
+            }))
+            .child(
+                Icon::new(match self.watching {
+                    true => IconName::Check,
+                    false => IconName::Close,
+                })
+                .size(IconSize::XSmall)
+                .color(match self.watching {
+                    true => Color::Accent,
+                    false => Color::Muted,
+                }),
+            )
+            .child(
+                Label::new("Watch the run")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+
+        let Some(metrics) = self.metrics.clone() else {
+            return h_flex()
+                .id("run-metrics")
+                .debug_selector(|| "run-metrics".to_string())
+                .w_full()
+                .gap_3()
+                .items_center()
+                .child(
+                    Label::new(match self.watching {
+                        true => "Nothing is running.",
+                        false => "The run is not being watched.",
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(toggle)
+                .into_any_element();
+        };
+
+        h_flex()
+            .id("run-metrics")
+            .debug_selector(|| "run-metrics".to_string())
+            .w_full()
+            .gap_3()
+            .items_center()
+            .child(said("PID", metrics.pid.to_string()))
+            .child(said("processes", metrics.processes.to_string()))
+            .child(said(
+                "CPU",
+                match metrics.cpu {
+                    Some(cpu) => format!("{cpu:.1}%"),
+                    None => "-- reading".to_string(),
+                },
+            ))
+            .child(said(
+                "RAM",
+                match metrics.memory {
+                    Some(bytes) => crate::process_metrics::as_memory(bytes),
+                    None => "--".to_string(),
+                },
+            ))
+            .child(said(
+                "network",
+                match metrics.network {
+                    Ok(bytes) => crate::process_metrics::as_memory(bytes),
+                    Err(why) => format!("-- {why}"),
+                },
+            ))
+            .child(said(
+                "video memory",
+                match metrics.video_memory {
+                    Ok(bytes) => crate::process_metrics::as_memory(bytes),
+                    Err(why) => format!("-- {why}"),
+                },
+            ))
+            .child(div().flex_1())
+            .child(toggle)
+            .into_any_element()
+    }
+
+    /// How a run meets the terminal. Both are the task file's own settings, shown
+    /// here because they decide what happens on the second press of Run.
+    fn render_run_toggles(&self, cx: &mut Context<Self>) -> AnyElement {
+        let switch = |id: &'static str,
+                      label: &'static str,
+                      hint: &'static str,
+                      on: bool,
+                      cx: &mut Context<Self>,
+                      toggle: fn(&mut Self, &mut Context<Self>)| {
+            h_flex()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .on_click(cx.listener(move |view, _, _window, cx| toggle(view, cx)))
+                .child(
+                    Icon::new(match on {
+                        true => IconName::Check,
+                        false => IconName::Close,
+                    })
+                    .size(IconSize::XSmall)
+                    .color(match on {
+                        true => Color::Accent,
+                        false => Color::Muted,
+                    }),
+                )
+                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        v_flex()
+            .gap_1()
+            .child(switch(
+                "configuration-new-terminal",
+                "A terminal of its own",
+                "every run opens one rather than reusing the last",
+                self.use_new_terminal,
+                cx,
+                |view, cx| {
+                    view.use_new_terminal = !view.use_new_terminal;
+                    view.edited = true;
+                    cx.notify();
+                },
+            ))
+            .child(switch(
+                "configuration-several-at-once",
+                "Several at once",
+                "a new run leaves the running one alone",
+                self.several_at_once,
+                cx,
+                |view, cx| {
+                    view.several_at_once = !view.several_at_once;
+                    view.edited = true;
+                    cx.notify();
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// The entry as it will stand in the file. These files are read and edited by
+    /// hand and go into the project's history, so a form that hides what it writes
+    /// leaves the reader guessing.
+    /// The entry as JSON, exactly as the block below the form shows it.
+    fn json_for_test(&self, kind: Kind, cx: &App) -> String {
+        let written = match kind {
+            Kind::Task => configurations_file::task_as_written(&self.task_in_the_form(cx)),
+            Kind::Debug => configurations_file::scenario_as_written(&self.scenario_in_the_form(cx)),
+        };
+        match written {
+            Ok(entry) => {
+                serde_json::to_string_pretty(&entry).unwrap_or_else(|error| format!("// {error}"))
+            }
+            Err(error) => format!("// {error:#}"),
+        }
+    }
+
+    fn render_as_json(&self, kind: Kind, cx: &mut Context<Self>) -> AnyElement {
+        let text = self.json_for_test(kind, cx);
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id("configuration-json-toggle")
+                    .debug_selector(|| "configuration-json-toggle".to_string())
+                    .gap_1()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _window, cx| {
+                        view.showing_json = !view.showing_json;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(match self.showing_json {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Show as JSON")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(self.showing_json, |block| {
+                block.child(
+                    div()
+                        .id("configuration-json")
+                        .debug_selector(|| "configuration-json".to_string())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .border_1()
+                        .border_color(ui::cyberpunk::border_dim())
+                        .child(
+                            Label::new(text)
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some((kind, _)) = self.chosen else {
             return v_flex()
@@ -1009,6 +1351,10 @@ impl RunConfigurationsView {
                     .child(field("Builds first (a task's name)", &self.builds, false))
                     .child(field("What the debugger needs", &self.adapter_config, true))
             })
+            .when(kind == Kind::Task, |form| {
+                form.child(self.render_run_toggles(cx))
+            })
+            .child(self.render_as_json(kind, cx))
             .child(
                 h_flex()
                     .w_full()
@@ -1159,6 +1505,16 @@ impl Render for RunConfigurationsView {
                     .child(self.render_list(window, cx))
                     .child(self.render_form(window, cx)),
             )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(ui::cyberpunk::border_dim())
+                    .child(self.render_metrics(cx)),
+            )
     }
 }
 
@@ -1189,6 +1545,23 @@ mod tests {
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn debug_center(
+        cx: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Point<gpui::Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
+            .center()
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1315,6 +1688,149 @@ mod tests {
                 .expect("a task the editor can read back")
                 .command,
             "go"
+        );
+    }
+
+    /// The row that says what a run is using is on screen from the moment the
+    /// window opens, and says plainly when there is nothing to watch rather than
+    /// showing zeroes.
+    #[gpui::test]
+    async fn the_metrics_row_says_when_there_is_nothing_to_watch(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("run-metrics").is_some(),
+            "the row is there whether or not anything is running"
+        );
+        assert!(
+            view.read_with(&cx, |view, _| view.metrics.is_none()),
+            "with nothing running there is nothing measured"
+        );
+        assert!(
+            view.read_with(&cx, |view, _| view.watching),
+            "and it is watching, ready for a run"
+        );
+
+        // Turned off, it stops watching and says so.
+        let toggle = debug_center(&mut cx, "metrics-toggle");
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            !view.read_with(&cx, |view, _| view.watching),
+            "the reader can turn the watching off"
+        );
+        assert!(
+            cx.debug_bounds("run-metrics").is_some(),
+            "and the row still says what it is doing"
+        );
+    }
+
+    /// The two settings that decide what the second press of Run does are the
+    /// reader's to change, and they land in the file.
+    #[gpui::test]
+    async fn the_run_toggles_are_written_into_the_file(cx: &mut TestAppContext) {
+        let (view, fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "api server", "command": "go run ./cmd/api" }]"#),
+            cx,
+        )
+        .await;
+        view.update_in(&mut cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            !view.read_with(&cx, |view, _| view.use_new_terminal),
+            "a task says nothing about terminals until somebody says so"
+        );
+
+        for switch in [
+            "configuration-new-terminal",
+            "configuration-several-at-once",
+        ] {
+            let at = debug_center(&mut cx, switch);
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+            draw(&mut cx);
+        }
+        view.update_in(&mut cx, |view, _window, cx| view.save(cx));
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("the file is written");
+        let read_back = crate::configurations_file::read(Kind::Task, &written);
+        let task = read_back.configurations[0]
+            .task
+            .as_ref()
+            .expect("a task the editor reads back");
+        assert!(
+            task.use_new_terminal,
+            "a terminal of its own is in the file"
+        );
+        assert!(
+            task.allow_concurrent_runs,
+            "and so is running several at once"
+        );
+        assert!(
+            written.contains("use_new_terminal") && written.contains("allow_concurrent_runs"),
+            "written under the names the file uses:\n{written}"
+        );
+    }
+
+    /// The files go into the project's history and are edited by hand, so the form
+    /// shows exactly what it will write.
+    #[gpui::test]
+    async fn the_form_shows_what_it_writes(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "api server", "command": "go run ./cmd/api" }]"#),
+            cx,
+        )
+        .await;
+        view.update_in(&mut cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("configuration-json").is_none(),
+            "hidden until it is asked for"
+        );
+        let toggle = debug_center(&mut cx, "configuration-json-toggle");
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("configuration-json").is_some(),
+            "and shown when it is"
+        );
+
+        let shown = view.read_with(&cx, |view, cx| view.json_for_test(Kind::Task, cx));
+        assert!(
+            shown.contains("\"label\": \"api server\"")
+                && shown.contains("\"command\": \"go run ./cmd/api\""),
+            "what it shows is what lands in the file:\n{shown}"
+        );
+        assert!(
+            !shown.contains("use_new_terminal"),
+            "and nothing the entry never set:\n{shown}"
         );
     }
 

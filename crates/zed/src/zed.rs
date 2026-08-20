@@ -1621,6 +1621,12 @@ fn initialize_pane(
             toolbar.add_item(solo_diff_style_toolbar, window, cx);
             let breadcrumbs = cx.new(|_| Breadcrumbs::new());
             toolbar.add_item(breadcrumbs, window, cx);
+            let run_configurations = cx.new(|cx| {
+                run_configurations::configurations_toolbar::ConfigurationsToolbar::new(
+                    workspace, cx,
+                )
+            });
+            toolbar.add_item(run_configurations, window, cx);
             let buffer_search_bar = cx.new(|cx| {
                 search::BufferSearchBar::new(
                     Some(workspace.project().read(cx).languages().clone()),
