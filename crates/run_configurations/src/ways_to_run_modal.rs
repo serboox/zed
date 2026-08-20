@@ -28,11 +28,11 @@ pub enum Way {
         task: TaskTemplate,
     },
     /// A way that was run on the spot before and is still remembered. It is not in
-    /// any file either, so it carries the way to pin it into one.
+    /// any file either, so it carries the way to pin it into one -- named rather
+    /// than numbered, since the list of them shifts as things are run and pinned.
     Remembered {
         label: SharedString,
         detail: SharedString,
-        at: usize,
         task: TaskTemplate,
     },
 }
@@ -110,7 +110,7 @@ impl WaysToRunModal {
             });
         }
         let store = store.read(cx);
-        for (at, task) in store.temporary().iter().enumerate() {
+        for task in store.temporary() {
             let already_offered = ways.iter().any(|way| match way {
                 Way::OnTheSpot { task: theirs, .. } => {
                     theirs.label == task.label && theirs.command == task.command
@@ -127,7 +127,6 @@ impl WaysToRunModal {
                         .trim()
                         .to_string(),
                 ),
-                at,
                 task: task.clone(),
             });
         }
@@ -259,7 +258,21 @@ impl WaysToRunModal {
     /// Writes a remembered way into the project's file, where everybody else reads
     /// it. The list is rebuilt, since what was temporary is now kept.
     fn pin(&mut self, at: usize, cx: &mut Context<Self>) {
-        let Some(Way::Remembered { at: which, .. }) = self.ways.get(at).cloned() else {
+        let Some(Way::Remembered { task, .. }) = self.ways.get(at).cloned() else {
+            return;
+        };
+        // Looked up by what it is, not by where it was: the list shifts as things
+        // are run and pinned, and pinning the wrong one writes somebody else's
+        // command into the project's file.
+        let Some(which) = self
+            .store
+            .read(cx)
+            .temporary()
+            .iter()
+            .position(|kept| kept.label == task.label && kept.command == task.command)
+        else {
+            self.trouble = Some("That way is no longer remembered.".into());
+            cx.notify();
             return;
         };
         let writing = self

@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::StreamExt as _;
-use collections::HashMap;
-use gpui::{App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task, WeakEntity};
 use project::Project;
 use serde_json::Value;
 
@@ -15,32 +14,34 @@ use task::TaskTemplate;
 /// somebody typed into them by hand.
 pub struct ConfigurationsChanged;
 
-
 /// One store per project, so the window that lists configurations, the windows
 /// that run them and the switcher in the toolbar all read the same files -- read
 /// once, and warm by the time anything asks. A store made where it is needed is
 /// still empty when the surface it feeds is drawn.
-struct StoreForProject(HashMap<EntityId, Entity<ConfigurationsStore>>);
+/// Held against a weak handle to the project, so a project that is closed takes
+/// its store -- and the two file watchers inside it -- away with it.
+struct StoreForProject(Vec<(WeakEntity<Project>, Entity<ConfigurationsStore>)>);
 
 impl Global for StoreForProject {}
 
 pub fn store_for(project: &Entity<Project>, cx: &mut App) -> Entity<ConfigurationsStore> {
-    let id = project.entity_id();
-    if let Some(store) = cx
-        .try_global::<StoreForProject>()
-        .and_then(|stores| stores.0.get(&id).cloned())
-    {
-        return store;
-    }
-    let store = cx.new(|cx| ConfigurationsStore::new(project, cx));
-    let mut stores = match cx.has_global::<StoreForProject>() {
+    let mut kept = match cx.has_global::<StoreForProject>() {
         true => cx.remove_global::<StoreForProject>(),
-        false => StoreForProject(HashMap::default()),
+        false => StoreForProject(Vec::new()),
     };
-    // A project that is gone takes its store with it.
-    stores.0.retain(|_, store| store.entity_id() != id);
-    stores.0.insert(id, store.clone());
-    cx.set_global(stores);
+    kept.0.retain(|(theirs, _)| theirs.upgrade().is_some());
+    let found = kept.0.iter().find_map(|(theirs, store)| {
+        (theirs.entity_id() == project.entity_id()).then(|| store.clone())
+    });
+    let store = match found {
+        Some(store) => store,
+        None => {
+            let store = cx.new(|cx| ConfigurationsStore::new(project, cx));
+            kept.0.push((project.downgrade(), store.clone()));
+            store
+        }
+    };
+    cx.set_global(kept);
     store
 }
 

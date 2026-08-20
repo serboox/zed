@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, mem, ops::Range, sync::Arc};
 use clock::Global;
 use collections::{HashMap, HashSet};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _, Task,
-    Window,
+    App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _,
+    MouseButton, Task, Window,
 };
 use language::{Buffer, BufferRow, Runnable};
 use lsp::LanguageServerName;
@@ -17,8 +17,8 @@ use text::{BufferId, OffsetRangeExt as _, ToOffset as _, ToPoint as _};
 use ui::{Clickable as _, Color, IconButton, IconSize, Toggleable as _};
 
 use crate::{
-    Editor, EditorSettings, EditorStyle, RangeToAnchorExt, SpawnNearestTask, UPDATE_DEBOUNCE,
-    display_map::DisplayRow,
+    CodeActionSource, Editor, EditorSettings, EditorStyle, RangeToAnchorExt, SpawnNearestTask,
+    ToggleCodeActions, UPDATE_DEBOUNCE, display_map::DisplayRow,
 };
 
 #[derive(Debug)]
@@ -644,8 +644,30 @@ impl Editor {
             .icon_size(IconSize::XSmall)
             .icon_color(color)
             .toggle_state(is_active)
-            .on_click(cx.listener(move |editor, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |editor, e: &ClickEvent, window, cx| {
                 window.focus(&editor.focus_handle(cx), cx);
+                // Nothing may be listening for the action -- an editor embedded
+                // without the crate that keeps run configurations, or a test. The
+                // button has to do something either way, so it falls back to the
+                // menu the editor can put up on its own.
+                if !window
+                    .is_action_available(&zed_actions::run_configurations::RunFromEntryPoint, cx)
+                {
+                    let quick_launch = match e {
+                        ClickEvent::Keyboard(_) => true,
+                        ClickEvent::Mouse(e) => e.down.button == MouseButton::Left,
+                        ClickEvent::Touch(_) => true,
+                    };
+                    editor.toggle_code_actions(
+                        &ToggleCodeActions {
+                            deployed_from: Some(CodeActionSource::RunMenu(row)),
+                            quick_launch,
+                        },
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 // Asking is better than guessing: a line can be run in more ways
                 // than one, and the reader may want a configuration of their own
                 // rather than whatever the editor would pick. The window that

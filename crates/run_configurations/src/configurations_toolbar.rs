@@ -13,8 +13,10 @@ use crate::configurations_store::ConfigurationsStore;
 pub enum Pointing {
     /// A configuration one of the project's files holds.
     Kept { kind: Kind, at: usize },
-    /// A way that was run on the spot and is still remembered.
-    Remembered { at: usize },
+    /// A way that was run on the spot and is still remembered, named rather than
+    /// numbered: the list of them shifts as things are run, evicted and pinned, and
+    /// an index would quietly come to mean a different way.
+    Remembered { label: String },
 }
 
 /// The switcher above the editor: what will run, and the two presses that run it.
@@ -64,10 +66,9 @@ impl ConfigurationsToolbar {
                     kind: Kind::Debug,
                     at: 0,
                 }),
-                true => match store.temporary().is_empty() {
-                    false => Some(Pointing::Remembered { at: 0 }),
-                    true => None,
-                },
+                true => store.temporary().first().map(|task| Pointing::Remembered {
+                    label: task.label.clone(),
+                }),
             },
         };
     }
@@ -79,9 +80,10 @@ impl ConfigurationsToolbar {
             Pointing::Kept { kind, at } => store
                 .get(*kind, *at)
                 .map(|configuration| (SharedString::from(configuration.shown_label()), true)),
-            Pointing::Remembered { at } => store
+            Pointing::Remembered { label } => store
                 .temporary()
-                .get(*at)
+                .iter()
+                .find(|task| &task.label == label)
                 .map(|task| (SharedString::from(task.label.clone()), false)),
         }
     }
@@ -96,7 +98,11 @@ impl ConfigurationsToolbar {
         let store = self.store.read(cx);
         match self.pointing.as_ref()? {
             Pointing::Kept { kind, at } => store.get(*kind, *at)?.task.clone(),
-            Pointing::Remembered { at } => store.temporary().get(*at).cloned(),
+            Pointing::Remembered { label } => store
+                .temporary()
+                .iter()
+                .find(|task| &task.label == label)
+                .cloned(),
         }
     }
 
@@ -186,10 +192,12 @@ impl ConfigurationsToolbar {
                 ));
             }
         }
-        for (at, task) in store.temporary().iter().enumerate() {
+        for task in store.temporary() {
             listed.push((
                 SharedString::from(task.label.clone()),
-                Pointing::Remembered { at },
+                Pointing::Remembered {
+                    label: task.label.clone(),
+                },
             ));
         }
         listed

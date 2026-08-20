@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -49,10 +49,19 @@ pub struct Sample {
     pub memory: u64,
 }
 
-/// The ticks a second holds on Linux. `USER_HZ` has been 100 on every Linux this
-/// editor runs on; a wrong guess here would only skew the percentage, never the
-/// memory.
-const TICKS_A_SECOND: f32 = 100.;
+/// The ticks a second holds, as the machine itself says. Guessing it skews every
+/// percentage; the fallback is the value Linux has used for decades, for a machine
+/// that will not answer.
+fn ticks_a_second() -> f32 {
+    #[cfg(unix)]
+    {
+        let answer = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if answer > 0 {
+            return answer as f32;
+        }
+    }
+    100.
+}
 
 /// Reads `/proc/<pid>/stat` and `/proc/<pid>/statm` into a sample.
 ///
@@ -72,12 +81,21 @@ pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
     Some(Sample {
         pid,
         parent,
-        ticks: utime + stime,
-        memory: pages * page_size(),
+        ticks: utime.saturating_add(stime),
+        memory: pages.saturating_mul(page_size()),
     })
 }
 
+/// What a page of memory holds, as the machine says. `statm` counts pages, so a
+/// wrong size here would report the wrong amount of memory.
 fn page_size() -> u64 {
+    #[cfg(unix)]
+    {
+        let answer = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if answer > 0 {
+            return answer as u64;
+        }
+    }
     4096
 }
 
@@ -92,14 +110,15 @@ pub fn tree_of(root: u32, everything: &[Sample]) -> Vec<Sample> {
         return Vec::new();
     };
     let mut tree = vec![root_sample];
+    // A tree, not a cycle: /proc can name a parent that is also a descendant while
+    // processes come and go, and a set says in one look whether a pid is already in.
+    let mut taken: HashSet<u32> = HashSet::from([root]);
     let mut at = 0;
     while at < tree.len() {
         let pid = tree[at].pid;
         if let Some(theirs) = children.get(&pid) {
             for child in theirs {
-                // A tree, not a cycle: /proc can hand back a parent that is also a
-                // descendant while processes come and go.
-                if !tree.iter().any(|kept| kept.pid == child.pid) {
+                if taken.insert(child.pid) {
                     tree.push(*child);
                 }
             }
@@ -112,7 +131,11 @@ pub fn tree_of(root: u32, everything: &[Sample]) -> Vec<Sample> {
 /// What was read last time, so a rate can be worked out from the difference.
 #[derive(Clone, Debug, Default)]
 pub struct Watcher {
-    last: Option<(Instant, u64)>,
+    /// When the last reading was taken, of which process, and what it said. The
+    /// pid is part of it because pids come back: a new process under an old number
+    /// would otherwise be measured against somebody else's processor time and
+    /// report a percentage out of nowhere.
+    last: Option<(Instant, u32, u64)>,
 }
 
 impl Watcher {
@@ -120,19 +143,25 @@ impl Watcher {
     /// machine will talk about; `now` is when it was read.
     pub fn metrics_of(&mut self, root: u32, everything: &[Sample], now: Instant) -> Metrics {
         let tree = tree_of(root, everything);
-        let ticks: u64 = tree.iter().map(|sample| sample.ticks).sum();
-        let memory: u64 = tree.iter().map(|sample| sample.memory).sum();
+        let ticks: u64 = tree
+            .iter()
+            .fold(0u64, |total, sample| total.saturating_add(sample.ticks));
+        let memory: u64 = tree
+            .iter()
+            .fold(0u64, |total, sample| total.saturating_add(sample.memory));
         let cpu = match self.last {
-            Some((then, before)) if now > then && ticks >= before => {
+            Some((then, whose, before))
+                if whose == root && now > then && ticks >= before && !tree.is_empty() =>
+            {
                 let seconds = now.duration_since(then).as_secs_f32();
                 match seconds > 0. {
-                    true => Some((ticks - before) as f32 / TICKS_A_SECOND / seconds * 100.),
+                    true => Some((ticks - before) as f32 / ticks_a_second() / seconds * 100.),
                     false => None,
                 }
             }
             _ => None,
         };
-        self.last = Some((now, ticks));
+        self.last = Some((now, root, ticks));
         Metrics {
             pid: root,
             processes: tree.len(),
@@ -255,10 +284,40 @@ mod tests {
             })
             .collect();
         let second = watcher.metrics_of(10, &busier, started + Duration::from_secs(1));
+        // Written against what the machine says a tick is, rather than against a
+        // guess: the reading is only as portable as that number.
+        let expected = 100. / ticks_a_second() * 100.;
         assert_eq!(
             second.cpu,
-            Some(100.),
-            "a hundred ticks in a second is one core's worth"
+            Some(expected),
+            "a second's worth of ticks in a second is one core's worth"
+        );
+    }
+
+    /// Pids come back. A new process under an old number must not be measured
+    /// against the processor time of the one that had it before.
+    #[test]
+    fn a_pid_that_came_back_is_not_measured_against_the_old_one() {
+        let mut watcher = Watcher::default();
+        let started = Instant::now();
+        let busy = vec![a_sample(500, 1, 10_000, 1_000)];
+        watcher.metrics_of(500, &busy, started);
+
+        // The same number, a moment later, with far less processor time behind it:
+        // a different process altogether.
+        let fresh = vec![a_sample(500, 1, 5, 1_000)];
+        let after = watcher.metrics_of(500, &fresh, started + Duration::from_secs(1));
+        assert_eq!(
+            after.cpu, None,
+            "fewer ticks than before is a new process, not a negative rate"
+        );
+
+        // And a different pid starts its own reckoning.
+        let other = vec![a_sample(600, 1, 10, 1_000)];
+        let first_of_another = watcher.metrics_of(600, &other, started + Duration::from_secs(2));
+        assert_eq!(
+            first_of_another.cpu, None,
+            "a rate for a process needs two readings of that process"
         );
     }
 
