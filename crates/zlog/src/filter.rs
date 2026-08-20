@@ -48,6 +48,16 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     // credentials, and a busy page writes a line per request, which is paid for in
     // formatting and a file write while the page is trying to draw.
     ("net::cookie_storage", log::LevelFilter::Warn),
+    // And for the same two reasons, the rest of the web engine's running
+    // commentary. Its loader writes a line for every request a page makes, which
+    // is every address the reader has been to; its script thread writes the
+    // page's own address over and over while the page loads -- two hundred lines
+    // in a second, each one formatted and written while the page is trying to
+    // draw; and its strict-transport list says of each host that it is on the
+    // list.
+    ("net::http_loader", log::LevelFilter::Warn),
+    ("net::hsts", log::LevelFilter::Warn),
+    ("script::dom::window::window", log::LevelFilter::Warn),
 ];
 
 pub fn init_env_filter(filter: env_config::EnvFilter) {
@@ -543,6 +553,45 @@ mod tests {
         assert_eq!(
             map.is_enabled(&scope_from_scope_str("q.r.s.t"), None, Level::Warn),
             EnabledStatus::Disabled
+        );
+    }
+
+    // The engine's running commentary: every request a page makes is every address
+    // the reader has been to, and the page's own address is written over and over
+    // while it loads. Off by default, and still there for whoever asks.
+    #[test]
+    fn the_engines_running_commentary_is_off_by_default() {
+        use log::Level;
+        let unused = scope_from_scope_str("__unused__");
+        let quiet =
+            ScopeMap::new_from_settings_and_env(&HashMap::default(), None, super::DEFAULT_FILTERS);
+
+        for module in [
+            "net::http_loader",
+            "net::hsts",
+            "script::dom::window::window",
+        ] {
+            assert_eq!(
+                quiet.is_enabled(&unused, Some(module), Level::Info),
+                EnabledStatus::Disabled,
+                "{module} must not write a line per request by default"
+            );
+            assert_eq!(
+                quiet.is_enabled(&unused, Some(module), Level::Warn),
+                EnabledStatus::Enabled,
+                "a real problem in {module} still has to be reported"
+            );
+        }
+
+        let asked_for: HashMap<String, String> =
+            [("net::http_loader".to_string(), "info".to_string())]
+                .into_iter()
+                .collect();
+        let loud = ScopeMap::new_from_settings_and_env(&asked_for, None, super::DEFAULT_FILTERS);
+        assert_eq!(
+            loud.is_enabled(&unused, Some("net::http_loader"), Level::Info),
+            EnabledStatus::Enabled,
+            "a reader who asks to see what a page fetches gets it"
         );
     }
 
