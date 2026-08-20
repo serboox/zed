@@ -8,6 +8,7 @@ use project::Project;
 use serde_json::Value;
 
 use crate::configurations_file::{self, Configuration, FileContents, Kind};
+use task::TaskTemplate;
 
 /// Said whenever the files have been read again, so a view can keep up with what
 /// somebody typed into them by hand.
@@ -23,8 +24,17 @@ pub struct ConfigurationsStore {
     fs: Arc<dyn fs::Fs>,
     tasks: FileContents,
     scenarios: FileContents,
+    /// The ways that were run without ever being written down -- from the gutter,
+    /// or from the window that lists them -- newest first. They live as long as the
+    /// window does and never reach the project's files, so a one-off run leaves
+    /// nothing behind for anybody else to read. Pinning one puts it in the file.
+    temporary: Vec<TaskTemplate>,
     _watching: Vec<Task<()>>,
 }
+
+/// How many ways run on the spot are worth remembering. Older ones fall off the
+/// end: this is a handful of recent runs, not a history.
+pub const MOST_TEMPORARIES_KEPT: usize = 5;
 
 impl EventEmitter<ConfigurationsChanged> for ConfigurationsStore {}
 
@@ -42,6 +52,7 @@ impl ConfigurationsStore {
             fs,
             tasks: FileContents::default(),
             scenarios: FileContents::default(),
+            temporary: Vec::new(),
             _watching: Vec::new(),
         };
         store.watch_the_files(cx);
@@ -81,6 +92,64 @@ impl ConfigurationsStore {
                     }
                 }
             }));
+        }
+    }
+
+    /// The ways run on the spot, newest first.
+    pub fn temporary(&self) -> &[TaskTemplate] {
+        &self.temporary
+    }
+
+    /// Remembers a way that was run without being written down. The same way run
+    /// again moves back to the front rather than being kept twice, and once there
+    /// are more than `MOST_TEMPORARIES_KEPT` the oldest falls off the end.
+    pub fn remember_temporary(&mut self, task: TaskTemplate, cx: &mut Context<Self>) {
+        self.temporary
+            .retain(|kept| !(kept.label == task.label && kept.command == task.command));
+        self.temporary.insert(0, task);
+        self.temporary.truncate(MOST_TEMPORARIES_KEPT);
+        cx.emit(ConfigurationsChanged);
+        cx.notify();
+    }
+
+    /// Takes a way run on the spot out of the list without keeping it.
+    pub fn forget_temporary(&mut self, at: usize, cx: &mut Context<Self>) {
+        if at >= self.temporary.len() {
+            return;
+        }
+        self.temporary.remove(at);
+        cx.emit(ConfigurationsChanged);
+        cx.notify();
+    }
+
+    /// Writes a way run on the spot into the project's own file, where everybody
+    /// else reads it, and stops holding it as a temporary one.
+    pub fn pin_temporary(&mut self, at: usize, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let Some(task) = self.temporary.get(at).cloned() else {
+            return Task::ready(Err(anyhow!("that way is no longer in the list")));
+        };
+        let entry = match configurations_file::task_as_written(&task) {
+            Ok(entry) => entry,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let writing = self.save(Kind::Task, None, entry, cx);
+        self.temporary.remove(at);
+        cx.emit(ConfigurationsChanged);
+        cx.notify();
+        writing
+    }
+
+    /// A store with no project behind it, for testing the list of ways run on the
+    /// spot -- which is held in memory and has nothing to do with the files.
+    #[cfg(test)]
+    fn empty_for_test(fs: Arc<dyn fs::Fs>) -> Self {
+        Self {
+            project_root: None,
+            fs,
+            tasks: FileContents::default(),
+            scenarios: FileContents::default(),
+            temporary: Vec::new(),
+            _watching: Vec::new(),
         }
     }
 
@@ -170,4 +239,82 @@ fn place_of(text: &str, at: usize, original: &Value, path: &std::path::Path) -> 
             path.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn a_store(cx: &mut TestAppContext) -> Entity<ConfigurationsStore> {
+        let fs = fs::FakeFs::new(cx.executor());
+        cx.new(|_| ConfigurationsStore::empty_for_test(fs))
+    }
+
+    fn a_way(label: &str) -> TaskTemplate {
+        TaskTemplate {
+            label: label.to_string(),
+            command: "go".to_string(),
+            args: vec!["run".to_string(), ".".to_string()],
+            ..TaskTemplate::default()
+        }
+    }
+
+    /// A handful of recent runs, not a history: the newest is at the front and the
+    /// oldest falls off the end.
+    #[gpui::test]
+    fn only_a_handful_of_ways_run_on_the_spot_are_remembered(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            for at in 0..MOST_TEMPORARIES_KEPT + 2 {
+                store.remember_temporary(a_way(&format!("run {at}")), cx);
+            }
+            let kept: Vec<&str> = store
+                .temporary()
+                .iter()
+                .map(|task| task.label.as_str())
+                .collect();
+            assert_eq!(
+                kept,
+                vec!["run 6", "run 5", "run 4", "run 3", "run 2"],
+                "the newest first, and the two oldest gone"
+            );
+        });
+    }
+
+    /// The same way run again is one entry, moved back to the front.
+    #[gpui::test]
+    fn the_same_way_run_again_is_remembered_once(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            store.remember_temporary(a_way("first"), cx);
+            store.remember_temporary(a_way("second"), cx);
+            store.remember_temporary(a_way("first"), cx);
+            let kept: Vec<&str> = store
+                .temporary()
+                .iter()
+                .map(|task| task.label.as_str())
+                .collect();
+            assert_eq!(kept, vec!["first", "second"]);
+        });
+    }
+
+    /// Forgetting one takes it out and leaves the rest where they were.
+    #[gpui::test]
+    fn a_way_can_be_forgotten(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            store.remember_temporary(a_way("first"), cx);
+            store.remember_temporary(a_way("second"), cx);
+            store.forget_temporary(0, cx);
+            assert_eq!(store.temporary().len(), 1);
+            assert_eq!(store.temporary()[0].label, "first");
+            store.forget_temporary(7, cx);
+            assert_eq!(
+                store.temporary().len(),
+                1,
+                "an index past the end does nothing"
+            );
+        });
+    }
 }

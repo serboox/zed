@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, mem, ops::Range, sync::Arc};
 use clock::Global;
 use collections::{HashMap, HashSet};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _,
-    MouseButton, Task, Window,
+    App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _, Task,
+    Window,
 };
 use language::{Buffer, BufferRow, Runnable};
 use lsp::LanguageServerName;
@@ -17,8 +17,8 @@ use text::{BufferId, OffsetRangeExt as _, ToOffset as _, ToPoint as _};
 use ui::{Clickable as _, Color, IconButton, IconSize, Toggleable as _};
 
 use crate::{
-    CodeActionSource, Editor, EditorSettings, EditorStyle, RangeToAnchorExt, SpawnNearestTask,
-    ToggleCodeActions, UPDATE_DEBOUNCE, display_map::DisplayRow,
+    Editor, EditorSettings, EditorStyle, RangeToAnchorExt, SpawnNearestTask, UPDATE_DEBOUNCE,
+    display_map::DisplayRow,
 };
 
 #[derive(Debug)]
@@ -644,20 +644,19 @@ impl Editor {
             .icon_size(IconSize::XSmall)
             .icon_color(color)
             .toggle_state(is_active)
-            .on_click(cx.listener(move |editor, e: &ClickEvent, window, cx| {
-                let quick_launch = match e {
-                    ClickEvent::Keyboard(_) => true,
-                    ClickEvent::Mouse(e) => e.down.button == MouseButton::Left,
-                    ClickEvent::Touch(_) => true,
-                };
-
+            .on_click(cx.listener(move |editor, _: &ClickEvent, window, cx| {
                 window.focus(&editor.focus_handle(cx), cx);
-                editor.toggle_code_actions(
-                    &ToggleCodeActions {
-                        deployed_from: Some(CodeActionSource::RunMenu(row)),
-                        quick_launch,
-                    },
-                    window,
+                // Asking is better than guessing: a line can be run in more ways
+                // than one, and the reader may want a configuration of their own
+                // rather than whatever the editor would pick. The window that
+                // opens offers both, and it is the one place a run is started
+                // from -- the offer is left in a global because the editor cannot
+                // depend on the surface that keeps configurations.
+                if let Some(offer) = editor.entry_point_offer_at_display_row(row, cx) {
+                    cx.set_global(offer);
+                }
+                window.dispatch_action(
+                    Box::new(zed_actions::run_configurations::RunFromEntryPoint),
                     cx,
                 );
             }))

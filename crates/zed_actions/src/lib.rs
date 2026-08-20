@@ -1090,7 +1090,10 @@ pub mod run_configurations {
             /// Shows the project's run configurations.
             OpenRunConfigurations,
             /// Makes a run configuration for the entry point the editor found.
-            CreateFromEntryPoint
+            CreateFromEntryPoint,
+            /// Shows the ways of running the entry point the editor found, or
+            /// offers to write one when the project has none.
+            RunFromEntryPoint
         ]
     );
 

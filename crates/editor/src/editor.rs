@@ -4212,6 +4212,19 @@ impl Editor {
         })
     }
 
+    /// The offer for the row a gutter control sits on. A display row and the row a
+    /// buffer counts by are not the same thing when anything is folded above.
+    pub(crate) fn entry_point_offer_at_display_row(
+        &self,
+        display_row: DisplayRow,
+        cx: &App,
+    ) -> Option<zed_actions::run_configurations::EntryPointOffer> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(Point::new(display_row.0, 0u32));
+        let row = snapshot.summary_for_anchor::<Point>(&anchor).row;
+        self.entry_point_offer_at_row(row, cx)
+    }
+
     fn gutter_context_menu(
         &self,
         anchor: Anchor,

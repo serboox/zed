@@ -11,7 +11,7 @@ use workspace::{Item, Workspace, item::ItemEvent};
 
 use crate::configurations_file::{self, Configuration, Kind};
 use crate::configurations_store::{ConfigurationsChanged, ConfigurationsStore};
-use crate::{CreateFromEntryPoint, OpenRunConfigurations};
+use crate::{CreateFromEntryPoint, OpenRunConfigurations, RunFromEntryPoint};
 
 actions!(
     run_configurations,
@@ -70,22 +70,48 @@ fn debugger_for(command: &str) -> &'static str {
 }
 
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        // What the editor found on a line, asked for from its gutter. The offer
-        // itself was left in a global by the editor, which cannot depend on this
-        // crate.
-        workspace.register_action(|workspace, _: &CreateFromEntryPoint, window, cx| {
-            let offer = match cx.has_global::<zed_actions::run_configurations::EntryPointOffer>() {
-                true => cx.remove_global::<zed_actions::run_configurations::EntryPointOffer>(),
-                false => Default::default(),
-            };
-            let store = cx.new(|cx| ConfigurationsStore::new(workspace.project(), cx));
-            let handle = workspace.weak_handle();
-            workspace.toggle_modal(window, cx, move |window, cx| {
-                crate::new_configuration_modal::NewConfigurationModal::new(
-                    offer, store, handle, window, cx,
-                )
-            });
+    cx.observe_new(|workspace: &mut Workspace, _window, cx| {
+        // One store for the whole workspace, made when it opens: the files are read
+        // once and are already warm by the time a window asks what the project
+        // knows. A store made inside an action would still be empty when the window
+        // it feeds is drawn.
+        let store = cx.new(|cx| ConfigurationsStore::new(workspace.project(), cx));
+
+        // The run button in the gutter. Every way of running the line is offered;
+        // with no way at all there is nothing to choose between, so the window that
+        // writes one opens instead. The offer itself was left in a global by the
+        // editor, which cannot depend on this crate.
+        workspace.register_action({
+            let store = store.clone();
+            move |workspace, _: &RunFromEntryPoint, window, cx| {
+                let offer = taken_offer(cx);
+                let handle = workspace.weak_handle();
+                let store = store.clone();
+                let ways = crate::ways_to_run_modal::WaysToRunModal::ways_of(&offer, &store, cx);
+                match ways.is_empty() {
+                    true => workspace.toggle_modal(window, cx, move |window, cx| {
+                        crate::new_configuration_modal::NewConfigurationModal::new(
+                            offer, store, handle, window, cx,
+                        )
+                    }),
+                    false => workspace.toggle_modal(window, cx, move |_window, cx| {
+                        crate::ways_to_run_modal::WaysToRunModal::new(offer, store, handle, cx)
+                    }),
+                }
+            }
+        });
+        workspace.register_action({
+            let store = store.clone();
+            move |workspace, _: &CreateFromEntryPoint, window, cx| {
+                let offer = taken_offer(cx);
+                let handle = workspace.weak_handle();
+                let store = store.clone();
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    crate::new_configuration_modal::NewConfigurationModal::new(
+                        offer, store, handle, window, cx,
+                    )
+                });
+            }
         });
         workspace.register_action(|workspace, _: &OpenRunConfigurations, window, cx| {
             let existing = workspace
@@ -145,6 +171,42 @@ pub async fn run_a_task(
     workspace
         .update_in(cx, |workspace, window, cx| {
             workspace.schedule_task(comes_from, &task, &context, false, window, cx);
+        })
+        .ok();
+}
+
+/// The offer the editor left behind, taken rather than read: it is answered once,
+/// so a later ask that comes from somewhere else is not filled in from a line the
+/// reader looked at long ago.
+fn taken_offer(cx: &mut App) -> zed_actions::run_configurations::EntryPointOffer {
+    match cx.has_global::<zed_actions::run_configurations::EntryPointOffer>() {
+        true => cx.remove_global::<zed_actions::run_configurations::EntryPointOffer>(),
+        false => Default::default(),
+    }
+}
+
+/// Starts a debug session in the workspace, with the project's own variables
+/// filled in. Shared, because a configuration is started from the window that
+/// lists them, from the form, and from the gutter's own window.
+pub async fn start_a_debug_session(
+    workspace: &WeakEntity<Workspace>,
+    scenario: DebugScenario,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let Some(contexts) = workspace
+        .update_in(cx, |workspace, window, cx| {
+            tasks_ui::task_contexts(workspace, window, cx)
+        })
+        .ok()
+    else {
+        return;
+    };
+    let contexts = contexts.await;
+    let worktree = contexts.worktree();
+    let context = contexts.active_context().cloned().unwrap_or_default();
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.start_debug_session(scenario, context.into(), None, worktree, window, cx);
         })
         .ok();
 }
@@ -665,29 +727,9 @@ impl RunConfigurationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let contexts = workspace.update(cx, |workspace, cx| {
-            tasks_ui::task_contexts(workspace, window, cx)
-        });
-        let workspace = workspace.downgrade();
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            let contexts = contexts.await;
-            let worktree = contexts.worktree();
-            let context = contexts.active_context().cloned().unwrap_or_default();
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.start_debug_session(
-                        scenario,
-                        context.into(),
-                        None,
-                        worktree,
-                        window,
-                        cx,
-                    );
-                })
-                .ok();
+            start_a_debug_session(&workspace, scenario, cx).await;
         })
         .detach();
     }
@@ -1273,6 +1315,168 @@ mod tests {
                 .expect("a task the editor can read back")
                 .command,
             "go"
+        );
+    }
+
+    /// A way run on the spot is nobody else's business until it is pinned, and then
+    /// it is in the project's own file like any other.
+    #[gpui::test]
+    async fn pinning_a_way_run_on_the_spot_writes_it_into_the_file(cx: &mut TestAppContext) {
+        let (view, fs, mut cx) = a_view_of(None, cx).await;
+        let store = view.read_with(&cx, |view, _| view.store.clone());
+
+        store.update_in(&mut cx, |store, _window, cx| {
+            store.remember_temporary(
+                task::TaskTemplate {
+                    label: "go run ./cmd/api".to_string(),
+                    command: "go".to_string(),
+                    args: vec!["run".to_string(), "./cmd/api".to_string()],
+                    ..task::TaskTemplate::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            store.read_with(&cx, |store, _| store.temporary().len()),
+            1,
+            "it is remembered while it is nobody else's business"
+        );
+        assert!(
+            fs.load(path!("/project/.zed/tasks.json").as_ref())
+                .await
+                .is_err(),
+            "and nothing is written to the project for it"
+        );
+
+        let pinning = store.update_in(&mut cx, |store, _window, cx| store.pin_temporary(0, cx));
+        pinning.await.expect("pinning writes the file");
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("pinning writes the project's own file");
+        let read_back = crate::configurations_file::read(Kind::Task, &written);
+        assert_eq!(read_back.configurations.len(), 1);
+        assert_eq!(read_back.configurations[0].label, "go run ./cmd/api");
+        assert_eq!(
+            store.read_with(&cx, |store, _| store.temporary().len()),
+            0,
+            "and it is no longer one of the temporary ones"
+        );
+    }
+
+    /// The gutter's run button asks rather than guesses: the window lists the way
+    /// the editor found for the line first, then everything the project keeps.
+    #[gpui::test]
+    async fn the_gutter_offers_every_way_of_running(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".zed": {
+                    "tasks.json": r#"[
+                      { "label": "unit tests", "command": "go test ./..." }
+                    ]"#,
+                },
+                "cmd": { "api": { "main.go": "package main\n\nfunc main() {}\n" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            cx.set_global(zed_actions::run_configurations::EntryPointOffer {
+                language: Some("Go".to_string()),
+                file: Some(std::path::PathBuf::from(path!("/project/cmd/api/main.go"))),
+                line: 3,
+                label: Some("go run ./cmd/api".to_string()),
+                command: Some("go".to_string()),
+                args: vec!["run".to_string(), ".".to_string()],
+                cwd: None,
+            });
+        });
+        cx.dispatch_action(RunFromEntryPoint);
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<crate::ways_to_run_modal::WaysToRunModal>(cx)
+            })
+            .expect("the run button opens the window of ways");
+        let ways = modal.read_with(cx, |modal, _| modal.shown_ways());
+        assert_eq!(
+            ways,
+            vec![
+                ("go run ./cmd/api".to_string(), true),
+                ("unit tests".to_string(), false),
+            ],
+            "the line's own way comes first, marked as the one that is not in a file yet"
+        );
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| gpui::div(),
+        );
+        cx.run_until_parked();
+    }
+
+    /// With nothing to choose between, there is nothing to ask: the window that
+    /// writes a configuration opens instead.
+    #[gpui::test]
+    async fn with_no_way_to_run_the_writing_window_opens(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        // An offer for a language nothing is known about, so there is no way to run
+        // it either.
+        cx.update(|_, cx| {
+            cx.set_global(zed_actions::run_configurations::EntryPointOffer {
+                language: Some("Brainfuck".to_string()),
+                file: Some(std::path::PathBuf::from(path!("/project/src/main.bf"))),
+                line: 1,
+                label: None,
+                command: None,
+                args: Vec::new(),
+                cwd: None,
+            });
+        });
+        cx.dispatch_action(RunFromEntryPoint);
+        cx.run_until_parked();
+
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<crate::ways_to_run_modal::WaysToRunModal>(
+                    cx
+                ))
+                .is_none(),
+            "there is nothing to choose between"
+        );
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+                })
+                .is_some(),
+            "so the window that writes one opens"
         );
     }
 
