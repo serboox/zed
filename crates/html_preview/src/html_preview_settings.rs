@@ -40,10 +40,6 @@ fn as_a_file_on_this_machine(typed: &str) -> Option<url::Url> {
 /// it, is a mistake rather than a preference.
 const SENSIBLE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
 
-/// As many pixels to one as a page is drawn with unless the reader asks for more.
-/// Past this, a frame costs more and reads no better.
-const SHARP_ENOUGH: f32 = 1.5;
-
 /// Where a search goes when the reader has not said otherwise.
 /// Google reads `hl` as the language to answer in and `gl` as the country to
 /// answer for; without them it guesses both from where the request came from.
@@ -84,20 +80,20 @@ impl HtmlPreviewSettings {
 
     /// The scale to draw a page at in a window whose own is `display`.
     ///
-    /// A page costs what its pixels cost, and the reader's own choice wins
-    /// whatever it is; left unsaid, a display asking for more than `SHARP_ENOUGH`
-    /// gets that instead of its own. On a display of two pixels to one this is
-    /// nearly half the pixels a frame, and on one of the panels that ask for it --
-    /// 250 pixels to the inch and more -- the difference is below what an eye
-    /// resolves at arm's length.
+    /// The display's own, unless the reader asks for something else. A page drawn
+    /// at less than the display can show is a page that has to be read through
+    /// the blur, and no frame rate is worth that: what a frame costs turned out
+    /// to be the editor asking the page where it stood on every turn of the
+    /// engine, not the pixels -- see `WHILE_THE_PAGE_MOVES`. Drawing coarser
+    /// bought a third of a frame and cost the reading.
     pub fn scale_in(&self, display: f32) -> f32 {
         match self.render_scale {
             Some(asked) if SENSIBLE.contains(&asked) => asked,
             Some(asked) => {
                 log::warn!("a page cannot be drawn at {asked} pixels to one; using {display}");
-                display.min(SHARP_ENOUGH)
+                display
             }
-            None => display.min(SHARP_ENOUGH),
+            None => display,
         }
     }
 }
@@ -143,34 +139,31 @@ mod tests {
         }
     }
 
-    /// A page costs what its pixels cost. A display of two to one asks for four
-    /// times as many as one of one to one, which is what makes a page on such a
-    /// display move in steps, so it is not given all of them unless it is asked
-    /// for.
+    /// A page is drawn at everything the display can show. Drawn coarser it has
+    /// to be read through the blur, and that was tried: it bought a third of a
+    /// frame and cost the reading, while what a frame actually cost was the
+    /// editor asking the page where it stood on every turn of the engine.
     #[test]
-    fn a_page_is_not_drawn_finer_than_it_reads() {
+    fn a_page_is_drawn_at_everything_the_display_can_show() {
         let left_unsaid = settings(SEARCH);
-        assert_eq!(
-            left_unsaid.scale_in(1.),
-            1.,
-            "an ordinary display gets its own"
-        );
+        assert_eq!(left_unsaid.scale_in(1.), 1.);
         assert_eq!(
             left_unsaid.scale_in(2.),
-            1.5,
-            "and a fine one is drawn a little coarser than it asks"
+            2.,
+            "a fine display is drawn at its own, however dear that is"
         );
+        assert_eq!(left_unsaid.scale_in(2.5), 2.5);
 
-        // Whatever the reader says goes.
+        // Whatever the reader says goes, in either direction.
         let mut asked = settings(SEARCH);
-        asked.render_scale = Some(2.);
-        assert_eq!(asked.scale_in(2.), 2.);
+        asked.render_scale = Some(1.5);
+        assert_eq!(asked.scale_in(2.), 1.5);
         asked.render_scale = Some(0.5);
         assert_eq!(asked.scale_in(2.), 0.5);
 
         // A number that is no scale at all is not one to draw by.
         asked.render_scale = Some(40.);
-        assert_eq!(asked.scale_in(2.), 1.5);
+        assert_eq!(asked.scale_in(2.), 2.);
     }
 
     #[test]

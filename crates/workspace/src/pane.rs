@@ -4273,23 +4273,10 @@ fn default_render_tab_bar_buttons(
                     .into()
                 }),
         )
-        .child({
-            let zoomed = pane.is_zoomed();
-            IconButton::new("toggle_zoom", IconName::Maximize)
-                .icon_size(IconSize::Small)
-                .toggle_state(zoomed)
-                .selected_icon(IconName::Minimize)
-                .on_click(cx.listener(|pane, _, window, cx| {
-                    pane.toggle_zoom(&crate::ToggleZoom, window, cx);
-                }))
-                .tooltip(move |_window, cx| {
-                    Tooltip::for_action(
-                        if zoomed { "Zoom Out" } else { "Zoom In" },
-                        &ToggleZoom,
-                        cx,
-                    )
-                })
-        })
+        // Filling the pane is still an action -- `workspace::ToggleZoom` -- but not
+        // a button here. Three controls that all made something bigger sat within
+        // an inch of each other; the one that survives is the one that gives the
+        // window over to the document entirely.
         .into_any_element()
         .into();
     (None, right_children)

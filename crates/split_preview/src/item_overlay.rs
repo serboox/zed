@@ -69,35 +69,8 @@ fn render_layout_switch(
                     .debug_selector(|| "preview-appearance".into())
                     .child(render_appearance_button(cx)),
             )
-            // Reading something in full takes two steps otherwise: choose the
-            // preview alone, then find the pane's own zoom a tab bar away. This
-            // is the second of them, put where the first one is.
-            .child(
-                div()
-                    .debug_selector(|| "preview-zoom".into())
-                    .child(render_zoom_button(pane)),
-            )
             .into_any_element(),
     )
-}
-
-/// Fills the window with whatever is being read, and gives the rest of the
-/// editor back when pressed again.
-///
-/// Whether the pane is filling the window already is not shown here. This runs
-/// while the pane is being updated, and asking it anything at that moment is
-/// what `register_item_overlay` warns against -- the editor stops there and
-/// then. The handler below runs later, when asking is allowed.
-fn render_zoom_button(pane: &Entity<Pane>) -> impl IntoElement {
-    let pane = pane.clone();
-    IconButton::new("preview-zoom", IconName::Maximize)
-        .icon_size(IconSize::Small)
-        .tooltip(Tooltip::text("Fill the window with this, or give it back"))
-        .on_click(move |_, window, cx| {
-            pane.update(cx, |pane, cx| {
-                pane.toggle_zoom(&workspace::ToggleZoom, window, cx);
-            });
-        })
 }
 
 fn render_appearance_button(cx: &mut App) -> impl IntoElement {
@@ -462,9 +435,7 @@ mod tests {
     // arrangement this replaced -- a reserved row satisfies "not covering the
     // text", and a switch anywhere satisfies "no reserved row".
     #[gpui::test]
-    async fn the_switch_floats_over_the_document_without_a_row_of_its_own(
-        cx: &mut TestAppContext,
-    ) {
+    async fn the_switch_floats_over_the_document_without_a_row_of_its_own(cx: &mut TestAppContext) {
         let (_, cx) = workspace_with_file("spec.yaml", CONTRACT, yaml_language(), cx).await;
 
         // Side by side, because that layout is the one whose halves carry
