@@ -51,6 +51,23 @@ const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
 #[cfg(feature = "servo")]
 const WHERE_THE_PAGE_STANDS: Duration = Duration::from_millis(100);
 
+/// How long to leave the graphics card alone when the page is waiting for nothing
+/// else. Short enough not to be felt between frames, long enough that the card
+/// and the engine's own threads get the processor rather than a loop asking
+/// whether the card is done yet.
+#[cfg(feature = "servo")]
+const UNTIL_THE_CARD_IS_ASKED_AGAIN: Duration = Duration::from_millis(1);
+
+/// How often a page on the move is asked where it stands.
+///
+/// Asking is a script, and handing the engine a script is work it wakes up for,
+/// so asking on every turn is a loop that feeds itself: measured in the editor, a
+/// frame took ten thousand turns of the engine and 360 ms, nearly all of it
+/// asking. This is faster than an eye follows a scrollbar and slow enough to
+/// leave the engine alone between frames.
+#[cfg(feature = "servo")]
+const WHILE_THE_PAGE_MOVES: Duration = Duration::from_millis(8);
+
 /// What the page's own menu offers. Named here because the tests look the items
 /// up by the words the reader sees.
 const OPEN_LINK: &str = "Open Link in New Browser Tab";
@@ -723,12 +740,20 @@ impl HtmlPreviewView {
         };
         self.pump = Some(cx.spawn(async move |view, cx| {
             let mut unseen = false;
+            let mut waiting_for_the_card = false;
             let mut frames = HowTheFramesGo::default();
             loop {
                 // Whichever comes first: the engine saying it has work, or the
                 // safety net going off. Nothing here asks the engine again and
                 // again -- a page at rest wakes nobody and costs nothing.
-                let heartbeat = if unseen { UNSEEN_HEARTBEAT } else { HEARTBEAT };
+                // A page waiting for the card is not waiting to be told
+                // anything: the card says nothing when it reaches the mark, so
+                // it is looked at again shortly rather than waited on.
+                let heartbeat = match (waiting_for_the_card, unseen) {
+                    (true, _) => UNTIL_THE_CARD_IS_ASKED_AGAIN,
+                    (false, true) => UNSEEN_HEARTBEAT,
+                    (false, false) => HEARTBEAT,
+                };
                 smol::future::or(
                     engine.wait_for_work(),
                     cx.background_executor().timer(heartbeat),
@@ -743,7 +768,7 @@ impl HtmlPreviewView {
                     page.set_throttled(out_of_sight);
                     page.set_dark(reading_in_the_dark(cx));
                     if out_of_sight {
-                        return Some((true, None));
+                        return Some((true, None, false));
                     }
                     let bounds = view.page_bounds.get();
                     let scale = page_scale(window, cx);
@@ -752,6 +777,7 @@ impl HtmlPreviewView {
                     }
                     let painted = page.pump();
                     let drew = painted.then_some((bounds.size, scale));
+                    let for_the_card = page.waiting_for_the_card();
                     if let Some(url) = page.take_link_for_new_tab() {
                         log::debug!("the page navigated to {url}");
                     }
@@ -778,14 +804,15 @@ impl HtmlPreviewView {
                         page.scroll_to(down);
                     }
                     // Where the page stands is a script's answer, which arrives
-                    // on a later turn. A page on the move is asked on every turn:
-                    // told only ten times a second, the bar arrives in steps
-                    // behind a page gliding under the wheel. A page at rest has
-                    // not moved, so the slower pace is enough for it. Nothing has
-                    // to be redrawn when the answer lands: a page that is moving
-                    // is painting.
+                    // on a later turn. A page on the move is asked often, so the
+                    // bar does not arrive in steps behind a page gliding under
+                    // the wheel -- but not on every turn: the asking is itself
+                    // work the engine wakes up for. A page at rest has not moved,
+                    // so the slower pace is enough for it. Nothing has to be
+                    // redrawn when the answer lands: a page that is moving is
+                    // painting.
                     let often_enough = match view.page_scroll.moving() {
-                        true => Duration::ZERO,
+                        true => WHILE_THE_PAGE_MOVES,
                         false => WHERE_THE_PAGE_STANDS,
                     };
                     let due = view
@@ -854,7 +881,7 @@ impl HtmlPreviewView {
                             log::debug!("a superseded frame could not be released: {error:#}");
                         }
                         cx.notify();
-                        return Some((false, drew));
+                        return Some((false, drew, for_the_card));
                     }
                     if painted {
                         let superseded = view.frame.take();
@@ -871,11 +898,12 @@ impl HtmlPreviewView {
                         }
                         cx.notify();
                     }
-                    Some((false, drew))
+                    Some((false, drew, for_the_card))
                 });
                 match turn {
-                    Ok(Some((out_of_sight, drew))) => {
+                    Ok(Some((out_of_sight, drew, for_the_card))) => {
                         unseen = out_of_sight;
+                        waiting_for_the_card = for_the_card;
                         if let Some((at, scale)) = drew {
                             frames.painted(at, scale);
                         }

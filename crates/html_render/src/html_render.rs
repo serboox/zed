@@ -507,6 +507,20 @@ mod engine {
         /// Lets the engine run and picks up the newest frame it painted. Returns
         /// whether there is something new to show.
         pub fn pump(&mut self) -> bool {
+            // Only the graphics card is being waited on. Turning the engine over
+            // will not make the card any faster, and a turn is a select over
+            // every channel the engine has and a context made current: measured
+            // in the editor, a frame took ten thousand of them and 360 ms, which
+            // is what the waiting cost rather than what the frame cost. So the
+            // mark is looked at, and nothing else is done.
+            if self.awaiting_the_card.get() {
+                self.bind();
+                if self.rendering_context.frame_is_drawn() {
+                    self.awaiting_the_card.set(false);
+                    return true;
+                }
+                return false;
+            }
             self.bind();
             self.engine.spin();
             // Bound again: one turn of the engine runs every page there is, and
@@ -541,8 +555,9 @@ mod engine {
                 if self.rendering_context.frame_is_drawn() {
                     return painted || awaited;
                 }
+                // Waited for on a clock of its own rather than by asking the
+                // engine again: whoever drives the page comes back for it.
                 self.awaiting_the_card.set(true);
-                self.engine.nudge();
                 return false;
             }
             // Collected before the next is asked for: a frame asked for while
@@ -568,6 +583,14 @@ mod engine {
                 self.engine.nudge();
             }
             false
+        }
+
+        /// Whether the page is waiting for nothing but the graphics card to
+        /// reach the mark left after the last frame was drawn. Whoever drives the
+        /// page should come back for it shortly rather than wait to be told: the
+        /// card says nothing when it gets there.
+        pub fn waiting_for_the_card(&self) -> bool {
+            self.awaiting_the_card.get()
         }
 
         pub fn frame(&self) -> Option<Arc<RenderImage>> {
