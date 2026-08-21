@@ -9911,33 +9911,6 @@ impl Render for Workspace {
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
-                    // The way out, beside the tabs it comes back with: a mode
-                    // that hides everything has to say how to leave it.
-                    .when(
-                        crate::only_the_document::only_the_document(cx)
-                            && crate::only_the_document::chrome_is_showing(cx),
-                        |parent| {
-                            parent.child(
-                                h_flex().absolute().top_1().right_2().child(
-                                    ui::IconButton::new(
-                                        "leave-only-the-document",
-                                        ui::IconName::Minimize,
-                                    )
-                                    .icon_size(ui::IconSize::Small)
-                                    .tooltip(ui::Tooltip::text("Show everything again (F11)"))
-                                    .on_click(cx.listener(
-                                        |workspace, _, window, cx| {
-                                            workspace.toggle_only_the_document(
-                                                &ToggleOnlyTheDocument,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                ),
-                            )
-                        },
-                    )
                     .child(self.toast_layer.clone()),
             )
             .on_action(cx.listener(|workspace, _: &DismissLoadingReport, _, cx| {
@@ -18729,6 +18702,52 @@ mod tests {
                 2,
                 "Both panels should still be in the right dock"
             );
+        });
+    }
+
+    #[gpui::test]
+    /// Showing nothing but the document is one action, and pressing it once must
+    /// leave it on: the mode was reached through a button while the keystroke
+    /// looked as if it did nothing, and this says which of the two was at fault.
+    #[gpui::test]
+    async fn asking_for_only_the_document_once_leaves_it_on(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        cx.update(|_, cx| {
+            assert!(
+                !crate::only_the_document::only_the_document(cx),
+                "the window shows everything to begin with"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_only_the_document(&ToggleOnlyTheDocument, window, cx);
+        });
+        cx.update(|_, cx| {
+            assert!(
+                crate::only_the_document::only_the_document(cx),
+                "asked once, it is on"
+            );
+        });
+        workspace.update_in(cx, |workspace, _, cx| {
+            assert!(
+                !workspace.status_bar_visible(cx),
+                "and what surrounds the document is not drawn"
+            );
+        });
+
+        // And again puts everything back, so the same key both enters and leaves.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_only_the_document(&ToggleOnlyTheDocument, window, cx);
+        });
+        cx.update(|_, cx| {
+            assert!(!crate::only_the_document::only_the_document(cx));
         });
     }
 

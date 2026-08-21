@@ -1561,16 +1561,28 @@ impl HtmlPreviewView {
                     .border_color(colors.border_variant)
                     .child(self.address.clone()),
             )
-            // The page and the screen, as a browser gives them. The tabs come
-            // back when the pointer reaches the top edge.
-            .child(
-                IconButton::new("html-preview-full-screen", IconName::Maximize)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Show only the page (F11)"))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(workspace::ToggleOnlyTheDocument), cx);
-                    }),
-            )
+            // The page and the screen, as a browser gives them, and the way
+            // back: this bar is what stays in that mode, so the way out belongs
+            // here rather than floating over the tabs it hides -- there it would
+            // sit on the title bar's own controls.
+            .child({
+                let only_the_page = workspace::only_the_document::only_the_document(cx);
+                IconButton::new(
+                    "html-preview-full-screen",
+                    match only_the_page {
+                        true => IconName::Minimize,
+                        false => IconName::Maximize,
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(match only_the_page {
+                    true => "Show everything again (F11)",
+                    false => "Show only the page (F11)",
+                }))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(workspace::ToggleOnlyTheDocument), cx);
+                })
+            })
             .child(
                 IconButton::new("html-preview-zoom-out", IconName::Dash)
                     .icon_size(IconSize::Small)
