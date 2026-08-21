@@ -723,6 +723,7 @@ impl HtmlPreviewView {
         };
         self.pump = Some(cx.spawn(async move |view, cx| {
             let mut unseen = false;
+            let mut frames = HowTheFramesGo::default();
             loop {
                 // Whichever comes first: the engine saying it has work, or the
                 // safety net going off. Nothing here asks the engine again and
@@ -733,6 +734,7 @@ impl HtmlPreviewView {
                     cx.background_executor().timer(heartbeat),
                 )
                 .await;
+                frames.turned();
                 let turn = view.update_in(cx, |view, window, cx| {
                     let out_of_sight = !view.on_screen;
                     let Some(page) = view.page.as_mut() else {
@@ -741,13 +743,15 @@ impl HtmlPreviewView {
                     page.set_throttled(out_of_sight);
                     page.set_dark(reading_in_the_dark(cx));
                     if out_of_sight {
-                        return Some(true);
+                        return Some((true, None));
                     }
                     let bounds = view.page_bounds.get();
+                    let scale = page_scale(window, cx);
                     if bounds.size.width > gpui::px(64.) {
-                        page.resize(bounds.size, page_scale(window, cx));
+                        page.resize(bounds.size, scale);
                     }
                     let painted = page.pump();
+                    let drew = painted.then_some((bounds.size, scale));
                     if let Some(url) = page.take_link_for_new_tab() {
                         log::debug!("the page navigated to {url}");
                     }
@@ -850,7 +854,7 @@ impl HtmlPreviewView {
                             log::debug!("a superseded frame could not be released: {error:#}");
                         }
                         cx.notify();
-                        return Some(false);
+                        return Some((false, drew));
                     }
                     if painted {
                         let superseded = view.frame.take();
@@ -867,10 +871,15 @@ impl HtmlPreviewView {
                         }
                         cx.notify();
                     }
-                    Some(false)
+                    Some((false, drew))
                 });
                 match turn {
-                    Ok(Some(out_of_sight)) => unseen = out_of_sight,
+                    Ok(Some((out_of_sight, drew))) => {
+                        unseen = out_of_sight;
+                        if let Some((at, scale)) = drew {
+                            frames.painted(at, scale);
+                        }
+                    }
                     // The page is gone, or the view is: either way there is
                     // nothing left to drive.
                     Ok(None) | Err(_) => break,
@@ -2341,6 +2350,67 @@ impl ui::scrollbars::ScrollbarVisibility for PageScrollbarSetting {
 /// How many pixels the page is drawn with for each of the editor's own: the
 /// display's, unless the reader has asked for fewer to buy smoothness.
 #[cfg(feature = "servo")]
+/// How the frames actually go, for the log.
+///
+/// A preview that feels slow is worth a number, and the number has to come from
+/// the machine it feels slow on. What is timed is the whole way round: from the
+/// moment work arrived to the frame that came of it, and how many turns of the
+/// engine that took -- a frame needs several, and each one costs.
+#[cfg(feature = "servo")]
+#[derive(Default)]
+struct HowTheFramesGo {
+    /// When the work that this frame came of first arrived.
+    began: Option<std::time::Instant>,
+    turns: u32,
+    took: Vec<Duration>,
+    turns_each: Vec<u32>,
+    said: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "servo")]
+impl HowTheFramesGo {
+    /// How often what it has gathered reaches the log: often enough to watch a
+    /// page being scrolled, seldom enough that the log is not the slow part.
+    const HOW_OFTEN: Duration = Duration::from_secs(5);
+
+    fn turned(&mut self) {
+        self.turns = self.turns.saturating_add(1);
+        self.began.get_or_insert_with(std::time::Instant::now);
+    }
+
+    fn painted(&mut self, at: gpui::Size<gpui::Pixels>, scale: f32) {
+        let Some(began) = self.began.take() else {
+            return;
+        };
+        self.took.push(began.elapsed());
+        self.turns_each.push(self.turns);
+        self.turns = 0;
+        let said = *self.said.get_or_insert_with(std::time::Instant::now);
+        if said.elapsed() < Self::HOW_OFTEN {
+            return;
+        }
+        self.said = Some(std::time::Instant::now());
+        self.took.sort_unstable();
+        let middle = self.took.get(self.took.len() / 2).copied();
+        let worst = self.took.iter().max().copied();
+        let turns = match self.turns_each.is_empty() {
+            true => 0,
+            false => self.turns_each.iter().sum::<u32>() / self.turns_each.len() as u32,
+        };
+        if let (Some(middle), Some(worst)) = (middle, worst) {
+            log::info!(
+                "the page drew {} frames at {}x{} and {scale} pixels to one: {middle:?} at the \
+                 middle, {worst:?} at worst, {turns} turns of the engine each",
+                self.took.len(),
+                (f32::from(at.width) * scale).round() as u32,
+                (f32::from(at.height) * scale).round() as u32,
+            );
+        }
+        self.took.clear();
+        self.turns_each.clear();
+    }
+}
+
 fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
     use crate::html_preview_settings::HtmlPreviewSettings;
 
@@ -2375,7 +2445,6 @@ mod tests {
             "the address bar reads whatever we send the tab to, so it carries no settings"
         );
     }
-
 
     /// The preview inside something that scrolls, because chrome drawn over a
     /// page has to land where the reader clicked at any scroll offset, not only
