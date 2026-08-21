@@ -113,27 +113,11 @@ pub fn init(cx: &mut App) {
             }
         });
         workspace.register_action(|workspace, _: &OpenRunConfigurations, window, cx| {
-            let existing = workspace
-                .active_pane()
-                .read(cx)
-                .items()
-                .find_map(|item| item.downcast::<RunConfigurationsView>());
-            match existing {
-                Some(existing) => {
-                    workspace.activate_item(&existing, true, true, window, cx);
-                }
-                None => {
-                    let view = cx.new(|cx| {
-                        RunConfigurationsView::new(
-                            workspace.project().clone(),
-                            workspace.weak_handle(),
-                            window,
-                            cx,
-                        )
-                    });
-                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-                }
-            }
+            let project = workspace.project().clone();
+            let handle = workspace.weak_handle();
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                RunConfigurationsView::new(project, handle, window, cx)
+            });
         });
     })
     .detach();
@@ -844,129 +828,188 @@ impl RunConfigurationsView {
         .detach();
     }
 
-    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let store = self.store.read(cx);
-        let rows: Vec<AnyElement> = store
-            .all()
-            .map(|configuration| {
-                let kind = configuration.kind;
-                let at = configuration.at;
-                let chosen = self.chosen == Some((kind, at));
-                let what_it_runs = configuration
-                    .task
-                    .as_ref()
-                    .map(|task| task.command.clone())
-                    .or_else(|| {
-                        configuration
-                            .scenario
-                            .as_ref()
-                            .map(|scenario| scenario.adapter.to_string())
-                    })
-                    .unwrap_or_default();
-                let shown_label = configuration.shown_label();
-                let configuration = configuration.clone();
-                h_flex()
-                    .id((
-                        "configuration",
-                        at + matches!(kind, Kind::Debug) as usize * 10_000,
-                    ))
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .items_center()
-                    .when(chosen, |row| row.bg(ui::cyberpunk::row_chosen()))
-                    .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        let configuration = configuration.clone();
-                        view.show(&configuration, window, cx);
-                    }))
-                    .child(
-                        Label::new(match kind {
-                            Kind::Task => "run",
-                            Kind::Debug => "debug",
-                        })
-                        .size(LabelSize::XSmall)
-                        .color(match kind {
-                            Kind::Task => Color::Accent,
-                            Kind::Debug => Color::Warning,
-                        }),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Label::new(shown_label).size(LabelSize::Small))
-                            .child(
-                                Label::new(what_it_runs)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .child(
-                        IconButton::new(
-                            ("run", at + matches!(kind, Kind::Debug) as usize * 10_000),
-                            IconName::PlayFilled,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Run this"))
-                        .on_click(cx.listener(
-                            move |view, _, window, cx| {
-                                if let Some(configuration) =
-                                    view.store.read(cx).get(kind, at).cloned()
-                                {
-                                    view.show(&configuration, window, cx);
-                                }
-                                view.run(window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        IconButton::new(
-                            ("debug", at + matches!(kind, Kind::Debug) as usize * 10_000),
-                            IconName::Debug,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Debug this"))
-                        .on_click(cx.listener(
-                            move |view, _, window, cx| {
-                                if let Some(configuration) =
-                                    view.store.read(cx).get(kind, at).cloned()
-                                {
-                                    view.show(&configuration, window, cx);
-                                }
-                                view.debug(window, cx);
-                            },
-                        )),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+    /// A small heading over a group in the list, as the mockup has them.
+    fn group_heading(said: impl Into<SharedString>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(Label::new(said).size(LabelSize::XSmall).color(Color::Muted))
+            .into_any_element()
+    }
 
-        let nothing_yet = rows.is_empty();
+    /// One configuration in the list: what it is, what it is called, and what it
+    /// runs. No buttons of its own -- what to do with the chosen one is at the
+    /// foot of the window, where a reader looks for it once rather than on every
+    /// row.
+    fn render_row(&self, configuration: &Configuration, cx: &mut Context<Self>) -> AnyElement {
+        let kind = configuration.kind;
+        let at = configuration.at;
+        let chosen = self.chosen == Some((kind, at));
+        let what_it_runs = configuration
+            .task
+            .as_ref()
+            .map(|task| task.command.clone())
+            .or_else(|| {
+                configuration
+                    .scenario
+                    .as_ref()
+                    .map(|scenario| scenario.adapter.to_string())
+            })
+            .unwrap_or_default();
+        let shown_label = configuration.shown_label();
+        let configuration = configuration.clone();
+        h_flex()
+            .id((
+                "configuration",
+                at + matches!(kind, Kind::Debug) as usize * 10_000,
+            ))
+            .debug_selector(move || format!("configuration-{}-{at}", kind.file_name()))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .when(chosen, |row| row.bg(ui::cyberpunk::row_chosen()))
+            .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _, window, cx| {
+                let configuration = configuration.clone();
+                view.show(&configuration, window, cx);
+            }))
+            .child(
+                Label::new(match kind {
+                    Kind::Task => "run",
+                    Kind::Debug => "debug",
+                })
+                .size(LabelSize::XSmall)
+                .color(match kind {
+                    Kind::Task => Color::Accent,
+                    Kind::Debug => Color::Warning,
+                }),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(shown_label).size(LabelSize::Small))
+                    .child(
+                        Label::new(what_it_runs)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One way run on the spot: kept in memory, offered here so it can be looked
+    /// at and, if it is worth keeping, written into the project.
+    fn render_temporary(
+        &self,
+        at: usize,
+        task: &TaskTemplate,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = match task.label.trim().is_empty() {
+            true => task.command.clone(),
+            false => task.label.clone(),
+        };
+        let what_it_runs = format!("{} {}", task.command, task.args.join(" "))
+            .trim()
+            .to_string();
+        h_flex()
+            .id(("temporary", at))
+            .debug_selector(move || format!("temporary-{at}"))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
+            .child(
+                Label::new("on the spot")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(label).size(LabelSize::Small))
+                    .child(
+                        Label::new(what_it_runs)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                Button::new(("pin", at), "Keep")
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text("Write this into the project's own file"))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.store
+                            .update(cx, |store, cx| store.pin_temporary(at, cx))
+                            .detach_and_log_err(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let kept: Vec<AnyElement> = self
+            .store
+            .read(cx)
+            .all()
+            .cloned()
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|configuration| self.render_row(configuration, cx))
+            .collect();
+        let temporary: Vec<AnyElement> = self
+            .store
+            .read(cx)
+            .temporary()
+            .to_vec()
+            .iter()
+            .enumerate()
+            .map(|(at, task)| self.render_temporary(at, task, cx))
+            .collect();
+        let how_many_temporary = temporary.len();
+        let nothing_at_all = kept.is_empty() && temporary.is_empty();
+
         v_flex()
             .id("configurations-list")
             .flex_none()
-            .w(px(320.))
+            .w(px(300.))
             .h_full()
             .border_r_1()
             .border_color(ui::cyberpunk::border_dim())
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll)
-            .when(nothing_yet, |list| {
+            .when(nothing_at_all, |list| {
                 list.child(
                     div().p_3().child(
                         Label::new(
-                            "This project has no run configurations yet. Add one, or write \
-                             .zed/tasks.json by hand -- both end up in the same file.",
+                            "Nothing here yet. Add one, or write .zed/tasks.json by hand -- \
+                             both end up in the same file.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     ),
                 )
             })
-            .children(rows)
+            .when(!kept.is_empty(), |list| {
+                list.child(Self::group_heading("KEPT IN THE PROJECT"))
+            })
+            .children(kept)
+            .when(how_many_temporary > 0, |list| {
+                list.child(Self::group_heading(format!(
+                    "RUN ON THE SPOT · {how_many_temporary} of {}",
+                    crate::configurations_store::MOST_TEMPORARIES_KEPT
+                )))
+            })
+            .children(temporary)
             .custom_scrollbars(
                 ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
                     .tracked_scroll_handle(&self.list_scroll),
@@ -1351,56 +1394,23 @@ impl RunConfigurationsView {
                     .size(LabelSize::Small)
                     .color(Color::Error)
             }))
-            .child(field("Name", &self.label, false))
+            .child(field("NAME", &self.label, false))
             .when(kind == Kind::Task, |form| {
-                form.child(field("Command", &self.command, false))
-                    .child(field("Arguments", &self.args, true))
-                    .child(field("Working directory", &self.cwd, false))
-                    .child(field("Environment file", &self.env_file, false))
-                    .child(field("Environment", &self.env, true))
+                form.child(field("COMMAND", &self.command, false))
+                    .child(field("ARGUMENTS", &self.args, true))
+                    .child(field("WORKING DIRECTORY", &self.cwd, false))
+                    .child(field("ENVIRONMENT", &self.env, true))
+                    .child(field("ENVIRONMENT FILE", &self.env_file, false))
             })
             .when(kind == Kind::Debug, |form| {
-                form.child(field("Debugger", &self.adapter, false))
-                    .child(field("Builds first (a task's name)", &self.builds, false))
-                    .child(field("What the debugger needs", &self.adapter_config, true))
+                form.child(field("DEBUGGER", &self.adapter, false))
+                    .child(field("BUILDS FIRST", &self.builds, false))
+                    .child(field("WHAT THE DEBUGGER NEEDS", &self.adapter_config, true))
             })
             .when(kind == Kind::Task, |form| {
                 form.child(self.render_run_toggles(cx))
             })
             .child(self.render_as_json(kind, cx))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        Button::new("configuration-run", "Run")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, window, cx| view.run(window, cx))),
-                    )
-                    .child(
-                        Button::new("configuration-debug", "Debug")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, window, cx| view.debug(window, cx))),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("configuration-save", "Save to the file")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
-                    )
-                    .child(
-                        Button::new("configuration-duplicate", "Duplicate")
-                            .label_size(LabelSize::Small)
-                            .on_click(
-                                cx.listener(|view, _, window, cx| view.duplicate(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("configuration-remove", "Remove")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| view.remove(cx))),
-                    ),
-            )
             .child(self.render_where_it_lives(window, cx))
             .into_any_element()
     }
@@ -1450,9 +1460,155 @@ impl RunConfigurationsView {
     }
 }
 
+impl EventEmitter<gpui::DismissEvent> for RunConfigurationsView {}
+impl workspace::ModalView for RunConfigurationsView {}
+
 impl Focusable for RunConfigurationsView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+impl RunConfigurationsView {
+    /// The window's own row of controls, as the mockup has it: add, duplicate,
+    /// remove, and move the chosen one up or down the file.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_one = self.chosen.is_some();
+        h_flex()
+            .gap_px()
+            .child(
+                IconButton::new("configuration-add-task", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Add a way of running"))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_a_new_one(Kind::Task, window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new("configuration-add-debug", IconName::Debug)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Add a way of debugging"))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_a_new_one(Kind::Debug, window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new("configuration-duplicate", IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_one)
+                    .tooltip(Tooltip::text("Make a copy of this one"))
+                    .on_click(cx.listener(|view, _, window, cx| view.duplicate(window, cx))),
+            )
+            .child(
+                IconButton::new("configuration-remove", IconName::Dash)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_one)
+                    .tooltip(Tooltip::text("Take this one out of the file"))
+                    .on_click(cx.listener(|view, _, _, cx| view.remove(cx))),
+            )
+            .child(
+                IconButton::new("configuration-earlier", IconName::ChevronUp)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_one)
+                    .tooltip(Tooltip::text("Move it earlier in the file"))
+                    .on_click(cx.listener(|view, _, _, cx| view.move_it(false, cx))),
+            )
+            .child(
+                IconButton::new("configuration-later", IconName::ChevronDown)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_one)
+                    .tooltip(Tooltip::text("Move it later in the file"))
+                    .on_click(cx.listener(|view, _, _, cx| view.move_it(true, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Moves the chosen configuration one place in its file, which is the order
+    /// everything that lists them shows.
+    fn move_it(&mut self, later: bool, cx: &mut Context<Self>) {
+        let Some((kind, at)) = self.chosen else {
+            return;
+        };
+        let Some(original) = self
+            .store
+            .read(cx)
+            .get(kind, at)
+            .map(|configuration| configuration.as_written.clone())
+        else {
+            return;
+        };
+        let writing = self.store.read(cx).move_it(kind, at, original, later, cx);
+        // Which one is chosen follows it, so pressing again moves the same entry
+        // rather than whatever has taken its place.
+        self.chosen = Some((
+            kind,
+            match later {
+                true => at + 1,
+                false => at.saturating_sub(1),
+            },
+        ));
+        cx.spawn(async move |view, cx| {
+            let said = writing.await;
+            view.update(cx, |view, cx| {
+                view.trouble = said
+                    .err()
+                    .map(|error| SharedString::from(format!("{error:#}")));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the window is for, at the foot of it: where this is written down, and
+    /// what can be done with the one in front of the reader.
+    fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_one = self.chosen.is_some();
+        h_flex()
+            .flex_none()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .items_center()
+            .border_t_1()
+            .border_color(ui::cyberpunk::border_dim())
+            // What the run is using, and the way to stop watching it: this says
+            // plainly when nothing is running, so the line is always here and the
+            // switch is always reachable. Where the configuration is kept is said
+            // in the form, beside the fields it belongs to.
+            .child(self.render_metrics(cx))
+            .children(self.trouble.clone().map(|trouble| {
+                Label::new(trouble)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element()
+            }))
+            .child(
+                Button::new("configuration-cancel", "Close")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(gpui::DismissEvent))),
+            )
+            .child(
+                Button::new("configuration-save", "Save")
+                    .label_size(LabelSize::Small)
+                    .disabled(!has_one)
+                    .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
+            )
+            .child(
+                Button::new("configuration-debug", "Debug")
+                    .label_size(LabelSize::Small)
+                    .disabled(!has_one)
+                    .on_click(cx.listener(|view, _, window, cx| view.debug(window, cx))),
+            )
+            .child(
+                Button::new("configuration-run", "Run")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .disabled(!has_one)
+                    .on_click(cx.listener(|view, _, window, cx| view.run(window, cx))),
+            )
+            .into_any_element()
     }
 }
 
@@ -1474,6 +1630,7 @@ impl Render for RunConfigurationsView {
         v_flex()
             .key_context("RunConfigurations")
             .track_focus(&self.focus)
+            .debug_selector(|| "run-configurations".to_string())
             .on_action(
                 cx.listener(|view, _: &RunThisConfiguration, window, cx| view.run(window, cx)),
             )
@@ -1481,34 +1638,31 @@ impl Render for RunConfigurationsView {
                 cx.listener(|view, _: &DebugThisConfiguration, window, cx| view.debug(window, cx)),
             )
             .on_action(cx.listener(|view, _: &SaveThisConfiguration, _, cx| view.save(cx)))
-            .size_full()
-            .bg(ui::cyberpunk::surface())
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(gpui::DismissEvent)))
+            // A window, not a document: as wide as two columns need and no wider,
+            // so what is being read behind it is still there.
+            .w(px(960.))
+            .h(px(600.))
+            .elevation_3(cx)
+            .overflow_hidden()
             .child(
                 h_flex()
                     .flex_none()
                     .w_full()
-                    .px_2()
-                    .py_1()
+                    .px_3()
+                    .py_2()
                     .gap_2()
                     .items_center()
                     .border_b_1()
                     .border_color(ui::cyberpunk::border_dim())
                     .child(
-                        Button::new("configuration-new-task", "Add a task")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_a_new_one(Kind::Task, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("configuration-new-debug", "Add a debug configuration")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_a_new_one(Kind::Debug, window, cx)
-                            })),
+                        Label::new("RUN CONFIGURATIONS")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     )
                     .child(div().flex_1())
-                    .children(trouble_in_files),
+                    .children(trouble_in_files)
+                    .child(self.render_toolbar(cx)),
             )
             .child(
                 h_flex()
@@ -1518,16 +1672,7 @@ impl Render for RunConfigurationsView {
                     .child(self.render_list(window, cx))
                     .child(self.render_form(window, cx)),
             )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(ui::cyberpunk::border_dim())
-                    .child(self.render_metrics(cx)),
-            )
+            .child(self.render_footer(cx))
     }
 }
 

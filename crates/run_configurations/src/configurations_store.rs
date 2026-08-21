@@ -245,6 +245,48 @@ impl ConfigurationsStore {
         })
     }
 
+    /// Moves the configuration read as `original` one place earlier or later in
+    /// its file, which is the order everything that lists them shows.
+    ///
+    /// The file is read again first, and the entry is found by what it says
+    /// rather than by where it was: the reader may have moved it by hand since
+    /// this was drawn, and writing by the old index would move somebody else.
+    pub fn move_it(
+        &self,
+        kind: Kind,
+        at: usize,
+        original: Value,
+        later: bool,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        let Some(path) = self.file_path(kind) else {
+            return Task::ready(Err(anyhow!("there is no file to move it in")));
+        };
+        let fs = self.fs.clone();
+        cx.background_spawn(async move {
+            let text = fs.load(&path).await.unwrap_or_default();
+            let at = place_of(&text, at, &original, &path)?;
+            let read = configurations_file::read(kind, &text);
+            let to = match later {
+                true => at + 1,
+                false => at.checked_sub(1).context("it is already the first one")?,
+            };
+            let theirs = read
+                .configurations
+                .get(to)
+                .context("it is already the last one")?
+                .as_written
+                .clone();
+            // Written as a swap of the two entries rather than as a removal and an
+            // insertion: the file's own text is edited in place, so everything
+            // around the two -- comments, spacing, whatever else the reader put
+            // there -- is left exactly as it was.
+            let text = configurations_file::text_with(&text, Some(at), &theirs);
+            let text = configurations_file::text_with(&text, Some(to), &original);
+            configurations_file::write(&fs, &path, &text).await
+        })
+    }
+
     /// Takes the configuration that was read as `original` out of its file.
     pub fn remove(&self, kind: Kind, at: usize, original: Value, cx: &App) -> Task<Result<()>> {
         let Some(path) = self.file_path(kind) else {
