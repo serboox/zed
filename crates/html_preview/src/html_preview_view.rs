@@ -231,6 +231,12 @@ pub struct HtmlPreviewView {
     /// Where the page is, and where the reader may type to send it elsewhere.
     #[cfg(feature = "servo")]
     address: Entity<Editor>,
+    /// How tall this preview's own row of controls is, so that whatever floats
+    /// over the document can be put below it rather than on top of it. Measured
+    /// while drawing, since the row holds buttons and a field and what it comes
+    /// to is the row's own business.
+    #[cfg(feature = "servo")]
+    chrome_height: std::rc::Rc<std::cell::Cell<Pixels>>,
     /// The address last put into the bar, so a page that has gone somewhere of
     /// its own accord is noticed without asking the engine every frame.
     #[cfg(feature = "servo")]
@@ -503,6 +509,7 @@ impl HtmlPreviewView {
                 #[cfg(feature = "servo")]
                 address: address_bar(window, cx),
                 #[cfg(feature = "servo")]
+                chrome_height: std::rc::Rc::new(std::cell::Cell::new(Pixels::ZERO)),
                 showing_address: None,
                 #[cfg(feature = "servo")]
                 looking_for: None,
@@ -1222,6 +1229,17 @@ impl HtmlPreviewView {
                                 return;
                             }
                             let delta = event.delta.pixel_delta(window.line_height());
+                            // The wheel with the control key held is zoom, as it
+                            // is in every browser -- and then it is not scrolling,
+                            // so the page is not told to move.
+                            if event.modifiers.control || event.modifiers.platform {
+                                view.update(cx, |view, cx| {
+                                    view.zoom_the_page(f32::from(delta.y), cx);
+                                })
+                                .ok();
+                                cx.stop_propagation();
+                                return;
+                            }
                             view.update(cx, |view, _| {
                                 if let Some(page) = view.page.as_ref() {
                                     page.scrolled(page_point(event.position), delta);
@@ -1514,6 +1532,33 @@ impl HtmlPreviewView {
                     .border_color(colors.border_variant)
                     .child(self.address.clone()),
             )
+            .child(
+                IconButton::new("html-preview-zoom-out", IconName::Dash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Smaller"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.zoom_the_page(-1., cx);
+                    })),
+            )
+            // What the zoom is, and a way back to the page as written. Shown only
+            // when the page is not drawn as written: a browser says nothing while
+            // there is nothing to say.
+            .children(self.zoom_as_read().map(|zoom| {
+                Button::new("html-preview-zoom-back", zoom)
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Back to the page as written"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.zoom_the_page_back(cx);
+                    }))
+            }))
+            .child(
+                IconButton::new("html-preview-zoom-in", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Larger"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.zoom_the_page(1., cx);
+                    })),
+            )
             .child({
                 // The switch that floats over a document is painted over the
                 // source, not over this: a preview opened in a tab of its own
@@ -1602,6 +1647,45 @@ impl HtmlPreviewView {
                 .looking_for
                 .as_ref()
                 .is_some_and(|field| field.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// Draws the page a step larger or smaller, the way a browser's own zoom
+    /// works. Says whether there was a page to zoom.
+    #[cfg(feature = "servo")]
+    fn zoom_the_page(&mut self, by: f32, cx: &mut Context<Self>) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        // A step of a quarter, as browsers step it, rather than a fixed amount:
+        // going from a tenth to a fifth is a doubling, and from four times to
+        // four and a tenth is nothing at all.
+        let step = 1.25_f32;
+        let zoom = match by > 0. {
+            true => page.zoom() * step,
+            false => page.zoom() / step,
+        };
+        page.set_zoom(zoom);
+        cx.notify();
+        true
+    }
+
+    /// Back to the page as it was written.
+    #[cfg(feature = "servo")]
+    fn zoom_the_page_back(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        page.set_zoom(1.);
+        cx.notify();
+        true
+    }
+
+    /// What the zoom reads as, for the button that shows it. Nothing when the
+    /// page is drawn as written -- a browser says nothing at all then.
+    #[cfg(feature = "servo")]
+    fn zoom_as_read(&self) -> Option<String> {
+        let zoom = self.page.as_ref()?.zoom();
+        ((zoom - 1.).abs() > 0.01).then(|| format!("{:.0}%", zoom * 100.))
     }
 
     /// Opens the search field, or puts the cursor back in it.
@@ -2258,7 +2342,31 @@ impl Render for HtmlPreviewView {
             }))
             .on_action(cx.listener(|view, _: &StopFindingInPage, window, cx| {
                 view.stop_looking(window, cx);
-            }));
+            }))
+            // A live page is not drawn at the markdown font size, so the
+            // keyboard's zoom means the page's own. The persisting variants come
+            // from the palette and mean "change the setting", which is not this.
+            .on_action(cx.listener(
+                |view, action: &zed_actions::IncreaseBufferFontSize, _, cx| {
+                    if action.persist || !view.zoom_the_page(1., cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |view, action: &zed_actions::DecreaseBufferFontSize, _, cx| {
+                    if action.persist || !view.zoom_the_page(-1., cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .on_action(
+                cx.listener(|view, action: &zed_actions::ResetBufferFontSize, _, cx| {
+                    if action.persist || !view.zoom_the_page_back(cx) {
+                        cx.propagate();
+                    }
+                }),
+            );
         // A live page scrolls itself and draws its own scrollbar. Wrapping it in
         // a scroll container gives one document two scrollers, and they fight:
         // the wheel moves both, and the picture slides under the pointer.
@@ -2298,6 +2406,16 @@ impl Render for HtmlPreviewView {
 
 impl Item for HtmlPreviewView {
     type Event = ();
+
+    /// The address bar is this preview's own, and it sits in the very corner the
+    /// pane floats its controls over.
+    #[cfg(feature = "servo")]
+    fn floating_controls_inset(&self, _: &App) -> Pixels {
+        match self.showing_live_page() {
+            true => self.chrome_height.get(),
+            false => Pixels::ZERO,
+        }
+    }
 
     /// The pane has moved on to another tab. Whatever page this preview holds is
     /// now behind it, and is told to hold back until it is looked at again.

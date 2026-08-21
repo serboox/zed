@@ -880,6 +880,22 @@ mod engine {
         /// Tells the page whether the editor is dark or light, so a page that
         /// asks -- through `prefers-color-scheme` -- is answered the same way
         /// the rest of the window is dressed.
+        /// How much larger than life the page is drawn, as a browser's own zoom
+        /// means it: 1.0 is the page as written.
+        pub fn zoom(&self) -> f32 {
+            self.webview.page_zoom()
+        }
+
+        /// Draws the page larger or smaller. Kept within what a reader can still
+        /// use: a page at a twentieth of its size is not a page any more, and one
+        /// at five times is a single word.
+        pub fn set_zoom(&self, zoom: f32) {
+            const AS_SMALL_AS: f32 = 0.25;
+            const AS_LARGE_AS: f32 = 5.0;
+            self.webview.set_page_zoom(zoom.clamp(AS_SMALL_AS, AS_LARGE_AS));
+            self.engine.nudge();
+        }
+
         pub fn set_dark(&mut self, dark: bool) {
             if self.dark == Some(dark) {
                 return;

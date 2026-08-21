@@ -352,6 +352,15 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         ToolbarItemLocation::Hidden
     }
 
+    /// How far down this item's own controls reach at its top left corner.
+    ///
+    /// Controls floating over an item are put in that corner, and an item that
+    /// keeps controls of its own there -- a browser's address bar, say -- would
+    /// have them painted over. What is said here is left free.
+    fn floating_controls_inset(&self, _: &App) -> Pixels {
+        Pixels::ZERO
+    }
+
     fn breadcrumbs(&self, _cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {
         None
     }
@@ -573,6 +582,7 @@ pub trait ItemHandle: 'static + Send {
     fn to_searchable_item_handle(&self, cx: &App) -> Option<Box<dyn SearchableItemHandle>>;
     fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation;
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)>;
+    fn floating_controls_inset(&self, cx: &App) -> Pixels;
     fn breadcrumb_prefix(&self, window: &mut Window, cx: &mut App) -> Option<gpui::AnyElement>;
     fn show_toolbar(&self, cx: &App) -> bool;
     fn pixel_position_of_cursor(&self, cx: &App) -> Option<Point<Pixels>>;
@@ -1130,6 +1140,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation {
         self.read(cx).breadcrumb_location(cx)
+    }
+
+    fn floating_controls_inset(&self, cx: &App) -> Pixels {
+        self.read(cx).floating_controls_inset(cx)
     }
 
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {

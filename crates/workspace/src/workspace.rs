@@ -1078,7 +1078,10 @@ impl ItemOverlayRegistry {
         Some(
             h_flex()
                 .absolute()
-                .top_0p5()
+                // Below whatever the item keeps in that corner itself: a
+                // browser's address bar is the item's own, and controls floating
+                // over the document must not sit on it.
+                .top(item.floating_controls_inset(cx) + px(2.))
                 .left_3()
                 .gap_1()
                 .children(overlays),

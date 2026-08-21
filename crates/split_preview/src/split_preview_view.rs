@@ -168,6 +168,19 @@ impl SplitPreviewView {
                 .is_ok()
     }
 
+    /// How far down the preview's own controls reach at the top left. Only a
+    /// browser page keeps any there.
+    fn preview_inset(&self, cx: &App) -> gpui::Pixels {
+        match self
+            .preview
+            .clone()
+            .downcast::<html_preview::html_preview_view::HtmlPreviewView>()
+        {
+            Ok(page) => Item::floating_controls_inset(page.read(cx), cx),
+            Err(_) => gpui::Pixels::ZERO,
+        }
+    }
+
     /// An action handler here stops the action by default, so everything this
     /// tab does not mean to take over has to be handed back on with
     /// `cx.propagate()` -- otherwise zoom would go dead in the editor-only
@@ -459,8 +472,22 @@ impl Item for SplitPreviewView {
             .update(cx, |editor, cx| Item::deactivated(editor, window, cx))
     }
 
+    /// The path above the document is the editor's, and it says nothing that the
+    /// tab does not: with the editor hidden there is nothing for it to point at,
+    /// and it costs a row of the window.
     fn breadcrumb_location(&self, cx: &App) -> workspace::ToolbarItemLocation {
-        Item::breadcrumb_location(self.editor.read(cx), cx)
+        match self.layout {
+            PreviewLayout::Preview => workspace::ToolbarItemLocation::Hidden,
+            _ => Item::breadcrumb_location(self.editor.read(cx), cx),
+        }
+    }
+
+    /// With only the preview showing, the corner belongs to the preview.
+    fn floating_controls_inset(&self, cx: &App) -> gpui::Pixels {
+        match self.layout {
+            PreviewLayout::Preview => self.preview_inset(cx),
+            _ => Item::floating_controls_inset(self.editor.read(cx), cx),
+        }
     }
 
     fn breadcrumbs(

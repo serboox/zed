@@ -1389,6 +1389,23 @@ fn register_actions(
                 workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
             },
         )
+        // The page's own menu offers "Inspect", and the tools are a panel like
+        // any other: without this the menu item names an action nothing answers.
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &html_preview::ToggleFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                #[cfg(feature = "servo")]
+                workspace.toggle_panel_focus::<html_preview::browser_tools_panel::BrowserToolsPanel>(
+                    window, cx,
+                );
+                #[cfg(not(feature = "servo"))]
+                {
+                    let _ = (workspace, window, cx);
+                }
+            },
+        )
         .register_action(
             |workspace: &mut Workspace,
              _: &zed_actions::api_client_panel::ToggleResponseDockFocus,
