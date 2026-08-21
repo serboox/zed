@@ -18,11 +18,11 @@ use anyhow::Result;
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use futures::{StreamExt, stream::FuturesUnordered};
 use gpui::{
-    Action, Anchor, AnyElement, App, AsyncWindowContext, ClickEvent, ClipboardItem, Context, Div,
-    DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
-    Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point, PromptLevel, Render,
-    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window, actions,
-    anchored, deferred, prelude::*,
+    Action, Anchor, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClickEvent,
+    ClipboardItem, Context, Div, DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths,
+    FocusHandle, FocusOutEvent, Focusable, KeyContext, MouseButton, NavigationDirection, Pixels,
+    Point, PromptLevel, Render, ScrollHandle, Subscription, Task, TaskExt, WeakEntity,
+    WeakFocusHandle, Window, actions, anchored, deferred, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -4303,8 +4303,10 @@ impl Render for Pane {
         let should_display_tab_bar = self.should_display_tab_bar.clone();
         // The tabs are around the document, so they go with everything else that
         // is -- until the pointer reaches the top edge to fetch them back.
-        let display_tab_bar = should_display_tab_bar(window, cx)
-            && crate::only_the_document::draw_what_surrounds_the_document(cx);
+        let display_tab_bar =
+            should_display_tab_bar(window, cx) && crate::only_the_document::draw_the_top(cx);
+        // Fetched back rather than always there, so they come back moving.
+        let tabs_slide_in = crate::only_the_document::only_the_document(cx);
         let Some(project) = self.project.upgrade() else {
             return div().track_focus(&self.focus_handle(cx));
         };
@@ -4471,7 +4473,35 @@ impl Render for Pane {
                 }
             }))
             .when(self.active_item().is_some() && display_tab_bar, |pane| {
-                pane.child((self.render_tab_bar.clone())(self, window, cx))
+                let bar = (self.render_tab_bar.clone())(self, window, cx);
+                pane.child(match tabs_slide_in {
+                    // Slid down from behind the window's edge rather than
+                    // appearing whole: what is fetched back by a pointer at the
+                    // edge should look as though it came from there. The room it
+                    // takes grows with it, so the document is pushed rather than
+                    // covered, and the movement is short enough not to be waited
+                    // for.
+                    true => div()
+                        .child(bar)
+                        .with_animation(
+                            "the-tabs-come-back",
+                            gpui::Animation::new(crate::only_the_document::HOW_LONG_IT_TAKES)
+                                .with_easing(gpui::ease_out_quint()),
+                            |this, how_far| {
+                                // Slid down into place from behind the window's
+                                // edge, and faded while it comes: what a pointer
+                                // fetched from an edge should look as though it
+                                // came from there. The offset is a margin that
+                                // ends at nothing, so when the movement is over
+                                // there is no constraint left behind -- a height
+                                // animated to a guess would clip the bar for as
+                                // long as it showed.
+                                this.opacity(how_far).mt(px(-12. * (1. - how_far)))
+                            },
+                        )
+                        .into_any_element(),
+                    false => bar,
+                })
             })
             .child({
                 let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();

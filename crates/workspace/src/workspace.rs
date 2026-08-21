@@ -65,12 +65,12 @@ use futures::{
     future::{Either, Shared, try_join_all},
 };
 use gpui::{
-    Action, AnyElement, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
-    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
-    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
-    WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
+    Action, AnimationExt as _, AnyElement, AnyEntity, AnyView, AnyWeakView, App, AsyncApp,
+    AsyncWindowContext, Axis, Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
+    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
     transparent_black,
 };
 pub use history_manager::*;
@@ -2835,8 +2835,7 @@ impl Workspace {
     }
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
-        StatusBarSettings::get_global(cx).show
-            && crate::only_the_document::draw_what_surrounds_the_document(cx)
+        StatusBarSettings::get_global(cx).show && crate::only_the_document::draw_the_bottom(cx)
     }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
@@ -8422,16 +8421,23 @@ impl Workspace {
         dock: &Entity<Dock>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Stateful<Div>> {
+    ) -> Option<AnyElement> {
         if self.zoomed_position == Some(position) {
             return None;
         }
         // Nothing but the document means nothing but the document: a panel is
-        // around it, not part of it.
-        if !crate::only_the_document::draw_what_surrounds_the_document(cx) {
+        // around it, not part of it. Each edge answers for its own, so the
+        // pointer at the left edge brings the left panel and leaves the rest.
+        let at_this_edge = match position {
+            DockPosition::Left => crate::only_the_document::draw_the_left(cx),
+            DockPosition::Right => crate::only_the_document::draw_the_right(cx),
+            DockPosition::Bottom => crate::only_the_document::draw_the_bottom(cx),
+        };
+        if !at_this_edge {
             return None;
         }
 
+        let fetched_back = crate::only_the_document::it_was_fetched_back(cx);
         let leader_border = dock.read(cx).active_panel().and_then(|panel| {
             let pane = panel.pane(cx)?;
             let follower_states = &self.follower_states;
@@ -8513,7 +8519,30 @@ impl Workspace {
             }
         }
 
-        Some(container)
+        // A panel the pointer fetched from an edge comes back moving, from that
+        // edge. The offset is a margin that ends at nothing, so the movement
+        // leaves no constraint behind once it is over.
+        if !fetched_back {
+            return Some(container.into_any_element());
+        }
+        Some(
+            container
+                .with_animation(
+                    gpui::SharedString::from(format!("a-panel-comes-back-{dock_element_id}")),
+                    gpui::Animation::new(crate::only_the_document::HOW_LONG_IT_TAKES)
+                        .with_easing(gpui::ease_out_quint()),
+                    move |this, how_far| {
+                        let out_of_sight = px(-24. * (1. - how_far));
+                        let this = this.opacity(how_far);
+                        match position {
+                            DockPosition::Left => this.ml(out_of_sight),
+                            DockPosition::Right => this.mr(out_of_sight),
+                            DockPosition::Bottom => this.mb(out_of_sight),
+                        }
+                    },
+                )
+                .into_any_element(),
+        )
     }
 
     /// Returns the currently-visible major window regions ("parts"), in a stable
@@ -9480,10 +9509,11 @@ impl Render for Workspace {
                         |_, _, _| (),
                         |_, _, window, _| {
                             window.on_mouse_event(
-                                move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                move |event: &gpui::MouseMoveEvent, phase, window, cx| {
                                     if phase == gpui::DispatchPhase::Bubble {
                                         crate::only_the_document::the_pointer_is_at(
-                                            event.position.y,
+                                            event.position,
+                                            window.viewport_size(),
                                             cx,
                                         );
                                     }
@@ -9509,7 +9539,7 @@ impl Render for Workspace {
             .when_some(
                 self.titlebar_item
                     .clone()
-                    .filter(|_| crate::only_the_document::draw_what_surrounds_the_document(cx)),
+                    .filter(|_| crate::only_the_document::draw_the_top(cx)),
                 |this, item| {
                     this.child(
                         div()
