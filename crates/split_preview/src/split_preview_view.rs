@@ -514,6 +514,15 @@ impl Item for SplitPreviewView {
             Some(self_handle.clone().into())
         } else if TypeId::of::<Editor>() == type_id {
             Some(self.editor.clone().into())
+        } else if TypeId::of::<html_preview::html_preview_view::HtmlPreviewView>() == type_id {
+            // The developer's tools ask the workspace for the page being read,
+            // and inside this tab the page is not the item -- this is. Without
+            // this the tools find nothing and show three empty tabs.
+            self.preview
+                .clone()
+                .downcast::<html_preview::html_preview_view::HtmlPreviewView>()
+                .ok()
+                .map(Into::into)
         } else {
             None
         }

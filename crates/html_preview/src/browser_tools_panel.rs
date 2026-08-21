@@ -166,9 +166,12 @@ impl BrowserToolsPanel {
     fn page(&self, cx: &App) -> Option<Entity<HtmlPreviewView>> {
         let workspace = self.workspace.upgrade()?;
         let workspace = workspace.read(cx);
+        // Asked for as "whatever stands in for a page", not as the item itself: a
+        // page read beside its source is inside another item, and that item
+        // answers for it.
         workspace
             .active_item(cx)
-            .and_then(|item| item.downcast::<HtmlPreviewView>())
+            .and_then(|item| item.act_as::<HtmlPreviewView>(cx))
     }
 
     /// Asks the page whatever the open tab needs. Every answer is a script the

@@ -251,12 +251,11 @@ pub struct HtmlPreviewView {
     /// Where the page is, and where the reader may type to send it elsewhere.
     #[cfg(feature = "servo")]
     address: Entity<Editor>,
-    /// How tall this preview's own row of controls is, so that whatever floats
-    /// over the document can be put below it rather than on top of it. Measured
-    /// while drawing, since the row holds buttons and a field and what it comes
-    /// to is the row's own business.
+    /// Where this preview's own top is, so that what sits above the page -- the
+    /// address row, and anything that joins it -- can be measured as the distance
+    /// from here to the page rather than counted up from paddings and borders.
     #[cfg(feature = "servo")]
-    chrome_height: std::rc::Rc<std::cell::Cell<Pixels>>,
+    own_top: std::rc::Rc<std::cell::Cell<Pixels>>,
     /// The address last put into the bar, so a page that has gone somewhere of
     /// its own accord is noticed without asking the engine every frame.
     #[cfg(feature = "servo")]
@@ -529,7 +528,7 @@ impl HtmlPreviewView {
                 #[cfg(feature = "servo")]
                 address: address_bar(window, cx),
                 #[cfg(feature = "servo")]
-                chrome_height: std::rc::Rc::new(std::cell::Cell::new(Pixels::ZERO)),
+                own_top: std::rc::Rc::new(std::cell::Cell::new(Pixels::ZERO)),
                 #[cfg(feature = "servo")]
                 showing_address: None,
                 #[cfg(feature = "servo")]
@@ -1502,6 +1501,7 @@ impl HtmlPreviewView {
         let colors = cx.theme().colors();
         h_flex()
             .id("html-preview-address")
+            .debug_selector(|| "html-preview-address".into())
             .key_context("HtmlPreviewAddress")
             .on_action(cx.listener(|view, _: &menu::Confirm, window, cx| {
                 view.go_where_the_bar_says(window, cx);
@@ -2422,7 +2422,18 @@ impl Render for HtmlPreviewView {
         // a scroll container gives one document two scrollers, and they fight:
         // the wheel moves both, and the picture slides under the pointer.
         if live_page {
+            let own_top = self.own_top.clone();
             return root
+                .relative()
+                .child(
+                    // Absolute, so knowing where this view starts takes no room.
+                    canvas(
+                        move |bounds, _, _| own_top.set(bounds.origin.y),
+                        |_, _, _, _| (),
+                    )
+                    .absolute()
+                    .size_full(),
+                )
                 .child(
                     v_flex()
                         .size_full()
@@ -2462,10 +2473,13 @@ impl Item for HtmlPreviewView {
     /// pane floats its controls over.
     #[cfg(feature = "servo")]
     fn floating_controls_inset(&self, _: &App) -> Pixels {
-        match self.showing_live_page() {
-            true => self.chrome_height.get(),
-            false => Pixels::ZERO,
+        if !self.showing_live_page() {
+            return Pixels::ZERO;
         }
+        // From this view's own top to the page's: whatever is between them is
+        // this browser's own, and floating controls belong below all of it.
+        let above_the_page = self.page_bounds.get().origin.y - self.own_top.get();
+        above_the_page.max(Pixels::ZERO)
     }
 
     /// The pane has moved on to another tab. Whatever page this preview holds is
@@ -2676,6 +2690,31 @@ mod tests {
     const AN_IMAGE: &str = "https://example.com/picture.png";
     const A_SELECTION: &str = "how tall is a giraffe";
     const A_SOURCE: &str = "<html><body><p>Hello</p></body></html>";
+
+    /// Controls floating over a document are put in the pane's top left corner,
+    /// and the browser keeps its own row of them there. What the browser says
+    /// that row comes to has to be a real measurement -- it was reported as
+    /// nothing at all once, and the floating controls landed on the back,
+    /// forward and reload buttons.
+    #[gpui::test]
+    async fn the_browser_says_how_far_its_own_row_reaches(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+
+        let bar = painted(cx, "html-preview-address");
+        let said = frame.read_with(cx, |frame, cx| {
+            workspace::item::Item::floating_controls_inset(frame.preview.read(cx), cx)
+        });
+        assert!(
+            said >= bar.size.height,
+            "the row is {:?} tall and the browser says {said:?}: anything floating \
+             over the document would be painted on it",
+            bar.size.height
+        );
+        assert!(
+            said > px(0.),
+            "and nothing at all is what it said when this went wrong"
+        );
+    }
 
     #[test]
     fn a_new_tab_starts_at_the_web_and_not_at_a_file_of_ours() {
