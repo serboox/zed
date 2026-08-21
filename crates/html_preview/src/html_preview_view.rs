@@ -510,6 +510,7 @@ impl HtmlPreviewView {
                 address: address_bar(window, cx),
                 #[cfg(feature = "servo")]
                 chrome_height: std::rc::Rc::new(std::cell::Cell::new(Pixels::ZERO)),
+                #[cfg(feature = "servo")]
                 showing_address: None,
                 #[cfg(feature = "servo")]
                 looking_for: None,
@@ -1531,6 +1532,16 @@ impl HtmlPreviewView {
                     .border_1()
                     .border_color(colors.border_variant)
                     .child(self.address.clone()),
+            )
+            // The page and the screen, as a browser gives them. The tabs come
+            // back when the pointer reaches the top edge.
+            .child(
+                IconButton::new("html-preview-full-screen", IconName::Maximize)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Show only the page (F11)"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(workspace::ToggleOnlyTheDocument), cx);
+                    }),
             )
             .child(
                 IconButton::new("html-preview-zoom-out", IconName::Dash)
@@ -2561,6 +2572,56 @@ fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
     use crate::html_preview_settings::HtmlPreviewSettings;
 
     HtmlPreviewSettings::get_global(cx).scale_in(window.scale_factor())
+}
+
+#[cfg(all(test, feature = "servo"))]
+mod how_often_the_page_is_asked {
+    use super::*;
+
+    /// The pace at which a moving page is asked where it stands is the whole
+    /// difference between a page that glides and one that crawls, so it is worth
+    /// a test that says why.
+    ///
+    /// Asking is a script, and handing the engine a script is work it wakes for.
+    /// Asked on every turn -- which is what `Duration::ZERO` meant here -- the
+    /// asking fed itself: measured in the editor, ten thousand turns of the
+    /// engine for one frame and 360 ms a frame, of which almost nothing was
+    /// drawing. Paced, the same page takes fifteen turns.
+    #[test]
+    fn a_moving_page_is_asked_often_but_not_on_every_turn() {
+        assert!(
+            WHILE_THE_PAGE_MOVES > Duration::ZERO,
+            "asking on every turn is a loop that feeds itself: it cost ten \
+             thousand turns of the engine a frame"
+        );
+        // A frame is sixteen milliseconds at sixty a second. Asking no more often
+        // than that leaves the engine a whole frame between asks.
+        assert!(
+            WHILE_THE_PAGE_MOVES <= Duration::from_millis(16),
+            "and a scrollbar told less often than a frame arrives in steps behind \
+             the page"
+        );
+        // At rest there is nothing to follow, so the slower pace is enough --
+        // and it must stay the slower one.
+        assert!(
+            WHERE_THE_PAGE_STANDS > WHILE_THE_PAGE_MOVES,
+            "a page at rest has not moved, and asking it as often as a moving one \
+             is work for nothing"
+        );
+    }
+
+    /// What a second of scrolling costs the engine in asks, and what it must not
+    /// grow to. This is the number that regressed.
+    #[test]
+    fn a_second_of_scrolling_asks_the_page_a_hundred_odd_times() {
+        let asks = (1000. / WHILE_THE_PAGE_MOVES.as_millis() as f64).round() as u32;
+        assert!(
+            (60..=200).contains(&asks),
+            "a second of scrolling should ask the page a hundred-odd times, not \
+             {asks}: fewer and the bar lags, more and the asking is what the \
+             frame is spent on"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -128,6 +128,7 @@ mod engine {
             let engine = Rc::new(Self {
                 servo: RefCell::new(Some(
                     ServoBuilder::default()
+                        .opts(how_to_be_watched())
                         .preferences(preferences(&options))
                         .event_loop_waker(Box::new(Waker(tell.clone())))
                         .build(),
@@ -183,6 +184,30 @@ mod engine {
         pub fn nudge(&self) {
             self.tell.try_send(()).ok();
         }
+
+        /// Whether the engine has said it has work, without waiting for it to.
+        /// Whoever drives a page turns it over when this is true and leaves it
+        /// alone when it is not -- which is what keeps a page at rest free.
+        pub fn has_work_waiting(&self) -> bool {
+            self.woken.try_recv().is_ok()
+        }
+    }
+
+    /// Whether the engine is asked to say where its own time goes.
+    ///
+    /// Off unless `ZED_HTML_PROFILE` names how many seconds between reports.
+    /// The engine then writes what each part of it -- script, layout, painting --
+    /// spent, which is the only way to tell a slow page from a slow engine.
+    fn how_to_be_watched() -> servo::Opts {
+        let mut opts = servo::Opts::default();
+        if let Ok(asked) = std::env::var("ZED_HTML_PROFILE")
+            && let Ok(seconds) = asked.trim().parse::<f64>()
+            && seconds > 0.
+        {
+            opts.time_profiling = Some(servo::OutputOptions::Stdout(seconds));
+            log::info!("the engine will say where its time goes every {seconds} seconds");
+        }
+        opts
     }
 
     /// How the engine is set up for a preview rather than for a browser.
@@ -892,7 +917,8 @@ mod engine {
         pub fn set_zoom(&self, zoom: f32) {
             const AS_SMALL_AS: f32 = 0.25;
             const AS_LARGE_AS: f32 = 5.0;
-            self.webview.set_page_zoom(zoom.clamp(AS_SMALL_AS, AS_LARGE_AS));
+            self.webview
+                .set_page_zoom(zoom.clamp(AS_SMALL_AS, AS_LARGE_AS));
             self.engine.nudge();
         }
 

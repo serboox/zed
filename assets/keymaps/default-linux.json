@@ -1422,6 +1422,9 @@
       "ctrl-g": "html::FindNextInPage",
       "ctrl-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",
+      // On a page, full screen means what it means in a browser: the page and
+      // nothing else, with the tabs a pointer's reach away.
+      "f11": "workspace::ToggleOnlyTheDocument",
     },
   },
   {

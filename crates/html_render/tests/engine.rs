@@ -428,6 +428,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         );
         drop(sharp);
 
+        a_scroll_costs_only_a_few_turns_of_the_engine(cx);
         the_page_can_be_taken_somewhere(cx);
         the_page_can_be_searched(cx);
         the_page_knows_how_wide_it_is(cx);
@@ -447,6 +448,70 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
             what_a_plain_page_costs(cx);
         }
     });
+}
+
+/// A frame must not cost the engine more than a handful of turns when it is
+/// driven the way the editor drives it: turned when it says it has work, left
+/// alone when it does not.
+///
+/// This is a guard rather than a measurement, and it is worth a test of its own
+/// because the editor once turned the engine **ten thousand times for one frame**
+/// -- it asked the page where it stood on every turn, and asking is a script,
+/// which is work the engine wakes for, so the asking fed itself. A frame took
+/// 360 ms of which almost nothing was drawing. Anything that puts a wake-up on a
+/// path taken every turn brings that back, and the count is what shows it.
+fn a_scroll_costs_only_a_few_turns_of_the_engine(cx: &mut gpui::App) {
+    /// What a frame is allowed. Fifteen is what the editor takes; the room above
+    /// it is for a slower machine needing another turn or two, not for a loop.
+    const AT_MOST: u32 = 200;
+
+    let paragraphs = (0..40)
+        .map(|number| format!("<p style=\"font:16px sans-serif\">Paragraph {number}.</p>"))
+        .collect::<String>();
+    let Some(mut page) = page(
+        &document("background:#fff;color:#111", &paragraphs),
+        800.,
+        600.,
+        1.,
+        cx,
+    ) else {
+        return;
+    };
+    wait_for_colour(&mut page, [255, 255, 255], "a page to scroll");
+
+    let engine = page.engine();
+    let mut worst = 0;
+    for _ in 0..8 {
+        page.scrolled(
+            gpui::point(px(100.), px(100.)),
+            gpui::point(px(0.), px(-60.)),
+        );
+        let mut turns = 0;
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            // The editor's own rule: a turn only when the engine says there is
+            // something to turn for.
+            if engine.has_work_waiting() {
+                turns += 1;
+                if page.pump() {
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+        worst = worst.max(turns);
+    }
+    println!("BENCH: a scroll took at most {worst} turns of the engine for a frame");
+    assert!(
+        worst <= AT_MOST,
+        "a frame should take a handful of turns of the engine, not {worst}: something on the \
+         path taken every turn is waking the engine up"
+    );
+    drop(page);
 }
 
 /// What a frame actually costs, at the size a preview really is. Not part of the

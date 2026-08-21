@@ -15,6 +15,7 @@ pub mod pane_group;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
+pub mod only_the_document;
 pub mod path_link;
 mod persistence;
 pub mod preview_appearance;
@@ -347,6 +348,10 @@ actions!(
         ToggleLeftDock,
         /// Toggles the right dock.
         ToggleRightDock,
+        /// Shows nothing but the document: no tabs, no panels, no status bar, the
+        /// window itself full screen -- the way a browser looks when it is. The
+        /// tabs come back when the pointer reaches the top edge.
+        ToggleOnlyTheDocument,
         /// Toggles zoom on the active pane.
         ToggleZoom,
         /// Toggles maximizing the active editor pane within the center area,
@@ -2831,6 +2836,7 @@ impl Workspace {
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
         StatusBarSettings::get_global(cx).show
+            && crate::only_the_document::draw_what_surrounds_the_document(cx)
     }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
@@ -8084,6 +8090,7 @@ impl Workspace {
                 },
             ))
             .on_action(cx.listener(Workspace::toggle_centered_layout))
+            .on_action(cx.listener(Workspace::toggle_only_the_document))
             .on_action(cx.listener(Workspace::toggle_editor_zoom))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, action: &pane::ActivateNextItem, window, cx| {
@@ -8340,6 +8347,26 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows nothing but the document, and takes the window full screen with it:
+    /// a reader who asks for this wants the page and the screen, as a browser
+    /// gives them. Pressing again puts everything back.
+    pub fn toggle_only_the_document(
+        &mut self,
+        _: &ToggleOnlyTheDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on = !crate::only_the_document::only_the_document(cx);
+        crate::only_the_document::set_only_the_document(on, cx);
+        // Full screen follows the mode rather than being toggled blindly: asking
+        // for the mode twice should not leave the window full screen with the
+        // tabs back.
+        if window.is_fullscreen() != on {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
+    }
+
     pub fn clear_bookmarks(&mut self, _: &ClearBookmarks, _: &mut Window, cx: &mut Context<Self>) {
         self.project()
             .read(cx)
@@ -8397,6 +8424,11 @@ impl Workspace {
         cx: &mut App,
     ) -> Option<Stateful<Div>> {
         if self.zoomed_position == Some(position) {
+            return None;
+        }
+        // Nothing but the document means nothing but the document: a panel is
+        // around it, not part of it.
+        if !crate::only_the_document::draw_what_surrounds_the_document(cx) {
             return None;
         }
 
@@ -9436,6 +9468,33 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .font(ui_font)
+            // Showing nothing but the document, the pointer's own place decides
+            // whether the tabs are there: a window listener rather than the
+            // element's own, since a move over the document is heard by whatever
+            // is drawn on top of it. Registered while drawing, which is how a
+            // frame-scoped listener is registered, and only in this mode -- this
+            // is every mouse move there is.
+            .when(crate::only_the_document::only_the_document(cx), |this| {
+                this.child(
+                    canvas(
+                        |_, _, _| (),
+                        |_, _, window, _| {
+                            window.on_mouse_event(
+                                move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                    if phase == gpui::DispatchPhase::Bubble {
+                                        crate::only_the_document::the_pointer_is_at(
+                                            event.position.y,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .gap_0()
             .justify_start()
             .items_start()
@@ -9447,36 +9506,41 @@ impl Render for Workspace {
             // a tab group: region navigation lands on the first control (per
             // the ARIA toolbar pattern), Tab steps through them, and arrow keys
             // move between them once focus is inside.
-            .when_some(self.titlebar_item.clone(), |this, item| {
-                this.child(
-                    div()
-                        .id("titlebar-region")
-                        .track_focus(&self.titlebar_focus_handle)
-                        .tab_group()
-                        .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
-                        .on_key_down(cx.listener(
-                            |workspace, event: &gpui::KeyDownEvent, window, cx| {
-                                if event.keystroke.modifiers.modified() {
-                                    return;
-                                }
-                                match event.keystroke.key.as_str() {
-                                    "right" => {
-                                        workspace.move_titlebar_item_focus(true, window, cx);
-                                        cx.stop_propagation();
+            .when_some(
+                self.titlebar_item
+                    .clone()
+                    .filter(|_| crate::only_the_document::draw_what_surrounds_the_document(cx)),
+                |this, item| {
+                    this.child(
+                        div()
+                            .id("titlebar-region")
+                            .track_focus(&self.titlebar_focus_handle)
+                            .tab_group()
+                            .role(gpui::Role::Toolbar)
+                            .aria_label("Title bar")
+                            .on_key_down(cx.listener(
+                                |workspace, event: &gpui::KeyDownEvent, window, cx| {
+                                    if event.keystroke.modifiers.modified() {
+                                        return;
                                     }
-                                    "left" => {
-                                        workspace.move_titlebar_item_focus(false, window, cx);
-                                        cx.stop_propagation();
+                                    match event.keystroke.key.as_str() {
+                                        "right" => {
+                                            workspace.move_titlebar_item_focus(true, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        "left" => {
+                                            workspace.move_titlebar_item_focus(false, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
-                                }
-                            },
-                        ))
-                        .w_full()
-                        .child(item),
-                )
-            })
+                                },
+                            ))
+                            .w_full()
+                            .child(item),
+                    )
+                },
+            )
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {
                     cx.notify(id);
@@ -9847,6 +9911,33 @@ impl Render for Workspace {
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
+                    // The way out, beside the tabs it comes back with: a mode
+                    // that hides everything has to say how to leave it.
+                    .when(
+                        crate::only_the_document::only_the_document(cx)
+                            && crate::only_the_document::chrome_is_showing(cx),
+                        |parent| {
+                            parent.child(
+                                h_flex().absolute().top_1().right_2().child(
+                                    ui::IconButton::new(
+                                        "leave-only-the-document",
+                                        ui::IconName::Minimize,
+                                    )
+                                    .icon_size(ui::IconSize::Small)
+                                    .tooltip(ui::Tooltip::text("Show everything again (F11)"))
+                                    .on_click(cx.listener(
+                                        |workspace, _, window, cx| {
+                                            workspace.toggle_only_the_document(
+                                                &ToggleOnlyTheDocument,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                            )
+                        },
+                    )
                     .child(self.toast_layer.clone()),
             )
             .on_action(cx.listener(|workspace, _: &DismissLoadingReport, _, cx| {
