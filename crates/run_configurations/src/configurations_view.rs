@@ -10,6 +10,12 @@ use ui::{Tooltip, WithScrollbar, prelude::*};
 use workspace::{Item, Workspace, item::ItemEvent};
 
 use crate::configurations_file::{self, Configuration, Kind};
+
+/// One variable of a run's environment, as the form holds it.
+struct EnvRow {
+    name: Entity<Editor>,
+    value: Entity<Editor>,
+}
 use crate::configurations_store::{ConfigurationsChanged, ConfigurationsStore};
 use crate::{CreateFromEntryPoint, OpenRunConfigurations, RunFromEntryPoint};
 
@@ -234,7 +240,10 @@ pub struct RunConfigurationsView {
     args: Entity<Editor>,
     cwd: Entity<Editor>,
     env_file: Entity<Editor>,
-    env: Entity<Editor>,
+    /// The environment, a row to a variable, as the model holds it. Each row is
+    /// two little editors; an empty name is a row the reader has not filled in
+    /// yet and is left out of what is written.
+    env_rows: Vec<EnvRow>,
     adapter: Entity<Editor>,
     adapter_config: Entity<Editor>,
     builds: Entity<Editor>,
@@ -282,7 +291,6 @@ impl RunConfigurationsView {
         let args = lines("One argument a line", window, cx);
         let cwd = field("Where to run it, blank for the project root", window, cx);
         let env_file = field("A file of variables, such as .env.local", window, cx);
-        let env = lines("NAME=value, one a line", window, cx);
         let adapter = field(
             "Which debugger: Delve, CodeLLDB, Debugpy, JavaScript, GDB",
             window,
@@ -297,7 +305,6 @@ impl RunConfigurationsView {
             &args,
             &cwd,
             &env_file,
-            &env,
             &adapter,
             &adapter_config,
             &builds,
@@ -334,7 +341,7 @@ impl RunConfigurationsView {
             args,
             cwd,
             env_file,
-            env,
+            env_rows: Vec::new(),
             adapter,
             adapter_config,
             builds,
@@ -392,18 +399,13 @@ impl RunConfigurationsView {
             .as_ref()
             .is_some_and(|task| task.allow_concurrent_runs);
 
-        let (label, command, args, cwd, env_file, env) = match &configuration.task {
+        let (label, command, args, cwd, env_file) = match &configuration.task {
             Some(task) => (
                 task.label.clone(),
                 task.command.clone(),
                 task.args.join("\n"),
                 task.cwd.clone().unwrap_or_default(),
                 task.env_file.clone().unwrap_or_default(),
-                task.env
-                    .iter()
-                    .map(|(name, value)| format!("{name}={value}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
             ),
             None => (
                 configuration.label.clone(),
@@ -411,9 +413,26 @@ impl RunConfigurationsView {
                 String::new(),
                 String::new(),
                 String::new(),
-                String::new(),
             ),
         };
+        // A row to a variable, in the order the reader will see them again next
+        // time: a map has no order of its own, and rows that jump about between
+        // two openings of the same configuration read as a bug.
+        let mut variables: Vec<(String, String)> = configuration
+            .task
+            .as_ref()
+            .map(|task| {
+                task.env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        variables.sort();
+        self.env_rows = variables
+            .into_iter()
+            .map(|(name, value)| self.an_env_row(&name, &value, window, cx))
+            .collect();
         let (adapter, adapter_config, builds) = match &configuration.scenario {
             Some(scenario) => (
                 scenario.adapter.to_string(),
@@ -452,7 +471,6 @@ impl RunConfigurationsView {
             (&self.args, args),
             (&self.cwd, cwd),
             (&self.env_file, env_file),
-            (&self.env, env),
             (&self.adapter, adapter),
             (&self.adapter_config, adapter_config),
             (&self.builds, builds),
@@ -510,8 +528,12 @@ impl RunConfigurationsView {
         task.cwd = (!cwd.is_empty()).then_some(cwd);
         let env_file = text(&self.env_file);
         task.env_file = (!env_file.is_empty()).then_some(env_file);
-        for (name, value) in task::env_file_variables(&text(&self.env)) {
-            task.env.insert(name, value);
+        for row in &self.env_rows {
+            let name = text(&row.name);
+            if name.trim().is_empty() {
+                continue;
+            }
+            task.env.insert(name, text(&row.value));
         }
         task.use_new_terminal = self.use_new_terminal;
         task.allow_concurrent_runs = self.several_at_once;
@@ -1215,6 +1237,159 @@ impl RunConfigurationsView {
 
     /// How a run meets the terminal. Both are the task file's own settings, shown
     /// here because they decide what happens on the second press of Run.
+    /// One row of the environment: a name, a value, and the two little editors
+    /// that hold them. Every edit marks the form as edited, the same as any other
+    /// field, so Save knows there is something to write.
+    fn an_env_row(
+        &self,
+        name: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EnvRow {
+        let one = |placeholder: &str, said: &str, window: &mut Window, cx: &mut Context<Self>| {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(placeholder, window, cx);
+                editor.set_text(said, window, cx);
+                editor
+            });
+            cx.subscribe(&editor, |view: &mut Self, _, event, cx| {
+                if matches!(
+                    event,
+                    editor::EditorEvent::Edited { .. } | editor::EditorEvent::BufferEdited { .. }
+                ) {
+                    view.edited = true;
+                    cx.notify();
+                }
+            })
+            .detach();
+            editor
+        };
+        EnvRow {
+            name: one("NAME", name, window, cx),
+            value: one("value", value, window, cx),
+        }
+    }
+
+    /// The environment, as the mockup draws it: a row to a variable, a name
+    /// beside a value, one taken out from its own end and one added from the
+    /// heading.
+    fn render_env(&self, cx: &mut Context<Self>) -> AnyElement {
+        let boxed = |editor: &Entity<Editor>, wide: bool| {
+            div()
+                .h(px(28.))
+                .when(wide, |cell| cell.flex_1().min_w_0())
+                .when(!wide, |cell| cell.w(px(200.)))
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(ui::cyberpunk::border_dim())
+                .child(editor.clone())
+        };
+        let rows: Vec<AnyElement> = self
+            .env_rows
+            .iter()
+            .enumerate()
+            .map(|(at, row)| {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(boxed(&row.name, false))
+                    .child(boxed(&row.value, true))
+                    .child(
+                        IconButton::new(("env-remove", at), IconName::Dash)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Take this variable out"))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if at < view.env_rows.len() {
+                                    view.env_rows.remove(at);
+                                    view.edited = true;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(
+                        Label::new("ENVIRONMENT")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("env-add", IconName::Plus)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Add a variable"))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                let row = view.an_env_row("", "", window, cx);
+                                view.env_rows.push(row);
+                                view.edited = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// Asks for the file of variables rather than making the reader type a path.
+    /// What comes back is put in the field as it is: a path relative to the
+    /// project is what the file wants, and turning an absolute one into that is
+    /// the reader's own business -- guessing it wrong would point the run at
+    /// nothing.
+    fn find_the_env_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let start = self
+            .store
+            .read(cx)
+            .project_root()
+            .cloned()
+            .unwrap_or_else(|| paths::home_dir().clone());
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose the file of variables".into()),
+        });
+        let _ = start;
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(path) = paths.first().cloned() else {
+                return;
+            };
+            view.update_in(cx, |view, window, cx| {
+                let root = view.store.read(cx).project_root().cloned();
+                let said = match root.and_then(|root| {
+                    path.strip_prefix(&root)
+                        .ok()
+                        .map(|inside| inside.display().to_string())
+                }) {
+                    Some(inside) => inside,
+                    None => path.display().to_string(),
+                };
+                view.env_file.update(cx, |editor, cx| {
+                    editor.set_text(said, window, cx);
+                });
+                view.edited = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn render_run_toggles(&self, cx: &mut Context<Self>) -> AnyElement {
         let switch = |id: &'static str,
                       label: &'static str,
@@ -1229,17 +1404,13 @@ impl RunConfigurationsView {
                 .items_center()
                 .cursor_pointer()
                 .on_click(cx.listener(move |view, _, _window, cx| toggle(view, cx)))
-                .child(
-                    Icon::new(match on {
-                        true => IconName::Check,
-                        false => IconName::Close,
-                    })
-                    .size(IconSize::XSmall)
-                    .color(match on {
-                        true => Color::Accent,
-                        false => Color::Muted,
-                    }),
-                )
+                .child(ui::Checkbox::new(
+                    id,
+                    match on {
+                        true => ui::ToggleState::Selected,
+                        false => ui::ToggleState::Unselected,
+                    },
+                ))
                 .child(Label::new(label).size(LabelSize::Small))
                 .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
         };
@@ -1399,8 +1570,26 @@ impl RunConfigurationsView {
                 form.child(field("COMMAND", &self.command, false))
                     .child(field("ARGUMENTS", &self.args, true))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
-                    .child(field("ENVIRONMENT", &self.env, true))
-                    .child(field("ENVIRONMENT FILE", &self.env_file, false))
+                    .child(self.render_env(cx))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_end()
+                            .child(div().flex_1().child(field(
+                                "ENVIRONMENT FILE",
+                                &self.env_file,
+                                false,
+                            )))
+                            .child(
+                                Button::new("env-file-find", "…")
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text("Find the file"))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.find_the_env_file(window, cx)
+                                    })),
+                            ),
+                    )
             })
             .when(kind == Kind::Debug, |form| {
                 form.child(field("DEBUGGER", &self.adapter, false))
@@ -1573,10 +1762,20 @@ impl RunConfigurationsView {
             .items_center()
             .border_t_1()
             .border_color(ui::cyberpunk::border_dim())
+            .child(
+                Label::new(format!(
+                    "Kept in .zed/{}",
+                    self.chosen
+                        .map(|(kind, _)| kind.file_name())
+                        .unwrap_or(Kind::Task.file_name())
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
             // What the run is using, and the way to stop watching it: this says
             // plainly when nothing is running, so the line is always here and the
-            // switch is always reachable. Where the configuration is kept is said
-            // in the form, beside the fields it belongs to.
+            // switch is always reachable.
+            .child(div().w(px(12.)))
             .child(self.render_metrics(cx))
             .children(self.trouble.clone().map(|trouble| {
                 Label::new(trouble)
@@ -1661,7 +1860,14 @@ impl Render for RunConfigurationsView {
                             .color(Color::Muted),
                     )
                     .child(div().flex_1())
-                    .children(trouble_in_files)
+                    .children(trouble_in_files),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px_2()
+                    .py_1()
                     .child(self.render_toolbar(cx)),
             )
             .child(
@@ -2460,8 +2666,8 @@ mod tests {
             });
             view.env_file
                 .update(cx, |editor, cx| editor.set_text(".env.local", window, cx));
-            view.env
-                .update(cx, |editor, cx| editor.set_text("PORT=8080", window, cx));
+            let row = view.an_env_row("PORT", "8080", window, cx);
+            view.env_rows.push(row);
             view.save(cx);
         });
         cx.run_until_parked();

@@ -22,6 +22,7 @@ gpui.workspace = true
 log.workspace = true
 menu.workspace = true
 path.workspace = true
+paths.workspace = true
 project.workspace = true
 serde_json.workspace = true
 settings.workspace = true
