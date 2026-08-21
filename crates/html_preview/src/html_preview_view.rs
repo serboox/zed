@@ -45,6 +45,26 @@ const HEARTBEAT: Duration = Duration::from_millis(250);
 /// The same, for a preview nobody is looking at.
 #[cfg(feature = "servo")]
 const UNSEEN_HEARTBEAT: Duration = Duration::from_millis(1000);
+/// The safety net while a page is still arriving.
+///
+/// A wake-up that arrives while a turn is already running is dropped, since one
+/// pending wake-up says all a second one would -- and a page being loaded has
+/// several threads signalling at once, so the dropped ones are the rule and the
+/// net is what the next step waits on. A quarter of a second per step is a page
+/// that arrives in visible stages.
+///
+/// Only while it is arriving. Turning the engine over on a fast clock while it
+/// draws buys nothing -- the frame is not late because nobody asked for it, it is
+/// late because it is being drawn -- and on a machine drawing in software it
+/// takes the processor the drawing needs: measured on google.com, a 4 ms net
+/// while painting turned 16 turns a frame into a hundred and the frame got no
+/// faster.
+#[cfg(feature = "servo")]
+const WHILE_THE_PAGE_ARRIVES: Duration = Duration::from_millis(4);
+/// How long after the last sign of arriving the short net is still used, so the
+/// last step of a load is not left waiting on the long one.
+#[cfg(feature = "servo")]
+const STILL_ARRIVING_FOR: Duration = Duration::from_millis(200);
 /// How often the page is asked where it stands. Asking runs a script in the
 /// page, so it is worth doing often enough for the scrollbar to keep up with a
 /// reader's thumb and no more.
@@ -749,6 +769,7 @@ impl HtmlPreviewView {
         self.pump = Some(cx.spawn(async move |view, cx| {
             let mut unseen = false;
             let mut waiting_for_the_card = false;
+            let mut arriving_until: Option<std::time::Instant> = None;
             let mut frames = HowTheFramesGo::default();
             loop {
                 // Whichever comes first: the engine saying it has work, or the
@@ -757,10 +778,13 @@ impl HtmlPreviewView {
                 // A page waiting for the card is not waiting to be told
                 // anything: the card says nothing when it reaches the mark, so
                 // it is looked at again shortly rather than waited on.
-                let heartbeat = match (waiting_for_the_card, unseen) {
-                    (true, _) => UNTIL_THE_CARD_IS_ASKED_AGAIN,
-                    (false, true) => UNSEEN_HEARTBEAT,
-                    (false, false) => HEARTBEAT,
+                let arriving =
+                    arriving_until.is_some_and(|until| std::time::Instant::now() < until);
+                let heartbeat = match (waiting_for_the_card, arriving, unseen) {
+                    (true, _, _) => UNTIL_THE_CARD_IS_ASKED_AGAIN,
+                    (false, true, _) => WHILE_THE_PAGE_ARRIVES,
+                    (false, false, true) => UNSEEN_HEARTBEAT,
+                    (false, false, false) => HEARTBEAT,
                 };
                 smol::future::or(
                     engine.wait_for_work(),
@@ -776,7 +800,7 @@ impl HtmlPreviewView {
                     page.set_throttled(out_of_sight);
                     page.set_dark(reading_in_the_dark(cx));
                     if out_of_sight {
-                        return Some((true, None, false));
+                        return Some((true, None, false, false));
                     }
                     let bounds = view.page_bounds.get();
                     let scale = page_scale(window, cx);
@@ -786,6 +810,7 @@ impl HtmlPreviewView {
                     let painted = page.pump();
                     let drew = painted.then_some((bounds.size, scale));
                     let for_the_card = page.waiting_for_the_card();
+                    let still_arriving = page.is_loading();
                     if let Some(url) = page.take_link_for_new_tab() {
                         log::debug!("the page navigated to {url}");
                     }
@@ -889,7 +914,7 @@ impl HtmlPreviewView {
                             log::debug!("a superseded frame could not be released: {error:#}");
                         }
                         cx.notify();
-                        return Some((false, drew, for_the_card));
+                        return Some((false, drew, for_the_card, still_arriving));
                     }
                     if painted {
                         let superseded = view.frame.take();
@@ -906,12 +931,15 @@ impl HtmlPreviewView {
                         }
                         cx.notify();
                     }
-                    Some((false, drew, for_the_card))
+                    Some((false, drew, for_the_card, still_arriving))
                 });
                 match turn {
-                    Ok(Some((out_of_sight, drew, for_the_card))) => {
+                    Ok(Some((out_of_sight, drew, for_the_card, still_arriving))) => {
                         unseen = out_of_sight;
                         waiting_for_the_card = for_the_card;
+                        if still_arriving {
+                            arriving_until = Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
+                        }
                         if let Some((at, scale)) = drew {
                             frames.painted(at, scale);
                         }
