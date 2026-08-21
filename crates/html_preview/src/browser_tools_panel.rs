@@ -148,7 +148,7 @@ impl BrowserToolsPanel {
                 focus_handle: cx.focus_handle(),
                 workspace,
                 position: DockPosition::Bottom,
-                showing: Tools::Console,
+                showing: Tools::Elements,
                 console,
                 said: Vec::new(),
                 rows: Vec::new(),
@@ -304,8 +304,15 @@ impl BrowserToolsPanel {
 
     fn render_elements(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.rows.is_empty() {
-            return Label::new("Nothing to show: open a Browser Page and this fills in.")
-                .color(Color::Muted)
+            return div()
+                .p_2()
+                .child(
+                    Label::new(
+                        "Nothing to show yet. Open a page and what it is made of appears here.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
                 .into_any_element();
         }
         h_flex()
@@ -368,6 +375,21 @@ impl BrowserToolsPanel {
     fn render_console(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
+            // Said plainly rather than left blank: a page that has logged nothing
+            // is not a panel that is broken, and the reader cannot tell the two
+            // apart from an empty box.
+            .when(self.said.is_empty(), |console| {
+                console.child(
+                    div().p_2().child(
+                        Label::new(
+                            "This page has not said anything. Whatever it logs appears here; \
+                             what you type below runs in the page.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+                )
+            })
             .child(
                 v_flex()
                     .id("browser-tools-said")
@@ -407,8 +429,16 @@ impl BrowserToolsPanel {
 
     fn render_network(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.fetched.is_empty() {
-            return Label::new("Nothing fetched yet.")
-                .color(Color::Muted)
+            return div()
+                .p_2()
+                .child(
+                    Label::new(
+                        "This page has not fetched anything. Every request it makes is listed \
+                         here, with what it cost.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
                 .into_any_element();
         }
         v_flex()
