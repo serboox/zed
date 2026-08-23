@@ -435,6 +435,9 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         the_page_is_laid_out_the_way_it_asks_to_be(cx);
         the_engine_plays_no_media(cx);
         the_page_answers_the_developer_tools(cx);
+        what_the_engine_lends_the_tools(cx);
+        the_page_answers_the_whole_panel(cx);
+        the_tools_reach_a_page_the_reader_went_to(cx);
 
         #[cfg(target_os = "linux")]
         the_page_lends_its_own_memory(cx);
@@ -1392,5 +1395,817 @@ fn the_page_lends_its_own_texture(cx: &mut gpui::App) {
         } else {
             "the top of the page"
         }
+    );
+}
+
+/// Everything the tools would like to read out of a page, asked of the engine
+/// itself rather than assumed. A panel built on an interface the engine does not
+/// have goes blank without a word, so the interfaces the tools stand on are
+/// checked here and named in the failure.
+fn what_the_engine_lends_the_tools(cx: &mut gpui::App) {
+    let body = "<style>#outer{color:rgb(1,2,3)}</style>\
+         <div id=\"outer\"><p class=\"inner\">Some words</p></div>";
+    let mut page = page(
+        &document("margin:0;background:#fff", body),
+        400.,
+        260.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page to ask about itself");
+    pump_for(&mut page, Duration::from_millis(400));
+
+    let probe = r#"(function () {
+      var out = {};
+      var check = function (name, fn) {
+        try { out[name] = String(fn()); }
+        catch (whatever) { out[name] = 'ERR ' + (whatever && whatever.message ? whatever.message : whatever); }
+      };
+      check('localStorage', function () { localStorage.setItem('zed', '1'); return localStorage.getItem('zed') + '/' + localStorage.length; });
+      check('sessionStorage', function () { sessionStorage.setItem('zed', '1'); return sessionStorage.getItem('zed'); });
+      check('cookie', function () { document.cookie = 'zed=1'; return document.cookie; });
+      check('styleSheets', function () { return document.styleSheets.length; });
+      check('cssRules', function () { var s = document.styleSheets[0]; return s.cssRules.length + '/' + (s.cssRules[0] && s.cssRules[0].selectorText) + '/' + (s.cssRules[0] && s.cssRules[0].cssText); });
+      check('sheetHref', function () { var s = document.styleSheets[0]; return String(s.href) + '/' + String(s.ownerNode && s.ownerNode.nodeName); });
+      check('sheetDisabled', function () { var s = document.styleSheets[0]; s.disabled = true; var was = s.disabled; s.disabled = false; return was; });
+      check('insertRule', function () { var s = document.styleSheets[0]; s.insertRule('#zednone{color:red}', s.cssRules.length); return s.cssRules.length; });
+      check('deleteRule', function () { var s = document.styleSheets[0]; s.deleteRule(s.cssRules.length - 1); return s.cssRules.length; });
+      check('matches', function () { return document.body.matches('body'); });
+      check('computed', function () { var c = getComputedStyle(document.body); return c.length + '/' + c.item(0); });
+      check('computedPseudo', function () { var c = getComputedStyle(document.body, '::before'); return c ? String(c.content) : 'none'; });
+      check('navigationTiming', function () { var n = performance.getEntriesByType('navigation'); return n.length + '/' + (n[0] ? Object.keys(n[0].toJSON ? n[0].toJSON() : n[0]).join(' ').slice(0, 300) : ''); });
+      check('paintTiming', function () { var p = performance.getEntriesByType('paint'); return p.length + '/' + (p[0] ? p[0].name + ':' + Math.round(p[0].startTime) : ''); });
+      check('resourceTiming', function () { return performance.getEntriesByType('resource').length; });
+      check('legacyTiming', function () { return performance.timing ? String(performance.timing.domContentLoadedEventEnd - performance.timing.navigationStart) : 'none'; });
+      check('timeOrigin', function () { return typeof performance.timeOrigin; });
+      check('XMLHttpRequest', function () { return typeof XMLHttpRequest; });
+      check('fetch', function () { return typeof fetch; });
+      check('Headers', function () { return typeof Headers; });
+      check('MutationObserver', function () { return typeof MutationObserver; });
+      check('getAnimations', function () { return typeof document.getAnimations; });
+      check('serviceWorker', function () { return typeof navigator.serviceWorker; });
+      check('indexedDB', function () { return typeof indexedDB; });
+      check('caches', function () { return typeof caches; });
+      check('errorStack', function () { return String(new Error('x').stack).slice(0, 90); });
+      check('consoleApi', function () { return ['table', 'group', 'groupEnd', 'count', 'time', 'timeEnd', 'trace', 'assert', 'dir'].map(function (name) { return name + ':' + typeof console[name]; }).join(' '); });
+      check('unhandledrejection', function () { return String('onunhandledrejection' in window); });
+      check('CSSescape', function () { return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape('a b') : 'none'; });
+      check('outerHTMLset', function () { var d = document.createElement('div'); document.body.appendChild(d); d.outerHTML = '<span id=zedprobe></span>'; var found = document.getElementById('zedprobe'); var ok = !!found; if (found) { found.parentNode.removeChild(found); } return ok; });
+      check('attributes', function () { var a = document.getElementById('outer').attributes; return a.length + '/' + a[0].name + '=' + a[0].value; });
+      check('dataset', function () { return typeof document.body.dataset; });
+      check('devicePixelRatio', function () { return window.devicePixelRatio; });
+      check('userAgent', function () { return navigator.userAgent.slice(0, 70); });
+      check('readyState', function () { return document.readyState; });
+      check('contentType', function () { return String(document.contentType) + '/' + String(document.characterSet); });
+      check('performanceMemory', function () { return performance.memory ? JSON.stringify(performance.memory) : 'none'; });
+      check('matchMedia', function () { return typeof matchMedia === 'function' ? String(matchMedia('(max-width: 10000px)').matches) : 'none'; });
+      check('IntersectionObserver', function () { return typeof IntersectionObserver; });
+      check('ResizeObserver', function () { return typeof ResizeObserver; });
+      check('requestAnimationFrame', function () { return typeof requestAnimationFrame; });
+      check('windowProps', function () { return Object.getOwnPropertyNames(window).length; });
+      check('history', function () { return history.length; });
+      check('nodeCount', function () { return document.getElementsByTagName('*').length; });
+      check('TextEncoder', function () { return typeof TextEncoder; });
+      check('structuredClone', function () { return typeof structuredClone; });
+      check('elementFromPoint', function () { var e = document.elementFromPoint(5, 5); return e ? e.nodeName : 'none'; });
+      check('attachShadow', function () { return typeof document.createElement('div').attachShadow; });
+      check('xpath', function () { return typeof document.evaluate; });
+      check('scrollIntoView', function () { return typeof document.body.scrollIntoView; });
+      check('visibilityState', function () { return String(document.visibilityState); });
+      check('cloneNode', function () { return typeof document.body.cloneNode; });
+      check('tabIndexOrder', function () { return document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]').length; });
+      check('ariaRole', function () { return String(document.body.getAttribute('role')); });
+      check('permissions', function () { return navigator.permissions ? 'yes' : 'none'; });
+      return JSON.stringify(out);
+    })()"#;
+
+    let answer = ask_selection_probe(&mut page, probe);
+    println!("TOOLS_API: {answer}");
+    assert!(
+        answer.contains("localStorage"),
+        "the engine would not answer what it lends: {answer}"
+    );
+}
+
+/// The tools reach a page the reader was taken to, and reach it early enough to
+/// hear what that page says as it arrives.
+///
+/// A page of our own carries the tools inside it. A page the reader navigated to
+/// does not, so they are put in as the page arrives -- and if they went in only
+/// once it had finished arriving, everything it said while getting there would
+/// have been said to nobody. This page speaks as soon as it is parsed, which is
+/// before it has finished loading.
+fn the_tools_reach_a_page_the_reader_went_to(cx: &mut gpui::App) {
+    let second = std::env::temp_dir().join(format!(
+        "zed-tools-second-{}-{:?}.html",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(
+        &second,
+        "<html><body style=\"background:rgb(0,128,0)\"><p>Another page</p>\
+         <script>document.addEventListener('DOMContentLoaded', function () {\
+           console.log('the second page spoke');\
+         });</script></body></html>",
+    )
+    .expect("a page to be taken to has to be written");
+    let address = url::Url::from_file_path(&second).expect("the path has to be an address");
+
+    let mut page = page(&document("background:rgb(255,0,0)", ""), 200., 120., 1., cx)
+        .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 0, 0], "a page to leave");
+
+    page.go_to(address);
+    wait_for_colour(&mut page, [0, 128, 0], "the page the reader was taken to");
+    pump_for(&mut page, Duration::from_millis(600));
+
+    let ask = |page: &mut HtmlPage, question: &str| {
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        page.ask_tools(question, {
+            let answer = answer.clone();
+            move |text| *answer.borrow_mut() = Some(text)
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer.borrow_mut().take().unwrap_or_default()
+    };
+
+    let who = ask(&mut page, "who()");
+    assert!(
+        !who.is_empty(),
+        "the tools have to be in a page the reader was taken to at all"
+    );
+    let said = ask(&mut page, "said()");
+    assert!(
+        said.contains("the second page spoke"),
+        "and in it early enough to hear what it said as it arrived: {said}"
+    );
+    let tree = ask(&mut page, "tree(30)");
+    assert!(
+        tree.contains("p"),
+        "and the page they answer about has to be the one in front of the reader: {tree}"
+    );
+
+    std::fs::remove_file(&second).ok();
+}
+
+/// Everything the developer's panel asks a page beyond the first three answers:
+/// which rules reach one element, what it is painted with, the box it takes up,
+/// what it listens for, what it fetched and what that cost, what it keeps, and
+/// what would stand between it and a reader who cannot see it.
+///
+/// All of it is read out of the page itself, so if the page stops answering any
+/// of these the panel goes blank without a word -- which is exactly what this
+/// test is here to catch.
+fn the_page_answers_the_whole_panel(cx: &mut gpui::App) {
+    let body = "<link rel=\"manifest\" href=\"app.webmanifest\">\
+         <style>\
+           .line { color: rgb(1, 2, 3); font-size: 16px; font-family: \"Golos Text\", serif }\
+           @media (min-width: 1px) { .line { letter-spacing: 1px } }\
+         </style>\
+         <h1>A page</h1>\
+         <div id=\"sheet\" style=\"display:flex;gap:8px;padding:4px\">\
+           <p class=\"line\" style=\"color:rgb(4,5,6)\">Some words</p>\
+           <p style=\"color:#eeeeee;background:#ffffff\">Hard to read</p>\
+           <img src=\"nothing-here.png\">\
+           <input type=\"text\">\
+           <button onclick=\"void 0\"></button>\
+         </div>\
+         <h3>A heading out of order</h3>\
+         <script>\
+           document.getElementById('sheet').addEventListener('click', function () {});\
+           document.getElementById('sheet').addEventListener('click', function () {});\
+           document.body.addEventListener('click', function () {\
+             window.__clicks = (window.__clicks || 0) + 1;\
+           });\
+           console.log('hello from the page');\
+           console.error('and a complaint');\
+           console.count('twice'); console.count('twice');\
+           console.group('a group'); console.log('inside'); console.groupEnd();\
+           console.time('t'); console.timeEnd('t');\
+           console.assert(false, 'this never holds');\
+           console.table([{ a: 1, b: 2 }]);\
+           try { localStorage.setItem('theme', 'dark'); } catch (whatever) {}\
+           try { sessionStorage.setItem('seen', '1'); } catch (whatever) {}\
+           try { document.cookie = 'session=abc'; } catch (whatever) {}\
+           fetch('also-nothing-here.json').then(function () {}, function () {});\
+           var asked = new XMLHttpRequest();\
+           asked.open('GET', 'asked-for-nothing.json');\
+           asked.setRequestHeader('Accept', 'application/json');\
+           try { asked.send(); } catch (whatever) {}\
+         </script>";
+    let mut page = page(
+        &document("margin:0;background:#fff", body),
+        500.,
+        400.,
+        1.,
+        cx,
+    )
+    .expect("the engine started once already");
+    wait_for_colour(&mut page, [255, 255, 255], "a page for the whole panel");
+    pump_for(&mut page, Duration::from_millis(800));
+
+    let ask = |page: &mut HtmlPage, question: &str| {
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        page.ask_tools(question, {
+            let answer = answer.clone();
+            move |text| *answer.borrow_mut() = Some(text)
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| panic!("the page said nothing to {question}"))
+    };
+
+    let runs = |page: &mut HtmlPage, script: &str| -> String {
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        page.run_in_page(script, {
+            let answer = answer.clone();
+            move |text| *answer.borrow_mut() = Some(text)
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| panic!("the page would not run {script}"))
+    };
+
+    // The tree, with what a leaf says and how many things listen to it.
+    let tree = ask(&mut page, "tree(30)");
+    assert!(
+        tree.contains("div#sheet") && tree.contains("p.line"),
+        "the tree should name the page's own elements: {tree}"
+    );
+    assert!(
+        tree.contains("Some words"),
+        "a leaf should carry the words in it, so a reader can find it: {tree}"
+    );
+
+    // Which row is which is decided by the walk, so the element to ask about is
+    // found by name rather than by a number written into this test.
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&tree).expect("the tree has to be a list");
+    let row_for = |name: &str| -> &serde_json::Value {
+        rows.iter()
+            .find(|row| row["text"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("the tree has no {name} in it: {tree}"))
+    };
+    // An element something listens to is marked as one. The mark counts kinds of
+    // event rather than listeners -- two clicks are one kind -- and how many
+    // there are of that kind is what `listening` answers below.
+    assert_eq!(
+        row_for("div#sheet")["listens"].as_u64(),
+        Some(1),
+        "an element a script listens to should be marked as one: {tree}"
+    );
+    assert_eq!(
+        row_for("p.line")["listens"].as_u64(),
+        Some(0),
+        "and one nothing listens to should not be: {tree}"
+    );
+    // Our own two scripts are in the document only because we put them there.
+    // The tree is the page's own elements, and this page has one script of its
+    // own.
+    let scripts = rows
+        .iter()
+        .filter(|row| row["text"].as_str() == Some("script"))
+        .count();
+    assert_eq!(
+        scripts, 1,
+        "the tree should show the page's own script and not the tools' own: {tree}"
+    );
+    let at = |name: &str| -> usize {
+        rows.iter()
+            .position(|row| row["text"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("the tree has no {name} in it: {tree}"))
+    };
+    let the_line = at("p.line");
+    let the_sheet = at("div#sheet");
+
+    // Which rules reach it, from the page's own stylesheets and from the element.
+    let rules = ask(&mut page, &format!("rules({the_line})"));
+    assert!(
+        rules.contains(".line") && rules.contains("rgb(1, 2, 3)"),
+        "the stylesheet's own rule should reach this element: {rules}"
+    );
+    assert!(
+        rules.contains("style attribute") && rules.contains("rgb(4, 5, 6)"),
+        "and what the element itself sets, which wins: {rules}"
+    );
+    assert!(
+        rules.contains("min-width"),
+        "a rule inside a media query should say what it is inside: {rules}"
+    );
+
+    // Everything it is painted with. This is the answer with no cascade in it.
+    let computed = ask(&mut page, &format!("computed({the_line})"));
+    assert!(
+        computed.contains("color") && computed.contains("font-size"),
+        "the computed answer should carry the properties themselves: {computed}"
+    );
+    assert!(
+        computed.len() > 200,
+        "a computed view shows everything, not a handful: {computed}"
+    );
+
+    // The box it takes up, and what a flex container is doing with its children.
+    let layout = ask(&mut page, &format!("layout({the_sheet})"));
+    assert!(
+        layout.contains("\"padding\":[4,4,4,4]"),
+        "the padding should be read side by side: {layout}"
+    );
+    assert!(
+        layout.contains("\"flex\"") && layout.contains("\"gap\":\"8px\""),
+        "a flex container should say how it lays its children out: {layout}"
+    );
+
+    // What listens to it: both what a script asked for and what the markup says.
+    let listening = ask(&mut page, &format!("listening({the_sheet})"));
+    assert!(
+        listening.contains("[\"click\",2,\"script\"]"),
+        "two scripts listening for a click should be counted as two: {listening}"
+    );
+    let button = at("button");
+    let markup = ask(&mut page, &format!("listening({button})"));
+    assert!(
+        markup.contains("markup"),
+        "a handler written into the markup should be found too: {markup}"
+    );
+
+    // The fonts its words are set in, and the faces the page has loaded.
+    let fonts = ask(&mut page, &format!("fonts({the_line})"));
+    assert!(
+        fonts.contains("Golos Text") && fonts.contains("\"size\":\"16px\""),
+        "the fonts of an element should be the ones its rules asked for: {fonts}"
+    );
+    assert!(
+        fonts.contains("\"faces\""),
+        "and what the page has loaded should be a list, even an empty one: {fonts}"
+    );
+
+    // What the page has installed to work without the network.
+    let installed = ask(&mut page, "installed()");
+    assert!(
+        installed.contains("app.webmanifest"),
+        "a page with a manifest should say where it is: {installed}"
+    );
+    assert!(
+        installed.contains("\"workers\""),
+        "and the workers it registered should be a list: {installed}"
+    );
+
+    // A selector that finds it again, and the path down to it.
+    let selector = ask(&mut page, &format!("selector({the_line})"));
+    assert!(
+        selector.contains("#sheet"),
+        "a selector should be anchored on the nearest id: {selector}"
+    );
+    let path = ask(&mut page, &format!("path({the_line})"));
+    assert!(
+        path.contains("html") && path.contains("div#sheet"),
+        "the path should read from the root down: {path}"
+    );
+
+    // What the page fetched, with the method and what came back where the page
+    // itself did the fetching.
+    let network = ask(&mut page, "network()");
+    assert!(
+        network.starts_with('['),
+        "what was fetched should come back as a list: {network}"
+    );
+    assert!(
+        network.contains("also-nothing-here.json"),
+        "a fetch the page made should be listed: {network}"
+    );
+    let wires: Vec<serde_json::Value> =
+        serde_json::from_str(&network).expect("the requests have to be a list");
+    let fetched = wires
+        .iter()
+        .find(|wire| {
+            wire["url"]
+                .as_str()
+                .is_some_and(|url| url.contains("also-nothing-here.json"))
+        })
+        .expect("the fetch has to be in the list");
+    assert_eq!(fetched["method"].as_str(), Some("GET"));
+    assert_eq!(fetched["kind"].as_str(), Some("fetch"));
+    let id = fetched["id"].as_i64().expect("a request has an id");
+    let request = ask(&mut page, &format!("request({id})"));
+    assert!(
+        request.contains("\"phases\"") && request.contains("\"resHeaders\""),
+        "one request should open to its headers and what each stage cost: {request}"
+    );
+
+    // What the page asked for through the older interface is recorded the same
+    // way, with the headers it set.
+    let asked = wires
+        .iter()
+        .find(|wire| {
+            wire["url"]
+                .as_str()
+                .is_some_and(|url| url.contains("asked-for-nothing.json"))
+        })
+        .unwrap_or_else(|| panic!("the page's own request has to be in the list: {network}"));
+    assert_eq!(asked["kind"].as_str(), Some("xhr"));
+    assert_eq!(asked["method"].as_str(), Some("GET"));
+    let asked_id = asked["id"].as_i64().expect("a request has an id");
+    let asked_about = ask(&mut page, &format!("request({asked_id})"));
+    assert!(
+        asked_about.contains("Accept"),
+        "the header the page set has to be kept with the request: {asked_about}"
+    );
+
+    // The stylesheets, and the eye that turns one off.
+    let sheets = ask(&mut page, "sheets()");
+    assert!(
+        sheets.contains("\"rules\"") && sheets.contains("inline stylesheet"),
+        "the page's own stylesheet should be listed: {sheets}"
+    );
+    let text = ask(&mut page, "sheet(0)");
+    assert!(
+        text.contains(".line"),
+        "a stylesheet should open to its rules: {text}"
+    );
+    let off = ask(&mut page, "toggleSheet(0)");
+    assert_eq!(off, "off", "the eye should turn a stylesheet off");
+    let on = ask(&mut page, "toggleSheet(0)");
+    assert_eq!(on, "on", "and back on again");
+
+    // What it keeps. A page opened from a file may be refused its own storage,
+    // which is the browser's rule; the shape of the answer is what matters, and
+    // whatever the page did manage to keep has to be in it.
+    let storage = ask(&mut page, "storage()");
+    let stores: serde_json::Value =
+        serde_json::from_str(&storage).expect("what the page keeps has to be an object");
+    for store in ["cookies", "local", "session", "databases", "caches"] {
+        assert!(
+            stores[store].is_array(),
+            "the {store} store should come back as a list: {storage}"
+        );
+    }
+    println!("STORAGE: {storage}");
+
+    // What it cost to arrive, and what it now holds.
+    let timings = ask(&mut page, "timings()");
+    let cost: serde_json::Value =
+        serde_json::from_str(&timings).expect("what the page cost has to be an object");
+    assert!(
+        cost["counts"]["elements"].as_u64().unwrap_or(0) > 5,
+        "the page holds more than five elements: {timings}"
+    );
+    assert!(
+        cost["counts"]["rules"].as_u64().unwrap_or(0) >= 2,
+        "and the rules of its own stylesheet: {timings}"
+    );
+    assert!(
+        cost["counts"]["listeners"].as_u64().unwrap_or(0) >= 2,
+        "and the listeners its scripts asked for: {timings}"
+    );
+    assert!(
+        cost["phases"].is_array() && cost["paints"].is_array(),
+        "how it arrived and when it showed have to be lists: {timings}"
+    );
+
+    // What the engine calls the colours it painted with. Printed rather than
+    // asserted: engines write the same colour in more ways than one, and a
+    // contrast that cannot be worked out is a colour that could not be read.
+    println!(
+        "COLOURS: {}",
+        runs(
+            &mut page,
+            "(function () { var one = document.querySelectorAll('p')[1]; \
+             var style = getComputedStyle(one); \
+             return style.color + ' on ' + style.backgroundColor; })()"
+        )
+    );
+
+    // And what the page makes of that, element by element: printed as well,
+    // because a contrast that is never worked out and one that passes look the
+    // same in a list of findings.
+    let dim = at("p");
+    println!("CONTRAST: {}", ask(&mut page, &format!("contrast({dim})")));
+
+    // What would stand in a reader's way. The page above was written to have one
+    // of each, so each of them has to be found.
+    let audit = ask(&mut page, "audit()");
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_str(&audit).expect("the findings have to be a list");
+    let rule_found = |rule: &str| {
+        findings
+            .iter()
+            .any(|one| one["rule"].as_str() == Some(rule))
+    };
+    assert!(
+        rule_found("image without alt"),
+        "an image with no alt should be found: {audit}"
+    );
+    assert!(
+        rule_found("field without a label"),
+        "a field with no label should be found: {audit}"
+    );
+    assert!(
+        rule_found("nothing to read"),
+        "a button with no words in it should be found: {audit}"
+    );
+    assert!(
+        rule_found("heading order"),
+        "a page that jumps from h1 to h3 should be found: {audit}"
+    );
+    assert!(
+        rule_found("hard to read"),
+        "text that does not stand out from its background should be found: {audit}"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|one| one["at"].as_i64().is_some() && one["selector"].is_string()),
+        "every finding has to name the element it is about: {audit}"
+    );
+
+    // The tools that are drawn on the page itself. Each of them answers what it
+    // did, and each has to be able to be turned off again.
+    let numbered = ask(&mut page, "tabOrder(1)");
+    assert!(
+        numbered.parse::<usize>().unwrap_or(0) >= 2,
+        "the tab order should number the field and the button: {numbered}"
+    );
+    assert_eq!(ask(&mut page, "tabOrder(0)"), "off");
+    assert_eq!(ask(&mut page, "rulers(1)"), "on");
+    assert_eq!(ask(&mut page, "rulers(0)"), "off");
+    assert_eq!(ask(&mut page, "measure(1)"), "on");
+    assert_eq!(ask(&mut page, "measure(0)"), "off");
+    assert_eq!(ask(&mut page, "pick(1)"), "armed");
+    assert_eq!(
+        ask(&mut page, "picked()"),
+        "",
+        "nothing has been clicked, so nothing has been picked"
+    );
+
+    // The picker, with a real click rather than a question: the reader's click
+    // has to pick what was under it and must not reach the page, and once the
+    // picker is off the page has to hear clicks again. Anything less would pass
+    // on a picker that leaves the page unclickable.
+    let clicks = |page: &mut HtmlPage| -> String {
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        page.run_in_page("String(window.__clicks || 0)", {
+            let answer = answer.clone();
+            move |text| *answer.borrow_mut() = Some(text)
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && answer.borrow().is_none() {
+            page.pump();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        answer.borrow_mut().take().unwrap_or_default()
+    };
+    // Where the page's own words really are, asked of the page rather than
+    // guessed: below the content there is no body left to click, only the root
+    // above it, and a click there never reaches a handler on the body.
+    let about_the_line = ask(&mut page, &format!("about({the_line})"));
+    let box_of: serde_json::Value =
+        serde_json::from_str(&about_the_line).expect("an element comes back as an object");
+    let middle = gpui::point(
+        px(box_of["box"]["left"].as_f64().unwrap_or(4.) as f32
+            + box_of["box"]["width"].as_f64().unwrap_or(8.) as f32 / 2.),
+        px(box_of["box"]["top"].as_f64().unwrap_or(4.) as f32
+            + box_of["box"]["height"].as_f64().unwrap_or(8.) as f32 / 2.),
+    );
+    println!("THE WORDS ARE AT: {middle:?} of {}", box_of["box"]);
+    assert_eq!(clicks(&mut page), "0", "the page has heard no click yet");
+    page.mouse_down(middle, MouseButton::Left);
+    page.mouse_up(middle, MouseButton::Left);
+    pump_for(&mut page, Duration::from_millis(300));
+    let taken = ask(&mut page, "picked()");
+    assert!(
+        taken.contains("\"at\""),
+        "a click while the picker is armed has to pick what was under it: {taken}"
+    );
+    assert_eq!(
+        clicks(&mut page),
+        "0",
+        "and that click must not reach the page's own handlers"
+    );
+
+    // Off again, and the page is the reader's to use.
+    assert_eq!(ask(&mut page, "pick(0)"), "off");
+    page.mouse_down(middle, MouseButton::Left);
+    page.mouse_up(middle, MouseButton::Left);
+    pump_for(&mut page, Duration::from_millis(300));
+    assert_eq!(
+        clicks(&mut page),
+        "1",
+        "with the picker off the page has to hear clicks again"
+    );
+    // Whatever those drew, the page must be left as it was: an overlay the
+    // reader cannot see and cannot get rid of is worse than no ruler at all.
+    let ours = runs(
+        &mut page,
+        "String(document.querySelectorAll('[data-zed-selection=\"rulers\"], \
+         [data-zed-selection=\"tab-order\"]').length)",
+    );
+    assert_eq!(
+        ours.trim(),
+        "0",
+        "the rulers and the numbers have to be taken off the page again: {ours}"
+    );
+
+    // The tree is handed over only when the page is not the one the panel is
+    // already holding. This is what keeps a panel open on a three-thousand
+    // element page from costing the page a full walk twice a second -- and what
+    // keeps the numbering the panel is holding valid between reads.
+    ask(&mut page, "tree(30)");
+    pump_for(&mut page, Duration::from_millis(200));
+    assert_eq!(
+        ask(&mut page, "treeIfChanged(30)"),
+        "",
+        "a page that has not changed must not be handed over again"
+    );
+    // What the panel itself draws on the page is not the page changing.
+    ask(&mut page, &format!("highlight({the_line})"));
+    ask(&mut page, "rulers(1)");
+    ask(&mut page, "tabOrder(1)");
+    pump_for(&mut page, Duration::from_millis(200));
+    assert_eq!(
+        ask(&mut page, "treeIfChanged(30)"),
+        "",
+        "an outline of ours is not a change to the page"
+    );
+    ask(&mut page, "rulers(0)");
+    ask(&mut page, "tabOrder(0)");
+    ask(&mut page, "highlight(-1)");
+    // What the page does to itself is.
+    let changed = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.run_in_page(
+        "document.body.appendChild(document.createElement('span')), 'done'",
+        {
+            let changed = changed.clone();
+            move |answer| *changed.borrow_mut() = Some(answer)
+        },
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && changed.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    pump_for(&mut page, Duration::from_millis(200));
+    assert!(
+        !ask(&mut page, "treeIfChanged(30)").is_empty(),
+        "a page that has changed has to be handed over again"
+    );
+
+    // And the console: what the reader types is run in the page, the answer is
+    // described, and a script that throws says what it threw.
+    let value = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.run_in_page("1 + 1", {
+        let value = value.clone();
+        move |answer| *value.borrow_mut() = Some(answer)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && value.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        value.borrow_mut().take().as_deref(),
+        Some("2"),
+        "what the reader typed has to be run in the page"
+    );
+
+    let complaint = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.run_in_page("nothing.at.all()", {
+        let complaint = complaint.clone();
+        move |answer| *complaint.borrow_mut() = Some(answer)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && complaint.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let complaint = complaint.borrow_mut().take().unwrap_or_default();
+    assert!(
+        complaint.starts_with("!!"),
+        "a script that throws has to come back as a complaint, not as nothing: {complaint}"
+    );
+
+    // A quote in what is typed must not end the script early and run whatever
+    // follows it.
+    let quoted = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.run_in_page("\"a\\\"b\".length", {
+        let quoted = quoted.clone();
+        move |answer| *quoted.borrow_mut() = Some(answer)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && quoted.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        quoted.borrow_mut().take().as_deref(),
+        Some("3"),
+        "a quote inside what was typed has to reach the page as a quote"
+    );
+
+    // The rest of the console's own interface. All of it is kept, and the panel
+    // reads it off in one go.
+    let said = ask(&mut page, "said()");
+    for expected in [
+        "hello from the page",
+        "and a complaint",
+        "twice: 2",
+        "inside",
+        "this never holds",
+        "(index)",
+    ] {
+        assert!(
+            said.contains(expected),
+            "the console should have kept {expected:?}: {said}"
+        );
+    }
+    assert!(
+        said.contains("\"times\":"),
+        "every line should say how often it was said: {said}"
+    );
+
+    // What the picked element is, for `$0` in the console.
+    assert_eq!(ask(&mut page, &format!("chose({the_line})")), "yes");
+    let tag = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.run_in_page("$0.tagName", {
+        let tag = tag.clone();
+        move |answer| *tag.borrow_mut() = Some(answer)
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && tag.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        tag.borrow_mut().take().as_deref(),
+        Some("P"),
+        "the element the reader picked has to be `$0` in the console"
+    );
+
+    // Rewriting an element is a real change to the page, so it is checked
+    // against the page rather than against the answer -- and the answer to a
+    // rewrite that worked is nothing at all.
+    let find = |page: &mut HtmlPage, name: &str| -> usize {
+        let text = ask(page, "tree(30)");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("the tree has to be a list");
+        rows.iter()
+            .position(|row| row["text"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("the tree has no {name} in it: {text}"))
+    };
+    let sheet_again = find(&mut page, "div#sheet");
+    let rewritten = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.ask_tools_about(
+        "setHtml",
+        &[
+            &sheet_again.to_string(),
+            "<section id=\"instead\"><em>Put here instead</em></section>",
+        ],
+        {
+            let rewritten = rewritten.clone();
+            move |answer| *rewritten.borrow_mut() = Some(answer)
+        },
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && rewritten.borrow().is_none() {
+        page.pump();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(
+        rewritten.borrow_mut().take().as_deref(),
+        Some(""),
+        "a rewrite that worked says nothing"
+    );
+    pump_for(&mut page, Duration::from_millis(200));
+    let after = ask(&mut page, "tree(30)");
+    assert!(
+        after.contains("section#instead") && !after.contains("div#sheet"),
+        "the element the reader rewrote has to be the one in the page now: {after}"
+    );
+
+    // Taking an element out of the page is a real change to the page, so it is
+    // checked against the page rather than against the answer.
+    let footer = find(&mut page, "h3");
+    assert_eq!(ask(&mut page, &format!("remove({footer})")), "gone");
+    pump_for(&mut page, Duration::from_millis(200));
+    let left = ask(&mut page, "tree(30)");
+    assert!(
+        !left.contains("A heading out of order"),
+        "an element taken out of the page has to be gone from it: {left}"
     );
 }

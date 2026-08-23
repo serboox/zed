@@ -272,6 +272,16 @@ pub struct HtmlPreviewView {
     /// engine's own.
     #[cfg(feature = "servo")]
     answer_from_the_page: std::rc::Rc<std::cell::Cell<Option<(usize, usize)>>>,
+    /// The size a device would give the page, when the reader has asked to see
+    /// it as one. The page is really laid out at that size rather than drawn
+    /// small, so what is on screen is what a reader on that device would get.
+    #[cfg(feature = "servo")]
+    device: Option<gpui::Size<Pixels>>,
+    /// What the last handful of frames cost, as the pump measured them. It is
+    /// already gathered for the log; the tools show the same numbers, which is
+    /// the only place a reader can see what a page costs this engine.
+    #[cfg(feature = "servo")]
+    frames: Option<Frames>,
     /// Kept so a change to the reading theme reaches this preview at once. The
     /// page would otherwise hear about it on the pump's next turn, which is why
     /// the button looked as though it took two presses.
@@ -428,6 +438,29 @@ impl HtmlPreviewView {
         self.page.as_ref()
     }
 
+    /// What the last few seconds of frames cost, for the tools to show.
+    #[cfg(feature = "servo")]
+    pub fn how_the_frames_go(&self) -> Option<Frames> {
+        self.frames
+    }
+
+    /// Shows the page at the size a device would give it, the way a browser's
+    /// responsive view does, or at the size of the pane again when asked for
+    /// nothing. Nothing else has to change for this: the page is laid out to
+    /// whatever the area it is painted in comes to, and a click is measured
+    /// against that same area, so narrowing the area is the whole of it.
+    #[cfg(feature = "servo")]
+    pub fn show_at(&mut self, device: Option<gpui::Size<Pixels>>, cx: &mut Context<Self>) {
+        self.device = device;
+        cx.notify();
+    }
+
+    /// The size the page is being shown at, when it is not the pane's own.
+    #[cfg(feature = "servo")]
+    pub fn shown_at(&self) -> Option<gpui::Size<Pixels>> {
+        self.device
+    }
+
     /// A page with nothing behind it: the reader types where to go. It is the
     /// same preview in every other way -- the same engine, the same address bar,
     /// the same page -- only without a document of the editor's to follow.
@@ -537,6 +570,10 @@ impl HtmlPreviewView {
                 found: (0, 0),
                 #[cfg(feature = "servo")]
                 answer_from_the_page: std::rc::Rc::new(std::cell::Cell::new(None)),
+                #[cfg(feature = "servo")]
+                device: None,
+                #[cfg(feature = "servo")]
+                frames: None,
                 #[cfg(feature = "servo")]
                 _appearance: workspace::preview_appearance::observe_preview_appearance(cx),
                 #[cfg(test)]
@@ -939,8 +976,16 @@ impl HtmlPreviewView {
                         if still_arriving {
                             arriving_until = Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
                         }
-                        if let Some((at, scale)) = drew {
-                            frames.painted(at, scale);
+                        if let Some((at, scale)) = drew
+                            && let Some(measured) = frames.painted(at, scale)
+                            && let Err(error) = view.update(cx, |view, cx| {
+                                view.frames = Some(measured);
+                                cx.notify();
+                            })
+                        {
+                            // Only when the preview is already gone, which is
+                            // the next turn's business rather than this one's.
+                            log::debug!("the frame numbers reached no preview: {error:#}");
                         }
                     }
                     // The page is gone, or the view is: either way there is
@@ -1055,7 +1100,30 @@ impl HtmlPreviewView {
     /// document otherwise.
     fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.showing_live_page() {
-            return self.page_area(window, cx);
+            let area = self.page_area(window, cx);
+            #[cfg(feature = "servo")]
+            if let Some(device) = self.device {
+                // Room around the page, so it reads as a device standing in the
+                // pane rather than as a page that has gone narrow. What spills
+                // past the pane is cut off rather than allowed to push the
+                // editor's own furniture about.
+                return h_flex()
+                    .size_full()
+                    .justify_center()
+                    .items_start()
+                    .overflow_hidden()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(
+                        div()
+                            .w(device.width)
+                            .h(device.height)
+                            .flex_none()
+                            .debug_selector(|| "html-preview-device".into())
+                            .child(area),
+                    )
+                    .into_any_element();
+            }
+            return area;
         }
         #[cfg(feature = "servo")]
         if self.page.is_some() {
@@ -2589,16 +2657,18 @@ impl HowTheFramesGo {
         self.began.get_or_insert_with(std::time::Instant::now);
     }
 
-    fn painted(&mut self, at: gpui::Size<gpui::Pixels>, scale: f32) {
+    /// Answers with what the last few seconds of frames cost, on the turn it
+    /// says so in the log, and with nothing on every other turn.
+    fn painted(&mut self, at: gpui::Size<gpui::Pixels>, scale: f32) -> Option<Frames> {
         let Some(began) = self.began.take() else {
-            return;
+            return None;
         };
         self.took.push(began.elapsed());
         self.turns_each.push(self.turns);
         self.turns = 0;
         let said = *self.said.get_or_insert_with(std::time::Instant::now);
         if said.elapsed() < Self::HOW_OFTEN {
-            return;
+            return None;
         }
         self.said = Some(std::time::Instant::now());
         self.took.sort_unstable();
@@ -2608,18 +2678,41 @@ impl HowTheFramesGo {
             true => 0,
             false => self.turns_each.iter().sum::<u32>() / self.turns_each.len() as u32,
         };
+        let width = (f32::from(at.width) * scale).round() as u32;
+        let height = (f32::from(at.height) * scale).round() as u32;
+        let mut measured = None;
         if let (Some(middle), Some(worst)) = (middle, worst) {
             log::info!(
-                "the page drew {} frames at {}x{} and {scale} pixels to one: {middle:?} at the \
-                 middle, {worst:?} at worst, {turns} turns of the engine each",
+                "the page drew {} frames at {width}x{height} and {scale} pixels to one: \
+                 {middle:?} at the middle, {worst:?} at worst, {turns} turns of the engine each",
                 self.took.len(),
-                (f32::from(at.width) * scale).round() as u32,
-                (f32::from(at.height) * scale).round() as u32,
             );
+            measured = Some(Frames {
+                frames: self.took.len(),
+                middle_ms: middle.as_secs_f32() * 1000.,
+                worst_ms: worst.as_secs_f32() * 1000.,
+                turns,
+                width,
+                height,
+            });
         }
         self.took.clear();
         self.turns_each.clear();
+        measured
     }
+}
+
+/// What the last few seconds of frames cost the engine. Gathered by the pump,
+/// shown by the developer's tools.
+#[cfg(feature = "servo")]
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    pub frames: usize,
+    pub middle_ms: f32,
+    pub worst_ms: f32,
+    pub turns: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
@@ -2713,6 +2806,67 @@ mod tests {
         assert!(
             said > px(0.),
             "and nothing at all is what it said when this went wrong"
+        );
+    }
+
+    /// A page shown as a device has to really be laid out at that size -- the
+    /// engine is told the size of the area the page is painted in, and a click is
+    /// measured against that same area, so a page drawn small instead of laid out
+    /// small would lie about both.
+    #[gpui::test]
+    async fn a_page_shown_as_a_device_is_laid_out_at_that_size(cx: &mut TestAppContext) {
+        let (frame, cx) = a_page_frame(a_page_showing(nothing_in_particular()), cx).await;
+        let pane = painted(cx, PAGE_AREA);
+        assert!(
+            pane.size.width > px(500.),
+            "the pane starts wider than any phone, not {:?}",
+            pane.size
+        );
+
+        let phone = gpui::size(px(375.), px(500.));
+        frame.update(cx, |frame, cx| {
+            frame
+                .preview
+                .update(cx, |preview, cx| preview.show_at(Some(phone), cx));
+        });
+        draw(cx);
+
+        let page = painted(cx, PAGE_AREA);
+        assert!(
+            (page.size.width - phone.width).abs() < px(1.)
+                && (page.size.height - phone.height).abs() < px(1.),
+            "the page has to be laid out at the device's own size, not {:?}",
+            page.size
+        );
+        assert!(
+            page.origin.x > pane.origin.x,
+            "and stood in the middle of the pane, not at {:?}",
+            page.origin
+        );
+        // The same bounds are what the engine is resized to and what a click is
+        // measured against, so this is the page really being that size.
+        let told = frame.read_with(cx, |frame, cx| frame.preview.read(cx).page_bounds.get());
+        assert!(
+            (told.size.width - phone.width).abs() < px(1.),
+            "the engine has to be told the same size the page is painted at, not {:?}",
+            told.size
+        );
+        assert_eq!(
+            frame.read_with(cx, |frame, cx| frame.preview.read(cx).shown_at()),
+            Some(phone)
+        );
+
+        frame.update(cx, |frame, cx| {
+            frame
+                .preview
+                .update(cx, |preview, cx| preview.show_at(None, cx));
+        });
+        draw(cx);
+        let back = painted(cx, PAGE_AREA);
+        assert!(
+            (back.size.width - pane.size.width).abs() < px(1.),
+            "asking for the pane's own size again has to give the whole pane back, not {:?}",
+            back.size
         );
     }
 

@@ -412,15 +412,28 @@ mod engine {
             // to search.
             if matches!(start, PageStart::Address(_)) {
                 delegate.needs_the_shim.set(true);
+                delegate.needs_the_tools.set(true);
             }
             let webview = {
                 let servo = engine.servo.borrow();
                 let servo = servo
                     .as_ref()
                     .ok_or_else(|| anyhow!("the HTML engine has already stopped"))?;
+                // Our own two scripts, handed to the engine as the page's own
+                // rather than run at it afterwards. The engine puts them in as
+                // it parses the head of every document this page ever holds --
+                // the one it opens with, and every page the reader goes to
+                // after. Run from outside, they would arrive after the page's
+                // own scripts had already said and fetched everything they had
+                // to say, and the tools would answer for a page that had
+                // apparently done nothing.
+                let ours = std::rc::Rc::new(servo::UserContentManager::new(servo));
+                ours.add_script(std::rc::Rc::new(servo::UserScript::from(TOOLS_SHIM)));
+                ours.add_script(std::rc::Rc::new(servo::UserScript::from(SELECTION_SHIM)));
                 WebViewBuilder::new(servo, rendering_context.clone())
                     .url(first_url)
                     .hidpi_scale_factor(euclid::Scale::new(scale))
+                    .user_content_manager(ours)
                     .delegate(delegate.clone())
                     .build()
             };
@@ -464,6 +477,11 @@ mod engine {
             // What it arrives at is not our document, and none of our script
             // will be in it until it has settled.
             self.delegate.needs_the_shim.set(true);
+            self.delegate.needs_the_tools.set(true);
+            // Said here rather than waited for: until the engine reports it, the
+            // status is still the page being left, and a turn of ours in that gap
+            // would put our script into that page and call it done.
+            self.delegate.load_status.set(LoadStatus::Started);
             self.webview.load(url);
             self.engine.nudge();
         }
@@ -693,12 +711,27 @@ mod engine {
         /// Called on every turn: a page that has finished loading no longer
         /// needs the document it came from, and a page the reader has navigated
         /// to has none of our own script in it, so it gets it again.
+        ///
+        /// The tools go in as soon as there is a document to put them in rather
+        /// than once the page has finished arriving. What they are for is the
+        /// page's own doing -- what it says, what it fetches, what it listens
+        /// for -- and all of that begins with the page's first script. Put in at
+        /// the end, they would answer with a page that had apparently said
+        /// nothing and fetched nothing. The selection can wait: there is nothing
+        /// to select until the words are there.
         fn settled(&mut self) {
-            if self.delegate.load_status.get() != LoadStatus::Complete {
+            let arrived = self.delegate.load_status.get();
+            if arrived != LoadStatus::Started && self.delegate.needs_the_tools.replace(false) {
+                self.evaluate(TOOLS_SHIM, |_| {});
+            }
+            if arrived != LoadStatus::Complete {
                 return;
             }
             self.previous = None;
             if self.delegate.needs_the_shim.replace(false) {
+                // Again, in case the head went by without a turn of ours in
+                // between; the tools put themselves in only once.
+                self.evaluate(TOOLS_SHIM, |_| {});
                 self.evaluate(SELECTION_SHIM, |_| {});
             }
         }
@@ -854,6 +887,40 @@ mod engine {
                 &format!("window.__zedTools ? window.__zedTools.{question} : ''"),
                 deliver,
             );
+        }
+
+        /// Runs what the reader typed in the tools' console. It goes through
+        /// the page's own tools rather than straight to the engine so that the
+        /// answer is described the way a console describes one, the value is
+        /// kept as `$_`, and a script that throws says what it threw instead of
+        /// answering with nothing.
+        pub fn run_in_page(&self, script: &str, deliver: impl FnOnce(String) + 'static) {
+            let script = serde_escape(script);
+            self.evaluate(
+                &format!(
+                    "window.__zedTools ? window.__zedTools.run(\"{script}\") \
+                     : 'The page has no tools in it.'"
+                ),
+                deliver,
+            );
+        }
+
+        /// Asks the page a question the tools need, with words of the reader's
+        /// own in it -- a key to forget, a name to look for. Each of them is
+        /// escaped rather than pasted, so a quote in a cookie's name cannot end
+        /// the question early and run something else.
+        pub fn ask_tools_about(
+            &self,
+            question: &str,
+            words: &[&str],
+            deliver: impl FnOnce(String) + 'static,
+        ) {
+            let escaped = words
+                .iter()
+                .map(|word| format!("\"{}\"", serde_escape(word)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.ask_tools(&format!("{question}({escaped})"), deliver);
         }
 
         /// Asks the page for the text the reader has selected.
@@ -1051,6 +1118,12 @@ mod engine {
     /// selection to offer outside form fields.
     const SELECTION_SHIM: &str = include_str!("selection.js");
 
+    /// The developer's tools, implemented in the page itself for the same
+    /// reason: what a panel wants to know -- what the page said, what it
+    /// fetched, what listens to what -- is only knowable from inside, and it
+    /// has to be in place before the page's own scripts run.
+    const TOOLS_SHIM: &str = include_str!("devtools.js");
+
     impl PageFile {
         fn write(html: &str, base_directory: Option<&Path>) -> Result<Self> {
             let directory = tempfile::tempdir().context("creating a directory for the page")?;
@@ -1060,11 +1133,10 @@ mod engine {
                     Some(base) => format!("<base href=\"{base}\">\n{html}"),
                     None => html.to_string(),
                 };
-            // First, so that what the page's own scripts say as they run is kept:
-            // the shim hooks the console, and anything said before it is in
-            // place is said to nobody. It touches no element until the page has
-            // loaded, so being ahead of the document costs it nothing.
-            let document = format!("<script>{SELECTION_SHIM}</script>\n{document}");
+            // Nothing of ours is written into the document any more: the engine
+            // puts our scripts into every page it holds, ahead of the page's own,
+            // which is both earlier than a tag of ours could be and true of the
+            // pages the reader goes to afterwards as well.
             std::fs::write(&path, document).context("writing the page for the engine to load")?;
             Ok(Self {
                 _directory: directory,
@@ -1087,6 +1159,9 @@ mod engine {
         /// Set when the page has gone somewhere of its own accord. What it
         /// arrives at has none of our script in it, so it has to be put back.
         needs_the_shim: Cell<bool>,
+        /// The same, for the developer's tools alone: they go in earlier than
+        /// the rest, so they are asked for separately.
+        needs_the_tools: Cell<bool>,
         /// Whether there is anywhere behind and ahead of where the page is now.
         history: Cell<(bool, bool)>,
     }
@@ -1099,6 +1174,7 @@ mod engine {
                 load_status: Cell::new(LoadStatus::Started),
                 link_for_new_tab: RefCell::new(None),
                 needs_the_shim: Cell::new(false),
+                needs_the_tools: Cell::new(false),
                 history: Cell::new((false, false)),
             }
         }
@@ -1115,6 +1191,14 @@ mod engine {
         }
 
         fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+            // A page that has started arriving is a document of its own, and none
+            // of our script is in it. Asked for here rather than where each
+            // navigation is triggered, because a link the reader follows and a
+            // page that redirects itself never pass through any of those places.
+            if status == LoadStatus::Started {
+                self.needs_the_shim.set(true);
+                self.needs_the_tools.set(true);
+            }
             self.load_status.set(status);
         }
 
@@ -1137,6 +1221,7 @@ mod engine {
         ) {
             *self.link_for_new_tab.borrow_mut() = Some(navigation_request.url.clone());
             self.needs_the_shim.set(true);
+            self.needs_the_tools.set(true);
             navigation_request.allow();
         }
     }

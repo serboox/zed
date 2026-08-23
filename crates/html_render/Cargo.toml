@@ -74,6 +74,12 @@ windows = { workspace = true, optional = true }
 gpui = { workspace = true, features = ["test-support"] }
 libc.workspace = true
 keyboard_types.workspace = true
+# The page answers the developer's tools in JSON, and a test that reads those
+# answers by looking for substrings would pass on a malformed one.
+serde_json.workspace = true
+# A page the reader was taken to is named by its address, and taking one
+# somewhere is what puts our own script into a page that never had it.
+url.workspace = true
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows.workspace = true
