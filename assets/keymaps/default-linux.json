@@ -733,7 +733,6 @@
       "ctrl-shift-d": "debug_panel::ToggleFocus",
       "ctrl-alt-8": "database_panel::ToggleFocus",
       "ctrl-alt-9": "api_client_panel::ToggleFocus",
-      "ctrl-shift-i": "browser_tools::ToggleFocus",
       "ctrl-?": "agent::ToggleFocus",
       "alt-save": "workspace::SaveAll",
       "ctrl-alt-s": "workspace::SaveAll",
@@ -1425,6 +1424,12 @@
       // On a page, full screen means what it means in a browser: the page and
       // nothing else, with the tabs a pointer's reach away.
       "f11": "workspace::ToggleOnlyTheDocument",
+      // And the developer's tools on the key a browser opens them with.
+      // Bound here as well as on the workspace because an editor binds this
+      // key to formatting, and an editor is the closer context of the two:
+      // pressed over a page the reader is looking at, this has to be the
+      // one that answers.
+      "ctrl-shift-i": "browser_tools::Inspect",
     },
   },
   {

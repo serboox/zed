@@ -784,7 +784,6 @@
       "cmd-shift-d": "debug_panel::ToggleFocus",
       "cmd-alt-8": "database_panel::ToggleFocus",
       "cmd-alt-9": "api_client_panel::ToggleFocus",
-      "cmd-shift-i": "browser_tools::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
@@ -1503,6 +1502,11 @@
       "cmd-g": "html::FindNextInPage",
       "cmd-shift-g": "html::FindPreviousInPage",
       "escape": "html::StopFindingInPage",
+      // The developer's tools on the key a browser opens them with.
+      // Bound here as well as on the workspace because an editor binds
+      // this key to formatting, and an editor is the closer context of
+      // the two: pressed over a page, this has to be the one that answers.
+      "cmd-shift-i": "browser_tools::Inspect",
     },
   },
   {

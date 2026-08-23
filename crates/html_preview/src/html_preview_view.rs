@@ -1485,7 +1485,7 @@ impl HtmlPreviewView {
             .entry(VIEW_SOURCE, None, move |window, cx| {
                 ask_the_page_for_its_source(&view, SourceGoes::ToATab, window, cx)
             })
-            .action(INSPECT, Box::new(crate::ToggleFocus))
+            .action(INSPECT, Box::new(crate::Inspect))
         });
         window.focus(&menu.focus_handle(cx), cx);
         let subscription = cx.subscribe(&menu, |view, _, _: &DismissEvent, cx| {

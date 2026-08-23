@@ -1389,8 +1389,8 @@ fn register_actions(
                 workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
             },
         )
-        // The page's own menu offers "Inspect", and the tools are a panel like
-        // any other: without this the menu item names an action nothing answers.
+        // The tools are a panel like any other, and this is the panel's own
+        // action: it shows them, or puts them away again.
         .register_action(
             |workspace: &mut Workspace,
              _: &html_preview::ToggleFocus,
@@ -1400,6 +1400,33 @@ fn register_actions(
                 workspace.toggle_panel_focus::<html_preview::browser_tools_panel::BrowserToolsPanel>(
                     window, cx,
                 );
+                #[cfg(not(feature = "servo"))]
+                {
+                    let _ = (workspace, window, cx);
+                }
+            },
+        )
+        // And this is what the page's own menu asks for. It only ever shows
+        // them: asked to inspect a page while the tools are already open,
+        // toggling would put them away, which reads as the menu item doing
+        // nothing. Revealed rather than merely opened, so a zoomed terminal
+        // over the dock does not swallow them.
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &html_preview::Inspect,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                #[cfg(feature = "servo")]
+                {
+                    workspace
+                        .reveal_panel::<html_preview::browser_tools_panel::BrowserToolsPanel>(
+                            window, cx,
+                        );
+                    workspace
+                        .focus_panel::<html_preview::browser_tools_panel::BrowserToolsPanel>(
+                            window, cx,
+                        );
+                }
                 #[cfg(not(feature = "servo"))]
                 {
                     let _ = (workspace, window, cx);
@@ -5446,6 +5473,62 @@ mod tests {
                 .map(|binding| binding.action().name().to_string())
                 .collect()
         })
+    }
+
+    /// What the default keymap resolves for `keystroke` in `context`, best first.
+    fn bindings_for(keystroke: &str, context: &str, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| {
+            let mut bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-linux.json",
+                cx,
+            )
+            .unwrap();
+            for binding in &mut bindings {
+                binding.set_meta(settings::KeybindSource::Default.meta());
+            }
+            gpui::Keymap::new(bindings)
+                .bindings_for_input(
+                    &[gpui::Keystroke::parse(keystroke).unwrap()],
+                    &[gpui::KeyContext::parse(context).unwrap()],
+                )
+                .0
+                .iter()
+                .map(|binding| binding.action().name().to_string())
+                .collect()
+        })
+    }
+
+    /// The key a browser opens its developer tools with is the key an editor
+    /// formats a document with, and an editor is the closer context of the two.
+    /// Pressed over a page -- including in the address bar above it, which is an
+    /// editor like any other -- it has to open the tools, or the reader presses
+    /// it and the page silently gets formatted instead.
+    #[gpui::test]
+    fn test_the_tools_key_answers_over_a_page(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+
+        for over_a_page in [
+            "Workspace HtmlPreview",
+            "Workspace SplitPreview HtmlPreview",
+            "Workspace HtmlPreview HtmlPreviewAddress Editor",
+        ] {
+            assert_eq!(
+                bindings_for("ctrl-shift-i", over_a_page, cx)
+                    .first()
+                    .map(String::as_str),
+                Some("browser_tools::Inspect"),
+                "over a page ({over_a_page}) this key belongs to the tools"
+            );
+        }
+
+        // And in an editor it is still what it always was.
+        assert_eq!(
+            bindings_for("ctrl-shift-i", "Workspace Pane Editor", cx)
+                .first()
+                .map(String::as_str),
+            Some("editor::Format"),
+            "in an editor it is still formatting"
+        );
     }
 
     /// `editor::MoveDown` and `editor::MoveUp` propagate when the cursor doesn't move, which at the

@@ -20,7 +20,12 @@ actions!(
     browser_tools,
     [
         /// Shows or hides the developer tools for the page being read.
-        ToggleFocus
+        ToggleFocus,
+        /// Shows the developer tools for the page being read, and puts the
+        /// reader in them. Never hides them: a reader who asks to inspect a page
+        /// with the tools already open means "show me", and toggling them shut
+        /// there reads as the button doing nothing at all.
+        Inspect
     ]
 );
 
