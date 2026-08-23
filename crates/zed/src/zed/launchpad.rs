@@ -33,13 +33,17 @@ const HEIGHT_OF_DISPLAY: f32 = 0.55;
 /// would give a launcher over two thousand points across, where a project row
 /// stretches its path halfway across the screen and reads as nothing, and a small
 /// display would give one too cramped to read a path in at all.
-const MIN_WIDTH: Pixels = px(640.);
+const MIN_WIDTH: Pixels = px(700.);
 const MAX_WIDTH: Pixels = px(900.);
 const MIN_HEIGHT: Pixels = px(460.);
 const MAX_HEIGHT: Pixels = px(720.);
 
-/// Below this the launchpad is no longer worth opening as a window.
-const MIN_WINDOW_SIZE: Size<Pixels> = size(px(420.), px(320.));
+/// The smallest the window may be made, which is the smallest it is laid out
+/// for: the three ways in sit in one row across the foot of it, and a window
+/// narrower than that row cuts the last of them in half. Taken from the same
+/// numbers the opening size is clamped to, so the two cannot drift apart --
+/// and a remembered window smaller than this is refused rather than reopened.
+const MIN_WINDOW_SIZE: Size<Pixels> = size(MIN_WIDTH, MIN_HEIGHT);
 
 /// Height of one project row: the folder name with its path beneath.
 const PROJECT_ROW_HEIGHT: Pixels = px(48.);
@@ -697,7 +701,11 @@ impl Launchpad {
         v_flex()
             .id("launchpad-projects")
             .debug_selector(|| "launchpad-projects".into())
-            .h(PROJECT_ROW_HEIGHT * shown as f32)
+            // A ceiling rather than a fixed height: in a window too short for
+            // both, the list gives up its room to the ways in below it instead
+            // of keeping its rows and being painted over.
+            .max_h(PROJECT_ROW_HEIGHT * shown as f32)
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
             .children(rows)
@@ -780,6 +788,11 @@ impl Launchpad {
         } else {
             h_flex()
                 .debug_selector(|| "launchpad-ways-in".into())
+                // Wrapped rather than squeezed: a window narrower than the row
+                // -- which the window's own minimum is set to prevent, but a
+                // platform is free to ignore it -- moves the last of them onto
+                // a line of its own instead of cutting it off at the edge.
+                .flex_wrap()
                 .gap_1()
                 .child(new_file)
                 .child(open_folder)
@@ -813,6 +826,7 @@ impl Render for Launchpad {
                 .into_any_element()
         } else {
             v_flex()
+                .debug_selector(|| "launchpad-body".into())
                 .gap(cyberpunk::SPACE_14)
                 .flex_1()
                 .min_h_0()
@@ -929,6 +943,7 @@ impl Render for Launchpad {
                         .when(!has_no_history, |content| {
                             content.child(
                                 v_flex()
+                                    .flex_none()
                                     .gap(cyberpunk::SPACE_14)
                                     .pt(cyberpunk::SPACE_14)
                                     .border_t_1()
@@ -1460,6 +1475,126 @@ mod tests {
             "reading the history is long enough for a window to appear, and one had"
         );
         assert!(launchpad_windows(cx).is_empty());
+    }
+
+    /// The window may not be made narrower than the row of ways in across its
+    /// foot -- which is what cut the last of them in half -- and if a platform
+    /// hands it a narrower one anyway, the row wraps rather than painting past
+    /// the edge.
+    #[gpui::test]
+    async fn test_the_ways_in_stay_inside_a_narrow_window(cx: &mut TestAppContext) {
+        let app_state = init_launchpad_test(cx);
+        // A full list, because what the ways in have to take room from is the
+        // list, and a launchpad with one project in it has room to spare.
+        let recents = (1..=ROWS_BEFORE_SCROLLING as i64)
+            .map(|id| {
+                recent(
+                    &format!("project-{id}"),
+                    &format!("/projects/project-{id}"),
+                    id,
+                )
+            })
+            .collect();
+        let window = open_launchpad_with(recents, app_state, cx);
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        narrow_windows_keep_everything_inside(&mut visual);
+
+        // And the same with one project in the list, which is what a launchpad
+        // looks like the first time it is opened.
+        let app_state = init_launchpad_test(cx);
+        let window = open_launchpad_with(vec![recent("zed", "/projects/zed", 1)], app_state, cx);
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        narrow_windows_keep_everything_inside(&mut visual);
+    }
+
+    fn narrow_windows_keep_everything_inside(visual: &mut VisualTestContext) {
+        // The last of these is narrower and shorter than the window's own
+        // minimum allows, which is where a platform that ignores the minimum
+        // leaves it -- and where the ways in wrap to three rows and the list has
+        // to give up the room for them.
+        for (width, height) in [
+            (MIN_WIDTH, px(560.)),
+            (px(620.), px(520.)),
+            (px(520.), px(420.)),
+            (px(460.), px(360.)),
+        ] {
+            visual.simulate_resize(size(width, height));
+            draw(visual);
+
+            let viewport = visual.update(|window, _| window.viewport_size());
+            let window_area = Bounds {
+                origin: point(px(0.), px(0.)),
+                size: viewport,
+            };
+            for id in [
+                "launchpad-new-file",
+                "launchpad-open-folder",
+                "launchpad-open-file",
+            ] {
+                let button = visual
+                    .debug_bounds(id)
+                    .unwrap_or_else(|| panic!("{id} was painted"));
+                assert!(
+                    fits_inside(button, window_area),
+                    "at {width:?}x{height:?} {id} painted {button:?}, outside the \
+                     {viewport:?} window"
+                );
+                assert!(
+                    button.size.width > px(0.) && button.size.height > px(0.),
+                    "at {width:?}x{height:?} {id} painted {:?}, no area to click",
+                    button.size
+                );
+            }
+            // Narrow enough and the ways in take three rows instead of one. The
+            // list gives up the room for them rather than being painted over:
+            // seen on a real window, the buttons stood on top of the first
+            // project and the word above it.
+            let list = visual
+                .debug_bounds("launchpad-projects")
+                .expect("the project list was painted");
+            let body = visual
+                .debug_bounds("launchpad-body")
+                .expect("the filter and the list were painted");
+            let ways_in = visual
+                .debug_bounds("launchpad-ways-in")
+                .expect("the ways in were painted");
+            assert!(
+                list.bottom() <= ways_in.origin.y,
+                "at {width:?}x{height:?} the list painted {list:?}, under the ways \
+                 in at {ways_in:?}"
+            );
+            assert!(
+                body.bottom() <= ways_in.origin.y,
+                "at {width:?}x{height:?} everything above the ways in came to \
+                 {body:?}, which the ways in at {ways_in:?} are painted over"
+            );
+        }
+    }
+
+    /// The size the window opens at and the size it may be shrunk to are the
+    /// same numbers, so that what the launchpad is laid out for is also the
+    /// least it can be given.
+    #[test]
+    fn test_the_window_is_never_smaller_than_it_is_laid_out_for() {
+        assert_eq!(MIN_WINDOW_SIZE.width, MIN_WIDTH);
+        assert_eq!(MIN_WINDOW_SIZE.height, MIN_HEIGHT);
+
+        let too_small = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(MIN_WIDTH - px(1.), MIN_HEIGHT),
+        };
+        assert!(
+            !is_openable(too_small),
+            "a remembered window narrower than the launchpad is laid out for has \
+             to be refused rather than reopened at that size"
+        );
+        let just_enough = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(MIN_WIDTH, MIN_HEIGHT),
+        };
+        assert!(is_openable(just_enough));
     }
 
     #[gpui::test]
