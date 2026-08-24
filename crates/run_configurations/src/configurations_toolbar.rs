@@ -13,7 +13,7 @@ use crate::configurations_store::ConfigurationsStore;
 
 /// The plaque's own height, from the mockup: it sits in a title bar, so it is
 /// the bar's row and not a button's.
-const PLAQUE_HEIGHT: f32 = 26.0;
+const PLAQUE_HEIGHT: f32 = 28.0;
 
 /// Which way of running the switcher is pointing at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +264,7 @@ impl Render for ConfigurationsToolbar {
                     .child(
                         IconButton::new("run-configurations-debug", IconName::Debug)
                             .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Debug it"))
                             .on_click(
                                 cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx)),
@@ -293,7 +294,7 @@ impl ConfigurationsToolbar {
                 h_flex()
                     .debug_selector(|| "run-configurations-plaque".to_string())
                     .h(px(PLAQUE_HEIGHT))
-                    .w(px(280.))
+                    .w(px(286.))
                     .min_w_0()
                     .max_w(px(340.))
                     .px_2()
@@ -305,7 +306,10 @@ impl ConfigurationsToolbar {
                             false => IconName::PlayOutlined,
                         })
                         .size(IconSize::XSmall)
-                        .color(Color::Accent),
+                        .color(match kept {
+                            true => Color::Accent,
+                            false => Color::Muted,
+                        }),
                     )
                     .child(
                         div()
@@ -314,7 +318,10 @@ impl ConfigurationsToolbar {
                             .overflow_hidden()
                             .cyberpunk_monospace(cx)
                             .text_size(px(13.))
-                            .text_color(cyberpunk::text_primary())
+                            .text_color(match kept {
+                                true => cyberpunk::text_primary(),
+                                false => cyberpunk::text_secondary(),
+                            })
                             .when(!kept, |name| name.italic())
                             .child(name),
                     )
@@ -366,7 +373,7 @@ impl RowKind {
     fn icon(&self) -> IconName {
         match self {
             RowKind::Kept => IconName::PlayFilled,
-            RowKind::Debugged => IconName::Debug,
+            RowKind::Debugged => IconName::Circle,
             RowKind::Temporary => IconName::PlayOutlined,
         }
     }
@@ -532,7 +539,9 @@ impl ConfigurationsList {
             .gap_2()
             .items_center()
             .when(chosen, |row| row.bg(cyberpunk::row_chosen()))
-            .hover(|row| row.bg(cyberpunk::row_hovered()))
+            .when(!chosen, |row| {
+                row.hover(|row| row.bg(cyberpunk::row_hovered()))
+            })
             .child(
                 Icon::new(row.kind.icon())
                     .size(IconSize::XSmall)
@@ -562,7 +571,7 @@ impl ConfigurationsList {
                     div()
                         .id(("keep-it", at))
                         .debug_selector(move || format!("KEEP-{at}"))
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(cyberpunk::Accent::Cyan.border())
                         .child("keep it")
                         .on_click(cx.listener(move |list, _, _, cx| {
@@ -681,6 +690,7 @@ impl Render for ConfigurationsList {
             .child(
                 v_flex()
                     .id("configurations-rows")
+                    .px(px(6.))
                     .track_scroll(&self.scroll)
                     .max_h(px(Self::ROW_HEIGHT * Self::MOST_ROWS_SHOWN))
                     .min_h_0()

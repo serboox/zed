@@ -35,6 +35,7 @@
       "ctrl-q": "zed::Quit",
       "f4": "debugger::Start",
       "ctrl-alt-q": "run_configurations::OpenRunConfigurations",
+      "ctrl-alt-n": "run_configurations::CreateFromEntryPoint",
       "f11": "zed::ToggleFullScreen",
       "ctrl-alt-z": "edit_prediction::RatePredictions",
       "ctrl-alt-shift-i": "edit_prediction::ToggleMenu",
