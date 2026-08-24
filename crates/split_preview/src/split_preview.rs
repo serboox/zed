@@ -3,9 +3,13 @@ use workspace::Workspace;
 
 pub mod item_overlay;
 pub mod open_split_preview;
+pub mod preview_project_item;
 pub mod split_preview_view;
 
-pub use open_split_preview::{PreviewKind, preview_kind_for};
+pub use open_split_preview::{
+    PreviewKind, preview_kind_for, preview_kind_for_extension, preview_kind_for_path,
+};
+pub use preview_project_item::{PreviewableDocument, SplitPreviewSettings, opens_in_preview};
 pub use split_preview_view::{PreviewLayout, SplitPreviewView};
 
 actions!(
@@ -26,6 +30,10 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    // After the editor's own registration, so that a document with a rendered
+    // view is opened by way of that view: the registry asks whoever registered
+    // last first, and the editor answers for every path.
+    workspace::register_project_item::<SplitPreviewView>(cx);
     item_overlay::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {

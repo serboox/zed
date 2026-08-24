@@ -1,8 +1,12 @@
+use std::path::Path;
+
 use editor::Editor;
 use gpui::{App, Entity, Window};
 use html_preview::html_preview_view::HtmlPreviewView;
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use openapi_preview::{OpenApiPreviewView, looks_like_openapi};
+use project::{Project, ProjectPath};
+use svg_preview::svg_preview_view::{SvgPreviewMode, SvgPreviewView};
 use ui::prelude::*;
 use workspace::{Pane, Workspace};
 
@@ -13,19 +17,70 @@ use crate::{OpenSplitPreview, split_preview_view};
 pub enum PreviewKind {
     Markdown,
     Html,
+    Svg,
     OpenApi,
 }
 
-/// Which preview, if any, can render the document the editor is showing.
-/// The language decides for Markdown and HTML; an OpenAPI contract is a plain
-/// YAML or JSON file, so its content has to be inspected as well.
 /// How much of a document is read to tell whether it is an OpenAPI contract.
 /// Matches the limit the check itself applies.
 const SNIFF_CHARS: usize = 8 * 1024;
 
+/// Which preview a file with this extension can be rendered by, if any. Only the
+/// extension is read, so this answers for a file that has not been opened yet.
+pub fn preview_kind_for_extension(extension: &str) -> Option<PreviewKind> {
+    match extension.to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Some(PreviewKind::Markdown),
+        "html" | "htm" => Some(PreviewKind::Html),
+        "svg" => Some(PreviewKind::Svg),
+        _ => None,
+    }
+}
+
+fn preview_kind_for_name(name: &Path) -> Option<PreviewKind> {
+    preview_kind_for_extension(name.extension()?.to_str()?)
+}
+
+/// Which preview, if any, can render the file at this path.
+///
+/// The name is all there is to go on: which item opens a file is settled before
+/// a byte of it has been read, so a document whose kind shows only in its
+/// contents -- an OpenAPI contract, which is a plain YAML or JSON file -- is not
+/// one of these.
+///
+/// A file opened on its own, from the command line say, becomes a worktree of
+/// itself, and then the path inside that worktree is empty and carries no name
+/// at all. The worktree's own path is the file in that case, so it answers.
+pub fn preview_kind_for_path(
+    project: &Entity<Project>,
+    path: &ProjectPath,
+    cx: &App,
+) -> Option<PreviewKind> {
+    path.path
+        .extension()
+        .and_then(preview_kind_for_extension)
+        .or_else(|| {
+            let worktree_path = project
+                .read(cx)
+                .worktree_for_id(path.worktree_id, cx)?
+                .read(cx)
+                .abs_path();
+            preview_kind_for_name(&worktree_path)
+        })
+}
+
+/// Which preview, if any, can render the document the editor is showing.
+/// The name decides for a document that has no language of its own -- an SVG is
+/// XML as far as the editor is concerned -- and the language decides for
+/// Markdown and HTML; an OpenAPI contract is a plain YAML or JSON file, so its
+/// content has to be inspected as well.
 pub fn preview_kind_for(editor: &Entity<Editor>, cx: &App) -> Option<PreviewKind> {
     let multi_buffer = editor.read(cx).buffer().read(cx);
     let buffer = multi_buffer.as_singleton()?;
+    if let Some(file) = buffer.read(cx).file()
+        && let Some(kind) = preview_kind_for_name(Path::new(file.file_name(cx)))
+    {
+        return Some(kind);
+    }
     let language_name = buffer.read(cx).language().map(|language| language.name());
 
     match language_name.as_ref().map(|name| name.as_ref()) {
@@ -135,6 +190,17 @@ pub fn open_for_editor(
             );
             cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
         }
+        PreviewKind::Svg => {
+            let multi_buffer = editor.read(cx).buffer().clone();
+            let preview = SvgPreviewView::new(
+                SvgPreviewMode::Default,
+                multi_buffer,
+                workspace_handle,
+                window,
+                cx,
+            );
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
+        }
         PreviewKind::OpenApi => {
             let preview = OpenApiPreviewView::new(editor.clone(), window, cx);
             cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
@@ -181,4 +247,55 @@ fn existing_index_for(
                 == Some(&target_buffer)
         })
         .and_then(|view| pane.index_for_item(&view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_document_is_recognised_whatever_the_spelling_of_its_extension() {
+        assert_eq!(
+            preview_kind_for_extension("md"),
+            Some(PreviewKind::Markdown)
+        );
+        assert_eq!(
+            preview_kind_for_extension("MD"),
+            Some(PreviewKind::Markdown),
+            "a name is not spelled one way"
+        );
+        assert_eq!(
+            preview_kind_for_extension("markdown"),
+            Some(PreviewKind::Markdown)
+        );
+        assert_eq!(preview_kind_for_extension("html"), Some(PreviewKind::Html));
+        assert_eq!(preview_kind_for_extension("htm"), Some(PreviewKind::Html));
+        assert_eq!(preview_kind_for_extension("SVG"), Some(PreviewKind::Svg));
+    }
+
+    #[test]
+    fn nothing_else_is_taken_for_a_document_with_a_rendered_view() {
+        assert_eq!(preview_kind_for_extension("rs"), None);
+        assert_eq!(
+            preview_kind_for_extension("yaml"),
+            None,
+            "a contract is only visible in what the file says, not in its name"
+        );
+        assert_eq!(preview_kind_for_extension("mdx"), None);
+        assert_eq!(
+            preview_kind_for_name(Path::new("Makefile")),
+            None,
+            "a file with no extension is not one"
+        );
+    }
+
+    /// A file opened on its own becomes a worktree of itself, and the name of
+    /// that worktree is the only name there is.
+    #[test]
+    fn a_file_opened_on_its_own_is_judged_by_the_worktree_it_became() {
+        assert_eq!(
+            preview_kind_for_name(Path::new("/home/reader/notes.md")),
+            Some(PreviewKind::Markdown)
+        );
+    }
 }

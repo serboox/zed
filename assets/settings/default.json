@@ -1604,6 +1604,10 @@
   "disable_ai": false,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
+  // Whether a file that has a rendered view -- a page, a document, a drawing --
+  // opens showing that view rather than its source. Alt-1 shows the source,
+  // alt-2 shows both.
+  "open_in_preview": true,
   "auto_update": true,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //

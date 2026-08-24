@@ -106,6 +106,40 @@ impl SplitPreviewView {
         }
     }
 
+    /// A tab whose preview cannot be built yet, showing its editor until it is.
+    /// An SVG page can only be built while the workspace is free to be borrowed,
+    /// and it is not while a tab is being built for a file that is opening, so
+    /// the page arrives a beat later through [`Self::install_preview`]. Until it
+    /// does -- and if it never does -- the tab is the document's editor, which is
+    /// what a reader would have got anyway.
+    pub fn awaiting_preview(editor: Entity<Editor>, cx: &mut Context<Self>) -> Self {
+        let pending = cx.new(|cx| PendingPreview {
+            focus_handle: cx.focus_handle(),
+        });
+        Self::new(editor, pending, PreviewLayout::Editor, cx)
+    }
+
+    pub fn install_preview<P: Render + Focusable>(
+        &mut self,
+        preview: Entity<P>,
+        layout: PreviewLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A file can be opened without being the one the reader is looking at,
+        // and such a tab must not pull focus over to itself when its preview
+        // turns up.
+        let is_being_read = self.focus_handle(cx).contains_focused(window, cx);
+        self.preview_focus_handle = preview.read(cx).focus_handle(cx);
+        self.preview = preview.into();
+        self.layout = layout;
+        if is_being_read {
+            self.focus_the_visible_pane(window, cx);
+        }
+        cx.emit(EditorEvent::TitleChanged);
+        cx.notify();
+    }
+
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
     }
@@ -127,17 +161,25 @@ impl SplitPreviewView {
         if self.layout == layout {
             return;
         }
+        self.apply_layout(layout, window, cx);
+    }
+
+    fn apply_layout(&mut self, layout: PreviewLayout, window: &mut Window, cx: &mut Context<Self>) {
         self.layout = layout;
-        // Focus has to land somewhere that is actually on screen, or typing
-        // would go to a hidden editor.
-        match layout {
+        self.focus_the_visible_pane(window, cx);
+        cx.emit(EditorEvent::TitleChanged);
+        cx.notify();
+    }
+
+    /// Focus has to land somewhere that is actually on screen, or typing would go
+    /// to a hidden editor.
+    fn focus_the_visible_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.layout {
             PreviewLayout::Preview => self.preview_focus_handle.focus(window, cx),
             PreviewLayout::Editor | PreviewLayout::EditorAndPreview => {
                 self.editor.focus_handle(cx).focus(window, cx)
             }
         }
-        cx.emit(EditorEvent::TitleChanged);
-        cx.notify();
     }
 
     /// Zoom belongs to whatever is being read. The editor's font size is an
@@ -277,6 +319,24 @@ impl SplitPreviewView {
     }
 }
 
+/// Stands in for a preview that is still to be built. It is never on screen: the
+/// tab shows its editor until the real preview replaces this one.
+struct PendingPreview {
+    focus_handle: FocusHandle,
+}
+
+impl Focusable for PendingPreview {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for PendingPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().track_focus(&self.focus_handle)
+    }
+}
+
 impl Focusable for SplitPreviewView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.layout {
@@ -379,6 +439,10 @@ impl Item for SplitPreviewView {
 
     fn is_dirty(&self, cx: &App) -> bool {
         Item::is_dirty(self.editor.read(cx), cx)
+    }
+
+    fn preserve_preview(&self, cx: &App) -> bool {
+        Item::preserve_preview(self.editor.read(cx), cx)
     }
 
     fn has_conflict(&self, cx: &App) -> bool {

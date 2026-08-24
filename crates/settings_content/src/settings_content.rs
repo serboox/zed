@@ -179,6 +179,13 @@ pub struct SettingsContent {
     /// Configuration of the HTML preview.
     pub html_preview: Option<HtmlPreviewSettingsContent>,
 
+    /// Whether a file that has a rendered view -- a page, a document, a drawing
+    /// -- opens showing that view rather than its source. The source is one
+    /// keystroke away either way.
+    ///
+    /// Default: true
+    pub open_in_preview: Option<bool>,
+
     /// Whether or not to automatically check for updates.
     ///
     /// Default: true
