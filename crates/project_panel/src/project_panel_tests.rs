@@ -1,7 +1,7 @@
 use super::*;
 // use crate::undo::tests::{build_create_operation, build_rename_operation};
 use collections::HashSet;
-use editor::{Editor, MultiBufferOffset};
+use editor::{Editor, MultiBufferOffset, test::editor_test_context::assert_state_with_diff};
 use git::{
     Oid,
     repository::{InitialGraphCommitData, LogSource, RepoPath},
@@ -11,7 +11,7 @@ use menu::Cancel;
 use pretty_assertions::assert_eq;
 use project::{FakeFs, ProjectPath};
 use serde_json::json;
-use settings::{ProjectPanelAutoOpenSettings, SettingsStore};
+use settings::{DiffViewStyle, ProjectPanelAutoOpenSettings, SettingsStore};
 use smallvec::smallvec;
 use std::path::{Path, PathBuf};
 use util::{path, paths::PathStyle, rel_path::rel_path};
@@ -9927,6 +9927,254 @@ async fn test_compare_files_context_menu(cx: &mut gpui::TestAppContext) {
             "Selecting a directory should not affect the number of comparable files"
         );
     }
+}
+
+/// Opens a project panel that is docked and rendering, so the tests below can
+/// right-click real rows and read the menu back off the painted frame.
+async fn setup_compare_panel(
+    cx: &mut gpui::TestAppContext,
+    tree: serde_json::Value,
+) -> (Entity<Workspace>, Entity<ProjectPanel>, VisualTestContext) {
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), tree).await;
+
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut visual_cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<ProjectPanel>(window, cx);
+        panel
+    });
+    panel.update_in(&mut visual_cx, |panel, window, cx| {
+        window.focus(&panel.focus_handle, cx);
+    });
+    visual_cx.run_until_parked();
+    (workspace, panel, visual_cx)
+}
+
+/// Right-clicks a painted project panel row the way a reader does, and paints
+/// the frame that the resulting context menu appears in. Any menu still open is
+/// dismissed first, since an open menu occludes the rows underneath it.
+fn right_click_entry(selector: &'static str, cx: &mut VisualTestContext) {
+    cx.dispatch_action(Cancel);
+    cx.run_until_parked();
+    // Twice: dismissing the menu moves focus and marks the panel for another
+    // frame, and the rows are laid out again in that one rather than in this.
+    draw(cx);
+    cx.run_until_parked();
+    draw(cx);
+    let center = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("expected {selector} to be painted"))
+        .center();
+    cx.simulate_mouse_down(center, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(center, MouseButton::Right, Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+}
+
+fn click_menu_item(selector: &'static str, cx: &mut VisualTestContext) {
+    let center = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("expected {selector} to be painted"))
+        .center();
+    cx.simulate_click(center, Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+}
+
+fn open_item_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    workspace.update(cx, |workspace, cx| {
+        workspace
+            .panes()
+            .iter()
+            .map(|pane| pane.read(cx).items_len())
+            .sum()
+    })
+}
+
+#[gpui::test]
+async fn test_compare_with_selected_appears_only_once_a_file_is_selected(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test_with_editor(cx);
+
+    let (_workspace, panel, mut cx) = setup_compare_panel(
+        cx,
+        json!({
+            "file1.txt": "old line 1\nline 2\n",
+            "file2.txt": "new line 1\nline 2\n",
+            // Two files, so the panel cannot fold the directory and its only
+            // child into one row named for both of them.
+            "dir1": { "a.txt": "", "b.txt": "" },
+        }),
+    )
+    .await;
+    let cx = &mut cx;
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file1.txt", cx);
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Select for Compare").is_some(),
+        "any file must offer to start a comparison"
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Compare with Selected").is_none(),
+        "there is nothing to compare against before a file has been picked"
+    );
+
+    click_menu_item("MENU_ITEM-Select for Compare", cx);
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file1.txt", cx);
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Compare with Selected").is_none(),
+        "a file must never be offered a comparison against itself"
+    );
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file2.txt", cx);
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Compare with Selected").is_some(),
+        "the pick must survive right-clicking around the tree and be offered on another file"
+    );
+
+    panel.update(cx, |panel, _| {
+        assert!(
+            panel.entry_selected_for_compare.is_some(),
+            "the pending pick is the panel's own state, so it outlives the menu"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_compare_is_not_offered_for_a_directory(cx: &mut TestAppContext) {
+    init_test_with_editor(cx);
+
+    let (_workspace, _panel, mut cx) = setup_compare_panel(
+        cx,
+        json!({
+            "file1.txt": "a\n",
+            // Two files, so the panel cannot fold the directory and its only child
+            // into one row named for both of them.
+            "dir1": { "a.txt": "", "b.txt": "" },
+        }),
+    )
+    .await;
+    let cx = &mut cx;
+
+    right_click_entry("PROJECT_PANEL_ENTRY-dir1", cx);
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Select for Compare").is_none(),
+        "a directory has no text to diff, so it must not offer to be compared"
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Compare with Selected").is_none(),
+        "a directory has no text to diff, so it must not offer to be compared"
+    );
+}
+
+#[gpui::test]
+async fn test_compare_with_selected_opens_a_diff_of_both_files(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+            });
+        });
+    });
+
+    let (workspace, _panel, mut cx) = setup_compare_panel(
+        cx,
+        json!({
+            "file1.txt": "old line 1\nline 2\n",
+            "file2.txt": "new line 1\nline 2\n",
+        }),
+    )
+    .await;
+    let cx = &mut cx;
+
+    assert_eq!(
+        open_item_count(&workspace, cx),
+        0,
+        "the comparison must be the only thing this test opens"
+    );
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file1.txt", cx);
+    click_menu_item("MENU_ITEM-Select for Compare", cx);
+    right_click_entry("PROJECT_PANEL_ENTRY-file2.txt", cx);
+    click_menu_item("MENU_ITEM-Compare with Selected", cx);
+
+    assert_eq!(
+        open_item_count(&workspace, cx),
+        1,
+        "comparing two files opens exactly one tab"
+    );
+
+    let editor = workspace.update(cx, |workspace, cx| {
+        let item = workspace
+            .active_pane()
+            .read(cx)
+            .active_item()
+            .expect("the comparison must be the active tab");
+        let diff_view = item
+            .downcast::<FileDiffView>()
+            .expect("the comparison must reuse the file diff view");
+        assert_eq!(
+            diff_view.tab_content_text(0, cx),
+            "file1.txt ↔ file2.txt",
+            "the tab must name both sides, in the order they were picked"
+        );
+        item.act_as::<Editor>(cx)
+            .expect("the diff view must be backed by an editor")
+    });
+
+    assert_state_with_diff(&editor, cx, "- old line 1\n+ ˇnew line 1\n  line 2\n");
+}
+
+#[gpui::test]
+async fn test_compare_with_selected_forgets_a_deleted_file(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+
+    let (workspace, panel, mut cx) = setup_compare_panel(
+        cx,
+        json!({
+            "file1.txt": "old line 1\nline 2\n",
+            "file2.txt": "new line 1\nline 2\n",
+        }),
+    )
+    .await;
+    let cx = &mut cx;
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file1.txt", cx);
+    click_menu_item("MENU_ITEM-Select for Compare", cx);
+
+    select_path(&panel, "root/file1.txt", cx);
+    submit_deletion_skipping_prompt(&panel, cx);
+    draw(cx);
+    assert!(
+        cx.debug_bounds("PROJECT_PANEL_ENTRY-file1.txt").is_none(),
+        "the file picked for comparison is gone from the tree"
+    );
+
+    right_click_entry("PROJECT_PANEL_ENTRY-file2.txt", cx);
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Compare with Selected").is_none(),
+        "a deleted file must not be offered as the other side of a diff"
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.compare_with_selected(&CompareWithSelected, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        open_item_count(&workspace, cx),
+        0,
+        "a stale pick must open nothing at all, not a broken diff"
+    );
 }
 
 #[gpui::test]

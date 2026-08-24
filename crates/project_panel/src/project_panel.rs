@@ -159,6 +159,10 @@ pub struct ProjectPanel {
     folded_directory_drag_target: Option<FoldedDirectoryDragTarget>,
     drag_target_entry: Option<DragTarget>,
     marked_entries: Vec<SelectedEntry>,
+    // The file picked by "Select for Compare", waiting for its counterpart. Held
+    // as an id rather than a path and resolved on use, so an entry that is gone
+    // by then simply offers no comparison instead of diffing a stale path.
+    entry_selected_for_compare: Option<SelectedEntry>,
     selection: Option<SelectedEntry>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
@@ -445,6 +449,10 @@ actions!(
         SelectPrevDirectory,
         /// Opens a diff view to compare two marked files.
         CompareMarkedFiles,
+        /// Remembers the selected file as one side of a later comparison.
+        SelectForCompare,
+        /// Opens a diff view between the file remembered for comparison and the selected one.
+        CompareWithSelected,
         /// Undoes the last file operation.
         Undo,
         /// Redoes the last undone file operation.
@@ -920,6 +928,7 @@ impl ProjectPanel {
                 folded_directory_drag_target: None,
                 drag_target_entry: None,
                 marked_entries: Default::default(),
+                entry_selected_for_compare: None,
                 selection: None,
                 context_menu: None,
                 filename_editor,
@@ -1180,6 +1189,8 @@ impl ProjectPanel {
                 && (cfg!(target_os = "windows")
                     || (settings.hide_root && visible_worktrees_count == 1));
             let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
+            let should_show_compare_with_selected =
+                !is_dir && self.file_abs_paths_to_compare_with_selected(cx).is_some();
 
             let (has_git_repo, has_history) = {
                 let project_path = project::ProjectPath {
@@ -1234,9 +1245,21 @@ impl ProjectPanel {
                             .when(is_foldable, |menu| {
                                 menu.action("Fold Directory", Box::new(FoldDirectory))
                             })
-                            .when(should_show_compare, |menu| {
+                            .when(!is_dir, |menu| {
                                 menu.separator()
-                                    .action("Compare Marked Files", Box::new(CompareMarkedFiles))
+                                    .when(should_show_compare, |menu| {
+                                        menu.action(
+                                            "Compare Marked Files",
+                                            Box::new(CompareMarkedFiles),
+                                        )
+                                    })
+                                    .action("Select for Compare", Box::new(SelectForCompare))
+                                    .when(should_show_compare_with_selected, |menu| {
+                                        menu.action(
+                                            "Compare with Selected",
+                                            Box::new(CompareWithSelected),
+                                        )
+                                    })
                             })
                             .separator()
                             .action("Cut", Box::new(Cut))
@@ -3928,6 +3951,73 @@ impl ProjectPanel {
         }
     }
 
+    fn compare_target_abs_path(&self, target: SelectedEntry, cx: &App) -> Option<PathBuf> {
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(target.worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        let entry = worktree.entry_for_id(target.entry_id)?;
+        entry.is_file().then(|| worktree.absolutize(&entry.path))
+    }
+
+    /// The pair `(previously selected, currently selected)` that "Compare with
+    /// Selected" would diff, or `None` when either side is missing, is not a
+    /// file, or both sides are the same entry.
+    fn file_abs_paths_to_compare_with_selected(&self, cx: &App) -> Option<(PathBuf, PathBuf)> {
+        let selected_for_compare = self.entry_selected_for_compare?;
+        let (worktree, entry) = self.selected_sub_entry(cx)?;
+        let current = SelectedEntry {
+            worktree_id: worktree.read(cx).id(),
+            entry_id: entry.id,
+        };
+        if current == selected_for_compare {
+            return None;
+        }
+        Some((
+            self.compare_target_abs_path(selected_for_compare, cx)?,
+            self.compare_target_abs_path(current, cx)?,
+        ))
+    }
+
+    fn select_for_compare(&mut self, _: &SelectForCompare, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((worktree, entry)) = self.selected_sub_entry(cx) else {
+            return;
+        };
+        if !entry.is_file() {
+            return;
+        }
+        self.entry_selected_for_compare = Some(SelectedEntry {
+            worktree_id: worktree.read(cx).id(),
+            entry_id: entry.id,
+        });
+        cx.notify();
+    }
+
+    fn compare_with_selected(
+        &mut self,
+        _: &CompareWithSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((old_path, new_path)) = self.file_abs_paths_to_compare_with_selected(cx) else {
+            return;
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                FileDiffView::open(
+                    old_path,
+                    new_path,
+                    None,
+                    workspace.weak_handle(),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            })
+            .ok();
+    }
+
     fn open_system(&mut self, _: &OpenWithSystem, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((worktree, entry)) = self.selected_entry(cx) {
             let abs_path = worktree.absolutize(&entry.path);
@@ -6004,6 +6094,7 @@ impl ProjectPanel {
 
         div()
             .id(id.clone())
+            .debug_selector(|| format!("PROJECT_PANEL_ENTRY-{}", details.filename))
             .relative()
             .group(GROUP_NAME)
             .cursor_pointer()
@@ -7323,6 +7414,8 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::fold_directory))
                 .on_action(cx.listener(Self::remove_from_project))
                 .on_action(cx.listener(Self::compare_marked_files))
+                .on_action(cx.listener(Self::select_for_compare))
+                .on_action(cx.listener(Self::compare_with_selected))
                 .when(!project.is_read_only(cx), |el| {
                     el.on_action(cx.listener(Self::new_file))
                         .on_action(cx.listener(Self::new_directory))
