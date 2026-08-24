@@ -104,7 +104,7 @@ impl WaysToRunModal {
         cx: &App,
     ) -> Vec<Way> {
         let mut ways = Vec::new();
-        let on_the_spot = crate::new_configuration_modal::task_from(offer);
+        let on_the_spot = crate::templates::task_from(offer);
         if !on_the_spot.command.trim().is_empty() {
             let task = on_the_spot;
             ways.push(Way::OnTheSpot {
@@ -372,22 +372,15 @@ impl WaysToRunModal {
 
     /// Opens the window that writes a new configuration, filled in from whatever
     /// the editor found on the line.
-    fn write_a_new_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn write_a_new_one(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let offer = self.offer.clone();
-        let store = self.store.clone();
         let workspace = self.workspace.clone();
         cx.emit(DismissEvent);
         let Some(alive) = workspace.upgrade() else {
             return;
         };
-        alive.update(cx, |workspace, cx| {
-            let handle = workspace.weak_handle();
-            workspace.toggle_modal(window, cx, move |window, cx| {
-                crate::new_configuration_modal::NewConfigurationModal::new(
-                    offer, store, handle, window, cx,
-                )
-            });
-        });
+        let project = alive.read(cx).project().clone();
+        crate::configurations_view::open_window_for_a_new_one(project, workspace, Some(offer), cx);
     }
 
     fn open_them_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {

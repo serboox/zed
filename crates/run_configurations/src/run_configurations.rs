@@ -3,9 +3,9 @@ pub mod configurations_store;
 pub mod configurations_toolbar;
 pub mod configurations_view;
 pub mod debugging;
-pub mod new_configuration_modal;
 pub mod process_metrics;
 pub mod run_configurations_settings;
+pub mod templates;
 pub mod ways_to_run_modal;
 
 use gpui::App;

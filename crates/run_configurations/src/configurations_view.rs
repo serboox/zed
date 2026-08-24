@@ -9,7 +9,7 @@ use project::Project;
 use serde_json::Value;
 use settings::Settings;
 use task::{DebugScenario, TaskTemplate};
-use ui::{Tooltip, WithScrollbar, prelude::*};
+use ui::{ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
 use uuid::Uuid;
 use workspace::{Item, Workspace, client_side_decorations, item::ItemEvent};
@@ -92,35 +92,32 @@ pub fn init(cx: &mut App) {
         // writes one opens instead. The offer itself was left in a global by the
         // editor, which cannot depend on this crate.
         workspace.register_action({
-            let store = store.clone();
             move |workspace, _: &RunFromEntryPoint, window, cx| {
                 let offer = taken_offer(cx);
                 let handle = workspace.weak_handle();
                 let store = store.clone();
                 let ways = crate::ways_to_run_modal::WaysToRunModal::ways_of(&offer, &store, cx);
                 match ways.is_empty() {
-                    true => workspace.toggle_modal(window, cx, move |window, cx| {
-                        crate::new_configuration_modal::NewConfigurationModal::new(
-                            offer, store, handle, window, cx,
-                        )
-                    }),
+                    true => open_window_for_a_new_one(
+                        workspace.project().clone(),
+                        handle,
+                        Some(offer),
+                        cx,
+                    ),
                     false => workspace.toggle_modal(window, cx, move |_window, cx| {
                         crate::ways_to_run_modal::WaysToRunModal::new(offer, store, handle, cx)
                     }),
                 }
             }
         });
-        workspace.register_action({
-            move |workspace, _: &CreateFromEntryPoint, window, cx| {
-                let offer = taken_offer(cx);
-                let handle = workspace.weak_handle();
-                let store = store.clone();
-                workspace.toggle_modal(window, cx, move |window, cx| {
-                    crate::new_configuration_modal::NewConfigurationModal::new(
-                        offer, store, handle, window, cx,
-                    )
-                });
-            }
+        workspace.register_action(|workspace, _: &CreateFromEntryPoint, _window, cx| {
+            let offer = taken_offer(cx);
+            open_window_for_a_new_one(
+                workspace.project().clone(),
+                workspace.weak_handle(),
+                Some(offer),
+                cx,
+            );
         });
         workspace.register_action(|workspace, _: &OpenRunConfigurations, _window, cx| {
             open_window(workspace.project().clone(), workspace.weak_handle(), cx);
@@ -217,6 +214,29 @@ pub fn open_window(project: Entity<Project>, workspace: WeakEntity<Workspace>, c
                     view.focus.clone().focus(window, cx);
                 })
                 .log_err();
+        }
+    });
+}
+
+/// Opens the window on a configuration that is not written down yet, filled in
+/// from whatever the editor knew about the line the reader asked from -- or empty,
+/// when they asked for a new one with nothing in mind.
+pub fn open_window_for_a_new_one(
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+    offer: Option<zed_actions::run_configurations::EntryPointOffer>,
+    cx: &mut App,
+) {
+    let asked_for = workspace.entity_id();
+    open_window(project, workspace, cx);
+    // After the open, which is itself deferred: the window has to exist before
+    // it can be told what to show.
+    cx.defer(move |cx| {
+        if let Some(form) = window_over(asked_for, cx) {
+            form.update(cx, |view, window, cx| {
+                view.start_from_an_offer(offer, window, cx)
+            })
+            .log_err();
         }
     });
 }
@@ -712,6 +732,38 @@ impl RunConfigurationsView {
             as_written: Value::Null,
         };
         self.show(&blank, window, cx);
+        self.unsaved = true;
+        self.trouble = None;
+        cx.notify();
+    }
+
+    /// Starts a configuration that is not in a file yet. An offer from the
+    /// editor's gutter fills it in -- what that line runs, named as a reader
+    /// reads it -- and without one the fields are left for the reader.
+    fn start_from_an_offer(
+        &mut self,
+        offer: Option<zed_actions::run_configurations::EntryPointOffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_a_new_one(Kind::Task, window, cx);
+        let Some(offer) = offer.filter(|offer| offer.file.is_some() || offer.command.is_some())
+        else {
+            return;
+        };
+        let filled_in = crate::templates::task_from(&offer);
+        self.show(
+            &Configuration {
+                kind: Kind::Task,
+                at: self.store.read(cx).of_kind(Kind::Task).configurations.len(),
+                label: filled_in.label.clone(),
+                task: Some(filled_in),
+                scenario: None,
+                as_written: Value::Null,
+            },
+            window,
+            cx,
+        );
         self.unsaved = true;
         self.trouble = None;
         cx.notify();
@@ -1497,6 +1549,107 @@ impl RunConfigurationsView {
     /// The environment, as the mockup draws it: a row to a variable, a name
     /// beside a value, one taken out from its own end and one added from the
     /// heading.
+    /// The template a command comes from, and the debugger that follows from it.
+    /// Picking one fills the command and its arguments in; the debugger beside it
+    /// is not the reader's to type, since it is worked out from the command.
+    fn render_template_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let command = self.command.read(cx).text(cx);
+        let chosen = crate::templates::template_of(&command);
+        let view = cx.entity();
+        h_flex()
+            .w_full()
+            .gap_3()
+            .items_end()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .debug_selector(|| "configuration-template".to_string())
+                    .child(
+                        Label::new("TEMPLATE")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        PopoverMenu::new("configuration-template")
+                            .trigger(
+                                Button::new(
+                                    "configuration-template-chosen",
+                                    match chosen {
+                                        Some(template) => template.name,
+                                        None => "Pick one, or write the command yourself",
+                                    },
+                                )
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .full_width()
+                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                            )
+                            .menu(move |window, cx| {
+                                let view = view.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for template in crate::templates::TEMPLATES {
+                                        let view = view.clone();
+                                        menu =
+                                            menu.entry(template.name, None, move |window, cx| {
+                                                view.update(cx, |view, cx| {
+                                                    view.fill_in_from(template, window, cx)
+                                                });
+                                            });
+                                    }
+                                    menu
+                                }))
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w(px(220.))
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Label::new("DEBUGGER")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .debug_selector(|| "configuration-debugger".to_string())
+                    .child(
+                        Label::new(match chosen.and_then(|template| template.debugger) {
+                            Some(debugger) => format!("{debugger} (from the template)"),
+                            None => "not worked out from this command".to_string(),
+                        })
+                        .size(LabelSize::Small)
+                        .color(
+                            match chosen.and_then(|template| template.debugger) {
+                                Some(_) => Color::Default,
+                                None => Color::Muted,
+                            },
+                        ),
+                    ),
+            )
+            .debug_selector(|| "configuration-template-row".to_string())
+            .into_any_element()
+    }
+
+    /// Fills the command and its arguments in from a template, leaving every
+    /// other field as the reader left it.
+    fn fill_in_from(
+        &mut self,
+        template: &crate::templates::Template,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command.update(cx, |editor, cx| {
+            editor.set_text(template.command, window, cx)
+        });
+        self.args.update(cx, |editor, cx| {
+            editor.set_text(template.args.join("\n"), window, cx)
+        });
+        self.edited = true;
+        cx.notify();
+    }
+
     fn render_env(&self, cx: &mut Context<Self>) -> AnyElement {
         let boxed = |editor: &Entity<Editor>, wide: bool| {
             div()
@@ -1789,7 +1942,8 @@ impl RunConfigurationsView {
             }))
             .child(field("NAME", &self.label, false))
             .when(kind == Kind::Task, |form| {
-                form.child(field("COMMAND", &self.command, false))
+                form.child(self.render_template_row(cx))
+                    .child(field("COMMAND", &self.command, false))
                     .child(field("ARGUMENTS", &self.args, false))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
                     .child(self.render_env(cx))
@@ -2475,7 +2629,7 @@ mod tests {
         let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
         });
-        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let _workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
         cx.run_until_parked();
 
         // What the editor leaves behind when the reader asks its gutter.
@@ -2504,13 +2658,16 @@ mod tests {
         cx.dispatch_action(CreateFromEntryPoint);
         cx.run_until_parked();
 
-        let modal = workspace
-            .read_with(cx, |workspace, cx| {
-                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+        let form = cx
+            .update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<RunConfigurationsView>())
             })
             .expect("asking the gutter opens the window");
+        let view = form.root(cx).expect("the window holds the form");
 
-        let filled_in = modal.read_with(cx, |modal, cx| modal.task(cx));
+        let filled_in = view.read_with(cx, |view, cx| view.task_in_the_form(cx));
         assert_eq!(
             filled_in.label, "go run ./cmd/api",
             "the fields come filled in from what the editor already runs"
@@ -2518,7 +2675,7 @@ mod tests {
         assert_eq!(filled_in.command, "go");
         assert_eq!(filled_in.args, vec!["run".to_string(), ".".to_string()]);
 
-        modal.update_in(cx, |modal, window, cx| modal.save(false, window, cx));
+        view.update_in(cx, |view, _window, cx| view.save(cx));
         cx.run_until_parked();
 
         let written = fs
@@ -3007,13 +3164,64 @@ mod tests {
             "there is nothing to choose between"
         );
         assert!(
-            workspace
-                .read_with(cx, |workspace, cx| {
-                    workspace
-                        .active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
-                })
-                .is_some(),
+            cx.update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .any(|window| window.downcast::<RunConfigurationsView>().is_some())
+            }),
             "so the window that writes one opens"
+        );
+    }
+
+    /// The templates the document names are offered in the form, and picking one
+    /// fills the command in. What it says about debugging follows the command:
+    /// for a Makefile target nothing can be worked out, and it says so rather
+    /// than naming a debugger it cannot use.
+    #[gpui::test]
+    async fn a_template_fills_the_command_in_and_says_what_debugs_it(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.start_a_new_one(Kind::Task, window, cx)
+        });
+        draw(&mut cx);
+
+        let picker = cx
+            .debug_bounds("configuration-template")
+            .expect("the form offers a template to start from");
+        assert!(
+            cx.debug_bounds("configuration-debugger").is_some(),
+            "and says which debugger follows from it"
+        );
+
+        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let go = cx
+            .debug_bounds("MENU_ITEM-Go")
+            .expect("every template the document names is offered");
+        for named in ["MENU_ITEM-Rust", "MENU_ITEM-Makefile", "MENU_ITEM-Mise"] {
+            assert!(
+                cx.debug_bounds(named).is_some(),
+                "{named} is one of them too"
+            );
+        }
+        cx.simulate_click(go.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let filled_in = view.read_with(&cx, |view, cx| view.task_in_the_form(cx));
+        assert_eq!(filled_in.command, "go", "picking one fills the command in");
+        assert_eq!(filled_in.args, vec!["run".to_string(), ".".to_string()]);
+
+        // And one whose command nothing can be derived from says so.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.command
+                .update(cx, |editor, cx| editor.set_text("make", window, cx));
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("configuration-debugger").is_some(),
+            "the debugger it would use is still said, even when it is nothing"
         );
     }
 
@@ -3033,7 +3241,7 @@ mod tests {
         let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
         });
-        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let _workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
         cx.run_until_parked();
 
         cx.update(|_, cx| {
@@ -3050,22 +3258,30 @@ mod tests {
         });
         cx.dispatch_action(CreateFromEntryPoint);
         cx.run_until_parked();
-        workspace
-            .read_with(cx, |workspace, cx| {
-                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+        let first = cx
+            .update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<RunConfigurationsView>())
             })
-            .expect("the first ask opens the window")
-            .update_in(cx, |_, _window, cx| cx.emit(gpui::DismissEvent));
+            .expect("the first ask opens the window");
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("closing it again");
         cx.run_until_parked();
 
         cx.dispatch_action(CreateFromEntryPoint);
         cx.run_until_parked();
-        let asked_again = workspace
-            .read_with(cx, |workspace, cx| {
-                workspace.active_modal::<crate::new_configuration_modal::NewConfigurationModal>(cx)
+        let asked_again = cx
+            .update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<RunConfigurationsView>())
             })
-            .expect("asking again opens the window");
-        let filled_in = asked_again.read_with(cx, |modal, cx| modal.task(cx));
+            .expect("asking again opens the window")
+            .root(cx)
+            .expect("the window holds the form");
+        let filled_in = asked_again.read_with(cx, |view, cx| view.task_in_the_form(cx));
         assert_eq!(
             filled_in.command, "",
             "with nothing found, the window opens empty rather than repeating what \
