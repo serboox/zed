@@ -1,3 +1,9 @@
+use std::{
+    env::consts::EXE_SUFFIX,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use collections::HashMap;
@@ -7,6 +13,36 @@ use serde::{Deserialize, Serialize};
 use task::{DebugScenario, SpawnInTerminal, TaskTemplate};
 
 pub struct GoLocator;
+
+/// Delve builds the debuggee itself when `mode` is `debug` or `test`, and without an explicit
+/// `output` it writes the binary into the working directory (e.g. `./debug`), leaving a stray
+/// untracked executable in the project tree. This picks a path under Zed's cache directory
+/// instead, keyed by the working directory and the resolved configuration so repeated debug runs
+/// of the same configuration reuse one path while different configurations don't collide.
+fn debug_binary_output_path(build_config: &TaskTemplate, resolved_label: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    build_config
+        .cwd
+        .as_deref()
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    resolved_label.hash(&mut hasher);
+    build_config.args.hash(&mut hasher);
+
+    paths::temp_dir()
+        .join("go-debug-builds")
+        .join(format!("{:016x}{EXE_SUFFIX}", hasher.finish()))
+}
+
+/// Ensures the parent directory of a go debug build output path exists, so Delve's build step
+/// doesn't fail trying to write into a missing cache directory.
+fn ensure_output_dir_exists(output_path: &Path) {
+    if let Some(parent) = output_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create go debug build directory {parent:?}: {error}");
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -170,7 +206,7 @@ impl DapLocator for GoLocator {
                     args.push("-test.v".to_string());
                 }
 
-                let config: serde_json::Value = serde_json::to_value(DelveLaunchRequest {
+                let mut config: serde_json::Value = serde_json::to_value(DelveLaunchRequest {
                     request: "launch".to_string(),
                     mode: "test".to_string(),
                     program,
@@ -180,6 +216,15 @@ impl DapLocator for GoLocator {
                     env: build_config.env.clone(),
                 })
                 .unwrap();
+
+                let output_path = debug_binary_output_path(build_config, resolved_label);
+                ensure_output_dir_exists(&output_path);
+                if let Some(config_object) = config.as_object_mut() {
+                    config_object.insert(
+                        "output".to_string(),
+                        output_path.to_string_lossy().into_owned().into(),
+                    );
+                }
 
                 Some(DebugScenario {
                     label: resolved_label.to_string().into(),
@@ -214,7 +259,7 @@ impl DapLocator for GoLocator {
                     }
                 }
 
-                let config: serde_json::Value = serde_json::to_value(DelveLaunchRequest {
+                let mut config: serde_json::Value = serde_json::to_value(DelveLaunchRequest {
                     cwd: build_config.cwd.clone(),
                     env: build_config.env.clone(),
                     request: "launch".to_string(),
@@ -224,6 +269,15 @@ impl DapLocator for GoLocator {
                     build_flags,
                 })
                 .unwrap();
+
+                let output_path = debug_binary_output_path(build_config, resolved_label);
+                ensure_output_dir_exists(&output_path);
+                if let Some(config_object) = config.as_object_mut() {
+                    config_object.insert(
+                        "output".to_string(),
+                        output_path.to_string_lossy().into_owned().into(),
+                    );
+                }
 
                 Some(DebugScenario {
                     label: resolved_label.to_string().into(),
@@ -243,5 +297,159 @@ impl DapLocator for GoLocator {
         _executor: BackgroundExecutor,
     ) -> Result<DebugRequest> {
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn go_task(args: &[&str], cwd: Option<&str>) -> TaskTemplate {
+        TaskTemplate {
+            label: "go task".into(),
+            command: "go".into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            cwd: cwd.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn output_path_of(config: &serde_json::Value) -> PathBuf {
+        PathBuf::from(
+            config
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .expect("Delve launch config should carry an explicit `output` path"),
+        )
+    }
+
+    #[gpui::test]
+    async fn go_run_builds_into_cache_dir_outside_project(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = go_task(&["run", "."], Some("/home/example/project"));
+
+        let scenario = locator
+            .create_scenario(&task, "Run main", &delve)
+            .await
+            .unwrap();
+
+        let output_path = output_path_of(&scenario.config);
+        assert!(
+            output_path.starts_with(paths::temp_dir()),
+            "expected {output_path:?} to be under the Zed cache dir {:?}",
+            paths::temp_dir()
+        );
+        assert!(
+            !output_path.starts_with("/home/example/project"),
+            "debug build output must not land inside the project directory, got {output_path:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn go_test_also_builds_into_cache_dir(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = go_task(&["test", "./..."], Some("/home/example/project"));
+
+        let scenario = locator
+            .create_scenario(&task, "Run tests", &delve)
+            .await
+            .unwrap();
+
+        let output_path = output_path_of(&scenario.config);
+        assert!(output_path.starts_with(paths::temp_dir()));
+        assert!(!output_path.starts_with("/home/example/project"));
+    }
+
+    #[gpui::test]
+    async fn same_configuration_reuses_the_same_output_path(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = go_task(&["run", "."], Some("/home/example/project"));
+
+        let first = locator
+            .create_scenario(&task, "Run main", &delve)
+            .await
+            .unwrap();
+        let second = locator
+            .create_scenario(&task, "Run main", &delve)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output_path_of(&first.config),
+            output_path_of(&second.config)
+        );
+    }
+
+    #[gpui::test]
+    async fn different_configurations_get_different_output_paths(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task_a = go_task(&["run", "."], Some("/home/example/project"));
+        let task_b = go_task(&["run", "./cmd/worker"], Some("/home/example/project"));
+
+        let scenario_a = locator
+            .create_scenario(&task_a, "Run main", &delve)
+            .await
+            .unwrap();
+        let scenario_b = locator
+            .create_scenario(&task_b, "Run worker", &delve)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            output_path_of(&scenario_a.config),
+            output_path_of(&scenario_b.config)
+        );
+    }
+
+    #[gpui::test]
+    async fn non_go_command_is_rejected(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = TaskTemplate {
+            label: "cargo build".into(),
+            command: "cargo".into(),
+            args: vec!["build".into()],
+            ..Default::default()
+        };
+
+        assert!(
+            locator
+                .create_scenario(&task, "cargo build", &delve)
+                .await
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn unsupported_go_action_is_rejected(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = go_task(&["clean"], None);
+
+        assert!(
+            locator
+                .create_scenario(&task, "go clean", &delve)
+                .await
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn go_build_is_still_unhandled(_: &mut TestAppContext) {
+        let locator = GoLocator;
+        let delve = DebugAdapterName("Delve".into());
+        let task = go_task(&["build", "."], None);
+
+        assert!(
+            locator
+                .create_scenario(&task, "go build", &delve)
+                .await
+                .is_none()
+        );
     }
 }
