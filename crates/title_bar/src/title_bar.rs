@@ -254,7 +254,8 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
-        let mut children = <ArrayVec<_, 5>>::new();
+        let mut children = <ArrayVec<_, 3>>::new();
+        let mut project_end = <ArrayVec<AnyElement, 3>>::new();
 
         let mut project_name = None;
         let mut repository = None;
@@ -313,7 +314,7 @@ impl Render for TitleBar {
             }
         }
 
-        children.push(
+        project_end.push(
             h_flex()
                 .h_full()
                 .gap_0p5()
@@ -361,24 +362,39 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
+        project_end.push(self.render_collaborator_list(window, cx).into_any_element());
+
+        if title_bar_settings.show_onboarding_banner {
+            if let Some(banner) = &self.banner {
+                project_end.push(banner.clone().into_any_element())
+            }
+        }
+
+        children.push(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .gap_0p5()
+                .overflow_hidden()
+                .children(project_end)
+                .into_any_element(),
+        );
 
         if let Some(middle) = self.middle.clone() {
             children.push(
                 h_flex()
-                    .flex_none()
+                    // Shrinkable, not fixed: a narrow window would otherwise push
+                    // the account controls past its own edge.
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .overflow_hidden()
                     .justify_center()
                     .debug_selector(|| "title-bar-middle".to_string())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(middle)
                     .into_any_element(),
             );
-        }
-
-        if title_bar_settings.show_onboarding_banner {
-            if let Some(banner) = &self.banner {
-                children.push(banner.clone().into_any_element())
-            }
         }
 
         let status = self.client.status();
@@ -399,6 +415,9 @@ impl Render for TitleBar {
 
         children.push(
             h_flex()
+                .flex_1()
+                .min_w_0()
+                .justify_end()
                 .pr_1()
                 .gap_1()
                 .debug_selector(|| "title-bar-account-end".to_string())

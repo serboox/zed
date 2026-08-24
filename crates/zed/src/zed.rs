@@ -3060,7 +3060,7 @@ mod tests {
     };
     use gpui::{
         Action, AnyWindowHandle, App, AssetSource, BorrowAppContext, Modifiers, TestAppContext,
-        UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px,
+        UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px, size,
     };
     use language::LanguageRegistry;
     use languages::{markdown_lang, rust_lang};
@@ -5529,7 +5529,7 @@ mod tests {
             .debug_bounds("title-bar-middle")
             .expect("the title bar has a middle for the way the project is run");
         let plaque = cx
-            .debug_bounds("run-configurations-toolbar")
+            .debug_bounds("run-configurations-plaque")
             .expect("and the plaque that says how to run it is in the bar");
         let project_end = cx
             .debug_bounds("title-bar-project-end")
@@ -5564,10 +5564,68 @@ mod tests {
             middle.right(),
             account_end.origin.x
         );
+        // Centred, not merely somewhere in between: the room left of it and the
+        // room right of it are the same. This is what a plaque jammed against
+        // the account controls fails.
+        let room_to_the_left = middle.origin.x - project_end.origin.x;
+        let room_to_the_right = account_end.right() - middle.right();
+        assert!(
+            (room_to_the_left - room_to_the_right).abs() < px(8.),
+            "the plaque is not centred: {room_to_the_left:?} of room on its left \
+             against {room_to_the_right:?} on its right"
+        );
+        // And it is a plaque, not a chip: a name has to be readable in it.
+        assert!(
+            plaque.size.width >= px(200.),
+            "the plaque is too small to read a name in: {:?}",
+            plaque.size
+        );
+
+        // A narrow window is the case that pushes things off the edge: the
+        // plaque takes the width it prefers and gives it up when there is not
+        // enough, rather than shoving the account controls out of the window.
+        let narrow = px(700.);
+        cx.simulate_resize(size(narrow, px(600.)));
+        cx.run_until_parked();
+        let squeezed_plaque = cx
+            .debug_bounds("run-configurations-plaque")
+            .expect("the plaque is still there in a narrow window");
+        let squeezed_account = cx
+            .debug_bounds("title-bar-account-end")
+            .expect("and so are the account controls");
+        assert!(
+            squeezed_account.right() <= narrow + px(1.),
+            "the account controls were pushed past the window's edge: {:?} \
+             against a window {:?} wide",
+            squeezed_account.right(),
+            narrow
+        );
+        assert!(
+            squeezed_plaque.right() <= squeezed_account.origin.x + px(1.),
+            "and the plaque is painted over them: {squeezed_plaque:?} against \
+             {squeezed_account:?}"
+        );
         assert!(
             plaque.origin.y >= project_end.origin.y - px(4.)
                 && plaque.bottom() <= project_end.bottom() + px(4.),
             "and sits on the same row as the rest of the bar: {plaque:?} against {project_end:?}"
+        );
+    }
+
+    /// The list of configurations shows Enter and Shift-Enter on the row it is
+    /// on. Those hints are read out of the keymap, so the keymap has to carry
+    /// them -- a hint for an unbound key is a lie the reader acts on.
+    #[gpui::test]
+    fn test_the_configurations_list_binds_the_keys_its_rows_offer(cx: &mut TestAppContext) {
+        assert!(
+            bindings_for("enter", "RunConfigurationsList", cx)
+                .contains(&"menu::Confirm".to_string()),
+            "Enter has to run the row the list is on"
+        );
+        assert!(
+            bindings_for("shift-enter", "RunConfigurationsList", cx)
+                .contains(&"menu::SecondaryConfirm".to_string()),
+            "Shift-Enter has to debug it, as the mockup has it"
         );
     }
 

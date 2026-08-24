@@ -55,6 +55,12 @@
     },
   },
   {
+    "context": "RunConfigurationsList",
+    "bindings": {
+      "shift-enter": "menu::SecondaryConfirm"
+    }
+  },
+  {
     "context": "Editor",
     "use_key_equivalents": true,
     "bindings": {
