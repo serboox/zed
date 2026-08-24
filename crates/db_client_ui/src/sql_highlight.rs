@@ -161,7 +161,9 @@ fn tokenize_statement(statement: &str, base: usize, out: &mut Vec<SqlHighlightTo
             let start = index;
             index += 1;
             while index < len
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] >= 0x80)
+                && (bytes[index].is_ascii_alphanumeric()
+                    || bytes[index] == b'_'
+                    || bytes[index] >= 0x80)
             {
                 index += 1;
             }
@@ -204,24 +206,136 @@ fn is_keyword(upper: &str) -> bool {
             // functions (COUNT, SUM, ...), which should stay identifiers or be
             // classified as functions by the `(` lookahead instead.
             [
-                "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "LIMIT",
-                "OFFSET", "FETCH", "DISTINCT", "ALL", "AS", "WITH", "RECURSIVE", "UNION",
-                "INTERSECT", "EXCEPT", "MINUS", "RETURNING", "QUALIFY", "WINDOW", "JOIN",
-                "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "NATURAL", "ON",
-                "USING", "LATERAL", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
-                "RLIKE", "REGEXP", "BETWEEN", "EXISTS", "ANY", "SOME", "NULL", "TRUE",
-                "FALSE", "UNKNOWN", "CASE", "WHEN", "THEN", "ELSE", "END", "IF", "ASC",
-                "DESC", "NULLS", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
-                "TRUNCATE", "MERGE", "REPLACE", "UPSERT", "CREATE", "ALTER", "DROP",
-                "RENAME", "TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "TRIGGER",
-                "PROCEDURE", "FUNCTION", "SEQUENCE", "TEMPORARY", "COLUMN", "ADD",
-                "MODIFY", "CHANGE", "CONSTRAINT", "PRIMARY", "FOREIGN", "KEY", "UNIQUE",
-                "REFERENCES", "DEFAULT", "CHECK", "AUTO_INCREMENT", "IDENTITY",
-                "GENERATED", "CASCADE", "RESTRICT", "ENGINE", "CHARSET", "COLLATE",
-                "UNSIGNED", "ZEROFILL", "AFTER", "BEGIN", "START", "COMMIT", "ROLLBACK",
-                "TRANSACTION", "SAVEPOINT", "LOCK", "UNLOCK", "GRANT", "REVOKE", "TO",
-                "PRIVILEGES", "EXPLAIN", "ANALYZE", "DESCRIBE", "SHOW", "USE", "OVER",
-                "PARTITION", "ROWS", "RANGE", "UNBOUNDED", "PRECEDING", "FOLLOWING",
+                "SELECT",
+                "FROM",
+                "WHERE",
+                "GROUP",
+                "BY",
+                "HAVING",
+                "ORDER",
+                "LIMIT",
+                "OFFSET",
+                "FETCH",
+                "DISTINCT",
+                "ALL",
+                "AS",
+                "WITH",
+                "RECURSIVE",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+                "MINUS",
+                "RETURNING",
+                "QUALIFY",
+                "WINDOW",
+                "JOIN",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "OUTER",
+                "CROSS",
+                "NATURAL",
+                "ON",
+                "USING",
+                "LATERAL",
+                "AND",
+                "OR",
+                "NOT",
+                "IN",
+                "IS",
+                "LIKE",
+                "ILIKE",
+                "RLIKE",
+                "REGEXP",
+                "BETWEEN",
+                "EXISTS",
+                "ANY",
+                "SOME",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "CASE",
+                "WHEN",
+                "THEN",
+                "ELSE",
+                "END",
+                "IF",
+                "ASC",
+                "DESC",
+                "NULLS",
+                "INSERT",
+                "INTO",
+                "VALUES",
+                "UPDATE",
+                "SET",
+                "DELETE",
+                "TRUNCATE",
+                "MERGE",
+                "REPLACE",
+                "UPSERT",
+                "CREATE",
+                "ALTER",
+                "DROP",
+                "RENAME",
+                "TABLE",
+                "VIEW",
+                "INDEX",
+                "DATABASE",
+                "SCHEMA",
+                "TRIGGER",
+                "PROCEDURE",
+                "FUNCTION",
+                "SEQUENCE",
+                "TEMPORARY",
+                "COLUMN",
+                "ADD",
+                "MODIFY",
+                "CHANGE",
+                "CONSTRAINT",
+                "PRIMARY",
+                "FOREIGN",
+                "KEY",
+                "UNIQUE",
+                "REFERENCES",
+                "DEFAULT",
+                "CHECK",
+                "AUTO_INCREMENT",
+                "IDENTITY",
+                "GENERATED",
+                "CASCADE",
+                "RESTRICT",
+                "ENGINE",
+                "CHARSET",
+                "COLLATE",
+                "UNSIGNED",
+                "ZEROFILL",
+                "AFTER",
+                "BEGIN",
+                "START",
+                "COMMIT",
+                "ROLLBACK",
+                "TRANSACTION",
+                "SAVEPOINT",
+                "LOCK",
+                "UNLOCK",
+                "GRANT",
+                "REVOKE",
+                "TO",
+                "PRIVILEGES",
+                "EXPLAIN",
+                "ANALYZE",
+                "DESCRIBE",
+                "SHOW",
+                "USE",
+                "OVER",
+                "PARTITION",
+                "ROWS",
+                "RANGE",
+                "UNBOUNDED",
+                "PRECEDING",
+                "FOLLOWING",
             ]
             .into_iter()
             .collect()
@@ -232,7 +346,8 @@ fn is_keyword(upper: &str) -> bool {
 fn is_data_type(upper: &str) -> bool {
     matches!(
         upper,
-        "INT" | "INTEGER"
+        "INT"
+            | "INTEGER"
             | "TINYINT"
             | "SMALLINT"
             | "MEDIUMINT"
@@ -272,7 +387,13 @@ fn is_data_type(upper: &str) -> bool {
     )
 }
 
-fn push(out: &mut Vec<SqlHighlightToken>, base: usize, start: usize, end: usize, kind: SqlTokenKind) {
+fn push(
+    out: &mut Vec<SqlHighlightToken>,
+    base: usize,
+    start: usize,
+    end: usize,
+    kind: SqlTokenKind,
+) {
     if end > start {
         out.push(SqlHighlightToken {
             range: (base + start)..(base + end),
@@ -339,8 +460,9 @@ mod tests {
 
         let final_start = text.rfind("SELECT id").expect("final statement present");
         assert!(
-            tokens.iter().any(|token| token.kind == SqlTokenKind::Keyword
-                && token.range.start == final_start),
+            tokens.iter().any(
+                |token| token.kind == SqlTokenKind::Keyword && token.range.start == final_start
+            ),
             "final SELECT must be a keyword token starting at the final statement"
         );
         assert!(
@@ -367,10 +489,9 @@ mod tests {
 
         let final_start = text.rfind("SELECT id").expect("final statement present");
         assert!(
-            tokens
-                .iter()
-                .any(|token| token.kind == SqlTokenKind::Keyword
-                    && token.range.start == final_start),
+            tokens.iter().any(
+                |token| token.kind == SqlTokenKind::Keyword && token.range.start == final_start
+            ),
             "final SELECT must be a keyword token, not swallowed by the unclosed quote"
         );
         assert!(

@@ -1,18 +1,24 @@
 use crate::driver_icon::brand_icon;
 use db_client::{
-    ConnectionConfig, DatabaseDriver, KubernetesRelayCommandKind, KubernetesTargetKind,
-    KubernetesTunnelModeKind, SshAuthMethod, SslMode, kubernetes_tunnel_caveat,
+    ConnectionConfig, ConnectionId, DatabaseDriver, KubernetesRelayCommandKind,
+    KubernetesTargetKind, KubernetesTunnelModeKind, SshAuthMethod, SslMode,
+    kubernetes_tunnel_caveat,
 };
 use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
+    App, Bounds, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    Render, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
+    point,
 };
+use platform_title_bar::PlatformTitleBar;
+use settings::Settings;
 use ui::{
     Button, ButtonCommon, ButtonStyle, Checkbox, Icon, IconName, Label, LabelSize, ToggleState,
     prelude::*,
 };
+use util::ResultExt as _;
 use uuid::Uuid;
-use workspace::{Item, item::ItemEvent};
+use workspace::{Item, Workspace, client_side_decorations, item::ItemEvent};
 
 const FOLDER_PLACEHOLDER: &str = "Folder (optional)";
 const COLOR_PLACEHOLDER: &str = "#rrggbb (optional)";
@@ -52,6 +58,156 @@ enum TestState {
     Failure(String),
 }
 
+/// Where the window was left, so reopening it does not undo the reader's
+/// dragging and sizing. Held for the run of the editor rather than written down:
+/// the placement matters within a sitting, and a stored one can name a display
+/// that is no longer plugged in.
+struct WhereItWasLeft {
+    bounds: Bounds<Pixels>,
+    display: Uuid,
+}
+
+impl gpui::Global for WhereItWasLeft {}
+
+/// The size it opens at when it has not been sized yet: the list of databases
+/// beside a form two fields wide, and no more, so the editor behind it is still
+/// there.
+const OPENING_SIZE: Size<Pixels> = Size {
+    width: px(940.),
+    height: px(660.),
+};
+
+/// Small enough to be pushed aside, large enough that the form still has a
+/// column beside the list of databases rather than one word a line.
+const SMALLEST_SIZE: Size<Pixels> = Size {
+    width: px(640.),
+    height: px(420.),
+};
+
+/// Opens the connection form in a window of the reader's own: it is moved and
+/// sized like any other, and the editor stays readable behind it.
+///
+/// `editing` is the connection being changed, or `None` for one that is not
+/// written down yet. `on_confirm` is handed what the form was filled in with
+/// once Save is pressed.
+pub fn open_window(
+    workspace: WeakEntity<Workspace>,
+    editing: Option<ConnectionConfig>,
+    cx: &mut App,
+    on_confirm: impl FnOnce(ConnectionConfig, &mut App) + 'static,
+) {
+    // One window over one connection. A second over the same one would write it
+    // from two forms and the later save would quietly win, so an open one is
+    // brought forward instead. A window belonging to another editor window is
+    // somebody else's and is left where it is.
+    let asked_for = workspace.entity_id();
+    let about = editing.as_ref().map(|config| config.id);
+    // Deferred to get the workspace off the stack: the click that led here is
+    // still updating it, and opening a window reads it again. Everything else
+    // waits until then as well, so two asks in one frame cannot both decide that
+    // there is no window yet and open one each.
+    cx.defer(move |cx| {
+        if workspace.upgrade().is_none() {
+            return;
+        }
+        if let Some(open_already) = window_over(asked_for, about, cx) {
+            open_already
+                .update(cx, |view, window, cx| {
+                    window.activate_window();
+                    view.focus_handle.clone().focus(window, cx);
+                })
+                .log_err();
+            return;
+        }
+
+        let bounds = where_to_open(cx);
+        let app_id = release_channel::ReleaseChannel::global(cx).app_id();
+        let decorations = match std::env::var("ZED_WINDOW_DECORATIONS") {
+            Ok(asked) if asked == "server" => gpui::WindowDecorations::Server,
+            Ok(asked) if asked == "client" => gpui::WindowDecorations::Client,
+            _ => match workspace::WorkspaceSettings::get_global(cx).window_decorations {
+                settings::WindowDecorations::Server => gpui::WindowDecorations::Server,
+                settings::WindowDecorations::Client => gpui::WindowDecorations::Client,
+            },
+        };
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(match about {
+                    Some(_) => "Zed — Edit connection".into(),
+                    None => "Zed — New connection".into(),
+                }),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
+            }),
+            focus: true,
+            show: true,
+            is_movable: true,
+            kind: gpui::WindowKind::Normal,
+            window_background: cx.theme().window_background_appearance(),
+            app_id: Some(app_id.to_owned()),
+            window_decorations: Some(decorations),
+            window_min_size: Some(SMALLEST_SIZE),
+            window_bounds: Some(bounds),
+            ..Default::default()
+        };
+        let opened = cx.open_window(options, |window, cx| {
+            cx.new(|cx| {
+                ConnectionView::for_a_window(editing.as_ref(), workspace, window, cx)
+                    .with_on_confirm(on_confirm)
+            })
+        });
+        if let Some(handle) = opened.log_err() {
+            handle
+                .update(cx, |view, window, cx| {
+                    window.activate_window();
+                    view.focus_handle.clone().focus(window, cx);
+                })
+                .log_err();
+        }
+    });
+}
+
+/// The form already open over this editor window for this connection, if there
+/// is one. Two forms over one connection would write it from both and the later
+/// save would quietly win. A form over another connection, or over another
+/// editor window, is somebody else's and is left where it is.
+fn window_over(
+    workspace: gpui::EntityId,
+    about: Option<ConnectionId>,
+    cx: &App,
+) -> Option<gpui::WindowHandle<ConnectionView>> {
+    cx.windows().into_iter().find_map(|window| {
+        let handle = window.downcast::<ConnectionView>()?;
+        let same_form = handle.read(cx).ok().is_some_and(|view| {
+            view.about == about
+                && view
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|editor| editor.entity_id() == workspace)
+        });
+        same_form.then_some(handle)
+    })
+}
+
+/// Where it was left, if that screen is still there and still holds it;
+/// otherwise the middle of the screen at the size it opens at.
+fn where_to_open(cx: &mut App) -> WindowBounds {
+    let left = cx.try_global::<WhereItWasLeft>().and_then(|left| {
+        let screen = cx
+            .displays()
+            .into_iter()
+            .find(|display| display.uuid().ok() == Some(left.display))?;
+        screen
+            .bounds()
+            .intersects(&left.bounds)
+            .then_some(left.bounds)
+    });
+    match left {
+        Some(bounds) => WindowBounds::Windowed(bounds),
+        None => WindowBounds::centered(OPENING_SIZE, cx),
+    }
+}
+
 pub struct ConnectionView {
     focus_handle: FocusHandle,
     title: SharedString,
@@ -86,6 +242,19 @@ pub struct ConnectionView {
     k8s_target_kind: KubernetesTargetKind,
     k8s_target_name_editor: Entity<Editor>,
     test_state: TestState,
+    /// The editor window this form was opened from, when it has a window of its
+    /// own. Left unset for a form put in a pane by hand.
+    workspace: Option<WeakEntity<Workspace>>,
+    /// The connection being changed, or `None` for one that is not written down
+    /// yet. A second ask for the same one reaches this window rather than opening
+    /// another over it.
+    about: Option<ConnectionId>,
+    /// The bar the window is dragged by, and which carries its buttons. macOS
+    /// draws its own, so there is nothing to put there.
+    title_bar: Option<Entity<PlatformTitleBar>>,
+    /// A drag delivers a bounds change a frame; the last one is what is kept.
+    remembering_bounds: Option<gpui::Task<()>>,
+    _subscriptions: Vec<Subscription>,
     pub on_confirm: Option<Box<dyn FnOnce(ConnectionConfig, &mut App)>>,
 }
 
@@ -170,6 +339,11 @@ impl ConnectionView {
             k8s_target_kind: KubernetesTargetKind::Pod,
             k8s_target_name_editor,
             test_state: TestState::Idle,
+            workspace: None,
+            about: None,
+            title_bar: None,
+            remembering_bounds: None,
+            _subscriptions: Vec::new(),
             on_confirm: None,
         }
     }
@@ -314,7 +488,92 @@ impl ConnectionView {
             k8s_target_kind: config.k8s_target_kind,
             k8s_target_name_editor,
             test_state: TestState::Idle,
+            workspace: None,
+            about: None,
+            title_bar: None,
+            remembering_bounds: None,
+            _subscriptions: Vec::new(),
             on_confirm: None,
+        }
+    }
+
+    /// The form as the root view of a window of its own. It remembers which
+    /// editor window asked for it and which connection it is about, so a second
+    /// ask reaches this window instead of opening another over the same
+    /// connection.
+    fn for_a_window(
+        editing: Option<&ConnectionConfig>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = match editing {
+            Some(config) => Self::new_with_config(config, window, cx),
+            None => Self::new(window, cx),
+        };
+        view.about = editing.map(|config| config.id);
+        view.title_bar = (!cfg!(target_os = "macos"))
+            .then(|| cx.new(|cx| PlatformTitleBar::new("connection-view-title-bar", cx)));
+        let mut subscriptions = vec![
+            cx.observe_window_bounds(window, |view, window, cx| {
+                view.remember_where_it_was_left(window, cx);
+            }),
+            // Only a window can say which appearance it was given, and the
+            // application-wide guess can differ from it. Without this the window
+            // opens light in front of a dark editor.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                *theme::SystemAppearance::global_mut(cx) =
+                    theme::SystemAppearance(window.appearance().into());
+                theme_settings::reload_theme(cx);
+                theme_settings::reload_icon_theme(cx);
+            }),
+        ];
+        // The form writes one editor window's connections. When that window goes,
+        // so does this one -- a form left behind saves into a project nobody has
+        // open any more. A view put in a pane is not its window's root, and
+        // removing the window there would close the editor itself.
+        if let Some(alive) = workspace.upgrade() {
+            subscriptions.push(cx.observe_release_in(&alive, window, |_, _, window, _| {
+                if window.window_handle().downcast::<Self>().is_some() {
+                    window.remove_window();
+                }
+            }));
+        }
+        view.workspace = Some(workspace);
+        view._subscriptions = subscriptions;
+        view
+    }
+
+    fn remember_where_it_was_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remembering_bounds.is_some() {
+            return;
+        }
+        self.remembering_bounds = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            view.update_in(cx, |view, window, cx| {
+                view.remembering_bounds.take();
+                // A maximized or fullscreen window has no placement worth
+                // keeping: it would come back as a window the reader never sized.
+                if let WindowBounds::Windowed(bounds) = window.inner_window_bounds()
+                    && let Some(display) = window.display(cx).and_then(|it| it.uuid().ok())
+                {
+                    cx.set_global(WhereItWasLeft { bounds, display });
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    /// Closing is closing the window: the form is the reader's own now, not a tab
+    /// over the editor.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A view put in a pane by hand has no window of its own to remove, and
+        // the tab is closed the way any tab is.
+        match window.window_handle().downcast::<Self>() {
+            Some(_) => window.remove_window(),
+            None => cx.emit(DismissEvent),
         }
     }
 
@@ -587,6 +846,7 @@ impl ConnectionView {
         field_bg: gpui::Hsla,
     ) -> impl IntoElement {
         div()
+            .debug_selector(move || format!("field-{label}"))
             .flex()
             .flex_col()
             .gap_1()
@@ -614,6 +874,7 @@ impl ConnectionView {
         let colors = cx.theme().colors();
         h_flex()
             .id(SharedString::from(format!("driver-row-{label}")))
+            .debug_selector(move || format!("driver-row-{label}"))
             .w_full()
             .gap_2()
             .px_2()
@@ -661,7 +922,7 @@ impl Item for ConnectionView {
 }
 
 impl Render for ConnectionView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_file_based = self.selected_driver.is_file_based();
         let selected_driver = self.selected_driver;
         let use_ssh = self.use_ssh;
@@ -789,6 +1050,7 @@ impl Render for ConnectionView {
                     presets = presets.child(
                         h_flex()
                             .id(SharedString::from(format!("env-preset-{name}")))
+                            .debug_selector(move || format!("env-preset-{name}"))
                             .gap_1p5()
                             .items_center()
                             .cursor_pointer()
@@ -810,15 +1072,19 @@ impl Render for ConnectionView {
                     );
                 }
                 presets = presets.child(
-                    Button::new("env-preset-none", "No Color")
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.color_editor.update(cx, |editor, cx| {
-                                editor.set_text("", window, cx);
-                            });
-                            cx.notify();
-                        })),
+                    div()
+                        .debug_selector(|| "env-preset-none".to_string())
+                        .child(
+                            Button::new("env-preset-none", "No Color")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.color_editor.update(cx, |editor, cx| {
+                                        editor.set_text("", window, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
                 );
 
                 v_flex()
@@ -987,18 +1253,22 @@ impl Render for ConnectionView {
                     .items_center()
                     .gap_1p5()
                     .child(
-                        Checkbox::new(
-                            "use-ssh",
-                            if use_ssh {
-                                ToggleState::Selected
-                            } else {
-                                ToggleState::Unselected
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.use_ssh = !this.use_ssh;
-                            cx.notify();
-                        })),
+                        div()
+                            .debug_selector(|| "use-ssh-checkbox".to_string())
+                            .child(
+                                Checkbox::new(
+                                    "use-ssh",
+                                    if use_ssh {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.use_ssh = !this.use_ssh;
+                                    cx.notify();
+                                })),
+                            ),
                     )
                     .child(Label::new("SSH Tunnel").size(LabelSize::Small)),
             )
@@ -1258,20 +1528,24 @@ impl Render for ConnectionView {
                                     .items_center()
                                     .gap_1p5()
                                     .child(
-                                        Checkbox::new(
-                                            "auto-connect",
-                                            if self.auto_connect {
-                                                ToggleState::Selected
-                                            } else {
-                                                ToggleState::Unselected
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _state, _, cx| {
-                                                this.auto_connect = !this.auto_connect;
-                                                cx.notify();
-                                            }),
-                                        ),
+                                        div()
+                                            .debug_selector(|| "auto-connect-checkbox".to_string())
+                                            .child(
+                                                Checkbox::new(
+                                                    "auto-connect",
+                                                    if self.auto_connect {
+                                                        ToggleState::Selected
+                                                    } else {
+                                                        ToggleState::Unselected
+                                                    },
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _state, _, cx| {
+                                                        this.auto_connect = !this.auto_connect;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                            ),
                                     )
                                     .child(
                                         Label::new("Auto-connect on startup")
@@ -1332,33 +1606,47 @@ impl Render for ConnectionView {
                                 },
                             )
                             .child(
-                                Button::new("test", "Test Connection")
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.run_test_connection(cx);
-                                    })),
+                                div()
+                                    .debug_selector(|| "test-connection-button".to_string())
+                                    .child(
+                                        Button::new("test", "Test Connection")
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_test_connection(cx);
+                                            })),
+                                    ),
                             )
                             .child(
-                                Button::new("cancel", "Cancel")
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(DismissEvent);
-                                    })),
+                                div()
+                                    .debug_selector(|| "cancel-button".to_string())
+                                    .child(
+                                        Button::new("cancel", "Cancel")
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.close(window, cx);
+                                            })),
+                                    ),
                             )
                             .child(
                                 // Saving is all this does: the connection is
-                                // written down and the pane closes. Nothing is
+                                // written down and the window closes. Nothing is
                                 // dialled until the reader opens it.
-                                Button::new("save", "Save")
-                                    .style(ButtonStyle::Filled)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(config) = this.build_config(cx) {
-                                            if let Some(callback) = this.on_confirm.take() {
-                                                callback(config, cx);
-                                            }
-                                        }
-                                        cx.emit(DismissEvent);
-                                    })),
+                                div()
+                                    .debug_selector(|| "save-button".to_string())
+                                    .child(
+                                        Button::new("save", "Save")
+                                            .style(ButtonStyle::Filled)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if let Some(config) = this.build_config(cx) {
+                                                    if let Some(callback) =
+                                                        this.on_confirm.take()
+                                                    {
+                                                        callback(config, cx);
+                                                    }
+                                                }
+                                                this.close(window, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             );
@@ -1374,17 +1662,42 @@ impl Render for ConnectionView {
             .child(sidebar)
             .child(fields);
 
-        div()
+        let body = div()
             .id("connection-view")
+            .debug_selector(|| "connection-view".to_string())
             .track_focus(&self.focus_handle)
             .key_context("ConnectionView")
-            .size_full()
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| this.close(window, cx)))
             .bg(page_bg)
             .flex()
             .flex_col()
             .p_6()
             .overflow_y_scroll()
-            .child(card)
+            .child(card);
+
+        // A window of its own gets a window's shell: a bar to drag it by and
+        // borders to pull. The same view can also be put in a pane as a tab,
+        // which has both already and must not grow a second set.
+        if window.window_handle().downcast::<Self>().is_none() {
+            return body.size_full().into_any_element();
+        }
+
+        client_side_decorations(
+            v_flex()
+                .size_full()
+                .bg(page_bg)
+                .child(
+                    div()
+                        .debug_selector(|| "connection-view-titlebar".to_string())
+                        .w_full()
+                        .flex_none()
+                        .children(self.title_bar.clone()),
+                )
+                .child(body.flex_1().min_h_0().w_full()),
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 }
 
@@ -1392,6 +1705,7 @@ impl Render for ConnectionView {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use project::{FakeFs, Project};
     use settings::SettingsStore;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1399,7 +1713,64 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // The form opens a window of its own, and a window is given the
+            // application's own id.
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
         });
+    }
+
+    /// A whole editor window, which is what the panel asks the form for.
+    async fn an_editor_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        gpui::AnyWindowHandle,
+        gpui::VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let editor = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = editor.root(cx).expect("the editor window has a workspace");
+        let handle: gpui::AnyWindowHandle = editor.into();
+        let editor_cx = gpui::VisualTestContext::from_window(handle, cx);
+        editor_cx.run_until_parked();
+        (workspace, handle, editor_cx)
+    }
+
+    /// Asks for the form the way the panel does, and hands back the window it
+    /// opened.
+    fn open_the_form(
+        workspace: &Entity<Workspace>,
+        editing: Option<ConnectionConfig>,
+        editor_cx: &mut gpui::VisualTestContext,
+    ) -> gpui::WindowHandle<ConnectionView> {
+        let asked_by = workspace.downgrade();
+        editor_cx.update(|_, cx| {
+            open_window(
+                asked_by,
+                editing,
+                cx,
+                |_config: ConnectionConfig, _: &mut App| {},
+            );
+        });
+        editor_cx.run_until_parked();
+        editor_cx
+            .update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<ConnectionView>())
+            })
+            .expect("the connection form opened a window of its own")
+    }
+
+    fn forms_open(cx: &mut gpui::VisualTestContext) -> usize {
+        cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter(|window| window.downcast::<ConnectionView>().is_some())
+                .count()
+        })
     }
 
     #[test]
@@ -1877,5 +2248,215 @@ mod tests {
             cx.debug_bounds("k8s-tunnel-caveat").is_some(),
             "switching to Aerospike with the Kubernetes tunnel enabled must paint the caveat"
         );
+    }
+
+    /// The form opens in a window of the reader's own: one they can drag anywhere
+    /// and pull to any size, not a tab filling a pane of the editor. Measured on
+    /// the window itself and on what it paints, since a fixed-size view would
+    /// keep its size however the window is pulled.
+    #[gpui::test]
+    async fn the_connection_form_opens_in_a_window_of_its_own(cx: &mut TestAppContext) {
+        let (workspace, editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let windows_before = editor_cx.update(|_, cx| cx.windows().len());
+
+        let opened = open_the_form(&workspace, None, &mut editor_cx);
+
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            windows_before + 1,
+            "the editor's window is still there, with the form beside it"
+        );
+        let form_window: gpui::AnyWindowHandle = opened.into();
+        assert_ne!(
+            form_window, editor_window,
+            "the form has a window of its own, not the editor's"
+        );
+
+        let mut window_cx = gpui::VisualTestContext::from_window(form_window, &editor_cx.cx);
+        window_cx.run_until_parked();
+        let narrow = window_cx
+            .debug_bounds("connection-view")
+            .expect("the form is painted in its window");
+
+        // Pulled wider and taller: what is inside has to follow the window, which
+        // a view laid out at a fixed size would not.
+        let was = window_cx.update(|window, _| window.bounds().size);
+        window_cx.simulate_resize(gpui::size(was.width + px(240.), was.height + px(120.)));
+        window_cx.run_until_parked();
+        let wide = window_cx
+            .debug_bounds("connection-view")
+            .expect("the form is still painted after the window was pulled");
+        assert!(
+            wide.size.width > narrow.size.width + px(200.),
+            "the form had to follow the window: {:?} against {:?}",
+            narrow.size.width,
+            wide.size.width
+        );
+        assert!(
+            wide.size.height > narrow.size.height + px(80.),
+            "and follow it downwards too: {:?} against {:?}",
+            narrow.size.height,
+            wide.size.height
+        );
+
+        // Dragging the window itself is the window manager's to do -- the test
+        // platform refuses to be asked -- so what is checked here is that there
+        // is a bar to drag it by, across the top of the window.
+        let bar = window_cx
+            .debug_bounds("connection-view-titlebar")
+            .expect("the window has a bar to drag it by");
+        assert!(
+            bar.size.width > wide.size.width - px(4.),
+            "the bar spans the window: {:?} against {:?}",
+            bar.size.width,
+            wide.size.width
+        );
+        assert!(
+            bar.origin.y < wide.origin.y,
+            "and sits above the form, not under it: {:?} against {:?}",
+            bar.origin.y,
+            wide.origin.y
+        );
+        // macOS draws its own bar, so there is nothing of ours to measure there.
+        if !cfg!(target_os = "macos") {
+            assert!(
+                bar.size.height > px(8.),
+                "the bar has to be tall enough to grab: {:?}",
+                bar.size
+            );
+        }
+    }
+
+    /// Asking for the same connection while its form is already open brings that
+    /// window forward instead of opening a second form over it, which would write
+    /// the connection from two places and let the later save quietly win.
+    #[gpui::test]
+    async fn asking_again_brings_the_open_window_forward(cx: &mut TestAppContext) {
+        let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let mut existing = ConnectionConfig::default();
+        existing.host = "127.0.0.1".to_string();
+        existing.username = "root".to_string();
+
+        let first = open_the_form(&workspace, Some(existing.clone()), &mut editor_cx);
+        let after_first = editor_cx.update(|_, cx| cx.windows().len());
+        assert_eq!(forms_open(&mut editor_cx), 1, "the form opened");
+
+        let again = open_the_form(&workspace, Some(existing), &mut editor_cx);
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            after_first,
+            "the second ask had to reach the open window, not open another one"
+        );
+        assert_eq!(
+            gpui::AnyWindowHandle::from(again),
+            gpui::AnyWindowHandle::from(first),
+            "and it had to be the very same window"
+        );
+    }
+
+    /// Cancel closes the window it is in. The editor is left alone: the form is
+    /// the reader's own window now, not a tab in the editor's pane.
+    #[gpui::test]
+    async fn clicking_cancel_closes_the_form_window_and_leaves_the_editor_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let windows_before = editor_cx.update(|_, cx| cx.windows().len());
+        let opened = open_the_form(&workspace, None, &mut editor_cx);
+
+        let mut window_cx = gpui::VisualTestContext::from_window(opened.into(), &editor_cx.cx);
+        window_cx.run_until_parked();
+        let cancel = window_cx
+            .debug_bounds("cancel-button")
+            .expect("the form has a Cancel button")
+            .center();
+        window_cx.simulate_click(cancel, gpui::Modifiers::none());
+        window_cx.run_until_parked();
+
+        // Counted from the editor's window, since the one that was closed can no
+        // longer be asked anything.
+        assert_eq!(forms_open(&mut editor_cx), 0, "Cancel closed the form");
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            windows_before,
+            "and left only the editor's own window"
+        );
+    }
+
+    /// Escape is Cancel: it closes the form's window, not the editor's.
+    #[gpui::test]
+    async fn escape_closes_the_form_window_and_leaves_the_editor_alone(cx: &mut TestAppContext) {
+        let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let windows_before = editor_cx.update(|_, cx| cx.windows().len());
+        let opened = open_the_form(&workspace, None, &mut editor_cx);
+
+        let mut window_cx = gpui::VisualTestContext::from_window(opened.into(), &editor_cx.cx);
+        window_cx.run_until_parked();
+        window_cx.dispatch_action(menu::Cancel);
+        window_cx.run_until_parked();
+
+        assert_eq!(forms_open(&mut editor_cx), 0, "Escape closed the form");
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            windows_before,
+            "and left only the editor's own window"
+        );
+    }
+
+    /// Moving the form out of the pane must not lose anything it held: every
+    /// database, field, swatch, chip, checkbox and button that was in the pane is
+    /// painted in the window too.
+    #[gpui::test]
+    async fn every_control_the_pane_had_is_painted_in_the_window(cx: &mut TestAppContext) {
+        let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let opened = open_the_form(&workspace, None, &mut editor_cx);
+
+        let mut window_cx = gpui::VisualTestContext::from_window(opened.into(), &editor_cx.cx);
+        // Given room for the whole form at once, so nothing is missed for sitting
+        // below the fold of a window opened at its smallest.
+        window_cx.simulate_resize(gpui::size(px(1200.), px(1100.)));
+        window_cx.run_until_parked();
+
+        let expected: &[&'static str] = &[
+            "driver-row-MySQL",
+            "driver-row-PostgreSQL",
+            "driver-row-MongoDB",
+            "driver-row-Cassandra",
+            "driver-row-SQLite",
+            "driver-row-Aerospike",
+            "driver-row-Redis",
+            "driver-row-ClickHouse",
+            "field-Name",
+            "field-Folder",
+            "field-Environment Color",
+            "env-preset-Local",
+            "env-preset-Development",
+            "env-preset-Staging",
+            "env-preset-Production",
+            "env-preset-Neutral",
+            "env-preset-none",
+            "field-Host",
+            "field-Port",
+            "field-Username",
+            "field-Password",
+            "field-Database",
+            "chip-Disabled",
+            "chip-Require",
+            "chip-Verify CA",
+            "chip-Verify Full",
+            "use-ssh-checkbox",
+            "use-kubernetes-tunnel-checkbox",
+            "auto-connect-checkbox",
+            "read-only-checkbox",
+            "test-connection-button",
+            "cancel-button",
+            "save-button",
+        ];
+        for selector in expected.iter().copied() {
+            assert!(
+                window_cx.debug_bounds(selector).is_some(),
+                "{selector} was in the pane and has to be painted in the window too"
+            );
+        }
     }
 }

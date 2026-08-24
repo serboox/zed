@@ -1,6 +1,6 @@
 use crate::aerospike_view::AerospikeView;
 use crate::compare_data::CompareDataView;
-use crate::connection_view::ConnectionView;
+use crate::connection_view;
 use crate::data_import::ImportDataView;
 use crate::db_migration::{
     BUNDLE_VERSION, ConsoleFile, EncryptedSecrets, ExportBundle, decrypt_secrets, encrypt_secrets,
@@ -5213,45 +5213,34 @@ impl DatabasePanel {
         );
     }
 
-    fn open_add_connection_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_add_connection_modal(&self, _window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
-        self.workspace
-            .update(cx, |workspace, cx| {
-                let view = cx.new(|cx| {
-                    ConnectionView::new(window, cx).with_on_confirm(move |config, cx| {
-                        store.update(cx, |store, cx| {
-                            store.add_connection(config, cx);
-                        });
-                    })
-                });
-                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-            })
-            .log_err();
+        connection_view::open_window(self.workspace.clone(), None, cx, move |config, cx| {
+            store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+        });
     }
 
     fn open_edit_connection_modal(
         &self,
         existing: ConnectionConfig,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
         let original_id = existing.id;
-        self.workspace
-            .update(cx, |workspace, cx| {
-                let view = cx.new(|cx| {
-                    ConnectionView::new_with_config(&existing, window, cx).with_on_confirm(
-                        move |mut config, cx| {
-                            config.id = original_id;
-                            store.update(cx, |store, cx| {
-                                store.update_connection(config, cx);
-                            });
-                        },
-                    )
+        connection_view::open_window(
+            self.workspace.clone(),
+            Some(existing),
+            cx,
+            move |mut config, cx| {
+                config.id = original_id;
+                store.update(cx, |store, cx| {
+                    store.update_connection(config, cx);
                 });
-                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-            })
-            .log_err();
+            },
+        );
     }
 
     fn toggle_folder_collapsed(&mut self, folder: FolderId, cx: &mut Context<Self>) {
@@ -5544,23 +5533,16 @@ impl DatabasePanel {
     fn new_connection_in_folder(
         &self,
         folder: Option<FolderId>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
-        self.workspace
-            .update(cx, |workspace, cx| {
-                let view = cx.new(|cx| {
-                    ConnectionView::new(window, cx).with_on_confirm(move |mut config, cx| {
-                        config.folder_id = folder;
-                        store.update(cx, |store, cx| {
-                            store.add_connection(config, cx);
-                        });
-                    })
-                });
-                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-            })
-            .log_err();
+        connection_view::open_window(self.workspace.clone(), None, cx, move |mut config, cx| {
+            config.folder_id = folder;
+            store.update(cx, |store, cx| {
+                store.add_connection(config, cx);
+            });
+        });
     }
 
     fn drag_preview(
@@ -11442,6 +11424,7 @@ mod keybinding_precedence_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_view::ConnectionView;
     use fs::FakeFs;
     use gpui::{TestAppContext, VisualTestContext, actions};
     use project::Project;
@@ -15965,20 +15948,30 @@ mod tests {
             assert!(store.folders().is_empty());
         });
 
-        // The background menu's "New Connection" opens a connection form.
+        // The background menu's "New Connection" opens a connection form in a
+        // window of its own, beside the editor rather than inside it.
         panel.update_in(cx, |panel, window, cx| {
             panel.new_connection_in_folder(None, window, cx);
         });
-        let connection_forms = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .active_pane()
-                .read(cx)
-                .items_of_type::<ConnectionView>()
+        cx.run_until_parked();
+        let connection_forms = cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter(|window| window.downcast::<ConnectionView>().is_some())
                 .count()
         });
         assert_eq!(
             connection_forms, 1,
-            "New Connection opens a connection form"
+            "New Connection opens a connection form in a window of its own"
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ConnectionView>()
+                .count()),
+            0,
+            "and no longer takes a tab in the editor"
         );
 
         // The background menu's "New Folder" creates a top-level folder.
@@ -17109,6 +17102,9 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // The connection form opens a window of its own, and a window is
+            // given the application's own id.
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
             super::init(cx);
         });
     }
