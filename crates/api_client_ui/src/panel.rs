@@ -1806,7 +1806,6 @@ impl ApiClientPanel {
                     store,
                     languages,
                     crate::code_generator::Snippet::Curl,
-                    None,
                     window,
                     cx,
                 )

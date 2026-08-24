@@ -20,8 +20,9 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    ContextMenu, ContextMenuEntry, DocumentationSide, ElevationIndex, Icon, IconName, IconSize,
-    Label, LabelSize, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*,
+    Checkbox, ContextMenu, ContextMenuEntry, DocumentationSide, ElevationIndex, Icon, IconName,
+    IconSize, Label, LabelSize, ScrollAxes, Scrollbars, ToggleState, Tooltip, WithScrollbar,
+    cyberpunk, prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, Toast, Workspace, item::ItemEvent, notifications::NotificationId};
@@ -528,8 +529,6 @@ pub struct RequestView {
     send_state: SendState,
     /// The shape the code window was last opened on.
     code_snippet_shape: Snippet,
-    /// Where the code window was left, so it opens there again.
-    code_snippet_place: Option<(Point<Pixels>, Size<Pixels>)>,
     response_tab: ResponseTab,
     pretty_body_editor: Entity<Editor>,
     raw_body_editor: Entity<Editor>,
@@ -850,7 +849,6 @@ impl RequestView {
             jwt_query_param_key_editor,
             send_state: SendState::Idle,
             code_snippet_shape: Snippet::Curl,
-            code_snippet_place: None,
             response_tab: ResponseTab::Pretty,
             pretty_body_editor,
             raw_body_editor,
@@ -2172,27 +2170,18 @@ impl RequestView {
         let languages = workspace.read(cx).app_state().languages.clone();
         let store = self.store.clone();
         let shown = self.code_snippet_shape;
-        let was_left_at = self.code_snippet_place;
         let view = cx.entity().downgrade();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                let modal = CodeSnippetModal::new(
-                    request,
-                    store,
-                    languages,
-                    shown,
-                    was_left_at,
-                    window,
-                    cx,
-                );
-                // What the reader picked, and where they left the window, are
-                // remembered: it opens on that shape, in that place, at that size.
+                let modal = CodeSnippetModal::new(request, store, languages, shown, window, cx);
+                // The shape the reader picked is remembered here, so the window
+                // opens on it rather than on cURL again. Where they left the window
+                // is remembered by the window itself, for whichever request opens
+                // it next.
                 cx.observe_release(&cx.entity(), move |_, modal: &mut CodeSnippetModal, cx| {
                     let shown = modal.shown();
-                    let was_left_at = modal.was_left_at();
                     view.update(cx, |view, _| {
                         view.code_snippet_shape = shown;
-                        view.code_snippet_place = Some(was_left_at);
                     })
                     .log_err();
                 })
@@ -4837,11 +4826,15 @@ pub(crate) struct CodeSnippetModal {
     store: Entity<ApiClientStore>,
     languages: Arc<language::LanguageRegistry>,
     shown: Snippet,
+    /// Whether a line too long for the window is folded onto the next one rather
+    /// than left to run off the right of it.
+    wrapped: bool,
     /// Where its top-left corner sits in the window, and how big it is. The reader
     /// moves and resizes it, so neither is fixed.
     place: Point<Pixels>,
     size: Size<Pixels>,
     held: Option<Held>,
+    remembering_place: Option<gpui::Task<()>>,
 }
 
 /// What the pointer is doing to the window while a button is down.
@@ -4867,25 +4860,38 @@ const SNIPPET_WINDOW_SIZE: Size<Pixels> = Size {
     height: px(520.),
 };
 
+/// Where the window was left, so reopening it does not undo the reader's dragging
+/// and sizing. Kept for the whole editor rather than on the view that opened it:
+/// the next one is usually opened from another request, and to the reader it is
+/// the same window. Held for the run of the editor rather than written down --
+/// the placement matters within a sitting, and a stored one can name room the
+/// editor's window no longer has.
+struct WhereItWasLeft {
+    place: Point<Pixels>,
+    size: Size<Pixels>,
+}
+
+impl gpui::Global for WhereItWasLeft {}
+
 impl CodeSnippetModal {
     pub(crate) fn new(
         request: api_client::Request,
         store: Entity<ApiClientStore>,
         languages: Arc<language::LanguageRegistry>,
         shown: Snippet,
-        was_left_at: Option<(Point<Pixels>, Size<Pixels>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let code_editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
             editor.set_read_only(true);
+            // A command is read here rather than written, and a URL disappearing
+            // off the right of the window is the one thing this window cannot
+            // afford: long lines are folded until the reader says otherwise.
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             editor
         });
-        let (place, size) = was_left_at.unwrap_or_else(|| {
-            let size = SNIPPET_WINDOW_SIZE;
-            (Self::first_place_of(size, window), size)
-        });
+        let (place, size) = Self::where_to_open(window, cx);
         let mut modal = Self {
             focus_handle: cx.focus_handle(),
             code_editor,
@@ -4893,9 +4899,11 @@ impl CodeSnippetModal {
             store,
             languages,
             shown,
+            wrapped: true,
             place,
             size,
             held: None,
+            remembering_place: None,
         };
         modal.keep_inside_the_window(window);
         modal.show(shown, window, cx);
@@ -4908,10 +4916,21 @@ impl CodeSnippetModal {
         self.shown
     }
 
-    /// Where it was left, so it opens there again instead of jumping back to the
-    /// middle every time.
-    pub(crate) fn was_left_at(&self) -> (Point<Pixels>, Size<Pixels>) {
-        (self.place, self.size)
+    /// Where it was left, if the editor's window still has room for it there;
+    /// otherwise across the window at the size it opens at.
+    fn where_to_open(window: &Window, cx: &App) -> (Point<Pixels>, Size<Pixels>) {
+        let viewport = window.viewport_size();
+        let left = cx.try_global::<WhereItWasLeft>().filter(|left| {
+            left.place.x + left.size.width <= viewport.width
+                && left.place.y + left.size.height <= viewport.height
+        });
+        match left {
+            Some(left) => (left.place, left.size),
+            None => {
+                let size = SNIPPET_WINDOW_SIZE;
+                (Self::first_place_of(size, window), size)
+            }
+        }
     }
 
     /// Across the window and a little down from its top: near the request it came
@@ -4968,6 +4987,7 @@ impl CodeSnippetModal {
             None => return,
         }
         self.keep_inside_the_window(window);
+        self.remember_where_it_was_left(cx);
         cx.notify();
     }
 
@@ -4975,6 +4995,29 @@ impl CodeSnippetModal {
         if self.held.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// A drag delivers a move a frame, and writing every one of them down is work
+    /// nobody asked for: only where the window is a tenth of a second later is
+    /// kept.
+    fn remember_where_it_was_left(&mut self, cx: &mut Context<Self>) {
+        if self.remembering_place.is_some() {
+            return;
+        }
+        self.remembering_place = Some(cx.spawn(async move |modal, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            modal
+                .update(cx, |modal, cx| {
+                    modal.remembering_place.take();
+                    cx.set_global(WhereItWasLeft {
+                        place: modal.place,
+                        size: modal.size,
+                    });
+                })
+                .log_err();
+        }));
     }
 
     /// While the window is held, the pointer is followed wherever it goes --
@@ -5084,6 +5127,41 @@ impl CodeSnippetModal {
     fn copy(&self, cx: &mut Context<Self>) {
         let text = self.code_editor.read(cx).text(cx);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// Folds long lines into the window, or lets them run off the right of it for a
+    /// reader who wants one command on one line.
+    fn wrap_the_lines(&mut self, wrapped: bool, cx: &mut Context<Self>) {
+        self.wrapped = wrapped;
+        let mode = match wrapped {
+            true => language::language_settings::SoftWrap::EditorWidth,
+            false => language::language_settings::SoftWrap::None,
+        };
+        self.code_editor
+            .update(cx, |editor, cx| editor.set_soft_wrap_mode(mode, cx));
+        cx.notify();
+    }
+
+    fn render_wrap_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "code-snippet-wrap".to_string())
+            .child(
+                Checkbox::new(
+                    "code-snippet-wrap",
+                    match self.wrapped {
+                        true => ToggleState::Selected,
+                        false => ToggleState::Unselected,
+                    },
+                )
+                .label("Wrap")
+                .label_size(LabelSize::Small)
+                .tooltip(Tooltip::text("Fold long lines into the window"))
+                .on_click(cx.listener(
+                    |modal, wanted: &ToggleState, _window, cx| {
+                        modal.wrap_the_lines(matches!(wanted, ToggleState::Selected), cx)
+                    },
+                )),
+            )
     }
 
     fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5213,6 +5291,7 @@ impl Render for CodeSnippetModal {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .child(self.render_wrap_toggle(cx))
                             .child(self.render_picker(cx))
                             .child(
                                 IconButton::new("code-snippet-copy-icon", IconName::Copy)
@@ -6229,6 +6308,24 @@ mod tests {
         Entity<CodeSnippetModal>,
         VisualTestContext,
     ) {
+        let (workspace, _store, _request, modal, cx) =
+            a_code_window_showing("https://api.example.com/ping", cx).await;
+        (workspace, modal, cx)
+    }
+
+    /// The same window, for a request whose URL the test chooses, and with the
+    /// store and the request as well -- enough to open the window a second time
+    /// from a request view that has never opened one.
+    async fn a_code_window_showing(
+        url: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ApiClientStore>,
+        Request,
+        Entity<CodeSnippetModal>,
+        VisualTestContext,
+    ) {
         init_test(cx);
         let store = cx.new(|cx| ApiClientStore::new(cx));
         let collection_id = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
@@ -6237,7 +6334,7 @@ mod tests {
         });
         store.update(cx, |store, cx| {
             store.update_request(request_id, cx, |request| {
-                request.url = "https://api.example.com/ping".to_string();
+                request.url = url.to_string();
             });
         });
         let request = store.read_with(cx, |store, _| {
@@ -6276,7 +6373,51 @@ mod tests {
                 workspace.active_modal::<CodeSnippetModal>(cx)
             })
             .expect("the Code button should open the code window");
-        (workspace, modal, cx)
+        (workspace, store, request, modal, cx)
+    }
+
+    /// A URL whose `curl` line is far wider than the window opens, so what the
+    /// window does with a line too long to show is there to be measured.
+    const A_URL_TOO_LONG_FOR_THE_WINDOW: &str = "https://api.example.com/v1/reports/quarterly/consolidated\
+         ?fields=identifier,display_name,description,created_at,updated_at,owner_email\
+         &filter=everything-that-happened-in-the-last-quarter\
+         &sort=-created_at&page=1&per_page=100";
+
+    /// How the code is laid out in the window as it is painted.
+    struct AsLaidOut {
+        /// The rows the text is laid out over: one a line, until a line too long
+        /// for the window is folded onto more of them.
+        rows: u32,
+        /// How tall one of those rows is painted.
+        line_height: Pixels,
+        /// The longest row the editor laid out, in characters, against the whole
+        /// command's length. Folding keeps every row shorter than the command;
+        /// not folding leaves one row as long as the whole of it.
+        longest_row: u32,
+        whole_command: u32,
+    }
+
+    fn how_the_code_is_laid_out(
+        modal: &Entity<CodeSnippetModal>,
+        cx: &mut VisualTestContext,
+    ) -> AsLaidOut {
+        let rem_size = cx.update(|window, _| window.rem_size());
+        modal.update_in(cx, |modal, _window, cx| {
+            modal.code_editor.update(cx, |editor, cx| {
+                // Display rows, not buffer rows: a line folded at the width the
+                // editor painted takes several of them, and an unfolded one takes
+                // exactly one however long it is.
+                let laid_out = editor.display_snapshot(cx);
+                let rows = laid_out.max_point().row().0 + 1;
+                let longest_row = laid_out.line_len(laid_out.longest_row());
+                AsLaidOut {
+                    rows,
+                    line_height: editor.style(cx).text.line_height_in_pixels(rem_size),
+                    longest_row,
+                    whole_command: laid_out.buffer_snapshot().len().0 as u32,
+                }
+            })
+        })
     }
 
     /// The window is dragged by its title, and what moves is the window on screen,
@@ -6464,6 +6605,151 @@ mod tests {
         assert!(
             modal.read_with(&cx, |modal, _| modal.held.is_none()),
             "and it must not still think it is being dragged"
+        );
+    }
+
+    /// A line too long for the window is folded into it as the window opens:
+    /// reading the command must not mean scrolling sideways for the end of it.
+    #[gpui::test]
+    async fn the_code_window_wraps_a_long_line_by_default(cx: &mut TestAppContext) {
+        let (_workspace, _store, _request, modal, mut cx) =
+            a_code_window_showing(A_URL_TOO_LONG_FOR_THE_WINDOW, cx).await;
+
+        let editor = cx
+            .debug_bounds("code-snippet-editor")
+            .expect("the editor is painted");
+        let laid_out = how_the_code_is_laid_out(&modal, &mut cx);
+
+        assert!(
+            laid_out.rows > 1,
+            "one line of code, too long for an editor {:?} wide, has to be folded \
+             onto more rows than the one it is in the buffer",
+            editor.size.width
+        );
+        assert!(
+            laid_out.line_height * laid_out.rows as f32 <= editor.size.height,
+            "which the reader sees all of at once: {} rows of {:?} in {:?} of editor",
+            laid_out.rows,
+            laid_out.line_height,
+            editor.size.height
+        );
+        assert!(
+            laid_out.longest_row < laid_out.whole_command,
+            "and no row is the whole command, which is what hanging past the right \
+             edge would mean: {} of {} characters in an editor {:?} wide",
+            laid_out.longest_row,
+            laid_out.whole_command,
+            editor.size.width
+        );
+    }
+
+    /// Wrapping is the reader's to turn off, from the window itself: unchecked, the
+    /// long line runs off the right of it again, and checked, it comes back.
+    #[gpui::test]
+    async fn the_wrap_checkbox_turns_the_folding_off_and_on(cx: &mut TestAppContext) {
+        let (_workspace, _store, _request, modal, mut cx) =
+            a_code_window_showing(A_URL_TOO_LONG_FOR_THE_WINDOW, cx).await;
+
+        let checkbox = debug_center(&mut cx, "code-snippet-wrap");
+        cx.simulate_click(checkbox, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let unwrapped = how_the_code_is_laid_out(&modal, &mut cx);
+        assert_eq!(
+            unwrapped.rows, 1,
+            "with the box unchecked the command is one line again"
+        );
+        assert_eq!(
+            unwrapped.longest_row, unwrapped.whole_command,
+            "which puts the whole command on that one row, hanging past the right \
+             edge of the window"
+        );
+
+        let checkbox = debug_center(&mut cx, "code-snippet-wrap");
+        cx.simulate_click(checkbox, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let wrapped_again = how_the_code_is_laid_out(&modal, &mut cx);
+        assert!(
+            wrapped_again.rows > 1,
+            "checking it again folds the line back into the window"
+        );
+        assert!(
+            wrapped_again.longest_row < wrapped_again.whole_command,
+            "and no row is the whole command any more: {} of {}",
+            wrapped_again.longest_row,
+            wrapped_again.whole_command
+        );
+    }
+
+    /// The window comes back where and at the size it was left, even for a request
+    /// view that has never opened one: the reader's dragging belongs to the window,
+    /// not to the tab that happened to open it.
+    #[gpui::test]
+    async fn the_code_window_opens_where_it_was_left(cx: &mut TestAppContext) {
+        let (workspace, store, request, _modal, mut cx) =
+            a_code_window_showing("https://api.example.com/ping", cx).await;
+
+        let grip = debug_center(&mut cx, "code-snippet-grip");
+        cx.simulate_mouse_down(grip, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let pulled_to = point(grip.x - px(180.), grip.y - px(120.));
+        cx.simulate_mouse_move(pulled_to, Some(MouseButton::Left), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        cx.simulate_mouse_up(pulled_to, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let left_at = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window is painted");
+        assert!(
+            left_at.size.width < SNIPPET_WINDOW_SIZE.width
+                && left_at.size.height < SNIPPET_WINDOW_SIZE.height,
+            "the drag has to have resized it, or there is nothing to remember: {:?}",
+            left_at.size
+        );
+        // Where it was left is written down a tenth of a second after the dragging
+        // stops.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+
+        // Touching the title brings the window forward, which is what makes Escape
+        // reach it.
+        let title = debug_center(&mut cx, "code-snippet-title");
+        cx.simulate_click(title, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            workspace
+                .read_with(&cx, |workspace, cx| workspace
+                    .active_modal::<CodeSnippetModal>(cx))
+                .is_none(),
+            "the window has to be closed before opening it again means anything"
+        );
+
+        let another_view = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let workspace_handle = workspace.weak_handle();
+            cx.new(|cx| RequestView::new(&request, store.clone(), workspace_handle, window, cx))
+        });
+        another_view.update_in(&mut cx, |view, window, cx| view.show_as_code(window, cx));
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let opened_at = cx
+            .debug_bounds("code-snippet-window")
+            .expect("the window opens again");
+        assert_eq!(
+            (opened_at.origin, opened_at.size),
+            (left_at.origin, left_at.size),
+            "it has to come back where it was left, at the size it was left"
         );
     }
 
