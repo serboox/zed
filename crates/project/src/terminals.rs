@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, Task, WeakEntity};
 
@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use task::{Shell, ShellBuilder, ShellKind, SpawnInTerminal};
+use task::{Shell, ShellBuilder, ShellKind, SpawnInTerminal, VariableName};
 use terminal::{
     TaskState, TaskStatus, Terminal, TerminalBuilder, insert_zed_terminal_env,
     terminal_settings::TerminalSettings,
@@ -137,7 +137,6 @@ impl Project {
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
         let env_file = spawn_task.env_file.clone();
-        let env_file_from = spawn_task.cwd.clone();
         let fs = self.fs.clone();
         cx.spawn(async move |project, cx| {
             let mut env = env_task.await.unwrap_or_default();
@@ -147,20 +146,26 @@ impl Project {
             // next run picks it up. What the configuration itself says wins, so it
             // is merged before `spawn_task.env` below.
             if let Some(env_file) = env_file {
-                let env_file = match env_file.is_absolute() {
-                    true => env_file,
-                    false => match env_file_from.as_ref() {
-                        Some(from) => from.join(&env_file),
+                // A relative path always resolves against the worktree root, not the
+                // task's `cwd`, so a configuration committed to the repo can point at
+                // a secrets file outside of it (e.g. `../secrets/corp.env`).
+                let env_file = if env_file.is_absolute() {
+                    env_file
+                } else {
+                    match spawn_task.env.get(&VariableName::WorktreeRoot.to_string()) {
+                        Some(worktree_root) => PathBuf::from(worktree_root).join(&env_file),
                         None => env_file,
-                    },
+                    }
                 };
-                match fs.load(&env_file).await {
-                    Ok(text) => env.extend(task::env_file_variables(&text)),
-                    Err(error) => log::warn!(
-                        "the environment file {} could not be read: {error}",
+                // Naming a file that cannot be read must fail the run rather than
+                // silently spawning with a partial environment.
+                let text = fs.load(&env_file).await.with_context(|| {
+                    format!(
+                        "the environment file {} could not be read",
                         env_file.display()
-                    ),
-                }
+                    )
+                })?;
+                env.extend(task::env_file_variables(&text));
             }
 
             let activation_script = maybe!(async {
@@ -741,7 +746,219 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::time::Duration;
+    use terminal::HeadlessTerminal;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    /// Polls `get_content` instead of checking it once right after the task
+    /// completes, since output can still be draining into the terminal's
+    /// grid for a moment after the process exits.
+    async fn content_eventually_containing(
+        terminal: &Entity<Terminal>,
+        expected: &str,
+        cx: &mut TestAppContext,
+    ) -> String {
+        let mut content = String::new();
+        for _ in 0..100 {
+            content = terminal.read_with(cx, |terminal, _| terminal.get_content());
+            if content.contains(expected) {
+                return content;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        content
+    }
+
+    #[gpui::test]
+    async fn missing_env_file_fails_the_run_instead_of_spawning(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({})).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let spawn_task = SpawnInTerminal {
+            command: Some("true".to_string()),
+            cwd: Some(PathBuf::from("/tmp")),
+            env_file: Some(PathBuf::from("/project/missing.env")),
+            ..SpawnInTerminal::default()
+        };
+
+        let result = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(spawn_task, cx)
+            })
+            .await;
+
+        let error = result
+            .err()
+            .expect("a task naming an env file that cannot be read must fail instead of spawning");
+        assert!(
+            format!("{error}").contains("missing.env"),
+            "the error should name the unreadable file, got: {error}"
+        );
+    }
+
+    #[gpui::test]
+    async fn relative_env_file_resolves_against_worktree_root_not_task_cwd(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        // Run the task as a plain subprocess: PTY allocation is not guaranteed
+        // wherever this test runs, but a plain subprocess always is.
+        cx.update(|cx| cx.set_global(HeadlessTerminal(true)));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".env": "PICKED=from_worktree_root\n" }),
+        )
+        .await;
+        fs.insert_tree(
+            Path::new("/tmp"),
+            json!({ ".env": "PICKED=from_task_cwd\n" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let (program, args) =
+            ShellBuilder::new(&Shell::System, false).build(Some("echo $PICKED".to_string()), &[]);
+        let mut env = HashMap::default();
+        env.insert(
+            VariableName::WorktreeRoot.to_string(),
+            "/project".to_string(),
+        );
+        let spawn_task = SpawnInTerminal {
+            command: Some(program),
+            args,
+            cwd: Some(PathBuf::from("/tmp")),
+            env_file: Some(PathBuf::from(".env")),
+            env,
+            ..SpawnInTerminal::default()
+        };
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(spawn_task, cx)
+            })
+            .await
+            .unwrap();
+        terminal
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+
+        let content = content_eventually_containing(&terminal, "from_worktree_root", cx).await;
+        assert!(
+            content.contains("from_worktree_root"),
+            "expected the worktree root's .env to be used, got: {content}"
+        );
+        assert!(
+            !content.contains("from_task_cwd"),
+            "the task's cwd must not be consulted for a relative env_file, got: {content}"
+        );
+    }
+
+    #[gpui::test]
+    async fn existing_env_file_variables_merge_into_the_environment(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(HeadlessTerminal(true)));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ "vars.env": "MERGED_VAR=file_value\n" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let (program, args) = ShellBuilder::new(&Shell::System, false)
+            .build(Some("echo $MERGED_VAR".to_string()), &[]);
+        let spawn_task = SpawnInTerminal {
+            command: Some(program),
+            args,
+            cwd: Some(PathBuf::from("/tmp")),
+            env_file: Some(PathBuf::from("/project/vars.env")),
+            ..SpawnInTerminal::default()
+        };
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(spawn_task, cx)
+            })
+            .await
+            .unwrap();
+        terminal
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+
+        let content = content_eventually_containing(&terminal, "file_value", cx).await;
+        assert!(
+            content.contains("file_value"),
+            "the environment file's variables should reach the spawned process, got: {content}"
+        );
+    }
+
+    #[gpui::test]
+    async fn task_env_overrides_the_environment_file_for_the_same_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(HeadlessTerminal(true)));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ "vars.env": "SHARED=from_file\n" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let (program, args) =
+            ShellBuilder::new(&Shell::System, false).build(Some("echo $SHARED".to_string()), &[]);
+        let mut env = HashMap::default();
+        env.insert("SHARED".to_string(), "from_task_env".to_string());
+        let spawn_task = SpawnInTerminal {
+            command: Some(program),
+            args,
+            cwd: Some(PathBuf::from("/tmp")),
+            env_file: Some(PathBuf::from("/project/vars.env")),
+            env,
+            ..SpawnInTerminal::default()
+        };
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(spawn_task, cx)
+            })
+            .await
+            .unwrap();
+        terminal
+            .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+            .await;
+
+        let content = content_eventually_containing(&terminal, "from_task_env", cx).await;
+        assert!(
+            content.contains("from_task_env"),
+            "the task's own env must win over the environment file for the same key, got: {content}"
+        );
+        assert!(
+            !content.contains("from_file"),
+            "the file's value must not survive once the task's own env overrides it, got: {content}"
+        );
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
