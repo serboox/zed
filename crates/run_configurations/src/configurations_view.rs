@@ -1,13 +1,18 @@
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, actions,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowOptions, actions, point,
 };
+use platform_title_bar::PlatformTitleBar;
 use project::Project;
 use serde_json::Value;
+use settings::Settings as _;
 use task::{DebugScenario, TaskTemplate};
 use ui::{Tooltip, WithScrollbar, prelude::*};
-use workspace::{Item, Workspace, item::ItemEvent};
+use util::ResultExt as _;
+use uuid::Uuid;
+use workspace::{Item, Workspace, client_side_decorations, item::ItemEvent};
 
 use crate::configurations_file::{self, Configuration, Kind};
 
@@ -118,15 +123,140 @@ pub fn init(cx: &mut App) {
                 });
             }
         });
-        workspace.register_action(|workspace, _: &OpenRunConfigurations, window, cx| {
-            let project = workspace.project().clone();
-            let handle = workspace.weak_handle();
-            workspace.toggle_modal(window, cx, move |window, cx| {
-                RunConfigurationsView::new(project, handle, window, cx)
-            });
+        workspace.register_action(|workspace, _: &OpenRunConfigurations, _window, cx| {
+            open_window(workspace.project().clone(), workspace.weak_handle(), cx);
         });
     })
     .detach();
+}
+
+/// Where the window was left, so reopening it does not undo the reader's
+/// dragging and sizing. Held for the run of the editor rather than written down:
+/// the placement matters within a sitting, and a stored one can name a display
+/// that is no longer plugged in.
+struct WhereItWasLeft {
+    bounds: Bounds<Pixels>,
+    display: Uuid,
+}
+
+impl gpui::Global for WhereItWasLeft {}
+
+/// The size it opens at when it has not been sized yet: as wide as two columns
+/// need, and no wider, so what is being read behind it is still there.
+const OPENING_SIZE: Size<Pixels> = Size {
+    width: px(960.),
+    height: px(600.),
+};
+
+/// Small enough to be pushed aside, large enough that the form still has a
+/// column beside the list rather than one word a line.
+const SMALLEST_SIZE: Size<Pixels> = Size {
+    width: px(640.),
+    height: px(400.),
+};
+
+/// Opens the configurations in a window of the reader's own: it is moved and
+/// sized like any other, and the editor stays readable behind it.
+pub fn open_window(project: Entity<Project>, workspace: WeakEntity<Workspace>, cx: &mut App) {
+    // One window over one project's files. A second over the same project would
+    // write the same file from two forms and the later save would quietly win,
+    // so an open one is brought forward instead. A window belonging to another
+    // project is somebody else's and is left where it is.
+    let asked_for = workspace.entity_id();
+    // Deferred to get the workspace off the stack: the action that led here is
+    // still updating it, and opening a window reads it again. Everything else
+    // waits until then as well, so two asks in one frame cannot both decide that
+    // there is no window yet and open one each.
+    cx.defer(move |cx| {
+        if workspace.upgrade().is_none() {
+            return;
+        }
+        if let Some(open_already) = window_over(asked_for, cx) {
+            open_already
+                .update(cx, |view, window, cx| {
+                    window.activate_window();
+                    view.focus.clone().focus(window, cx);
+                })
+                .log_err();
+            return;
+        }
+
+        let bounds = where_to_open(cx);
+        let app_id = release_channel::ReleaseChannel::global(cx).app_id();
+        let decorations = match std::env::var("ZED_WINDOW_DECORATIONS") {
+            Ok(asked) if asked == "server" => gpui::WindowDecorations::Server,
+            Ok(asked) if asked == "client" => gpui::WindowDecorations::Client,
+            _ => match workspace::WorkspaceSettings::get_global(cx).window_decorations {
+                settings::WindowDecorations::Server => gpui::WindowDecorations::Server,
+                settings::WindowDecorations::Client => gpui::WindowDecorations::Client,
+            },
+        };
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("Zed — Run configurations".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
+            }),
+            focus: true,
+            show: true,
+            is_movable: true,
+            kind: gpui::WindowKind::Normal,
+            window_background: cx.theme().window_background_appearance(),
+            app_id: Some(app_id.to_owned()),
+            window_decorations: Some(decorations),
+            window_min_size: Some(SMALLEST_SIZE),
+            window_bounds: Some(bounds),
+            ..Default::default()
+        };
+        let opened = cx.open_window(options, |window, cx| {
+            cx.new(|cx| RunConfigurationsView::new(project, workspace, window, cx))
+        });
+        if let Some(handle) = opened.log_err() {
+            handle
+                .update(cx, |view, window, cx| {
+                    window.activate_window();
+                    view.focus.clone().focus(window, cx);
+                })
+                .log_err();
+        }
+    });
+}
+
+/// The form already open over this workspace, if there is one. One window over
+/// one project's files: a second over the same project would write the same file
+/// from two forms and the later save would quietly win. A window belonging to
+/// another project is somebody else's and is left where it is.
+fn window_over(
+    workspace: gpui::EntityId,
+    cx: &App,
+) -> Option<gpui::WindowHandle<RunConfigurationsView>> {
+    cx.windows().into_iter().find_map(|window| {
+        let handle = window.downcast::<RunConfigurationsView>()?;
+        let same_project = handle
+            .read(cx)
+            .ok()
+            .is_some_and(|view| view.workspace.entity_id() == workspace);
+        same_project.then_some(handle)
+    })
+}
+
+/// Where it was left, if that screen is still there and still holds it;
+/// otherwise the middle of the screen at the size it opens at.
+fn where_to_open(cx: &mut App) -> WindowBounds {
+    let left = cx.try_global::<WhereItWasLeft>().and_then(|left| {
+        let screen = cx
+            .displays()
+            .into_iter()
+            .find(|display| display.uuid().ok() == Some(left.display))?;
+        screen
+            .bounds()
+            .intersects(&left.bounds)
+            .then_some(left.bounds)
+    });
+    match left {
+        Some(bounds) => WindowBounds::Windowed(bounds),
+        None => WindowBounds::centered(OPENING_SIZE, cx),
+    }
 }
 
 /// Runs `task` in the workspace, with the project's own variables filled in.
@@ -250,6 +380,11 @@ pub struct RunConfigurationsView {
     trouble: Option<SharedString>,
     list_scroll: ScrollHandle,
     form_scroll: ScrollHandle,
+    /// The bar the window is dragged by, and which carries its buttons. macOS
+    /// draws its own, so there is nothing to put there.
+    title_bar: Option<Entity<PlatformTitleBar>>,
+    /// A drag delivers a bounds change a frame; the last one is what is kept.
+    remembering_bounds: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -263,13 +398,38 @@ impl RunConfigurationsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let store = crate::configurations_store::store_for(&project, cx);
-        let mut subscriptions = vec![cx.subscribe_in(
-            &store,
-            window,
-            |view: &mut Self, _, _: &ConfigurationsChanged, window, cx| {
-                view.the_files_changed(window, cx)
-            },
-        )];
+        let mut subscriptions = vec![
+            cx.subscribe_in(
+                &store,
+                window,
+                |view: &mut Self, _, _: &ConfigurationsChanged, window, cx| {
+                    view.the_files_changed(window, cx)
+                },
+            ),
+            cx.observe_window_bounds(window, |view, window, cx| {
+                view.remember_where_it_was_left(window, cx);
+            }),
+            // Only a window can say which appearance it was given, and the
+            // application-wide guess can differ from it. Without this the window
+            // opens light in front of a dark editor.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                *theme::SystemAppearance::global_mut(cx) =
+                    theme::SystemAppearance(window.appearance().into());
+                theme_settings::reload_theme(cx);
+                theme_settings::reload_icon_theme(cx);
+            }),
+        ];
+        // The form writes one project's files. When that project's window goes,
+        // so does this one -- a form left behind writes to a project nobody has
+        // open any more. A view put in a pane is not its window's root, and
+        // removing the window there would close the editor itself.
+        if let Some(alive) = workspace.upgrade() {
+            subscriptions.push(cx.observe_release_in(&alive, window, |_, _, window, _| {
+                if window.window_handle().downcast::<Self>().is_some() {
+                    window.remove_window();
+                }
+            }));
+        }
 
         let field = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| {
@@ -348,12 +508,48 @@ impl RunConfigurationsView {
             trouble: None,
             list_scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
+            title_bar: (!cfg!(target_os = "macos"))
+                .then(|| cx.new(|cx| PlatformTitleBar::new("run-configurations-title-bar", cx))),
+            remembering_bounds: None,
             _subscriptions: subscriptions,
         };
         // Watching starts with the view: a run that is already going should be
         // reported the moment this is opened, not a second after somebody clicks.
         view.watch_the_run(cx);
         view
+    }
+
+    fn remember_where_it_was_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remembering_bounds.is_some() {
+            return;
+        }
+        self.remembering_bounds = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            view.update_in(cx, |view, window, cx| {
+                view.remembering_bounds.take();
+                // A maximized or fullscreen window has no placement worth
+                // keeping: it would come back as a window the reader never sized.
+                if let WindowBounds::Windowed(bounds) = window.inner_window_bounds()
+                    && let Some(display) = window.display(cx).and_then(|it| it.uuid().ok())
+                {
+                    cx.set_global(WhereItWasLeft { bounds, display });
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    /// Closing is closing the window: it is the reader's own now, not a sheet
+    /// over the editor.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A view added to a pane by hand has no window of its own to remove, and
+        // the tab is closed the way any tab is.
+        match window.window_handle().downcast::<Self>() {
+            Some(_) => window.remove_window(),
+            None => cx.emit(gpui::DismissEvent),
+        }
     }
 
     /// The files were read again. What is being shown follows them, unless the
@@ -1650,8 +1846,6 @@ impl RunConfigurationsView {
 }
 
 impl EventEmitter<gpui::DismissEvent> for RunConfigurationsView {}
-impl workspace::ModalView for RunConfigurationsView {}
-
 impl Focusable for RunConfigurationsView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -1786,7 +1980,7 @@ impl RunConfigurationsView {
             .child(
                 Button::new("configuration-cancel", "Close")
                     .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(gpui::DismissEvent))),
+                    .on_click(cx.listener(|view, _, window, cx| view.close(window, cx))),
             )
             .child(
                 Button::new("configuration-save", "Save")
@@ -1826,7 +2020,7 @@ impl Render for RunConfigurationsView {
             })
             .collect();
 
-        v_flex()
+        let body = v_flex()
             .key_context("RunConfigurations")
             .track_focus(&self.focus)
             .debug_selector(|| "run-configurations".to_string())
@@ -1837,12 +2031,12 @@ impl Render for RunConfigurationsView {
                 cx.listener(|view, _: &DebugThisConfiguration, window, cx| view.debug(window, cx)),
             )
             .on_action(cx.listener(|view, _: &SaveThisConfiguration, _, cx| view.save(cx)))
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(gpui::DismissEvent)))
-            // A window, not a document: as wide as two columns need and no wider,
-            // so what is being read behind it is still there.
-            .w(px(960.))
-            .h(px(600.))
-            .elevation_3(cx)
+            .on_action(cx.listener(|view, _: &menu::Cancel, window, cx| view.close(window, cx)))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .bg(cx.theme().colors().background)
+            .text_color(cx.theme().colors().text)
             .overflow_hidden()
             .child(
                 h_flex()
@@ -1878,7 +2072,31 @@ impl Render for RunConfigurationsView {
                     .child(self.render_list(window, cx))
                     .child(self.render_form(window, cx)),
             )
-            .child(self.render_footer(cx))
+            .child(self.render_footer(cx));
+
+        // A window of its own gets a window's shell: a bar to drag it by and
+        // borders to pull. The same view can also be put in a pane as a tab,
+        // which has both already and must not grow a second set.
+        if window.window_handle().downcast::<Self>().is_none() {
+            return body.into_any_element();
+        }
+
+        client_side_decorations(
+            v_flex()
+                .size_full()
+                .bg(cx.theme().colors().background)
+                .child(
+                    div()
+                        .debug_selector(|| "run-configurations-titlebar".to_string())
+                        .w_full()
+                        .flex_none()
+                        .children(self.title_bar.clone()),
+                )
+                .child(body),
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 }
 
@@ -1905,7 +2123,7 @@ mod tests {
     use super::*;
 
     use fs::Fs as _;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext, size};
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
@@ -1934,6 +2152,7 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             crate::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
         });
     }
 
@@ -1973,6 +2192,248 @@ mod tests {
         });
         cx.run_until_parked();
         (view, fs, cx.clone())
+    }
+
+    /// The configurations open in a window of the reader's own: one they can drag
+    /// anywhere and pull to any size, not a sheet pinned to the middle of the
+    /// editor. Measured on the window itself and on what it paints, since a
+    /// fixed-size view would keep its size however the window is pulled.
+    #[gpui::test]
+    async fn the_configurations_open_in_a_window_that_can_be_moved_and_sized(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // Through a whole window, because the action that opens it is registered
+        // by the workspace and only listened for there.
+        let (_multi_workspace, editor_cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        editor_cx.run_until_parked();
+        let windows_before = editor_cx.update(|_, cx| cx.windows().len());
+
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.run_until_parked();
+
+        let opened = editor_cx
+            .update(|_, cx| {
+                cx.windows()
+                    .into_iter()
+                    .find_map(|window| window.downcast::<RunConfigurationsView>())
+            })
+            .expect("the configurations opened a window of their own");
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            windows_before + 1,
+            "the editor's window is still there, with the configurations beside it"
+        );
+
+        let mut window_cx = VisualTestContext::from_window(opened.into(), &editor_cx.cx);
+        window_cx.run_until_parked();
+        let narrow = window_cx
+            .debug_bounds("run-configurations")
+            .expect("the configurations are painted in their window");
+
+        // Pulled wider by 240 pixels: what is inside has to follow the window,
+        // which a view laid out at a fixed width would not.
+        let was = window_cx.update(|window, _| window.bounds().size);
+        window_cx.simulate_resize(size(was.width + px(240.), was.height + px(120.)));
+        window_cx.run_until_parked();
+        let wide = window_cx
+            .debug_bounds("run-configurations")
+            .expect("the configurations are still painted after the window was pulled");
+        assert!(
+            wide.size.width > narrow.size.width + px(200.),
+            "the form had to follow the window: {:?} against {:?}",
+            narrow.size.width,
+            wide.size.width
+        );
+        assert!(
+            wide.size.height > narrow.size.height + px(80.),
+            "and follow it downwards too: {:?} against {:?}",
+            narrow.size.height,
+            wide.size.height
+        );
+
+        // Dragging the window itself is the window manager's to do -- the test
+        // platform refuses to be asked -- so what is checked here is that there
+        // is a bar to drag it by, across the top of the window.
+        let bar = window_cx
+            .debug_bounds("run-configurations-titlebar")
+            .expect("the window has a bar to drag it by");
+        assert!(
+            bar.size.height > px(8.),
+            "the bar has to be tall enough to grab: {:?}",
+            bar.size
+        );
+        assert!(
+            bar.size.width > wide.size.width - px(4.),
+            "the bar spans the window: {:?} against {:?}",
+            bar.size.width,
+            wide.size.width
+        );
+        assert!(
+            bar.origin.y < wide.origin.y,
+            "and sits above the form, not under it: {:?} against {:?}",
+            bar.origin.y,
+            wide.origin.y
+        );
+
+        // Closing it is closing the window, and the editor is left alone.
+        window_cx.dispatch_action(menu::Cancel);
+        window_cx.run_until_parked();
+        // Counted from the editor's window, since the one that was closed can no
+        // longer be asked anything.
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            windows_before,
+            "closing the configurations left only the editor's own window"
+        );
+    }
+
+    /// Two projects are two sets of files, so each gets its own form. Asking
+    /// from the second must not bring the first project's window forward, which
+    /// would show -- and then write -- somebody else's configurations.
+    #[gpui::test]
+    async fn a_second_project_gets_a_window_of_its_own(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/one"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        fs.insert_tree(path!("/two"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let first = Project::test(fs.clone(), [path!("/one").as_ref()], cx).await;
+        let second = Project::test(fs.clone(), [path!("/two").as_ref()], cx).await;
+
+        let one = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(first.clone(), window, cx)
+        });
+        let two = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(second.clone(), window, cx)
+        });
+        let mut one_cx = VisualTestContext::from_window(one.into(), cx);
+        let mut two_cx = VisualTestContext::from_window(two.into(), cx);
+        one_cx.run_until_parked();
+        two_cx.run_until_parked();
+
+        one_cx.dispatch_action(OpenRunConfigurations);
+        one_cx.run_until_parked();
+        two_cx.dispatch_action(OpenRunConfigurations);
+        two_cx.run_until_parked();
+        assert_eq!(
+            forms_open(&mut two_cx),
+            2,
+            "each project has to get a form of its own"
+        );
+
+        // And asking the first project again brings its own window forward
+        // rather than opening a third.
+        one_cx.dispatch_action(OpenRunConfigurations);
+        one_cx.run_until_parked();
+        assert_eq!(
+            forms_open(&mut one_cx),
+            2,
+            "asking again had to reach that project's own open window"
+        );
+    }
+
+    /// Two asks in the same frame are two asks for the same window. Both are
+    /// answered after the frame, so neither may decide on its own that there is
+    /// no window yet.
+    #[gpui::test]
+    async fn asking_twice_in_one_frame_opens_one_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (_multi_workspace, editor_cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        editor_cx.run_until_parked();
+
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.run_until_parked();
+        assert_eq!(
+            forms_open(editor_cx),
+            1,
+            "the two asks had to end up at the same window"
+        );
+    }
+
+    /// The form writes one project's files. When that project's window closes
+    /// there is nothing left for it to write to, so it goes with it rather than
+    /// being left behind over a project nobody has open.
+    #[gpui::test]
+    async fn closing_the_editor_takes_the_form_with_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let editor = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let mut editor_cx = VisualTestContext::from_window(editor.into(), cx);
+        editor_cx.run_until_parked();
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.run_until_parked();
+        assert_eq!(forms_open(&mut editor_cx), 1, "the form opened");
+
+        editor_cx.update(|window, _| window.remove_window());
+        // Counted through the application, since by then neither window is left
+        // to be asked anything.
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .filter(|window| window.downcast::<RunConfigurationsView>().is_some())
+                    .count()
+            }),
+            0,
+            "the form had to close with the project's own window"
+        );
+    }
+
+    fn forms_open(cx: &mut VisualTestContext) -> usize {
+        cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter(|window| window.downcast::<RunConfigurationsView>().is_some())
+                .count()
+        })
+    }
+
+    /// Asking for the configurations while they are already open brings that
+    /// window forward instead of opening a second form over the same files.
+    #[gpui::test]
+    async fn asking_again_brings_the_open_window_forward(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (_multi_workspace, editor_cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        editor_cx.run_until_parked();
+
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.run_until_parked();
+        let after_first = editor_cx.update(|_, cx| cx.windows().len());
+
+        editor_cx.dispatch_action(OpenRunConfigurations);
+        editor_cx.run_until_parked();
+        assert_eq!(
+            editor_cx.update(|_, cx| cx.windows().len()),
+            after_first,
+            "the second ask had to reach the open window, not open another one"
+        );
     }
 
     /// The whole chain the gutter starts: what the editor found becomes a window
