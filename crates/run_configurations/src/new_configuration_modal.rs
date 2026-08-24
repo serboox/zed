@@ -3,8 +3,8 @@ use std::path::Path;
 use collections::HashMap;
 use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    WeakEntity, Window,
+    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    SharedString, WeakEntity, Window,
 };
 use task::TaskTemplate;
 use ui::{ElevationIndex, prelude::*};
@@ -178,6 +178,11 @@ pub struct NewConfigurationModal {
     pub args: Entity<Editor>,
     pub cwd: Entity<Editor>,
     pub env_file: Entity<Editor>,
+    /// A terminal of its own for every run, rather than the last one reused.
+    use_new_terminal: bool,
+    /// Several runs of this configuration at once, rather than the running one
+    /// being replaced.
+    several_at_once: bool,
     found_at: Option<String>,
     trouble: Option<SharedString>,
 }
@@ -252,6 +257,8 @@ impl NewConfigurationModal {
                 window,
                 cx,
             ),
+            use_new_terminal: task.use_new_terminal,
+            several_at_once: task.allow_concurrent_runs,
             found_at,
             trouble: None,
         }
@@ -273,6 +280,8 @@ impl NewConfigurationModal {
                 .collect(),
             cwd: (!cwd.is_empty()).then_some(cwd),
             env_file: (!env_file.is_empty()).then_some(env_file),
+            use_new_terminal: self.use_new_terminal,
+            allow_concurrent_runs: self.several_at_once,
             ..TaskTemplate::default()
         }
     }
@@ -322,6 +331,57 @@ impl NewConfigurationModal {
             .file_path(Kind::Task)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "no folder is open".to_string())
+    }
+
+    fn render_run_toggles(&self, cx: &mut Context<Self>) -> AnyElement {
+        let switch = |id: &'static str,
+                      label: &'static str,
+                      hint: &'static str,
+                      on: bool,
+                      cx: &mut Context<Self>,
+                      toggle: fn(&mut Self, &mut Context<Self>)| {
+            h_flex()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .on_click(cx.listener(move |modal, _, _window, cx| toggle(modal, cx)))
+                .child(ui::Checkbox::new(
+                    id,
+                    match on {
+                        true => ui::ToggleState::Selected,
+                        false => ui::ToggleState::Unselected,
+                    },
+                ))
+                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        v_flex()
+            .gap_1()
+            .child(switch(
+                "new-configuration-new-terminal",
+                "A terminal of its own",
+                "every run opens one rather than reusing the last",
+                self.use_new_terminal,
+                cx,
+                |modal, cx| {
+                    modal.use_new_terminal = !modal.use_new_terminal;
+                    cx.notify();
+                },
+            ))
+            .child(switch(
+                "new-configuration-several-at-once",
+                "Several at once",
+                "a new run leaves the running one alone",
+                self.several_at_once,
+                cx,
+                |modal, cx| {
+                    modal.several_at_once = !modal.several_at_once;
+                    cx.notify();
+                },
+            ))
+            .into_any_element()
     }
 }
 
@@ -377,6 +437,7 @@ impl Render for NewConfigurationModal {
             .child(field("Arguments", &self.args, true))
             .child(field("Working directory", &self.cwd, false))
             .child(field("Environment file", &self.env_file, false))
+            .child(self.render_run_toggles(cx))
             .child(
                 Label::new(format!("It will be written to {}", self.where_it_goes(cx)))
                     .size(LabelSize::XSmall)
@@ -414,7 +475,10 @@ impl Render for NewConfigurationModal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::Fs as _;
+    use gpui::{TestAppContext, VisualTestContext};
     use std::path::PathBuf;
+    use util::path;
 
     #[test]
     fn each_language_is_offered_the_way_it_is_usually_run() {
@@ -453,8 +517,9 @@ mod tests {
         let line = how.args.join(" ");
 
         assert!(
-            line.contains("${XDG_CACHE_HOME-$HOME/.cache}/zed/run"),
-            "the binary goes to the editor's cache, wherever the shell says that is: {line}"
+            line.contains("$RUN_CONFIGURATION_CACHE_ROOT"),
+            "the binary goes to the editor's own cache, read by name so no path is \
+             spliced into the command: {line}"
         );
         assert!(
             !line.contains("target/"),
@@ -586,5 +651,162 @@ mod tests {
             task.label, "run report",
             "and it is named after the file, so the list reads as something"
         );
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn debug_center(
+        cx: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Point<gpui::Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("expected debug bounds for {selector}"))
+            .center()
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+    }
+
+    /// A window opened the way the gutter opens it: through the workspace action,
+    /// with the offer left in the global the editor uses to hand one over.
+    async fn a_modal_over(
+        offer: EntryPointOffer,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<NewConfigurationModal>,
+        std::sync::Arc<project::FakeFs>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({ "cmd": { "api": { "main.go": "package main\n\nfunc main() {}\n" } } }),
+        )
+        .await;
+        let project = project::Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // Through a whole window, because the action the gutter dispatches is only
+        // listened for there.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| cx.set_global(offer));
+        cx.dispatch_action(crate::CreateFromEntryPoint);
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<NewConfigurationModal>(cx)
+            })
+            .expect("asking the gutter opens the window");
+        (modal, fs, cx.clone())
+    }
+
+    fn an_offer() -> EntryPointOffer {
+        EntryPointOffer {
+            language: Some("Go".to_string()),
+            file: Some(PathBuf::from(path!("/project/cmd/api/main.go"))),
+            line: 3,
+            label: Some("go run ./cmd/api".to_string()),
+            command: Some("go".to_string()),
+            args: vec!["run".to_string(), ".".to_string()],
+            cwd: Some("${ZED_DIRNAME}".to_string()),
+            env: Default::default(),
+        }
+    }
+
+    /// The window offers the same two toggles the "All configurations" window
+    /// does, and clicking them here reaches the file exactly the same way.
+    #[gpui::test]
+    async fn the_run_toggles_are_written_into_the_file(cx: &mut TestAppContext) {
+        let (modal, fs, mut cx) = a_modal_over(an_offer(), cx).await;
+        draw(&mut cx);
+
+        assert!(
+            !modal.read_with(&cx, |modal, _| modal.use_new_terminal),
+            "a fresh configuration says nothing about terminals until somebody says so"
+        );
+        assert!(
+            !modal.read_with(&cx, |modal, _| modal.several_at_once),
+            "nor about running several at once"
+        );
+
+        for switch in [
+            "new-configuration-new-terminal",
+            "new-configuration-several-at-once",
+        ] {
+            let at = debug_center(&mut cx, switch);
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+            draw(&mut cx);
+        }
+        modal.update_in(&mut cx, |modal, window, cx| modal.save(false, window, cx));
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("saving writes the project's own file");
+        let read_back = configurations_file::read(Kind::Task, &written);
+        let task = read_back.configurations[0]
+            .task
+            .as_ref()
+            .expect("a task the editor reads back");
+        assert!(
+            task.use_new_terminal,
+            "a terminal of its own is in the file"
+        );
+        assert!(
+            task.allow_concurrent_runs,
+            "and so is running several at once"
+        );
+        assert!(
+            written.contains("use_new_terminal") && written.contains("allow_concurrent_runs"),
+            "written under the names the file uses:\n{written}"
+        );
+    }
+
+    /// A configuration nobody touched the toggles on is written the same as any
+    /// other task with nothing said about how it runs: neither key in the file.
+    #[gpui::test]
+    async fn leaving_the_toggles_untouched_keeps_the_defaults(cx: &mut TestAppContext) {
+        let (modal, fs, mut cx) = a_modal_over(an_offer(), cx).await;
+        draw(&mut cx);
+
+        modal.update_in(&mut cx, |modal, window, cx| modal.save(false, window, cx));
+        cx.run_until_parked();
+
+        let written = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("saving writes the project's own file");
+        assert!(
+            !written.contains("use_new_terminal") && !written.contains("allow_concurrent_runs"),
+            "an untouched configuration says nothing about either toggle:\n{written}"
+        );
+        let read_back = configurations_file::read(Kind::Task, &written);
+        let task = read_back.configurations[0]
+            .task
+            .as_ref()
+            .expect("a task the editor reads back");
+        assert!(!task.use_new_terminal);
+        assert!(!task.allow_concurrent_runs);
     }
 }

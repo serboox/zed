@@ -54,9 +54,7 @@ const DEBUGGERS: [(&str, &[&str]); 4] = [
     ),
     (
         "CodeLLDB",
-        &[
-            "cargo", "rustc", "gcc", "g++", "clang", "clang++", "make", "mise",
-        ],
+        &["cargo", "rustc", "gcc", "g++", "clang", "clang++"],
     ),
 ];
 
@@ -1707,7 +1705,7 @@ impl RunConfigurationsView {
             .into_any_element()
     }
 
-    fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_form(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some((kind, _)) = self.chosen else {
             return v_flex()
                 .flex_1()
@@ -1764,7 +1762,7 @@ impl RunConfigurationsView {
             .child(field("NAME", &self.label, false))
             .when(kind == Kind::Task, |form| {
                 form.child(field("COMMAND", &self.command, false))
-                    .child(field("ARGUMENTS", &self.args, true))
+                    .child(field("ARGUMENTS", &self.args, false))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
                     .child(self.render_env(cx))
                     .child(
@@ -1796,51 +1794,6 @@ impl RunConfigurationsView {
                 form.child(self.render_run_toggles(cx))
             })
             .child(self.render_as_json(kind, cx))
-            .child(self.render_where_it_lives(window, cx))
-            .into_any_element()
-    }
-
-    /// Says which file this comes from, and offers to open it: clicking a form
-    /// together and writing the file are the same thing, and the reader should be
-    /// able to switch at any moment.
-    fn render_where_it_lives(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let store = self.store.read(cx);
-        let shown = |kind: Kind| {
-            store
-                .file_path(kind)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "no folder is open".to_string())
-        };
-        v_flex()
-            .w_full()
-            .gap_1()
-            .pt_2()
-            .border_t_1()
-            .border_color(ui::cyberpunk::border_dim())
-            .child(
-                Label::new("Everything here is what these files say:")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .children([Kind::Task, Kind::Debug].map(|kind| {
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new(shown(kind))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .buffer_font(cx),
-                    )
-                    .child(
-                        Button::new(("open-file", kind as usize), "Open")
-                            .label_size(LabelSize::XSmall)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.open_the_file(kind, window, cx)
-                            })),
-                    )
-            }))
             .into_any_element()
     }
 }
@@ -1943,10 +1896,25 @@ impl RunConfigurationsView {
         .detach();
     }
 
+    /// Why the Debug button on the footer has to be withheld for the chosen
+    /// configuration, or `None` when it may be pressed. Only a task's own
+    /// command is judged: a debug configuration already names its debugger, so
+    /// deriving one from a command never comes up for it.
+    fn why_the_debug_button_is_withheld(&self, cx: &App) -> Option<&'static str> {
+        match self.chosen {
+            Some((Kind::Task, _)) => {
+                crate::debugging::why_it_cannot_be_debugged(&self.command.read(cx).text(cx))
+            }
+            _ => None,
+        }
+    }
+
     /// What the window is for, at the foot of it: where this is written down, and
     /// what can be done with the one in front of the reader.
     fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_one = self.chosen.is_some();
+        let kind_being_edited = self.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
+        let cannot_debug = self.why_the_debug_button_is_withheld(cx);
         h_flex()
             .flex_none()
             .w_full()
@@ -1957,14 +1925,23 @@ impl RunConfigurationsView {
             .border_t_1()
             .border_color(ui::cyberpunk::border_dim())
             .child(
-                Label::new(format!(
-                    "Kept in .zed/{}",
-                    self.chosen
-                        .map(|(kind, _)| kind.file_name())
-                        .unwrap_or(Kind::Task.file_name())
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+                Label::new(format!("Kept in .zed/{}", kind_being_edited.file_name()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .id("configuration-open-file-hit-area")
+                    .debug_selector(|| "configuration-open-file".to_string())
+                    .child(
+                        Button::new("configuration-open-file-button", "Open")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!has_one)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                let kind = view.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
+                                view.open_the_file(kind, window, cx)
+                            })),
+                    ),
             )
             // What the run is using, and the way to stop watching it: this says
             // plainly when nothing is running, so the line is always here and the
@@ -1989,10 +1966,18 @@ impl RunConfigurationsView {
                     .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
             )
             .child(
-                Button::new("configuration-debug", "Debug")
-                    .label_size(LabelSize::Small)
-                    .disabled(!has_one)
-                    .on_click(cx.listener(|view, _, window, cx| view.debug(window, cx))),
+                div()
+                    .id("configuration-debug-hit-area")
+                    .debug_selector(|| "configuration-debug".to_string())
+                    .child(
+                        Button::new("configuration-debug-button", "Debug")
+                            .label_size(LabelSize::Small)
+                            .disabled(!has_one || cannot_debug.is_some())
+                            .when_some(cannot_debug, |button, reason| {
+                                button.tooltip(Tooltip::text(reason))
+                            })
+                            .on_click(cx.listener(|view, _, window, cx| view.debug(window, cx))),
+                    ),
             )
             .child(
                 Button::new("configuration-run", "Run")
@@ -3224,5 +3209,183 @@ mod tests {
                 "a first guess for {command:?} that the reader then changes"
             );
         }
+    }
+
+    /// A Makefile target is opaque: no locator can say what it builds, so the
+    /// mockup calls for a Debug button that stays on screen but does nothing --
+    /// painted disabled, and unmoved by a click where it sits.
+    #[gpui::test]
+    async fn the_debug_button_is_withheld_with_a_reason_for_an_opaque_command(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "build", "command": "make build" }]"#),
+            cx,
+        )
+        .await;
+        view.update_in(&mut cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let reason = view.read_with(&cx, |view, cx| view.why_the_debug_button_is_withheld(cx));
+        assert!(
+            reason.is_some_and(|reason| !reason.is_empty()),
+            "a Makefile target's artifact cannot be worked out, so the button has to say why"
+        );
+
+        let before = view.read_with(&cx, |view, cx| {
+            (
+                view.chosen,
+                view.store
+                    .read(cx)
+                    .of_kind(Kind::Debug)
+                    .configurations
+                    .len(),
+            )
+        });
+        let at = debug_center(&mut cx, "configuration-debug");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let after = view.read_with(&cx, |view, cx| {
+            (
+                view.chosen,
+                view.store
+                    .read(cx)
+                    .of_kind(Kind::Debug)
+                    .configurations
+                    .len(),
+            )
+        });
+        assert_eq!(
+            before, after,
+            "the button is disabled, so a click where it is painted must do nothing"
+        );
+    }
+
+    /// The counterpart of the test above: a command a locator was written for
+    /// keeps offering a guess, exactly as it did before the button could be
+    /// withheld.
+    #[gpui::test]
+    async fn the_debug_button_still_offers_a_guess_for_a_command_a_locator_understands(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "tests", "command": "cargo test" }]"#),
+            cx,
+        )
+        .await;
+        view.update_in(&mut cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert_eq!(
+            view.read_with(&cx, |view, cx| view.why_the_debug_button_is_withheld(cx)),
+            None,
+            "cargo has a locator, so nothing withholds the button"
+        );
+
+        let at = debug_center(&mut cx, "configuration-debug");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.chosen.map(|(kind, _)| kind)),
+            Some(Kind::Debug),
+            "the button is enabled, so pressing it where it is painted offers a debug \
+             configuration to save"
+        );
+    }
+
+    /// The footer's Open button, with a task shown, has to reach for tasks.json
+    /// alone -- not the form-embedded pair the old block offered for both files
+    /// at once, one of which was never the one being edited.
+    #[gpui::test]
+    async fn the_footer_open_button_reaches_only_the_task_file_for_a_task(cx: &mut TestAppContext) {
+        let (view, fs, mut cx) =
+            a_view_of(Some(r#"[{ "label": "one", "command": "true" }]"#), cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let at = debug_center(&mut cx, "configuration-open-file");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !fs.is_file(path!("/project/.zed/debug.json").as_ref()).await,
+            "editing a task must not reach for the debug file"
+        );
+        let tasks_after = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("opening the task file must not have removed it");
+        assert!(
+            tasks_after.contains("\"command\": \"true\""),
+            "opening the task file must not have rewritten it:\n{tasks_after}"
+        );
+    }
+
+    /// The counterpart: with a debug configuration shown, the same button has
+    /// to reach for debug.json, made if it was not there yet, and leave the
+    /// task file alone.
+    #[gpui::test]
+    async fn the_footer_open_button_reaches_only_the_debug_file_for_a_debug_configuration(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, fs, mut cx) =
+            a_view_of(Some(r#"[{ "label": "one", "command": "true" }]"#), cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.start_a_new_one(Kind::Debug, window, cx)
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.chosen.map(|(kind, _)| kind)),
+            Some(Kind::Debug),
+            "a debug configuration is the one shown"
+        );
+
+        let at = debug_center(&mut cx, "configuration-open-file");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            fs.is_file(path!("/project/.zed/debug.json").as_ref()).await,
+            "editing a debug configuration must open debug.json, made if it was not there"
+        );
+        let tasks_after = fs
+            .load(path!("/project/.zed/tasks.json").as_ref())
+            .await
+            .expect("the task file is still there");
+        assert!(
+            tasks_after.contains("\"command\": \"true\""),
+            "opening the debug file must not have touched the task file:\n{tasks_after}"
+        );
     }
 }

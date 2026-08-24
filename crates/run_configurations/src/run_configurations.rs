@@ -2,6 +2,7 @@ pub mod configurations_file;
 pub mod configurations_store;
 pub mod configurations_toolbar;
 pub mod configurations_view;
+pub mod debugging;
 pub mod new_configuration_modal;
 pub mod process_metrics;
 pub mod ways_to_run_modal;

@@ -98,10 +98,10 @@ impl ConfigurationsToolbar {
         cx.notify();
     }
 
-    /// The task the switcher would run, if it is a task at all.
-    fn task_it_points_at(&self, cx: &App) -> Option<TaskTemplate> {
+    /// The task this pointing would run, if it points at a task at all.
+    fn task_at(&self, pointing: &Pointing, cx: &App) -> Option<TaskTemplate> {
         let store = self.store.read(cx);
-        match self.pointing.as_ref()? {
+        match pointing {
             Pointing::Kept { kind, at } => store.get(*kind, *at)?.task.clone(),
             Pointing::Remembered { label } => store
                 .temporary()
@@ -109,6 +109,35 @@ impl ConfigurationsToolbar {
                 .find(|task| &task.label == label)
                 .cloned(),
         }
+    }
+
+    /// The task the switcher would run, if it is a task at all.
+    fn task_it_points_at(&self, cx: &App) -> Option<TaskTemplate> {
+        self.task_at(self.pointing.as_ref()?, cx)
+    }
+
+    /// The debug scenario this pointing would start, if it already is one. A
+    /// temporary one is always a plain task, never a debug scenario.
+    fn scenario_at(&self, pointing: &Pointing, cx: &App) -> Option<task::DebugScenario> {
+        match pointing {
+            Pointing::Kept { kind, at } => self
+                .store
+                .read(cx)
+                .get(*kind, *at)
+                .and_then(|configuration| configuration.scenario.clone()),
+            Pointing::Remembered { .. } => None,
+        }
+    }
+
+    /// Why a debugger cannot be derived for this pointing, or `None` when it
+    /// can. A debug configuration is already what debugging is, so it always
+    /// can -- there is nothing to derive from it.
+    fn cannot_be_debugged(&self, pointing: &Pointing, cx: &App) -> Option<&'static str> {
+        if self.scenario_at(pointing, cx).is_some() {
+            return None;
+        }
+        let command = self.task_at(pointing, cx).map(|task| task.command);
+        crate::debugging::why_it_cannot_be_debugged(command.as_deref().unwrap_or(""))
     }
 
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -229,6 +258,13 @@ impl Render for ConfigurationsToolbar {
         let pointing_at = self.what_it_points_at(cx);
         let toolbar = cx.entity();
         let running = pointing_at.is_some();
+        // `None` for the reason a nonexistent pointing "cannot" be debugged
+        // reads as it being fine, which only ever shows up behind `running`
+        // being false, where the debug button is not rendered at all.
+        let cannot_be_debugged = self
+            .pointing
+            .as_ref()
+            .and_then(|pointing| self.cannot_be_debugged(pointing, cx));
 
         h_flex()
             .id("run-configurations-toolbar")
@@ -262,12 +298,30 @@ impl Render for ConfigurationsToolbar {
                             ),
                     )
                     .child(
-                        IconButton::new("run-configurations-debug", IconName::Debug)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Debug it"))
-                            .on_click(
-                                cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx)),
+                        // Wrapped in its own div: `IconButton` has no
+                        // `debug_selector` of its own to tell a test which of
+                        // the two states was painted, and a `disabled` button
+                        // otherwise looks identical to an enabled one on
+                        // bounds alone.
+                        div()
+                            .debug_selector(move || {
+                                match cannot_be_debugged {
+                                    Some(_) => "run-configurations-debug-disabled",
+                                    None => "run-configurations-debug-enabled",
+                                }
+                                .to_string()
+                            })
+                            .child(
+                                IconButton::new("run-configurations-debug", IconName::Debug)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .disabled(cannot_be_debugged.is_some())
+                                    .tooltip(Tooltip::text(
+                                        cannot_be_debugged.unwrap_or("Debug it"),
+                                    ))
+                                    .on_click(cx.listener(|toolbar, _, window, cx| {
+                                        toolbar.debug(window, cx)
+                                    })),
                             ),
                     )
             })
@@ -340,6 +394,9 @@ struct Row {
     name: SharedString,
     pointing: Pointing,
     kind: RowKind,
+    /// Whether Shift-Enter on this row could derive a debug session, worked
+    /// out once when the list is built rather than on every repaint.
+    can_be_debugged: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -421,6 +478,7 @@ impl ConfigurationsList {
             .into_iter()
             .map(|(name, pointing)| Row {
                 kind: RowKind::of(&pointing),
+                can_be_debugged: toolbar.read(cx).cannot_be_debugged(&pointing, cx).is_none(),
                 name,
                 pointing,
             })
@@ -530,6 +588,7 @@ impl ConfigurationsList {
         let temporary = row.kind == RowKind::Temporary;
         let chosen = at == self.highlighted;
         let keeping = temporary.then(|| row.name.clone());
+        let can_be_debugged = row.can_be_debugged;
         h_flex()
             .id(("configuration-row", at))
             .debug_selector(move || format!("CONFIGURATION-{at}"))
@@ -579,7 +638,10 @@ impl ConfigurationsList {
                         })),
                 )
             })
-            // The two presses, on the row they would act on.
+            // The two presses, on the row they would act on. Shift-Enter is
+            // left off a row whose command is opaque: it cannot derive a
+            // session either, and a hint for a press that does nothing is a
+            // promise the row cannot keep.
             .when(chosen, |row| {
                 row.children(Self::hint(
                     "HINT-RUN",
@@ -588,13 +650,15 @@ impl ConfigurationsList {
                     window,
                     cx,
                 ))
-                .children(Self::hint(
-                    "HINT-DEBUG",
-                    &menu::SecondaryConfirm,
-                    &self.focus,
-                    window,
-                    cx,
-                ))
+                .when(can_be_debugged, |row| {
+                    row.children(Self::hint(
+                        "HINT-DEBUG",
+                        &menu::SecondaryConfirm,
+                        &self.focus,
+                        window,
+                        cx,
+                    ))
+                })
             })
             .on_click(cx.listener(move |list, _, _, cx| list.point_at(at, cx)))
             .into_any_element()
@@ -1230,6 +1294,74 @@ mod tests {
         assert!(
             cx.debug_bounds("ICON-PlayFilled").is_none(),
             "a run button with nothing behind it must not be offered"
+        );
+    }
+
+    /// The mockup's rule for a task nobody wrote a locator for: the debug
+    /// button stays on the plaque, but disabled, rather than being pressable
+    /// and quietly opening the configurations window instead of debugging
+    /// anything. `IconButton` paints the same bounds whether it is disabled or
+    /// not, so the two states are told apart by the `debug_selector` given to
+    /// the `div` wrapping it, not by a difference in the bounds themselves.
+    #[gpui::test]
+    async fn an_opaque_command_paints_the_debug_button_disabled(cx: &mut TestAppContext) {
+        let (_toolbar, _bar, mut cx) =
+            a_bar_with_the_plaque(r#"[{ "label": "build", "command": "make build" }]"#, cx).await;
+
+        assert!(
+            cx.debug_bounds("run-configurations-debug-disabled")
+                .is_some(),
+            "no locator can read a Makefile target, so the button has to disable itself"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-debug-enabled")
+                .is_none(),
+            "and not also paint as enabled"
+        );
+    }
+
+    /// The other side of the same rule: a command a locator was written for
+    /// keeps the button enabled, since a session genuinely can be derived
+    /// from it.
+    #[gpui::test]
+    async fn a_derivable_command_keeps_the_debug_button_enabled(cx: &mut TestAppContext) {
+        let (_toolbar, _bar, mut cx) =
+            a_bar_with_the_plaque(r#"[{ "label": "tests", "command": "cargo test" }]"#, cx).await;
+
+        assert!(
+            cx.debug_bounds("run-configurations-debug-enabled")
+                .is_some(),
+            "cargo has a locator, so the button has to stay enabled"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-debug-disabled")
+                .is_none(),
+            "and not also paint as disabled"
+        );
+    }
+
+    /// The list's own version of the same rule: Shift-Enter is a promise the
+    /// row makes, and a row for an opaque command cannot keep it, so the hint
+    /// for it is left off -- while Enter, which the row can always honor,
+    /// still shows.
+    #[gpui::test]
+    async fn an_opaque_command_shows_no_debug_hint_in_the_list(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) =
+            a_bar_with_the_plaque(r#"[{ "label": "build", "command": "make build" }]"#, cx).await;
+        let plaque = cx
+            .debug_bounds("run-configurations-plaque")
+            .expect("the plaque is painted");
+        cx.simulate_click(plaque.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw_the_bar(bar, &mut cx);
+
+        assert!(
+            cx.debug_bounds("HINT-RUN").is_some(),
+            "Enter can still run an opaque command"
+        );
+        assert!(
+            cx.debug_bounds("HINT-DEBUG").is_none(),
+            "but Shift-Enter cannot derive a session for it, so the hint has to be withheld"
         );
     }
 }
