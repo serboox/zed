@@ -796,6 +796,7 @@ fn main() {
         csv_preview::init(cx);
         pdf_preview::init(cx);
         run_configurations::init(cx);
+        zed::put_run_configurations_in_the_title_bar(cx);
         svg_preview::init(cx);
         html_preview::init(cx);
         onboarding::init(cx);

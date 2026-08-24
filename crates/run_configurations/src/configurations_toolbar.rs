@@ -1,9 +1,7 @@
-use gpui::{
-    App, Context, Entity, EventEmitter, Render, SharedString, Subscription, WeakEntity, Window,
-};
+use gpui::{App, Context, Entity, Render, SharedString, Subscription, WeakEntity, Window};
 use task::TaskTemplate;
 use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
-use workspace::{ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace};
+use workspace::Workspace;
 
 use crate::configurations_file::Kind;
 use crate::configurations_store::ConfigurationsStore;
@@ -29,8 +27,6 @@ pub struct ConfigurationsToolbar {
     pointing: Option<Pointing>,
     _subscriptions: Vec<Subscription>,
 }
-
-impl EventEmitter<ToolbarItemEvent> for ConfigurationsToolbar {}
 
 impl ConfigurationsToolbar {
     pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
@@ -204,28 +200,9 @@ impl ConfigurationsToolbar {
     }
 }
 
-impl ToolbarItemView for ConfigurationsToolbar {
-    fn set_active_pane_item(
-        &mut self,
-        active_pane_item: Option<&dyn workspace::ItemHandle>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> ToolbarItemLocation {
-        self.keep_pointing_at_something(cx);
-        // Shown wherever there is something to run and something on screen to run
-        // it beside; with nothing to run there is nothing to say.
-        match active_pane_item.is_some() && self.pointing.is_some() {
-            true => ToolbarItemLocation::PrimaryRight,
-            false => ToolbarItemLocation::Hidden,
-        }
-    }
-}
-
 impl Render for ConfigurationsToolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some((name, kept)) = self.what_it_points_at(cx) else {
-            return div().into_any_element();
-        };
+        let pointing_at = self.what_it_points_at(cx);
         let listed = self.listed(cx);
         let temporaries = self.store.read(cx).temporary().len();
         let toolbar = cx.entity();
@@ -238,15 +215,25 @@ impl Render for ConfigurationsToolbar {
             .child(
                 PopoverMenu::new("run-configurations-switcher")
                     .trigger_with_tooltip(
-                        Button::new("run-configurations-chosen", name)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .color(match kept {
-                                true => Color::Default,
-                                false => Color::Accent,
-                            })
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
-                        Tooltip::text("What will run"),
+                        Button::new(
+                            "run-configurations-chosen",
+                            match &pointing_at {
+                                Some((name, _)) => name.clone(),
+                                None => SharedString::from("Nothing to run yet"),
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .color(match &pointing_at {
+                            Some((_, true)) => Color::Default,
+                            Some((_, false)) => Color::Accent,
+                            None => Color::Muted,
+                        })
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                        Tooltip::text(match &pointing_at {
+                            Some(_) => "What will run",
+                            None => "Say how this project is run",
+                        }),
                     )
                     .menu({
                         move |window, cx| {
@@ -300,19 +287,26 @@ impl Render for ConfigurationsToolbar {
                         }
                     }),
             )
-            .child(
-                IconButton::new("run-configurations-run", IconName::PlayFilled)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Accent)
-                    .tooltip(Tooltip::text("Run it"))
-                    .on_click(cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx))),
-            )
-            .child(
-                IconButton::new("run-configurations-debug", IconName::Debug)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Debug it"))
-                    .on_click(cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx))),
-            )
+            .when(pointing_at.is_some(), |plaque| {
+                plaque
+                    .child(
+                        IconButton::new("run-configurations-run", IconName::PlayFilled)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Accent)
+                            .tooltip(Tooltip::text("Run it"))
+                            .on_click(
+                                cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx)),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("run-configurations-debug", IconName::Debug)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Debug it"))
+                            .on_click(
+                                cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx)),
+                            ),
+                    )
+            })
             .into_any_element()
     }
 }
@@ -424,10 +418,11 @@ mod tests {
         );
     }
 
-    /// With nothing to run there is nothing to say, so the switcher stays out of
-    /// the toolbar.
+    /// A project that has not been told how to run it yet still gets the plaque:
+    /// it is the way in to writing the first configuration. What it must not
+    /// offer is a run button with nothing behind it.
     #[gpui::test]
-    async fn with_nothing_to_run_it_is_not_shown(cx: &mut TestAppContext) {
+    async fn with_nothing_to_run_it_offers_the_way_in(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
@@ -441,13 +436,23 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let where_it_goes = toolbar.update_in(&mut cx, |toolbar, window, cx| {
-            toolbar.set_active_pane_item(None, window, cx)
-        });
-        assert_eq!(where_it_goes, ToolbarItemLocation::Hidden);
         assert_eq!(
             toolbar.read_with(&cx, |toolbar, cx| toolbar.what_it_points_at(cx)),
             None
+        );
+
+        cx.draw(
+            gpui::Point::default(),
+            gpui::size(px(900.), px(40.)),
+            |_window, _cx| gpui::div().w_full().h_full().child(toolbar.clone()),
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-toolbar").is_some(),
+            "the plaque has to be there for a project with nothing to run yet"
+        );
+        assert!(
+            cx.debug_bounds("ICON-PlayFilled").is_none(),
+            "a run button with nothing behind it must not be offered"
         );
     }
 }

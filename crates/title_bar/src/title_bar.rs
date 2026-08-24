@@ -27,8 +27,8 @@ use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    Action, Anchor, Animation, AnimationExt, AnyElement, AnyView, App, Context, Element, Entity,
+    Focusable, Global, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
     pulsating_between,
 };
@@ -194,6 +194,27 @@ fn set_window_layout(layout: WindowLayout, cx: &App) {
     drop(AgentSettings::set_layout(layout, fs, cx));
 }
 
+/// Makes whatever goes in the middle of the title bar for one workspace.
+///
+/// Registered rather than depended on: what belongs there -- today, the way the
+/// project is run -- knows about the project and the editor, which the title bar
+/// itself has no business knowing.
+type MiddleOfTheBar =
+    Arc<dyn Fn(&Workspace, &mut Window, &mut App) -> Option<AnyView> + Send + Sync>;
+
+struct WhatGoesInTheMiddle(MiddleOfTheBar);
+
+impl Global for WhatGoesInTheMiddle {}
+
+/// Says what the title bar puts between the project and the account controls.
+/// Set once, before any workspace is opened.
+pub fn set_middle_of_the_bar(
+    cx: &mut App,
+    middle: impl Fn(&Workspace, &mut Window, &mut App) -> Option<AnyView> + Send + Sync + 'static,
+) {
+    cx.set_global(WhatGoesInTheMiddle(Arc::new(middle)));
+}
+
 pub struct TitleBar {
     platform_titlebar: Entity<PlatformTitleBar>,
     project: Entity<Project>,
@@ -207,6 +228,9 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
+    /// What sits between the project and the account controls, if anything was
+    /// registered to go there.
+    middle: Option<AnyView>,
 }
 
 impl Render for TitleBar {
@@ -293,6 +317,9 @@ impl Render for TitleBar {
             h_flex()
                 .h_full()
                 .gap_0p5()
+                .min_w_0()
+                .overflow_hidden()
+                .debug_selector(|| "title-bar-project-end".to_string())
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
                         || title_bar_settings.show_project_items;
@@ -336,6 +363,18 @@ impl Render for TitleBar {
 
         children.push(self.render_collaborator_list(window, cx).into_any_element());
 
+        if let Some(middle) = self.middle.clone() {
+            children.push(
+                h_flex()
+                    .flex_none()
+                    .justify_center()
+                    .debug_selector(|| "title-bar-middle".to_string())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(middle)
+                    .into_any_element(),
+            );
+        }
+
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
                 children.push(banner.clone().into_any_element())
@@ -362,6 +401,7 @@ impl Render for TitleBar {
             h_flex()
                 .pr_1()
                 .gap_1()
+                .debug_selector(|| "title-bar-account-end".to_string())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
@@ -438,6 +478,10 @@ impl TitleBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let middle = cx
+            .try_global::<WhatGoesInTheMiddle>()
+            .map(|middle| middle.0.clone())
+            .and_then(|make| make(workspace, window, cx));
         let project = workspace.project().clone();
         let git_store = project.read(cx).git_store().clone();
         let user_store = workspace.app_state().user_store.clone();
@@ -518,6 +562,7 @@ impl TitleBar {
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
+            middle,
         };
 
         this.observe_diagnostics(cx);

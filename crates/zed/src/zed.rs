@@ -358,6 +358,23 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
     }
 }
 
+/// Puts the plaque that says how a project is run in the middle of the title
+/// bar. Registered from here rather than from either crate: the title bar has no
+/// business knowing about projects being run, and the crate that runs them has
+/// none knowing where the bar keeps things.
+pub fn put_run_configurations_in_the_title_bar(cx: &mut App) {
+    title_bar::set_middle_of_the_bar(cx, |workspace, _window, cx| {
+        Some(
+            cx.new(|cx| {
+                run_configurations::configurations_toolbar::ConfigurationsToolbar::new(
+                    workspace, cx,
+                )
+            })
+            .into(),
+        )
+    });
+}
+
 pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowOptions {
     let display = display_uuid.and_then(|uuid| {
         cx.displays()
@@ -1665,12 +1682,6 @@ fn initialize_pane(
             toolbar.add_item(solo_diff_style_toolbar, window, cx);
             let breadcrumbs = cx.new(|_| Breadcrumbs::new());
             toolbar.add_item(breadcrumbs, window, cx);
-            let run_configurations = cx.new(|cx| {
-                run_configurations::configurations_toolbar::ConfigurationsToolbar::new(
-                    workspace, cx,
-                )
-            });
-            toolbar.add_item(run_configurations, window, cx);
             let buffer_search_bar = cx.new(|cx| {
                 search::BufferSearchBar::new(
                     Some(workspace.project().read(cx).languages().clone()),
@@ -5473,6 +5484,91 @@ mod tests {
                 .map(|binding| binding.action().name().to_string())
                 .collect()
         })
+    }
+
+    /// The way a project is run belongs in the middle of the title bar: between
+    /// the project and branch on one side and the account controls on the other,
+    /// there whenever a project is open. Measured on what is painted, because a
+    /// plaque that is only registered is a plaque nobody can reach.
+    #[gpui::test]
+    async fn test_how_to_run_the_project_sits_in_the_middle_of_the_title_bar(
+        cx: &mut TestAppContext,
+    ) {
+        use workspace::OpenMode;
+
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            title_bar::init(cx);
+            run_configurations::init(cx);
+            put_run_configurations_in_the_title_bar(cx);
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({ "src": { "main.rs": "" } }))
+            .await;
+
+        let workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                workspace::Workspace::new_local(
+                    vec![path!("/project").into()],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let middle = cx
+            .debug_bounds("title-bar-middle")
+            .expect("the title bar has a middle for the way the project is run");
+        let plaque = cx
+            .debug_bounds("run-configurations-toolbar")
+            .expect("and the plaque that says how to run it is in the bar");
+        let project_end = cx
+            .debug_bounds("title-bar-project-end")
+            .expect("the project and branch are at one end");
+        let account_end = cx
+            .debug_bounds("title-bar-account-end")
+            .expect("the account controls are at the other");
+
+        assert!(
+            plaque.origin.x >= middle.origin.x - px(1.)
+                && plaque.right() <= middle.right() + px(1.),
+            "the plaque belongs in the middle of the bar: {plaque:?} against {middle:?}, \
+             between {project_end:?} and {account_end:?}"
+        );
+        // Nothing in the bar may be painted over: the plaque sits beside the
+        // account controls, never on top of them.
+        assert!(
+            plaque.right() <= account_end.origin.x + px(1.),
+            "the plaque overlaps the account controls: {:?} against {:?}",
+            plaque.right(),
+            account_end.origin.x
+        );
+        assert!(
+            middle.origin.x >= project_end.right() - px(1.),
+            "the middle starts after the project and branch: {:?} against {:?}",
+            middle.origin.x,
+            project_end.right()
+        );
+        assert!(
+            middle.right() <= account_end.origin.x + px(1.),
+            "and ends before the account controls: {:?} against {:?}",
+            middle.right(),
+            account_end.origin.x
+        );
+        assert!(
+            plaque.origin.y >= project_end.origin.y - px(4.)
+                && plaque.bottom() <= project_end.bottom() + px(4.),
+            "and sits on the same row as the rest of the bar: {plaque:?} against {project_end:?}"
+        );
     }
 
     /// What the default keymap resolves for `keystroke` in `context`, best first.
