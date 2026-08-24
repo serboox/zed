@@ -1608,6 +1608,14 @@
   // opens showing that view rather than its source. Alt-1 shows the source,
   // alt-2 shows both.
   "open_in_preview": true,
+  // How run configurations behave.
+  "run_configurations": {
+    // How many of the ways run on the spot are kept before the oldest is
+    // dropped. A lower number takes hold at once; zero keeps none at all.
+    "most_temporaries_kept": 5,
+    // Whether the strip of readings for a running configuration is shown.
+    "show_process_metrics": true
+  },
   "auto_update": true,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //

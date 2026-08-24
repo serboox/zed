@@ -185,6 +185,25 @@ pub fn scenario_as_written(scenario: &DebugScenario) -> Result<Value> {
     serde_json::to_value(scenario).context("writing the debug configuration")
 }
 
+/// An attach configuration: a debugger, and the process it should find already
+/// running once one is chosen. There is no command, arguments or working
+/// directory to leave out here the way `task_as_written` leaves out a task's
+/// defaults -- attaching never had a field for any of them, so there is nothing
+/// to trim.
+pub fn attach_scenario(label: &str, adapter: &str, process_id: Option<u32>) -> DebugScenario {
+    let config = match process_id {
+        Some(process_id) => serde_json::json!({ "request": "attach", "processId": process_id }),
+        None => serde_json::json!({ "request": "attach" }),
+    };
+    DebugScenario {
+        adapter: adapter.into(),
+        label: label.into(),
+        build: None,
+        config,
+        tcp_connection: None,
+    }
+}
+
 /// Where the two files of a project live.
 pub fn file_path(project_root: &Path, kind: Kind) -> PathBuf {
     project_root.join(".zed").join(kind.file_name())
@@ -473,5 +492,65 @@ mod tests {
                  {written}"
             );
         }
+    }
+
+    #[test]
+    fn an_attach_configuration_has_none_of_the_fields_that_do_not_apply() {
+        let scenario = attach_scenario("attach to api", "Delve", Some(1234));
+        let written = scenario_as_written(&scenario).expect("it can be written");
+
+        assert_eq!(
+            written.get("request").and_then(Value::as_str),
+            Some("attach")
+        );
+        assert_eq!(written.get("processId").and_then(Value::as_u64), Some(1234));
+        for key in ["command", "args", "cwd", "env", "program"] {
+            assert!(
+                written.get(key).is_none(),
+                "attaching has no {key} to run something with: {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_the_process_unchosen_does_not_write_one() {
+        let scenario = attach_scenario("attach later", "Python", None);
+        let written = scenario_as_written(&scenario).expect("it can be written");
+
+        assert!(
+            written.get("processId").is_none(),
+            "no process was chosen, so nothing is written for one -- not even null: {written}"
+        );
+        assert_eq!(
+            written.get("request").and_then(Value::as_str),
+            Some("attach")
+        );
+    }
+
+    #[test]
+    fn an_attach_configuration_reads_back_as_the_one_that_was_written() {
+        let scenario = attach_scenario("attach to api", "Delve", Some(1234));
+        let written = text_with(
+            Kind::Debug.empty_file(),
+            None,
+            &scenario_as_written(&scenario).expect("it can be written"),
+        );
+
+        let read_back = read(Kind::Debug, &written);
+        assert!(read_back.trouble.is_none(), "{:?}", read_back.trouble);
+        assert_eq!(read_back.configurations.len(), 1);
+        assert_eq!(read_back.configurations[0].label, "attach to api");
+        let read_scenario = read_back.configurations[0]
+            .scenario
+            .as_ref()
+            .expect("the editor understands an attach configuration");
+        assert_eq!(read_scenario.adapter.as_ref(), "Delve");
+        assert_eq!(
+            read_scenario
+                .config
+                .get("processId")
+                .and_then(Value::as_u64),
+            Some(1234)
+        );
     }
 }

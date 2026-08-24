@@ -179,6 +179,9 @@ pub struct SettingsContent {
     /// Configuration of the HTML preview.
     pub html_preview: Option<HtmlPreviewSettingsContent>,
 
+    /// Configuration of the run configurations.
+    pub run_configurations: Option<RunConfigurationsSettingsContent>,
+
     /// Whether a file that has a rendered view -- a page, a document, a drawing
     /// -- opens showing that view rather than its source. The source is one
     /// keystroke away either way.
@@ -506,6 +509,22 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// Configuration of the run configurations.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct RunConfigurationsSettingsContent {
+    /// How many of the ways run on the spot are kept before the oldest is
+    /// dropped. A lower number takes hold at once; zero keeps none at all.
+    ///
+    /// Default: 5
+    pub most_temporaries_kept: Option<usize>,
+
+    /// Whether the strip of readings for a running configuration is shown.
+    ///
+    /// Default: true
+    pub show_process_metrics: Option<bool>,
 }
 
 /// Configuration of the HTML preview.

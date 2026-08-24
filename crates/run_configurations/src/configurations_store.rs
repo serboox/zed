@@ -3,11 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription, Task, WeakEntity,
+};
 use project::Project;
 use serde_json::Value;
+use settings::{Settings, SettingsStore};
 
 use crate::configurations_file::{self, Configuration, FileContents, Kind};
+use crate::run_configurations_settings::RunConfigurationsSettings;
 use task::TaskTemplate;
 
 /// Said whenever the files have been read again, so a view can keep up with what
@@ -61,10 +65,15 @@ pub struct ConfigurationsStore {
     /// nothing behind for anybody else to read. Pinning one puts it in the file.
     temporary: Vec<TaskTemplate>,
     _watching: Vec<Task<()>>,
+    /// Held so the store keeps noticing a lowered limit for as long as it
+    /// lives itself, rather than only until whoever first ran something in
+    /// it goes away.
+    _settings_subscription: Subscription,
 }
 
-/// How many ways run on the spot are worth remembering. Older ones fall off the
-/// end: this is a handful of recent runs, not a history.
+/// How many ways run on the spot are worth remembering when the reader has
+/// not set `most_temporaries_kept` in their own settings. Older ones fall off
+/// the end either way: this is a handful of recent runs, not a history.
 pub const MOST_TEMPORARIES_KEPT: usize = 5;
 
 impl EventEmitter<ConfigurationsChanged> for ConfigurationsStore {}
@@ -78,16 +87,27 @@ impl ConfigurationsStore {
             .next()
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
 
-        let mut store = Self {
+        let mut store = Self::bare(project_root, fs, cx);
+        store.watch_the_files(cx);
+        store
+    }
+
+    /// A store with nothing read from its own files yet, wired up to react at
+    /// once if the reader lowers how many ways run on the spot are worth
+    /// keeping while some are already remembered.
+    fn bare(project_root: Option<PathBuf>, fs: Arc<dyn fs::Fs>, cx: &mut Context<Self>) -> Self {
+        let settings_subscription = cx.observe_global::<SettingsStore>(|store, cx| {
+            store.forget_past_the_limit(cx);
+        });
+        Self {
             project_root,
             fs,
             tasks: FileContents::default(),
             scenarios: FileContents::default(),
             temporary: Vec::new(),
             _watching: Vec::new(),
-        };
-        store.watch_the_files(cx);
-        store
+            _settings_subscription: settings_subscription,
+        }
     }
 
     /// Follows both files. Their contents arrive here whenever they change on
@@ -133,14 +153,34 @@ impl ConfigurationsStore {
 
     /// Remembers a way that was run without being written down. The same way run
     /// again moves back to the front rather than being kept twice, and once there
-    /// are more than `MOST_TEMPORARIES_KEPT` the oldest falls off the end.
+    /// are more than the reader's chosen limit the oldest falls off the end.
     pub fn remember_temporary(&mut self, task: TaskTemplate, cx: &mut Context<Self>) {
         self.temporary
             .retain(|kept| !(kept.label == task.label && kept.command == task.command));
         self.temporary.insert(0, task);
-        self.temporary.truncate(MOST_TEMPORARIES_KEPT);
+        self.temporary.truncate(Self::most_temporaries_kept(cx));
         cx.emit(ConfigurationsChanged);
         cx.notify();
+    }
+
+    /// Drops whatever no longer fits the moment the reader lowers the limit,
+    /// rather than leaving the extra ones until the next thing is run on the
+    /// spot. A limit of zero empties the list entirely, and does it without
+    /// underflowing: `Vec::truncate` is a no-op past the end and a full clear
+    /// at zero either way.
+    fn forget_past_the_limit(&mut self, cx: &mut Context<Self>) {
+        let most_kept = Self::most_temporaries_kept(cx);
+        if self.temporary.len() > most_kept {
+            self.temporary.truncate(most_kept);
+            cx.emit(ConfigurationsChanged);
+            cx.notify();
+        }
+    }
+
+    /// How many ways run on the spot are worth keeping right now, from
+    /// settings.
+    fn most_temporaries_kept(cx: &App) -> usize {
+        RunConfigurationsSettings::get_global(cx).most_temporaries_kept
     }
 
     /// Takes a way run on the spot out of the list without keeping it.
@@ -173,15 +213,8 @@ impl ConfigurationsStore {
     /// A store with no project behind it, for testing the list of ways run on the
     /// spot -- which is held in memory and has nothing to do with the files.
     #[cfg(test)]
-    fn empty_for_test(fs: Arc<dyn fs::Fs>) -> Self {
-        Self {
-            project_root: None,
-            fs,
-            tasks: FileContents::default(),
-            scenarios: FileContents::default(),
-            temporary: Vec::new(),
-            _watching: Vec::new(),
-        }
+    fn empty_for_test(fs: Arc<dyn fs::Fs>, cx: &mut Context<Self>) -> Self {
+        Self::bare(None, fs, cx)
     }
 
     pub fn project_root(&self) -> Option<&PathBuf> {
@@ -317,11 +350,15 @@ fn place_of(text: &str, at: usize, original: &Value, path: &std::path::Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
 
     fn a_store(cx: &mut TestAppContext) -> Entity<ConfigurationsStore> {
         let fs = fs::FakeFs::new(cx.executor());
-        cx.new(|_| ConfigurationsStore::empty_for_test(fs))
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        cx.new(|cx| ConfigurationsStore::empty_for_test(fs, cx))
     }
 
     fn a_way(label: &str) -> TaskTemplate {
@@ -331,6 +368,22 @@ mod tests {
             args: vec!["run".to_string(), ".".to_string()],
             ..TaskTemplate::default()
         }
+    }
+
+    /// Sets how many ways run on the spot are worth keeping, as if the
+    /// reader had written it into their own settings.
+    fn set_most_temporaries_kept(cx: &mut TestAppContext, most_kept: usize) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.run_configurations = Some(settings::RunConfigurationsSettingsContent {
+                        most_temporaries_kept: Some(most_kept),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        cx.executor().run_until_parked();
     }
 
     /// A handful of recent runs, not a history: the newest is at the front and the
@@ -388,6 +441,91 @@ mod tests {
                 1,
                 "an index past the end does nothing"
             );
+        });
+    }
+
+    /// Left unset, the limit is still the same five it always was.
+    #[gpui::test]
+    fn nobody_setting_a_limit_still_means_five(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            for at in 0..MOST_TEMPORARIES_KEPT + 2 {
+                store.remember_temporary(a_way(&format!("run {at}")), cx);
+            }
+            assert_eq!(
+                store.temporary().len(),
+                MOST_TEMPORARIES_KEPT,
+                "nobody chose a limit, so the old default of five still applies"
+            );
+        });
+    }
+
+    /// A reader who wants more history than the default should get to keep it.
+    #[gpui::test]
+    fn a_higher_limit_keeps_more(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        set_most_temporaries_kept(cx, MOST_TEMPORARIES_KEPT + 3);
+        store.update(cx, |store, cx| {
+            for at in 0..MOST_TEMPORARIES_KEPT + 3 {
+                store.remember_temporary(a_way(&format!("run {at}")), cx);
+            }
+            assert_eq!(
+                store.temporary().len(),
+                MOST_TEMPORARIES_KEPT + 3,
+                "a raised limit keeps everything run so far"
+            );
+        });
+    }
+
+    /// Lowering the limit while more are already remembered drops the extra
+    /// ones at once -- not the next time something is run on the spot.
+    #[gpui::test]
+    fn lowering_the_limit_drops_the_extra_at_once(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            for at in 0..MOST_TEMPORARIES_KEPT {
+                store.remember_temporary(a_way(&format!("run {at}")), cx);
+            }
+        });
+        set_most_temporaries_kept(cx, 2);
+        store.update(cx, |store, _cx| {
+            assert_eq!(
+                store.temporary().len(),
+                2,
+                "the extra ones are gone without anything else being run"
+            );
+        });
+    }
+
+    /// A limit of zero means none of them are worth keeping, and running
+    /// something on the spot while it is zero does not panic.
+    #[gpui::test]
+    fn a_limit_of_zero_remembers_nothing(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        set_most_temporaries_kept(cx, 0);
+        store.update(cx, |store, cx| {
+            store.remember_temporary(a_way("first"), cx);
+            store.remember_temporary(a_way("second"), cx);
+            assert_eq!(
+                store.temporary().len(),
+                0,
+                "a limit of zero keeps none of them"
+            );
+        });
+    }
+
+    /// Dropping the limit to zero after some were already remembered clears
+    /// them at once too, and does not panic doing it.
+    #[gpui::test]
+    fn a_limit_lowered_to_zero_clears_what_was_kept(cx: &mut TestAppContext) {
+        let store = a_store(cx);
+        store.update(cx, |store, cx| {
+            store.remember_temporary(a_way("first"), cx);
+            store.remember_temporary(a_way("second"), cx);
+        });
+        set_most_temporaries_kept(cx, 0);
+        store.update(cx, |store, _cx| {
+            assert_eq!(store.temporary().len(), 0);
         });
     }
 }

@@ -7,7 +7,7 @@ use gpui::{
 use platform_title_bar::PlatformTitleBar;
 use project::Project;
 use serde_json::Value;
-use settings::Settings as _;
+use settings::Settings;
 use task::{DebugScenario, TaskTemplate};
 use ui::{Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
@@ -22,6 +22,7 @@ struct EnvRow {
     value: Entity<Editor>,
 }
 use crate::configurations_store::{ConfigurationsChanged, ConfigurationsStore};
+use crate::run_configurations_settings::RunConfigurationsSettings;
 use crate::{CreateFromEntryPoint, OpenRunConfigurations, RunFromEntryPoint};
 
 actions!(
@@ -356,6 +357,10 @@ pub struct RunConfigurationsView {
     /// Whether the machine is being watched at all. Watching costs a reading a
     /// second, which is nothing, but a reader who does not want the row can say so.
     watching: bool,
+    /// Whether this window is the one in front. A poll nobody can see is a poll
+    /// for nothing, so it stops the moment focus leaves this window and starts
+    /// again the moment focus comes back.
+    window_active: bool,
     _watching_task: Option<gpui::Task<()>>,
     /// Whether the JSON that lands in the file is shown under the form. The files
     /// are read and edited by hand, so what the form writes has to be checkable.
@@ -416,6 +421,13 @@ impl RunConfigurationsView {
                 theme_settings::reload_theme(cx);
                 theme_settings::reload_icon_theme(cx);
             }),
+            // The row's poll is not worth running while nobody can see it: this
+            // stops it the moment the window loses focus and starts it again the
+            // moment focus comes back.
+            cx.observe_window_activation(window, Self::window_activation_changed),
+            // Turning the row off by setting should stop the poll right away,
+            // not wait for the window to lose and regain focus first.
+            cx.observe_global::<settings::SettingsStore>(|view, cx| view.watch_the_run(cx)),
         ];
         // The form writes one project's files. When that project's window goes,
         // so does this one -- a form left behind writes to a project nobody has
@@ -489,6 +501,7 @@ impl RunConfigurationsView {
             metrics: None,
             watcher: crate::process_metrics::Watcher::default(),
             watching: true,
+            window_active: window.is_window_active(),
             _watching_task: None,
             showing_json: false,
             unsaved: false,
@@ -1261,15 +1274,30 @@ impl RunConfigurationsView {
         newest
     }
 
+    /// The window this row lives in gained or lost focus. Losing it is exactly
+    /// the moment nobody can see the row, so the poll is stopped along with it;
+    /// gaining it back starts the poll again.
+    fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_active = window.is_window_active();
+        self.watch_the_run(cx);
+    }
+
     /// Reads what the run is using, once a second, for as long as this view is on
-    /// screen and the reader wants it. The reading itself happens off the drawing
-    /// thread: `/proc` holds a few hundred files and none of that belongs in a
-    /// frame.
+    /// screen, its window has focus, and the reader wants it. The reading itself
+    /// happens off the drawing thread: `/proc` holds a few hundred files and none
+    /// of that belongs in a frame.
     fn watch_the_run(&mut self, cx: &mut Context<Self>) {
         if !self.watching {
             self._watching_task = None;
             self.metrics = None;
             self.watcher.forget();
+            return;
+        }
+        if !self.window_active || !RunConfigurationsSettings::get_global(cx).show_process_metrics {
+            // Neither of these means the run itself stopped, so the last reading
+            // stays on screen rather than being thrown away -- it is just that
+            // nobody can see it right now, or the reader turned the row off.
+            self._watching_task = None;
             return;
         }
         self._watching_task = Some(cx.spawn(async move |view, cx| {
@@ -1945,9 +1973,16 @@ impl RunConfigurationsView {
             )
             // What the run is using, and the way to stop watching it: this says
             // plainly when nothing is running, so the line is always here and the
-            // switch is always reachable.
-            .child(div().w(px(12.)))
-            .child(self.render_metrics(cx))
+            // switch is always reachable -- unless the row was turned off by
+            // setting, in which case none of it is painted at all.
+            .when(
+                RunConfigurationsSettings::get_global(cx).show_process_metrics,
+                |footer| {
+                    footer
+                        .child(div().w(px(12.)))
+                        .child(self.render_metrics(cx))
+                },
+            )
             .children(self.trouble.clone().map(|trouble| {
                 Label::new(trouble)
                     .size(LabelSize::XSmall)
@@ -2535,6 +2570,89 @@ mod tests {
         assert!(
             cx.debug_bounds("run-metrics").is_some(),
             "and the row still says what it is doing"
+        );
+    }
+
+    /// A poll costs a reading a second, and that is only worth paying while
+    /// somebody can actually see the row. The window losing focus stops it, and
+    /// the window getting focus back starts it again -- underneath the reader's
+    /// own toggle, which still means what it always did.
+    #[gpui::test]
+    async fn the_poll_stops_while_the_window_is_not_looked_at(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+
+        // The window this row lives in already has focus, the same as the real
+        // window does the moment the reader opens it.
+        assert!(
+            view.read_with(&cx, |view, _| view._watching_task.is_some()),
+            "the poll runs while the window has focus"
+        );
+
+        cx.deactivate_window();
+        assert!(
+            view.read_with(&cx, |view, _| view._watching_task.is_none()),
+            "losing focus stops it -- nobody left to read the row"
+        );
+
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(&cx, |view, _| view._watching_task.is_some()),
+            "and getting focus back starts it again"
+        );
+
+        // The reader's own toggle still works underneath all of this.
+        draw(&mut cx);
+        let toggle = debug_center(&mut cx, "metrics-toggle");
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(&cx, |view, _| !view.watching
+                && view._watching_task.is_none()),
+            "and turning it off by hand still turns it off, focus or no focus"
+        );
+    }
+
+    /// The per-window toggle only lasts as long as the window does. The setting
+    /// is the one that keeps the row gone for good, and it takes the whole row
+    /// with it -- the toggle included, since there is nothing left to toggle.
+    #[gpui::test]
+    async fn turning_the_row_off_by_setting_paints_none_of_it(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(None, cx).await;
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("run-metrics").is_some(),
+            "the row is there by default"
+        );
+        assert!(
+            view.read_with(&cx, |view, _| view._watching_task.is_some()),
+            "and its poll is running while the window has focus"
+        );
+
+        cx.update(|_, cx| {
+            RunConfigurationsSettings::override_global(
+                RunConfigurationsSettings {
+                    show_process_metrics: false,
+                    ..RunConfigurationsSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("run-metrics").is_none(),
+            "turned off by setting, none of the row is painted"
+        );
+        assert!(
+            cx.debug_bounds("metrics-toggle").is_none(),
+            "not even the toggle that would otherwise turn it back on"
+        );
+        assert!(
+            view.read_with(&cx, |view, _| view._watching_task.is_none()),
+            "and the poll behind an invisible row is not worth running either, \
+             even though the window still has focus"
         );
     }
 
