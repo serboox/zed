@@ -1230,6 +1230,13 @@ pub struct ResultView {
     value_editor: Option<Entity<Editor>>,
     value_editor_size: Option<(f32, f32)>,
     value_editor_resize_drag: Option<ValueEditorResizeDrag>,
+    /// A column's edge under the pointer, while it is being dragged.
+    column_resize: Option<ColumnResizeDrag>,
+    /// The widths the reader set by hand, by column name. Kept by name rather
+    /// than by position so that running the query again, or hiding a column
+    /// beside it, leaves their work alone. An address that does not fit in the
+    /// width a sample of the rows suggests is the whole reason this exists.
+    widths_by_hand: std::collections::HashMap<String, gpui::Pixels>,
     // Find-on-page state: None = bar hidden, Some(text) = bar open with this query.
     find_query: Option<String>,
     // Ordered list of (abs_row, col_idx) for cells that match `find_query`.
@@ -1493,6 +1500,19 @@ struct ValueEditorResizeDrag {
     start_height: f32,
 }
 
+/// A column's edge being dragged. The width is worked out from where the drag
+/// began rather than from each step, so a fast drag cannot drift.
+#[derive(Clone, Copy)]
+struct ColumnResizeDrag {
+    display_pos: usize,
+    // The data column that sat at `display_pos` when the edge was grabbed.
+    // Columns can be reordered, hidden or replaced while a button is held, and
+    // the position alone would then point at somebody else's column.
+    data_col: usize,
+    grab_x: f32,
+    started_at: f32,
+}
+
 impl ResultView {
     pub fn new(title: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
@@ -1542,6 +1562,8 @@ impl ResultView {
             value_editor: None,
             value_editor_size: None,
             value_editor_resize_drag: None,
+            column_resize: None,
+            widths_by_hand: std::collections::HashMap::new(),
             find_query: None,
             find_matches: Vec::new(),
             find_current: 0,
@@ -1693,6 +1715,97 @@ impl ResultView {
         (width, height)
     }
 
+    /// The narrowest and widest a column may be dragged to. Narrow enough to
+    /// push a column out of the way, wide enough for a long address.
+    const MIN_COLUMN_W: f32 = 40.0;
+    const MAX_COLUMN_W: f32 = 1600.0;
+
+    fn begin_column_resize(&mut self, display_pos: usize, grab_x: f32) {
+        let Some(&data_col) = self.visible_columns.get(display_pos) else {
+            return;
+        };
+        let started_at = self
+            .col_widths
+            .get(display_pos)
+            .copied()
+            .map(f32::from)
+            .unwrap_or(120.0);
+        self.column_resize = Some(ColumnResizeDrag {
+            display_pos,
+            data_col,
+            grab_x,
+            started_at,
+        });
+    }
+
+    fn update_column_resize(&mut self, x: f32) {
+        let Some(drag) = self.column_resize else {
+            return;
+        };
+        if self.visible_columns.get(drag.display_pos) != Some(&drag.data_col) {
+            self.end_column_resize();
+            return;
+        }
+        let width =
+            (drag.started_at + x - drag.grab_x).clamp(Self::MIN_COLUMN_W, Self::MAX_COLUMN_W);
+        if let Some(slot) = self.col_widths.get_mut(drag.display_pos) {
+            *slot = px(width);
+        }
+        if let Some(name) = self.column_name_at(drag.display_pos) {
+            self.widths_by_hand.insert(name, px(width));
+        }
+        // The columns are drawn from a running total of their widths, and what
+        // is on screen is decided from the same numbers, so both have to be
+        // worked out again for the drag to be seen at all.
+        self.recompute_column_edges();
+    }
+
+    fn end_column_resize(&mut self) {
+        self.column_resize = None;
+    }
+
+    /// Back to the width the rows themselves suggest.
+    const MOST_REMEMBERED_WIDTHS: usize = 128;
+
+    fn forget_widths_for_columns_that_left(&mut self) {
+        if self.widths_by_hand.len() <= Self::MOST_REMEMBERED_WIDTHS {
+            return;
+        }
+        let Some(result) = self.result.as_ref() else {
+            self.widths_by_hand.clear();
+            return;
+        };
+        let still_here: std::collections::HashSet<String> = (0..result.columns.len())
+            .filter_map(|data_col| Self::width_key(&result.columns, data_col))
+            .collect();
+        self.widths_by_hand
+            .retain(|name, _| still_here.contains(name));
+    }
+
+    fn fit_column_to_its_rows(&mut self, display_pos: usize) {
+        if let Some(name) = self.column_name_at(display_pos) {
+            self.widths_by_hand.remove(&name);
+        }
+        self.recompute_layout();
+    }
+
+    /// The name of the column at a display position, which is how a width the
+    /// reader set is remembered.
+    fn column_name_at(&self, display_pos: usize) -> Option<String> {
+        let data_col = *self.visible_columns.get(display_pos)?;
+        let result = self.result.as_ref()?;
+        Self::width_key(&result.columns, data_col)
+    }
+
+    /// The key a hand-set width is remembered under: the column's name, plus
+    /// how many columns of that same name came before it. A join can hand us
+    /// two `id` columns, and they are resized separately.
+    fn width_key(columns: &[String], data_col: usize) -> Option<String> {
+        let name = columns.get(data_col)?;
+        let ordinal = columns[..data_col].iter().filter(|it| *it == name).count();
+        Some(format!("{name}#{ordinal}"))
+    }
+
     fn begin_value_editor_resize(&mut self, grab_x: f32, grab_y: f32, width: f32, height: f32) {
         self.value_editor_size = Some((width, height));
         self.value_editor_resize_drag = Some(ValueEditorResizeDrag {
@@ -1827,7 +1940,12 @@ impl ResultView {
                     .unwrap_or(0)
                     .max(col.chars().count())
                     .max(3);
-                px((widest as f32 * 7.5 + 28.0).clamp(80.0, 360.0))
+                match Self::width_key(&result.columns, data_col)
+                    .and_then(|key| self.widths_by_hand.get(&key))
+                {
+                    Some(&by_hand) => by_hand,
+                    None => px((widest as f32 * 7.5 + 28.0).clamp(80.0, 360.0)),
+                }
             })
             .collect();
 
@@ -1891,8 +2009,16 @@ impl ResultView {
             })
             .collect();
 
-        // Cumulative right edge of each visible column (content coords) for
-        // click→column hit testing, plus the total content width.
+        self.recompute_column_edges();
+
+        self.recompute_local_filter_inner();
+    }
+
+    /// Cumulative right edge of each visible column (content coords) for
+    /// click-to-column hit testing, plus the total content width. Worked out
+    /// again whenever a width changes, which is what makes a column dragged
+    /// wider move the ones after it.
+    fn recompute_column_edges(&mut self) {
         let mut running = 0.0f32;
         self.column_edges = self
             .col_widths
@@ -1903,8 +2029,6 @@ impl ResultView {
             })
             .collect();
         self.total_width = running;
-
-        self.recompute_local_filter_inner();
     }
 
     fn recompute_local_filter_inner(&mut self) {
@@ -2637,6 +2761,8 @@ impl ResultView {
         self.last_selected_row = None;
         self.value_editor_open = false;
         self.value_editor_resize_drag = None;
+        self.column_resize = None;
+        self.forget_widths_for_columns_that_left();
         self.is_loading = false;
         // Reset per-column filter editors when the result schema changes.
         self.local_filter_editors.clear();
@@ -7756,6 +7882,7 @@ impl ResultView {
                             .w(width)
                             .flex_none()
                             .flex()
+                            .relative()
                             .items_center()
                             .border_r_1()
                             .border_color(strong_grid_border)
@@ -7802,6 +7929,40 @@ impl ResultView {
                                 |el, tip| el.tooltip(Tooltip::text(tip)),
                             )
                             .when(is_numeric_header, |el| el.justify_end())
+                            // The column's own edge, to be dragged. Narrow, on the
+                            // seam between two columns, and the press stops here so
+                            // that taking hold of it does not also sort the column.
+                            // A double click gives the column back the width its own
+                            // rows suggest, which is the way out of having dragged it
+                            // too narrow to read.
+                            .child(
+                                div()
+                                    .id(ElementId::from(SharedString::from(format!(
+                                        "col-resize-{col_idx}"
+                                    ))))
+                                    .debug_selector(move || format!("COL_RESIZE-{col_idx}"))
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(6.0))
+                                    .cursor_ew_resize()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            if event.click_count >= 2 {
+                                                this.fit_column_to_its_rows(display_pos);
+                                            } else {
+                                                this.begin_column_resize(
+                                                    display_pos,
+                                                    f32::from(event.position.x),
+                                                );
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
                             .child(
                                 h_flex()
                                     .debug_selector(move || format!("COL_HEADER_CONTENT-{col_idx}"))
@@ -8304,6 +8465,9 @@ impl ResultView {
                     .when_some(self.render_value_editor_resize_overlay(cx), |el, overlay| {
                         el.child(overlay)
                     })
+                    .when_some(self.render_column_resize_overlay(cx), |el, overlay| {
+                        el.child(overlay)
+                    })
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_date_popup(cx), |el, popup| el.child(popup))
                     .when_some(self.render_column_list_popup(cx), |el, popup| el.child(popup))
@@ -8631,6 +8795,9 @@ impl ResultView {
 
     fn toggle_transpose(&mut self, cx: &mut Context<Self>) {
         self.transposed = !self.transposed;
+        // The transposed grid has no edges to drag, and coming back must not
+        // find a drag from before still in hand.
+        self.column_resize = None;
         cx.notify();
     }
 
@@ -8962,6 +9129,46 @@ impl ResultView {
                                 cx.notify();
                             }),
                         ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// While a column's edge is held, the pointer is followed here rather than
+    /// on the edge itself: a drag leaves the six pixels it started in at once.
+    fn render_column_resize_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.column_resize?;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .cursor_ew_resize()
+                .debug_selector(|| "COL_RESIZE_OVERLAY".to_string())
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    cx.stop_propagation();
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.end_column_resize();
+                        cx.notify();
+                        return;
+                    }
+                    this.update_column_resize(f32::from(event.position.x));
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.end_column_resize();
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        this.end_column_resize();
+                        cx.notify();
+                    }),
                 )
                 .into_any_element(),
         )
@@ -13563,6 +13770,329 @@ mod tests {
             cx.debug_bounds("MONGO_DOCUMENTS_VIEW").is_some(),
             "clicking Documents must switch a homogeneous Mongo result to the documents view"
         );
+    }
+
+    /// A column whose values are longer than the width a sample of the rows
+    /// suggests -- an address, say -- is cut off, and the reader has to be able
+    /// to take its edge and pull. Measured on the painted header, with a real
+    /// press, drag and release: the width the view holds says nothing about what
+    /// the reader can actually see.
+    #[gpui::test]
+    fn visual_dragging_a_column_edge_makes_the_column_wider(cx: &mut gpui::TestAppContext) {
+        let long = "https://s2.coinmarketcap.com/static/img/coins/64x64/17106.png";
+        let result = QueryResult {
+            columns: vec!["id".into(), "logo_url".into()],
+            rows: (0..12)
+                .map(|row| {
+                    vec![
+                        Some(format!("{}", 3294 + row)),
+                        Some(format!("{long}?v={row}")),
+                    ]
+                })
+                .collect(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        };
+        let (window, view, mut cx) = framed_plain_result_window(cx, result);
+
+        let before = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the address column has a header");
+        let edge = cx
+            .debug_bounds("COL_RESIZE-1")
+            .expect("the address column has an edge to take hold of");
+        assert!(
+            edge.size.width > px(1.) && edge.size.height > px(1.),
+            "the edge has to be there to be grabbed, not {:?}",
+            edge.size
+        );
+        assert!(
+            (edge.right() - before.right()).abs() < px(2.),
+            "the edge belongs on the seam between the columns: {:?} against {:?}",
+            edge.right(),
+            before.right()
+        );
+
+        let took_hold_at = edge.center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: took_hold_at,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        // Two steps, because a drag is not one jump, and the width has to be
+        // worked out from where the drag began rather than from the last step.
+        for step in [90., 180.] {
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: gpui::point(took_hold_at.x + px(step), took_hold_at.y),
+                pressed_button: Some(gpui::MouseButton::Left),
+                modifiers: gpui::Modifiers::none(),
+            });
+        }
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: gpui::point(took_hold_at.x + px(180.), took_hold_at.y),
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view_frame(window, &mut cx);
+
+        let after = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the address column still has a header");
+        assert!(
+            (after.size.width - before.size.width - px(180.)).abs() < px(6.),
+            "the column had to follow the drag: {:?} before, {:?} after",
+            before.size.width,
+            after.size.width
+        );
+        // And the drag is over, so the page is the reader's again.
+        assert!(
+            cx.debug_bounds("COL_RESIZE_OVERLAY").is_none(),
+            "letting go has to take the overlay off the grid"
+        );
+        // Taking hold of the edge must not sort the column: the press is the
+        // reader reaching for the seam, not for the header.
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.sort_columns.is_empty(),
+                "grabbing the edge sorted the column instead of resizing it"
+            );
+        });
+
+        // A width set by hand is the reader's decision, and running the query
+        // again must not undo it.
+        let same_again = QueryResult {
+            columns: vec!["id".into(), "logo_url".into()],
+            rows: vec![vec![Some("1".into()), Some(long.into())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        };
+        view.update(&mut cx, |view, cx| view.set_result(same_again, cx));
+        draw_result_view_frame(window, &mut cx);
+        let kept = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the address column has a header after running it again");
+        assert!(
+            (kept.size.width - after.size.width).abs() < px(2.),
+            "the width the reader set has to survive the next run: {:?} against {:?}",
+            kept.size.width,
+            after.size.width
+        );
+
+        // And a double click on the edge gives the column back the width its own
+        // rows suggest, which is the way out of dragging it too narrow to read.
+        let edge = cx
+            .debug_bounds("COL_RESIZE-1")
+            .expect("the edge is still there");
+        let at = edge.center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: at,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: at,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        draw_result_view_frame(window, &mut cx);
+        let fitted = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the address column has a header after being fitted");
+        assert!(
+            fitted.size.width < after.size.width,
+            "a double click on the edge has to go back to what the rows ask for: \
+             {:?} against {:?}",
+            fitted.size.width,
+            after.size.width
+        );
+    }
+
+    /// A join hands us two columns of the same name. Widening one must leave the
+    /// other alone, so a hand-set width is remembered per column, not per name.
+    #[gpui::test]
+    fn visual_same_named_columns_are_resized_separately(cx: &mut gpui::TestAppContext) {
+        let result = QueryResult {
+            columns: vec!["id".into(), "id".into()],
+            rows: vec![vec![Some("1".into()), Some("2".into())]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        };
+        let (window, _view, mut cx) = framed_plain_result_window(cx, result);
+
+        let first_before = cx
+            .debug_bounds("COL_HEADER-0")
+            .expect("the first id column has a header");
+        let second_before = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the second id column has a header");
+        let edge = cx
+            .debug_bounds("COL_RESIZE-1")
+            .expect("the second id column has an edge");
+
+        drag_horizontally(&mut cx, edge.center(), 120.);
+        draw_result_view_frame(window, &mut cx);
+
+        let first_after = cx
+            .debug_bounds("COL_HEADER-0")
+            .expect("the first id column still has a header");
+        let second_after = cx
+            .debug_bounds("COL_HEADER-1")
+            .expect("the second id column still has a header");
+        assert!(
+            (second_after.size.width - second_before.size.width - px(120.)).abs() < px(6.),
+            "the column that was dragged had to follow: {:?} against {:?}",
+            second_before.size.width,
+            second_after.size.width
+        );
+        assert!(
+            (first_after.size.width - first_before.size.width).abs() < px(2.),
+            "its namesake had to stay where it was: {:?} against {:?}",
+            first_before.size.width,
+            first_after.size.width
+        );
+    }
+
+    /// Columns can be hidden while a button is held. The held position would
+    /// then belong to a different column, so the drag has to let go instead of
+    /// resizing whichever column moved into that slot.
+    #[gpui::test]
+    fn hiding_a_column_mid_drag_lets_go_instead_of_resizing_its_neighbour(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let result = QueryResult {
+            columns: vec!["id".into(), "name".into(), "url".into()],
+            rows: vec![vec![
+                Some("1".into()),
+                Some("Alice".into()),
+                Some("https://example.com/a".into()),
+            ]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
+        };
+        let (window, view, mut cx) = framed_plain_result_window(cx, result);
+
+        let edge = cx
+            .debug_bounds("COL_RESIZE-2")
+            .expect("the last column has an edge");
+        let took_hold_at = edge.center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: took_hold_at,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        view.update(&mut cx, |view, cx| view.toggle_column_visibility(1, cx));
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: gpui::point(took_hold_at.x + px(200.), took_hold_at.y),
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::none(),
+        });
+        draw_result_view_frame(window, &mut cx);
+
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.column_resize.is_none(),
+                "the drag had to let go once its column left the row"
+            );
+            assert!(
+                view.widths_by_hand.is_empty(),
+                "nothing was resized, so no width was remembered: {:?}",
+                view.widths_by_hand
+            );
+        });
+    }
+
+    /// The overlay that follows the pointer is hit-tested, so a release that
+    /// lands somewhere else in the window never reaches it. The drag still has
+    /// to end, or the overlay stays up and eats every later click.
+    #[gpui::test]
+    fn letting_go_away_from_the_grid_still_ends_the_drag(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = table_backed_result_window(cx);
+
+        let edge = cx
+            .debug_bounds("COL_RESIZE-1")
+            .expect("the second column has an edge");
+        let took_hold_at = edge.center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: took_hold_at,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: gpui::point(took_hold_at.x + px(60.), took_hold_at.y),
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::none(),
+        });
+        draw_result_view(window, &mut cx);
+        let overlay = cx
+            .debug_bounds("COL_RESIZE_OVERLAY")
+            .expect("the drag put the overlay up");
+
+        // Above the overlay's own top edge: inside the window, outside the grid.
+        let away = gpui::point(overlay.center().x, overlay.origin.y - px(4.));
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: away,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
+        draw_result_view(window, &mut cx);
+
+        view.update(&mut cx, |view, _| {
+            assert!(
+                view.column_resize.is_none(),
+                "letting go away from the grid had to end the drag"
+            );
+        });
+        assert!(
+            cx.debug_bounds("COL_RESIZE_OVERLAY").is_none(),
+            "the overlay had to come down with the drag"
+        );
+    }
+
+    fn drag_horizontally(
+        cx: &mut gpui::VisualTestContext,
+        from: gpui::Point<gpui::Pixels>,
+        by: f32,
+    ) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: from,
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for step in [by / 2., by] {
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: gpui::point(from.x + px(step), from.y),
+                pressed_button: Some(gpui::MouseButton::Left),
+                modifiers: gpui::Modifiers::none(),
+            });
+        }
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: gpui::point(from.x + px(by), from.y),
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+        });
     }
 
     #[gpui::test]
