@@ -106,6 +106,11 @@ mod engine {
         /// nothing here polls it on a timer.
         woken: async_channel::Receiver<()>,
         tell: async_channel::Sender<()>,
+        /// Told only when we hand the engine something -- a key, a click, a
+        /// script. Kept apart from the engine's own wake-ups so a page that
+        /// keeps asking to be turned for nothing cannot drown out the reader.
+        our_own: async_channel::Receiver<()>,
+        tell_of_our_own: async_channel::Sender<()>,
     }
 
     impl HtmlEngine {
@@ -123,6 +128,7 @@ mod engine {
             // One is enough: a second pending wake-up says nothing the first
             // one did not, so the sender drops it rather than queueing work.
             let (tell, woken) = async_channel::bounded(1);
+            let (tell_of_our_own, our_own) = async_channel::bounded(1);
             let options = engine_options(cx);
             let started = std::time::Instant::now();
             let engine = Rc::new(Self {
@@ -135,6 +141,8 @@ mod engine {
                 )),
                 woken,
                 tell,
+                our_own,
+                tell_of_our_own,
             });
             log::info!("the HTML engine started in {:?}", started.elapsed());
             cx.set_global(GlobalHtmlEngine(engine.clone()));
@@ -183,6 +191,14 @@ mod engine {
         /// the engine an event or a script is work it has not noticed yet.
         pub fn nudge(&self) {
             self.tell.try_send(()).ok();
+            self.tell_of_our_own.try_send(()).ok();
+        }
+
+        /// Waits until we hand the engine something. What the reader does always
+        /// reaches the page at once, even while the engine's own asking to be
+        /// turned is being ignored.
+        pub async fn wait_until_we_gave_it_something(&self) {
+            self.our_own.recv().await.ok();
         }
 
         /// Whether the engine has said it has work, without waiting for it to.
@@ -524,6 +540,10 @@ mod engine {
             // not finished when it is asked for, and the page may still be
             // fetching a stylesheet or an image from beside the old file.
             self.previous = std::mem::replace(&mut self.document, Some(document));
+            // Said rather than waited for: the driver holds a page that has been
+            // painting nothing to its own slow clock, and a fresh document is
+            // ours to announce.
+            self.engine.nudge();
             Ok(())
         }
 
@@ -545,6 +565,9 @@ mod engine {
             // surface already set to the new size makes its own resize a no-op,
             // which leaves the compositor drawing at the old one.
             self.webview.resize(size);
+            // A new size is a new layout, which the driver has to turn the engine
+            // for even if the page had been painting nothing.
+            self.engine.nudge();
         }
 
         /// Lets the engine run and picks up the newest frame it painted. Returns

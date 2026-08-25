@@ -843,6 +843,12 @@ impl HtmlPreviewView {
             let mut turns_this_second = 0u32;
             let mut frames_this_second = 0u32;
             let mut said_at = std::time::Instant::now();
+            // Set once a page has shown itself to be turning for nothing, and
+            // cleared the moment it paints or the reader touches it.
+            let mut only_spinning = false;
+            // A page still arriving is turning for something, however little it
+            // has painted so far.
+            let mut arrived_this_second = false;
             loop {
                 // Whichever comes first: the engine saying it has work, or the
                 // safety net going off. Nothing here asks the engine again and
@@ -852,15 +858,22 @@ impl HtmlPreviewView {
                 // it is looked at again shortly rather than waited on.
                 let arriving =
                     arriving_until.is_some_and(|until| std::time::Instant::now() < until);
-                let heartbeat = match (waiting_for_the_card, arriving, unseen) {
+                let heartbeat = match (waiting_for_the_card, arriving, unseen || only_spinning) {
                     (true, _, _) => UNTIL_THE_CARD_IS_ASKED_AGAIN,
                     (false, true, _) => WHILE_THE_PAGE_ARRIVES,
                     (false, false, true) => UNSEEN_HEARTBEAT,
                     (false, false, false) => HEARTBEAT,
                 };
+                // A page turning for nothing is left to the safety net, and its
+                // own asking is ignored until it paints something or the reader
+                // gives it something to do -- which reaches it at once, since
+                // what we hand the engine has a channel of its own.
                 let woke_for_work = smol::future::or(
                     async {
-                        engine.wait_for_work().await;
+                        match only_spinning {
+                            true => engine.wait_until_we_gave_it_something().await,
+                            false => engine.wait_for_work().await,
+                        }
                         true
                     },
                     async {
@@ -869,6 +882,11 @@ impl HtmlPreviewView {
                     },
                 )
                 .await;
+                if woke_for_work && only_spinning {
+                    // The reader did something, so the page is worth turning at
+                    // full pace again.
+                    only_spinning = false;
+                }
                 frames.turned();
                 turns_this_second += 1;
                 if said_at.elapsed() >= Duration::from_secs(1) {
@@ -876,6 +894,17 @@ impl HtmlPreviewView {
                     // safety net alone -- four times a second -- and every turn
                     // of the engine draws the page again, so a count well above
                     // that is a page holding a processor for nothing.
+                    if !only_spinning
+                        && !arrived_this_second
+                        && the_page_is_only_spinning(turns_this_second, frames_this_second)
+                    {
+                        only_spinning = true;
+                        log::info!(
+                            "html preview: the page asked to be turned {turns_this_second} times \
+                             in the last second and painted nothing, so it is left to the \
+                             safety net until it has something to show"
+                        );
+                    }
                     if turns_this_second > TOO_MANY_TURNS {
                         // The two numbers together say which of the two costs it
                         // is: frames the engine keeps painting for a page that is
@@ -889,6 +918,7 @@ impl HtmlPreviewView {
                     }
                     turns_this_second = 0;
                     frames_this_second = 0;
+                    arrived_this_second = false;
                     said_at = std::time::Instant::now();
                 }
                 let turn = view.update_in(cx, |view, window, cx| {
@@ -944,7 +974,7 @@ impl HtmlPreviewView {
                     // redrawn when the answer lands: a page that is moving is
                     // painting.
                     if worth_asking_where_it_stands(
-                        woke_for_work,
+                        painted,
                         view.page_scroll.moving(),
                         view.asked_where.map(|asked| asked.elapsed()),
                     ) {
@@ -1035,9 +1065,12 @@ impl HtmlPreviewView {
                         waiting_for_the_card = for_the_card;
                         if still_arriving {
                             arriving_until = Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
+                            arrived_this_second = true;
+                            only_spinning = false;
                         }
                         if drew.is_some() {
                             frames_this_second += 1;
+                            only_spinning = false;
                         }
                         if let Some((at, scale)) = drew
                             && let Some(measured) = frames.painted(at, scale)
@@ -2787,6 +2820,16 @@ pub struct Frames {
     pub redraws_a_second: u32,
 }
 
+/// Whether the page is being turned over and over for nothing. The engine asks
+/// to be turned whenever it thinks it has work; a page that asks many times in a
+/// second and paints not one frame has none, and turning it that often is a
+/// processor held for a picture that never changes. Measured on a page at rest:
+/// twenty turns a second, not one frame, and half a core gone.
+#[cfg(feature = "servo")]
+fn the_page_is_only_spinning(turns_last_second: u32, frames_last_second: u32) -> bool {
+    turns_last_second > TOO_MANY_TURNS && frames_last_second == 0
+}
+
 /// Whether the page is worth asking where it stands.
 ///
 /// Asking runs a script, and handing the engine a script is work it wakes up
@@ -2796,16 +2839,19 @@ pub struct Frames {
 /// times a second on a page at rest, and every turn draws the page again: half a
 /// core held for a still page nobody was touching.
 ///
-/// So a page is asked only when it has done something -- the engine woke us,
-/// rather than the safety net going off -- or while it is being scrolled, which
-/// is the one case where the answer has to keep up with a thumb.
+/// So a page is asked only when it has painted something -- where it stands can
+/// only have changed if the picture did -- or while it is being scrolled, which
+/// is the one case where the answer has to keep up with a thumb. Being woken is
+/// not reason enough: the answer to an ask is itself a waking, so a page at rest
+/// asked because it was woken goes on asking forever, which measured twenty
+/// turns of the engine a second for a picture that never changed.
 #[cfg(feature = "servo")]
 fn worth_asking_where_it_stands(
-    woke_for_work: bool,
+    painted: bool,
     moving: bool,
     since_asked: Option<Duration>,
 ) -> bool {
-    if !woke_for_work && !moving {
+    if !painted && !moving {
         return false;
     }
     let often_enough = match moving {
@@ -2854,7 +2900,14 @@ mod how_often_the_page_is_asked {
                 "a page that has done nothing must not be asked, and it has been {since:?}"
             );
         }
-        // A page that did something is asked, at the resting pace.
+        // Being woken is not doing something: that was the loop that fed itself.
+        for since in [None, Some(Duration::from_secs(1))] {
+            assert!(
+                !worth_asking_where_it_stands(false, false, since),
+                "a page that painted nothing must not be asked, however it was woken"
+            );
+        }
+        // A page that painted something is asked, at the resting pace.
         assert!(worth_asking_where_it_stands(
             true,
             false,
