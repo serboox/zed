@@ -13,6 +13,7 @@ path = "src/split_preview.rs"
 
 [dependencies]
 anyhow.workspace = true
+db.workspace = true
 editor.workspace = true
 gpui.workspace = true
 html_preview.workspace = true

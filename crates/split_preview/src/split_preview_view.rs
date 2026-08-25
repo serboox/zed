@@ -13,6 +13,7 @@ use workspace::Workspace;
 use workspace::item::{Item, ItemEvent, SaveOptions, TabContentParams};
 use workspace::searchable::SearchableItemHandle;
 
+use crate::open_split_preview::PreviewKind;
 use crate::{CycleLayout, ShowEditorAndPreview, ShowEditorOnly, ShowPreviewOnly};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,10 @@ pub struct SplitPreviewView {
     preview_focus_handle: FocusHandle,
     focus_handle: FocusHandle,
     layout: PreviewLayout,
+    /// Which preview this tab holds, for the session to write down: the kind of
+    /// a document that is not one of these -- a contract, which is plain YAML --
+    /// cannot be worked out from its path when the tab is restored.
+    kind: Option<PreviewKind>,
     _editor_subscription: Subscription,
 }
 
@@ -102,8 +107,20 @@ impl SplitPreviewView {
             preview_focus_handle,
             focus_handle: cx.focus_handle(),
             layout,
+            kind: None,
             _editor_subscription: subscription,
         }
+    }
+
+    /// Records which preview this tab was built for, so the session can bring
+    /// the same one back.
+    pub fn of_kind(mut self, kind: PreviewKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    pub fn preview_kind(&self) -> Option<PreviewKind> {
+        self.kind
     }
 
     /// A tab whose preview cannot be built yet, showing its editor until it is.

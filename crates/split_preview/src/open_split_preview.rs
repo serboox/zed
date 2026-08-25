@@ -21,6 +21,30 @@ pub enum PreviewKind {
     OpenApi,
 }
 
+impl PreviewKind {
+    pub fn to_db(self) -> i64 {
+        match self {
+            Self::Markdown => 0,
+            Self::Html => 1,
+            Self::Svg => 2,
+            Self::OpenApi => 3,
+        }
+    }
+
+    /// Which preview a restored tab held. Written down rather than worked out
+    /// from the path again, because a contract's kind is only visible in its
+    /// contents -- the path says YAML and nothing more.
+    pub fn from_db(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Markdown),
+            1 => Some(Self::Html),
+            2 => Some(Self::Svg),
+            3 => Some(Self::OpenApi),
+            _ => None,
+        }
+    }
+}
+
 /// How much of a document is read to tell whether it is an OpenAPI contract.
 /// Matches the limit the check itself applies.
 const SNIFF_CHARS: usize = 8 * 1024;
@@ -103,7 +127,7 @@ pub fn register(workspace: &mut Workspace) {
     });
 }
 
-fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+pub(crate) fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(source_editor) = workspace
         .active_item(cx)
         .and_then(|item| item.act_as::<Editor>(cx))
@@ -178,7 +202,7 @@ pub fn open_for_editor(
                 window,
                 cx,
             );
-            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx).of_kind(kind))
         }
         PreviewKind::Html => {
             let preview = HtmlPreviewView::new(
@@ -188,7 +212,7 @@ pub fn open_for_editor(
                 window,
                 cx,
             );
-            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx).of_kind(kind))
         }
         PreviewKind::Svg => {
             let multi_buffer = editor.read(cx).buffer().clone();
@@ -199,11 +223,11 @@ pub fn open_for_editor(
                 window,
                 cx,
             );
-            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx).of_kind(kind))
         }
         PreviewKind::OpenApi => {
             let preview = OpenApiPreviewView::new(editor.clone(), window, cx);
-            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx))
+            cx.new(|cx| SplitPreviewView::new(editor, preview, layout, cx).of_kind(kind))
         }
     };
 

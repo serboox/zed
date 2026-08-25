@@ -34,6 +34,9 @@ pub fn init(cx: &mut App) {
     // view is opened by way of that view: the registry asks whoever registered
     // last first, and the editor answers for every path.
     workspace::register_project_item::<SplitPreviewView>(cx);
+    // Without this a tab holding a preview is dropped from the session, and a
+    // document that opens on its page would come back as nothing at all.
+    workspace::register_serializable_item::<SplitPreviewView>(cx);
     item_overlay::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {
