@@ -841,6 +841,7 @@ impl HtmlPreviewView {
             let mut arriving_until: Option<std::time::Instant> = None;
             let mut frames = HowTheFramesGo::default();
             let mut turns_this_second = 0u32;
+            let mut frames_this_second = 0u32;
             let mut said_at = std::time::Instant::now();
             loop {
                 // Whichever comes first: the engine saying it has work, or the
@@ -876,12 +877,18 @@ impl HtmlPreviewView {
                     // of the engine draws the page again, so a count well above
                     // that is a page holding a processor for nothing.
                     if turns_this_second > TOO_MANY_TURNS {
+                        // The two numbers together say which of the two costs it
+                        // is: frames the engine keeps painting for a page that is
+                        // not changing, or turns that paint nothing and are the
+                        // turning itself.
                         log::info!(
                             "html preview: the page's driver turned the engine \
-                             {turns_this_second} times in the last second"
+                             {turns_this_second} times in the last second, and the \
+                             engine painted {frames_this_second} frames"
                         );
                     }
                     turns_this_second = 0;
+                    frames_this_second = 0;
                     said_at = std::time::Instant::now();
                 }
                 let turn = view.update_in(cx, |view, window, cx| {
@@ -1028,6 +1035,9 @@ impl HtmlPreviewView {
                         waiting_for_the_card = for_the_card;
                         if still_arriving {
                             arriving_until = Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
+                        }
+                        if drew.is_some() {
+                            frames_this_second += 1;
                         }
                         if let Some((at, scale)) = drew
                             && let Some(measured) = frames.painted(at, scale)
