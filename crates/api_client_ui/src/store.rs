@@ -1138,7 +1138,7 @@ impl ApiClientStore {
     /// whichever environment is currently active store-wide.
     pub fn effective_environment_for(&self, request: &Request) -> Option<&Environment> {
         request
-            .pinned_environment_id
+            .primary_pinned_environment()
             .and_then(|id| self.environment_by_id(id))
             .or_else(|| self.active_environment())
     }
@@ -1152,9 +1152,38 @@ impl ApiClientStore {
         let Some(request) = self.requests.iter_mut().find(|r| r.id == request_id) else {
             return;
         };
-        request.pinned_environment_id = environment_id;
+        request.pin_to_environments(environment_id.into_iter().collect());
         cx.notify();
         self.persist_collections(cx);
+    }
+
+    /// Adds or removes one pinned environment, leaving the rest alone. Several
+    /// are what comparing across environments works from.
+    pub fn toggle_request_pinned_environment(
+        &mut self,
+        request_id: RequestId,
+        environment_id: EnvironmentId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.requests.iter_mut().find(|r| r.id == request_id) else {
+            return;
+        };
+        request.toggle_pinned_environment(environment_id);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
+    /// Every environment a request is pinned to, resolved to the environments
+    /// themselves and skipping any that have since been deleted.
+    pub fn pinned_environments_for(&self, request_id: RequestId) -> Vec<Environment> {
+        let Some(request) = self.requests.iter().find(|r| r.id == request_id) else {
+            return Vec::new();
+        };
+        request
+            .pinned_environments()
+            .into_iter()
+            .filter_map(|id| self.environment_by_id(id).cloned())
+            .collect()
     }
 
     /// Mutates an environment's variable list (add/edit/remove/reorder — the
@@ -1733,6 +1762,102 @@ mod tests {
         store.read_with(cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.pinned_environment_id, None);
+        });
+    }
+
+    #[gpui::test]
+    fn toggling_pins_keeps_the_others_and_sends_to_the_first(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let staging_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let production_id = store.update(cx, |store, cx| {
+            store.create_environment("Production".into(), cx)
+        });
+        let other_id = store.update(cx, |store, cx| store.create_environment("Local".into(), cx));
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.set_active_environment(Some(other_id), cx);
+            store.toggle_request_pinned_environment(request_id, staging_id, cx);
+            store.toggle_request_pinned_environment(request_id, production_id, cx);
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .pinned_environments_for(request_id)
+                    .iter()
+                    .map(|environment| environment.id)
+                    .collect::<Vec<_>>(),
+                vec![staging_id, production_id],
+                "pinning a second environment must not drop the first"
+            );
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                store.effective_environment_for(request).map(|it| it.id),
+                Some(staging_id),
+                "a plain send goes to the first pinned environment"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, staging_id, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .pinned_environments_for(request_id)
+                    .iter()
+                    .map(|environment| environment.id)
+                    .collect::<Vec<_>>(),
+                vec![production_id]
+            );
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                store.effective_environment_for(request).map(|it| it.id),
+                Some(production_id)
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, production_id, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(store.pinned_environments_for(request_id).is_empty());
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                store.effective_environment_for(request).map(|it| it.id),
+                Some(other_id),
+                "with nothing pinned the request falls back to the active environment"
+            );
+        });
+    }
+
+    /// A pin whose environment has since been deleted must simply not show up,
+    /// rather than leaving a hole the caller has to guess the meaning of.
+    #[gpui::test]
+    fn a_pin_to_a_deleted_environment_is_skipped(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let staging_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, staging_id, cx);
+            store.environments.retain(|it| it.id != staging_id);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(store.pinned_environments_for(request_id).is_empty());
         });
     }
 

@@ -432,7 +432,7 @@ pub fn pretty_print_body(body: &[u8], content_type: &str) -> Option<(String, &'s
 /// whatever whitespace the server happened to send), otherwise the raw
 /// UTF-8 text, otherwise a byte-length placeholder for genuinely binary
 /// bodies (diffing binary bytes as text would produce useless noise).
-fn diffable_body_text(response: &ResponseData) -> String {
+pub fn diffable_body_text(response: &ResponseData) -> String {
     if let Some((pretty, _)) = pretty_print_body(&response.body, response.content_type()) {
         return pretty;
     }

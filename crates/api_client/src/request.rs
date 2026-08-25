@@ -322,11 +322,62 @@ pub struct Request {
     /// Overrides the store's globally active environment for this request
     /// alone, for a request that is always meant to run against one
     /// particular environment regardless of what's currently active.
+    ///
+    /// Kept alongside `pinned_environment_ids` and holding the first of them, so
+    /// a collection written by this build still reads sensibly in one that only
+    /// knows about a single pin. Read it through `pinned_environments`.
     #[serde(default)]
     pub pinned_environment_id: Option<EnvironmentId>,
+    /// Every environment this request is pinned to, in the order they were
+    /// pinned. The first is the one a plain send uses; the rest are what
+    /// comparing across environments has to work with -- the same request
+    /// against stage and production, say.
+    #[serde(default)]
+    pub pinned_environment_ids: Vec<EnvironmentId>,
 }
 
 impl Request {
+    /// Every environment this request is pinned to. Falls back to the single
+    /// pin a collection written by an older build holds, so nothing is lost on
+    /// the way in.
+    pub fn pinned_environments(&self) -> Vec<EnvironmentId> {
+        match self.pinned_environment_ids.is_empty() {
+            false => self.pinned_environment_ids.clone(),
+            true => self.pinned_environment_id.into_iter().collect(),
+        }
+    }
+
+    /// The environment a plain send uses: the first pinned, if any.
+    pub fn primary_pinned_environment(&self) -> Option<EnvironmentId> {
+        self.pinned_environments().first().copied()
+    }
+
+    /// Pins this request to exactly these environments, keeping the single-pin
+    /// field in step for anything that still reads it.
+    pub fn pin_to_environments(&mut self, ids: Vec<EnvironmentId>) {
+        self.pinned_environment_id = ids.first().copied();
+        self.pinned_environment_ids = ids;
+    }
+
+    /// Adds or removes one, leaving the others as they are. Returns whether it
+    /// is pinned afterwards.
+    pub fn toggle_pinned_environment(&mut self, id: EnvironmentId) -> bool {
+        let mut pinned = self.pinned_environments();
+        let was_there = pinned.iter().position(|pinned| *pinned == id);
+        let now_pinned = match was_there {
+            Some(at) => {
+                pinned.remove(at);
+                false
+            }
+            None => {
+                pinned.push(id);
+                true
+            }
+        };
+        self.pin_to_environments(pinned);
+        now_pinned
+    }
+
     pub fn new(collection_id: CollectionId, name: String) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -346,6 +397,7 @@ impl Request {
             test_script: String::new(),
             examples: Vec::new(),
             pinned_environment_id: None,
+            pinned_environment_ids: Vec::new(),
         }
     }
 }
@@ -479,5 +531,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn a_request() -> Request {
+        Request::new(Uuid::new_v4(), "Get users".into())
+    }
+
+    #[test]
+    fn a_request_can_be_pinned_to_several_environments() {
+        let staging = Uuid::new_v4();
+        let production = Uuid::new_v4();
+        let mut request = a_request();
+
+        assert!(request.toggle_pinned_environment(staging));
+        assert!(request.toggle_pinned_environment(production));
+        assert_eq!(request.pinned_environments(), vec![staging, production]);
+        assert_eq!(request.primary_pinned_environment(), Some(staging));
+
+        assert!(!request.toggle_pinned_environment(staging));
+        assert_eq!(request.pinned_environments(), vec![production]);
+        assert_eq!(
+            request.primary_pinned_environment(),
+            Some(production),
+            "unpinning the first must promote the next, not leave a stale primary"
+        );
+
+        assert!(!request.toggle_pinned_environment(production));
+        assert!(request.pinned_environments().is_empty());
+        assert_eq!(request.primary_pinned_environment(), None);
+    }
+
+    /// The single-pin field is what a build that knows nothing about several
+    /// pins reads, so it has to keep holding the first of them.
+    #[test]
+    fn the_single_pin_field_stays_in_step_with_the_list() {
+        let staging = Uuid::new_v4();
+        let production = Uuid::new_v4();
+        let mut request = a_request();
+        request.pin_to_environments(vec![staging, production]);
+        assert_eq!(request.pinned_environment_id, Some(staging));
+
+        request.toggle_pinned_environment(staging);
+        assert_eq!(request.pinned_environment_id, Some(production));
+
+        request.pin_to_environments(Vec::new());
+        assert_eq!(request.pinned_environment_id, None);
+    }
+
+    /// A collection saved before several pins existed carries only the single
+    /// field; reading it must still report that one pin.
+    #[test]
+    fn a_lone_legacy_pin_is_read_as_the_only_pin() {
+        let staging = Uuid::new_v4();
+        let mut request = a_request();
+        request.pinned_environment_id = Some(staging);
+        request.pinned_environment_ids = Vec::new();
+
+        assert_eq!(request.pinned_environments(), vec![staging]);
+        assert_eq!(request.primary_pinned_environment(), Some(staging));
+
+        let production = Uuid::new_v4();
+        assert!(request.toggle_pinned_environment(production));
+        assert_eq!(
+            request.pinned_environments(),
+            vec![staging, production],
+            "toggling on top of a legacy pin must keep it, not replace it"
+        );
+    }
+
+    #[test]
+    fn several_pins_survive_a_round_trip_through_json() {
+        let staging = Uuid::new_v4();
+        let production = Uuid::new_v4();
+        let mut request = a_request();
+        request.pin_to_environments(vec![staging, production]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.pinned_environments(), vec![staging, production]);
     }
 }

@@ -1,4 +1,5 @@
 use crate::code_generator::Snippet;
+use crate::environment_diff_view::{EnvironmentDiffView, SideOfTheComparison, WhatIsCompared};
 use crate::response_dock::{
     DockResponseEntry, ResponseDockPanel, SendGeneration, existing_response_tab,
     reveal_response_tab,
@@ -443,6 +444,20 @@ fn comparison_diff_text(
     }
 }
 
+/// What one environment answered, in the shape the comparison tab shows it.
+fn side_of_the_comparison(
+    environment: SharedString,
+    result: anyhow::Result<api_client::HttpResponseSummary>,
+) -> SideOfTheComparison {
+    SideOfTheComparison {
+        environment,
+        outcome: match result {
+            Ok(summary) => Ok(ResponseData::from_summary(summary)),
+            Err(error) => Err(error.to_string().into()),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestTab {
     Params,
@@ -539,6 +554,10 @@ pub struct RequestView {
     diff_comparison_environment: Option<EnvironmentId>,
     comparing_environment: bool,
     comparison_environment_handle: ui::PopoverMenuHandle<ContextMenu>,
+    /// Set while the two sides of an across-environments comparison are in
+    /// flight, so the button says so and cannot be pressed again meanwhile.
+    comparing_environments: bool,
+    environments_comparison_handle: ui::PopoverMenuHandle<ContextMenu>,
     pre_request_script_editor: Entity<Editor>,
     test_script_editor: Entity<Editor>,
     test_results: Vec<api_client::TestResult>,
@@ -859,6 +878,8 @@ impl RequestView {
             diff_comparison_environment: None,
             comparing_environment: false,
             comparison_environment_handle: ui::PopoverMenuHandle::default(),
+            comparing_environments: false,
+            environments_comparison_handle: ui::PopoverMenuHandle::default(),
             pre_request_script_editor,
             test_script_editor,
             test_results: Vec::new(),
@@ -2899,6 +2920,224 @@ impl RequestView {
             )
     }
 
+    /// Sends this request to two environments at once and opens a tab that
+    /// diffs the two answers. Both are sent fresh and together: comparing
+    /// stage against production is only worth anything if both were asked the
+    /// same question at the same moment.
+    fn compare_across_environments(
+        &mut self,
+        left_id: EnvironmentId,
+        right_id: EnvironmentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if left_id == right_id || self.comparing_environments {
+            return;
+        }
+        let Some(request) = self
+            .store
+            .read(cx)
+            .requests
+            .iter()
+            .find(|candidate| candidate.id == self.request_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.warn_response_dock_unavailable(cx);
+            return;
+        };
+        let store = self.store.clone();
+        let client = store.read(cx).http_client.clone();
+        let names = |cx: &App| {
+            let store = store.read(cx);
+            (
+                store
+                    .environment_by_id(left_id)
+                    .map(|environment| SharedString::from(environment.name.clone()))
+                    .unwrap_or_else(|| "Left".into()),
+                store
+                    .environment_by_id(right_id)
+                    .map(|environment| SharedString::from(environment.name.clone()))
+                    .unwrap_or_else(|| "Right".into()),
+            )
+        };
+        let (left_name, right_name) = names(cx);
+        let compared = WhatIsCompared {
+            request_id: self.request_id,
+            left: left_id,
+            right: right_id,
+        };
+        let title = self.title.clone();
+        self.comparing_environments = true;
+        cx.notify();
+
+        let workspace = workspace.downgrade();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut resolve_against = |environment_id: EnvironmentId| {
+                store.update(cx, |store, _| {
+                    let context = store.variable_context_for_environment(&request, environment_id);
+                    let dynamic = SystemDynamicVariableSource;
+                    let resolve = |text: &str| {
+                        api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
+                    };
+                    api_client::build_resolved_request(&request, &resolve)
+                })
+            };
+            let left_request = resolve_against(left_id);
+            let right_request = resolve_against(right_id);
+            let (left_result, right_result) = smol::future::zip(
+                api_client::execute(&client, &left_request),
+                api_client::execute(&client, &right_request),
+            )
+            .await;
+
+            this.update(cx, |this, cx| {
+                this.comparing_environments = false;
+                cx.notify();
+            })
+            .ok();
+
+            let opened = EnvironmentDiffView::open(
+                compared,
+                title,
+                side_of_the_comparison(left_name, left_result),
+                side_of_the_comparison(right_name, right_result),
+                workspace,
+                cx,
+            )
+            .await;
+            if let Err(error) = opened {
+                log::error!("failed to open the environment comparison: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// The button that fires the comparison: one click for the pair already
+    /// pinned, and a menu of the rest to compare the primary against.
+    fn render_environments_comparison(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        // A pin to an environment that has since been deleted is nothing to
+        // compare against: resolving against it would quietly drop its
+        // variables and read as an environment with none.
+        let pinned: Vec<EnvironmentId> = store
+            .requests
+            .iter()
+            .find(|request| request.id == self.request_id)
+            .map(|request| request.pinned_environments())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| store.environment_by_id(*id).is_some())
+            .collect();
+        // Without a pin the comparison still has to start somewhere, and the
+        // environment the request would be sent to anyway is that somewhere.
+        let base = pinned
+            .first()
+            .copied()
+            .or_else(|| store.active_environment().map(|environment| environment.id));
+        let name_of = |id: EnvironmentId| {
+            store
+                .environment_by_id(id)
+                .map(|environment| environment.name.clone())
+                .unwrap_or_default()
+        };
+        // Every pinned environment pairs with the one a send uses, so three
+        // pins offer two pairs rather than only the first two.
+        let pinned_pairs: Vec<(EnvironmentId, String)> = match base {
+            Some(base) => pinned
+                .iter()
+                .filter(|id| **id != base)
+                .map(|id| {
+                    (
+                        *id,
+                        format!("Compare pinned: {} ↔ {}", name_of(base), name_of(*id)),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        // What is already offered as a pair is not offered again below it.
+        let against: Vec<(EnvironmentId, String)> = store
+            .environments
+            .iter()
+            .filter(|environment| Some(environment.id) != base && !pinned.contains(&environment.id))
+            .map(|environment| (environment.id, environment.name.clone()))
+            .collect();
+        let nothing_to_compare = base.is_none() || (pinned_pairs.is_empty() && against.is_empty());
+        let label: SharedString = if self.comparing_environments {
+            "Comparing...".into()
+        } else {
+            "Compare".into()
+        };
+        let view = cx.entity();
+        let popover_handle = self.environments_comparison_handle.clone();
+
+        div()
+            .id("request-environments-comparison")
+            .debug_selector(|| "request-environments-comparison".to_string())
+            .child(
+                ui::PopoverMenu::new("request-environments-comparison-popover")
+                    .with_handle(popover_handle)
+                    .trigger(
+                        Button::new("request-environments-comparison-trigger", label)
+                            .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                            .style(if !pinned_pairs.is_empty() {
+                                ButtonStyle::Tinted(ui::TintColor::Accent)
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .tooltip(Tooltip::text(
+                                "Send this request to two environments and diff the answers",
+                            ))
+                            .disabled(self.comparing_environments || nothing_to_compare),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        let against = against.clone();
+                        let pinned_pairs = pinned_pairs.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let Some(base) = base else {
+                                return menu;
+                            };
+                            let paired = !pinned_pairs.is_empty();
+                            let menu = pinned_pairs.iter().fold(menu, |menu, (id, label)| {
+                                let view = view.clone();
+                                let id = *id;
+                                menu.entry(label.clone(), None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.compare_across_environments(base, id, window, cx);
+                                    });
+                                })
+                            });
+                            let menu = match (paired, against.is_empty()) {
+                                (true, false) => menu.separator(),
+                                _ => menu,
+                            };
+                            against.iter().fold(menu, |menu, (id, name)| {
+                                let view = view.clone();
+                                let id = *id;
+                                menu.entry(format!("vs {name}"), None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.compare_across_environments(base, id, window, cx);
+                                    });
+                                })
+                            })
+                        }))
+                    }),
+            )
+    }
+
+    /// Adds or removes one pinned environment, leaving the others alone.
+    fn toggle_pinned_environment(&mut self, id: EnvironmentId, cx: &mut Context<Self>) {
+        let request_id = self.request_id;
+        self.store.update(cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, id, cx)
+        });
+        cx.notify();
+    }
+
     fn set_pinned_environment(
         &mut self,
         environment_id: Option<EnvironmentId>,
@@ -2918,17 +3157,23 @@ impl RequestView {
     /// specific request will actually resolve `{{tokens}}` against.
     fn render_environment_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let pinned_id = store
+        let pinned: Vec<EnvironmentId> = store
             .requests
             .iter()
             .find(|request| request.id == self.request_id)
-            .and_then(|request| request.pinned_environment_id);
-        let pinned_name = pinned_id
-            .and_then(|id| store.environment_by_id(id))
-            .map(|environment| environment.name.clone());
-        let trigger_label: SharedString = match &pinned_name {
-            Some(name) => format!("Pinned: {name}").into(),
-            None => "Active Environment".into(),
+            .map(|request| request.pinned_environments())
+            .unwrap_or_default();
+        let pinned_names: Vec<String> = pinned
+            .iter()
+            .filter_map(|id| store.environment_by_id(*id))
+            .map(|environment| environment.name.clone())
+            .collect();
+        // Several fit on the chip only as a count; the names are in the menu
+        // below, each with its own tick.
+        let trigger_label: SharedString = match pinned_names.as_slice() {
+            [] => "Active Environment".into(),
+            [only] => format!("Pinned: {only}").into(),
+            [first, rest @ ..] => format!("Pinned: {first} +{}", rest.len()).into(),
         };
         let environments: Vec<(EnvironmentId, String)> = store
             .environments
@@ -2938,44 +3183,68 @@ impl RequestView {
         let view = cx.entity();
         let popover_handle = self.environment_pin_handle.clone();
 
+        // The label goes into a selector of its own so a test can read what the
+        // chip actually says, which is the only place the pin count is shown.
+        let shown_on_the_chip = trigger_label.clone();
         div()
             .id("request-environment-pin")
             .debug_selector(|| "request-environment-pin".to_string())
             .child(
-                ui::PopoverMenu::new("request-environment-pin-popover")
-                    .with_handle(popover_handle)
-                    .trigger(
-                        Button::new("request-environment-pin-trigger", trigger_label)
-                            .start_icon(Icon::new(IconName::Pin))
-                            .style(if pinned_id.is_some() {
-                                ButtonStyle::Tinted(ui::TintColor::Accent)
-                            } else {
-                                ButtonStyle::Subtle
+                div()
+                    .debug_selector(move || format!("request-environment-pin:{shown_on_the_chip}"))
+                    .child(
+                        ui::PopoverMenu::new("request-environment-pin-popover")
+                            .with_handle(popover_handle)
+                            .trigger(
+                                Button::new("request-environment-pin-trigger", trigger_label)
+                                    .start_icon(Icon::new(IconName::Pin))
+                                    .style(if !pinned.is_empty() {
+                                        ButtonStyle::Tinted(ui::TintColor::Accent)
+                                    } else {
+                                        ButtonStyle::Subtle
+                                    }),
+                            )
+                            .menu(move |window, cx| {
+                                let view = view.clone();
+                                let environments = environments.clone();
+                                let pinned = pinned.clone();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                    let menu = menu.entry("Use Active Environment", None, {
+                                        let view = view.clone();
+                                        move |_window, cx| {
+                                            view.update(cx, |view, cx| {
+                                                view.set_pinned_environment(None, cx);
+                                            });
+                                        }
+                                    });
+                                    // Each is a tick of its own: a request is often meant
+                                    // for more than one environment -- the same call
+                                    // against stage and production -- and comparing them
+                                    // needs both pinned at once. The first pinned is the
+                                    // one a plain send uses.
+                                    environments.iter().fold(menu, |menu, (id, name)| {
+                                        let view = view.clone();
+                                        let id = *id;
+                                        let is_pinned = pinned.contains(&id);
+                                        let shown = match pinned.iter().position(|it| *it == id) {
+                                            Some(0) => format!("{name}  (sent to)"),
+                                            _ => name.clone(),
+                                        };
+                                        menu.toggleable_entry(
+                                            shown,
+                                            is_pinned,
+                                            ui::IconPosition::Start,
+                                            None,
+                                            move |_window, cx| {
+                                                view.update(cx, |view, cx| {
+                                                    view.toggle_pinned_environment(id, cx);
+                                                });
+                                            },
+                                        )
+                                    })
+                                }))
                             }),
-                    )
-                    .menu(move |window, cx| {
-                        let view = view.clone();
-                        let environments = environments.clone();
-                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                            let menu = menu.entry("Use Active Environment", None, {
-                                let view = view.clone();
-                                move |_window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.set_pinned_environment(None, cx);
-                                    });
-                                }
-                            });
-                            environments.iter().fold(menu, |menu, (id, name)| {
-                                let view = view.clone();
-                                let id = *id;
-                                menu.entry(name.clone(), None, move |_window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.set_pinned_environment(Some(id), cx);
-                                    });
-                                })
-                            })
-                        }))
-                    }),
+                    ),
             )
     }
 
@@ -4625,6 +4894,7 @@ impl Render for RequestView {
                     ),
             )
             .child(self.render_environment_pin(cx))
+            .child(self.render_environments_comparison(cx))
             .child({
                 let is_sending = matches!(self.send_state, SendState::Sending);
                 // Sending is the one thing this view exists for, so it is the
@@ -5595,6 +5865,224 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.run_until_parked();
+    }
+
+    /// The request is pinned by ticking environments in the chip's own menu, and
+    /// ticking a second one must not quietly replace the first: an endpoint is
+    /// often meant for stage *and* production at once.
+    #[gpui::test]
+    async fn ticking_a_second_environment_pins_both(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        let (staging_id, production_id) = store.update(&mut cx, |store, cx| {
+            (
+                store.create_environment("Staging".into(), cx),
+                store.create_environment("Production".into(), cx),
+            )
+        });
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("request-environment-pin:Active Environment")
+                .is_some(),
+            "with nothing pinned the chip says which environment the request follows"
+        );
+
+        tick_in_the_pin_menu(&mut cx, "MENU_ITEM-Staging");
+        tick_in_the_pin_menu(&mut cx, "MENU_ITEM-Production");
+
+        assert!(
+            cx.debug_bounds("request-environment-pin:Pinned: Staging +1")
+                .is_some(),
+            "the chip has to show that a second environment is pinned as well, \
+             not just the first"
+        );
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store
+                    .pinned_environments_for(request_id)
+                    .iter()
+                    .map(|environment| environment.id)
+                    .collect::<Vec<_>>(),
+                vec![staging_id, production_id]
+            );
+        });
+
+        // The one a plain send goes to is named as such, so which of several pins
+        // is the primary is readable rather than guessed.
+        let chip = debug_center(&mut cx, "request-environment-pin");
+        cx.simulate_click(chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Staging  (sent to)").is_some(),
+            "the first pinned environment is the one a send uses, and says so"
+        );
+
+        let entry = debug_center(&mut cx, "MENU_ITEM-Staging  (sent to)");
+        cx.simulate_click(entry, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("request-environment-pin:Pinned: Production")
+                .is_some(),
+            "unticking the first leaves the other pinned, and it becomes the one \
+             a send uses"
+        );
+        store.read_with(&cx, |store, _| {
+            let request = store
+                .requests
+                .iter()
+                .find(|request| request.id == request_id)
+                .unwrap();
+            assert_eq!(
+                store
+                    .effective_environment_for(request)
+                    .map(|environment| environment.id),
+                Some(production_id)
+            );
+        });
+    }
+
+    /// The pinned pair is one click away, and every other environment is offered
+    /// to compare the request's own environment against.
+    #[gpui::test]
+    async fn the_compare_button_offers_the_pinned_pair_first(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        let (staging_id, production_id) = store.update(&mut cx, |store, cx| {
+            let staging = store.create_environment("Staging".into(), cx);
+            let production = store.create_environment("Production".into(), cx);
+            store.create_environment("Local".into(), cx);
+            (staging, production)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, staging_id, cx);
+            store.toggle_request_pinned_environment(request_id, production_id, cx);
+        });
+        draw(&mut cx);
+
+        let button = debug_center(&mut cx, "request-environments-comparison");
+        cx.simulate_click(button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Compare pinned: Staging ↔ Production")
+                .is_some(),
+            "the two pinned environments are the pair the reader means, so they are \
+             offered as one entry"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Local").is_some(),
+            "and any other environment can be compared against the one a send uses"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Staging").is_none(),
+            "comparing the primary against itself is not a comparison"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Production").is_none(),
+            "and what the pair entry already offers is not offered a second time"
+        );
+    }
+
+    /// A third pin is a second pair, not a pin the menu quietly forgets.
+    #[gpui::test]
+    async fn every_pinned_environment_pairs_with_the_one_a_send_uses(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            for name in ["Staging", "Production", "Canary"] {
+                let id = store.create_environment(name.into(), cx);
+                store.toggle_request_pinned_environment(request_id, id, cx);
+            }
+        });
+        draw(&mut cx);
+
+        let button = debug_center(&mut cx, "request-environments-comparison");
+        cx.simulate_click(button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Compare pinned: Staging ↔ Production")
+                .is_some()
+                && cx
+                    .debug_bounds("MENU_ITEM-Compare pinned: Staging ↔ Canary")
+                    .is_some(),
+            "each pinned environment can be compared against the one a send uses"
+        );
+    }
+
+    /// A pin whose environment was deleted is not something to compare against:
+    /// the comparison falls back to the environment a send would use.
+    #[gpui::test]
+    async fn a_pin_to_a_deleted_environment_is_not_offered(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            let gone = store.create_environment("Gone".into(), cx);
+            store.toggle_request_pinned_environment(request_id, gone, cx);
+            let staging = store.create_environment("Staging".into(), cx);
+            store.set_active_environment(Some(staging), cx);
+            store.create_environment("Production".into(), cx);
+            store
+                .environments
+                .retain(|environment| environment.id != gone);
+        });
+        draw(&mut cx);
+
+        let button = debug_center(&mut cx, "request-environments-comparison");
+        cx.simulate_click(button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Production").is_some(),
+            "the comparison starts from the environment a send uses instead"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Staging").is_none(),
+            "which is Staging, so it is not offered against itself"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Compare pinned: Gone ↔ Production")
+                .is_none()
+                && cx.debug_bounds("MENU_ITEM-vs Gone").is_none(),
+            "and the environment that no longer exists is offered nowhere"
+        );
+    }
+
+    /// With one environment there is no pair to compare, and the button says so
+    /// by not opening anything.
+    #[gpui::test]
+    async fn the_compare_button_does_nothing_without_a_second_environment(cx: &mut TestAppContext) {
+        let (store, _request_id, _view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            let only = store.create_environment("Staging".into(), cx);
+            store.set_active_environment(Some(only), cx);
+        });
+        draw(&mut cx);
+
+        let button = debug_center(&mut cx, "request-environments-comparison");
+        cx.simulate_click(button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-vs Staging").is_none(),
+            "there is nothing to compare the only environment with"
+        );
+    }
+
+    /// Opens the pin chip's menu and clicks one entry in it, the way the reader
+    /// does -- the menu closes on the click, so it is opened again each time.
+    fn tick_in_the_pin_menu(cx: &mut VisualTestContext, entry: &'static str) {
+        let chip = debug_center(cx, "request-environment-pin");
+        cx.simulate_click(chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
+        let entry = debug_center(cx, entry);
+        cx.simulate_click(entry, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(cx);
     }
 
     /// The table of headers has room around it. Rows flush against the edges of

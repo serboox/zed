@@ -1,4 +1,5 @@
 mod code_generator;
+mod environment_diff_view;
 mod environment_editor;
 mod export;
 mod full_export;
