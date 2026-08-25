@@ -88,6 +88,12 @@ const UNTIL_THE_CARD_IS_ASKED_AGAIN: Duration = Duration::from_millis(1);
 #[cfg(feature = "servo")]
 const WHILE_THE_PAGE_MOVES: Duration = Duration::from_millis(8);
 
+/// How many turns of the engine in a second are worth saying out loud. A page at
+/// rest is turned by the safety net alone, four times a second, so anything well
+/// above this is the engine being woken for work it does not have.
+#[cfg(feature = "servo")]
+const TOO_MANY_TURNS: u32 = 15;
+
 /// What the page's own menu offers. Named here because the tests look the items
 /// up by the words the reader sees.
 const OPEN_LINK: &str = "Open Link in New Browser Tab";
@@ -218,6 +224,9 @@ pub struct HtmlPreviewView {
     /// this is set, no frame is ever copied through memory.
     #[cfg(all(feature = "servo", any(target_os = "linux", target_os = "windows")))]
     shared_frame: Option<std::sync::Arc<gpui::SharedFrame>>,
+    /// When the current second began, how many times the view has been laid out
+    /// in it, and what the last whole second came to.
+    redraws: std::cell::Cell<(std::time::Instant, u32, u32)>,
     #[cfg(feature = "servo")]
     pump: Option<Task<()>>,
     /// Which button, if any, was pressed on the page and is still down. A drag
@@ -441,7 +450,30 @@ impl HtmlPreviewView {
     /// What the last few seconds of frames cost, for the tools to show.
     #[cfg(feature = "servo")]
     pub fn how_the_frames_go(&self) -> Option<Frames> {
-        self.frames
+        let mut frames = self.frames?;
+        frames.redraws_a_second = self.redraws.get().2;
+        Some(frames)
+    }
+
+    /// Counts this laying out of the view. What is reported is the last whole
+    /// second's total, so the number stands still long enough to be read.
+    fn count_this_redraw(&self) {
+        let (since, counted, last_second) = self.redraws.get();
+        match since.elapsed() >= Duration::from_secs(1) {
+            true => {
+                // Said out loud as well as shown, and only when it looks wrong:
+                // reading it from a log is the only way to catch this happening
+                // on somebody else's machine.
+                if counted > TOO_MANY_TURNS {
+                    log::info!(
+                        "html preview: the window laid the page out {counted} times in the \
+                         last second"
+                    );
+                }
+                self.redraws.set((std::time::Instant::now(), 1, counted))
+            }
+            false => self.redraws.set((since, counted + 1, last_second)),
+        }
     }
 
     /// Shows the page at the size a device would give it, the way a browser's
@@ -544,6 +576,7 @@ impl HtmlPreviewView {
                 frame: None,
                 #[cfg(all(feature = "servo", any(target_os = "linux", target_os = "windows")))]
                 shared_frame: None,
+                redraws: std::cell::Cell::new((std::time::Instant::now(), 0, 0)),
                 #[cfg(feature = "servo")]
                 pump: None,
                 #[cfg(feature = "servo")]
@@ -807,6 +840,8 @@ impl HtmlPreviewView {
             let mut waiting_for_the_card = false;
             let mut arriving_until: Option<std::time::Instant> = None;
             let mut frames = HowTheFramesGo::default();
+            let mut turns_this_second = 0u32;
+            let mut said_at = std::time::Instant::now();
             loop {
                 // Whichever comes first: the engine saying it has work, or the
                 // safety net going off. Nothing here asks the engine again and
@@ -822,12 +857,33 @@ impl HtmlPreviewView {
                     (false, false, true) => UNSEEN_HEARTBEAT,
                     (false, false, false) => HEARTBEAT,
                 };
-                smol::future::or(
-                    engine.wait_for_work(),
-                    cx.background_executor().timer(heartbeat),
+                let woke_for_work = smol::future::or(
+                    async {
+                        engine.wait_for_work().await;
+                        true
+                    },
+                    async {
+                        cx.background_executor().timer(heartbeat).await;
+                        false
+                    },
                 )
                 .await;
                 frames.turned();
+                turns_this_second += 1;
+                if said_at.elapsed() >= Duration::from_secs(1) {
+                    // Only when it looks wrong. A page at rest is turned by the
+                    // safety net alone -- four times a second -- and every turn
+                    // of the engine draws the page again, so a count well above
+                    // that is a page holding a processor for nothing.
+                    if turns_this_second > TOO_MANY_TURNS {
+                        log::info!(
+                            "html preview: the page's driver turned the engine \
+                             {turns_this_second} times in the last second"
+                        );
+                    }
+                    turns_this_second = 0;
+                    said_at = std::time::Instant::now();
+                }
                 let turn = view.update_in(cx, |view, window, cx| {
                     let out_of_sight = !view.on_screen;
                     let Some(page) = view.page.as_mut() else {
@@ -880,14 +936,11 @@ impl HtmlPreviewView {
                     // so the slower pace is enough for it. Nothing has to be
                     // redrawn when the answer lands: a page that is moving is
                     // painting.
-                    let often_enough = match view.page_scroll.moving() {
-                        true => WHILE_THE_PAGE_MOVES,
-                        false => WHERE_THE_PAGE_STANDS,
-                    };
-                    let due = view
-                        .asked_where
-                        .is_none_or(|asked| asked.elapsed() >= often_enough);
-                    if due {
+                    if worth_asking_where_it_stands(
+                        woke_for_work,
+                        view.page_scroll.moving(),
+                        view.asked_where.map(|asked| asked.elapsed()),
+                    ) {
                         view.asked_where = Some(std::time::Instant::now());
                         let scroll = view.page_scroll.clone();
                         page.scroll_position(move |down, document, view| {
@@ -2417,6 +2470,7 @@ fn servo_button(button: MouseButton) -> Option<html_render::MouseButton> {
 
 impl Render for HtmlPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.count_this_redraw();
         let background = markdown::github_page_background(cx.theme().appearance());
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         #[cfg(feature = "servo")]
@@ -2694,6 +2748,9 @@ impl HowTheFramesGo {
                 turns,
                 width,
                 height,
+                // Filled in by whoever is asked for the report: only the view
+                // knows how often the window laid it out.
+                redraws_a_second: 0,
             });
         }
         self.took.clear();
@@ -2713,6 +2770,39 @@ pub struct Frames {
     pub turns: u32,
     pub width: u32,
     pub height: u32,
+    /// How often the window is laid out again a second while this page is shown.
+    /// A page at rest should be drawn once and then left alone; anything else is
+    /// the window being redrawn for a picture that has not changed, which costs
+    /// the whole window's worth of drawing every time.
+    pub redraws_a_second: u32,
+}
+
+/// Whether the page is worth asking where it stands.
+///
+/// Asking runs a script, and handing the engine a script is work it wakes up
+/// for, and the answer wakes it again -- so an ask that nobody needed is two
+/// turns of the engine bought for nothing. Measured in the editor, asking every
+/// tenth of a second whatever the page was doing turned the engine twenty-five
+/// times a second on a page at rest, and every turn draws the page again: half a
+/// core held for a still page nobody was touching.
+///
+/// So a page is asked only when it has done something -- the engine woke us,
+/// rather than the safety net going off -- or while it is being scrolled, which
+/// is the one case where the answer has to keep up with a thumb.
+#[cfg(feature = "servo")]
+fn worth_asking_where_it_stands(
+    woke_for_work: bool,
+    moving: bool,
+    since_asked: Option<Duration>,
+) -> bool {
+    if !woke_for_work && !moving {
+        return false;
+    }
+    let often_enough = match moving {
+        true => WHILE_THE_PAGE_MOVES,
+        false => WHERE_THE_PAGE_STANDS,
+    };
+    since_asked.is_none_or(|since| since >= often_enough)
 }
 
 fn page_scale(window: &gpui::Window, cx: &gpui::App) -> f32 {
@@ -2734,6 +2824,54 @@ mod how_often_the_page_is_asked {
     /// asking fed itself: measured in the editor, ten thousand turns of the
     /// engine for one frame and 360 ms a frame, of which almost nothing was
     /// drawing. Paced, the same page takes fifteen turns.
+    /// A page nobody is touching is asked nothing at all.
+    ///
+    /// Asking is a script, which the engine wakes for, and its answer wakes it
+    /// again. A page at rest was asked ten times a second regardless, which came
+    /// to twenty-five turns of the engine a second -- and a turn draws the page,
+    /// so a still page nobody was looking at held half a core.
+    #[cfg(feature = "servo")]
+    #[test]
+    fn a_page_at_rest_is_asked_nothing() {
+        // However long it has been, a page that has done nothing is not asked.
+        for since in [
+            None,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(60)),
+        ] {
+            assert!(
+                !worth_asking_where_it_stands(false, false, since),
+                "a page that has done nothing must not be asked, and it has been {since:?}"
+            );
+        }
+        // A page that did something is asked, at the resting pace.
+        assert!(worth_asking_where_it_stands(
+            true,
+            false,
+            Some(WHERE_THE_PAGE_STANDS)
+        ));
+        assert!(!worth_asking_where_it_stands(
+            true,
+            false,
+            Some(WHERE_THE_PAGE_STANDS / 2)
+        ));
+        // A page being scrolled is asked at the faster pace, since the answer has
+        // to keep up with the thumb -- even on a turn the net woke us for.
+        assert!(worth_asking_where_it_stands(
+            false,
+            true,
+            Some(WHILE_THE_PAGE_MOVES)
+        ));
+        assert!(!worth_asking_where_it_stands(
+            false,
+            true,
+            Some(WHILE_THE_PAGE_MOVES / 2)
+        ));
+        // Nothing asked yet is always worth asking, once there is a reason to.
+        assert!(worth_asking_where_it_stands(true, false, None));
+        assert!(worth_asking_where_it_stands(false, true, None));
+    }
+
     #[test]
     fn a_moving_page_is_asked_often_but_not_on_every_turn() {
         assert!(

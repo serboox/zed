@@ -2689,13 +2689,15 @@ impl BrowserToolsPanel {
                     .child(
                         Label::new(format!(
                             "{} frames at {}×{} · {} ms at the middle · {} ms at worst · \
-                             {} turns of the engine each",
+                             {} turns of the engine each · the window laid out {} times a \
+                             second",
                             frames.frames,
                             frames.width,
                             frames.height,
                             trim_number(frames.middle_ms),
                             trim_number(frames.worst_ms),
-                            frames.turns
+                            frames.turns,
+                            frames.redraws_a_second
                         ))
                         .size(LabelSize::XSmall)
                         .buffer_font(cx),
