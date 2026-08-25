@@ -21,6 +21,27 @@ pub trait DbProvider: Send + Sync {
     async fn list_databases(&self) -> Result<Vec<DatabaseInfo>>;
     async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>>;
     async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>>;
+
+    /// The columns of every table in one database, in one exchange with the
+    /// server where the server can answer that way.
+    ///
+    /// Asking table by table is a round trip each, and a schema has hundreds of
+    /// them: on a server reached over a slow link that is minutes of talking for
+    /// something one query can answer. A provider that cannot do it in one goes
+    /// on asking table by table, which is what this default does.
+    async fn describe_database(
+        &self,
+        database: &str,
+        tables: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ColumnInfo>>> {
+        let mut columns = std::collections::HashMap::new();
+        for table in tables {
+            if let Ok(found) = self.describe_table(database, table).await {
+                columns.insert(table.clone(), found);
+            }
+        }
+        Ok(columns)
+    }
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
 

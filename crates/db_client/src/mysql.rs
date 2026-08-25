@@ -822,6 +822,57 @@ impl DbProvider for MySqlProvider {
             .collect())
     }
 
+    /// Every table's columns in one exchange. MySQL keeps them all in one
+    /// table of its own, so one query answers for a whole schema -- where asking
+    /// table by table is a round trip each, and a schema has hundreds of them.
+    async fn describe_database(
+        &self,
+        database: &str,
+        _tables: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ColumnInfo>>> {
+        let _guard = self.op_lock.lock().await;
+        let pool = self.current_pool();
+        let query = sqlx::query_as::<
+            _,
+            (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Option<Vec<u8>>,
+                Vec<u8>,
+            ),
+        >(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, \
+                    COLUMN_DEFAULT, EXTRA \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION",
+        )
+        .bind(database)
+        .fetch_all(&pool);
+        let rows = Self::bounded_metadata(query, "Failed to describe the schema").await?;
+
+        let mut columns: std::collections::HashMap<String, Vec<ColumnInfo>> =
+            std::collections::HashMap::new();
+        for (table, name, data_type, nullable, key, default_value, extra) in rows {
+            let key = bytes_to_string(key);
+            columns
+                .entry(bytes_to_string(table))
+                .or_default()
+                .push(ColumnInfo {
+                    name: bytes_to_string(name),
+                    data_type: bytes_to_string(data_type),
+                    is_nullable: bytes_to_string(nullable) == "YES",
+                    column_key: if key.is_empty() { None } else { Some(key) },
+                    default_value: default_value.map(bytes_to_string),
+                    extra: bytes_to_string(extra),
+                });
+        }
+        Ok(columns)
+    }
+
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String> {
         let _guard = self.op_lock.lock().await;
         let pool = self.current_pool();

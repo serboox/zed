@@ -764,23 +764,30 @@ impl DatabaseStore {
                     }
                     let total = tables.len();
                     let per_database_limit = MAX_PREFETCH_TABLES_PER_DATABASE.min(column_budget);
-                    let mut columns = HashMap::new();
-                    for table in tables.iter().take(per_database_limit) {
-                        if let Some(cols) =
-                            provider.describe_table(database, &table.name).await.log_err()
-                        {
-                            columns.insert(table.name.clone(), cols);
-                        }
-                        tables_introspected += 1;
-                        if tables_planned > 0 {
-                            this.update(cx, |store, cx| {
-                                store
-                                    .schema_load_progress
-                                    .insert(id, (tables_introspected, tables_planned));
-                                cx.notify();
-                            })
-                            .ok();
-                        }
+                    let wanted: Vec<String> = tables
+                        .iter()
+                        .take(per_database_limit)
+                        .map(|table| table.name.clone())
+                        .collect();
+                    // One exchange for the whole schema where the server can
+                    // answer that way. Asking table by table is a round trip
+                    // each, and on a server reached over a slow link a schema of
+                    // three hundred tables is a minute of talking through the one
+                    // connection the reader's queries need.
+                    let columns: HashMap<String, Vec<ColumnInfo>> = provider
+                        .describe_database(database, &wanted)
+                        .await
+                        .log_err()
+                        .unwrap_or_default();
+                    tables_introspected += wanted.len();
+                    if tables_planned > 0 {
+                        this.update(cx, |store, cx| {
+                            store
+                                .schema_load_progress
+                                .insert(id, (tables_introspected.min(tables_planned), tables_planned));
+                            cx.notify();
+                        })
+                        .ok();
                     }
                     column_budget = column_budget.saturating_sub(total.min(per_database_limit));
                     if total > per_database_limit {
