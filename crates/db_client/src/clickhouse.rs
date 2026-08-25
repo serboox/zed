@@ -269,7 +269,11 @@ fn skip_quoted(chars: &[char], start: usize) -> usize {
 }
 
 fn keyword_at(chars: &[char], start: usize, keyword: &str) -> bool {
-    if start > 0 && chars.get(start - 1).is_some_and(|ch| is_identifier_char(*ch)) {
+    if start > 0
+        && chars
+            .get(start - 1)
+            .is_some_and(|ch| is_identifier_char(*ch))
+    {
         return false;
     }
     let mut index = start;
@@ -450,7 +454,8 @@ SETTINGS index_granularity = 8192";
 
     #[test]
     fn a_constraint_word_inside_an_identifier_is_not_a_constraint() {
-        let ddl = "CREATE TABLE t (`constraints_checked` UInt8, `my_constraint` String) ENGINE = Log";
+        let ddl =
+            "CREATE TABLE t (`constraints_checked` UInt8, `my_constraint` String) ENGINE = Log";
         assert!(super::parse_check_constraints(ddl).is_empty());
     }
 

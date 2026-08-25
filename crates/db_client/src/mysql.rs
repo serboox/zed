@@ -5,7 +5,7 @@ use smol::lock::Mutex as AsyncMutex;
 use sqlx::AssertSqlSafe;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::{Column as _, Row as _, TypeInfo as _};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::MAX_RESULT_ROWS;
@@ -30,6 +30,12 @@ pub struct MySqlProvider {
     // single-flight -- two callers can never build and swap in two
     // replacement pools at once.
     op_lock: AsyncMutex<()>,
+    /// The database this connection was last switched to. The switch is a round
+    /// trip of its own, and on a distant server that costs as much as the query
+    /// it precedes, so it is not repeated for a database already current.
+    /// Cleared whenever the pool is replaced: a fresh connection has had no
+    /// `USE` applied to it.
+    current_database: Mutex<Option<String>>,
 }
 
 /// Bounds how long a silently dead physical connection can stall a caller
@@ -149,6 +155,7 @@ impl MySqlProvider {
             pool: RwLock::new(pool),
             connect_options: opts,
             op_lock: AsyncMutex::new(()),
+            current_database: Mutex::new(None),
         })
     }
 
@@ -166,6 +173,186 @@ impl MySqlProvider {
     /// bounded by `bounded_metadata` (`ROW_FETCH_TIMEOUT`). Either way the
     /// call errors rather than wedging the provider, and the next probe-based
     /// call reconnects.
+    /// Says the connection no longer has any database selected. Called whenever
+    /// the pool is replaced.
+    fn forget_the_current_database(&self) {
+        *self
+            .current_database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn the_current_database(&self) -> Option<String> {
+        self.current_database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Switches the connection's database, unless it is already the one asked
+    /// for. Must be called while holding `op_lock`, which is what makes the
+    /// remembered name true of the one physical connection.
+    async fn switch_to(&self, pool: &MySqlPool, database: &str) -> Result<()> {
+        if !needs_a_switch(self.the_current_database().as_deref(), database) {
+            return Ok(());
+        }
+        // Must use the text protocol; MySQL rejects `USE` in the
+        // prepared-statement protocol (error 1295). Bounded so a connection
+        // that dies here cannot hang forever holding `op_lock`.
+        let use_stmt = format!("USE `{}`", database.replace('`', "``"));
+        tokio::time::timeout(
+            ROW_FETCH_TIMEOUT,
+            sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(pool),
+        )
+        .await
+        .context("Timed out switching database -- the connection stalled")?
+        .context("Failed to switch database")?;
+        *self
+            .current_database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(database.to_string());
+        Ok(())
+    }
+
+    /// One attempt at the caller's SQL on the connection given, with the
+    /// database switched first when it is not already the current one.
+    async fn run_the_query(
+        &self,
+        pool: &MySqlPool,
+        database: &str,
+        sql: &str,
+        pool_wait_ms: u64,
+    ) -> Result<QueryResult> {
+        self.switch_to(pool, database).await?;
+
+        let start = Instant::now();
+        let trimmed_upper = sql.trim().to_uppercase();
+        let is_read_query = trimmed_upper.starts_with("SELECT")
+            || trimmed_upper.starts_with("SHOW")
+            || trimmed_upper.starts_with("DESCRIBE")
+            || trimmed_upper.starts_with("EXPLAIN")
+            || trimmed_upper.starts_with("DESC")
+            || trimmed_upper.starts_with("WITH");
+        // Stored-program DDL (procedures, functions, triggers, events) is
+        // rejected by MySQL's prepared/binary protocol with error 1295 --
+        // per MySQL's own list of statements permitted as prepared
+        // statements, CREATE/ALTER/DROP PROCEDURE/FUNCTION/TRIGGER/EVENT are
+        // simply absent from it. These must go through the text protocol,
+        // the same way the `USE` statement above does.
+        let requires_text_protocol =
+            ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]
+                .iter()
+                .any(|keyword| {
+                    trimmed_upper.starts_with(&format!("CREATE {keyword}"))
+                        || trimmed_upper.starts_with(&format!("CREATE OR REPLACE {keyword}"))
+                        || trimmed_upper.starts_with(&format!("ALTER {keyword}"))
+                        || trimmed_upper.starts_with(&format!("DROP {keyword}"))
+                        || trimmed_upper.starts_with(&format!("DROP TEMPORARY {keyword}"))
+                });
+        let prefixed = format!(
+            "{}{}",
+            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+            sql
+        );
+
+        if is_read_query {
+            // Stream rows instead of buffering the whole result. Each row is
+            // decoded and its cells capped before the next row is read, so a huge
+            // result (many rows or multi-megabyte BLOB cells) cannot be pulled
+            // into memory all at once and freeze the client.
+            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(pool);
+            let mut columns: Vec<String> = Vec::new();
+            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+            // Set once the first row (or end-of-stream) arrives, splitting
+            // `execute_ms` (submit the query, wait for the server to start
+            // answering) from `streaming_ms` (pull and decode the rest).
+            let mut execute_ms: Option<u64> = None;
+            let mut first_row_at: Option<Instant> = None;
+
+            loop {
+                // Bound each row fetch so a connection that goes silently dead
+                // mid-result cannot block forever while `op_lock` is held; the
+                // guard then drops on return and the next query can reconnect.
+                let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
+                    Ok(Ok(Some(row))) => row,
+                    Ok(Ok(None)) => {
+                        if execute_ms.is_none() {
+                            execute_ms = Some(start.elapsed().as_millis() as u64);
+                        }
+                        break;
+                    }
+                    Ok(Err(error)) => return Err(error).context("Query execution failed"),
+                    Err(_elapsed) => anyhow::bail!(
+                        "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
+                         the database connection stalled mid-result"
+                    ),
+                };
+                if execute_ms.is_none() {
+                    execute_ms = Some(start.elapsed().as_millis() as u64);
+                    first_row_at = Some(Instant::now());
+                }
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
+                        .iter()
+                        .map(|column| column.name().to_string())
+                        .collect();
+                }
+
+                let decoded: Vec<Option<String>> = (0..columns.len())
+                    .map(|index| cell_to_string(&row, index))
+                    .collect();
+                result_rows.push(decoded);
+
+                if result_rows.len() >= MAX_RESULT_ROWS {
+                    break;
+                }
+            }
+
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            let rows_affected = result_rows.len() as u64;
+            let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
+            Ok(QueryResult {
+                raw_documents: None,
+                columns,
+                rows: result_rows,
+                rows_affected,
+                execution_time_ms,
+                timing: Some(QueryTiming {
+                    pool_wait_ms,
+                    execute_ms: execute_ms.unwrap_or(execution_time_ms),
+                    streaming_ms,
+                }),
+            })
+        } else {
+            let result = if requires_text_protocol {
+                sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
+                    .execute(pool)
+                    .await
+                    .context("Query execution failed")?
+            } else {
+                sqlx::query(AssertSqlSafe(prefixed.as_str()))
+                    .execute(pool)
+                    .await
+                    .context("Query execution failed")?
+            };
+
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            Ok(QueryResult {
+                raw_documents: None,
+                columns: vec![],
+                rows: vec![],
+                rows_affected: result.rows_affected(),
+                execution_time_ms,
+                timing: Some(QueryTiming {
+                    pool_wait_ms,
+                    execute_ms: execution_time_ms,
+                    streaming_ms: None,
+                }),
+            })
+        }
+    }
+
     fn current_pool(&self) -> MySqlPool {
         self.pool
             .read()
@@ -209,6 +396,7 @@ impl MySqlProvider {
         .await
         .context("Timed out reconnecting to MySQL")?
         .context("Failed to reconnect to MySQL")?;
+        self.forget_the_current_database();
         *self
             .pool
             .write()
@@ -348,7 +536,7 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 
 #[cfg(test)]
 mod connect_options_tests {
-    use super::mysql_connect_options;
+    use super::{mysql_connect_options, needs_a_switch, the_connection_died};
     use crate::connection::{ConnectionConfig, SslMode};
     use sqlx::mysql::MySqlSslMode;
 
@@ -361,6 +549,55 @@ mod connect_options_tests {
             password: "secret".to_string(),
             ..Default::default()
         }
+    }
+
+    /// The switch to a database is a round trip, and on a distant server it
+    /// costs as much as the query it precedes. It is worth doing once.
+    #[test]
+    fn a_database_already_current_is_not_switched_to_again() {
+        assert!(needs_a_switch(None, "shop"), "nothing selected yet");
+        assert!(needs_a_switch(Some("other"), "shop"), "a different one");
+        assert!(
+            !needs_a_switch(Some("shop"), "shop"),
+            "the one already current must not be switched to again"
+        );
+        assert!(
+            !needs_a_switch(None, ""),
+            "a caller that named no database is asking for no switch"
+        );
+        assert!(
+            !needs_a_switch(Some("shop"), ""),
+            "and still is when one is current"
+        );
+    }
+
+    /// Only a connection that died is worth sending a statement to twice. One
+    /// the server rejected would be rejected again, and one that may have
+    /// half-applied must never be repeated.
+    #[test]
+    fn only_a_dead_connection_is_worth_a_second_attempt() {
+        let died = anyhow::Error::new(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "gone",
+        )));
+        assert!(the_connection_died(&died));
+        assert!(the_connection_died(&anyhow::Error::new(
+            sqlx::Error::PoolClosed
+        )));
+        assert!(the_connection_died(&anyhow::Error::new(
+            sqlx::Error::PoolTimedOut
+        )));
+        // A plain message carries no failure to read, so nothing is repeated.
+        assert!(!the_connection_died(&anyhow::anyhow!(
+            "syntax error near ')'"
+        )));
+        assert!(!the_connection_died(&anyhow::Error::new(
+            sqlx::Error::RowNotFound
+        )));
+        // The context the query path adds must not hide the failure underneath.
+        assert!(the_connection_died(
+            &anyhow::Error::new(sqlx::Error::PoolClosed).context("Failed to run the query")
+        ));
     }
 
     #[test]
@@ -392,6 +629,38 @@ mod connect_options_tests {
         config.ssl_mode = SslMode::VerifyFull;
         let opts = mysql_connect_options(&config);
         assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::VerifyIdentity));
+    }
+}
+
+/// Whether a query for `wanted` has to switch the connection's database first.
+///
+/// The switch is a round trip, and on a distant server it costs as much as the
+/// query after it, so it is worth not repeating for a database that is already
+/// current. An empty name means the caller did not ask for one.
+fn needs_a_switch(current: Option<&str>, wanted: &str) -> bool {
+    !wanted.is_empty() && current != Some(wanted)
+}
+
+/// Whether this failure means the connection died rather than the statement
+/// being wrong.
+///
+/// Only these are worth running again: a statement the server rejected will be
+/// rejected the same way a second time, and one that may have half-applied must
+/// never be sent twice. A connection that died carried nothing to the server.
+fn the_connection_died(error: &anyhow::Error) -> bool {
+    let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>() else {
+        return false;
+    };
+    match sqlx_error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(database) => matches!(
+            database.code().as_deref(),
+            // Server gone away, connection lost during the query, the server
+            // shutting down, and the client being killed.
+            Some("2006" | "2013" | "1053" | "1317")
+        ),
+        _ => false,
     }
 }
 
@@ -583,156 +852,23 @@ impl DbProvider for MySqlProvider {
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
         let _guard = self.op_lock.lock().await;
-        // Confirms the connection is actually responsive before running the
-        // caller's SQL, so a silently dead connection (see
-        // `CONNECTION_HEALTH_TIMEOUT`) is caught and replaced up front,
-        // instead of leaving the query itself to hang indefinitely.
+        // The connection is not probed first. A probe is a round trip of its
+        // own, and on a distant server it costs as much as the query it guards
+        // -- measured against a stage server over a corporate link, a `SELECT 1`
+        // and the query after it cost 195 ms each. So the query is sent straight
+        // away, and only a failure meaning the connection died is answered by
+        // reconnecting and sending it once more. A statement the server rejected
+        // is never sent twice, and neither is one that may have half-applied.
         let pool_wait_start = Instant::now();
-        let pool = self.ensure_live_pool().await?;
+        let pool = self.current_pool();
         let pool_wait_ms = pool_wait_start.elapsed().as_millis() as u64;
-
-        if !database.is_empty() {
-            // USE must use the text protocol; MySQL rejects it in the
-            // prepared-statement protocol (error 1295). The single-connection
-            // pool keeps it applied for the query below. Bounded like the row
-            // fetch below: it runs after the liveness probe but on the same
-            // connection, so a silent death here must not hang forever holding
-            // `op_lock` and wedge every later query.
-            let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(
-                ROW_FETCH_TIMEOUT,
-                sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool),
-            )
-            .await
-            .context("Timed out switching database -- the connection stalled")?
-            .context("Failed to switch database")?;
-        }
-
-        let start = Instant::now();
-        let trimmed_upper = sql.trim().to_uppercase();
-        let is_read_query = trimmed_upper.starts_with("SELECT")
-            || trimmed_upper.starts_with("SHOW")
-            || trimmed_upper.starts_with("DESCRIBE")
-            || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESC")
-            || trimmed_upper.starts_with("WITH");
-        // Stored-program DDL (procedures, functions, triggers, events) is
-        // rejected by MySQL's prepared/binary protocol with error 1295 --
-        // per MySQL's own list of statements permitted as prepared
-        // statements, CREATE/ALTER/DROP PROCEDURE/FUNCTION/TRIGGER/EVENT are
-        // simply absent from it. These must go through the text protocol,
-        // the same way the `USE` statement above does.
-        let requires_text_protocol =
-            ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]
-                .iter()
-                .any(|keyword| {
-                    trimmed_upper.starts_with(&format!("CREATE {keyword}"))
-                        || trimmed_upper.starts_with(&format!("CREATE OR REPLACE {keyword}"))
-                        || trimmed_upper.starts_with(&format!("ALTER {keyword}"))
-                        || trimmed_upper.starts_with(&format!("DROP {keyword}"))
-                        || trimmed_upper.starts_with(&format!("DROP TEMPORARY {keyword}"))
-                });
-        let prefixed = format!(
-            "{}{}",
-            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
-            sql
-        );
-
-        if is_read_query {
-            // Stream rows instead of buffering the whole result. Each row is
-            // decoded and its cells capped before the next row is read, so a huge
-            // result (many rows or multi-megabyte BLOB cells) cannot be pulled
-            // into memory all at once and freeze the client.
-            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&pool);
-            let mut columns: Vec<String> = Vec::new();
-            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
-            // Set once the first row (or end-of-stream) arrives, splitting
-            // `execute_ms` (submit the query, wait for the server to start
-            // answering) from `streaming_ms` (pull and decode the rest).
-            let mut execute_ms: Option<u64> = None;
-            let mut first_row_at: Option<Instant> = None;
-
-            loop {
-                // Bound each row fetch so a connection that goes silently dead
-                // mid-result cannot block forever while `op_lock` is held; the
-                // guard then drops on return and the next query can reconnect.
-                let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
-                    Ok(Ok(Some(row))) => row,
-                    Ok(Ok(None)) => {
-                        if execute_ms.is_none() {
-                            execute_ms = Some(start.elapsed().as_millis() as u64);
-                        }
-                        break;
-                    }
-                    Ok(Err(error)) => return Err(error).context("Query execution failed"),
-                    Err(_elapsed) => anyhow::bail!(
-                        "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
-                         the database connection stalled mid-result"
-                    ),
-                };
-                if execute_ms.is_none() {
-                    execute_ms = Some(start.elapsed().as_millis() as u64);
-                    first_row_at = Some(Instant::now());
-                }
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|column| column.name().to_string())
-                        .collect();
-                }
-
-                let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| cell_to_string(&row, index))
-                    .collect();
-                result_rows.push(decoded);
-
-                if result_rows.len() >= MAX_RESULT_ROWS {
-                    break;
-                }
+        match self.run_the_query(&pool, database, sql, pool_wait_ms).await {
+            Err(error) if the_connection_died(&error) => {
+                let fresh = self.reconnect().await?;
+                self.run_the_query(&fresh, database, sql, pool_wait_ms)
+                    .await
             }
-
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            let rows_affected = result_rows.len() as u64;
-            let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
-            Ok(QueryResult {
-                raw_documents: None,
-                columns,
-                rows: result_rows,
-                rows_affected,
-                execution_time_ms,
-                timing: Some(QueryTiming {
-                    pool_wait_ms,
-                    execute_ms: execute_ms.unwrap_or(execution_time_ms),
-                    streaming_ms,
-                }),
-            })
-        } else {
-            let result = if requires_text_protocol {
-                sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
-                    .execute(&pool)
-                    .await
-                    .context("Query execution failed")?
-            } else {
-                sqlx::query(AssertSqlSafe(prefixed.as_str()))
-                    .execute(&pool)
-                    .await
-                    .context("Query execution failed")?
-            };
-
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            Ok(QueryResult {
-                raw_documents: None,
-                columns: vec![],
-                rows: vec![],
-                rows_affected: result.rows_affected(),
-                execution_time_ms,
-                timing: Some(QueryTiming {
-                    pool_wait_ms,
-                    execute_ms: execution_time_ms,
-                    streaming_ms: None,
-                }),
-            })
+            answer => answer,
         }
     }
 

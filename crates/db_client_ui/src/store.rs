@@ -38,6 +38,16 @@ const SCHEMA_CACHE_FILE: &str = "db_schema_cache.json";
 
 /// Upper bounds for the background full-schema prefetch so a huge server does
 /// not stall the worker or balloon memory. Beyond these the rest stays lazy.
+/// How long a schema read from a server is taken to still describe it.
+///
+/// Reading it again is not free: on a server with a hundred and fifty databases,
+/// reached over a corporate link where a round trip costs a fifth of a second,
+/// the read is minutes of talking to the server -- through the one connection
+/// the reader's own queries also have to use. A day-old list of tables is a
+/// far better answer than making somebody wait for a fresh one, and the
+/// refresh in the tree is there for when it matters.
+const SCHEMA_STAYS_FRESH_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
 const MAX_PREFETCH_DATABASES: usize = 50;
 const MAX_PREFETCH_TABLES_PER_DATABASE: usize = 300;
 /// Total describe_table calls a single prefetch may spend loading columns across
@@ -646,6 +656,20 @@ impl DatabaseStore {
         let Some(conn) = self.connections.iter().find(|c| c.config.id == id) else {
             return Task::ready(Ok(()));
         };
+        // What was read before still describes the server, so the reader gets
+        // their connection to themselves. `refresh_schema_cache` is the way to
+        // ask for it again.
+        if !worth_reading_the_schema_again(
+            self.schema_cache.get(&id).map(|cache| {
+                (
+                    cache.cached_at_unix_ms,
+                    cache.tables.values().any(|tables| !tables.is_empty()),
+                )
+            }),
+            SystemTime::now(),
+        ) {
+            return Task::ready(Ok(()));
+        }
         if !self.prefetching_schema.insert(id) {
             return Task::ready(Ok(()));
         }
@@ -2779,6 +2803,36 @@ fn save_ddl_cache_to_disk(cache: &HashMap<ConnectionId, DdlCache>) -> Result<()>
     Ok(())
 }
 
+/// Whether the schema of a connection is worth reading from the server again.
+///
+/// `held` is what the cache has for it: when it was written, and whether it
+/// actually holds any tables. Nothing cached, nothing in it, or nothing saying
+/// when it was written all mean the server has to be asked; otherwise it is
+/// asked only once the day is up.
+fn worth_reading_the_schema_again(held: Option<(Option<i64>, bool)>, now: SystemTime) -> bool {
+    let Some((cached_at_unix_ms, holds_tables)) = held else {
+        return true;
+    };
+    if !holds_tables {
+        return true;
+    }
+    let Some(cached_at_unix_ms) = cached_at_unix_ms else {
+        return true;
+    };
+    let Some(cached_at) = u64::try_from(cached_at_unix_ms)
+        .ok()
+        .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
+    else {
+        return true;
+    };
+    // A cache stamped in the future is a clock that moved; read it again rather
+    // than trust it until the clock catches up.
+    match now.duration_since(cached_at) {
+        Ok(age) => age >= SCHEMA_STAYS_FRESH_FOR,
+        Err(_) => true,
+    }
+}
+
 fn schema_cache_file_path() -> std::path::PathBuf {
     paths::config_dir().join(SCHEMA_CACHE_FILE)
 }
@@ -4160,6 +4214,64 @@ mod tests {
                 second_connection
             );
         });
+    }
+
+    /// A schema already read is not read again. It costs minutes on a large
+    /// server over a slow link, through the one connection the reader's own
+    /// queries need, so the day-old answer is the better one.
+    #[test]
+    fn a_schema_read_today_is_not_read_again() {
+        let now = SystemTime::now();
+        let stamp = |ago: Duration| {
+            now.checked_sub(ago)
+                .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                .map(|since| since.as_millis() as i64)
+        };
+
+        assert!(
+            !worth_reading_the_schema_again(Some((stamp(Duration::from_secs(60)), true)), now),
+            "a schema read a minute ago describes the server well enough"
+        );
+        assert!(
+            !worth_reading_the_schema_again(
+                Some((
+                    stamp(SCHEMA_STAYS_FRESH_FOR - Duration::from_secs(60)),
+                    true
+                )),
+                now
+            ),
+            "and so does one read just inside the day"
+        );
+        assert!(
+            worth_reading_the_schema_again(
+                Some((
+                    stamp(SCHEMA_STAYS_FRESH_FOR + Duration::from_secs(60)),
+                    true
+                )),
+                now
+            ),
+            "past the day it is worth asking again"
+        );
+        assert!(
+            worth_reading_the_schema_again(None, now),
+            "a connection with nothing cached has to ask"
+        );
+        assert!(
+            worth_reading_the_schema_again(Some((stamp(Duration::from_secs(60)), false)), now),
+            "a cache holding no tables at all is not an answer"
+        );
+        assert!(
+            worth_reading_the_schema_again(Some((None, true)), now),
+            "a cache that does not say when it was written cannot be trusted to be fresh"
+        );
+        let ahead = now
+            .checked_add(Duration::from_secs(600))
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as i64);
+        assert!(
+            worth_reading_the_schema_again(Some((ahead, true)), now),
+            "a cache stamped in the future is a clock that moved, not a fresh read"
+        );
     }
 
     #[test]
