@@ -429,6 +429,7 @@ fn the_engine_renders_scripts_and_answers_input(cx: &mut TestAppContext) {
         drop(sharp);
 
         a_scroll_costs_only_a_few_turns_of_the_engine(cx);
+        a_page_at_rest_says_it_has_no_work(cx);
         the_page_can_be_taken_somewhere(cx);
         the_page_can_be_searched(cx);
         the_page_knows_how_wide_it_is(cx);
@@ -513,6 +514,57 @@ fn a_scroll_costs_only_a_few_turns_of_the_engine(cx: &mut gpui::App) {
         worst <= AT_MOST,
         "a frame should take a handful of turns of the engine, not {worst}: something on the \
          path taken every turn is waking the engine up"
+    );
+    drop(page);
+}
+
+/// A page that has finished and is not being touched must cost nothing.
+///
+/// It once cost a whole processor. A frame copied out of the page is asked for
+/// and collected on a later turn, and the wait for it was made by asking the
+/// engine to wake us -- but that ask has nothing to wait for, so it came back at
+/// once, the driver turned the engine again, and the turning went on for as long
+/// as the copy took. On a still page, on a machine drawing in software, that is
+/// one core held for a page nobody is looking at. What the count measures here is
+/// exactly that: how often the engine says it has work while nothing is
+/// happening.
+fn a_page_at_rest_says_it_has_no_work(cx: &mut gpui::App) {
+    /// What a settled page is allowed to say over a second. A page at rest wakes
+    /// nobody: the few allowed here are for the last of the load draining out on
+    /// a slow machine, not for a loop.
+    const AT_MOST: u32 = 30;
+
+    let Some(mut page) = page(
+        &document("background:#fff;color:#111", "<p>Still.</p>"),
+        800.,
+        600.,
+        1.,
+        cx,
+    ) else {
+        return;
+    };
+    wait_for_colour(&mut page, [255, 255, 255], "a page to settle");
+    // Everything the load left behind, drained first: what is measured is the
+    // page after it has finished, not the tail of its arrival.
+    pump_for(&mut page, Duration::from_millis(1500));
+
+    let engine = page.engine();
+    let mut said_it_has_work = 0;
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        if engine.has_work_waiting() {
+            said_it_has_work += 1;
+            page.pump();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    println!("BENCH: a page at rest said it had work {said_it_has_work} times in a second");
+    assert!(
+        said_it_has_work <= AT_MOST,
+        "a page at rest must wake nobody, and this one woke us {said_it_has_work} times in a \
+         second: something is asking the engine for work it does not have, which is a loop that \
+         holds a processor for a page nobody is touching"
     );
     drop(page);
 }
