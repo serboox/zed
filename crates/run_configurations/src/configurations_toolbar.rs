@@ -348,9 +348,12 @@ impl ConfigurationsToolbar {
                 h_flex()
                     .debug_selector(|| "run-configurations-plaque".to_string())
                     .h(px(PLAQUE_HEIGHT))
-                    .w(px(286.))
+                    // Half again the width the mockup drew it at: a
+                    // configuration's name is longer than the mockup's example
+                    // and was being cut off at the arrow.
+                    .w(px(429.))
                     .min_w_0()
-                    .max_w(px(340.))
+                    .max_w(px(510.))
                     .px_2()
                     .gap_2()
                     .items_center()
@@ -461,9 +464,9 @@ impl ConfigurationsList {
     /// Every row is this tall, from the mockup: two lines of this list take the
     /// room one line of the form does, so a long list is still a list.
     const ROW_HEIGHT: f32 = 28.0;
-    /// As wide as the mockup has it -- half again the plaque, so a name that the
-    /// plaque truncates is readable here.
-    const WIDTH: f32 = 420.0;
+    /// Half again the plaque, so a name the plaque truncates is readable here --
+    /// the proportion the mockup drew, kept as the plaque itself grew.
+    const WIDTH: f32 = 630.0;
     /// The list scrolls past this; the actions below the rule stay put.
     const MOST_ROWS_SHOWN: f32 = 12.0;
 
