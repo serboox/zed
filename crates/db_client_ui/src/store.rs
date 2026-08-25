@@ -27,6 +27,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use util::ResultExt;
 
@@ -388,9 +389,66 @@ pub struct DatabaseStore {
     /// the tree row's status affordance. Cleared as soon as a prefetch for
     /// the same connection succeeds.
     schema_load_errors: HashMap<ConnectionId, String>,
+    /// The reader's own queries running on each connection. The schema reader
+    /// looks at this and stands aside: reading a schema ahead of time is meant
+    /// to keep out of the reader's way, not to queue in front of them on the
+    /// one connection they have.
+    queries_in_flight: HashMap<ConnectionId, Arc<AtomicUsize>>,
     run_configurations: Vec<RunConfiguration>,
     pub exec_jobs: Vec<crate::sql_exec::ExecJob>,
     pub(crate) next_exec_job_id: usize,
+}
+
+/// One of the reader's queries, counted as running for as long as this is held.
+pub struct QueryInFlight(Arc<AtomicUsize>);
+
+impl Drop for QueryInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long the schema reader waits before looking again at whether the reader
+/// still has a query of their own running.
+const WHILE_THE_READER_IS_BUSY: Duration = Duration::from_millis(150);
+
+/// For how long standing aside is worth it. A reader who keeps the connection
+/// busy for this long is not going to be interrupted by one more schema read,
+/// and a schema that is never read is a tree that never fills in -- so past
+/// this the reader's queries and the schema share the connection as they did
+/// before, a chunk each.
+const ONLY_STAND_ASIDE_FOR: Duration = Duration::from_secs(30);
+
+/// Stands aside while the reader has a query running on this connection. Both
+/// share one physical connection, so a schema read that starts now is a schema
+/// read the reader waits behind.
+async fn while_the_reader_is_busy(
+    store: &gpui::WeakEntity<DatabaseStore>,
+    id: ConnectionId,
+    cx: &mut gpui::AsyncApp,
+) {
+    // Counted from what was waited for rather than read off the clock: the two
+    // agree, and only the count moves when a test drives the clock itself.
+    let mut stood_aside_for = Duration::ZERO;
+    loop {
+        let busy = store
+            .read_with(cx, |store, _| store.the_reader_has_a_query_running(id))
+            .unwrap_or(false);
+        if !busy {
+            return;
+        }
+        if stood_aside_for >= ONLY_STAND_ASIDE_FOR {
+            log::info!(
+                "db_client: the schema reader stood aside for {stood_aside_for:?} and is \
+                 carrying on"
+            );
+            return;
+        }
+        cx.background_executor()
+            .timer(WHILE_THE_READER_IS_BUSY)
+            .await;
+        stood_aside_for += WHILE_THE_READER_IS_BUSY;
+    }
 }
 
 /// App-global handle to the single workspace `DatabaseStore`, set when the
@@ -552,6 +610,7 @@ impl DatabaseStore {
             prefetching_schema: HashSet::new(),
             schema_load_progress: HashMap::new(),
             schema_load_errors: HashMap::new(),
+            queries_in_flight: HashMap::new(),
             run_configurations: Vec::new(),
             exec_jobs: Vec::new(),
             next_exec_job_id: 0,
@@ -648,6 +707,20 @@ impl DatabaseStore {
     /// Bounded by `MAX_PREFETCH_*` and idempotent per connection (a second call
     /// while one is in flight is a no-op). Columns of non-primary databases stay
     /// lazy to keep the round-trip count sane on large servers.
+    /// Counts one of the reader's queries as running on `id` until the returned
+    /// marker is dropped -- including when the task holding it is cancelled.
+    fn a_query_starts(&mut self, id: ConnectionId) -> QueryInFlight {
+        let counter = self.queries_in_flight.entry(id).or_default().clone();
+        counter.fetch_add(1, Ordering::SeqCst);
+        QueryInFlight(counter)
+    }
+
+    pub fn the_reader_has_a_query_running(&self, id: ConnectionId) -> bool {
+        self.queries_in_flight
+            .get(&id)
+            .is_some_and(|counter| counter.load(Ordering::SeqCst) > 0)
+    }
+
     pub fn prefetch_full_schema(
         &mut self,
         id: ConnectionId,
@@ -702,6 +775,7 @@ impl DatabaseStore {
                     ..Default::default()
                 };
                 for info in databases.iter().take(MAX_PREFETCH_DATABASES) {
+                    while_the_reader_is_busy(&this, id, cx).await;
                     let database = info.name.clone();
                     let tables = provider.list_tables(&database).await.unwrap_or_default();
                     let views = provider.list_views(&database).await.unwrap_or_default();
@@ -774,6 +848,7 @@ impl DatabaseStore {
                     // each, and on a server reached over a slow link a schema of
                     // three hundred tables is a minute of talking through the one
                     // connection the reader's queries need.
+                    while_the_reader_is_busy(&this, id, cx).await;
                     let columns: HashMap<String, Vec<ColumnInfo>> = provider
                         .describe_database(database, &wanted)
                         .await
@@ -1156,6 +1231,10 @@ impl DatabaseStore {
     pub fn remove_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         self.connections.retain(|c| c.config.id != id);
         self.tunnels.remove(&id);
+        // A query still running keeps its own count alive; what goes is this
+        // map's hold on it, which is otherwise one entry per connection the
+        // reader ever had.
+        self.queries_in_flight.remove(&id);
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();
         cx.spawn(async move |_this, cx| {
@@ -2254,6 +2333,11 @@ impl DatabaseStore {
         self.record_query_history(sql.clone(), cx);
 
         cx.spawn(async move |this, cx| {
+            // Held from before the connection is even asked for: the schema
+            // reader looks at this to decide whether to stand aside, and a query
+            // that counts itself only once it has a provider can lose the
+            // connection to a schema read that started in between.
+            let _in_flight = this.update(cx, |store, _| store.a_query_starts(id))?;
             let provider = this
                 .update(cx, |store, cx| store.ensure_connected(id, cx))?
                 .await?;
@@ -3469,6 +3553,60 @@ mod tests {
         }
     }
 
+    /// A server whose queries hang until the test lets them finish, and which
+    /// writes down every schema read it is asked for.
+    struct BusyReaderProvider {
+        release_the_query: smol::channel::Receiver<()>,
+        schema_reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DbProvider for BusyReaderProvider {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+            Ok(vec![DatabaseInfo {
+                name: "shop".into(),
+            }])
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
+            self.schema_reads
+                .lock()
+                .unwrap()
+                .push(format!("tables of {database}"));
+            Ok(vec![TableInfo {
+                name: "users".into(),
+                kind: db_client::schema::TableKind::Table,
+            }])
+        }
+        async fn describe_table(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
+            self.schema_reads
+                .lock()
+                .unwrap()
+                .push(format!("columns of {database}.{table}"));
+            Ok(Vec::new())
+        }
+        async fn execute_query(
+            &self,
+            _database: &str,
+            _sql: &str,
+        ) -> Result<db_client::schema::QueryResult> {
+            self.release_the_query.recv().await.ok();
+            Ok(db_client::schema::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 0,
+                execution_time_ms: 0,
+                timing: None,
+                raw_documents: None,
+            })
+        }
+        async fn get_table_ddl(&self, _database: &str, _table: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
     struct RoutineMockProvider;
 
     #[async_trait::async_trait]
@@ -4062,6 +4200,101 @@ mod tests {
                 Some(SchemaObjectKind::Column)
             );
         });
+    }
+
+    /// The reader asks for their connection and gets it: while a query of theirs
+    /// is running, the schema reader must not be talking over the one connection
+    /// they share. It was waiting behind a thousand schema reads that made him
+    /// wait for his own query.
+    #[gpui::test]
+    fn the_schema_reader_stands_aside_while_the_reader_has_a_query_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (let_it_finish, release_the_query) = smol::channel::unbounded();
+        let schema_reads = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(BusyReaderProvider {
+            release_the_query,
+            schema_reads: schema_reads.clone(),
+        });
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider, cx);
+        });
+
+        let query = store.update(cx, |store, cx| {
+            store.execute_query(id, "shop".into(), "SELECT 1".into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            store.read_with(cx, |store, _| store.the_reader_has_a_query_running(id)),
+            "the reader's query has to be counted as running while it hangs"
+        );
+
+        store.update(cx, |store, cx| {
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(WHILE_THE_READER_IS_BUSY * 4);
+        cx.run_until_parked();
+        assert!(
+            schema_reads.lock().unwrap().is_empty(),
+            "the schema reader may not touch the connection while the reader's own \
+             query is running, but it read {:?}",
+            schema_reads.lock().unwrap()
+        );
+
+        let_it_finish.try_send(()).expect("the query is released");
+        cx.background_executor.run_until_parked();
+        query.detach();
+        cx.run_until_parked();
+        cx.executor().advance_clock(WHILE_THE_READER_IS_BUSY * 4);
+        cx.run_until_parked();
+        assert!(
+            !schema_reads.lock().unwrap().is_empty(),
+            "and it has to carry on once the reader is done"
+        );
+    }
+
+    /// Standing aside is bounded: a reader who holds the connection for minutes
+    /// would otherwise leave the tree empty, and one more schema read is not
+    /// what is keeping them waiting by then.
+    #[gpui::test]
+    fn the_schema_reader_does_not_stand_aside_for_ever(cx: &mut gpui::TestAppContext) {
+        let (_let_it_finish, release_the_query) = smol::channel::unbounded();
+        let schema_reads = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(BusyReaderProvider {
+            release_the_query,
+            schema_reads: schema_reads.clone(),
+        });
+        let store = cx.new(DatabaseStore::new);
+        let config = ConnectionConfig::default();
+        let id = config.id;
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, provider, cx);
+        });
+
+        let _query = store.update(cx, |store, cx| {
+            store.execute_query(id, "shop".into(), "SELECT 1".into(), cx)
+        });
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.prefetch_full_schema(id, cx).detach();
+        });
+        cx.run_until_parked();
+        assert!(
+            schema_reads.lock().unwrap().is_empty(),
+            "it stands aside first"
+        );
+
+        cx.executor()
+            .advance_clock(ONLY_STAND_ASIDE_FOR + WHILE_THE_READER_IS_BUSY * 2);
+        cx.run_until_parked();
+        assert!(
+            !schema_reads.lock().unwrap().is_empty(),
+            "and carries on once it has waited long enough, query or no query"
+        );
     }
 
     #[gpui::test]
