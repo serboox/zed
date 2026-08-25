@@ -65,6 +65,15 @@ const WHILE_THE_PAGE_ARRIVES: Duration = Duration::from_millis(4);
 /// last step of a load is not left waiting on the long one.
 #[cfg(feature = "servo")]
 const STILL_ARRIVING_FOR: Duration = Duration::from_millis(200);
+
+/// For how long a page that says it is still arriving is hurried along at that
+/// pace. A load that never finishes -- a file that is not there, a fetch that
+/// never answers -- would otherwise be turned every four milliseconds for as
+/// long as the tab is open, which is a whole processor held for a page that
+/// never appears. Measured: a file that did not exist held the driver at twenty
+/// turns a second with not one frame painted, for as long as it was open.
+#[cfg(feature = "servo")]
+const HURRY_AN_ARRIVAL_FOR: Duration = Duration::from_secs(10);
 /// How often the page is asked where it stands. Asking runs a script in the
 /// page, so it is worth doing often enough for the scrollbar to keep up with a
 /// reader's thumb and no more.
@@ -847,8 +856,10 @@ impl HtmlPreviewView {
             // cleared the moment it paints or the reader touches it.
             let mut only_spinning = false;
             // A page still arriving is turning for something, however little it
-            // has painted so far.
+            // has painted so far -- until it has been arriving too long to be
+            // arriving at all.
             let mut arrived_this_second = false;
+            let mut arriving_since: Option<std::time::Instant> = None;
             loop {
                 // Whichever comes first: the engine saying it has work, or the
                 // safety net going off. Nothing here asks the engine again and
@@ -856,8 +867,9 @@ impl HtmlPreviewView {
                 // A page waiting for the card is not waiting to be told
                 // anything: the card says nothing when it reaches the mark, so
                 // it is looked at again shortly rather than waited on.
-                let arriving =
-                    arriving_until.is_some_and(|until| std::time::Instant::now() < until);
+                let arriving = arriving_until
+                    .is_some_and(|until| std::time::Instant::now() < until)
+                    && worth_hurrying_the_arrival(arriving_since.map(|since| since.elapsed()));
                 let heartbeat = match (waiting_for_the_card, arriving, unseen || only_spinning) {
                     (true, _, _) => UNTIL_THE_CARD_IS_ASKED_AGAIN,
                     (false, true, _) => WHILE_THE_PAGE_ARRIVES,
@@ -1063,10 +1075,24 @@ impl HtmlPreviewView {
                     Ok(Some((out_of_sight, drew, for_the_card, still_arriving))) => {
                         unseen = out_of_sight;
                         waiting_for_the_card = for_the_card;
-                        if still_arriving {
-                            arriving_until = Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
-                            arrived_this_second = true;
-                            only_spinning = false;
+                        match still_arriving {
+                            true => {
+                                arriving_until =
+                                    Some(std::time::Instant::now() + STILL_ARRIVING_FOR);
+                                arriving_since =
+                                    arriving_since.or_else(|| Some(std::time::Instant::now()));
+                                // A page that has been arriving far too long is
+                                // treated as one that has arrived: it is not
+                                // going to paint, and nothing is gained by
+                                // turning it as though it were about to.
+                                if worth_hurrying_the_arrival(
+                                    arriving_since.map(|since| since.elapsed()),
+                                ) {
+                                    arrived_this_second = true;
+                                    only_spinning = false;
+                                }
+                            }
+                            false => arriving_since = None,
                         }
                         if drew.is_some() {
                             frames_this_second += 1;
@@ -2820,6 +2846,15 @@ pub struct Frames {
     pub redraws_a_second: u32,
 }
 
+/// Whether a page that says it is still arriving is worth turning at the pace
+/// of an arrival. A page that has been arriving for longer than any page takes
+/// is not arriving: it is waiting for something that is not coming, and the
+/// ordinary safety net is enough for it.
+#[cfg(feature = "servo")]
+fn worth_hurrying_the_arrival(arriving_for: Option<Duration>) -> bool {
+    arriving_for.is_none_or(|arriving_for| arriving_for < HURRY_AN_ARRIVAL_FOR)
+}
+
 /// Whether the page is being turned over and over for nothing. The engine asks
 /// to be turned whenever it thinks it has work; a page that asks many times in a
 /// second and paints not one frame has none, and turning it that often is a
@@ -2933,6 +2968,26 @@ mod how_often_the_page_is_asked {
         // Nothing asked yet is always worth asking, once there is a reason to.
         assert!(worth_asking_where_it_stands(true, false, None));
         assert!(worth_asking_where_it_stands(false, true, None));
+    }
+
+    /// A page that never finishes arriving is the one case measured to hold a
+    /// processor: turned every four milliseconds for as long as the tab is open.
+    #[cfg(feature = "servo")]
+    #[test]
+    fn an_arrival_is_hurried_along_only_for_so_long() {
+        assert!(
+            worth_hurrying_the_arrival(None),
+            "a page that has just started arriving is hurried along"
+        );
+        assert!(worth_hurrying_the_arrival(Some(
+            HURRY_AN_ARRIVAL_FOR - Duration::from_secs(1)
+        )));
+        assert!(
+            !worth_hurrying_the_arrival(Some(HURRY_AN_ARRIVAL_FOR)),
+            "and one that has been arriving longer than any page takes is left \
+             to the safety net"
+        );
+        assert!(!worth_hurrying_the_arrival(Some(HURRY_AN_ARRIVAL_FOR * 60)));
     }
 
     #[test]
