@@ -28,9 +28,9 @@ use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, AnyView, App, Context, Element, Entity,
-    Focusable, Global, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    Focusable, Global, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
-    pulsating_between,
+    pulsating_between, px,
 };
 use onboarding_banner::OnboardingBanner;
 use project::{
@@ -233,6 +233,9 @@ pub struct TitleBar {
     middle: Option<AnyView>,
 }
 
+/// How far right of the middle of the bar whatever is put in its middle sits.
+const NUDGED_RIGHT_BY: Pixels = px(24.);
+
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.multi_workspace.is_none() {
@@ -390,6 +393,13 @@ impl Render for TitleBar {
                     .min_w_0()
                     .overflow_hidden()
                     .justify_center()
+                    // Nudged off dead centre, which is where it reads as centred:
+                    // what sits to its left is a project name and a branch, and
+                    // what sits to its right is a row of controls, so the eye puts
+                    // the middle of the bar a little further along than the
+                    // arithmetic does. The room either side of it is split evenly,
+                    // so what is given here moves it half as far.
+                    .ml(NUDGED_RIGHT_BY * 2.)
                     .debug_selector(|| "title-bar-middle".to_string())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(middle)

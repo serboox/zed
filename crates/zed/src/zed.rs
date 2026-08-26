@@ -5564,15 +5564,17 @@ mod tests {
             middle.right(),
             account_end.origin.x
         );
-        // Centred, not merely somewhere in between: the room left of it and the
-        // room right of it are the same. This is what a plaque jammed against
-        // the account controls fails.
+        // Not merely somewhere in between: a little right of centre, which is
+        // where it reads as centred -- a project name and a branch sit to its
+        // left, a row of controls to its right. A plaque jammed against the
+        // account controls fails this, and so does one at dead centre.
         let room_to_the_left = middle.origin.x - project_end.origin.x;
         let room_to_the_right = account_end.right() - middle.right();
+        let off_centre = room_to_the_left - room_to_the_right;
         assert!(
-            (room_to_the_left - room_to_the_right).abs() < px(8.),
-            "the plaque is not centred: {room_to_the_left:?} of room on its left \
-             against {room_to_the_right:?} on its right"
+            off_centre > px(8.) && off_centre < px(96.),
+            "the plaque has to sit a little right of centre: {room_to_the_left:?} \
+             of room on its left against {room_to_the_right:?} on its right"
         );
         // And it is a plaque, not a chip: a name has to be readable in it.
         assert!(
