@@ -319,43 +319,48 @@ pub struct Request {
     pub test_script: String,
     #[serde(default)]
     pub examples: Vec<SavedExample>,
-    /// Overrides the store's globally active environment for this request
-    /// alone, for a request that is always meant to run against one
-    /// particular environment regardless of what's currently active.
+    /// The environment this request runs against, whatever is active
+    /// store-wide. Chosen by the reader in the request's own environment
+    /// picker; `None` means the request follows the active environment.
     ///
-    /// Kept alongside `pinned_environment_ids` and holding the first of them, so
-    /// a collection written by this build still reads sensibly in one that only
-    /// knows about a single pin. Read it through `pinned_environments`.
+    /// Choosing and pinning are two different things: this is where a send
+    /// goes, and `pinned_environment_ids` is which environments the picker
+    /// keeps at the top and which comparing works from.
     #[serde(default)]
     pub pinned_environment_id: Option<EnvironmentId>,
-    /// Every environment this request is pinned to, in the order they were
-    /// pinned. The first is the one a plain send uses; the rest are what
-    /// comparing across environments has to work with -- the same request
-    /// against stage and production, say.
+    /// The environments kept at the top of this request's picker, in the order
+    /// they were pinned -- the ones it is regularly sent to. Also what
+    /// comparing across environments works from: the same request against
+    /// stage and production, say. Pinning one does not send anything to it.
     #[serde(default)]
     pub pinned_environment_ids: Vec<EnvironmentId>,
 }
 
 impl Request {
-    /// Every environment this request is pinned to. Falls back to the single
-    /// pin a collection written by an older build holds, so nothing is lost on
-    /// the way in.
+    /// Every environment this request is pinned to.
+    ///
+    /// Only the list: the single field is where a send goes, and reading it as a
+    /// pin as well would leave every request that follows one environment
+    /// looking as though it were pinned to it.
     pub fn pinned_environments(&self) -> Vec<EnvironmentId> {
-        match self.pinned_environment_ids.is_empty() {
-            false => self.pinned_environment_ids.clone(),
-            true => self.pinned_environment_id.into_iter().collect(),
-        }
+        self.pinned_environment_ids.clone()
     }
 
-    /// The environment a plain send uses: the first pinned, if any.
-    pub fn primary_pinned_environment(&self) -> Option<EnvironmentId> {
-        self.pinned_environments().first().copied()
+    /// The environment a send goes to, if the reader chose one for this
+    /// request. Pinning an environment does not choose it.
+    pub fn chosen_environment(&self) -> Option<EnvironmentId> {
+        self.pinned_environment_id
     }
 
-    /// Pins this request to exactly these environments, keeping the single-pin
-    /// field in step for anything that still reads it.
+    /// Sends this request to `id` from now on, or back to whichever environment
+    /// is active store-wide when given `None`.
+    pub fn choose_environment(&mut self, id: Option<EnvironmentId>) {
+        self.pinned_environment_id = id;
+    }
+
+    /// Pins this request to exactly these environments, leaving where a send
+    /// goes alone.
     pub fn pin_to_environments(&mut self, ids: Vec<EnvironmentId>) {
-        self.pinned_environment_id = ids.first().copied();
         self.pinned_environment_ids = ids;
     }
 
@@ -546,56 +551,63 @@ mod tests {
         assert!(request.toggle_pinned_environment(staging));
         assert!(request.toggle_pinned_environment(production));
         assert_eq!(request.pinned_environments(), vec![staging, production]);
-        assert_eq!(request.primary_pinned_environment(), Some(staging));
 
         assert!(!request.toggle_pinned_environment(staging));
         assert_eq!(request.pinned_environments(), vec![production]);
-        assert_eq!(
-            request.primary_pinned_environment(),
-            Some(production),
-            "unpinning the first must promote the next, not leave a stale primary"
-        );
 
         assert!(!request.toggle_pinned_environment(production));
         assert!(request.pinned_environments().is_empty());
-        assert_eq!(request.primary_pinned_environment(), None);
     }
 
-    /// The single-pin field is what a build that knows nothing about several
-    /// pins reads, so it has to keep holding the first of them.
+    /// Pinning keeps an environment at hand and choosing one is where a send
+    /// goes. Neither touches the other.
     #[test]
-    fn the_single_pin_field_stays_in_step_with_the_list() {
+    fn pinning_and_choosing_are_two_different_things() {
         let staging = Uuid::new_v4();
         let production = Uuid::new_v4();
         let mut request = a_request();
-        request.pin_to_environments(vec![staging, production]);
-        assert_eq!(request.pinned_environment_id, Some(staging));
 
         request.toggle_pinned_environment(staging);
-        assert_eq!(request.pinned_environment_id, Some(production));
+        assert_eq!(
+            request.chosen_environment(),
+            None,
+            "pinning must not choose"
+        );
 
-        request.pin_to_environments(Vec::new());
-        assert_eq!(request.pinned_environment_id, None);
+        request.choose_environment(Some(production));
+        assert_eq!(request.chosen_environment(), Some(production));
+        assert_eq!(
+            request.pinned_environments(),
+            vec![staging],
+            "and choosing must not pin"
+        );
+
+        request.toggle_pinned_environment(staging);
+        assert!(request.pinned_environments().is_empty());
+        assert_eq!(
+            request.chosen_environment(),
+            Some(production),
+            "unpinning leaves where a send goes alone"
+        );
+
+        request.choose_environment(None);
+        assert_eq!(request.chosen_environment(), None);
     }
 
-    /// A collection saved before several pins existed carries only the single
-    /// field; reading it must still report that one pin.
+    /// A collection saved before pinning and choosing were told apart holds one
+    /// field. What it held is where the request was sent, so that is what it is
+    /// read as -- the request keeps going where it went.
     #[test]
-    fn a_lone_legacy_pin_is_read_as_the_only_pin() {
+    fn a_lone_legacy_pin_is_read_as_the_chosen_environment() {
         let staging = Uuid::new_v4();
         let mut request = a_request();
         request.pinned_environment_id = Some(staging);
         request.pinned_environment_ids = Vec::new();
 
-        assert_eq!(request.pinned_environments(), vec![staging]);
-        assert_eq!(request.primary_pinned_environment(), Some(staging));
-
-        let production = Uuid::new_v4();
-        assert!(request.toggle_pinned_environment(production));
-        assert_eq!(
-            request.pinned_environments(),
-            vec![staging, production],
-            "toggling on top of a legacy pin must keep it, not replace it"
+        assert_eq!(request.chosen_environment(), Some(staging));
+        assert!(
+            request.pinned_environments().is_empty(),
+            "and nothing is pinned, which is what an empty list says"
         );
     }
 

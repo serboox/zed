@@ -1111,18 +1111,23 @@ impl ApiClientStore {
         if self.active_environment_id == Some(id) {
             self.active_environment_id = None;
         }
-        // A pin to an environment that is gone is a pin to nothing: left in
-        // place it goes on claiming to be the environment a send uses, while a
-        // send has quietly fallen back to whichever one is active.
+        // A request pinned to an environment that is gone is pinned to nothing,
+        // and one that was sent to it has nowhere to be sent: both are dropped
+        // rather than left pointing at a name that no longer exists.
         let mut requests_repinned = false;
         for request in &mut self.requests {
-            let left = request
-                .pinned_environments()
-                .into_iter()
+            let pinned = request.pinned_environments();
+            let left = pinned
+                .iter()
+                .copied()
                 .filter(|pinned| *pinned != id)
                 .collect::<Vec<_>>();
-            if left.len() != request.pinned_environments().len() {
+            if left.len() != pinned.len() {
                 request.pin_to_environments(left);
+                requests_repinned = true;
+            }
+            if request.chosen_environment() == Some(id) {
+                request.choose_environment(None);
                 requests_repinned = true;
             }
         }
@@ -1155,17 +1160,18 @@ impl ApiClientStore {
     /// its own pinned environment when it has one, falling back to
     /// whichever environment is currently active store-wide.
     pub fn effective_environment_for(&self, request: &Request) -> Option<&Environment> {
-        // The first pin that still exists, not simply the first pin: an
-        // environment can be deleted from under a request, and the pins behind
-        // the dead one are still the reader's own choice.
+        // What the reader chose for this request, and the active environment
+        // otherwise. A pinned environment is one the picker keeps at hand, not
+        // one anything is sent to.
         request
-            .pinned_environments()
-            .into_iter()
-            .find_map(|id| self.environment_by_id(id))
+            .chosen_environment()
+            .and_then(|id| self.environment_by_id(id))
             .or_else(|| self.active_environment())
     }
 
-    pub fn set_request_pinned_environment(
+    /// Sends this request to `environment_id` from now on, or back to whichever
+    /// environment is active when given `None`. Leaves its pins alone.
+    pub fn choose_request_environment(
         &mut self,
         request_id: RequestId,
         environment_id: Option<EnvironmentId>,
@@ -1174,7 +1180,7 @@ impl ApiClientStore {
         let Some(request) = self.requests.iter_mut().find(|r| r.id == request_id) else {
             return;
         };
-        request.pin_to_environments(environment_id.into_iter().collect());
+        request.choose_environment(environment_id);
         cx.notify();
         self.persist_collections(cx);
     }
@@ -1772,14 +1778,14 @@ mod tests {
             store.create_request(collection_id, "Get users".into(), None, cx)
         });
         store.update(cx, |store, cx| {
-            store.set_request_pinned_environment(request_id, Some(env_id), cx);
+            store.choose_request_environment(request_id, Some(env_id), cx);
         });
         store.read_with(cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.pinned_environment_id, Some(env_id));
         });
         store.update(cx, |store, cx| {
-            store.set_request_pinned_environment(request_id, None, cx);
+            store.choose_request_environment(request_id, None, cx);
         });
         store.read_with(cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
@@ -1810,6 +1816,7 @@ mod tests {
             store.set_active_environment(Some(elsewhere), cx);
             store.toggle_request_pinned_environment(request_id, doomed, cx);
             store.toggle_request_pinned_environment(request_id, production, cx);
+            store.choose_request_environment(request_id, Some(doomed), cx);
         });
 
         store.update(cx, |store, cx| store.delete_environment(doomed, cx));
@@ -1831,25 +1838,29 @@ mod tests {
                 "and it is gone from the request itself, not merely hidden"
             );
             assert_eq!(
+                request.chosen_environment(),
+                None,
+                "the request is no longer sent to an environment that is gone"
+            );
+            assert_eq!(
                 store
                     .effective_environment_for(request)
                     .map(|environment| environment.id),
-                Some(production),
-                "a send follows the pin that is left, not the active environment"
+                Some(elsewhere),
+                "so it follows the active environment until the reader chooses again"
             );
         });
     }
 
-    /// The same request read before the deletion has been noticed: a pin whose
-    /// environment is gone must not send the request somewhere it was never
-    /// pinned to.
+    /// The same request read before the deletion has been noticed: a request
+    /// sent to an environment that is gone has to fall back rather than send
+    /// itself nowhere.
     #[gpui::test]
-    fn a_send_skips_a_pin_whose_environment_is_gone(cx: &mut TestAppContext) {
+    fn a_send_falls_back_when_the_chosen_environment_is_gone(cx: &mut TestAppContext) {
         let store = new_store(cx);
-        let (doomed, production, elsewhere) = store.update(cx, |store, cx| {
+        let (doomed, elsewhere) = store.update(cx, |store, cx| {
             (
                 store.create_environment("Doomed".into(), cx),
-                store.create_environment("Production".into(), cx),
                 store.create_environment("Elsewhere".into(), cx),
             )
         });
@@ -1858,9 +1869,9 @@ mod tests {
         });
         let collection = api_client::Collection::new("Sample".into());
         let mut request = api_client::Request::new(collection.id, "Get users".into());
-        request.pin_to_environments(vec![doomed, production]);
-        // Straight off the environment list, so the request keeps the stale pin
-        // the way a collection saved before the deletion would.
+        request.choose_environment(Some(doomed));
+        // Straight off the environment list, so the request keeps the stale
+        // choice the way a collection saved before the deletion would.
         store.update(cx, |store, _| {
             store
                 .environments
@@ -1872,13 +1883,13 @@ mod tests {
                 store
                     .effective_environment_for(&request)
                     .map(|environment| environment.id),
-                Some(production)
+                Some(elsewhere)
             );
         });
     }
 
     #[gpui::test]
-    fn toggling_pins_keeps_the_others_and_sends_to_the_first(cx: &mut TestAppContext) {
+    fn pinning_an_environment_is_not_choosing_it(cx: &mut TestAppContext) {
         let store = new_store(cx);
         let staging_id = store.update(cx, |store, cx| {
             store.create_environment("Staging".into(), cx)
@@ -1912,27 +1923,26 @@ mod tests {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(
                 store.effective_environment_for(request).map(|it| it.id),
-                Some(staging_id),
-                "a plain send goes to the first pinned environment"
+                Some(other_id),
+                "and pinning must not send the request anywhere: it still follows \
+                 the active environment"
             );
         });
 
         store.update(cx, |store, cx| {
-            store.toggle_request_pinned_environment(request_id, staging_id, cx);
+            store.choose_request_environment(request_id, Some(production_id), cx);
         });
         store.read_with(cx, |store, _| {
-            assert_eq!(
-                store
-                    .pinned_environments_for(request_id)
-                    .iter()
-                    .map(|environment| environment.id)
-                    .collect::<Vec<_>>(),
-                vec![production_id]
-            );
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(
                 store.effective_environment_for(request).map(|it| it.id),
-                Some(production_id)
+                Some(production_id),
+                "choosing one is what sends the request there"
+            );
+            assert_eq!(
+                request.pinned_environments(),
+                vec![staging_id, production_id],
+                "and choosing must leave the pins as they were"
             );
         });
 
@@ -1940,12 +1950,28 @@ mod tests {
             store.toggle_request_pinned_environment(request_id, production_id, cx);
         });
         store.read_with(cx, |store, _| {
-            assert!(store.pinned_environments_for(request_id).is_empty());
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.pinned_environments(),
+                vec![staging_id],
+                "unpinning takes the pin"
+            );
+            assert_eq!(
+                store.effective_environment_for(request).map(|it| it.id),
+                Some(production_id),
+                "and leaves where the request is sent alone"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.choose_request_environment(request_id, None, cx);
+        });
+        store.read_with(cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(
                 store.effective_environment_for(request).map(|it| it.id),
                 Some(other_id),
-                "with nothing pinned the request falls back to the active environment"
+                "and with no choice the request follows the active environment again"
             );
         });
     }

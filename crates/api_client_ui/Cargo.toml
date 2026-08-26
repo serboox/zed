@@ -25,6 +25,7 @@ log.workspace = true
 menu.workspace = true
 multi_buffer.workspace = true
 paths.workspace = true
+picker.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

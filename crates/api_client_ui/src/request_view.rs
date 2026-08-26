@@ -574,7 +574,13 @@ pub struct RequestView {
     test_results: Vec<api_client::TestResult>,
     visualize_data: Option<serde_json::Value>,
     scroll_handle: ScrollHandle,
-    environment_pin_handle: ui::PopoverMenuHandle<ContextMenu>,
+    /// The picker the chip opens, built once: it holds the reader's search text
+    /// and which row they are on, and both belong to the picker rather than to
+    /// each opening of it.
+    environment_picker:
+        Entity<picker::Picker<crate::environment_picker::EnvironmentPickerDelegate>>,
+    environment_pin_handle:
+        ui::PopoverMenuHandle<picker::Picker<crate::environment_picker::EnvironmentPickerDelegate>>,
     variable_picker_handle: ui::PopoverMenuHandle<ContextMenu>,
     method_selector_handle: ui::PopoverMenuHandle<ContextMenu>,
     auto_header_enabled: Vec<bool>,
@@ -831,6 +837,16 @@ impl RequestView {
             editor
         });
 
+        // Built before the handles are moved into the view: the picker keeps its
+        // own copies of both.
+        let environment_picker = crate::environment_picker::environment_picker(
+            store.clone(),
+            workspace.clone(),
+            request.id,
+            window,
+            cx,
+        );
+
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             request_id: request.id,
@@ -896,6 +912,7 @@ impl RequestView {
             test_results: Vec::new(),
             visualize_data: None,
             scroll_handle: ScrollHandle::new(),
+            environment_picker,
             environment_pin_handle: ui::PopoverMenuHandle::default(),
             variable_picker_handle: ui::PopoverMenuHandle::default(),
             method_selector_handle: ui::PopoverMenuHandle::default(),
@@ -921,6 +938,16 @@ impl RequestView {
             dock_tab: None,
             _subscriptions: Vec::new(),
         };
+
+        // The picker's rows come from the store, and an environment can be made
+        // or deleted while a request tab is open. Kept in step here rather than
+        // rebuilt on every render, which is where a list of a dozen names does
+        // not belong.
+        let observer = cx.observe_in(&this.store.clone(), window, |this, _store, window, cx| {
+            this.environment_picker
+                .update(cx, |picker, cx| picker.refresh(window, cx));
+        });
+        this._subscriptions.push(observer);
 
         for param in &request.params {
             this.push_param_row(
@@ -3042,12 +3069,17 @@ impl RequestView {
             .into_iter()
             .filter(|id| store.environment_by_id(*id).is_some())
             .collect();
-        // Without a pin the comparison still has to start somewhere, and the
-        // environment the request would be sent to anyway is that somewhere.
-        let base = pinned
-            .first()
-            .copied()
-            .or_else(|| store.active_environment().map(|environment| environment.id));
+        // The comparison starts from the environment this request is sent to,
+        // and from one it is pinned to when it follows no particular one -- a
+        // reader who pinned two environments meant those two.
+        let base = store
+            .requests
+            .iter()
+            .find(|request| request.id == self.request_id)
+            .and_then(|request| request.chosen_environment())
+            .filter(|id| store.environment_by_id(*id).is_some())
+            .or_else(|| store.active_environment().map(|environment| environment.id))
+            .or_else(|| pinned.first().copied());
         let name_of = |id: EnvironmentId| {
             store
                 .environment_by_id(id)
@@ -3144,75 +3176,31 @@ impl RequestView {
             )
     }
 
-    /// Adds or removes one pinned environment, leaving the others alone.
-    fn toggle_pinned_environment(&mut self, id: EnvironmentId, cx: &mut Context<Self>) {
-        let request_id = self.request_id;
-        self.store.update(cx, |store, cx| {
-            store.toggle_request_pinned_environment(request_id, id, cx)
-        });
-        cx.notify();
-    }
-
-    fn set_pinned_environment(
-        &mut self,
-        environment_id: Option<EnvironmentId>,
+    /// The chip that says which environment this request is sent to, and opens
+    /// the picker where that is chosen and environments are pinned.
+    fn render_environment_pin(
+        &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let request_id = self.request_id;
-        self.store.update(cx, |store, cx| {
-            store.set_request_pinned_environment(request_id, environment_id, cx)
-        });
-        cx.notify();
-    }
-
-    /// A compact control letting this request override the store's globally
-    /// active environment with one it's always meant to run against --
-    /// shows "Active Environment" when unpinned, or the pinned environment's
-    /// name otherwise, so it's obvious at a glance which environment this
-    /// specific request will actually resolve `{{tokens}}` against.
-    fn render_environment_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ) -> impl IntoElement {
         let store = self.store.read(cx);
-        // Only pins to environments that still exist: a pin left over from a
-        // deleted one is not what a send follows, so it must not be what the chip
-        // names or what the menu marks either.
-        let pinned: Vec<EnvironmentId> = store
+        let chosen = store
             .requests
             .iter()
             .find(|request| request.id == self.request_id)
-            .map(|request| request.pinned_environments())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|id| store.environment_by_id(*id).is_some())
-            .collect();
-        let pinned_names: Vec<String> = pinned
-            .iter()
-            .filter_map(|id| store.environment_by_id(*id))
-            .map(|environment| environment.name.clone())
-            .collect();
-        // Several fit on the chip only as a count; the names are in the menu
-        // below, each with its own tick.
-        let trigger_label: SharedString = match pinned_names.as_slice() {
-            [] => "Active Environment".into(),
-            [only] => format!("Pinned: {only}").into(),
-            [first, rest @ ..] => format!("Pinned: {first} +{}", rest.len()).into(),
+            .and_then(|request| request.chosen_environment())
+            .and_then(|id| store.environment_by_id(id));
+        let label: SharedString = match chosen {
+            Some(environment) => environment.name.clone().into(),
+            None => "Active Environment".into(),
         };
-        // The pinned ones sit at the top of the menu and the rest below a line,
-        // each group in alphabetical order: a list in the order the environments
-        // happen to have been created is a list the reader has to search, and
-        // what this request is pinned to is what they came to look at.
-        let (mut pinned_rows, mut the_rest): (Vec<_>, Vec<_>) = store
-            .environments
-            .iter()
-            .map(|environment| (environment.id, environment.name.clone()))
-            .partition(|(id, _)| pinned.contains(id));
-        by_name(&mut pinned_rows);
-        by_name(&mut the_rest);
-        let view = cx.entity();
+        let is_chosen = chosen.is_some();
+        let picker = self.environment_picker.clone();
         let popover_handle = self.environment_pin_handle.clone();
 
         // The label goes into a selector of its own so a test can read what the
-        // chip actually says, which is the only place the pin count is shown.
-        let shown_on_the_chip = trigger_label.clone();
+        // chip actually says, which is the only place the choice is named.
+        let shown_on_the_chip = label.clone();
         div()
             .id("request-environment-pin")
             .debug_selector(|| "request-environment-pin".to_string())
@@ -3220,77 +3208,21 @@ impl RequestView {
                 div()
                     .debug_selector(move || format!("request-environment-pin:{shown_on_the_chip}"))
                     .child(
-                        ui::PopoverMenu::new("request-environment-pin-popover")
-                            .with_handle(popover_handle)
-                            .trigger(
-                                Button::new("request-environment-pin-trigger", trigger_label)
-                                    .start_icon(Icon::new(IconName::Pin))
-                                    .style(if !pinned.is_empty() {
-                                        ButtonStyle::Tinted(ui::TintColor::Accent)
-                                    } else {
-                                        ButtonStyle::Subtle
-                                    }),
-                            )
-                            .menu(move |window, cx| {
-                                let view = view.clone();
-                                let pinned_rows = pinned_rows.clone();
-                                let the_rest = the_rest.clone();
-                                let pinned = pinned.clone();
-                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                                    let menu = menu.entry("Use Active Environment", None, {
-                                        let view = view.clone();
-                                        move |_window, cx| {
-                                            view.update(cx, |view, cx| {
-                                                view.set_pinned_environment(None, cx);
-                                            });
-                                        }
-                                    });
-                                    // Each is a tick of its own: a request is often meant
-                                    // for more than one environment -- the same call
-                                    // against stage and production -- and comparing them
-                                    // needs both pinned at once. The first pinned is the
-                                    // one a plain send uses.
-                                    let tick =
-                                        |menu: ContextMenu, rows: &[(EnvironmentId, String)]| {
-                                            rows.iter().fold(menu, |menu, (id, name)| {
-                                                let view = view.clone();
-                                                let id = *id;
-                                                let is_pinned = pinned.contains(&id);
-                                                let shown =
-                                                    match pinned.iter().position(|it| *it == id) {
-                                                        Some(0) => format!("{name}  (sent to)"),
-                                                        _ => name.clone(),
-                                                    };
-                                                menu.toggleable_entry(
-                                                    shown,
-                                                    is_pinned,
-                                                    ui::IconPosition::Start,
-                                                    None,
-                                                    move |_window, cx| {
-                                                        view.update(cx, |view, cx| {
-                                                            view.toggle_pinned_environment(id, cx);
-                                                        });
-                                                    },
-                                                )
-                                            })
-                                        };
-                                    // No line under the action when there is
-                                    // nothing below it to separate it from.
-                                    let menu = match pinned_rows.is_empty() && the_rest.is_empty() {
-                                        true => menu,
-                                        false => menu.separator(),
-                                    };
-                                    let menu = tick(menu, &pinned_rows);
-                                    // The line is what makes the pinned ones read as
-                                    // a group of their own rather than as the top of
-                                    // one long list.
-                                    let menu = match (pinned_rows.is_empty(), the_rest.is_empty()) {
-                                        (false, false) => menu.separator(),
-                                        _ => menu,
-                                    };
-                                    tick(menu, &the_rest)
-                                }))
-                            }),
+                        picker::popover_menu::PickerPopoverMenu::new(
+                            picker,
+                            Button::new("request-environment-pin-trigger", label)
+                                .start_icon(Icon::new(IconName::Pin))
+                                .style(if is_chosen {
+                                    ButtonStyle::Tinted(ui::TintColor::Accent)
+                                } else {
+                                    ButtonStyle::Subtle
+                                }),
+                            move |_window, cx| Tooltip::simple("Environment for this request", cx),
+                            gpui::Anchor::TopLeft,
+                            cx,
+                        )
+                        .with_handle(popover_handle)
+                        .render(window, cx),
                     ),
             )
     }
@@ -4940,7 +4872,7 @@ impl Render for RequestView {
                             ),
                     ),
             )
-            .child(self.render_environment_pin(cx))
+            .child(self.render_environment_pin(window, cx))
             .child(self.render_environments_comparison(cx))
             .child({
                 let is_sending = matches!(self.send_state, SendState::Sending);
@@ -5914,80 +5846,88 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// The request is pinned by ticking environments in the chip's own menu, and
-    /// ticking a second one must not quietly replace the first: an endpoint is
-    /// often meant for stage *and* production at once.
+    /// Clicking an environment sends the request there. It must not pin it:
+    /// pinning is the button on the row, and the two are different things.
     #[gpui::test]
-    async fn ticking_a_second_environment_pins_both(cx: &mut TestAppContext) {
+    async fn clicking_an_environment_sends_the_request_there_without_pinning_it(
+        cx: &mut TestAppContext,
+    ) {
         let (store, request_id, _view, mut cx) = build_request_view(cx).await;
-        let (staging_id, production_id) = store.update(&mut cx, |store, cx| {
-            (
-                store.create_environment("Staging".into(), cx),
-                store.create_environment("Production".into(), cx),
-            )
+        let staging_id = store.update(&mut cx, |store, cx| {
+            let staging = store.create_environment("Staging".into(), cx);
+            store.create_environment("Production".into(), cx);
+            staging
         });
         draw(&mut cx);
 
+        open_the_environment_picker(&mut cx);
+        click_in_the_picker(&mut cx, "environment-row:Staging");
+
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.chosen_environment(),
+                Some(staging_id),
+                "the click has to send the request to the environment it landed on"
+            );
+            assert!(
+                request.pinned_environments().is_empty(),
+                "and it must not pin it: {:?}",
+                request.pinned_environments()
+            );
+        });
+        assert!(
+            cx.debug_bounds("request-environment-pin:Staging").is_some(),
+            "the chip names the environment the request is sent to"
+        );
+    }
+
+    /// Pinning is the button on the row, and pinning does not send anything
+    /// anywhere: it only keeps the environment at the top of the list.
+    #[gpui::test]
+    async fn the_pin_button_pins_without_sending_the_request_there(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        let production_id = store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx);
+            store.create_environment("Production".into(), cx)
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        // The button is only there while the row is under the pointer, the way
+        // the reader meets it.
+        let row = debug_center(&mut cx, "environment-row:Production");
+        cx.simulate_mouse_move(row, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        let pin = debug_center(&mut cx, "environment-pin:Production");
+        cx.simulate_click(pin, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        store.read_with(&cx, |store, _| {
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.pinned_environments(),
+                vec![production_id],
+                "the button has to pin the row it belongs to"
+            );
+            assert_eq!(
+                request.chosen_environment(),
+                None,
+                "and pinning must not send the request anywhere"
+            );
+        });
         assert!(
             cx.debug_bounds("request-environment-pin:Active Environment")
                 .is_some(),
-            "with nothing pinned the chip says which environment the request follows"
+            "so the chip still says the request follows the active environment"
         );
-
-        tick_in_the_pin_menu(&mut cx, "MENU_ITEM-Staging");
-        tick_in_the_pin_menu(&mut cx, "MENU_ITEM-Production");
-
         assert!(
-            cx.debug_bounds("request-environment-pin:Pinned: Staging +1")
+            cx.debug_bounds("environment-picker-pinned-header")
                 .is_some(),
-            "the chip has to show that a second environment is pinned as well, \
-             not just the first"
+            "and the pinned group appears, with its heading"
         );
-        store.read_with(&cx, |store, _| {
-            assert_eq!(
-                store
-                    .pinned_environments_for(request_id)
-                    .iter()
-                    .map(|environment| environment.id)
-                    .collect::<Vec<_>>(),
-                vec![staging_id, production_id]
-            );
-        });
-
-        // The one a plain send goes to is named as such, so which of several pins
-        // is the primary is readable rather than guessed.
-        let chip = debug_center(&mut cx, "request-environment-pin");
-        cx.simulate_click(chip, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("MENU_ITEM-Staging  (sent to)").is_some(),
-            "the first pinned environment is the one a send uses, and says so"
-        );
-
-        let entry = debug_center(&mut cx, "MENU_ITEM-Staging  (sent to)");
-        cx.simulate_click(entry, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("request-environment-pin:Pinned: Production")
-                .is_some(),
-            "unticking the first leaves the other pinned, and it becomes the one \
-             a send uses"
-        );
-        store.read_with(&cx, |store, _| {
-            let request = store
-                .requests
-                .iter()
-                .find(|request| request.id == request_id)
-                .unwrap();
-            assert_eq!(
-                store
-                    .effective_environment_for(request)
-                    .map(|environment| environment.id),
-                Some(production_id)
-            );
-        });
     }
 
     /// The pinned pair is one click away, and every other environment is offered
@@ -6119,13 +6059,13 @@ mod tests {
         );
     }
 
-    /// The pinned ones go to the top of the menu and stay there, separated from
+    /// The pinned ones go to the top of the list and stay there, separated from
     /// the rest by a line, and both groups read alphabetically -- a list in the
     /// order the environments happened to be created is one the reader has to
     /// search through every time.
     #[gpui::test]
-    async fn the_pin_menu_puts_the_pinned_ones_on_top(cx: &mut TestAppContext) {
-        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+    async fn the_picker_puts_the_pinned_ones_on_top(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
         // Created out of order on purpose, and mixed in case: what is painted has
         // to come from the sorting rather than from the order they arrived in.
         let (zeta, beta) = store.update(&mut cx, |store, cx| {
@@ -6141,53 +6081,184 @@ mod tests {
         });
         draw(&mut cx);
 
-        let chip = debug_center(&mut cx, "request-environment-pin");
-        cx.simulate_click(chip, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
+        open_the_environment_picker(&mut cx);
 
-        // `zeta` was pinned first, so it is the one a plain send goes to and says
-        // so; the sorting still puts `beta` above it.
-        let beta_at = debug_center(&mut cx, "MENU_ITEM-beta");
-        let zeta_at = debug_center(&mut cx, "MENU_ITEM-zeta  (sent to)");
-        let alpha_at = debug_center(&mut cx, "MENU_ITEM-Alpha");
-        let omega_at = debug_center(&mut cx, "MENU_ITEM-omega");
+        let heading = debug_center(&mut cx, "environment-picker-pinned-header");
+        let beta_at = debug_center(&mut cx, "environment-row:beta");
+        let zeta_at = debug_center(&mut cx, "environment-row:zeta");
+        let active_at = debug_center(&mut cx, "environment-row:active");
+        let alpha_at = debug_center(&mut cx, "environment-row:Alpha");
+        let omega_at = debug_center(&mut cx, "environment-row:omega");
 
+        assert!(
+            heading.y < beta_at.y,
+            "the heading names the group under it: heading at {heading:?}, beta at {beta_at:?}"
+        );
         assert!(
             beta_at.y < zeta_at.y,
             "the pinned ones read alphabetically: beta at {beta_at:?}, zeta at {zeta_at:?}"
         );
         assert!(
-            zeta_at.y < alpha_at.y,
-            "and both sit above every environment that is not pinned, whatever its \
-             name: zeta at {zeta_at:?}, Alpha at {alpha_at:?}"
+            zeta_at.y < active_at.y && active_at.y < alpha_at.y,
+            "both sit above everything that is not pinned, whatever its name: \
+             zeta at {zeta_at:?}, Alpha at {alpha_at:?}"
         );
         assert!(
             alpha_at.y < omega_at.y,
             "the rest read alphabetically too: Alpha at {alpha_at:?}, omega at {omega_at:?}"
         );
 
-        // A line between the two groups, measured the only way a line can be:
-        // the step from the last pinned row to the first unpinned one is bigger
-        // than the step between two rows in the same group.
-        let within_a_group = omega_at.y - alpha_at.y;
-        let across_the_line = alpha_at.y - zeta_at.y;
-        assert!(
-            across_the_line > within_a_group,
-            "a line has to separate the pinned from the rest: {across_the_line:?} \
-             between the groups against {within_a_group:?} inside one"
+        // The line itself cannot be measured by spacing: the list draws it as a
+        // border on the row's own edge, with a negative padding that takes the
+        // space back again. What is ours to get right is which row it falls
+        // under, and that is asserted where it is asked for.
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        let (under, rows_above_it) = picker.read_with(&cx, |picker, cx| {
+            let under = picker::PickerDelegate::separators_after_indices(&picker.delegate);
+            let pinned = picker.delegate.rows_for_test(cx);
+            (under, pinned)
+        });
+        assert_eq!(
+            under.len(),
+            1,
+            "one line, between the two groups: {under:?}"
+        );
+        assert_eq!(
+            rows_above_it.get(under[0]).map(|name| name.as_ref()),
+            Some("zeta"),
+            "and it falls under the last pinned row: {rows_above_it:?}"
         );
     }
 
-    /// Opens the pin chip's menu and clicks one entry in it, the way the reader
-    /// does -- the menu closes on the click, so it is opened again each time.
-    fn tick_in_the_pin_menu(cx: &mut VisualTestContext, entry: &'static str) {
+    /// A line under the pinned ones only when something follows them: a search
+    /// that turns up nothing but pinned environments must not leave a line
+    /// hanging off the bottom of the list.
+    #[gpui::test]
+    async fn a_search_that_finds_only_pinned_ones_draws_no_line(cx: &mut TestAppContext) {
+        let (store, request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            let staging = store.create_environment("qagke-stage".into(), cx);
+            store.create_environment("localhost".into(), cx);
+            store.toggle_request_pinned_environment(request_id, staging, cx);
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        cx.update(|window, cx| {
+            window.focus(&gpui::Focusable::focus_handle(&picker, cx), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("qagke");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let (under, rows) = picker.read_with(&cx, |picker, cx| {
+            (
+                picker::PickerDelegate::separators_after_indices(&picker.delegate),
+                picker.delegate.rows_for_test(cx),
+            )
+        });
+        assert!(
+            under.is_empty(),
+            "nothing follows the pinned ones, so there is nothing to separate \
+             them from: rows {rows:?}, line under {under:?}"
+        );
+    }
+
+    /// The way back to following the active environment is searchable like any
+    /// other row, so a reader with something typed is not locked out of it.
+    #[gpui::test]
+    async fn the_active_environment_row_can_be_searched_for(cx: &mut TestAppContext) {
+        let (store, _request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            store.create_environment("qagke-stage".into(), cx);
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        cx.update(|window, cx| {
+            window.focus(&gpui::Focusable::focus_handle(&picker, cx), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("active");
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("environment-row:active").is_some(),
+            "typing what it is called has to find it"
+        );
+        assert!(
+            cx.debug_bounds("environment-row:qagke-stage").is_none(),
+            "and leave out what does not match"
+        );
+    }
+
+    /// The search box is what makes a dozen environments usable: typing narrows
+    /// the list to what was typed and leaves the rest out.
+    #[gpui::test]
+    async fn typing_in_the_picker_narrows_the_list(cx: &mut TestAppContext) {
+        let (store, _request_id, view, mut cx) = build_request_view(cx).await;
+        store.update(&mut cx, |store, cx| {
+            store.create_environment("ams-prod-gcp".into(), cx);
+            store.create_environment("qagke-stage".into(), cx);
+            store.create_environment("localhost".into(), cx);
+        });
+        draw(&mut cx);
+
+        open_the_environment_picker(&mut cx);
+        assert!(cx.debug_bounds("environment-row:localhost").is_some());
+
+        // Focus is given to the picker by hand here. In the app the popover
+        // takes it two frames after it is deployed, from a callback the platform
+        // runs at the start of a frame -- and the frames a test paints itself do
+        // not run those. Everything after this is the real path: real keystrokes
+        // into the picker's own search box, and the list it rebuilds from them.
+        let picker = view.read_with(&cx, |view, _| view.environment_picker.clone());
+        cx.update(|window, cx| {
+            window.focus(&gpui::Focusable::focus_handle(&picker, cx), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("stage");
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert_eq!(
+            picker.read_with(&cx, |picker, cx| picker.query(cx)),
+            "stage",
+            "the keystrokes have to reach the picker's own search box"
+        );
+
+        assert!(
+            cx.debug_bounds("environment-row:qagke-stage").is_some(),
+            "what was typed has to be found"
+        );
+        assert!(
+            cx.debug_bounds("environment-row:localhost").is_none()
+                && cx.debug_bounds("environment-row:ams-prod-gcp").is_none(),
+            "and what was not typed has to be out of the way"
+        );
+    }
+
+    /// Opens the environment picker from the chip, the way the reader does.
+    ///
+    /// Painted three times over: focus reaches a popover two frames after it is
+    /// deployed -- the list is linked into the dispatch tree first -- and until
+    /// it does, typing goes to whatever had the focus before.
+    fn open_the_environment_picker(cx: &mut VisualTestContext) {
         let chip = debug_center(cx, "request-environment-pin");
         cx.simulate_click(chip, gpui::Modifiers::none());
         cx.run_until_parked();
         draw(cx);
-        let entry = debug_center(cx, entry);
-        cx.simulate_click(entry, gpui::Modifiers::none());
+        draw(cx);
+        draw(cx);
+    }
+
+    /// Clicks one row of the open picker.
+    fn click_in_the_picker(cx: &mut VisualTestContext, row: &'static str) {
+        let row = debug_center(cx, row);
+        cx.simulate_click(row, gpui::Modifiers::none());
         cx.run_until_parked();
         draw(cx);
     }
