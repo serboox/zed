@@ -444,6 +444,17 @@ fn comparison_diff_text(
     }
 }
 
+/// Puts a menu's environments in the order a reader looks for a name in: by
+/// name, and blind to case, so `QA Test POD` sits with `qagke-qa` rather than
+/// above every lower-case name.
+fn by_name(rows: &mut [(EnvironmentId, String)]) {
+    rows.sort_by(|(_, one), (_, other)| {
+        one.to_lowercase()
+            .cmp(&other.to_lowercase())
+            .then_with(|| one.cmp(other))
+    });
+}
+
 /// What one environment answered, in the shape the comparison tab shows it.
 fn side_of_the_comparison(
     environment: SharedString,
@@ -3045,7 +3056,7 @@ impl RequestView {
         };
         // Every pinned environment pairs with the one a send uses, so three
         // pins offer two pairs rather than only the first two.
-        let pinned_pairs: Vec<(EnvironmentId, String)> = match base {
+        let mut pinned_pairs: Vec<(EnvironmentId, String)> = match base {
             Some(base) => pinned
                 .iter()
                 .filter(|id| **id != base)
@@ -3058,13 +3069,17 @@ impl RequestView {
                 .collect(),
             None => Vec::new(),
         };
-        // What is already offered as a pair is not offered again below it.
-        let against: Vec<(EnvironmentId, String)> = store
+        by_name(&mut pinned_pairs);
+        // What is already offered as a pair is not offered again below it, and
+        // both groups read in the same alphabetical order as the pin menu beside
+        // this one.
+        let mut against: Vec<(EnvironmentId, String)> = store
             .environments
             .iter()
             .filter(|environment| Some(environment.id) != base && !pinned.contains(&environment.id))
             .map(|environment| (environment.id, environment.name.clone()))
             .collect();
+        by_name(&mut against);
         let nothing_to_compare = base.is_none() || (pinned_pairs.is_empty() && against.is_empty());
         let label: SharedString = if self.comparing_environments {
             "Comparing...".into()
@@ -3157,12 +3172,18 @@ impl RequestView {
     /// specific request will actually resolve `{{tokens}}` against.
     fn render_environment_pin(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
+        // Only pins to environments that still exist: a pin left over from a
+        // deleted one is not what a send follows, so it must not be what the chip
+        // names or what the menu marks either.
         let pinned: Vec<EnvironmentId> = store
             .requests
             .iter()
             .find(|request| request.id == self.request_id)
             .map(|request| request.pinned_environments())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| store.environment_by_id(*id).is_some())
+            .collect();
         let pinned_names: Vec<String> = pinned
             .iter()
             .filter_map(|id| store.environment_by_id(*id))
@@ -3175,11 +3196,17 @@ impl RequestView {
             [only] => format!("Pinned: {only}").into(),
             [first, rest @ ..] => format!("Pinned: {first} +{}", rest.len()).into(),
         };
-        let environments: Vec<(EnvironmentId, String)> = store
+        // The pinned ones sit at the top of the menu and the rest below a line,
+        // each group in alphabetical order: a list in the order the environments
+        // happen to have been created is a list the reader has to search, and
+        // what this request is pinned to is what they came to look at.
+        let (mut pinned_rows, mut the_rest): (Vec<_>, Vec<_>) = store
             .environments
             .iter()
             .map(|environment| (environment.id, environment.name.clone()))
-            .collect();
+            .partition(|(id, _)| pinned.contains(id));
+        by_name(&mut pinned_rows);
+        by_name(&mut the_rest);
         let view = cx.entity();
         let popover_handle = self.environment_pin_handle.clone();
 
@@ -3206,7 +3233,8 @@ impl RequestView {
                             )
                             .menu(move |window, cx| {
                                 let view = view.clone();
-                                let environments = environments.clone();
+                                let pinned_rows = pinned_rows.clone();
+                                let the_rest = the_rest.clone();
                                 let pinned = pinned.clone();
                                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
                                     let menu = menu.entry("Use Active Environment", None, {
@@ -3222,26 +3250,45 @@ impl RequestView {
                                     // against stage and production -- and comparing them
                                     // needs both pinned at once. The first pinned is the
                                     // one a plain send uses.
-                                    environments.iter().fold(menu, |menu, (id, name)| {
-                                        let view = view.clone();
-                                        let id = *id;
-                                        let is_pinned = pinned.contains(&id);
-                                        let shown = match pinned.iter().position(|it| *it == id) {
-                                            Some(0) => format!("{name}  (sent to)"),
-                                            _ => name.clone(),
+                                    let tick =
+                                        |menu: ContextMenu, rows: &[(EnvironmentId, String)]| {
+                                            rows.iter().fold(menu, |menu, (id, name)| {
+                                                let view = view.clone();
+                                                let id = *id;
+                                                let is_pinned = pinned.contains(&id);
+                                                let shown =
+                                                    match pinned.iter().position(|it| *it == id) {
+                                                        Some(0) => format!("{name}  (sent to)"),
+                                                        _ => name.clone(),
+                                                    };
+                                                menu.toggleable_entry(
+                                                    shown,
+                                                    is_pinned,
+                                                    ui::IconPosition::Start,
+                                                    None,
+                                                    move |_window, cx| {
+                                                        view.update(cx, |view, cx| {
+                                                            view.toggle_pinned_environment(id, cx);
+                                                        });
+                                                    },
+                                                )
+                                            })
                                         };
-                                        menu.toggleable_entry(
-                                            shown,
-                                            is_pinned,
-                                            ui::IconPosition::Start,
-                                            None,
-                                            move |_window, cx| {
-                                                view.update(cx, |view, cx| {
-                                                    view.toggle_pinned_environment(id, cx);
-                                                });
-                                            },
-                                        )
-                                    })
+                                    // No line under the action when there is
+                                    // nothing below it to separate it from.
+                                    let menu = match pinned_rows.is_empty() && the_rest.is_empty() {
+                                        true => menu,
+                                        false => menu.separator(),
+                                    };
+                                    let menu = tick(menu, &pinned_rows);
+                                    // The line is what makes the pinned ones read as
+                                    // a group of their own rather than as the top of
+                                    // one long list.
+                                    let menu = match (pinned_rows.is_empty(), the_rest.is_empty()) {
+                                        (false, false) => menu.separator(),
+                                        _ => menu,
+                                    };
+                                    tick(menu, &the_rest)
                                 }))
                             }),
                     ),
@@ -6069,6 +6116,66 @@ mod tests {
         assert!(
             cx.debug_bounds("MENU_ITEM-vs Staging").is_none(),
             "there is nothing to compare the only environment with"
+        );
+    }
+
+    /// The pinned ones go to the top of the menu and stay there, separated from
+    /// the rest by a line, and both groups read alphabetically -- a list in the
+    /// order the environments happened to be created is one the reader has to
+    /// search through every time.
+    #[gpui::test]
+    async fn the_pin_menu_puts_the_pinned_ones_on_top(cx: &mut TestAppContext) {
+        let (store, request_id, _view, mut cx) = build_request_view(cx).await;
+        // Created out of order on purpose, and mixed in case: what is painted has
+        // to come from the sorting rather than from the order they arrived in.
+        let (zeta, beta) = store.update(&mut cx, |store, cx| {
+            let zeta = store.create_environment("zeta".into(), cx);
+            store.create_environment("Alpha".into(), cx);
+            let beta = store.create_environment("beta".into(), cx);
+            store.create_environment("omega".into(), cx);
+            (zeta, beta)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.toggle_request_pinned_environment(request_id, zeta, cx);
+            store.toggle_request_pinned_environment(request_id, beta, cx);
+        });
+        draw(&mut cx);
+
+        let chip = debug_center(&mut cx, "request-environment-pin");
+        cx.simulate_click(chip, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        // `zeta` was pinned first, so it is the one a plain send goes to and says
+        // so; the sorting still puts `beta` above it.
+        let beta_at = debug_center(&mut cx, "MENU_ITEM-beta");
+        let zeta_at = debug_center(&mut cx, "MENU_ITEM-zeta  (sent to)");
+        let alpha_at = debug_center(&mut cx, "MENU_ITEM-Alpha");
+        let omega_at = debug_center(&mut cx, "MENU_ITEM-omega");
+
+        assert!(
+            beta_at.y < zeta_at.y,
+            "the pinned ones read alphabetically: beta at {beta_at:?}, zeta at {zeta_at:?}"
+        );
+        assert!(
+            zeta_at.y < alpha_at.y,
+            "and both sit above every environment that is not pinned, whatever its \
+             name: zeta at {zeta_at:?}, Alpha at {alpha_at:?}"
+        );
+        assert!(
+            alpha_at.y < omega_at.y,
+            "the rest read alphabetically too: Alpha at {alpha_at:?}, omega at {omega_at:?}"
+        );
+
+        // A line between the two groups, measured the only way a line can be:
+        // the step from the last pinned row to the first unpinned one is bigger
+        // than the step between two rows in the same group.
+        let within_a_group = omega_at.y - alpha_at.y;
+        let across_the_line = alpha_at.y - zeta_at.y;
+        assert!(
+            across_the_line > within_a_group,
+            "a line has to separate the pinned from the rest: {across_the_line:?} \
+             between the groups against {within_a_group:?} inside one"
         );
     }
 

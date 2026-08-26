@@ -1111,9 +1111,27 @@ impl ApiClientStore {
         if self.active_environment_id == Some(id) {
             self.active_environment_id = None;
         }
+        // A pin to an environment that is gone is a pin to nothing: left in
+        // place it goes on claiming to be the environment a send uses, while a
+        // send has quietly fallen back to whichever one is active.
+        let mut requests_repinned = false;
+        for request in &mut self.requests {
+            let left = request
+                .pinned_environments()
+                .into_iter()
+                .filter(|pinned| *pinned != id)
+                .collect::<Vec<_>>();
+            if left.len() != request.pinned_environments().len() {
+                request.pin_to_environments(left);
+                requests_repinned = true;
+            }
+        }
         cx.emit(ApiClientStoreEvent::EnvironmentsChanged);
         cx.notify();
         self.persist_environments(cx);
+        if requests_repinned {
+            self.persist_collections(cx);
+        }
     }
 
     pub fn set_active_environment(&mut self, id: Option<EnvironmentId>, cx: &mut Context<Self>) {
@@ -1137,9 +1155,13 @@ impl ApiClientStore {
     /// its own pinned environment when it has one, falling back to
     /// whichever environment is currently active store-wide.
     pub fn effective_environment_for(&self, request: &Request) -> Option<&Environment> {
+        // The first pin that still exists, not simply the first pin: an
+        // environment can be deleted from under a request, and the pins behind
+        // the dead one are still the reader's own choice.
         request
-            .primary_pinned_environment()
-            .and_then(|id| self.environment_by_id(id))
+            .pinned_environments()
+            .into_iter()
+            .find_map(|id| self.environment_by_id(id))
             .or_else(|| self.active_environment())
     }
 
@@ -1762,6 +1784,96 @@ mod tests {
         store.read_with(cx, |store, _| {
             let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
             assert_eq!(request.pinned_environment_id, None);
+        });
+    }
+
+    /// An environment can be deleted from under a request that was pinned to it.
+    /// The pin has to go with it, and what a send follows is the next pin the
+    /// reader made -- not whichever environment happens to be active.
+    #[gpui::test]
+    fn deleting_an_environment_takes_the_pins_to_it(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (doomed, production, elsewhere) = store.update(cx, |store, cx| {
+            (
+                store.create_environment("Doomed".into(), cx),
+                store.create_environment("Production".into(), cx),
+                store.create_environment("Elsewhere".into(), cx),
+            )
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.set_active_environment(Some(elsewhere), cx);
+            store.toggle_request_pinned_environment(request_id, doomed, cx);
+            store.toggle_request_pinned_environment(request_id, production, cx);
+        });
+
+        store.update(cx, |store, cx| store.delete_environment(doomed, cx));
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .pinned_environments_for(request_id)
+                    .iter()
+                    .map(|environment| environment.id)
+                    .collect::<Vec<_>>(),
+                vec![production],
+                "the pin to the deleted environment goes with it"
+            );
+            let request = store.requests.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(
+                request.pinned_environments(),
+                vec![production],
+                "and it is gone from the request itself, not merely hidden"
+            );
+            assert_eq!(
+                store
+                    .effective_environment_for(request)
+                    .map(|environment| environment.id),
+                Some(production),
+                "a send follows the pin that is left, not the active environment"
+            );
+        });
+    }
+
+    /// The same request read before the deletion has been noticed: a pin whose
+    /// environment is gone must not send the request somewhere it was never
+    /// pinned to.
+    #[gpui::test]
+    fn a_send_skips_a_pin_whose_environment_is_gone(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let (doomed, production, elsewhere) = store.update(cx, |store, cx| {
+            (
+                store.create_environment("Doomed".into(), cx),
+                store.create_environment("Production".into(), cx),
+                store.create_environment("Elsewhere".into(), cx),
+            )
+        });
+        store.update(cx, |store, cx| {
+            store.set_active_environment(Some(elsewhere), cx)
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let mut request = api_client::Request::new(collection.id, "Get users".into());
+        request.pin_to_environments(vec![doomed, production]);
+        // Straight off the environment list, so the request keeps the stale pin
+        // the way a collection saved before the deletion would.
+        store.update(cx, |store, _| {
+            store
+                .environments
+                .retain(|environment| environment.id != doomed)
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .effective_environment_for(&request)
+                    .map(|environment| environment.id),
+                Some(production)
+            );
         });
     }
 
