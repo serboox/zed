@@ -921,6 +921,210 @@ impl Item for ConnectionView {
     }
 }
 
+impl ConnectionView {
+    /// The window's own footer: what a dialog puts at the bottom, outside the
+    /// form, so the buttons stay where the reader looks for them however far the
+    /// form has been scrolled.
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let how_the_test_went = match &self.test_state {
+            TestState::Idle => None,
+            TestState::Testing => Some(("Testing…".to_string(), Color::Muted)),
+            TestState::Success => Some(("Connected".to_string(), Color::Success)),
+            TestState::Failure(message) => Some((message.clone(), Color::Error)),
+        };
+
+        h_flex()
+            .id("connection-view-footer")
+            .debug_selector(|| "connection-view-footer".to_string())
+            .flex_none()
+            .w_full()
+            .px_6()
+            .py_3()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .debug_selector(|| "connection-view-footer-left".to_string())
+                    // Half the bar at most, and what does not fit is cut short:
+                    // asking a flex row to give way is not enough here, because
+                    // the text in it reports its whole width as the least it can
+                    // take. A button pushed past the edge of the window cannot be
+                    // clicked at all, so the labels are what lose the argument.
+                    .max_w(gpui::relative(0.5))
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .debug_selector(|| "auto-connect-checkbox".to_string())
+                                    .child(
+                                        Checkbox::new(
+                                            "auto-connect",
+                                            match self.auto_connect {
+                                                true => ToggleState::Selected,
+                                                false => ToggleState::Unselected,
+                                            },
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _state, _, cx| {
+                                                this.auto_connect = !this.auto_connect;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            // The label is what gives way, so it needs room to
+                            // give: a text element reports its whole width as its
+                            // smallest unless something around it says otherwise.
+                            .child(
+                                div().min_w_0().overflow_hidden().child(
+                                    Label::new("Auto-connect on startup")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .debug_selector(|| "read-only-checkbox".to_string())
+                                    .child(
+                                        Checkbox::new(
+                                            "read-only",
+                                            match self.read_only {
+                                                true => ToggleState::Selected,
+                                                false => ToggleState::Unselected,
+                                            },
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _state, _, cx| {
+                                                this.read_only = !this.read_only;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            // The label is what gives way, so it needs room to
+                            // give: a text element reports its whole width as its
+                            // smallest unless something around it says otherwise.
+                            .child(
+                                div().min_w_0().overflow_hidden().child(
+                                    Label::new("Read-only (block all writes)")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    // Shrinkable as a whole so a long failure gives way, with
+                    // the buttons held at their own width inside it: a button
+                    // pushed past the edge of the window cannot be clicked.
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .when_some(how_the_test_went, |el, (message, color)| {
+                        el.child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink(1.)
+                                .overflow_hidden()
+                                .debug_selector(|| "test-connection-message".to_string())
+                                .child(
+                                    Label::new(message)
+                                        .size(LabelSize::Small)
+                                        .color(color)
+                                        .truncate(),
+                                ),
+                        )
+                    })
+                    // Each button carries its own weight: what is tried, what is
+                    // given up on, and what is kept read as three different
+                    // things, and the one the reader is most likely to want is
+                    // the one that stands out.
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .debug_selector(|| "test-connection-button".to_string())
+                                    .child(
+                                        // Not disabled while a test is running:
+                                        // the message beside it already says so,
+                                        // and a test against a host that says
+                                        // nothing at all is at the mercy of the
+                                        // operating system's own patience -- a
+                                        // button disabled for two minutes reads
+                                        // as a broken one.
+                                        Button::new("test", "Test Connection")
+                                            .style(ButtonStyle::Tinted(ui::TintColor::Success))
+                                            .size(ButtonSize::Large)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_test_connection(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div().debug_selector(|| "cancel-button".to_string()).child(
+                                    Button::new("cancel", "Cancel")
+                                        .style(ButtonStyle::Filled)
+                                        .size(ButtonSize::Large)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close(window, cx);
+                                        })),
+                                ),
+                            )
+                            .child(
+                                // Saving is all this does: the connection is
+                                // written down and the window closes. Nothing is
+                                // dialled until the reader opens it.
+                                div().debug_selector(|| "save-button".to_string()).child(
+                                    Button::new("save", "Save")
+                                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                        .size(ButtonSize::Large)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Some(config) = this.build_config(cx) {
+                                                if let Some(callback) = this.on_confirm.take() {
+                                                    callback(config, cx);
+                                                }
+                                            }
+                                            this.close(window, cx);
+                                        })),
+                                ),
+                            ),
+                    ),
+            )
+    }
+}
+
 impl Render for ConnectionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_file_based = self.selected_driver.is_file_based();
@@ -1512,144 +1716,7 @@ impl Render for ConnectionView {
                             )
                         }),
                 )
-            })
-            .child(div().h(px(1.)).w_full().bg(divider))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .debug_selector(|| "auto-connect-checkbox".to_string())
-                                            .child(
-                                                Checkbox::new(
-                                                    "auto-connect",
-                                                    if self.auto_connect {
-                                                        ToggleState::Selected
-                                                    } else {
-                                                        ToggleState::Unselected
-                                                    },
-                                                )
-                                                .on_click(cx.listener(
-                                                    |this, _state, _, cx| {
-                                                        this.auto_connect = !this.auto_connect;
-                                                        cx.notify();
-                                                    },
-                                                )),
-                                            ),
-                                    )
-                                    .child(
-                                        Label::new("Auto-connect on startup")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .debug_selector(|| "read-only-checkbox".to_string())
-                                            .child(
-                                                Checkbox::new(
-                                                    "read-only",
-                                                    if self.read_only {
-                                                        ToggleState::Selected
-                                                    } else {
-                                                        ToggleState::Unselected
-                                                    },
-                                                )
-                                                .on_click(cx.listener(|this, _state, _, cx| {
-                                                    this.read_only = !this.read_only;
-                                                    cx.notify();
-                                                })),
-                                            ),
-                                    )
-                                    .child(
-                                        Label::new("Read-only (block all writes)")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .when_some(
-                                match &self.test_state {
-                                    TestState::Idle => None,
-                                    TestState::Testing => {
-                                        Some(("Testing…".to_string(), Color::Muted))
-                                    }
-                                    TestState::Success => {
-                                        Some(("Connected".to_string(), Color::Success))
-                                    }
-                                    TestState::Failure(message) => {
-                                        Some((message.clone(), Color::Error))
-                                    }
-                                },
-                                |el, (message, color)| {
-                                    el.child(
-                                        Label::new(message).size(LabelSize::Small).color(color),
-                                    )
-                                },
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| "test-connection-button".to_string())
-                                    .child(
-                                        Button::new("test", "Test Connection")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.run_test_connection(cx);
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| "cancel-button".to_string())
-                                    .child(
-                                        Button::new("cancel", "Cancel")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.close(window, cx);
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                // Saving is all this does: the connection is
-                                // written down and the window closes. Nothing is
-                                // dialled until the reader opens it.
-                                div()
-                                    .debug_selector(|| "save-button".to_string())
-                                    .child(
-                                        Button::new("save", "Save")
-                                            .style(ButtonStyle::Filled)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if let Some(config) = this.build_config(cx) {
-                                                    if let Some(callback) =
-                                                        this.on_confirm.take()
-                                                    {
-                                                        callback(config, cx);
-                                                    }
-                                                }
-                                                this.close(window, cx);
-                                            })),
-                                    ),
-                            ),
-                    ),
-            );
+            });
 
         let card = h_flex()
             .w_full()
@@ -1678,8 +1745,15 @@ impl Render for ConnectionView {
         // A window of its own gets a window's shell: a bar to drag it by and
         // borders to pull. The same view can also be put in a pane as a tab,
         // which has both already and must not grow a second set.
+        // A footer belongs to whatever holds the form, window or tab alike: it
+        // is outside the scrolling so the buttons never scroll away.
         if window.window_handle().downcast::<Self>().is_none() {
-            return body.size_full().into_any_element();
+            return v_flex()
+                .size_full()
+                .bg(page_bg)
+                .child(body.flex_1().min_h_0().w_full())
+                .child(self.render_footer(cx))
+                .into_any_element();
         }
 
         client_side_decorations(
@@ -1693,7 +1767,8 @@ impl Render for ConnectionView {
                         .flex_none()
                         .children(self.title_bar.clone()),
                 )
-                .child(body.flex_1().min_h_0().w_full()),
+                .child(body.flex_1().min_h_0().w_full())
+                .child(self.render_footer(cx)),
             window,
             cx,
         )
@@ -2406,6 +2481,172 @@ mod tests {
     /// Moving the form out of the pane must not lose anything it held: every
     /// database, field, swatch, chip, checkbox and button that was in the pane is
     /// painted in the window too.
+    /// The buttons belong to the window, not to the form: they sit in a bar of
+    /// their own under it, and the form scrolling under them leaves them where
+    /// they are. Before, they were the last row of the form and scrolled out of
+    /// reach with it.
+    #[gpui::test]
+    async fn the_buttons_sit_in_a_bar_below_the_form(cx: &mut TestAppContext) {
+        let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
+        let opened = open_the_form(&workspace, None, &mut editor_cx);
+        let mut window_cx = gpui::VisualTestContext::from_window(opened.into(), &editor_cx.cx);
+        // Short on purpose: the form has to be taller than the window, or there
+        // is nothing to scroll and nothing to prove.
+        window_cx.simulate_resize(gpui::size(px(900.), px(520.)));
+        window_cx.run_until_parked();
+
+        let footer = window_cx
+            .debug_bounds("connection-view-footer")
+            .expect("the footer is painted");
+        let form = window_cx
+            .debug_bounds("connection-view")
+            .expect("the form is painted");
+        assert!(
+            footer.origin.y >= form.origin.y + form.size.height - px(1.),
+            "the footer sits under the form rather than inside it: footer at \
+             {footer:?}, form {form:?}"
+        );
+
+        for button in ["test-connection-button", "cancel-button", "save-button"] {
+            let painted = window_cx
+                .debug_bounds(button)
+                .unwrap_or_else(|| panic!("{button} is painted"));
+            assert!(
+                painted.origin.y >= footer.origin.y
+                    && painted.origin.y + painted.size.height
+                        <= footer.origin.y + footer.size.height + px(1.),
+                "{button} has to be in the footer, not in the form: {painted:?} \
+                 against a footer of {footer:?}"
+            );
+            // A button rather than a line of text: the fill and the colour
+            // cannot be read off the geometry, but the height a large button is
+            // laid out at can, and a bare label is nowhere near it.
+            assert!(
+                painted.size.height >= px(24.),
+                "{button} has to be laid out as a button: {painted:?}"
+            );
+        }
+
+        // Narrow enough that something has to give: the labels beside the
+        // buttons, never a button.
+        window_cx.simulate_resize(gpui::size(px(700.), px(520.)));
+        window_cx.run_until_parked();
+        window_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        window_cx.run_until_parked();
+        let narrow_footer = window_cx
+            .debug_bounds("connection-view-footer")
+            .expect("the footer is painted in a narrow window");
+        for button in ["test-connection-button", "cancel-button", "save-button"] {
+            let painted = window_cx
+                .debug_bounds(button)
+                .unwrap_or_else(|| panic!("{button} is painted in a narrow window"));
+            let left = window_cx.debug_bounds("connection-view-footer-left");
+            assert!(
+                painted.origin.x >= narrow_footer.origin.x
+                    && painted.origin.x + painted.size.width
+                        <= narrow_footer.origin.x + narrow_footer.size.width,
+                "{button} must not hang past the edge of the footer, which is what \
+                 hanging past the edge of the window means: {painted:?} in a footer \
+                 of {narrow_footer:?}, left side {left:?}"
+            );
+        }
+        // A failure the server wrote at length is one more thing that must give
+        // way to the buttons rather than push them off the bar.
+        let form_view = opened.root(&mut window_cx).expect("the form is there");
+        form_view.update_in(&mut window_cx, |view, _window, cx| {
+            view.test_state = TestState::Failure(
+                "Failed to connect: server closed the connection unexpectedly while \
+                 negotiating TLS with instruments-db.example.com:3306, and the \
+                 handshake was never completed"
+                    .to_string(),
+            );
+            cx.notify();
+        });
+        window_cx.run_until_parked();
+        window_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let with_a_failure = window_cx
+            .debug_bounds("connection-view-footer")
+            .expect("the footer is painted");
+        for button in ["test-connection-button", "cancel-button", "save-button"] {
+            let painted = window_cx
+                .debug_bounds(button)
+                .unwrap_or_else(|| panic!("{button} is painted beside a long failure"));
+            assert!(
+                painted.origin.x + painted.size.width
+                    <= with_a_failure.origin.x + with_a_failure.size.width,
+                "{button} must not be pushed off the bar by a long failure: \
+                 {painted:?} in a footer of {with_a_failure:?}"
+            );
+        }
+        form_view.update_in(&mut window_cx, |view, _window, cx| {
+            view.test_state = TestState::Idle;
+            cx.notify();
+        });
+        window_cx.run_until_parked();
+
+        window_cx.simulate_resize(gpui::size(px(900.), px(520.)));
+        window_cx.run_until_parked();
+        window_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let form = window_cx
+            .debug_bounds("connection-view")
+            .expect("the form is painted");
+        let footer = window_cx
+            .debug_bounds("connection-view-footer")
+            .expect("the footer is painted");
+
+        // The form scrolls under them and they do not move.
+        let before = window_cx
+            .debug_bounds("field-Name")
+            .expect("the first field is painted");
+        window_cx.simulate_mouse_move(form.center(), None, gpui::Modifiers::none());
+        window_cx.simulate_event(gpui::ScrollWheelEvent {
+            position: form.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-240.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        window_cx.run_until_parked();
+        window_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let after = window_cx
+            .debug_bounds("field-Name")
+            .expect("the first field is still painted");
+        assert!(
+            after.origin.y < before.origin.y,
+            "the wheel has to have scrolled the form, or the rest proves nothing: \
+             {before:?} then {after:?}"
+        );
+        let footer_after = window_cx
+            .debug_bounds("connection-view-footer")
+            .expect("the footer is painted");
+        assert_eq!(
+            footer_after.origin.y, footer.origin.y,
+            "and the footer must not have moved with it"
+        );
+        for button in ["test-connection-button", "cancel-button", "save-button"] {
+            let painted = window_cx
+                .debug_bounds(button)
+                .unwrap_or_else(|| panic!("{button} is still painted"));
+            assert!(
+                painted.origin.y >= footer_after.origin.y,
+                "{button} has to still be in the footer after the form scrolled: \
+                 {painted:?}"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn every_control_the_pane_had_is_painted_in_the_window(cx: &mut TestAppContext) {
         let (workspace, _editor_window, mut editor_cx) = an_editor_window(cx).await;
