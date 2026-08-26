@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::rc::Rc;
 
 use crate::prelude::*;
-use crate::{Color, KeyBinding, Label, LabelSize, StyledExt, h_flex, v_flex};
+use crate::{Color, KeyBinding, Label, LabelSize, StyledExt, cyberpunk, h_flex, v_flex};
 use gpui::{Action, AnyElement, AnyView, AppContext, FocusHandle, IntoElement, Render};
 
 #[derive(RegisterComponent)]
@@ -204,9 +204,11 @@ impl Render for Tooltip {
             )
             .when_some(self.meta.clone(), |this, meta| {
                 this.child(
-                    div()
-                        .max_w_72()
-                        .child(Label::new(meta).size(LabelSize::Small).color(Color::Muted)),
+                    div().max_w_72().child(
+                        Label::new(meta)
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(cyberpunk::text_secondary())),
+                    ),
                 )
             })
         })
@@ -226,7 +228,6 @@ where
             .elevation_2(app)
             .font(ui_font)
             .text_ui(app)
-            .text_color(app.theme().colors().text)
             .py_1()
             .px_2()
             .map(|el| f(el, cx)),
@@ -263,7 +264,7 @@ impl Render for LinkPreview {
             el.child(
                 Label::new(self.link.clone())
                     .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                    .color(Color::Custom(cyberpunk::text_secondary())),
             )
         })
     }
@@ -287,5 +288,55 @@ impl Component for Tooltip {
                 .into_any_element(),
         )])
         .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not `use super::*`: this file imports `std::borrow::Borrow`, and
+    // with that trait in scope the `.borrow()` call inside the `gpui::test`
+    // expansion has two candidate impls and stops compiling.
+    use gpui::{
+        App, AppContext as _, Context, Div, Hsla, IntoElement, Render, Styled, TestAppContext,
+        Window, div,
+    };
+
+    use super::tooltip_container;
+    use crate::cyberpunk;
+
+    struct TooltipHost;
+
+    impl Render for TooltipHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    // A tooltip sits on the fork's fixed near-black surface, so the text color it
+    // composes has to come from the same fixed palette. Taking it from the active
+    // theme instead is how a light theme puts dark text on a near-black popover.
+    #[gpui::test]
+    async fn tooltip_text_color_comes_from_the_fixed_palette(cx: &mut TestAppContext) {
+        let composed_text_color: Option<Hsla> = cx.update(|cx: &mut App| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+
+            let host = cx.new(|_| TooltipHost);
+            host.update(cx, |_host, cx| {
+                let mut color = None;
+                let _ = tooltip_container(cx, |mut container: Div, _cx| {
+                    color = container.style().text.color;
+                    container
+                });
+                color
+            })
+        });
+
+        assert_eq!(
+            composed_text_color,
+            Some(cyberpunk::text_primary()),
+            "a tooltip must compose its text color from the fixed palette"
+        );
     }
 }

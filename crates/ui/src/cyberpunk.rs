@@ -1,8 +1,15 @@
-//! Shared palette and styling helpers for the cyberpunk dialog chrome
-//! (`Modal`, `AlertModal`, the built-in prompt renderer, and this fork's own
-//! modal forms). Colors are fixed, not read from the active theme: the whole
+//! Shared palette and styling helpers for everything this fork raises above the
+//! content: dialogs (`Modal`, `AlertModal`, the built-in prompt renderer, the
+//! fork's own modal forms), the pickers and command palette, and the surfaces
+//! that float over a buffer -- completion and code-action menus, hover and
+//! signature popovers, tooltips, context menus. Docked panels are outside that
+//! boundary and keep reading the active theme; the line is "does it float", not
+//! "is it ours". Colors here are fixed, not read from the active theme: the whole
 //! point of the style is a near-black surface with exactly two accents, so it
 //! must not drift with whatever theme the user has picked.
+//!
+//! A surface inside this boundary must not paint a themed color on top of these:
+//! a theme color over a fixed near-black surface is how unreadable text happens.
 //!
 //! Only two accents exist on purpose (cyan for the focal element, red for
 //! danger). Do not add a third without a matching argument for why every

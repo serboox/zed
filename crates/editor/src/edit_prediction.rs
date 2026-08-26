@@ -1,4 +1,5 @@
 use super::*;
+use ui::cyberpunk;
 
 pub fn make_suggestion_styles(cx: &App) -> EditPredictionStyles {
     EditPredictionStyles {
@@ -1235,9 +1236,8 @@ impl Editor {
                         h_flex()
                             .elevation_2(cx)
                             .border(BORDER_WIDTH)
-                            .border_color(cx.theme().colors().border)
                             .when(keybind_display.missing_accept_keystroke, |el| {
-                                el.border_color(cx.theme().status().error)
+                                el.border_color(cyberpunk::Accent::Red.border())
                             })
                             .rounded(RADIUS)
                             .rounded_tl(px(0.))
@@ -1266,7 +1266,7 @@ impl Editor {
                                     .px_2()
                                     .rounded_r(RADIUS - BORDER_WIDTH)
                                     .border_l_1()
-                                    .border_color(cx.theme().colors().border)
+                                    .border_color(cyberpunk::border_dim())
                                     .bg(Self::edit_prediction_line_popover_bg_color(cx))
                                     .when(keybind_display.show_hold_label, |el| {
                                         el.child(
@@ -1358,7 +1358,6 @@ impl Editor {
                 .max_w(max_width)
                 .flex_1()
                 .elevation_2(cx)
-                .border_color(cx.theme().colors().border)
                 .child(
                     div()
                         .flex_1()
@@ -1382,7 +1381,7 @@ impl Editor {
                                     .h_full()
                                     .border_l_1()
                                     .rounded_r_lg()
-                                    .border_color(cx.theme().colors().border)
+                                    .border_color(cyberpunk::border_dim())
                                     .bg(Self::edit_prediction_line_popover_bg_color(cx))
                                     .gap_1()
                                     .py_1()
@@ -1399,7 +1398,7 @@ impl Editor {
                                     .h_full()
                                     .border_l_1()
                                     .rounded_r_lg()
-                                    .border_color(cx.theme().colors().border)
+                                    .border_color(cyberpunk::border_dim())
                                     .bg(Self::edit_prediction_line_popover_bg_color(cx))
                                     .gap_1()
                                     .py_1()
