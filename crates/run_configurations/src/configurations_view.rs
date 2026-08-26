@@ -1,7 +1,7 @@
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
+    Pixels, ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
     WindowBounds, WindowOptions, actions, point,
 };
 use platform_title_bar::PlatformTitleBar;
@@ -278,6 +278,88 @@ fn where_to_open(cx: &mut App) -> WindowBounds {
     }
 }
 
+/// How wide the band along each edge that the window can be pulled by is, and
+/// how far into the window each corner's own reaches.
+const A_BAND_TO_PULL: Pixels = px(5.);
+const A_CORNER_TO_PULL: Pixels = px(14.);
+
+/// The bands along the window's edges and corners that it is resized by.
+///
+/// The shell draws its own outside the window's visible border, in the few
+/// transparent pixels the shadow occupies -- which is where nobody aims. A
+/// reader aims at the edge they can see, and lands just inside it, on the
+/// window's own content. These sit exactly there.
+fn what_the_window_is_pulled_by() -> Vec<AnyElement> {
+    use gpui::{CursorStyle, ResizeEdge};
+
+    let band = |name: &'static str, edge: ResizeEdge, cursor: CursorStyle| {
+        let grip = div()
+            .absolute()
+            .debug_selector(move || format!("run-configurations-pull-{name}"))
+            .cursor(cursor)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                window.start_window_resize(edge);
+            });
+        match edge {
+            ResizeEdge::Top => grip.top_0().left_0().right_0().h(A_BAND_TO_PULL),
+            ResizeEdge::Bottom => grip.bottom_0().left_0().right_0().h(A_BAND_TO_PULL),
+            ResizeEdge::Left => grip.left_0().top_0().bottom_0().w(A_BAND_TO_PULL),
+            ResizeEdge::Right => grip.right_0().top_0().bottom_0().w(A_BAND_TO_PULL),
+            // Corners last, and so painted over the edges they meet: a corner
+            // pulls both ways at once, which is what the reader means there.
+            ResizeEdge::TopLeft => grip
+                .top_0()
+                .left_0()
+                .w(A_CORNER_TO_PULL)
+                .h(A_CORNER_TO_PULL),
+            ResizeEdge::TopRight => grip
+                .top_0()
+                .right_0()
+                .w(A_CORNER_TO_PULL)
+                .h(A_CORNER_TO_PULL),
+            ResizeEdge::BottomLeft => grip
+                .bottom_0()
+                .left_0()
+                .w(A_CORNER_TO_PULL)
+                .h(A_CORNER_TO_PULL),
+            ResizeEdge::BottomRight => grip
+                .bottom_0()
+                .right_0()
+                .w(A_CORNER_TO_PULL)
+                .h(A_CORNER_TO_PULL),
+        }
+        .into_any_element()
+    };
+
+    vec![
+        band("top", ResizeEdge::Top, CursorStyle::ResizeUp),
+        band("bottom", ResizeEdge::Bottom, CursorStyle::ResizeDown),
+        band("left", ResizeEdge::Left, CursorStyle::ResizeLeft),
+        band("right", ResizeEdge::Right, CursorStyle::ResizeRight),
+        band(
+            "top-left",
+            ResizeEdge::TopLeft,
+            CursorStyle::ResizeUpLeftDownRight,
+        ),
+        band(
+            "top-right",
+            ResizeEdge::TopRight,
+            CursorStyle::ResizeUpRightDownLeft,
+        ),
+        band(
+            "bottom-left",
+            ResizeEdge::BottomLeft,
+            CursorStyle::ResizeUpRightDownLeft,
+        ),
+        band(
+            "bottom-right",
+            ResizeEdge::BottomRight,
+            CursorStyle::ResizeUpLeftDownRight,
+        ),
+    ]
+}
+
 /// Runs `task` in the workspace, with the project's own variables filled in.
 /// Shared, because the window that offers a configuration for an entry point can
 /// also run it straight away.
@@ -468,9 +550,13 @@ impl RunConfigurationsView {
                 editor
             })
         };
+        // Grows with what is typed in it, between these two heights. A whole
+        // editor in a box of a fixed height is what left the arguments in a
+        // sliver a few pixels tall, with a line number in it and no room to
+        // read the line beside it.
         let lines = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| {
-                let mut editor = Editor::multi_line(window, cx);
+                let mut editor = Editor::auto_height(3, 10, window, cx);
                 editor.set_placeholder_text(placeholder, window, cx);
                 editor
             })
@@ -1900,16 +1986,29 @@ impl RunConfigurationsView {
                 .into_any_element();
         };
 
+        let editor_background = cx.theme().colors().editor_background;
         let field = |name: &'static str, editor: &Entity<Editor>, tall: bool| {
             v_flex()
                 .w_full()
                 .gap_1()
-                .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    div()
+                        .debug_selector(move || format!("configuration-label-{name}"))
+                        .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted)),
+                )
                 .child(
                     div()
                         .w_full()
-                        .when(!tall, |field| field.h(px(28.)))
-                        .when(tall, |field| field.h(px(84.)))
+                        .debug_selector(move || format!("configuration-field-{name}"))
+                        // A ground of its own under every field: a box drawn with
+                        // a line alone reads as a rule across the form rather
+                        // than as somewhere to type.
+                        .bg(editor_background)
+                        .rounded_md()
+                        .when(!tall, |field| field.h(px(30.)))
+                        // Tall fields take the height their editor asks for, and
+                        // no less than three lines of it.
+                        .when(tall, |field| field.min_h(px(72.)))
                         .px_2()
                         .py_1()
                         .border_1()
@@ -1918,12 +2017,29 @@ impl RunConfigurationsView {
                 )
         };
 
+        // A rule with a few words on it, to break a long column of fields into
+        // the handful of things a reader is actually deciding.
+        let section = |name: &'static str| {
+            h_flex()
+                .w_full()
+                .pt_2()
+                .gap_2()
+                .items_center()
+                .debug_selector(move || format!("configuration-section-{name}"))
+                .child(
+                    Label::new(name)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .child(div().flex_1().h(px(1.)).bg(ui::cyberpunk::border_dim()))
+        };
+
         v_flex()
             .id("configuration-form")
             .flex_1()
             .min_w_0()
             .h_full()
-            .p_3()
+            .p_4()
             .gap_3()
             .overflow_y_scroll()
             .track_scroll(&self.form_scroll)
@@ -1943,9 +2059,11 @@ impl RunConfigurationsView {
             .child(field("NAME", &self.label, false))
             .when(kind == Kind::Task, |form| {
                 form.child(self.render_template_row(cx))
+                    .child(section("WHAT TO RUN"))
                     .child(field("COMMAND", &self.command, false))
-                    .child(field("ARGUMENTS", &self.args, false))
+                    .child(field("ARGUMENTS", &self.args, true))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
+                    .child(section("ENVIRONMENT"))
                     .child(self.render_env(cx))
                     .child(
                         h_flex()
@@ -1968,12 +2086,14 @@ impl RunConfigurationsView {
                     )
             })
             .when(kind == Kind::Debug, |form| {
-                form.child(field("DEBUGGER", &self.adapter, false))
+                form.child(section("WHAT DEBUGS IT"))
+                    .child(field("DEBUGGER", &self.adapter, false))
                     .child(field("BUILDS FIRST", &self.builds, false))
                     .child(field("WHAT THE DEBUGGER NEEDS", &self.adapter_config, true))
             })
             .when(kind == Kind::Task, |form| {
-                form.child(self.render_run_toggles(cx))
+                form.child(section("HOW TO RUN IT"))
+                    .child(self.render_run_toggles(cx))
             })
             .child(self.render_as_json(kind, cx))
             .into_any_element()
@@ -2256,17 +2376,32 @@ impl Render for RunConfigurationsView {
         }
 
         client_side_decorations(
-            v_flex()
+            div()
                 .size_full()
+                .relative()
                 .bg(cx.theme().colors().background)
                 .child(
-                    div()
-                        .debug_selector(|| "run-configurations-titlebar".to_string())
-                        .w_full()
-                        .flex_none()
-                        .children(self.title_bar.clone()),
+                    // A tenth larger than the editor's own text: this is a form
+                    // to read and type in, not a wall of code, and it is read at
+                    // arm's length from a window that floats over everything.
+                    ui::utils::WithRemSize::new(window.rem_size() * 1.1)
+                        .size_full()
+                        .child(
+                            v_flex()
+                                .size_full()
+                                .child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "run-configurations-titlebar".to_string()
+                                        })
+                                        .w_full()
+                                        .flex_none()
+                                        .children(self.title_bar.clone()),
+                                )
+                                .child(body),
+                        ),
                 )
-                .child(body),
+                .children(what_the_window_is_pulled_by()),
             window,
             cx,
         )
@@ -2366,6 +2501,54 @@ mod tests {
         });
         cx.run_until_parked();
         (view, fs, cx.clone())
+    }
+
+    /// The same view, in a window of its own -- which is what puts its own shell
+    /// around it: the bar to drag it by, the bands to pull it by, and the larger
+    async fn a_window_of(
+        tasks: &str,
+        cx: &mut TestAppContext,
+    ) -> (Entity<RunConfigurationsView>, VisualTestContext) {
+        let (pane_view, _fs, mut pane_cx) = a_view_of(Some(tasks), cx).await;
+        a_window_beside(&pane_view, &mut pane_cx)
+    }
+
+    /// A second window over the same app, with the view as its root -- which is
+    /// what gives it the shell a window of its own has.
+    fn a_window_beside(
+        beside: &Entity<RunConfigurationsView>,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<RunConfigurationsView>, VisualTestContext) {
+        let workspace = beside.read_with(cx, |view, _| view.workspace.clone());
+        let project = workspace
+            .read_with(cx, |workspace, _| workspace.project().clone())
+            .expect("the workspace the view belongs to");
+        let mut app = cx.cx.clone();
+        let opened =
+            app.add_window(|window, cx| RunConfigurationsView::new(project, workspace, window, cx));
+        let mut window_cx = VisualTestContext::from_window(opened.into(), &app);
+        let view = opened.root(&mut window_cx).expect("the window's view");
+        window_cx.run_until_parked();
+        (view, window_cx)
+    }
+
+    /// Shows the first configuration the store holds, which is what fills the
+    /// form in.
+    fn show_the_first_configuration(
+        view: &Entity<RunConfigurationsView>,
+        cx: &mut VisualTestContext,
+    ) {
+        view.update_in(cx, |view, window, cx| {
+            let first = view
+                .store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration");
+            view.show(&first, window, cx);
+        });
+        cx.run_until_parked();
+        draw(cx);
     }
 
     /// The configurations open in a window of the reader's own: one they can drag
@@ -2964,8 +3147,82 @@ mod tests {
         );
     }
 
-    /// The files go into the project's history and are edited by hand, so the form
-    /// shows exactly what it will write.
+    /// The same view in a window of its own: it can be pulled by every edge and
+    /// corner, not only by the one corner the shell's own transparent ring makes
+    /// easy to hit, and it is read a size larger than the editor around it.
+    #[gpui::test]
+    async fn the_window_can_be_pulled_by_every_edge(cx: &mut TestAppContext) {
+        let tasks = r#"[{ "label": "api server", "command": "go run ./cmd/api" }]"#;
+        let (view, mut window_cx) = a_window_of(tasks, cx).await;
+        show_the_first_configuration(&view, &mut window_cx);
+
+        let whole = window_cx
+            .debug_bounds("run-configurations-titlebar")
+            .expect("the window's own bar is painted");
+        for edge in [
+            "top",
+            "bottom",
+            "left",
+            "right",
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right",
+        ] {
+            let selector: &'static str = match edge {
+                "top" => "run-configurations-pull-top",
+                "bottom" => "run-configurations-pull-bottom",
+                "left" => "run-configurations-pull-left",
+                "right" => "run-configurations-pull-right",
+                "top-left" => "run-configurations-pull-top-left",
+                "top-right" => "run-configurations-pull-top-right",
+                "bottom-left" => "run-configurations-pull-bottom-left",
+                _ => "run-configurations-pull-bottom-right",
+            };
+            let band = window_cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{edge} has a band to pull the window by"));
+            assert!(
+                band.size.width > px(0.) && band.size.height > px(0.),
+                "{edge}'s band has to occupy real screen area: {band:?}"
+            );
+            assert!(
+                band.size.width >= whole.size.width - px(1.)
+                    || band.size.height > px(0.) && band.size.width <= px(20.),
+                "{edge}'s band is either the width of the window or a narrow strip: \
+                 {band:?} against a window {:?} wide",
+                whole.size.width
+            );
+        }
+    }
+
+    /// The arguments are typed into a box with room in it. They were typed into a
+    /// strip a few pixels tall, with a line number in it and no room for the line
+    /// beside it.
+    #[gpui::test]
+    async fn the_arguments_are_typed_into_a_box_with_room_in_it(cx: &mut TestAppContext) {
+        let tasks = r#"[{ "label": "api server", "command": "go run ./cmd/api" }]"#;
+        let (view, mut window_cx) = a_window_of(tasks, cx).await;
+        show_the_first_configuration(&view, &mut window_cx);
+
+        let arguments = window_cx
+            .debug_bounds("configuration-field-ARGUMENTS")
+            .expect("the arguments are a field of the form");
+        let command = window_cx
+            .debug_bounds("configuration-field-COMMAND")
+            .expect("and so is the command");
+        assert!(
+            arguments.size.height >= px(60.),
+            "one argument a line needs the room for a few lines: {arguments:?}"
+        );
+        assert!(
+            arguments.size.height > command.size.height * 1.5,
+            "and more room than a field that holds one line: {:?} against {:?}",
+            arguments.size.height,
+            command.size.height
+        );
+    }
+
     #[gpui::test]
     async fn the_form_shows_what_it_writes(cx: &mut TestAppContext) {
         let (view, _fs, mut cx) = a_view_of(
