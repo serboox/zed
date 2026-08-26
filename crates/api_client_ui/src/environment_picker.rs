@@ -15,6 +15,31 @@ use crate::store::ApiClientStore;
 /// to a search.
 const THE_ACTIVE_ONE: &str = "Use Active Environment";
 
+/// What the row that asks for no comparison is called.
+const NO_COMPARISON: &str = "Do Not Compare";
+
+/// What choosing a row in this picker means. The list itself is the same either
+/// way -- the same environments, the same pins, the same search -- because there
+/// is only one list of environments and one set of pins per request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WhatThePickerIsFor {
+    /// Where the request is sent.
+    WhereItGoes,
+    /// Which environment the next send is compared against. Choosing sends
+    /// nothing: the comparison waits for Send, like every other send.
+    WhatToCompareWith,
+}
+
+impl WhatThePickerIsFor {
+    /// What the row that chooses nothing is called.
+    fn the_row_that_chooses_nothing(self) -> &'static str {
+        match self {
+            Self::WhereItGoes => THE_ACTIVE_ONE,
+            Self::WhatToCompareWith => NO_COMPARISON,
+        }
+    }
+}
+
 /// What the reader sees in the request's environment picker. Choosing an
 /// environment and pinning one are two different things, so a row carries both:
 /// the row itself sends the request somewhere, and the pin on it decides whether
@@ -22,8 +47,9 @@ const THE_ACTIVE_ONE: &str = "Use Active Environment";
 enum Row {
     /// Names the group under it. Not something to land on.
     Header(SharedString),
-    /// Back to whichever environment is active store-wide.
-    TheActiveOne,
+    /// Back to whichever environment is active store-wide, or to no comparison
+    /// at all, depending on what the picker is for.
+    ChoosesNothing,
     Environment {
         id: EnvironmentId,
         name: SharedString,
@@ -35,6 +61,7 @@ pub struct EnvironmentPickerDelegate {
     store: Entity<ApiClientStore>,
     workspace: WeakEntity<Workspace>,
     request_id: RequestId,
+    what_for: WhatThePickerIsFor,
     rows: Vec<Row>,
     selected_index: usize,
 }
@@ -44,25 +71,30 @@ impl EnvironmentPickerDelegate {
         store: Entity<ApiClientStore>,
         workspace: WeakEntity<Workspace>,
         request_id: RequestId,
+        what_for: WhatThePickerIsFor,
     ) -> Self {
         Self {
             store,
             workspace,
             request_id,
+            what_for,
             rows: Vec::new(),
             selected_index: 0,
         }
     }
 
-    /// The environment this request is sent to, if the reader chose one that
-    /// still exists.
+    /// The environment this picker's tick is on: where the request is sent, or
+    /// what it is compared against. Only one that still exists.
     fn chosen(&self, cx: &App) -> Option<EnvironmentId> {
         let store = self.store.read(cx);
         store
             .requests
             .iter()
             .find(|request| request.id == self.request_id)
-            .and_then(|request| request.chosen_environment())
+            .and_then(|request| match self.what_for {
+                WhatThePickerIsFor::WhereItGoes => request.chosen_environment(),
+                WhatThePickerIsFor::WhatToCompareWith => request.compared_with(),
+            })
             .filter(|id| store.environment_by_id(*id).is_some())
     }
 
@@ -114,10 +146,11 @@ impl EnvironmentPickerDelegate {
             }
         }
         // Searchable like any other row rather than hidden by a search: it is
-        // the way back to following the active environment, and a reader with
-        // something typed must not be locked out of it.
-        if query.is_empty() || THE_ACTIVE_ONE.to_lowercase().contains(&query) {
-            rows.push(Row::TheActiveOne);
+        // the way back to choosing nothing at all, and a reader with something
+        // typed must not be locked out of it.
+        let chooses_nothing = self.what_for.the_row_that_chooses_nothing();
+        if query.is_empty() || chooses_nothing.to_lowercase().contains(&query) {
+            rows.push(Row::ChoosesNothing);
         }
         for (id, name) in the_rest {
             rows.push(Row::Environment {
@@ -136,7 +169,7 @@ impl EnvironmentPickerDelegate {
             .iter()
             .position(|row| match (row, chosen) {
                 (Row::Environment { id, .. }, Some(chosen)) => *id == chosen,
-                (Row::TheActiveOne, None) => true,
+                (Row::ChoosesNothing, None) => true,
                 _ => false,
             })
             .unwrap_or_else(|| {
@@ -167,7 +200,7 @@ impl EnvironmentPickerDelegate {
             .iter()
             .map(|row| match row {
                 Row::Header(title) => title.clone(),
-                Row::TheActiveOne => THE_ACTIVE_ONE.into(),
+                Row::ChoosesNothing => self.what_for.the_row_that_chooses_nothing().into(),
                 Row::Environment { name, .. } => name.clone(),
             })
             .collect()
@@ -216,12 +249,20 @@ impl PickerDelegate for EnvironmentPickerDelegate {
     fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let chosen = match self.rows.get(self.selected_index) {
             Some(Row::Environment { id, .. }) => Some(*id),
-            Some(Row::TheActiveOne) => None,
+            Some(Row::ChoosesNothing) => None,
             Some(Row::Header(_)) | None => return,
         };
         let request_id = self.request_id;
-        self.store.update(cx, |store, cx| {
-            store.choose_request_environment(request_id, chosen, cx)
+        let what_for = self.what_for;
+        self.store.update(cx, |store, cx| match what_for {
+            WhatThePickerIsFor::WhereItGoes => {
+                store.choose_request_environment(request_id, chosen, cx)
+            }
+            // Nothing is sent here. The comparison is asked for, and Send is
+            // what carries it out.
+            WhatThePickerIsFor::WhatToCompareWith => {
+                store.set_request_comparison_environment(request_id, chosen, cx)
+            }
         });
         cx.emit(DismissEvent);
     }
@@ -302,16 +343,18 @@ impl PickerDelegate for EnvironmentPickerDelegate {
                     )
                     .into_any_element(),
             ),
-            Row::TheActiveOne => Some(
+            Row::ChoosesNothing => Some(
                 div()
-                    .debug_selector(|| "environment-row:active".to_string())
+                    .debug_selector(|| "environment-row:nothing".to_string())
                     .child(
                         ListItem::new(("environment-row", ix))
                             .inset(true)
                             .spacing(ListItemSpacing::Sparse)
                             .toggle_state(selected)
                             .start_slot(the_mark(chosen.is_none()))
-                            .child(Label::new(THE_ACTIVE_ONE).truncate()),
+                            .child(
+                                Label::new(self.what_for.the_row_that_chooses_nothing()).truncate(),
+                            ),
                     )
                     .into_any_element(),
             ),
@@ -387,16 +430,18 @@ fn the_mark(marked: bool) -> AnyElement {
     }
 }
 
-/// The picker the environment chip opens.
+/// The picker a chip opens: the same list of environments and the same pins
+/// whichever chip asked for it.
 pub fn environment_picker(
     store: Entity<ApiClientStore>,
     workspace: WeakEntity<Workspace>,
     request_id: RequestId,
+    what_for: WhatThePickerIsFor,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Picker<EnvironmentPickerDelegate>> {
     cx.new(|cx| {
-        let mut delegate = EnvironmentPickerDelegate::new(store, workspace, request_id);
+        let mut delegate = EnvironmentPickerDelegate::new(store, workspace, request_id, what_for);
         delegate.rebuild("", cx);
         Picker::list(delegate, window, cx).max_height(ui::rems(20.))
     })

@@ -1130,6 +1130,10 @@ impl ApiClientStore {
                 request.choose_environment(None);
                 requests_repinned = true;
             }
+            if request.compared_with() == Some(id) {
+                request.compare_with(None);
+                requests_repinned = true;
+            }
         }
         cx.emit(ApiClientStoreEvent::EnvironmentsChanged);
         cx.notify();
@@ -1183,6 +1187,47 @@ impl ApiClientStore {
         request.choose_environment(environment_id);
         cx.notify();
         self.persist_collections(cx);
+    }
+
+    /// Asks for the next send of this request to be compared against
+    /// `environment_id`, or for no comparison when given `None`. Nothing is
+    /// sent here: the comparison waits for Send.
+    pub fn set_request_comparison_environment(
+        &mut self,
+        request_id: RequestId,
+        environment_id: Option<EnvironmentId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.requests.iter_mut().find(|r| r.id == request_id) else {
+            return;
+        };
+        request.compare_with(environment_id);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
+    /// What it takes to send this request against one environment: the client
+    /// and the request with every `{{token}}` in it resolved. Handed out rather
+    /// than sent here, so whoever asked can await it in their own window.
+    pub fn what_to_send(
+        &self,
+        request_id: RequestId,
+        environment_id: EnvironmentId,
+    ) -> Option<(reqwest::Client, api_client::ResolvedRequest)> {
+        // An environment that has been deleted is not one to send against: the
+        // request would go out resolved against nothing at all and come back
+        // labelled with a name that no longer exists.
+        self.environment_by_id(environment_id)?;
+        let request = self.requests.iter().find(|r| r.id == request_id)?;
+        let context = self.variable_context_for_environment(request, environment_id);
+        let dynamic = api_client::SystemDynamicVariableSource;
+        let resolve = |text: &str| {
+            api_client::resolve(text, &context, &dynamic, api_client::ResolveMode::ForSend)
+        };
+        Some((
+            self.http_client.clone(),
+            api_client::build_resolved_request(request, &resolve),
+        ))
     }
 
     /// Adds or removes one pinned environment, leaving the rest alone. Several
@@ -1885,6 +1930,40 @@ mod tests {
                     .map(|environment| environment.id),
                 Some(elsewhere)
             );
+        });
+    }
+
+    /// An environment that has been deleted is nothing to send against: the
+    /// request would go out resolved against nothing and come back labelled with
+    /// a name that no longer exists.
+    #[gpui::test]
+    fn what_to_send_refuses_an_environment_that_is_gone(cx: &mut TestAppContext) {
+        let store = new_store(cx);
+        let doomed = store.update(cx, |store, cx| {
+            store.create_environment("Doomed".into(), cx)
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.url = "https://example.com/ping".into();
+            });
+        });
+
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.what_to_send(request_id, doomed).is_some(),
+                "an environment that is there is one to send against"
+            );
+        });
+
+        store.update(cx, |store, cx| store.delete_environment(doomed, cx));
+        store.read_with(cx, |store, _| {
+            assert!(store.what_to_send(request_id, doomed).is_none());
         });
     }
 

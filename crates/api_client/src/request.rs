@@ -334,6 +334,19 @@ pub struct Request {
     /// stage and production, say. Pinning one does not send anything to it.
     #[serde(default)]
     pub pinned_environment_ids: Vec<EnvironmentId>,
+    /// The environment sends of this request are compared against, if the reader
+    /// asked for a comparison. Nothing is sent by choosing it: the comparison
+    /// waits for Send like any other send does.
+    ///
+    /// It stands until it is taken back -- comparing the same two environments
+    /// over and over is exactly what a reader chasing a difference does -- and
+    /// the chip says so while it stands.
+    ///
+    /// It may be the very environment the request is sent to. Two sends to one
+    /// environment can answer differently, and telling whether they do is the
+    /// whole point of asking.
+    #[serde(default)]
+    pub compare_with_environment_id: Option<EnvironmentId>,
 }
 
 impl Request {
@@ -356,6 +369,17 @@ impl Request {
     /// is active store-wide when given `None`.
     pub fn choose_environment(&mut self, id: Option<EnvironmentId>) {
         self.pinned_environment_id = id;
+    }
+
+    /// The environment the next send compares against, if any.
+    pub fn compared_with(&self) -> Option<EnvironmentId> {
+        self.compare_with_environment_id
+    }
+
+    /// Asks for the next send to be compared against `id`, or for no comparison
+    /// at all when given `None`.
+    pub fn compare_with(&mut self, id: Option<EnvironmentId>) {
+        self.compare_with_environment_id = id;
     }
 
     /// Pins this request to exactly these environments, leaving where a send
@@ -403,6 +427,7 @@ impl Request {
             examples: Vec::new(),
             pinned_environment_id: None,
             pinned_environment_ids: Vec::new(),
+            compare_with_environment_id: None,
         }
     }
 }
