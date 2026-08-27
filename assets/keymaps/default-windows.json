@@ -1052,7 +1052,7 @@
       "ctrl-k ctrl-shift-c": "workspace::CopyRelativePath",
       "ctrl-z": "project_panel::Undo",
       "ctrl-shift-z": "project_panel::Redo",
-      "enter": "project_panel::Rename",
+      "enter": "project_panel::Open",
       "f2": "project_panel::Rename",
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "delete": ["project_panel::Trash", { "skip_prompt": false }],

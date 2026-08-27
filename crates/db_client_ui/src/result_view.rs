@@ -1717,7 +1717,9 @@ impl ResultView {
 
     /// The narrowest and widest a column may be dragged to. Narrow enough to
     /// push a column out of the way, wide enough for a long address.
-    const MIN_COLUMN_W: f32 = 40.0;
+    // 40 pixels holds neither a value nor a header, so a column dragged that
+    // narrow costs space and shows nothing. 65 is the minimum JetBrains keeps.
+    const MIN_COLUMN_W: f32 = 65.0;
     const MAX_COLUMN_W: f32 = 1600.0;
 
     fn begin_column_resize(&mut self, display_pos: usize, grab_x: f32) {

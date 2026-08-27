@@ -10,17 +10,26 @@ use crate::{ElevationIndex, cyberpunk};
 // reason the launchpad's is: the look is a near-black surface with sharp corners
 // and one accent, and a theme is free to undo all three.
 fn elevated<E: Styled>(this: E, cx: &App, index: ElevationIndex) -> E {
+    // Border strength follows elevation too: a modal is further from the content
+    // than a menu, so it gets the raised border while menus and popovers keep the
+    // dim one.
+    let border = if index == ElevationIndex::ModalSurface {
+        cyberpunk::border_raised()
+    } else {
+        cyberpunk::border_dim()
+    };
+
     this.bg(cyberpunk::surface())
-        .rounded_none()
+        .rounded(index.radius())
         .border_1()
-        .border_color(cyberpunk::border_dim())
+        .border_color(border)
         .text_color(cyberpunk::text_primary())
         .shadow(index.shadow(cx))
 }
 
 fn elevated_borderless<E: Styled>(this: E, cx: &mut App, index: ElevationIndex) -> E {
     this.bg(cyberpunk::surface())
-        .rounded_none()
+        .rounded(index.radius())
         .text_color(cyberpunk::text_primary())
         .shadow(index.shadow(cx))
 }
@@ -48,7 +57,7 @@ pub trait StyledExt: Styled + Sized {
 
     /// The [`Surface`](ElevationIndex::Surface) elevation level, located above the app background, is the standard level for all elements
     ///
-    /// Sets `bg()`, `rounded_none()`, `border()`, `border_color()`, `text_color()`, `shadow()`
+    /// Sets `bg()`, `rounded()` from the elevation, `border()`, `border_color()`, `text_color()`, `shadow()`
     ///
     /// Example Elements: Title Bar, Panel, Tab Bar, Editor
     fn elevation_1(self, cx: &App) -> Self {
@@ -64,7 +73,7 @@ pub trait StyledExt: Styled + Sized {
 
     /// Non-Modal Elevated Surfaces appear above the [`Surface`](ElevationIndex::Surface) layer and is used for things that should appear above most UI elements like an editor or panel, but not elements like popovers, context menus, modals, etc.
     ///
-    /// Sets `bg()`, `rounded_none()`, `border()`, `border_color()`, `text_color()`, `shadow()`
+    /// Sets `bg()`, `rounded()` from the elevation, `border()`, `border_color()`, `text_color()`, `shadow()`
     ///
     /// Examples: Notifications, Palettes, Detached/Floating Windows, Detached/Floating Panels
     fn elevation_2(self, cx: &App) -> Self {
@@ -84,7 +93,7 @@ pub trait StyledExt: Styled + Sized {
     ///
     /// If the element does not have this behavior, it should be rendered at the [`Elevated Surface`](ElevationIndex::ElevatedSurface) layer.
     ///
-    /// Sets `bg()`, `rounded_none()`, `border()`, `border_color()`, `text_color()`, `shadow()`
+    /// Sets `bg()`, `rounded()` from the elevation, `border()`, `border_color()`, `text_color()`, `shadow()`
     ///
     /// Examples: Settings Modal, Channel Management, Wizards/Setup UI, Dialogs
     fn elevation_3(self, cx: &App) -> Self {

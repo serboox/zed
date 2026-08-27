@@ -3,8 +3,8 @@ use api_client::{CollectionId, EnvironmentId, Variable};
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, Size, Subscription, Window,
-    point, size,
+    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollHandle, Size,
+    Subscription, Window, point, size,
 };
 use ui::{
     Checkbox, ElevationIndex, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
@@ -444,13 +444,40 @@ impl EnvironmentEditorModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.store
-            .update(cx, |store, cx| store.delete_environment(id, cx));
-        if self.scope == Scope::Environment(id) {
-            self.select_scope(Scope::Global, window, cx);
-        } else {
-            cx.notify();
-        }
+        let name = self
+            .store
+            .read(cx)
+            .environments
+            .iter()
+            .find(|environment| environment.id == id)
+            .map(|environment| environment.name.clone())
+            .unwrap_or_default();
+        let message =
+            format!("Delete the environment \"{name}\" and its variables? This cannot be undone.");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Delete"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            // Cancel comes first, so deleting is the second button.
+            if answer.await != Ok(1) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.store
+                    .update(cx, |store, cx| store.delete_environment(id, cx));
+                if this.scope == Scope::Environment(id) {
+                    this.select_scope(Scope::Global, window, cx);
+                } else {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {

@@ -26,6 +26,9 @@ use ui_macros::derive_dynamic_spacing;
 // Example:
 //
 // DynamicSpacing::Base16 would return 16px at the default UI scale & density.
+// The variant names come from the middle column, so that column cannot be moved
+// without renaming every call site. Air is added instead by shipping
+// `ui_density: "comfortable"` as the default, which is the third column here.
 derive_dynamic_spacing![
     (0, 0, 0),
     (1, 1, 2),

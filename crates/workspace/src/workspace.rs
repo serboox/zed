@@ -12,6 +12,7 @@ pub mod notifications;
 pub mod opening_item_view;
 pub mod pane;
 pub mod pane_group;
+pub mod remembered_window;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
@@ -70,8 +71,8 @@ use gpui::{
     EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
     Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
     Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
-    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
-    transparent_black,
+    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, px, relative,
+    size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -8471,6 +8472,12 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            // Same card treatment as the editor region: a gutter and a radius,
+            // so a panel sits beside the document rather than being welded to it.
+            .m(px(5.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(cx.theme().colors().border)
             .child(dock.clone())
             .children(leader_border);
 
@@ -8701,6 +8708,19 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
+            // The regions of the window are cards with a gutter between them,
+            // not panes butted together and separated by a hairline. The gap
+            // shows the app background, so each region reads as its own surface
+            // and the seams stop being the loudest lines on screen.
+            // The gutter alone does not separate the regions: in most themes the
+            // app background behind it is the same colour as the editor, so the
+            // gap is invisible. The outline is what makes a region read as its
+            // own surface.
+            .m(px(5.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .overflow_hidden()
             .child(self.center.render(
                 self.zoomed.as_ref(),
                 self.maximized_pane.as_ref(),

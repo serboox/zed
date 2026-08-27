@@ -151,10 +151,17 @@ impl SystemWindowTabs {
     ) -> impl IntoElement + use<> {
         let entity = cx.entity();
         let settings = ItemSettings::get_global(cx);
-        let close_side = &settings.close_position;
-        let show_close_button = &settings.show_close_button;
+        // Copied out rather than borrowed: the icon square below needs `cx`
+        // mutably, and a live borrow of the settings would hold it.
+        let close_side = settings.close_position;
+        let show_close_button = settings.show_close_button;
 
         let rem_size = window.rem_size();
+        // A square icon button is its icon plus twice the padding, so this has to
+        // be asked for rather than assumed: a fixed box clips the button the
+        // moment the icon scale moves, and the tab clips overflow, which takes
+        // part of the hitbox with it.
+        let close_button_size = IconSize::XSmall.square(window, cx);
         let width = self.measured_tab_width.max(rem_size * 10);
         let is_active = window.window_handle().window_id() == item.id;
         let title = item.title.to_string();
@@ -243,8 +250,7 @@ impl SystemWindowTabs {
                     div()
                         .absolute()
                         .top_2()
-                        .w_4()
-                        .h_4()
+                        .size(close_button_size)
                         .map(|this| match close_side {
                             ClosePosition::Left => this.left_1(),
                             ClosePosition::Right => this.right_1(),

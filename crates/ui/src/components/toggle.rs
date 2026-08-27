@@ -52,7 +52,9 @@ pub struct Checkbox {
     label_size: LabelSize,
     label_color: Color,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView>>,
-    on_click: Option<Box<dyn Fn(&ToggleState, &ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_click: Option<Rc<dyn Fn(&ToggleState, &ClickEvent, &mut Window, &mut App) + 'static>>,
+    tab_index: Option<isize>,
+    aria_label: Option<SharedString>,
 }
 
 impl Checkbox {
@@ -71,7 +73,23 @@ impl Checkbox {
             label_color: Color::Muted,
             tooltip: None,
             on_click: None,
+            tab_index: None,
+            aria_label: None,
         }
+    }
+
+    /// Places the [`Checkbox`] in the keyboard tab order, which also gives it a
+    /// focus ring and lets Enter and Space toggle it.
+    pub fn tab_index(mut self, tab_index: impl Into<isize>) -> Self {
+        self.tab_index = Some(tab_index.into());
+        self
+    }
+
+    /// Sets the accessible name, for when the visible label is absent or is not
+    /// the whole story.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     /// Sets the disabled state of the [`Checkbox`].
@@ -91,7 +109,7 @@ impl Checkbox {
         mut self,
         handler: impl Fn(&ToggleState, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_click = Some(Box::new(move |state, _, window, cx| {
+        self.on_click = Some(Rc::new(move |state, _, window, cx| {
             handler(state, window, cx)
         }));
         self
@@ -101,7 +119,7 @@ impl Checkbox {
         mut self,
         handler: impl Fn(&ToggleState, &ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_click = Some(Box::new(handler));
+        self.on_click = Some(Rc::new(handler));
         self
     }
 
@@ -178,8 +196,24 @@ impl Checkbox {
         }
     }
 
+    /// The border color while the pointer is over the checkbox. It is a step
+    /// *stronger* than the resting border: a hover that fades the outline reads
+    /// as the control going away.
+    fn hover_border_color(&self, cx: &mut App) -> Hsla {
+        let base = self.border_color(cx);
+        let step = if is_light(cx) { -0.14 } else { 0.16 };
+        hsla(base.h, base.s, (base.l + step).clamp(0.0, 1.0), base.a)
+    }
+
+    /// The full footprint of the checkbox, which callers use to line siblings up
+    /// with it. It is also the pointer target, so it may not go below the 24
+    /// pixels that WCAG 2.5.8 asks for.
     pub fn container_size() -> Pixels {
-        px(20.0)
+        px(28.0)
+    }
+
+    fn box_size() -> Pixels {
+        px(18.0)
     }
 }
 
@@ -199,37 +233,80 @@ impl RenderOnce for Checkbox {
                 } else {
                     Some(
                         Icon::new(IconName::Check)
-                            .size(IconSize::Small)
+                            .size(IconSize::XSmall)
                             .color(color),
                     )
                 }
             }
-            ToggleState::Indeterminate => {
-                Some(Icon::new(IconName::Dash).size(IconSize::Small).color(color))
-            }
+            ToggleState::Indeterminate => Some(
+                Icon::new(IconName::Dash)
+                    .size(IconSize::XSmall)
+                    .color(color),
+            ),
             ToggleState::Unselected => None,
         };
 
         let bg_color = self.bg_color(cx);
         let border_color = self.border_color(cx);
-        let hover_border_color = border_color.alpha(0.7);
+        let hover_border_color = self.hover_border_color(cx);
+        let focus_border_color = cx.theme().colors().border_focused;
+        let transparent_border = cx.theme().colors().border_transparent;
+        let aria_label = self.aria_label.clone().or_else(|| self.label.clone());
+        let keyboard_on_click = self.on_click.clone();
+        let toggle_state = self.toggle_state;
 
         let size = Self::container_size();
 
         let checkbox = h_flex()
             .group(group_id.clone())
             .id(self.id.clone())
+            .debug_selector({
+                let id = self.id.clone();
+                move || format!("CHECKBOX-{}", id)
+            })
+            .role(Role::CheckBox)
+            .when_some(aria_label, |this, label| this.aria_label(label))
+            .aria_toggled(match self.toggle_state {
+                ToggleState::Selected => Toggled::True,
+                ToggleState::Indeterminate => Toggled::Mixed,
+                ToggleState::Unselected => Toggled::False,
+            })
             .size(size)
+            .flex_none()
+            .items_center()
             .justify_center()
+            .border_2()
+            .border_color(transparent_border)
+            .rounded_md()
+            .when_some(
+                self.tab_index
+                    .filter(|_| !self.disabled && !self.visualization),
+                |this, tab_index| {
+                    this.tab_index(tab_index)
+                        .focus_visible(move |mut style| {
+                            style.border_color = Some(focus_border_color);
+                            style
+                        })
+                        .when_some(keyboard_on_click, |this, on_click| {
+                            // Keyboard only. A pointer click on the indicator also
+                            // bubbles to the row handler below, and both listeners
+                            // would fire for one press.
+                            this.on_click(move |event, window, cx| {
+                                if matches!(event, ClickEvent::Keyboard(_)) {
+                                    on_click(&toggle_state.inverse(), event, window, cx)
+                                }
+                            })
+                        })
+                },
+            )
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .justify_center()
                     .items_center()
-                    .m_1()
-                    .size_4()
-                    .rounded_xs()
+                    .size(Self::box_size())
+                    .rounded(px(5.))
                     .bg(bg_color)
                     .border_1()
                     .border_color(border_color)
@@ -281,6 +358,277 @@ impl RenderOnce for Checkbox {
                     this.on_click(move |click, window, cx| {
                         on_click(&self.toggle_state.inverse(), click, window, cx)
                     })
+                },
+            )
+    }
+}
+
+/// Creates a new radio button.
+pub fn radio_button(id: impl Into<ElementId>, selected: bool) -> RadioButton {
+    RadioButton::new(id, selected)
+}
+
+/// A radio button: one option out of a set, where choosing one clears the rest.
+///
+/// Use it when the options are mutually exclusive and all of them should stay
+/// visible. For a single on/off answer use [`Checkbox`]; for one that applies
+/// immediately use [`Switch`].
+///
+/// Keyboard: give every radio in a set a `tab_index` so each is reachable.
+/// Arrow-key movement *within* a set, which the ARIA radio-group pattern also
+/// asks for, needs a focus-owning container and is not provided here yet.
+#[derive(IntoElement, RegisterComponent)]
+pub struct RadioButton {
+    id: ElementId,
+    selected: bool,
+    style: ToggleStyle,
+    disabled: bool,
+    label: Option<SharedString>,
+    label_size: LabelSize,
+    label_color: Color,
+    tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView>>,
+    on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    tab_index: Option<isize>,
+    aria_label: Option<SharedString>,
+}
+
+impl RadioButton {
+    /// Creates a new [`RadioButton`].
+    pub fn new(id: impl Into<ElementId>, selected: bool) -> Self {
+        Self {
+            id: id.into(),
+            selected,
+            style: ToggleStyle::default(),
+            disabled: false,
+            label: None,
+            label_size: LabelSize::Default,
+            label_color: Color::Default,
+            tooltip: None,
+            on_click: None,
+            tab_index: None,
+            aria_label: None,
+        }
+    }
+
+    /// Sets the disabled state of the [`RadioButton`].
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Binds a handler called when the option is chosen.
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_click = Some(Rc::new(handler));
+        self
+    }
+
+    /// Sets the style of the [`RadioButton`] using the specified [`ToggleStyle`].
+    pub fn style(mut self, style: ToggleStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Matches the style to the current elevation using [`ToggleStyle::ElevationBased`].
+    pub fn elevation(mut self, elevation: ElevationIndex) -> Self {
+        self.style = ToggleStyle::ElevationBased(elevation);
+        self
+    }
+
+    /// Sets the tooltip for the [`RadioButton`].
+    pub fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.tooltip = Some(Box::new(tooltip));
+        self
+    }
+
+    /// Sets the label shown next to the [`RadioButton`].
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Sets the size of the label.
+    pub fn label_size(mut self, size: LabelSize) -> Self {
+        self.label_size = size;
+        self
+    }
+
+    /// Sets the color of the label.
+    pub fn label_color(mut self, color: Color) -> Self {
+        self.label_color = color;
+        self
+    }
+
+    /// Places the [`RadioButton`] in the keyboard tab order, which also gives it
+    /// a focus ring and lets Enter and Space choose it.
+    pub fn tab_index(mut self, tab_index: impl Into<isize>) -> Self {
+        self.tab_index = Some(tab_index.into());
+        self
+    }
+
+    /// Sets the accessible name, for when the visible label is absent or is not
+    /// the whole story.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
+    }
+
+    fn bg_color(&self, cx: &App) -> Hsla {
+        match (self.style.clone(), self.selected) {
+            (_, false) => gpui::transparent_black(),
+            (ToggleStyle::Ghost, true) => cx.theme().colors().element_background,
+            (ToggleStyle::ElevationBased(elevation), true) => elevation.darker_bg(cx),
+            (ToggleStyle::Custom(color), true) => color.opacity(0.2),
+        }
+    }
+
+    fn border_color(&self, cx: &App) -> Hsla {
+        if self.disabled {
+            return cx.theme().colors().border_variant;
+        }
+
+        match self.style.clone() {
+            ToggleStyle::Ghost | ToggleStyle::ElevationBased(_) => {
+                if self.selected {
+                    cx.theme().colors().border_selected
+                } else {
+                    cx.theme().colors().border
+                }
+            }
+            ToggleStyle::Custom(color) => color.opacity(0.3),
+        }
+    }
+
+    fn hover_border_color(&self, cx: &mut App) -> Hsla {
+        let base = self.border_color(cx);
+        let step = if is_light(cx) { -0.14 } else { 0.16 };
+        hsla(base.h, base.s, (base.l + step).clamp(0.0, 1.0), base.a)
+    }
+
+    /// The full footprint, which is also the pointer target. It matches the
+    /// height of a default button so a radio lines up with the controls beside
+    /// it, and it clears the 24 pixels WCAG 2.5.8 asks for.
+    pub fn container_size() -> Pixels {
+        px(28.0)
+    }
+}
+
+impl RenderOnce for RadioButton {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let group_id = format!("radio_group_{:?}", self.id);
+        let bg_color = self.bg_color(cx);
+        let border_color = self.border_color(cx);
+        let hover_border_color = self.hover_border_color(cx);
+        let focus_border_color = cx.theme().colors().border_focused;
+        let transparent_border = cx.theme().colors().border_transparent;
+        let dot_color = if self.disabled {
+            Color::Disabled
+        } else {
+            Color::Selected
+        };
+        let aria_label = self.aria_label.clone().or_else(|| self.label.clone());
+        let keyboard_on_click = self.on_click.clone();
+        let pointer_on_click = self.on_click.clone();
+
+        let indicator = h_flex()
+            .group(group_id.clone())
+            .id(self.id.clone())
+            .debug_selector({
+                let id = self.id.clone();
+                move || format!("RADIO-{}", id)
+            })
+            .role(Role::RadioButton)
+            .when_some(aria_label, |this, label| this.aria_label(label))
+            .aria_toggled(if self.selected {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .size(Self::container_size())
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .border_2()
+            .border_color(transparent_border)
+            .rounded_full()
+            .when_some(
+                self.tab_index.filter(|_| !self.disabled),
+                |this, tab_index| {
+                    this.tab_index(tab_index)
+                        .focus_visible(move |mut style| {
+                            style.border_color = Some(focus_border_color);
+                            style
+                        })
+                        .when_some(keyboard_on_click, |this, on_click| {
+                            // Keyboard only, for the same reason as in `Checkbox`:
+                            // a pointer click here also reaches the row handler.
+                            this.on_click(move |event, window, cx| {
+                                if matches!(event, ClickEvent::Keyboard(_)) {
+                                    on_click(event, window, cx)
+                                }
+                            })
+                        })
+                },
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_center()
+                    .items_center()
+                    .size(Checkbox::box_size())
+                    .rounded_full()
+                    .bg(bg_color)
+                    .border_1()
+                    .border_color(border_color)
+                    .when(self.disabled, |this| {
+                        this.cursor_not_allowed().bg(cx
+                            .theme()
+                            .colors()
+                            .element_disabled
+                            .opacity(0.6))
+                    })
+                    .when(!self.disabled, |this| {
+                        this.group_hover(group_id.clone(), |el| el.border_color(hover_border_color))
+                    })
+                    .when(self.selected, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .rounded_full()
+                                .bg(dot_color.color(cx))
+                                .size(px(9.)),
+                        )
+                    }),
+            );
+
+        h_flex()
+            .id((self.id.clone(), "radio-row"))
+            .map(|this| {
+                if self.disabled {
+                    this.cursor_not_allowed()
+                } else {
+                    this.cursor_pointer()
+                }
+            })
+            .gap(DynamicSpacing::Base06.rems(cx))
+            .child(indicator)
+            .when_some(self.label, |this, label| {
+                this.child(
+                    Label::new(label)
+                        .color(self.label_color)
+                        .size(self.label_size),
+                )
+            })
+            .when_some(self.tooltip, |this, tooltip| {
+                this.tooltip(move |window, cx| tooltip(window, cx))
+            })
+            .when_some(
+                pointer_on_click.filter(|_| !self.disabled),
+                |this, on_click| {
+                    this.on_click(move |event, window, cx| on_click(event, window, cx))
                 },
             )
     }
@@ -507,8 +855,13 @@ impl RenderOnce for Switch {
                             style
                         })
                         .when_some(self.on_click.clone(), |this, on_click| {
-                            this.on_click(move |_, window, cx| {
-                                on_click(&self.toggle_state.inverse(), window, cx)
+                            // Keyboard only: a pointer click on the track also
+                            // bubbles to the row handler, which would fire the
+                            // callback a second time for one press.
+                            this.on_click(move |event, window, cx| {
+                                if matches!(event, ClickEvent::Keyboard(_)) {
+                                    on_click(&self.toggle_state.inverse(), window, cx)
+                                }
                             })
                         })
                 },
@@ -874,6 +1227,61 @@ impl Component for SwitchField {
     }
 }
 
+impl Component for RadioButton {
+    fn scope() -> ComponentScope {
+        ComponentScope::Input
+    }
+
+    fn description() -> &'static str {
+        "One option out of a mutually exclusive set, where choosing one clears the rest"
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+        v_flex()
+            .gap_6()
+            .children(vec![
+                example_group_with_title(
+                    "States",
+                    vec![
+                        single_example(
+                            "Unselected",
+                            RadioButton::new("radio_unselected", false).into_any_element(),
+                        ),
+                        single_example(
+                            "Selected",
+                            RadioButton::new("radio_selected", true).into_any_element(),
+                        ),
+                        single_example(
+                            "Disabled",
+                            RadioButton::new("radio_disabled", false)
+                                .disabled(true)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "Disabled and selected",
+                            RadioButton::new("radio_disabled_selected", true)
+                                .disabled(true)
+                                .into_any_element(),
+                        ),
+                    ],
+                ),
+                example_group_with_title(
+                    "A set",
+                    vec![single_example(
+                        "Three options, one chosen",
+                        v_flex()
+                            .gap_1()
+                            .child(RadioButton::new("radio_set_a", true).label("Ask every time"))
+                            .child(RadioButton::new("radio_set_b", false).label("Always allow"))
+                            .child(RadioButton::new("radio_set_c", false).label("Never allow"))
+                            .into_any_element(),
+                    )],
+                ),
+            ])
+            .into_any_element()
+    }
+}
+
 impl Component for Checkbox {
     fn scope() -> ComponentScope {
         ComponentScope::Input
@@ -1096,5 +1504,202 @@ impl Component for Switch {
                 ),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Context, IntoElement, Modifiers, Render, TestAppContext, Window, px};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::{Checkbox, RadioButton, ToggleState, prelude::*};
+
+    struct ControlsHost;
+
+    impl Render for ControlsHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .child(
+                    Checkbox::new("probe-checkbox", ToggleState::Unselected)
+                        .tab_index(0_isize)
+                        .label("Run on start"),
+                )
+                .child(
+                    RadioButton::new("probe-radio", true)
+                        .tab_index(1_isize)
+                        .label("Always allow"),
+                )
+        }
+    }
+
+    // The pointer target of a toggle is its whole container, and WCAG 2.5.8 puts
+    // the floor at 24 x 24 for targets that sit next to each other. Asserting on
+    // the painted bounds rather than on `container_size()` is deliberate: the
+    // checkbox used to declare 20 while painting 24, so the constant and the
+    // pixels disagreed.
+    #[gpui::test]
+    async fn a_checkbox_and_a_radio_are_big_enough_to_hit(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (_host, cx) = cx.add_window_view(|_window, _cx| ControlsHost);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let checkbox = cx
+            .debug_bounds("CHECKBOX-probe-checkbox")
+            .expect("the checkbox is painted");
+        let radio = cx
+            .debug_bounds("RADIO-probe-radio")
+            .expect("the radio button is painted");
+
+        assert!(
+            checkbox.size.width >= px(24.) && checkbox.size.height >= px(24.),
+            "a checkbox target must be at least 24 x 24, painted {:?}",
+            checkbox.size
+        );
+        assert!(
+            radio.size.width >= px(24.) && radio.size.height >= px(24.),
+            "a radio target must be at least 24 x 24, painted {:?}",
+            radio.size
+        );
+    }
+
+    // Hover has to make the outline easier to see, not fainter. The checkbox
+    // used to hover to `border_color.alpha(0.7)`, which reads as the control
+    // fading out from under the pointer.
+    #[gpui::test]
+    async fn hover_strengthens_the_outline(cx: &mut TestAppContext) {
+        let (resting, hovered, radio_resting, radio_hovered) = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+
+            let checkbox = Checkbox::new("hover-probe", ToggleState::Unselected);
+            let radio = RadioButton::new("hover-probe-radio", false);
+            (
+                checkbox.border_color(cx),
+                checkbox.hover_border_color(cx),
+                radio.border_color(cx),
+                radio.hover_border_color(cx),
+            )
+        });
+
+        let dark = resting.l < 0.5;
+        if dark {
+            assert!(
+                hovered.l > resting.l,
+                "on a dark theme the hovered checkbox outline must be lighter: {} -> {}",
+                resting.l,
+                hovered.l
+            );
+            assert!(
+                radio_hovered.l > radio_resting.l,
+                "on a dark theme the hovered radio outline must be lighter: {} -> {}",
+                radio_resting.l,
+                radio_hovered.l
+            );
+        } else {
+            assert!(
+                hovered.l < resting.l,
+                "on a light theme the hovered checkbox outline must be darker: {} -> {}",
+                resting.l,
+                hovered.l
+            );
+            assert!(
+                radio_hovered.l < radio_resting.l,
+                "on a light theme the hovered radio outline must be darker: {} -> {}",
+                radio_resting.l,
+                radio_hovered.l
+            );
+        }
+    }
+
+    struct CountingHost {
+        checkbox_clicks: Rc<Cell<usize>>,
+        radio_clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for CountingHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let checkbox_clicks = self.checkbox_clicks.clone();
+            let radio_clicks = self.radio_clicks.clone();
+            v_flex()
+                .child(
+                    Checkbox::new("click-probe", ToggleState::Unselected)
+                        .tab_index(0_isize)
+                        .on_click(move |_state, _window, _cx| {
+                            checkbox_clicks.set(checkbox_clicks.get() + 1);
+                        }),
+                )
+                .child(
+                    RadioButton::new("click-probe-radio", false)
+                        .tab_index(1_isize)
+                        .on_click(move |_event, _window, _cx| {
+                            radio_clicks.set(radio_clicks.get() + 1);
+                        }),
+                )
+        }
+    }
+
+    // A toggle that is both focusable and clickable carries two click listeners:
+    // one on the focusable indicator, for Enter and Space, and one on the row, so
+    // that the label is clickable too. A pointer press on the indicator bubbles
+    // through both, so without a guard one press counts as two.
+    #[gpui::test]
+    async fn one_pointer_click_counts_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let checkbox_clicks = Rc::new(Cell::new(0));
+        let radio_clicks = Rc::new(Cell::new(0));
+        let (_host, cx) = cx.add_window_view({
+            let checkbox_clicks = checkbox_clicks.clone();
+            let radio_clicks = radio_clicks.clone();
+            move |_window, _cx| CountingHost {
+                checkbox_clicks,
+                radio_clicks,
+            }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let checkbox = cx
+            .debug_bounds("CHECKBOX-click-probe")
+            .expect("the checkbox is painted");
+        cx.simulate_click(checkbox.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let radio = cx
+            .debug_bounds("RADIO-click-probe-radio")
+            .expect("the radio button is painted");
+        cx.simulate_click(radio.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            checkbox_clicks.get(),
+            1,
+            "one press on the checkbox must call the handler once"
+        );
+        assert_eq!(
+            radio_clicks.get(),
+            1,
+            "one press on the radio must call the handler once"
+        );
     }
 }

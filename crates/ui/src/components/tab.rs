@@ -90,8 +90,23 @@ impl Tab {
         DynamicSpacing::Base32.px(cx) - px(1.)
     }
 
+    /// Height of the strip a row of tabs sits in. A tab is shorter than this by
+    /// [`Tab::shoulder`], the gutter above it; below it there is no gutter at
+    /// all, because the selected tab has to reach the strip's bottom edge.
     pub fn container_height(cx: &App) -> Pixels {
-        DynamicSpacing::Base32.px(cx)
+        DynamicSpacing::Base32.px(cx) + px(8.)
+    }
+
+    /// The gutter above a tab, and the radius of both its top corners and of the
+    /// flare where it meets the strip.
+    pub fn shoulder() -> Pixels {
+        px(6.)
+    }
+
+    /// Height of one tab: the strip minus the gutter above it, so its bottom
+    /// edge lands exactly on the strip's bottom edge.
+    pub fn card_height(cx: &App) -> Pixels {
+        Self::container_height(cx) - Self::shoulder()
     }
 }
 
@@ -119,7 +134,7 @@ impl ParentElement for Tab {
 impl RenderOnce for Tab {
     #[allow(refining_impl_trait)]
     fn render(self, _: &mut Window, cx: &mut App) -> Stateful<Div> {
-        let (text_color, tab_bg, _tab_hover_bg, _tab_active_bg) = match self.selected {
+        let (text_color, tab_bg, tab_hover_bg, tab_active_bg) = match self.selected {
             false => (
                 cx.theme().colors().text_muted,
                 cx.theme().colors().tab_inactive_background,
@@ -153,37 +168,100 @@ impl RenderOnce for Tab {
             }
         };
 
+        // A tab is a card, not a cell in a table. The old shape -- flush
+        // rectangles telling each other apart by which of their four 1px borders
+        // was drawn, and by a one-pixel nudge of their padding -- is the single
+        // most dating thing about an editor's face. Position no longer changes
+        // the shape at all: the selected tab is the one that is filled and
+        // raised, and the accent rail on top says which document you are in from
+        // across the room.
+        let selected = self.selected;
+        let card_border = cx.theme().colors().border;
+        let card_height = Tab::card_height(cx);
+        let content_height = Tab::content_height(cx);
+        let content_px = DynamicSpacing::Base04.px(cx);
+        let content_gap = DynamicSpacing::Base04.rems(cx);
+        let shoulder = Tab::shoulder();
+        let strip_bg = cx.theme().colors().tab_bar_background;
+
+        // The selected tab and the buffer under it are one surface, the way a
+        // browser draws them: the fill is the same colour as the editor, only the
+        // top corners are rounded, nothing separates them along the bottom, and
+        // the tab flares outward where it meets the strip so the join reads as a
+        // physical continuation rather than a card resting on top.
+        let flare = |on_left: bool| {
+            div()
+                .absolute()
+                .bottom_0()
+                .w(shoulder)
+                .h(shoulder)
+                .bg(tab_bg)
+                .map(|this| {
+                    if on_left {
+                        this.left(-shoulder)
+                    } else {
+                        this.right(-shoulder)
+                    }
+                })
+                .child(
+                    // A disc of the strip's own colour, centred on the flare's
+                    // outer top corner, carves the concave quarter out of it.
+                    div()
+                        .absolute()
+                        .top(-shoulder)
+                        .w(shoulder * 2.)
+                        .h(shoulder * 2.)
+                        .rounded_full()
+                        .bg(strip_bg)
+                        .map(|this| {
+                            if on_left {
+                                this.left(-shoulder)
+                            } else {
+                                this.left(px(0.))
+                            }
+                        }),
+                )
+        };
+
         self.div
-            .h(Tab::container_height(cx))
-            .bg(tab_bg)
-            .border_color(cx.theme().colors().border)
+            .h(card_height)
+            .mt(shoulder)
+            .mx(px(2.))
+            // The strip gets a real inset at its ends rather than a tab flush
+            // against the window edge.
             .map(|this| match self.position {
-                TabPosition::First => {
-                    if self.selected {
-                        this.pl_px().border_r_1().pb_px()
-                    } else {
-                        this.pl_px().pr_px().border_b_1()
-                    }
-                }
-                TabPosition::Last => {
-                    if self.selected {
-                        this.border_l_1().border_r_1().pb_px()
-                    } else {
-                        this.pl_px().border_b_1().border_r_1()
-                    }
-                }
-                TabPosition::Middle(Ordering::Equal) => this.border_l_1().border_r_1().pb_px(),
-                TabPosition::Middle(Ordering::Less) => this.border_l_1().pr_px().border_b_1(),
-                TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
+                TabPosition::First => this.ml(shoulder),
+                TabPosition::Last => this.mr(shoulder),
+                TabPosition::Middle(_) => this,
+            })
+            .rounded_t(px(10.))
+            .relative()
+            .bg(if selected {
+                tab_bg
+            } else {
+                gpui::transparent_black()
+            })
+            .hover(move |style| style.bg(tab_hover_bg))
+            .active(move |style| style.bg(tab_active_bg))
+            .when(selected, move |this| {
+                // Border on three sides only. A line along the bottom is exactly
+                // what would say "this is a separate box", and a shadow would say
+                // it floats -- both are the opposite of what the shape is for.
+                this.border_t_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(card_border)
+                    .child(flare(true))
+                    .child(flare(false))
             })
             .cursor_pointer()
             .child(
                 h_flex()
                     .group("")
                     .relative()
-                    .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
-                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .h(content_height)
+                    .px(content_px)
+                    .gap(content_gap)
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)

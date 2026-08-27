@@ -464,11 +464,17 @@ pub enum ButtonSize {
 impl ButtonSize {
     pub fn rems(self) -> Rems {
         match self {
-            ButtonSize::Large => rems_from_px(32.),
-            ButtonSize::Medium => rems_from_px(28.),
-            ButtonSize::Default => rems_from_px(22.),
-            ButtonSize::Compact => rems_from_px(18.),
-            ButtonSize::None => rems_from_px(16.),
+            ButtonSize::Large => rems_from_px(36.),
+            ButtonSize::Medium => rems_from_px(32.),
+            // 24 is the floor WCAG 2.5.8 sets for a pointer target, and this is
+            // the size ~93% of the buttons in the tree get, because they do not
+            // ask for one. It is deliberately not 28: the taller default would
+            // also thicken every dense strip -- the status bar has no fixed
+            // height and simply grows -- so that step needs a visual pass over
+            // the chrome first.
+            ButtonSize::Default => rems_from_px(28.),
+            ButtonSize::Compact => rems_from_px(24.),
+            ButtonSize::None => rems_from_px(20.),
         }
     }
 }
@@ -796,11 +802,15 @@ impl RenderOnce for ButtonLike {
                 this.w(width).justify_center().text_center()
             })
             .when(is_outlined, |this| this.border_1())
+            // 4px on a 28px-tall control reads as "almost square, but not quite";
+            // 8px is the radius a control gets in Fluent, in JetBrains' New UI and
+            // on macOS. The corner is one of the few things that dates a chrome.
             .when_some(self.rounding, |this, rounding| {
-                this.when(rounding.top_left, |this| this.rounded_tl_sm())
-                    .when(rounding.top_right, |this| this.rounded_tr_sm())
-                    .when(rounding.bottom_right, |this| this.rounded_br_sm())
-                    .when(rounding.bottom_left, |this| this.rounded_bl_sm())
+                let radius = px(8.);
+                this.when(rounding.top_left, |this| this.rounded_tl(radius))
+                    .when(rounding.top_right, |this| this.rounded_tr(radius))
+                    .when(rounding.bottom_right, |this| this.rounded_br(radius))
+                    .when(rounding.bottom_left, |this| this.rounded_bl(radius))
             })
             .gap(DynamicSpacing::Base04.rems(cx))
             .map(|this| match self.size {
@@ -985,5 +995,35 @@ impl Component for ButtonLike {
                 ),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ButtonSize;
+    use crate::rems_from_px;
+
+    // Roughly 93% of the buttons in the tree never call `.size()`, so whatever
+    // `Default` returns is the height of almost every button in the editor. The
+    // floor is not the 24px of WCAG 2.5.8 but the 28px a control gets in a
+    // current desktop chrome: 24 merely stops being illegal, it does not stop
+    // looking cramped. Even `Compact`, chosen where space is tight, clears 24.
+    #[test]
+    fn the_default_button_clears_the_pointer_target_floor() {
+        assert!(
+            ButtonSize::Default.rems().0 >= rems_from_px(28.).0,
+            "the default button height is what most buttons get: {:?}",
+            ButtonSize::Default.rems()
+        );
+        assert!(
+            ButtonSize::Compact.rems().0 >= rems_from_px(24.).0,
+            "a compact button is still a pointer target: {:?}",
+            ButtonSize::Compact.rems()
+        );
+        assert!(
+            ButtonSize::Medium.rems().0 > ButtonSize::Default.rems().0
+                && ButtonSize::Large.rems().0 > ButtonSize::Medium.rems().0,
+            "the named sizes have to stay ordered"
+        );
     }
 }

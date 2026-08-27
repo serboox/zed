@@ -135,10 +135,10 @@ impl TextSize {
         let settings = theme::theme_settings(cx);
 
         match self {
-            Self::Large => rems_from_px(16.),
-            Self::Default => rems_from_px(14.),
-            Self::Small => rems_from_px(12.),
-            Self::XSmall => rems_from_px(10.),
+            Self::Large => rems_from_px(17.),
+            Self::Default => rems_from_px(15.),
+            Self::Small => rems_from_px(13.),
+            Self::XSmall => rems_from_px(11.),
             Self::Ui => rems_from_px(settings.ui_font_size(cx)),
             Self::Editor => rems_from_px(settings.buffer_font_size(cx)),
         }
@@ -148,10 +148,10 @@ impl TextSize {
         let settings = theme::theme_settings(cx);
 
         match self {
-            Self::Large => px(16.),
-            Self::Default => px(14.),
-            Self::Small => px(12.),
-            Self::XSmall => px(10.),
+            Self::Large => px(17.),
+            Self::Default => px(15.),
+            Self::Small => px(13.),
+            Self::XSmall => px(11.),
             Self::Ui => settings.ui_font_size(cx),
             Self::Editor => settings.buffer_font_size(cx),
         }

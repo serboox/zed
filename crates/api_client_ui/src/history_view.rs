@@ -2,8 +2,8 @@ use crate::request_view::RequestView;
 use crate::store::{ApiClientStore, ApiClientStoreEvent};
 use api_client::HistoryEntry;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle, Subscription,
-    WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Render, ScrollHandle,
+    Subscription, WeakEntity, Window,
 };
 use ui::{
     Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*,
@@ -71,8 +71,30 @@ impl HistoryView {
         });
     }
 
-    fn clear(&mut self, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| store.clear_history(cx));
+    fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.store.read(cx).history.len();
+        if count == 0 {
+            return;
+        }
+        let message = format!(
+            "Clear the history of {count} {}? This cannot be undone.",
+            if count == 1 { "request" } else { "requests" }
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Clear"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            // Cancel comes first, so clearing is the second button.
+            if answer.await == Ok(1) {
+                store.update(cx, |store, cx| store.clear_history(cx));
+            }
+        })
+        .detach();
     }
 }
 
@@ -146,7 +168,9 @@ impl Render for HistoryView {
                             .child(
                                 Button::new("history-clear", "Clear")
                                     .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, _window, cx| this.clear(cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.clear(window, cx)),
+                                    ),
                             ),
                     ),
             )
@@ -258,10 +282,46 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Clearing the history is not undoable, so it asks first. The click alone
+    /// must no longer be enough.
     #[gpui::test]
-    async fn clicking_clear_empties_the_history_list(cx: &mut TestAppContext) {
+    async fn clicking_clear_empties_the_history_list_once_confirmed(cx: &mut TestAppContext) {
         let (store, _view, mut cx) = build_history_view(cx).await;
-        store.update(&mut cx, |store, cx| {
+        record_one_entry(&store, &mut cx);
+        draw(&mut cx);
+
+        let clear_button = debug_center(&mut cx, "history-clear");
+        cx.simulate_click(clear_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Clear");
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| assert!(store.history.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn cancelling_the_clear_prompt_keeps_the_history(cx: &mut TestAppContext) {
+        let (store, _view, mut cx) = build_history_view(cx).await;
+        record_one_entry(&store, &mut cx);
+        draw(&mut cx);
+
+        let clear_button = debug_center(&mut cx, "history-clear");
+        cx.simulate_click(clear_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store.history.len(),
+                1,
+                "answering Cancel must leave the history alone"
+            )
+        });
+    }
+
+    fn record_one_entry(store: &Entity<ApiClientStore>, cx: &mut VisualTestContext) {
+        store.update(cx, |store, cx| {
             store.record_history_entry(
                 HistoryEntry::new(
                     Uuid::new_v4(),
@@ -273,13 +333,6 @@ mod tests {
                 cx,
             );
         });
-        draw(&mut cx);
-
-        let clear_button = debug_center(&mut cx, "history-clear");
-        cx.simulate_click(clear_button, gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        store.read_with(&cx, |store, _| assert!(store.history.is_empty()));
     }
 
     #[gpui::test]

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Finishes the install that stalled when the gcloud token expired.
+#
+# Signs in (interactive, one browser round trip), then builds the current commit
+# on the K8s builder and installs it as zed-fast. Safe to re-run: every step is
+# idempotent and the build is detached, so a VPN drop does not lose it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== 1/3 signing in to Google Cloud =="
+gcloud auth login
+
+echo "== 2/3 checking the builder is reachable =="
+./.remote-build/scripts/status.sh >/dev/null
+
+echo "== 3/3 building the current commit and installing it =="
+mise run remote:install
+
+echo
+echo "Done. Restart Zed to pick the new binary up."
+git --no-pager log --oneline -1

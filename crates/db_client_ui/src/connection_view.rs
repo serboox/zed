@@ -6,9 +6,8 @@ use db_client::{
 };
 use editor::Editor;
 use gpui::{
-    App, Bounds, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
-    point,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render, Size,
+    Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, point,
 };
 use platform_title_bar::PlatformTitleBar;
 use settings::Settings;
@@ -57,25 +56,8 @@ enum TestState {
     Success,
     Failure(String),
 }
-
-/// Where the window was left, so reopening it does not undo the reader's
-/// dragging and sizing. Held for the run of the editor rather than written down:
-/// the placement matters within a sitting, and a stored one can name a display
-/// that is no longer plugged in.
-struct WhereItWasLeft {
-    bounds: Bounds<Pixels>,
-    display: Uuid,
-}
-
-impl gpui::Global for WhereItWasLeft {}
-
-/// The size it opens at when it has not been sized yet: the list of databases
-/// beside a form two fields wide, and no more, so the editor behind it is still
-/// there.
-const OPENING_SIZE: Size<Pixels> = Size {
-    width: px(940.),
-    height: px(660.),
-};
+/// The name this window's remembered placement is stored under.
+const REMEMBERED_AS: &str = "database-connection";
 
 /// Small enough to be pushed aside, large enough that the form still has a
 /// column beside the list of databases rather than one word a line.
@@ -190,22 +172,10 @@ fn window_over(
 }
 
 /// Where it was left, if that screen is still there and still holds it;
-/// otherwise the middle of the screen at the size it opens at.
+/// Where it was left, if that screen is still there and still holds it;
+/// otherwise nearly the whole screen, so every field is in view at once.
 fn where_to_open(cx: &mut App) -> WindowBounds {
-    let left = cx.try_global::<WhereItWasLeft>().and_then(|left| {
-        let screen = cx
-            .displays()
-            .into_iter()
-            .find(|display| display.uuid().ok() == Some(left.display))?;
-        screen
-            .bounds()
-            .intersects(&left.bounds)
-            .then_some(left.bounds)
-    });
-    match left {
-        Some(bounds) => WindowBounds::Windowed(bounds),
-        None => WindowBounds::centered(OPENING_SIZE, cx),
-    }
+    workspace::remembered_window::where_to_open(REMEMBERED_AS, cx)
 }
 
 pub struct ConnectionView {
@@ -559,7 +529,12 @@ impl ConnectionView {
                 if let WindowBounds::Windowed(bounds) = window.inner_window_bounds()
                     && let Some(display) = window.display(cx).and_then(|it| it.uuid().ok())
                 {
-                    cx.set_global(WhereItWasLeft { bounds, display });
+                    workspace::remembered_window::remember(
+                        REMEMBERED_AS,
+                        bounds,
+                        display.to_string(),
+                        cx,
+                    );
                 }
             })
             .log_err();
@@ -854,9 +829,12 @@ impl ConnectionView {
             .child(
                 div()
                     .w_full()
+                    .flex()
+                    .items_center()
+                    .min_h(px(34.))
                     .px_2()
                     .py_1p5()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(border)
                     .bg(field_bg)
@@ -1138,7 +1116,6 @@ impl Render for ConnectionView {
         let colors = cx.theme().colors();
         let page_bg = colors.editor_background;
         let card_bg = colors.elevated_surface_background;
-        let card_border = colors.border_variant;
         let field_border = colors.border;
         let field_bg = colors.background;
         let divider = colors.border_variant;
@@ -1718,13 +1695,14 @@ impl Render for ConnectionView {
                 )
             });
 
+        // No frame around the body. The window is already a frame; a second one
+        // inside it reads as a window within a window, and the space between the
+        // two borders is spent saying nothing. The list and the form are told
+        // apart by the divider between them, which is what a divider is for.
         let card = h_flex()
             .w_full()
             .flex_1()
             .items_stretch()
-            .rounded_lg()
-            .border_1()
-            .border_color(card_border)
             .bg(card_bg)
             .child(sidebar)
             .child(fields);
@@ -1738,7 +1716,6 @@ impl Render for ConnectionView {
             .bg(page_bg)
             .flex()
             .flex_col()
-            .p_6()
             .overflow_y_scroll()
             .child(card);
 

@@ -1,8 +1,8 @@
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
-    Pixels, ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowOptions, actions, point,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels,
+    PromptLevel, ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, actions, point,
 };
 use platform_title_bar::PlatformTitleBar;
 use project::Project;
@@ -11,7 +11,6 @@ use settings::Settings;
 use task::{DebugScenario, TaskTemplate};
 use ui::{ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
-use uuid::Uuid;
 use workspace::{Item, Workspace, client_side_decorations, item::ItemEvent};
 
 use crate::configurations_file::{self, Configuration, Kind};
@@ -126,23 +125,8 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// Where the window was left, so reopening it does not undo the reader's
-/// dragging and sizing. Held for the run of the editor rather than written down:
-/// the placement matters within a sitting, and a stored one can name a display
-/// that is no longer plugged in.
-struct WhereItWasLeft {
-    bounds: Bounds<Pixels>,
-    display: Uuid,
-}
-
-impl gpui::Global for WhereItWasLeft {}
-
-/// The size it opens at when it has not been sized yet: as wide as two columns
-/// need, and no wider, so what is being read behind it is still there.
-const OPENING_SIZE: Size<Pixels> = Size {
-    width: px(960.),
-    height: px(600.),
-};
+/// The name this window's remembered placement is stored under.
+const REMEMBERED_AS: &str = "run-configurations";
 
 /// Small enough to be pushed aside, large enough that the form still has a
 /// column beside the list rather than one word a line.
@@ -260,22 +244,10 @@ fn window_over(
 }
 
 /// Where it was left, if that screen is still there and still holds it;
-/// otherwise the middle of the screen at the size it opens at.
+/// otherwise nearly the whole screen, so every field is in view without the
+/// reader resizing anything.
 fn where_to_open(cx: &mut App) -> WindowBounds {
-    let left = cx.try_global::<WhereItWasLeft>().and_then(|left| {
-        let screen = cx
-            .displays()
-            .into_iter()
-            .find(|display| display.uuid().ok() == Some(left.display))?;
-        screen
-            .bounds()
-            .intersects(&left.bounds)
-            .then_some(left.bounds)
-    });
-    match left {
-        Some(bounds) => WindowBounds::Windowed(bounds),
-        None => WindowBounds::centered(OPENING_SIZE, cx),
-    }
+    workspace::remembered_window::where_to_open(REMEMBERED_AS, cx)
 }
 
 /// How wide the band along each edge that the window can be pulled by is, and
@@ -651,7 +623,12 @@ impl RunConfigurationsView {
                 if let WindowBounds::Windowed(bounds) = window.inner_window_bounds()
                     && let Some(display) = window.display(cx).and_then(|it| it.uuid().ok())
                 {
-                    cx.set_global(WhereItWasLeft { bounds, display });
+                    workspace::remembered_window::remember(
+                        REMEMBERED_AS,
+                        bounds,
+                        display.to_string(),
+                        cx,
+                    );
                 }
             })
             .log_err();
@@ -985,11 +962,13 @@ impl RunConfigurationsView {
         cx.notify();
     }
 
-    fn remove(&mut self, cx: &mut Context<Self>) {
+    fn remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((kind, at)) = self.chosen else {
             return;
         };
         if self.unsaved {
+            // Nothing is in the file yet, so there is nothing to lose and nothing
+            // to ask about.
             self.chosen = None;
             self.unsaved = false;
             cx.notify();
@@ -1000,9 +979,39 @@ impl RunConfigurationsView {
             cx.notify();
             return;
         };
-        let removing = self.store.read(cx).remove(kind, at, original, cx);
-        self.chosen = None;
+        let name = original
+            .get("label")
+            .or_else(|| original.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let message = if name.is_empty() {
+            "Take this configuration out of the file? This cannot be undone.".to_string()
+        } else {
+            format!("Take \"{name}\" out of the file? This cannot be undone.")
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Remove"],
+            cx,
+        );
         cx.spawn(async move |view, cx| {
+            // Cancel comes first, so removing is the second button.
+            if answer.await != Ok(1) {
+                return;
+            }
+            let removing = view
+                .update(cx, |view, cx| {
+                    view.chosen = None;
+                    cx.notify();
+                    view.store.read(cx).remove(kind, at, original, cx)
+                })
+                .ok();
+            let Some(removing) = removing else {
+                return;
+            };
             if let Err(error) = removing.await {
                 view.update(cx, |view, cx| {
                     view.trouble = Some(format!("{error:#}").into());
@@ -1358,8 +1367,9 @@ impl RunConfigurationsView {
                 list.child(
                     div().p_3().child(
                         Label::new(
-                            "Nothing here yet. Add one, or write .zed/tasks.json by hand -- \
-                             both end up in the same file.",
+                            "Nothing here yet. Press + above and pick what you are \
+                             running -- Go, Rust, Node and the rest fill the command \
+                             in for you.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
@@ -1544,14 +1554,10 @@ impl RunConfigurationsView {
                 .w_full()
                 .gap_3()
                 .items_center()
-                .child(
-                    Label::new(match self.watching {
-                        true => "Nothing is running.",
-                        false => "The run is not being watched.",
-                    })
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
+                // No sentence when there is nothing to say. Absent numbers
+                // already mean nothing is running, and the toggle beside them
+                // says whether the run is being watched; a line repeating both
+                // is one more thing to read and nothing more to learn.
                 .child(div().flex_1())
                 .child(toggle)
                 .into_any_element();
@@ -1638,86 +1644,6 @@ impl RunConfigurationsView {
     /// The template a command comes from, and the debugger that follows from it.
     /// Picking one fills the command and its arguments in; the debugger beside it
     /// is not the reader's to type, since it is worked out from the command.
-    fn render_template_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let command = self.command.read(cx).text(cx);
-        let chosen = crate::templates::template_of(&command);
-        let view = cx.entity();
-        h_flex()
-            .w_full()
-            .gap_3()
-            .items_end()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .debug_selector(|| "configuration-template".to_string())
-                    .child(
-                        Label::new("TEMPLATE")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        PopoverMenu::new("configuration-template")
-                            .trigger(
-                                Button::new(
-                                    "configuration-template-chosen",
-                                    match chosen {
-                                        Some(template) => template.name,
-                                        None => "Pick one, or write the command yourself",
-                                    },
-                                )
-                                .label_size(LabelSize::Small)
-                                .style(ButtonStyle::Outlined)
-                                .full_width()
-                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
-                            )
-                            .menu(move |window, cx| {
-                                let view = view.clone();
-                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for template in crate::templates::TEMPLATES {
-                                        let view = view.clone();
-                                        menu =
-                                            menu.entry(template.name, None, move |window, cx| {
-                                                view.update(cx, |view, cx| {
-                                                    view.fill_in_from(template, window, cx)
-                                                });
-                                            });
-                                    }
-                                    menu
-                                }))
-                            }),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .w(px(220.))
-                    .flex_none()
-                    .gap_1()
-                    .child(
-                        Label::new("DEBUGGER")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .debug_selector(|| "configuration-debugger".to_string())
-                    .child(
-                        Label::new(match chosen.and_then(|template| template.debugger) {
-                            Some(debugger) => format!("{debugger} (from the template)"),
-                            None => "not worked out from this command".to_string(),
-                        })
-                        .size(LabelSize::Small)
-                        .color(
-                            match chosen.and_then(|template| template.debugger) {
-                                Some(_) => Color::Default,
-                                None => Color::Muted,
-                            },
-                        ),
-                    ),
-            )
-            .debug_selector(|| "configuration-template-row".to_string())
-            .into_any_element()
-    }
-
     /// Fills the command and its arguments in from a template, leaving every
     /// other field as the reader left it.
     fn fill_in_from(
@@ -1739,11 +1665,16 @@ impl RunConfigurationsView {
     fn render_env(&self, cx: &mut Context<Self>) -> AnyElement {
         let boxed = |editor: &Entity<Editor>, wide: bool| {
             div()
-                .h(px(28.))
+                // Same rule as every other field: a minimum height with the line
+                // centred, never a fixed one.
+                .flex()
+                .items_center()
+                .min_h(px(32.))
                 .when(wide, |cell| cell.flex_1().min_w_0())
                 .when(!wide, |cell| cell.w(px(200.)))
                 .px_2()
                 .py_1()
+                .rounded_lg()
                 .border_1()
                 .border_color(ui::cyberpunk::border_dim())
                 .child(editor.clone())
@@ -1775,33 +1706,7 @@ impl RunConfigurationsView {
             })
             .collect();
 
-        v_flex()
-            .w_full()
-            .gap_1()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .child(
-                        Label::new("ENVIRONMENT")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("env-add", IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Add a variable"))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                let row = view.an_env_row("", "", window, cx);
-                                view.env_rows.push(row);
-                                view.edited = true;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(rows)
-            .into_any_element()
+        v_flex().w_full().gap_1().children(rows).into_any_element()
     }
 
     /// Asks for the file of variables rather than making the reader type a path.
@@ -2004,11 +1909,17 @@ impl RunConfigurationsView {
                         // a line alone reads as a rule across the form rather
                         // than as somewhere to type.
                         .bg(editor_background)
-                        .rounded_md()
-                        .when(!tall, |field| field.h(px(30.)))
+                        .rounded_lg()
+                        // A minimum rather than a fixed height, and the line
+                        // centred inside it. A fixed box stops fitting the moment
+                        // the text scale moves, and the line then sits nearer the
+                        // top than the bottom -- which is the whole reason a
+                        // field can look subtly wrong without anything being
+                        // obviously broken.
+                        .when(!tall, |field| field.flex().items_center().min_h(px(34.)))
                         // Tall fields take the height their editor asks for, and
                         // no less than three lines of it.
-                        .when(tall, |field| field.min_h(px(72.)))
+                        .when(tall, |field| field.min_h(px(84.)))
                         .px_2()
                         .py_1()
                         .border_1()
@@ -2040,6 +1951,10 @@ impl RunConfigurationsView {
             .min_w_0()
             .h_full()
             .p_4()
+            // A reading column rather than the whole window. On a wide screen a
+            // command field a metre long is harder to read, not easier, and the
+            // labels drift away from the values they name.
+            .max_w(px(880.))
             .gap_3()
             .overflow_y_scroll()
             .track_scroll(&self.form_scroll)
@@ -2058,12 +1973,25 @@ impl RunConfigurationsView {
             }))
             .child(field("NAME", &self.label, false))
             .when(kind == Kind::Task, |form| {
-                form.child(self.render_template_row(cx))
-                    .child(section("WHAT TO RUN"))
+                form.child(section("WHAT TO RUN"))
                     .child(field("COMMAND", &self.command, false))
                     .child(field("ARGUMENTS", &self.args, true))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
-                    .child(section("ENVIRONMENT"))
+                    .child(
+                        // The plus rides the rule that names the section rather
+                        // than sitting alone on a line of its own beneath it.
+                        section("ENVIRONMENT").child(
+                            IconButton::new("env-add", IconName::Plus)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Add a variable"))
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    let row = view.an_env_row("", "", window, cx);
+                                    view.env_rows.push(row);
+                                    view.edited = true;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
                     .child(self.render_env(cx))
                     .child(
                         h_flex()
@@ -2114,14 +2042,39 @@ impl RunConfigurationsView {
         let has_one = self.chosen.is_some();
         h_flex()
             .gap_px()
-            .child(
-                IconButton::new("configuration-add-task", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Add a way of running"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_a_new_one(Kind::Task, window, cx)
-                    })),
-            )
+            .child({
+                // The templates belong to the moment of adding: this is where a
+                // reader decides what kind of thing they are running, and a
+                // dropdown sitting in the form afterwards only asks them to
+                // decide again about something already decided.
+                let view = cx.entity();
+                PopoverMenu::new("configuration-add-task")
+                    .trigger(
+                        IconButton::new("configuration-add-task", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Add a way of running")),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for template in crate::templates::TEMPLATES {
+                                let view = view.clone();
+                                menu = menu.entry(template.name, None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.start_a_new_one(Kind::Task, window, cx);
+                                        view.fill_in_from(template, window, cx);
+                                    });
+                                });
+                            }
+                            menu.separator()
+                                .entry("Something else", None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.start_a_new_one(Kind::Task, window, cx)
+                                    });
+                                })
+                        }))
+                    })
+            })
             .child(
                 IconButton::new("configuration-add-debug", IconName::Debug)
                     .icon_size(IconSize::Small)
@@ -2142,7 +2095,7 @@ impl RunConfigurationsView {
                     .icon_size(IconSize::Small)
                     .disabled(!has_one)
                     .tooltip(Tooltip::text("Take this one out of the file"))
-                    .on_click(cx.listener(|view, _, _, cx| view.remove(cx))),
+                    .on_click(cx.listener(|view, _, window, cx| view.remove(window, cx))),
             )
             .child(
                 IconButton::new("configuration-earlier", IconName::ChevronUp)
@@ -2226,23 +2179,26 @@ impl RunConfigurationsView {
             .items_center()
             .border_t_1()
             .border_color(ui::cyberpunk::border_dim())
-            .child(
-                Label::new(format!("Kept in .zed/{}", kind_being_edited.file_name()))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            // One quiet control instead of a sentence plus a button beside it:
+            // the file's own name says where the configurations are kept, and a
+            // name that opens the file needs no verb next to it.
             .child(
                 div()
                     .id("configuration-open-file-hit-area")
                     .debug_selector(|| "configuration-open-file".to_string())
                     .child(
-                        Button::new("configuration-open-file-button", "Open")
-                            .label_size(LabelSize::XSmall)
-                            .disabled(!has_one)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                let kind = view.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
-                                view.open_the_file(kind, window, cx)
-                            })),
+                        Button::new(
+                            "configuration-open-file-button",
+                            format!(".zed/{}", kind_being_edited.file_name()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .tooltip(Tooltip::text("Open the file these are kept in"))
+                        .disabled(!has_one)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            let kind = view.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
+                            view.open_the_file(kind, window, cx)
+                        })),
                     ),
             )
             // What the run is using, and the way to stop watching it: this says
@@ -3430,38 +3386,39 @@ mod tests {
         );
     }
 
-    /// The templates the document names are offered in the form, and picking one
-    /// fills the command in. What it says about debugging follows the command:
-    /// for a Makefile target nothing can be worked out, and it says so rather
-    /// than naming a debugger it cannot use.
+    /// The templates the document names are offered where a configuration is
+    /// added -- on the plus button -- and picking one both starts the
+    /// configuration and fills its command in. They are deliberately not a row
+    /// inside the form: by then the reader has already decided what they are
+    /// running, and a dropdown there only asks them to decide again.
     #[gpui::test]
-    async fn a_template_fills_the_command_in_and_says_what_debugs_it(cx: &mut TestAppContext) {
+    async fn adding_offers_the_templates_and_picking_one_fills_the_command_in(
+        cx: &mut TestAppContext,
+    ) {
         let (view, _fs, mut cx) = a_view_of(None, cx).await;
-        view.update_in(&mut cx, |view, window, cx| {
-            view.start_a_new_one(Kind::Task, window, cx)
-        });
         draw(&mut cx);
 
-        let picker = cx
-            .debug_bounds("configuration-template")
-            .expect("the form offers a template to start from");
-        assert!(
-            cx.debug_bounds("configuration-debugger").is_some(),
-            "and says which debugger follows from it"
-        );
-
-        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        let add = cx
+            .debug_bounds("ICON-Plus")
+            .expect("the toolbar offers a way to add one");
+        cx.simulate_click(add.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         draw(&mut cx);
+
         let go = cx
             .debug_bounds("MENU_ITEM-Go")
-            .expect("every template the document names is offered");
+            .expect("every template the document names is offered when adding");
         for named in ["MENU_ITEM-Rust", "MENU_ITEM-Makefile", "MENU_ITEM-Mise"] {
             assert!(
                 cx.debug_bounds(named).is_some(),
                 "{named} is one of them too"
             );
         }
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Something else").is_some(),
+            "and a way to start without one"
+        );
+
         cx.simulate_click(go.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         draw(&mut cx);
@@ -3470,15 +3427,9 @@ mod tests {
         assert_eq!(filled_in.command, "go", "picking one fills the command in");
         assert_eq!(filled_in.args, vec!["run".to_string(), ".".to_string()]);
 
-        // And one whose command nothing can be derived from says so.
-        view.update_in(&mut cx, |view, window, cx| {
-            view.command
-                .update(cx, |editor, cx| editor.set_text("make", window, cx));
-        });
-        draw(&mut cx);
         assert!(
-            cx.debug_bounds("configuration-debugger").is_some(),
-            "the debugger it would use is still said, even when it is nothing"
+            cx.debug_bounds("configuration-template-row").is_none(),
+            "and the form itself no longer carries a template row"
         );
     }
 

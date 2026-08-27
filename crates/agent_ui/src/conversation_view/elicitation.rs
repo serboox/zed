@@ -8,7 +8,7 @@ use gpui::{AnyElement, App, Div, Empty, Entity, Hsla, SharedString, Window, div}
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use ui::{
-    Button, Checkbox, Color, Icon, IconName, IconSize, Indicator, Label, LabelSize, ToggleState,
+    Button, Checkbox, Color, Icon, IconName, IconSize, Label, LabelSize, RadioButton, ToggleState,
     prelude::*,
 };
 
@@ -1516,11 +1516,11 @@ impl<'a> ElicitationCard<'a> {
                 let option_value = option.value.clone();
                 let option_id =
                     format!("elicitation-select-option-{entry_ix}-{field_name}-{option_value}");
+                let radio_id = format!("{option_id}-radio");
                 let is_selected =
                     selected_value.is_some_and(|selected_value| selected_value == &option.value);
                 let row_background = Self::option_row_background(is_selected, cx);
                 let hover_background = Self::option_row_hover_background(is_selected, cx);
-                let control_background = Self::option_control_background(cx);
                 let elicitation_id = elicitation_id.clone();
                 let field_name = field_name.clone();
                 let on_single_select_change = on_single_select_change.clone();
@@ -1546,19 +1546,7 @@ impl<'a> ElicitationCard<'a> {
                             cx,
                         );
                     })
-                    .child(
-                        div()
-                            .size(Checkbox::container_size())
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Self::render_radio_indicator(
-                                is_selected,
-                                border_color,
-                                control_background,
-                            )),
-                    )
+                    .child(RadioButton::new(radio_id, is_selected))
                     .child(Self::render_option_content(option))
             }))
             .into_any_element()
@@ -1598,25 +1586,6 @@ impl<'a> ElicitationCard<'a> {
                 .element_background
                 .blend(cx.theme().colors().editor_foreground.opacity(0.025))
         }
-    }
-
-    fn option_control_background(cx: &App) -> Hsla {
-        cx.theme().colors().editor_background
-    }
-
-    fn render_radio_indicator(is_selected: bool, border_color: Hsla, background: Hsla) -> Div {
-        div()
-            .size_3()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .border_1()
-            .border_color(border_color)
-            .bg(background)
-            .when(is_selected, |this| {
-                this.child(Indicator::dot().color(Color::Accent))
-            })
     }
 
     fn render_url_elicitation(&self, mode: &acp::ElicitationUrlMode) -> AnyElement {

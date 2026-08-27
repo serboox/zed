@@ -46,7 +46,7 @@ chmod +x "$staging"
 mv -f "$staging" "$installed"
 
 ln -sf "$installed" "$link"
-rm -f "$old_desktop_file"
+rm -f "$old_desktop_file" "$apps_dir/dev.zed.Zed-Dev-Legacy.desktop" "$bin_dir/zed-fast-legacy"
 
 cat > "$desktop_file" <<EOF
 [Desktop Entry]

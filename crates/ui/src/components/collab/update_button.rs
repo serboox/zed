@@ -306,11 +306,18 @@ mod tests {
                 .size_full()
                 .child(UpdateButton::checking())
                 .child(
-                    UpdateButton::downloading(Some(0.5)).tooltip_fn(move |_, cx| {
-                        tooltip_built.set(true);
-                        let rendered = tooltip_rendered.clone();
-                        cx.new(|_| TestTooltip { rendered }).into()
-                    }),
+                    // Wrapped so the test can hover this button by its painted
+                    // bounds. A hardcoded point breaks the moment a control
+                    // height changes, which is not what the test is about.
+                    gpui::div()
+                        .debug_selector(|| "downloading-button".to_string())
+                        .child(
+                            UpdateButton::downloading(Some(0.5)).tooltip_fn(move |_, cx| {
+                                tooltip_built.set(true);
+                                let rendered = tooltip_rendered.clone();
+                                cx.new(|_| TestTooltip { rendered }).into()
+                            }),
+                        ),
                 )
                 .child(UpdateButton::updated("Update to Version: 1.0.0"))
         }
@@ -334,9 +341,25 @@ mod tests {
             }
         });
 
-        cx.simulate_mouse_move(point(px(30.), px(30.)), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
         cx.run_until_parked();
-        cx.simulate_mouse_move(point(px(31.), px(30.)), None, gpui::Modifiers::default());
+        let button = cx
+            .debug_bounds("downloading-button")
+            .expect("the downloading button is painted");
+        // The wrapper stretches across the column, so its centre is empty space:
+        // the button itself hugs the left edge.
+        let over_button = point(button.origin.x + px(10.), button.center().y);
+
+        cx.simulate_mouse_move(over_button, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            point(over_button.x + px(1.), over_button.y),
+            None,
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
 
         cx.executor().advance_clock(Duration::from_millis(600));

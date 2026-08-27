@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use component::{Component, ComponentScope, example_group_with_title, single_example};
-use gpui::{AnyElement, AnyView, ClickEvent, MouseButton, MouseDownEvent, Pixels, Role, px};
+use gpui::{
+    AnyElement, AnyView, BoxShadow, ClickEvent, MouseButton, MouseDownEvent, Pixels, Role, point,
+    px,
+};
 use smallvec::SmallVec;
 
 use crate::{Disclosure, prelude::*};
@@ -315,13 +318,23 @@ impl RenderOnce for ListItem {
                 .when(self.selectable && !self.disabled, |this| {
                     this.hover(|style| style.bg(crate::cyberpunk::row_hovered()))
                         .active(|style| style.bg(crate::cyberpunk::row_pressed()))
-                        .when(self.outlined, |this| this.rounded_sm())
+                        .when(self.outlined, |this| this.rounded(px(6.)))
                         .when(self.selected, |this| {
+                            // Fill plus a 2px rail. Hover uses fill alone, so the
+                            // chosen row stays distinguishable from the row the
+                            // pointer happens to be over.
                             this.bg(crate::cyberpunk::row_chosen())
+                                .shadow(vec![BoxShadow {
+                                    color: crate::cyberpunk::Accent::Cyan.border(),
+                                    offset: point(px(2.), px(0.)),
+                                    blur_radius: px(0.),
+                                    spread_radius: px(0.),
+                                    inset: true,
+                                }])
                         })
                 })
             })
-            .when(self.rounded, |this| this.rounded_sm())
+            .when(self.rounded, |this| this.rounded(px(6.)))
             .when_some(self.on_hover, |this, on_hover| this.on_hover(on_hover))
             .child(
                 h_flex()
@@ -384,7 +397,7 @@ impl RenderOnce for ListItem {
                     .when(self.outlined, |this| {
                         this.border_1()
                             .border_color(cx.theme().colors().border)
-                            .rounded_sm()
+                            .rounded(px(6.))
                             .overflow_hidden()
                     })
                     .when_some(self.on_secondary_mouse_down, |this, on_mouse_down| {
@@ -395,7 +408,7 @@ impl RenderOnce for ListItem {
                     .when_some(self.tooltip, |this, tooltip| this.tooltip(tooltip))
                     .map(|this| {
                         if self.inset {
-                            this.rounded_sm()
+                            this.rounded(px(6.))
                         } else {
                             // When an item is not inset draw the indent spacing inside of the item
                             this.ml(self.indent_level as f32 * self.indent_step_size)

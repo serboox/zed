@@ -8210,3 +8210,91 @@ mod refresh_coalescing_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shipped_defaults_tests {
+    /// Reads the string value of the first `"key": "value"` pair that appears
+    /// after `anchor` in a JSONC asset. Deliberately textual: these files carry
+    /// comments and trailing commas, and the point of the test is what ships.
+    fn value_after(text: &str, anchor: &str, key: &str) -> String {
+        let from = text.find(anchor).unwrap_or_else(|| panic!("no {anchor:?}"));
+        let key_at = text[from..]
+            .find(&format!("\"{key}\":"))
+            .unwrap_or_else(|| panic!("no {key:?} after {anchor:?}"))
+            + from;
+        let rest = &text[key_at + key.len() + 3..];
+        let open = rest.find('"').expect("a quoted value");
+        let close = rest[open + 1..].find('"').expect("a closing quote") + open + 1;
+        rest[open + 1..close].to_string()
+    }
+
+    // One dock should hold surfaces of one kind. The left one is for moving
+    // around your own code, the right one for the conversation about changes.
+    // Four panels of different kinds used to share the right dock, so opening
+    // any of them hid the other three, and ctrl-b did not open files.
+    #[test]
+    fn the_docks_are_grouped_by_what_the_panel_is_for() {
+        let settings = include_str!("../../../assets/settings/default.json");
+
+        assert_eq!(
+            value_after(settings, "\"project_panel\": {", "dock"),
+            "left"
+        );
+        assert_eq!(
+            value_after(settings, "\"outline_panel\": {", "dock"),
+            "left"
+        );
+        assert_eq!(value_after(settings, "\"agent\": {", "dock"), "right");
+        assert_eq!(value_after(settings, "\"git_panel\": {", "dock"), "right");
+    }
+
+    // The menu bar listed eight of the ten dock panels; this fork's API client
+    // and its run configurations window appeared in it zero times, so the only
+    // way to reach them was to already know their name.
+    //
+    // Asserted textually, and from here rather than beside `app_menus`, because
+    // a test inside the `zed` package cannot be executed in this environment:
+    // that package pulls in `html_preview`, which does not compile without its
+    // `servo` feature, and building Servo in the debug profile does not fit on
+    // the builder. The semantic test lives next to the menu itself and is
+    // type-checked by `script/clippy`, which runs with `--all-targets
+    // --all-features`; this one is what actually runs.
+    #[test]
+    fn the_menu_bar_offers_the_forks_own_modules() {
+        let menus = include_str!("../../zed/src/zed/app_menus.rs");
+        for expected in [
+            "\"API Client Panel\"",
+            "\"Run Configurations…\"",
+            "\"Database Panel\"",
+        ] {
+            assert!(
+                menus.contains(expected),
+                "the menu bar must still offer {expected}"
+            );
+        }
+    }
+
+    // Enter used to start a rename, which is the most surprising thing it could
+    // do: everywhere else in the editor Enter acts on what is selected. F2 was
+    // already bound to renaming, so nothing was lost by moving it there.
+    #[test]
+    fn enter_opens_in_the_tree_and_f2_renames() {
+        for keymap in [
+            include_str!("../../../assets/keymaps/default-linux.json"),
+            include_str!("../../../assets/keymaps/default-macos.json"),
+            include_str!("../../../assets/keymaps/default-windows.json"),
+        ] {
+            let anchor = "\"context\": \"ProjectPanel\"";
+            assert_eq!(
+                value_after(keymap, anchor, "enter"),
+                "project_panel::Open",
+                "Enter in the project tree must open what is selected"
+            );
+            assert_eq!(
+                value_after(keymap, anchor, "f2"),
+                "project_panel::Rename",
+                "renaming keeps the key every other editor uses for it"
+            );
+        }
+    }
+}

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::prelude::*;
 use crate::{Color, KeyBinding, Label, LabelSize, StyledExt, cyberpunk, h_flex, v_flex};
-use gpui::{Action, AnyElement, AnyView, AppContext, FocusHandle, IntoElement, Render};
+use gpui::{Action, AnyElement, AnyView, AppContext, FocusHandle, IntoElement, Render, px};
 
 #[derive(RegisterComponent)]
 pub struct Tooltip {
@@ -226,6 +226,10 @@ where
     div().pl_2().pt_2p5().child(
         v_flex()
             .elevation_2(app)
+            // Tier one of the four floating tiers: a tooltip is not interactive
+            // and sits lowest, so it takes a smaller radius than the menus and
+            // popovers that share this elevation.
+            .rounded(px(6.))
             .font(ui_font)
             .text_ui(app)
             .py_1()

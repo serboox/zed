@@ -164,6 +164,9 @@ impl SearchOption {
         })
         .shape(IconButtonShape::Square)
         .toggle_state(active.contains(self.as_options()))
+        // Without this an engaged toggle differs from a disengaged one only by
+        // icon color, which is the same channel hover already uses.
+        .selected_style(ButtonStyle::Filled)
         .tooltip(move |_window, cx| Tooltip::for_action_in(label, action, &focus_handle, cx))
     }
 }

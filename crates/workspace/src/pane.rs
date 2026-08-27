@@ -2849,8 +2849,11 @@ impl Pane {
                 selected: is_active,
                 preview: is_preview,
                 deemphasized: !self.has_focus(window, cx),
-                max_title_len: None,
-                truncate_title_middle: false,
+                // A tab strip that never truncates simply runs off the window,
+                // and the only hint that anything is to the right is a border
+                // that appears once the strip has already scrolled.
+                max_title_len: Some(28),
+                truncate_title_middle: true,
             },
             window,
             cx,
@@ -4983,8 +4986,11 @@ impl Render for DraggedTab {
                 selected: false,
                 preview: false,
                 deemphasized: false,
-                max_title_len: None,
-                truncate_title_middle: false,
+                // A tab strip that never truncates simply runs off the window,
+                // and the only hint that anything is to the right is a border
+                // that appears once the strip has already scrolled.
+                max_title_len: Some(28),
+                truncate_title_middle: true,
             },
             window,
             cx,

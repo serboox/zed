@@ -52,15 +52,17 @@ impl RenderOnce for AnyIcon {
 
 #[derive(Default, PartialEq, Copy, Clone)]
 pub enum IconSize {
-    /// 10px
-    Indicator,
     /// 12px
-    XSmall,
+    Indicator,
     /// 14px
+    XSmall,
+    /// 17px
     Small,
     #[default]
-    /// 16px
+    /// 20px
     Medium,
+    /// 24px
+    Large,
     /// 48px
     XLarge,
     Custom(Rems),
@@ -69,10 +71,15 @@ pub enum IconSize {
 impl IconSize {
     pub fn rems(self) -> Rems {
         match self {
-            IconSize::Indicator => rems_from_px(10.),
-            IconSize::XSmall => rems_from_px(12.),
-            IconSize::Small => rems_from_px(14.),
-            IconSize::Medium => rems_from_px(16.),
+            // The whole scale sits one step up from where it was: 14px was the
+            // "normal" icon and 16 the largest before a jump to 48, which is the
+            // metric of an early-2010s desktop. Raising the steps rather than the
+            // call sites moves every icon in the editor at once.
+            IconSize::Indicator => rems_from_px(12.),
+            IconSize::XSmall => rems_from_px(14.),
+            IconSize::Small => rems_from_px(17.),
+            IconSize::Medium => rems_from_px(20.),
+            IconSize::Large => rems_from_px(24.),
             IconSize::XLarge => rems_from_px(48.),
             IconSize::Custom(size) => size,
         }
@@ -90,6 +97,7 @@ impl IconSize {
             IconSize::XSmall => DynamicSpacing::Base02.px(cx),
             IconSize::Small => DynamicSpacing::Base02.px(cx),
             IconSize::Medium => DynamicSpacing::Base02.px(cx),
+            IconSize::Large => DynamicSpacing::Base04.px(cx),
             IconSize::XLarge => DynamicSpacing::Base02.px(cx),
             // TODO: Wire into dynamic spacing
             IconSize::Custom(size) => size.to_pixels(window.rem_size()),
@@ -337,5 +345,85 @@ impl Component for Icon {
                 )]),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IconSize;
+    use crate::rems_from_px;
+    use gpui::{TestAppContext, px};
+
+    // The scale used to run 10, 12, 14, 16, 48: anything that needed a normal
+    // icon got 14 or 16, and anything larger had to jump straight to 48. Both
+    // problems are fixed at once -- a step was added and the whole scale moved
+    // up, because 14px was the "normal" icon and that is what dated the chrome.
+    #[test]
+    fn the_scale_is_not_stuck_in_the_early_twenty_tens() {
+        assert!(
+            IconSize::Medium.rems().0 >= rems_from_px(20.).0,
+            "the default icon is what most call sites get: {:?}",
+            IconSize::Medium.rems()
+        );
+        assert!(
+            IconSize::Small.rems().0 >= rems_from_px(16.).0,
+            "even the small icon has to stay legible: {:?}",
+            IconSize::Small.rems()
+        );
+        let steps = [
+            IconSize::Indicator.rems().0,
+            IconSize::XSmall.rems().0,
+            IconSize::Small.rems().0,
+            IconSize::Medium.rems().0,
+            IconSize::Large.rems().0,
+            IconSize::XLarge.rems().0,
+        ];
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "the scale has to stay ordered: {steps:?}"
+        );
+    }
+
+    // A square icon button is its icon *plus twice the padding*, so a container
+    // sized by eye at 16px clips it -- and where the parent hides overflow, the
+    // clipped strip takes part of the hitbox with it. That is exactly what
+    // happened to the close button in the system window tabs when the icon scale
+    // moved. Containers have to ask `square()` rather than assume a number.
+    #[gpui::test]
+    async fn a_square_icon_button_no_longer_fits_a_sixteen_pixel_box(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| SizeHost);
+
+        let (extra_small, small) = cx.update(|window, cx| {
+            (
+                IconSize::XSmall.square(window, cx),
+                IconSize::Small.square(window, cx),
+            )
+        });
+
+        assert!(
+            extra_small > px(16.),
+            "an XSmall square button is larger than the 16px boxes that used to hold it: {extra_small:?}"
+        );
+        assert!(
+            small > extra_small,
+            "the squares stay ordered with the icon scale"
+        );
+    }
+
+    struct SizeHost;
+
+    impl gpui::Render for SizeHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
     }
 }

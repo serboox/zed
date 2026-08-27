@@ -1510,10 +1510,33 @@ impl ApiClientPanel {
         .detach();
     }
 
-    fn delete_request(&mut self, id: RequestId, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
-            store.delete_request(id, cx);
-        });
+    fn delete_request(&mut self, id: RequestId, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .store
+            .read(cx)
+            .requests
+            .iter()
+            .find(|request| request.id == id)
+            .map(|request| request.name.clone())
+            .unwrap_or_default();
+        let message = format!("Delete the request \"{name}\"? This cannot be undone.");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &["Cancel", "Delete"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            // Cancel comes first, so deleting is the second button.
+            if answer.await == Ok(1) {
+                store.update(cx, |store, cx| {
+                    store.delete_request(id, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn duplicate_request(&mut self, id: RequestId, cx: &mut Context<Self>) {
@@ -1758,8 +1781,8 @@ impl ApiClientPanel {
                 .separator()
                 .entry("Delete", None, {
                     let panel = panel.clone();
-                    move |_window, cx| {
-                        panel.update(cx, |panel, cx| panel.delete_request(request_id, cx));
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| panel.delete_request(request_id, window, cx));
                     }
                 })
         })
@@ -4110,6 +4133,65 @@ mod tests {
         assert!(
             opened_a_request_tab,
             "clicking a Raw-body request row must open it as a tab instead of crashing"
+        );
+    }
+
+    /// Deleting a collection or a folder with contents has always asked first.
+    /// Deleting a single request used to be one store call with no way back, so
+    /// a mis-aimed context menu silently threw away work.
+    #[gpui::test]
+    async fn deleting_a_request_asks_first_and_cancel_keeps_it(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.delete_request(request_id, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            store.read_with(&cx, |store, _| store
+                .requests
+                .iter()
+                .any(|request| request.id == request_id)),
+            "answering Cancel must leave the request where it was"
+        );
+    }
+
+    #[gpui::test]
+    async fn deleting_a_request_goes_through_once_confirmed(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+        let collection_id = store.update(&mut cx, |store, cx| {
+            store.create_collection("Sample API".into(), cx)
+        });
+        let request_id = store.update(&mut cx, |store, cx| {
+            store.create_request(collection_id, "Get users".into(), None, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.delete_request(request_id, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(
+            !store.read_with(&cx, |store, _| store
+                .requests
+                .iter()
+                .any(|request| request.id == request_id)),
+            "confirming must actually delete the request"
         );
     }
 }

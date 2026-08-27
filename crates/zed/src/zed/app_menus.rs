@@ -2,7 +2,9 @@ use collab_ui::collab_panel;
 use gpui::{App, Menu, MenuItem, OsAction};
 use release_channel::ReleaseChannel;
 use terminal_view::terminal_panel;
-use zed_actions::{Quit, assistant, database_panel, debug_panel, dev, git_panel, project_panel};
+use zed_actions::{
+    Quit, api_client_panel, assistant, database_panel, debug_panel, dev, git_panel, project_panel,
+};
 
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     let mut view_items = vec![
@@ -44,6 +46,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::action("Terminal Panel", terminal_panel::Toggle),
         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),
         MenuItem::action("Database Panel", database_panel::ToggleFocus),
+        MenuItem::action("API Client Panel", api_client_panel::ToggleFocus),
         MenuItem::action("Agent Panel", assistant::ToggleFocus),
         MenuItem::action("Git Panel", git_panel::ToggleFocus),
         MenuItem::separator(),
@@ -263,6 +266,11 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 ),
                 MenuItem::action("Start Debugger", debugger_ui::Start),
                 MenuItem::separator(),
+                MenuItem::action(
+                    "Run Configurations…",
+                    zed_actions::run_configurations::OpenRunConfigurations,
+                ),
+                MenuItem::separator(),
                 MenuItem::action("Edit tasks.json…", zed_actions::OpenProjectTasks),
                 MenuItem::action("Edit debug.json…", zed_actions::OpenProjectDebugTasks),
                 MenuItem::separator(),
@@ -323,4 +331,47 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             ],
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_menus;
+    use gpui::{Menu, MenuItem, TestAppContext};
+
+    fn item_names(menus: &[Menu]) -> Vec<String> {
+        fn walk(items: &[MenuItem], into: &mut Vec<String>) {
+            for item in items {
+                match item {
+                    MenuItem::Action { name, .. } => into.push(name.to_string()),
+                    MenuItem::Submenu(menu) => walk(&menu.items, into),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut names = Vec::new();
+        for menu in menus {
+            walk(&menu.items, &mut names);
+        }
+        names
+    }
+
+    // Half of this fork's own modules had no menu entry at all, so the only way
+    // to reach them was to already know their name in the command palette.
+    #[gpui::test]
+    async fn the_menu_bar_lists_the_forks_panels(cx: &mut TestAppContext) {
+        let names = cx.update(|cx| item_names(&app_menus(cx)));
+
+        for expected in [
+            "Project Panel",
+            "Database Panel",
+            "API Client Panel",
+            "Run Configurations…",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "the menu bar must offer \"{expected}\"; it lists {names:?}"
+            );
+        }
+    }
 }
