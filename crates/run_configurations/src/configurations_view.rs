@@ -569,6 +569,12 @@ impl RunConfigurationsView {
             // Turning the row off by setting should stop the poll right away,
             // not wait for the window to lose and regain focus first.
             cx.observe_global::<settings::SettingsStore>(|view, cx| view.watch_the_run(cx)),
+            // A project is still being scanned while this window opens, and it
+            // keeps changing afterwards: a file with a `main()` added while the
+            // window is up is a way of running that the window has to know about.
+            cx.observe(&project, |view, project, cx| {
+                view.look_for_ways_to_run(&project, cx)
+            }),
         ];
         // The form writes one project's files. When that project's window goes,
         // so does this one -- a form left behind writes to a project nobody has
@@ -681,12 +687,25 @@ impl RunConfigurationsView {
 
     /// Reads the project for the ways it can be started, so the moment of adding
     /// a configuration offers them instead of an empty command field.
-    fn look_for_ways_to_run(&mut self, project: &Entity<project::Project>, cx: &mut Context<Self>) {
-        self.env_files = crate::entry_points::env_files(project, cx);
-        let looking = crate::entry_points::look_through(project, cx);
+    fn look_for_ways_to_run(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        let project = project.clone();
         self._looking = Some(cx.spawn(async move |view, cx| {
+            // The worktree is still being scanned while this window opens, and a
+            // list read before that finishes is a list of nothing. Every later
+            // change to the project comes through here as well, so the same wait
+            // collapses a burst of them into one reading.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let (env_files, looking) = cx.update(|cx| {
+                (
+                    crate::entry_points::env_files(&project, cx),
+                    crate::entry_points::look_through(&project, cx),
+                )
+            });
             let found = looking.await;
             view.update(cx, |view, cx| {
+                view.env_files = env_files;
                 view.found = found;
                 cx.notify();
             })
@@ -4266,6 +4285,11 @@ mod tests {
             workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
             view
         });
+        cx.run_until_parked();
+        // The reading waits for the worktree's own scan to finish before it
+        // starts, which in a test means the clock has to be moved past it.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
         cx.run_until_parked();
 
         let (found, env_files) = view.read_with(cx, |view, _| {
