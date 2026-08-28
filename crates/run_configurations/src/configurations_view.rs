@@ -528,6 +528,11 @@ pub struct RunConfigurationsView {
     /// The files of variables the project holds, offered for the field that
     /// names one.
     env_files: Vec<std::path::PathBuf>,
+    /// Set while a reading is on its way. A project changes constantly -- it is
+    /// scanned, watched, and answered by language servers -- and starting the
+    /// wait again on every one of those changes means a busy project is never
+    /// still long enough to be read at all.
+    looking_now: bool,
     _looking: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -675,6 +680,7 @@ impl RunConfigurationsView {
             remembering_bounds: None,
             found: Vec::new(),
             env_files: Vec::new(),
+            looking_now: false,
             _looking: None,
             _subscriptions: subscriptions,
         };
@@ -688,6 +694,10 @@ impl RunConfigurationsView {
     /// Reads the project for the ways it can be started, so the moment of adding
     /// a configuration offers them instead of an empty command field.
     fn look_for_ways_to_run(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        if self.looking_now {
+            return;
+        }
+        self.looking_now = true;
         let project = project.clone();
         self._looking = Some(cx.spawn(async move |view, cx| {
             // The worktree is still being scanned while this window opens, and a
@@ -697,14 +707,10 @@ impl RunConfigurationsView {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(500))
                 .await;
-            let (env_files, looking) = cx.update(|cx| {
-                (
-                    crate::entry_points::env_files(&project, cx),
-                    crate::entry_points::look_through(&project, cx),
-                )
-            });
-            let found = looking.await;
+            let looking = cx.update(|cx| crate::entry_points::look_through(&project, cx));
+            let (found, env_files) = looking.await;
             view.update(cx, |view, cx| {
+                view.looking_now = false;
                 view.env_files = env_files;
                 view.found = found;
                 cx.notify();
@@ -4330,5 +4336,56 @@ mod tests {
         assert_eq!(command, "go");
         assert_eq!(args, "run\n./cmd/api");
         assert_eq!(cwd, "$ZED_WORKTREE_ROOT");
+    }
+
+    /// A project is never still: it is scanned, watched and answered by language
+    /// servers, and every one of those is a change. Starting the wait again on
+    /// each of them means a real project is never quiet long enough to be read,
+    /// and the window offers nothing however long it is left open.
+    #[gpui::test]
+    async fn a_project_that_keeps_changing_is_still_read(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".zed": { "tasks.json": "[]" },
+                "cmd": { "api": { "main.go": "package main\n\nfunc main() {}\n" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let view = workspace.update_in(cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                RunConfigurationsView::new(
+                    workspace.project().clone(),
+                    workspace.weak_handle(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        // Changes arriving faster than the wait, and never stopping. There is no
+        // quiet spell at the end on purpose: with one, a reading that restarts on
+        // every change would finish during it and the test would pass either way.
+        for _ in 0..20 {
+            project.update(cx, |_, cx| cx.notify());
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .found
+                .iter()
+                .map(|point| point.name.clone())
+                .collect::<Vec<_>>()),
+            vec!["./cmd/api".to_string()],
+            "a project that never stops changing still has to be read"
+        );
     }
 }

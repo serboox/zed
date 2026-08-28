@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use collections::HashMap;
+use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Entity, Task};
 use project::Project;
 
@@ -51,17 +52,20 @@ impl Family {
 /// rather than reading it -- so the cost of reading more buys nothing.
 const AT_MOST: usize = 400;
 
-/// Every way of starting this project that its own files describe.
+/// Everything the project says about how it is started: the ways of running it,
+/// and the files of variables those runs can be given.
 ///
-/// Read from the worktree rather than asked of the reader: a field to type a
+/// Read from the project rather than asked of the reader: a field to type a
 /// package path into is a form, and what the editor can find it should find.
-pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<Vec<EntryPoint>> {
+pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<(Vec<EntryPoint>, Vec<PathBuf>)> {
     let project = project.read(cx);
     let fs = project.fs().clone();
+    let mut roots = Vec::new();
     let mut to_read: Vec<(PathBuf, PathBuf)> = Vec::new();
     for worktree in project.visible_worktrees(cx) {
         let worktree = worktree.read(cx);
         let root = worktree.abs_path().to_path_buf();
+        roots.push(root.clone());
         for entry in worktree.entries(false, 0) {
             if to_read.len() >= AT_MOST {
                 break;
@@ -92,29 +96,28 @@ pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<Vec<EntryPoint>
                 .then_with(|| one.name.cmp(&other.name))
         });
         found.dedup();
-        found
-    })
-}
 
-/// The environment files of the project, for the field that names one. Their
-/// paths alone are the answer, so nothing is read.
-pub fn env_files(project: &Entity<Project>, cx: &App) -> Vec<PathBuf> {
-    let project = project.read(cx);
-    let mut found = Vec::new();
-    for worktree in project.visible_worktrees(cx) {
-        let worktree = worktree.read(cx);
-        for entry in worktree.entries(false, 0) {
-            if found.len() >= AT_MOST {
-                break;
-            }
-            let relative = entry.path.as_std_path();
-            if entry.is_file() && is_env_file(relative) {
-                found.push(relative.to_path_buf());
+        // The files of variables are listed off the disk rather than taken from
+        // the worktree: every one of them begins with a dot, and a hidden entry
+        // is not scanned into the tree until somebody expands the directory
+        // holding it, so a project's `.env` is never there to be found.
+        let mut env = Vec::new();
+        for root in roots {
+            let Ok(mut listed) = fs.read_dir(&root).await else {
+                continue;
+            };
+            while let Some(Ok(path)) = listed.next().await {
+                if is_env_file(&path)
+                    && let Ok(relative) = path.strip_prefix(&root)
+                {
+                    env.push(relative.to_path_buf());
+                }
             }
         }
-    }
-    found.sort();
-    found
+        env.sort();
+        env.dedup();
+        (found, env)
+    })
 }
 
 /// Files the search opens. Everything else in a project is skipped on its name
