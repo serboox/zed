@@ -25,18 +25,24 @@ use zed_actions::editor::{MoveDown, MoveUp};
 use super::build_window_options;
 
 /// How much of the display the launchpad takes when the reader has not placed it
-/// themselves.
-const WIDTH_OF_DISPLAY: f32 = 0.5;
-const HEIGHT_OF_DISPLAY: f32 = 0.55;
+/// themselves. The same share every other window the editor opens takes: a
+/// window that opens small and has to be dragged wider before it can be read is
+/// asking for work before it has done any.
+const WIDTH_OF_DISPLAY: f32 = 0.9;
+const HEIGHT_OF_DISPLAY: f32 = 0.9;
 
-/// The proportions alone are not enough at either extreme: an ultrawide display
-/// would give a launcher over two thousand points across, where a project row
-/// stretches its path halfway across the screen and reads as nothing, and a small
-/// display would give one too cramped to read a path in at all.
+/// A display too small for the proportion to give a readable window still has to
+/// give one, so the size has a floor. It has no ceiling: the window follows the
+/// display however large it is, and what keeps a project row readable across an
+/// ultrawide one is [`CONTENT_MAX_WIDTH`], the column inside it, not a limit on
+/// the window itself.
 const MIN_WIDTH: Pixels = px(700.);
-const MAX_WIDTH: Pixels = px(900.);
 const MIN_HEIGHT: Pixels = px(460.);
-const MAX_HEIGHT: Pixels = px(720.);
+
+/// How wide the column of projects is allowed to grow inside the window. Past
+/// this a name and the path beneath it sit at opposite ends of a line the eye
+/// cannot travel in one go, which is what reading a list of paths asks of it.
+const CONTENT_MAX_WIDTH: Pixels = px(900.);
 
 /// The smallest the window may be made, which is the smallest it is laid out
 /// for: the three ways in sit in one row across the foot of it, and a window
@@ -105,26 +111,20 @@ struct DisplayShape {
     visible: Bounds<Pixels>,
 }
 
-/// Keeps `wanted` within the limits, and within `available` above all: a display
-/// smaller than the lower limit must not be given a window wider than itself,
-/// which would open with its edges off screen.
-fn fit(wanted: Pixels, min: Pixels, max: Pixels, available: Pixels) -> Pixels {
-    wanted.clamp(min, max).min(available)
+/// Keeps `wanted` above the floor, and within `available` above all: a display
+/// smaller than the floor must not be given a window wider than itself, which
+/// would open with its edges off screen.
+fn fit(wanted: Pixels, min: Pixels, available: Pixels) -> Pixels {
+    wanted.max(min).min(available)
 }
 
 /// The size the launchpad opens at on a display with `visible` free.
 fn size_for_display(visible: Size<Pixels>) -> Size<Pixels> {
     size(
-        fit(
-            visible.width * WIDTH_OF_DISPLAY,
-            MIN_WIDTH,
-            MAX_WIDTH,
-            visible.width,
-        ),
+        fit(visible.width * WIDTH_OF_DISPLAY, MIN_WIDTH, visible.width),
         fit(
             visible.height * HEIGHT_OF_DISPLAY,
             MIN_HEIGHT,
-            MAX_HEIGHT,
             visible.height,
         ),
     )
@@ -868,6 +868,11 @@ impl Render for Launchpad {
                         .key_context("Launchpad")
                         .track_focus(&self.focus_handle)
                         .w_full()
+                        // The window follows the display, the column inside it
+                        // does not: past a point a list of paths stops being a
+                        // list and becomes a field to scan across.
+                        .max_w(CONTENT_MAX_WIDTH)
+                        .mx_auto()
                         // The room left over once the title bar above has taken
                         // its own: `size_full` here would ask for the window's
                         // whole height a second time and push this column's last
@@ -985,15 +990,23 @@ mod tests {
     }
 
     #[test]
-    fn test_size_follows_the_display_within_limits() {
+    fn test_it_opens_at_the_size_of_the_display_it_is_on() {
         let sized = size_for_display(visible(2560., 1440.).size);
-        assert_eq!(sized.width, px(1280.).min(MAX_WIDTH));
-        assert_eq!(sized.height, px(1440. * HEIGHT_OF_DISPLAY).min(MAX_HEIGHT));
+        assert_eq!(sized.width, px(2560. * WIDTH_OF_DISPLAY));
+        assert_eq!(sized.height, px(1440. * HEIGHT_OF_DISPLAY));
 
-        // A middling display gets the proportion itself, untouched by either limit.
-        let sized = size_for_display(visible(1600., 1000.).size);
-        assert_eq!(sized.width, px(800.));
-        assert_eq!(sized.height, px(550.));
+        // The point of the proportion, stated as the test that would fail if it
+        // were quietly lowered again: the launchpad opens at the size the reader
+        // would have dragged it to, not at one they have to drag it from.
+        for (width, height) in [(1920., 1080.), (2560., 1440.), (3840., 2160.)] {
+            let display = visible(width, height);
+            let sized = size_for_display(display.size);
+            assert!(
+                sized.width >= display.size.width * 0.8
+                    && sized.height >= display.size.height * 0.8,
+                "{width}x{height} produced {sized:?}, a window the reader has to enlarge"
+            );
+        }
     }
 
     #[test]
@@ -1005,15 +1018,16 @@ mod tests {
                 sized.width <= display.size.width && sized.height <= display.size.height,
                 "{width}x{height} produced {sized:?}, which does not fit the display"
             );
-            assert!(sized.width <= MAX_WIDTH && sized.height <= MAX_HEIGHT);
         }
     }
 
     #[test]
-    fn test_size_stays_inside_the_limits_on_an_ultrawide_display() {
+    fn test_an_ultrawide_display_is_followed_rather_than_capped() {
+        // What keeps a project row readable on a display this wide is the column
+        // inside the window, which is why the window itself needs no ceiling.
         let sized = size_for_display(visible(5120., 1440.).size);
-        assert_eq!(sized.width, MAX_WIDTH);
-        assert!(sized.height <= MAX_HEIGHT);
+        assert_eq!(sized.width, px(5120. * WIDTH_OF_DISPLAY));
+        assert!(CONTENT_MAX_WIDTH < sized.width);
     }
 
     #[test]
@@ -1635,8 +1649,9 @@ mod tests {
             root.size
         );
         assert!(
-            viewport.width <= MAX_WIDTH && viewport.height <= MAX_HEIGHT,
-            "the launchpad window is {viewport:?}, past the limits it should keep to"
+            root.size.width <= CONTENT_MAX_WIDTH,
+            "the launchpad column is {:?} wide, past the width a path reads at",
+            root.size.width
         );
     }
 
