@@ -46,6 +46,36 @@ pub fn why_it_cannot_be_debugged(command: &str) -> Option<&'static str> {
     ))
 }
 
+/// The label with its leading word dropped, underscores turned to spaces, and
+/// lowercased -- "Run" in "Run API" and "Debug" in "Debug API" is the verb, and
+/// what is left is what the label is about.
+///
+/// A one-word label has nothing to drop a verb from, so it is kept whole
+/// instead: dropping its only word would compare every such label as the same
+/// empty subject.
+fn subject(label: &str) -> String {
+    let mut words = label.split_whitespace();
+    words.next();
+    let after_the_verb: String = words.collect::<Vec<_>>().join(" ");
+    let subject = match after_the_verb.is_empty() {
+        true => label.trim(),
+        false => after_the_verb.as_str(),
+    };
+    subject.replace('_', " ").to_lowercase()
+}
+
+/// Whether a task's label and a debug configuration's label are about the same
+/// thing, once the leading verb and the choice between underscores and spaces
+/// are looked past -- a project's tasks and its debug configurations are
+/// written in separate files, and do not always spell a shared name the same
+/// way (`Run industry_ratios_cron` and `Debug industry_ratios cron` are meant
+/// as the same pairing).
+pub fn name_the_same_thing(task_label: &str, debug_label: &str) -> bool {
+    !task_label.trim().is_empty()
+        && !debug_label.trim().is_empty()
+        && subject(task_label) == subject(debug_label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +145,57 @@ mod tests {
         assert!(can_be_derived_from("/opt/homebrew/bin/python3 -m app"));
         assert!(!can_be_derived_from("make python-tests"));
         assert!(!can_be_derived_from("env python app.py"));
+    }
+
+    /// The pairing a wrapper-script project actually relies on: a command an
+    /// automatic locator cannot read anything from is still pairable with a
+    /// debug configuration whose label names the same thing.
+    #[test]
+    fn a_task_pairs_with_the_debug_configuration_named_for_the_same_thing() {
+        assert!(name_the_same_thing("Run API", "Debug API"));
+        assert!(!can_be_derived_from("$HOME/.envs/.zed/with-env"));
+    }
+
+    /// The two files spell a shared name differently -- one keeps the
+    /// underscores throughout, the other breaks the last one into a space --
+    /// and the pairing has to look past that rather than treat them as two
+    /// unrelated things.
+    #[test]
+    fn underscores_and_spaces_do_not_break_the_pairing() {
+        assert!(name_the_same_thing(
+            "Run industry_ratios_cron",
+            "Debug industry_ratios cron"
+        ));
+        assert!(name_the_same_thing(
+            "Run ratios_financials_cron",
+            "Debug ratios_financials cron"
+        ));
+    }
+
+    /// A task with no debug configuration written for it pairs with nothing --
+    /// two labels about different things must not be said to be the same.
+    #[test]
+    fn unrelated_labels_do_not_pair() {
+        assert!(!name_the_same_thing("Run unit tests", "Debug API"));
+        assert!(!name_the_same_thing(
+            "Run tests",
+            "Debug ratios_financials cron"
+        ));
+    }
+
+    /// Neither side has to carry a verb at all: a label that is only the
+    /// subject still pairs with one that names the same subject after its own
+    /// verb is dropped.
+    #[test]
+    fn a_label_with_no_verb_still_pairs() {
+        assert!(name_the_same_thing("API", "Debug API"));
+    }
+
+    /// Two blank labels are not "the same thing" -- an empty subject must
+    /// never be treated as matching another empty subject.
+    #[test]
+    fn blank_labels_never_pair() {
+        assert!(!name_the_same_thing("", ""));
+        assert!(!name_the_same_thing("   ", "Debug API"));
     }
 }

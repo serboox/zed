@@ -6,12 +6,15 @@ use gpui::{
 };
 use platform_title_bar::PlatformTitleBar;
 use project::Project;
+use project::TaskContexts;
 use serde_json::Value;
 use settings::Settings;
-use task::{DebugScenario, TaskTemplate};
+use task::{DebugScenario, TaskContext, TaskTemplate};
 use ui::{ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
-use workspace::{Item, Workspace, client_side_decorations, item::ItemEvent};
+use workspace::{
+    Item, Toast, Workspace, client_side_decorations, item::ItemEvent, notifications::NotificationId,
+};
 
 use crate::configurations_file::{self, Configuration, Kind};
 
@@ -335,6 +338,36 @@ fn what_the_window_is_pulled_by() -> Vec<AnyElement> {
 /// Runs `task` in the workspace, with the project's own variables filled in.
 /// Shared, because the window that offers a configuration for an entry point can
 /// also run it straight away.
+/// The context a configuration written down in the project is resolved against.
+///
+/// The open item's own context is the more specific one -- it knows the file and
+/// the line -- but it says nothing about the project whenever the item is not a
+/// file of it: a request the API client has open, a buffer that was never saved,
+/// this very window. A configuration kept in `.zed` names `$ZED_WORKTREE_ROOT`,
+/// and resolving that against a context without it fails outright, which used to
+/// leave the press doing nothing at all. So the worktree's own variables go in
+/// first and whatever the open item knows is laid over them.
+fn what_to_resolve_against(contexts: &TaskContexts) -> TaskContext {
+    let mut context = contexts
+        .active_worktree_context
+        .as_ref()
+        .map(|(_, worktree)| worktree.clone())
+        .unwrap_or_default();
+    if let Some(active) = contexts.active_context() {
+        context.task_variables.extend(active.task_variables.clone());
+        context.project_env.extend(
+            active
+                .project_env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        if active.cwd.is_some() {
+            context.cwd = active.cwd.clone();
+        }
+    }
+    context
+}
+
 pub async fn run_a_task(
     workspace: &WeakEntity<Workspace>,
     task: TaskTemplate,
@@ -349,7 +382,7 @@ pub async fn run_a_task(
         return;
     };
     let contexts = contexts.await;
-    let context = contexts.active_context().cloned().unwrap_or_default();
+    let context = what_to_resolve_against(&contexts);
     let comes_from = match contexts.worktree() {
         Some(id) => project::TaskSourceKind::Worktree {
             id,
@@ -360,11 +393,38 @@ pub async fn run_a_task(
         },
         None => project::TaskSourceKind::UserInput,
     };
-    workspace
-        .update_in(cx, |workspace, window, cx| {
-            workspace.schedule_task(comes_from, &task, &context, false, window, cx);
-        })
-        .ok();
+    // `schedule_task` would resolve this itself and say nothing at all when the
+    // command or one of its variables cannot be resolved -- which is exactly
+    // what an unavailable `$ZED_WORKTREE_ROOT` or the like does. Resolving here
+    // first means a reader who presses Run and sees nothing happen is told why,
+    // instead of wondering whether the press even landed.
+    match task.resolve_task(&comes_from.to_id_base(), &context) {
+        Some(resolved) => {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.schedule_resolved_task(comes_from, resolved, false, window, cx);
+                })
+                .ok();
+        }
+        None => {
+            let label = task.label;
+            workspace
+                .update_in(cx, |workspace, _window, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<TaskTemplate>(),
+                            format!(
+                                "\"{label}\" could not be run: its command or a variable in \
+                                 it (such as $ZED_WORKTREE_ROOT) could not be resolved for \
+                                 this project."
+                            ),
+                        ),
+                        cx,
+                    );
+                })
+                .ok();
+        }
+    }
 }
 
 /// The offer the editor left behind, taken rather than read: it is answered once,
@@ -395,7 +455,7 @@ pub async fn start_a_debug_session(
     };
     let contexts = contexts.await;
     let worktree = contexts.worktree();
-    let context = contexts.active_context().cloned().unwrap_or_default();
+    let context = what_to_resolve_against(&contexts);
     workspace
         .update_in(cx, |workspace, window, cx| {
             workspace.start_debug_session(scenario, context.into(), None, worktree, window, cx);
@@ -2245,11 +2305,16 @@ impl RunConfigurationsView {
                     ),
             )
             .child(
-                Button::new("configuration-run", "Run")
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                    .disabled(!has_one)
-                    .on_click(cx.listener(|view, _, window, cx| view.run(window, cx))),
+                div()
+                    .id("configuration-run-hit-area")
+                    .debug_selector(|| "configuration-run".to_string())
+                    .child(
+                        Button::new("configuration-run-button", "Run")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .disabled(!has_one)
+                            .on_click(cx.listener(|view, _, window, cx| view.run(window, cx))),
+                    ),
             )
             .into_any_element()
     }
@@ -3928,6 +3993,123 @@ mod tests {
         assert!(
             tasks_after.contains("\"command\": \"true\""),
             "opening the debug file must not have touched the task file:\n{tasks_after}"
+        );
+    }
+
+    /// The window's own Run button used to resolve the task and throw the
+    /// result away in silence whenever a variable in it -- like an
+    /// `$ZED_...` one nothing supplies -- could not be resolved, the same
+    /// silent path the title bar's plaque took. A press that does nothing at
+    /// all reads as the press never having landed; the reader has to be told.
+    #[gpui::test]
+    async fn pressing_run_says_when_the_command_cannot_be_resolved(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "Run API", "command": "$ZED_CUSTOM_UNKNOWN_VARIABLE" }]"#),
+            cx,
+        )
+        .await;
+        show_the_first_configuration(&view, &mut cx);
+
+        let workspace = view
+            .read_with(&cx, |view, _| view.workspace.clone())
+            .upgrade()
+            .expect("the workspace is still open");
+        assert!(
+            workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .is_empty(),
+            "nothing has been said yet"
+        );
+
+        let at = debug_center(&mut cx, "configuration-run");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .is_empty(),
+            "pressing Run on a command that could not be resolved has to say \
+             so -- doing nothing looks exactly like the press never landed"
+        );
+    }
+
+    /// A configuration kept in the project names `$ZED_WORKTREE_ROOT`, and the
+    /// item the reader happens to have open often knows nothing about the
+    /// project -- an unsaved buffer, a request in the API client, this window
+    /// itself. Resolving against that item's context alone fails, and a failed
+    /// resolution is a press that does nothing.
+    #[test]
+    fn a_configuration_of_the_project_resolves_whatever_is_open() {
+        let mut contexts = project::TaskContexts::default();
+
+        let mut what_is_open = task::TaskContext::default();
+        what_is_open
+            .task_variables
+            .insert(task::VariableName::File, "/nowhere/scratch".to_string());
+        contexts.active_item_context = Some((None, None, what_is_open));
+
+        let mut the_project = task::TaskContext::default();
+        the_project.task_variables.insert(
+            task::VariableName::WorktreeRoot,
+            "/projects/thing".to_string(),
+        );
+        contexts.active_worktree_context = Some((project::WorktreeId::from_usize(0), the_project));
+
+        let configuration = TaskTemplate {
+            label: "Run API".to_string(),
+            command: "/bin/echo".to_string(),
+            cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
+            ..TaskTemplate::default()
+        };
+
+        // The control: without this, the test would pass whether or not the
+        // project's variables are filled in, and prove nothing.
+        assert!(
+            configuration
+                .resolve_task(
+                    "test",
+                    &contexts.active_context().cloned().unwrap_or_default()
+                )
+                .is_none(),
+            "the open item alone was expected to be missing the project's root"
+        );
+
+        let resolved = configuration
+            .resolve_task("test", &what_to_resolve_against(&contexts))
+            .expect("a configuration of the project resolves against the project");
+        assert_eq!(
+            resolved.resolved.cwd.as_deref(),
+            Some(std::path::Path::new("/projects/thing"))
+        );
+    }
+
+    /// What the open item knows is the more specific answer and has to win; the
+    /// project only fills in what the item leaves unsaid.
+    #[test]
+    fn what_is_open_wins_over_the_project() {
+        let mut contexts = project::TaskContexts::default();
+
+        let mut what_is_open = task::TaskContext::default();
+        what_is_open.task_variables.insert(
+            task::VariableName::WorktreeRoot,
+            "/projects/the-one-in-front".to_string(),
+        );
+        contexts.active_item_context = Some((None, None, what_is_open));
+
+        let mut the_project = task::TaskContext::default();
+        the_project.task_variables.insert(
+            task::VariableName::WorktreeRoot,
+            "/projects/some-other".to_string(),
+        );
+        contexts.active_worktree_context = Some((project::WorktreeId::from_usize(0), the_project));
+
+        let context = what_to_resolve_against(&contexts);
+        assert_eq!(
+            context
+                .task_variables
+                .get(&task::VariableName::WorktreeRoot),
+            Some("/projects/the-one-in-front")
         );
     }
 }

@@ -131,13 +131,51 @@ impl ConfigurationsToolbar {
 
     /// Why a debugger cannot be derived for this pointing, or `None` when it
     /// can. A debug configuration is already what debugging is, so it always
-    /// can -- there is nothing to derive from it.
+    /// can -- there is nothing to derive from it. Nor can a task the project
+    /// already keeps a matching debug configuration for: the command being
+    /// opaque only means nothing can be derived from it, not that the project
+    /// has nothing to debug it with.
     fn cannot_be_debugged(&self, pointing: &Pointing, cx: &App) -> Option<&'static str> {
         if self.scenario_at(pointing, cx).is_some() {
             return None;
         }
+        if self.matching_debug_scenario(pointing, cx).is_some() {
+            return None;
+        }
         let command = self.task_at(pointing, cx).map(|task| task.command);
         crate::debugging::why_it_cannot_be_debugged(command.as_deref().unwrap_or(""))
+    }
+
+    /// A debug configuration the project keeps whose label names the same
+    /// thing this pointing's task does, for a command no locator can read
+    /// anything from. Tried before giving up on debugging a task: a project
+    /// that already wrote "Debug API" beside "Run API" meant the two to be
+    /// pressed together, not to have the second one refuse.
+    fn matching_debug_scenario(
+        &self,
+        pointing: &Pointing,
+        cx: &App,
+    ) -> Option<task::DebugScenario> {
+        let task = self.task_at(pointing, cx)?;
+        let store = self.store.read(cx);
+        let mut named_for_it =
+            store
+                .of_kind(Kind::Debug)
+                .configurations
+                .iter()
+                .filter(|configuration| {
+                    configuration.scenario.is_some()
+                        && crate::debugging::name_the_same_thing(&task.label, &configuration.label)
+                });
+        let only_one = named_for_it.next()?;
+        // Two configurations named for the same thing leave nothing to choose
+        // between them, and starting whichever the file happens to list first is
+        // a coin toss the reader cannot see. The window that lists them is where
+        // they pick, so this falls through to it.
+        match named_for_it.next() {
+            Some(_) => None,
+            None => only_one.scenario.clone(),
+        }
     }
 
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -164,24 +202,28 @@ impl ConfigurationsToolbar {
     }
 
     fn debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let scenario = match self.pointing.as_ref() {
-            Some(Pointing::Kept { kind, at }) => store
-                .get(*kind, *at)
-                .and_then(|configuration| configuration.scenario.clone()),
-            _ => None,
+        let Some(pointing) = self.pointing.clone() else {
+            window.dispatch_action(
+                Box::new(zed_actions::run_configurations::OpenRunConfigurations),
+                cx,
+            );
+            return;
         };
-        match scenario {
-            Some(scenario) => self.start_debugging(scenario, window, cx),
-            // A task is not a debug configuration; the window that lists them is
-            // where one is written for it, rather than one being conjured here.
-            None => {
-                window.dispatch_action(
-                    Box::new(zed_actions::run_configurations::OpenRunConfigurations),
-                    cx,
-                );
-            }
+        if let Some(scenario) = self.scenario_at(&pointing, cx) {
+            self.start_debugging(scenario, window, cx);
+            return;
         }
+        if let Some(scenario) = self.matching_debug_scenario(&pointing, cx) {
+            self.start_debugging(scenario, window, cx);
+            return;
+        }
+        // Neither a debug configuration of its own, nor one the project keeps
+        // under a matching name; the window that lists them is where one is
+        // written for it, rather than one being conjured here.
+        window.dispatch_action(
+            Box::new(zed_actions::run_configurations::OpenRunConfigurations),
+            cx,
+        );
     }
 
     fn start_debugging(
@@ -289,12 +331,21 @@ impl Render for ConfigurationsToolbar {
             .when(running, |plaque| {
                 plaque
                     .child(
-                        IconButton::new("run-configurations-run", IconName::PlayFilled)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Accent)
-                            .tooltip(Tooltip::text("Run it"))
-                            .on_click(
-                                cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx)),
+                        // Wrapped in its own div, as the debug button below is:
+                        // `IconButton` paints another `IconName::PlayFilled` of
+                        // its own inside the plaque beside it, and a bare
+                        // `ICON-PlayFilled` selector would land on whichever
+                        // one painted last rather than on this button.
+                        div()
+                            .debug_selector(|| "run-configurations-run-button".to_string())
+                            .child(
+                                IconButton::new("run-configurations-run", IconName::PlayFilled)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Accent)
+                                    .tooltip(Tooltip::text("Run it"))
+                                    .on_click(cx.listener(|toolbar, _, window, cx| {
+                                        toolbar.run(window, cx)
+                                    })),
                             ),
                     )
                     .child(
@@ -1365,6 +1416,253 @@ mod tests {
         assert!(
             cx.debug_bounds("HINT-DEBUG").is_none(),
             "but Shift-Enter cannot derive a session for it, so the hint has to be withheld"
+        );
+    }
+
+    /// A bar with the plaque in it, over a project holding both `tasks` and a
+    /// `debug` file -- a pairing between the two can only be seen once both
+    /// are read.
+    async fn a_bar_with_the_plaque_and_debug_file(
+        tasks: &str,
+        debug: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ConfigurationsToolbar>,
+        gpui::WindowHandle<BarWithThePlaque>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".zed": { "tasks.json": tasks, "debug.json": debug } }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let mut workspace_cx = VisualTestContext::from_window(workspace_window.into(), cx);
+        let workspace = workspace_window.root(&mut workspace_cx).unwrap();
+        let toolbar = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
+            cx.new(|cx| ConfigurationsToolbar::new(workspace, cx))
+        });
+        let bar = cx.add_window(|_window, _cx| BarWithThePlaque {
+            toolbar: toolbar.clone(),
+        });
+        let cx = VisualTestContext::from_window(bar.into(), cx);
+        cx.run_until_parked();
+        (toolbar, bar, cx)
+    }
+
+    /// Records every debug scenario it is asked to start, standing in for the
+    /// real debugger subsystem: this crate only has to prove that pressing the
+    /// button reaches `Workspace::start_debug_session` with the right
+    /// configuration, not that a debug adapter actually launches.
+    struct RecordedDebugSession(std::rc::Rc<std::cell::RefCell<Vec<task::DebugScenario>>>);
+
+    impl workspace::DebuggerProvider for RecordedDebugSession {
+        fn start_session(
+            &self,
+            definition: task::DebugScenario,
+            _task_context: task::SharedTaskContext,
+            _active_buffer: Option<Entity<language::Buffer>>,
+            _worktree_id: Option<project::WorktreeId>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+            self.0.borrow_mut().push(definition);
+        }
+
+        fn spawn_task_or_modal(
+            &self,
+            _workspace: &mut Workspace,
+            _action: &zed_actions::Spawn,
+            _window: &mut Window,
+            _cx: &mut Context<Workspace>,
+        ) {
+        }
+
+        fn task_scheduled(&self, _cx: &mut App) {}
+        fn debug_scenario_scheduled(&self, _cx: &mut App) {}
+        fn debug_scenario_scheduled_last(&self, _cx: &App) -> bool {
+            false
+        }
+        fn active_thread_state(
+            &self,
+            _cx: &App,
+        ) -> Option<project::debugger::session::ThreadStatus> {
+            None
+        }
+    }
+
+    /// The reported dead button: a wrapper script no locator can read anything
+    /// from, paired in the project's own files with a debug configuration
+    /// named for the same thing. Before the pairing existed, this command left
+    /// the button disabled and a press could not have reached the debugger at
+    /// all; the fix is proven by the button coming back to life and a real
+    /// press on it starting the paired configuration.
+    #[gpui::test]
+    async fn two_debug_configurations_named_for_the_same_thing_pair_with_neither(
+        cx: &mut TestAppContext,
+    ) {
+        const TASK: &str = r#"[{
+            "label": "Run tests",
+            "command": "$HOME/.envs/.zed/with-env",
+            "args": ["go", "test", "./..."]
+        }]"#;
+        const ONE: &str = r#"[{
+            "label": "Debug tests",
+            "adapter": "Delve",
+            "request": "launch",
+            "mode": "test",
+            "program": "./pkg"
+        }]"#;
+        const TWO: &str = r#"[
+            {
+                "label": "Debug tests",
+                "adapter": "Delve",
+                "request": "launch",
+                "mode": "test",
+                "program": "./pkg"
+            },
+            {
+                "label": "Debug tests",
+                "adapter": "Delve",
+                "request": "launch",
+                "mode": "test",
+                "program": "./cmd"
+            }
+        ]"#;
+        let points_at_the_task = Pointing::Kept {
+            kind: Kind::Task,
+            at: 0,
+        };
+
+        // The control: one configuration named for the same thing is exactly what
+        // the pairing is for, and without this the test would pass even if the
+        // pairing never found anything at all.
+        let (toolbar, _bar, cx_one) = a_bar_with_the_plaque_and_debug_file(TASK, ONE, cx).await;
+        assert!(
+            toolbar
+                .read_with(&cx_one, |toolbar, cx| toolbar
+                    .matching_debug_scenario(&points_at_the_task, cx))
+                .is_some(),
+            "one configuration named for the same thing is what a task pairs with"
+        );
+
+        let (toolbar, _bar, cx_two) = a_bar_with_the_plaque_and_debug_file(TASK, TWO, cx).await;
+        assert!(
+            toolbar
+                .read_with(&cx_two, |toolbar, cx| toolbar
+                    .matching_debug_scenario(&points_at_the_task, cx))
+                .is_none(),
+            "with two configurations named for the same thing there is nothing to \
+             choose between them, so pressing Debug must not start a coin toss"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_matching_debug_configuration_makes_the_button_work(cx: &mut TestAppContext) {
+        let (toolbar, _bar, mut cx) = a_bar_with_the_plaque_and_debug_file(
+            r#"[{
+                "label": "Run API",
+                "command": "$HOME/.envs/.zed/with-env",
+                "args": ["go", "run", "./cmd/api"]
+            }]"#,
+            r#"[{
+                "label": "Debug API",
+                "adapter": "Delve",
+                "request": "launch",
+                "mode": "debug",
+                "program": "./cmd/api"
+            }]"#,
+            cx,
+        )
+        .await;
+
+        assert!(
+            !crate::debugging::can_be_derived_from("$HOME/.envs/.zed/with-env"),
+            "no locator reads anything from the wrapper script -- the pairing is \
+             the only thing that can enable the button"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-debug-enabled")
+                .is_some(),
+            "a debug configuration named for the same thing has to enable the \
+             button that an opaque command alone would leave disabled"
+        );
+
+        let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let workspace = toolbar
+            .read_with(&cx, |toolbar, _| toolbar.workspace.clone())
+            .upgrade()
+            .expect("the workspace is still open");
+        workspace.update_in(&mut cx, |workspace, _window, _cx| {
+            workspace.set_debugger_provider(RecordedDebugSession(recorded.clone()));
+        });
+
+        let debug_button = cx
+            .debug_bounds("run-configurations-debug-enabled")
+            .expect("the debug button is painted");
+        let windows_before = cx.update(|_, cx| cx.windows().len());
+        cx.simulate_click(debug_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let started: Vec<String> = recorded
+            .borrow()
+            .iter()
+            .map(|scenario| scenario.label.to_string())
+            .collect();
+        assert_eq!(
+            started,
+            vec!["Debug API".to_string()],
+            "pressing the button had to start the debug configuration the \
+             project keeps under the matching name, not merely allow the press"
+        );
+        assert_eq!(
+            cx.update(|_, cx| cx.windows().len()),
+            windows_before,
+            "the fallback that opens the configurations window must not fire \
+             once a matching debug configuration was found"
+        );
+    }
+
+    /// The other dead button: pressing Run used to resolve the task and throw
+    /// the result away in silence whenever a variable in it -- like an
+    /// `$ZED_...` one nothing supplies -- could not be resolved. A press that
+    /// does nothing at all is indistinguishable from one that never landed;
+    /// the reader has to be told.
+    #[gpui::test]
+    async fn pressing_run_says_when_the_command_cannot_be_resolved(cx: &mut TestAppContext) {
+        let (toolbar, _bar, mut cx) = a_bar_with_the_plaque(
+            r#"[{ "label": "Run API", "command": "$ZED_CUSTOM_UNKNOWN_VARIABLE" }]"#,
+            cx,
+        )
+        .await;
+
+        let workspace = toolbar
+            .read_with(&cx, |toolbar, _| toolbar.workspace.clone())
+            .upgrade()
+            .expect("the workspace is still open");
+        assert!(
+            workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .is_empty(),
+            "nothing has been said yet"
+        );
+
+        let run_button = cx
+            .debug_bounds("run-configurations-run-button")
+            .expect("the run button is painted");
+        cx.simulate_click(run_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace
+                .read_with(&cx, |workspace, _| workspace.notification_ids())
+                .is_empty(),
+            "pressing Run on a command that could not be resolved has to say \
+             so -- doing nothing looks exactly like the press never landed"
         );
     }
 }
