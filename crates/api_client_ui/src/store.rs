@@ -9,6 +9,7 @@ use credentials_provider::CredentialsProvider;
 use gpui::{App, AsyncApp, Context, Entity, EventEmitter, Global};
 use serde::{Deserialize, Serialize};
 use util::ResultExt;
+use uuid::Uuid;
 
 const COLLECTIONS_FILE: &str = "api_collections.json";
 const ENVIRONMENTS_FILE: &str = "api_environments.json";
@@ -286,6 +287,26 @@ pub enum RelativePosition {
     After,
 }
 
+/// The full request/response exchange behind one `HistoryEntry`. Kept only
+/// in memory for the life of the running app -- `HistoryEntry` itself is
+/// small enough to persist to disk and survive a restart, but headers,
+/// bodies and the environment used are not worth writing to disk on every
+/// send. Looked up by `HistoryEntry::id`, never by position in `history`,
+/// since that position shifts as new entries arrive and old ones are
+/// evicted.
+#[derive(Debug, Clone)]
+pub struct HistoryExchangeDetail {
+    pub request: api_client::ResolvedRequest,
+    pub outcome: HistoryExchangeOutcome,
+    pub environment_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum HistoryExchangeOutcome {
+    Success(crate::response_view::ResponseData),
+    Error(String),
+}
+
 pub struct ApiClientStore {
     pub collections: Vec<Collection>,
     pub tree_order: TreeOrder,
@@ -295,6 +316,11 @@ pub struct ApiClientStore {
     pub global_environment: Environment,
     pub active_environment_id: Option<EnvironmentId>,
     pub history: Vec<HistoryEntry>,
+    /// Session-only detail for entries still recent enough to have one --
+    /// see `HistoryExchangeDetail`. Kept in step with `history` by
+    /// `record_history_entry`/`clear_history` rather than growing without
+    /// bound.
+    pub history_details: std::collections::HashMap<Uuid, HistoryExchangeDetail>,
     pub http_client: reqwest::Client,
 }
 
@@ -354,6 +380,7 @@ impl ApiClientStore {
             global_environment: Environment::global(),
             active_environment_id: None,
             history: Vec::new(),
+            history_details: std::collections::HashMap::new(),
             http_client: reqwest::Client::new(),
         }
     }
@@ -1298,17 +1325,40 @@ impl ApiClientStore {
     }
 
     /// Appends a history entry and evicts the oldest ones past
-    /// `MAX_HISTORY_ENTRIES`, newest-first in `self.history`.
+    /// `MAX_HISTORY_ENTRIES`, newest-first in `self.history`. Any
+    /// `history_details` entry whose owning `HistoryEntry` was just evicted
+    /// is dropped along with it, so the detail map never outlives the entry
+    /// it belongs to.
     pub fn record_history_entry(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
         self.history.insert(0, entry);
         self.history.truncate(MAX_HISTORY_ENTRIES);
+        let live_ids: std::collections::HashSet<Uuid> =
+            self.history.iter().map(|entry| entry.id).collect();
+        self.history_details.retain(|id, _| live_ids.contains(id));
         cx.emit(ApiClientStoreEvent::HistoryChanged);
         cx.notify();
         self.persist_history(cx);
     }
 
+    /// Records the full request/response detail behind a history entry --
+    /// see `HistoryExchangeDetail`. Called alongside `record_history_entry`
+    /// for the entry it belongs to; a stale or unknown `entry_id` is simply
+    /// never looked up, so there is nothing to guard against here.
+    pub fn record_history_detail(&mut self, entry_id: Uuid, detail: HistoryExchangeDetail) {
+        self.history_details.insert(entry_id, detail);
+    }
+
+    /// The full exchange behind a history entry, if it is still recent
+    /// enough to have one -- `None` both for an entry that predates this
+    /// session (loaded from disk without detail) and for one evicted past
+    /// `MAX_HISTORY_ENTRIES`.
+    pub fn history_detail(&self, entry_id: Uuid) -> Option<&HistoryExchangeDetail> {
+        self.history_details.get(&entry_id)
+    }
+
     pub fn clear_history(&mut self, cx: &mut Context<Self>) {
         self.history.clear();
+        self.history_details.clear();
         cx.emit(ApiClientStoreEvent::HistoryChanged);
         cx.notify();
         self.persist_history(cx);

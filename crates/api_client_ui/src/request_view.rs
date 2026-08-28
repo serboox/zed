@@ -5,7 +5,7 @@ use crate::response_dock::{
     reveal_response_tab,
 };
 use crate::response_view::{ResponseData, ResponseTab, SendState};
-use crate::store::ApiClientStore;
+use crate::store::{ApiClientStore, HistoryExchangeDetail, HistoryExchangeOutcome};
 use crate::text_prompt_modal::TextPromptModal;
 use api_client::{
     ApiKeyPlacement, AuthConfig, AwsSigV4Config, DYNAMIC_VARIABLE_NAMES, EnvironmentId, Header,
@@ -2484,13 +2484,17 @@ impl RequestView {
                 }
             }
 
-            let resolved = store.update(cx, |store, _| {
+            let (resolved, environment_name) = store.update(cx, |store, _| {
                 let context = store.variable_context_for(&request);
                 let dynamic = SystemDynamicVariableSource;
                 let resolve = |text: &str| {
                     api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
                 };
-                api_client::build_resolved_request(&request, &resolve)
+                let resolved = api_client::build_resolved_request(&request, &resolve);
+                let environment_name = store
+                    .effective_environment_for(&request)
+                    .map(|environment| environment.name.clone());
+                (resolved, environment_name)
             });
 
             let sent_at_unix_ms = std::time::SystemTime::now()
@@ -2502,6 +2506,10 @@ impl RequestView {
                 Ok(summary) => {
                     let status = summary.status;
                     let response = ResponseData::from_summary(summary);
+                    // Cloned before `apply_response` takes ownership of `response`
+                    // below -- the history detail needs its own copy of the same
+                    // response that just went on screen.
+                    let response_for_history = response.clone();
 
                     if request.test_script.trim().is_empty() {
                         this.update_in(cx, |this, window, cx| {
@@ -2564,20 +2572,27 @@ impl RequestView {
                     }
 
                     store.update(cx, |store, cx| {
-                        store.record_history_entry(
-                            HistoryEntry::new(
-                                request_id,
-                                resolved.method.clone(),
-                                resolved.url.clone(),
-                                Some(status),
-                                sent_at_unix_ms,
-                            ),
-                            cx,
+                        let entry = HistoryEntry::new(
+                            request_id,
+                            resolved.method.clone(),
+                            resolved.url.clone(),
+                            Some(status),
+                            sent_at_unix_ms,
                         );
+                        store.record_history_detail(
+                            entry.id,
+                            HistoryExchangeDetail {
+                                request: resolved,
+                                outcome: HistoryExchangeOutcome::Success(response_for_history),
+                                environment_name,
+                            },
+                        );
+                        store.record_history_entry(entry, cx);
                     });
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    let message_for_history = message.clone();
                     this.update_in(cx, |this, window, cx| {
                         this.send_state = SendState::Error(message.clone());
                         this.route_error_to_dock(message, window, cx);
@@ -2585,16 +2600,22 @@ impl RequestView {
                     })
                     .ok();
                     store.update(cx, |store, cx| {
-                        store.record_history_entry(
-                            HistoryEntry::new(
-                                request_id,
-                                resolved.method.clone(),
-                                resolved.url.clone(),
-                                None,
-                                sent_at_unix_ms,
-                            ),
-                            cx,
+                        let entry = HistoryEntry::new(
+                            request_id,
+                            resolved.method.clone(),
+                            resolved.url.clone(),
+                            None,
+                            sent_at_unix_ms,
                         );
+                        store.record_history_detail(
+                            entry.id,
+                            HistoryExchangeDetail {
+                                request: resolved,
+                                outcome: HistoryExchangeOutcome::Error(message_for_history),
+                                environment_name,
+                            },
+                        );
+                        store.record_history_entry(entry, cx);
                     });
                 }
             }
