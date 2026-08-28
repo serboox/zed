@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 
-use gpui::{AnyElement, IntoElement, Stateful};
+use gpui::{
+    AnyElement, Bounds, Hsla, IntoElement, PathBuilder, Size, Stateful, canvas, point, size,
+};
 use smallvec::SmallVec;
 
 use crate::prelude::*;
@@ -31,6 +33,7 @@ pub enum TabCloseSide {
 
 #[derive(IntoElement, RegisterComponent)]
 pub struct Tab {
+    id: ElementId,
     div: Stateful<Div>,
     selected: bool,
     position: TabPosition,
@@ -45,6 +48,7 @@ impl Tab {
     pub fn new(id: impl Into<ElementId>) -> Self {
         let id = id.into();
         Self {
+            id: id.clone(),
             div: div()
                 .id(id.clone())
                 .debug_selector(|| format!("TAB-{}", id)),
@@ -97,10 +101,18 @@ impl Tab {
         DynamicSpacing::Base32.px(cx) + px(8.)
     }
 
-    /// The gutter above a tab, and the radius of both its top corners and of the
-    /// flare where it meets the strip.
+    /// The gutter above a tab. Above it there is strip to see; below it there is
+    /// none, because the selected tab has to reach the strip's bottom edge.
     pub fn shoulder() -> Pixels {
         px(6.)
+    }
+
+    /// The radius of the tab's two top corners and of the two feet it stands on
+    /// where it meets the strip. One number for both: the silhouette reads as a
+    /// single swept shape only when the outward turn at the top and the inward
+    /// turn at the bottom are the same size.
+    pub fn corner() -> Pixels {
+        px(10.)
     }
 
     /// Height of one tab: the strip minus the gutter above it, so its bottom
@@ -168,13 +180,12 @@ impl RenderOnce for Tab {
             }
         };
 
-        // A tab is a card, not a cell in a table. The old shape -- flush
-        // rectangles telling each other apart by which of their four 1px borders
-        // was drawn, and by a one-pixel nudge of their padding -- is the single
-        // most dating thing about an editor's face. Position no longer changes
-        // the shape at all: the selected tab is the one that is filled and
-        // raised, and the accent rail on top says which document you are in from
-        // across the room.
+        // The selected tab and the surface under it are one piece of material,
+        // the way a browser draws them: the same fill, only the top corners
+        // rounded, nothing along the bottom to separate them, and two concave
+        // feet where the sides meet the strip so the join reads as a
+        // continuation rather than a card resting on top. That shape cannot be
+        // made of boxes, so it is drawn as one path.
         let selected = self.selected;
         let card_border = cx.theme().colors().border;
         let card_height = Tab::card_height(cx);
@@ -182,77 +193,56 @@ impl RenderOnce for Tab {
         let content_px = DynamicSpacing::Base04.px(cx);
         let content_gap = DynamicSpacing::Base04.rems(cx);
         let shoulder = Tab::shoulder();
-        let strip_bg = cx.theme().colors().tab_bar_background;
-
-        // The selected tab and the buffer under it are one surface, the way a
-        // browser draws them: the fill is the same colour as the editor, only the
-        // top corners are rounded, nothing separates them along the bottom, and
-        // the tab flares outward where it meets the strip so the join reads as a
-        // physical continuation rather than a card resting on top.
-        let flare = |on_left: bool| {
-            div()
-                .absolute()
-                .bottom_0()
-                .w(shoulder)
-                .h(shoulder)
-                .bg(tab_bg)
-                .map(|this| {
-                    if on_left {
-                        this.left(-shoulder)
-                    } else {
-                        this.right(-shoulder)
-                    }
-                })
-                .child(
-                    // A disc of the strip's own colour, centred on the flare's
-                    // outer top corner, carves the concave quarter out of it.
-                    div()
-                        .absolute()
-                        .top(-shoulder)
-                        .w(shoulder * 2.)
-                        .h(shoulder * 2.)
-                        .rounded_full()
-                        .bg(strip_bg)
-                        .map(|this| {
-                            if on_left {
-                                this.left(-shoulder)
-                            } else {
-                                this.left(px(0.))
-                            }
-                        }),
-                )
-        };
+        let corner = Tab::corner();
+        let face_of = self.id.clone();
 
         self.div
+            .relative()
             .h(card_height)
             .mt(shoulder)
-            .mx(px(2.))
+            // Room on both sides for the feet, so the selected tab never plants
+            // one on the tab beside it.
+            .mx(corner)
             // The strip gets a real inset at its ends rather than a tab flush
             // against the window edge.
             .map(|this| match self.position {
-                TabPosition::First => this.ml(shoulder),
-                TabPosition::Last => this.mr(shoulder),
+                TabPosition::First => this.ml(corner + shoulder),
+                TabPosition::Last => this.mr(corner + shoulder),
                 TabPosition::Middle(_) => this,
             })
-            .rounded_t(px(10.))
-            .relative()
-            .bg(if selected {
-                tab_bg
-            } else {
-                gpui::transparent_black()
+            .rounded_t(corner)
+            // The selected tab answers to no hover: it is the surface you are
+            // already on, and lighting it under the pointer would say it is
+            // something to move to.
+            .when(!selected, move |this| {
+                this.hover(move |style| style.bg(tab_hover_bg))
+                    .active(move |style| style.bg(tab_active_bg))
             })
-            .hover(move |style| style.bg(tab_hover_bg))
-            .active(move |style| style.bg(tab_active_bg))
             .when(selected, move |this| {
-                // Border on three sides only. A line along the bottom is exactly
-                // what would say "this is a separate box", and a shadow would say
-                // it floats -- both are the opposite of what the shape is for.
-                this.border_t_1()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(card_border)
-                    .child(flare(true))
-                    .child(flare(false))
+                this.child(
+                    div()
+                        .debug_selector(move || format!("TAB-FACE-{face_of}"))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(-corner)
+                        .right(-corner)
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    paint_tab_silhouette(
+                                        bounds,
+                                        corner,
+                                        tab_bg,
+                                        card_border,
+                                        window,
+                                    );
+                                },
+                            )
+                            .size_full(),
+                        ),
+                )
             })
             .cursor_pointer()
             .child(
@@ -267,6 +257,96 @@ impl RenderOnce for Tab {
                     .children(self.children)
                     .child(end_slot),
             )
+    }
+}
+
+/// Draws the selected tab: a face with two rounded top corners that flares out
+/// at the bottom into two concave feet. `bounds` is the tab's own box widened by
+/// one foot on either side, and the shape is left open along the bottom so the
+/// tab and the surface beneath it share an edge instead of having one drawn
+/// between them.
+/// The largest corner a box of this size has room for. A tab narrower than four
+/// corners, or shorter than two, has none for the shape asked of it, and a path
+/// drawn to the full radius there folds through itself rather than coming out
+/// small. Panels are laid out at no width at all while they settle, so this is
+/// reached in ordinary use, not only at the extremes.
+fn corner_that_fits(size: Size<Pixels>, wanted: Pixels) -> Pixels {
+    wanted.min(size.width / 4.).min(size.height / 2.)
+}
+
+fn paint_tab_silhouette(
+    bounds: Bounds<Pixels>,
+    corner: Pixels,
+    fill: Hsla,
+    border: Hsla,
+    window: &mut Window,
+) {
+    // Where a quarter circle's Bezier handles sit along the tangents. A rounder
+    // number leaves a flat spot where each turn meets the straight beside it,
+    // which is exactly what the eye reads as "drawn by hand".
+    const HANDLE: f32 = 0.552_284_75;
+
+    // Returns whether there was room to draw at all. Each path is measured
+    // against its own box rather than against the tab's: the edge is drawn half
+    // a pixel in, so a radius that just fits the face leaves the edge's straight
+    // runs a pixel short and folds the path back through itself.
+    let outline = |builder: &mut PathBuilder, inset: Pixels| {
+        let left = bounds.origin.x + inset;
+        let top = bounds.origin.y + inset;
+        let right = bounds.right() - inset;
+        let bottom = bounds.bottom();
+        let corner = corner_that_fits(size(right - left, bottom - top), corner);
+        if corner <= px(0.) {
+            return false;
+        }
+        let handle = corner * HANDLE;
+        let face_left = left + corner;
+        let face_right = right - corner;
+
+        builder.move_to(point(left, bottom));
+        builder.cubic_bezier_to(
+            point(face_left, bottom - corner),
+            point(left + handle, bottom),
+            point(face_left, bottom - corner + handle),
+        );
+        builder.line_to(point(face_left, top + corner));
+        builder.cubic_bezier_to(
+            point(face_left + corner, top),
+            point(face_left, top + corner - handle),
+            point(face_left + corner - handle, top),
+        );
+        builder.line_to(point(face_right - corner, top));
+        builder.cubic_bezier_to(
+            point(face_right, top + corner),
+            point(face_right - corner + handle, top),
+            point(face_right, top + corner - handle),
+        );
+        builder.line_to(point(face_right, bottom - corner));
+        builder.cubic_bezier_to(
+            point(right, bottom),
+            point(face_right, bottom - corner + handle),
+            point(right - handle, bottom),
+        );
+        true
+    };
+
+    let mut face = PathBuilder::fill();
+    if outline(&mut face, px(0.)) {
+        face.close();
+        match face.build() {
+            Ok(face) => window.paint_path(face, fill),
+            Err(error) => log::warn!("the tab's face could not be drawn: {error}"),
+        }
+    }
+
+    // Half a pixel in, so the line lands inside the fill rather than half of it
+    // on the strip above and half on the editor below.
+    let mut edge = PathBuilder::stroke(px(1.));
+    if outline(&mut edge, px(0.5)) {
+        match edge.build() {
+            Ok(edge) => window.paint_path(edge, border),
+            Err(error) => log::warn!("the tab's edge could not be drawn: {error}"),
+        }
     }
 }
 
@@ -321,5 +401,126 @@ impl Component for Tab {
                 ],
             )])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Context, IntoElement, Render, TestAppContext, Window, px, size};
+
+    use super::corner_that_fits;
+    use crate::{Tab, TabBar, TabPosition, prelude::*};
+
+    struct StripHost;
+
+    impl Render for StripHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            TabBar::new("strip")
+                .child(
+                    Tab::new("resting")
+                        .position(TabPosition::First)
+                        .child("resting"),
+                )
+                .child(
+                    Tab::new("chosen")
+                        .position(TabPosition::Last)
+                        .toggle_state(true)
+                        .child("chosen"),
+                )
+        }
+    }
+
+    fn same(left: Pixels, right: Pixels) -> bool {
+        (f32::from(left) - f32::from(right)).abs() < 0.5
+    }
+
+    fn draw_a_strip(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| StripHost);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    // What the reader sees as one piece of material rather than a card resting
+    // on a shelf: the chosen tab reaches the strip's bottom edge, and its shape
+    // widens by one foot on each side to get there. Measured on the painted
+    // boxes, because the seam this replaces was a matter of pixels and not of
+    // state.
+    #[gpui::test]
+    async fn the_chosen_tab_flares_into_the_surface_below_it(cx: &mut TestAppContext) {
+        let cx = draw_a_strip(cx);
+
+        let tab = cx.debug_bounds("TAB-chosen").expect("the tab is painted");
+        let face = cx
+            .debug_bounds("TAB-FACE-chosen")
+            .expect("the chosen tab is drawn as a shape");
+        let strip = cx
+            .debug_bounds("TAB-BAR-strip")
+            .expect("the strip is painted");
+        let corner = Tab::corner();
+
+        assert!(
+            same(face.left(), tab.left() - corner) && same(face.right(), tab.right() + corner),
+            "the shape spans {:?}..{:?} around a tab of {:?}..{:?}, so it has no feet",
+            face.left(),
+            face.right(),
+            tab.left(),
+            tab.right()
+        );
+        assert!(
+            same(face.bottom(), tab.bottom()) && same(tab.bottom(), strip.bottom()),
+            "the tab ends at {:?} and the strip at {:?}: a seam the reader would see",
+            tab.bottom(),
+            strip.bottom()
+        );
+    }
+
+    // A foot that landed on the tab beside it would be painted over by that
+    // tab's own hover fill, and the join would come apart under the pointer.
+    #[gpui::test]
+    async fn a_foot_never_lands_on_the_tab_beside_it(cx: &mut TestAppContext) {
+        let cx = draw_a_strip(cx);
+
+        let resting = cx.debug_bounds("TAB-resting").expect("the tab is painted");
+        let face = cx
+            .debug_bounds("TAB-FACE-chosen")
+            .expect("the chosen tab is drawn as a shape");
+
+        assert!(
+            face.left() >= resting.right(),
+            "the shape starts at {:?}, inside the tab that ends at {:?}",
+            face.left(),
+            resting.right()
+        );
+    }
+
+    #[gpui::test]
+    async fn a_resting_tab_is_no_shape_at_all(cx: &mut TestAppContext) {
+        let cx = draw_a_strip(cx);
+
+        assert!(
+            cx.debug_bounds("TAB-FACE-resting").is_none(),
+            "a tab that is not the chosen one drew itself a shape"
+        );
+    }
+
+    #[test]
+    fn a_box_with_no_room_gets_the_corner_it_has_room_for() {
+        let wanted = px(10.);
+        assert_eq!(corner_that_fits(size(px(200.), px(34.)), wanted), wanted);
+        // Half the height, a quarter of the width: past either the path would
+        // fold through itself.
+        assert_eq!(corner_that_fits(size(px(200.), px(10.)), wanted), px(5.));
+        assert_eq!(corner_that_fits(size(px(12.), px(34.)), wanted), px(3.));
+        assert_eq!(corner_that_fits(size(px(0.), px(0.)), wanted), px(0.));
     }
 }

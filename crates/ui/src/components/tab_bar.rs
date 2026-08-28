@@ -91,8 +91,10 @@ impl ParentElement for TabBar {
 
 impl RenderOnce for TabBar {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let strip = self.id.clone();
         div()
             .id(self.id)
+            .debug_selector(move || format!("TAB-BAR-{strip}"))
             .group("tab_bar")
             .flex()
             .flex_none()
