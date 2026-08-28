@@ -84,7 +84,7 @@ pub fn template_of(command: &str) -> Option<&'static Template> {
 }
 
 /// What an entry point is run with.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HowToRun {
     pub command: String,
     pub args: Vec<String>,

@@ -522,6 +522,13 @@ pub struct RunConfigurationsView {
     title_bar: Option<Entity<PlatformTitleBar>>,
     /// A drag delivers a bounds change a frame; the last one is what is kept.
     remembering_bounds: Option<gpui::Task<()>>,
+    /// The ways of starting this project that its own files describe, offered
+    /// when a configuration is added so there is nothing to type.
+    found: Vec<crate::entry_points::EntryPoint>,
+    /// The files of variables the project holds, offered for the field that
+    /// names one.
+    env_files: Vec<std::path::PathBuf>,
+    _looking: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -660,12 +667,56 @@ impl RunConfigurationsView {
             title_bar: (!cfg!(target_os = "macos"))
                 .then(|| cx.new(|cx| PlatformTitleBar::new("run-configurations-title-bar", cx))),
             remembering_bounds: None,
+            found: Vec::new(),
+            env_files: Vec::new(),
+            _looking: None,
             _subscriptions: subscriptions,
         };
+        view.look_for_ways_to_run(&project, cx);
         // Watching starts with the view: a run that is already going should be
         // reported the moment this is opened, not a second after somebody clicks.
         view.watch_the_run(cx);
         view
+    }
+
+    /// Reads the project for the ways it can be started, so the moment of adding
+    /// a configuration offers them instead of an empty command field.
+    fn look_for_ways_to_run(&mut self, project: &Entity<project::Project>, cx: &mut Context<Self>) {
+        self.env_files = crate::entry_points::env_files(project, cx);
+        let looking = crate::entry_points::look_through(project, cx);
+        self._looking = Some(cx.spawn(async move |view, cx| {
+            let found = looking.await;
+            view.update(cx, |view, cx| {
+                view.found = found;
+                cx.notify();
+            })
+            .log_err();
+        }));
+    }
+
+    /// Fills the form in from one of the ways the project describes: the command
+    /// whole, with its arguments and the directory it runs in.
+    fn fill_in_from_way(
+        &mut self,
+        point: &crate::entry_points::EntryPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.label.update(cx, |editor, cx| {
+            editor.set_text(format!("Run {}", point.name), window, cx)
+        });
+        self.command.update(cx, |editor, cx| {
+            editor.set_text(point.how.command.clone(), window, cx)
+        });
+        self.args.update(cx, |editor, cx| {
+            editor.set_text(point.how.args.join("\n"), window, cx)
+        });
+        if let Some(cwd) = point.how.cwd.clone() {
+            self.cwd
+                .update(cx, |editor, cx| editor.set_text(cwd, window, cx));
+        }
+        self.edited = true;
+        cx.notify();
     }
 
     fn remember_where_it_was_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2063,14 +2114,57 @@ impl RunConfigurationsView {
                                 &self.env_file,
                                 false,
                             )))
-                            .child(
-                                Button::new("env-file-find", "…")
-                                    .label_size(LabelSize::Small)
-                                    .tooltip(Tooltip::text("Find the file"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.find_the_env_file(window, cx)
-                                    })),
-                            ),
+                            .child({
+                                let view = cx.entity();
+                                PopoverMenu::new("env-file-offer")
+                                    .trigger(
+                                        Button::new("env-file-find", "…")
+                                            .label_size(LabelSize::Small)
+                                            .tooltip(Tooltip::text("Pick the file of variables")),
+                                    )
+                                    .menu(move |window, cx| {
+                                        let view = view.clone();
+                                        let offered = view.read(cx).env_files.clone();
+                                        Some(ContextMenu::build(
+                                            window,
+                                            cx,
+                                            move |mut menu, _, _| {
+                                                for path in offered {
+                                                    let said = path.to_string_lossy().into_owned();
+                                                    let view = view.clone();
+                                                    menu = menu.entry(
+                                                        SharedString::from(said.clone()),
+                                                        None,
+                                                        move |window, cx| {
+                                                            let said = said.clone();
+                                                            view.update(cx, |view, cx| {
+                                                                view.env_file.update(
+                                                                    cx,
+                                                                    |editor, cx| {
+                                                                        editor.set_text(
+                                                                            said, window, cx,
+                                                                        )
+                                                                    },
+                                                                );
+                                                                view.edited = true;
+                                                                cx.notify();
+                                                            });
+                                                        },
+                                                    );
+                                                }
+                                                menu.separator().entry(
+                                                    "Choose a file…",
+                                                    None,
+                                                    move |window, cx| {
+                                                        view.update(cx, |view, cx| {
+                                                            view.find_the_env_file(window, cx)
+                                                        });
+                                                    },
+                                                )
+                                            },
+                                        ))
+                                    })
+                            }),
                     )
             })
             .when(kind == Kind::Debug, |form| {
@@ -2116,7 +2210,35 @@ impl RunConfigurationsView {
                     )
                     .menu(move |window, cx| {
                         let view = view.clone();
+                        // What the project itself says can be run comes first and
+                        // whole: a command with its package, its arguments and the
+                        // directory it runs in, so nothing is left to type. The
+                        // bare templates stay underneath for a project this found
+                        // nothing in.
+                        let found = view.read(cx).found.clone();
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            let mut family = None;
+                            for point in found {
+                                if family != Some(point.family) {
+                                    family = Some(point.family);
+                                    menu = menu.header(point.family.shown());
+                                }
+                                let view = view.clone();
+                                menu = menu.entry(
+                                    SharedString::from(point.name.clone()),
+                                    None,
+                                    move |window, cx| {
+                                        let point = point.clone();
+                                        view.update(cx, |view, cx| {
+                                            view.start_a_new_one(Kind::Task, window, cx);
+                                            view.fill_in_from_way(&point, window, cx);
+                                        });
+                                    },
+                                );
+                            }
+                            if family.is_some() {
+                                menu = menu.separator().header("Fill in by hand");
+                            }
                             for template in crate::templates::TEMPLATES {
                                 let view = view.clone();
                                 menu = menu.entry(template.name, None, move |window, cx| {
@@ -4111,5 +4233,78 @@ mod tests {
                 .get(&task::VariableName::WorktreeRoot),
             Some("/projects/the-one-in-front")
         );
+    }
+
+    /// The point of the moment of adding: what the project itself says can be
+    /// run is offered whole, so a reader who has never seen the command types
+    /// nothing at all.
+    #[gpui::test]
+    async fn adding_offers_what_the_project_itself_says_can_be_run(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".zed": { "tasks.json": "[]" },
+                ".env.local": "TOKEN=1",
+                "cmd": { "api": { "main.go": "package main\n\nfunc main() {}\n" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let view = workspace.update_in(cx, |workspace, window, cx| {
+            let view = cx.new(|cx| {
+                RunConfigurationsView::new(
+                    workspace.project().clone(),
+                    workspace.weak_handle(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            view
+        });
+        cx.run_until_parked();
+
+        let (found, env_files) = view.read_with(cx, |view, _| {
+            (
+                view.found
+                    .iter()
+                    .map(|point| point.name.clone())
+                    .collect::<Vec<_>>(),
+                view.env_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            found,
+            vec!["./cmd/api".to_string()],
+            "the Go program in the project is a way of running it"
+        );
+        assert_eq!(env_files, vec![".env.local".to_string()]);
+
+        // Picking it fills the command in whole, which is what "nothing to type"
+        // means: the command, its package and the directory it runs in.
+        let point = view.read_with(cx, |view, _| view.found[0].clone());
+        view.update_in(cx, |view, window, cx| {
+            view.start_a_new_one(Kind::Task, window, cx);
+            view.fill_in_from_way(&point, window, cx);
+        });
+        cx.run_until_parked();
+
+        let (command, args, cwd) = view.read_with(cx, |view, cx| {
+            (
+                view.command.read(cx).text(cx),
+                view.args.read(cx).text(cx),
+                view.cwd.read(cx).text(cx),
+            )
+        });
+        assert_eq!(command, "go");
+        assert_eq!(args, "run\n./cmd/api");
+        assert_eq!(cwd, "$ZED_WORKTREE_ROOT");
     }
 }
