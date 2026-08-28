@@ -66,6 +66,9 @@ pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<(Vec<EntryPoint
         let worktree = worktree.read(cx);
         let root = worktree.abs_path().to_path_buf();
         roots.push(root.clone());
+        // Ignored files are left out on purpose, which also means a project kept
+        // somewhere the reader's own global ignore rules cover has nothing here
+        // to find -- as it has nothing for the file finder either.
         for entry in worktree.entries(false, 0) {
             if to_read.len() >= AT_MOST {
                 break;
@@ -116,6 +119,11 @@ pub fn look_through(project: &Entity<Project>, cx: &App) -> Task<(Vec<EntryPoint
         }
         env.sort();
         env.dedup();
+        log::debug!(
+            "run configurations: {} ways to run, {} environment files",
+            found.len(),
+            env.len()
+        );
         (found, env)
     })
 }
