@@ -100,7 +100,6 @@ const WHILE_THE_PAGE_MOVES: Duration = Duration::from_millis(8);
 /// How many turns of the engine in a second are worth saying out loud. A page at
 /// rest is turned by the safety net alone, four times a second, so anything well
 /// above this is the engine being woken for work it does not have.
-#[cfg(feature = "servo")]
 const TOO_MANY_TURNS: u32 = 15;
 
 /// What the page's own menu offers. Named here because the tests look the items
