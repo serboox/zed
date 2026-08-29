@@ -5065,6 +5065,9 @@ pub(crate) struct CodeSnippetModal {
     size: Size<Pixels>,
     held: Option<Held>,
     remembering_place: Option<gpui::Task<()>>,
+    /// Set for a moment after the code is copied, so the button can say so.
+    copied: bool,
+    forgetting_the_copy: Option<gpui::Task<()>>,
 }
 
 /// What the pointer is doing to the window while a button is down.
@@ -5134,6 +5137,8 @@ impl CodeSnippetModal {
             size,
             held: None,
             remembering_place: None,
+            copied: false,
+            forgetting_the_copy: None,
         };
         modal.keep_inside_the_window(window);
         modal.show(shown, window, cx);
@@ -5354,9 +5359,25 @@ impl CodeSnippetModal {
         cx.notify();
     }
 
-    fn copy(&self, cx: &mut Context<Self>) {
+    fn copy(&mut self, cx: &mut Context<Self>) {
         let text = self.code_editor.read(cx).text(cx);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        // Said on the button rather than in a message somewhere else: a press
+        // that silently succeeds reads as a press that did nothing, and the
+        // clipboard cannot be looked at to check.
+        self.copied = true;
+        self.forgetting_the_copy = Some(cx.spawn(async move |modal, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            modal
+                .update(cx, |modal, cx| {
+                    modal.copied = false;
+                    cx.notify();
+                })
+                .ok();
+        }));
+        cx.notify();
     }
 
     /// Folds long lines into the window, or lets them run off the right of it for a
@@ -5478,6 +5499,7 @@ impl Render for CodeSnippetModal {
             .p_3()
             .gap_3()
             .cyberpunk_surface()
+            .rounded(ElevationIndex::ModalSurface.radius())
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(gpui::DismissEvent)))
             .child(
@@ -5524,14 +5546,9 @@ impl Render for CodeSnippetModal {
                             .child(self.render_wrap_toggle(cx))
                             .child(self.render_picker(cx))
                             .child(
-                                IconButton::new("code-snippet-copy-icon", IconName::Copy)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Copy the code"))
-                                    .on_click(cx.listener(|this, _, _window, cx| this.copy(cx))),
-                            )
-                            .child(
                                 IconButton::new("code-snippet-close", IconName::Close)
                                     .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Close"))
                                     .on_click(
                                         cx.listener(|_, _, _window, cx| {
                                             cx.emit(gpui::DismissEvent)
@@ -5546,11 +5563,12 @@ impl Render for CodeSnippetModal {
                     .debug_selector(|| "code-snippet-editor".to_string())
                     .flex_1()
                     .min_h_0()
-                    .p_2()
-                    .rounded_none()
-                    .border_1()
+                    .py_2()
+                    // A window inside a window: the code is what this window is
+                    // for, so it sits on the window's own surface with a rule
+                    // marking where the heading ends, and no frame of its own.
+                    .border_t_1()
                     .border_color(cyberpunk::border_dim())
-                    .bg(cyberpunk::surface())
                     .child(self.code_editor.clone()),
             )
             .child(
@@ -5560,22 +5578,31 @@ impl Render for CodeSnippetModal {
                     .justify_between()
                     .items_center()
                     .child(
-                        Label::new(
-                            "The same request Send would make: your variables resolved, your auth \
-                             applied, your own headers. Another tool adds its own.",
-                        )
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        Label::new("Exactly what Send would do: your variables, auth and headers.")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     )
                     .child(
-                        Button::new("code-snippet-copy", "Copy")
-                            .style(ButtonStyle::OutlinedCustom(
-                                cyberpunk::Accent::Cyan.border(),
-                            ))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.copy(cx);
-                                cx.emit(gpui::DismissEvent);
-                            })),
+                        // One copy, not two. The heading used to carry an icon
+                        // that copied without closing while this button copied
+                        // and closed, which is two behaviours nothing on screen
+                        // told apart. Copying now leaves the window open, so a
+                        // reader can switch the format and copy again.
+                        div()
+                            .debug_selector(|| "code-snippet-copy".to_string())
+                            .child(
+                                Button::new(
+                                    "code-snippet-copy",
+                                    match self.copied {
+                                        true => "Copied",
+                                        false => "Copy",
+                                    },
+                                )
+                                .style(ButtonStyle::OutlinedCustom(
+                                    cyberpunk::Accent::Cyan.border(),
+                                ))
+                                .on_click(cx.listener(|this, _, _window, cx| this.copy(cx))),
+                            ),
                     ),
             )
             .child(self.render_grip(cx))
@@ -7172,6 +7199,41 @@ mod tests {
                 }
             })
         })
+    }
+
+    /// Copying used to close the window, while an icon in the heading copied and
+    /// left it open -- two behaviours nothing on screen told apart. There is one
+    /// copy now, it says it worked, and the window stays open so the reader can
+    /// change the format and copy again.
+    #[gpui::test]
+    async fn copying_the_code_says_so_and_leaves_the_window_open(cx: &mut TestAppContext) {
+        let (_workspace, modal, mut cx) = a_code_window(cx).await;
+
+        assert!(
+            cx.debug_bounds("ICON-Copy").is_none(),
+            "the heading must not carry a second way to copy"
+        );
+
+        let copy = debug_center(&mut cx, "code-snippet-copy");
+        cx.simulate_click(copy, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("code-snippet-window").is_some(),
+            "copying must not take the window away"
+        );
+        assert!(
+            modal.read_with(&cx, |modal, _| modal.copied),
+            "the button has to say the code was copied"
+        );
+
+        // And it stops saying so on its own, rather than reading as copied for
+        // the rest of the window's life.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+        assert!(!modal.read_with(&cx, |modal, _| modal.copied));
     }
 
     /// The window is dragged by its title, and what moves is the window on screen,
