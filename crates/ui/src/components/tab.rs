@@ -264,9 +264,13 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(content_height)
-                    // Allowed to shrink, and to clip what will not fit: without
-                    // both, the name pushes the tab wider than the bound above
-                    // and takes the close button off its end.
+                    // Told to fill the tab rather than left to size itself to the
+                    // name. A row with no width of its own gives the name nothing
+                    // to be shortened against, so the name runs on and the bound
+                    // above clips the end of the row -- which is the close
+                    // button. Filling the tab pushes the shortening down to the
+                    // name, where the middle ellipsis is waiting for it.
+                    .w_full()
                     .min_w_0()
                     .overflow_hidden()
                     .px(content_px)
@@ -457,10 +461,15 @@ mod tests {
                 Tab::new("long")
                     .position(TabPosition::First)
                     .toggle_state(true)
+                    .end_slot(IconButton::new("close", IconName::Close).icon_size(IconSize::XSmall))
                     .child(
-                        Label::new("InstrumentsDB_instruments-db-qa_forexpros_com-3822039d.sql")
+                        h_flex().w_full().min_w_0().overflow_hidden().child(
+                            Label::new(
+                                "InstrumentsDB_instruments-db-qa_forexpros_com-3822039d.sql",
+                            )
                             .truncate_middle()
                             .flex_1(),
+                        ),
                     ),
             )
         }
