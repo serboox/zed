@@ -54,6 +54,11 @@ const MIN_WINDOW_SIZE: Size<Pixels> = size(MIN_WIDTH, MIN_HEIGHT);
 /// Height of one project row: the folder name with its path beneath.
 const PROJECT_ROW_HEIGHT: Pixels = px(48.);
 
+/// Enough projects that the list has to give room back rather than having it to
+/// spare, for the tests that ask what happens when the window is too small.
+#[cfg(test)]
+const A_FULL_LIST: i64 = 40;
+
 /// The mark at the top of the window.
 const MARK_SIZE: Pixels = px(120.);
 
@@ -61,10 +66,6 @@ const MARK_SIZE: Pixels = px(120.);
 /// than a box around the row, which is the terminal-output motif this chrome is
 /// built from.
 const SELECTED_EDGE: Pixels = px(3.);
-
-/// How many rows the list shows before it scrolls. Past this the filter field is
-/// the way to find a project, not the scrollbar.
-const ROWS_BEFORE_SCROLLING: usize = 8;
 
 /// How many recent projects are read from the database. Every one of them is
 /// checked against the file system first, so this is also a bound on that work.
@@ -630,6 +631,7 @@ impl Launchpad {
         Some(
             h_flex()
                 .id(("launchpad-project", row))
+                .debug_selector(move || format!("launchpad-project-{row}"))
                 .w_full()
                 .h(PROJECT_ROW_HEIGHT)
                 .items_center()
@@ -695,16 +697,14 @@ impl Launchpad {
                 .into_any_element();
         }
 
-        // A height counted in rows is what makes the list scroll rather than grow:
-        // it stops at ROWS_BEFORE_SCROLLING however long the history is.
-        let shown = self.matches.len().min(ROWS_BEFORE_SCROLLING);
         v_flex()
             .id("launchpad-projects")
             .debug_selector(|| "launchpad-projects".into())
-            // A ceiling rather than a fixed height: in a window too short for
-            // both, the list gives up its room to the ways in below it instead
-            // of keeping its rows and being painted over.
-            .max_h(PROJECT_ROW_HEIGHT * shown as f32)
+            // The room left over, whatever that is: a window twice as tall shows
+            // twice the projects rather than the same eight and a band of nothing
+            // under them. `min_h_0` is what lets it give that room back when the
+            // window is too short, so the ways in below are never painted over.
+            .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
@@ -1305,6 +1305,57 @@ mod tests {
         }
     }
 
+    /// A tall window has to show the projects that fit in it. The list used to
+    /// stop at eight rows however much room it was given, leaving a band of
+    /// nothing between the last project and the buttons -- the taller the window,
+    /// the larger the band.
+    #[gpui::test]
+    async fn test_the_list_takes_the_room_the_window_gives_it(cx: &mut TestAppContext) {
+        let app_state = init_launchpad_test(cx);
+        let recents = (1..=A_FULL_LIST)
+            .map(|id| {
+                recent(
+                    &format!("project-{id}"),
+                    &format!("/projects/project-{id}"),
+                    id,
+                )
+            })
+            .collect();
+        let window = open_launchpad_with(recents, app_state, cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let mut heights = Vec::new();
+        for window_height in [px(700.), px(1100.)] {
+            visual.simulate_resize(size(px(900.), window_height));
+            draw(&mut visual);
+            let list = visual
+                .debug_bounds("launchpad-projects")
+                .expect("the project list was painted");
+            let ways_in = visual
+                .debug_bounds("launchpad-ways-in")
+                .expect("the ways in were painted");
+            assert!(
+                list.bottom() <= ways_in.origin.y + px(1.),
+                "at {window_height:?} the list reached {:?}, over the buttons at {:?}",
+                list.bottom(),
+                ways_in.origin.y
+            );
+            heights.push(list.size.height);
+        }
+
+        let [shorter, taller] = [heights[0], heights[1]];
+        assert!(
+            taller > shorter + px(200.),
+            "the window grew by 400 and the list by {:?}: it is not taking the room",
+            taller - shorter
+        );
+        assert!(
+            taller > PROJECT_ROW_HEIGHT * 8.,
+            "a list of {taller:?} in an 1100 tall window is still the old eight rows"
+        );
+    }
+
     // A full history and a window short enough that the rows cannot all fit:
     // whatever gives way, it may not be the row of buttons. Pre-fix the content
     // column asked for the window's whole height on top of the title bar's, so
@@ -1314,7 +1365,7 @@ mod tests {
     #[gpui::test]
     async fn test_the_ways_in_stay_inside_a_short_window(cx: &mut TestAppContext) {
         let app_state = init_launchpad_test(cx);
-        let recents = (1..=ROWS_BEFORE_SCROLLING as i64)
+        let recents = (1..=A_FULL_LIST)
             .map(|id| {
                 recent(
                     &format!("project-{id}"),
@@ -1500,7 +1551,7 @@ mod tests {
         let app_state = init_launchpad_test(cx);
         // A full list, because what the ways in have to take room from is the
         // list, and a launchpad with one project in it has room to spare.
-        let recents = (1..=ROWS_BEFORE_SCROLLING as i64)
+        let recents = (1..=A_FULL_LIST)
             .map(|id| {
                 recent(
                     &format!("project-{id}"),
@@ -1846,22 +1897,24 @@ mod tests {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         draw(&mut visual);
 
-        let both = visual
-            .debug_bounds("launchpad-projects")
-            .expect("the project list was painted");
-        assert_eq!(both.size.height, PROJECT_ROW_HEIGHT * 2.);
+        assert!(
+            visual.debug_bounds("launchpad-project-1").is_some(),
+            "both projects have to be painted before the filter narrows them"
+        );
 
         visual.simulate_input("shell");
         cx.run_until_parked();
         assert_eq!(drawn_names(window, cx), ["shell"]);
 
-        // The list is one row shorter on screen, not merely one entry shorter in
-        // the state behind it.
+        // One row fewer on screen, not merely one entry fewer in the state behind
+        // it. Counted in painted rows rather than in the height of the box around
+        // them: the box takes the room the window gives it either way.
         draw(&mut visual);
-        let narrowed = visual
-            .debug_bounds("launchpad-projects")
-            .expect("the project list was painted");
-        assert_eq!(narrowed.size.height, PROJECT_ROW_HEIGHT);
+        assert!(
+            visual.debug_bounds("launchpad-project-0").is_some()
+                && visual.debug_bounds("launchpad-project-1").is_none(),
+            "the filter has to take the second row off the screen"
+        );
 
         // The path is part of what the filter reads, not only the folder name.
         window
