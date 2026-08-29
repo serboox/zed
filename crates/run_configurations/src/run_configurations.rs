@@ -6,6 +6,7 @@ pub mod debugging;
 pub mod entry_points;
 pub mod process_metrics;
 pub mod run_configurations_settings;
+pub mod run_metrics_status_item;
 pub mod templates;
 pub mod ways_to_run_modal;
 

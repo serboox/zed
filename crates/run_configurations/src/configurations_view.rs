@@ -24,7 +24,6 @@ struct EnvRow {
     value: Entity<Editor>,
 }
 use crate::configurations_store::{ConfigurationsChanged, ConfigurationsStore};
-use crate::run_configurations_settings::RunConfigurationsSettings;
 use crate::{CreateFromEntryPoint, OpenRunConfigurations, RunFromEntryPoint};
 
 actions!(
@@ -484,18 +483,6 @@ pub struct RunConfigurationsView {
     /// Several runs of this configuration at once, rather than the running one
     /// being replaced.
     several_at_once: bool,
-    /// What the running configuration is using, and the reading before it, which is
-    /// what makes a rate out of two numbers.
-    metrics: Option<crate::process_metrics::Metrics>,
-    watcher: crate::process_metrics::Watcher,
-    /// Whether the machine is being watched at all. Watching costs a reading a
-    /// second, which is nothing, but a reader who does not want the row can say so.
-    watching: bool,
-    /// Whether this window is the one in front. A poll nobody can see is a poll
-    /// for nothing, so it stops the moment focus leaves this window and starts
-    /// again the moment focus comes back.
-    window_active: bool,
-    _watching_task: Option<gpui::Task<()>>,
     /// Whether the JSON that lands in the file is shown under the form. The files
     /// are read and edited by hand, so what the form writes has to be checkable.
     showing_json: bool,
@@ -567,13 +554,6 @@ impl RunConfigurationsView {
                 theme_settings::reload_theme(cx);
                 theme_settings::reload_icon_theme(cx);
             }),
-            // The row's poll is not worth running while nobody can see it: this
-            // stops it the moment the window loses focus and starts it again the
-            // moment focus comes back.
-            cx.observe_window_activation(window, Self::window_activation_changed),
-            // Turning the row off by setting should stop the poll right away,
-            // not wait for the window to lose and regain focus first.
-            cx.observe_global::<settings::SettingsStore>(|view, cx| view.watch_the_run(cx)),
             // A project is still being scanned while this window opens, and it
             // keeps changing afterwards: a file with a `main()` added while the
             // window is up is a way of running that the window has to know about.
@@ -654,11 +634,6 @@ impl RunConfigurationsView {
             as_read: None,
             use_new_terminal: false,
             several_at_once: false,
-            metrics: None,
-            watcher: crate::process_metrics::Watcher::default(),
-            watching: true,
-            window_active: window.is_window_active(),
-            _watching_task: None,
             showing_json: false,
             unsaved: false,
             edited: false,
@@ -685,9 +660,6 @@ impl RunConfigurationsView {
             _subscriptions: subscriptions,
         };
         view.look_for_ways_to_run(&project, cx);
-        // Watching starts with the view: a run that is already going should be
-        // reported the moment this is opened, not a second after somebody clicks.
-        view.watch_the_run(cx);
         view
     }
 
@@ -1532,211 +1504,6 @@ impl RunConfigurationsView {
             .into_any_element()
     }
 
-    /// The process a run of this project is going on in, if one is. The terminal
-    /// panel holds the runs; a task terminal is one that was started from a task,
-    /// which is what a configuration is.
-    fn process_of_a_run(&self, cx: &App) -> Option<u32> {
-        let workspace = self.workspace.upgrade()?;
-        let panel = workspace
-            .read(cx)
-            .panel::<terminal_view::terminal_panel::TerminalPanel>(cx)?;
-        let panel = panel.read(cx);
-        let mut newest = None;
-        for pane in panel.panes() {
-            for item in pane.read(cx).items() {
-                let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
-                    continue;
-                };
-                let terminal = view.read(cx).terminal().read(cx);
-                if terminal.task().is_some()
-                    && let Some(pid) = terminal.pid()
-                {
-                    newest = Some(pid.as_u32());
-                }
-            }
-        }
-        newest
-    }
-
-    /// The window this row lives in gained or lost focus. Losing it is exactly
-    /// the moment nobody can see the row, so the poll is stopped along with it;
-    /// gaining it back starts the poll again.
-    fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.window_active = window.is_window_active();
-        self.watch_the_run(cx);
-    }
-
-    /// Reads what the run is using, once a second, for as long as this view is on
-    /// screen, its window has focus, and the reader wants it. The reading itself
-    /// happens off the drawing thread: `/proc` holds a few hundred files and none
-    /// of that belongs in a frame.
-    fn watch_the_run(&mut self, cx: &mut Context<Self>) {
-        if !self.watching {
-            self._watching_task = None;
-            self.metrics = None;
-            self.watcher.forget();
-            return;
-        }
-        if !self.window_active || !RunConfigurationsSettings::get_global(cx).show_process_metrics {
-            // Neither of these means the run itself stopped, so the last reading
-            // stays on screen rather than being thrown away -- it is just that
-            // nobody can see it right now, or the reader turned the row off.
-            self._watching_task = None;
-            return;
-        }
-        self._watching_task = Some(cx.spawn(async move |view, cx| {
-            loop {
-                let Ok(pid) = view.read_with(cx, |view, cx| view.process_of_a_run(cx)) else {
-                    return;
-                };
-                let samples = match pid {
-                    Some(_) => {
-                        cx.background_spawn(
-                            async move { crate::process_metrics::everything_running() },
-                        )
-                        .await
-                    }
-                    None => None,
-                };
-                let now = std::time::Instant::now();
-                if view
-                    .update(cx, |view, cx| {
-                        if view.read_the_run(pid, samples.as_deref(), now) {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                cx.background_executor()
-                    .timer(crate::process_metrics::Watcher::HOW_OFTEN)
-                    .await;
-            }
-        }));
-    }
-
-    /// One reading. `samples` is every process the machine talked about, or
-    /// nothing when it did not answer; `pid` is the run to look for among them.
-    /// Says whether the row changed.
-    ///
-    /// A run the machine has nothing to say about is over, and the row says so.
-    /// A machine that did not answer at all leaves the row as it was, rather than
-    /// reporting a running thing as gone.
-    fn read_the_run(
-        &mut self,
-        pid: Option<u32>,
-        samples: Option<&[crate::process_metrics::Sample]>,
-        now: std::time::Instant,
-    ) -> bool {
-        let Some(pid) = pid else {
-            self.watcher.forget();
-            return self.metrics.take().is_some();
-        };
-        let Some(samples) = samples else {
-            return false;
-        };
-        let read = self.watcher.metrics_of(pid, samples, now);
-        let changed = read != self.metrics;
-        self.metrics = read;
-        changed
-    }
-
-    /// What the run is using, in one line. A number nobody can measure says why
-    /// rather than showing a zero, which would read as "it is using none".
-    fn render_metrics(&self, cx: &mut Context<Self>) -> AnyElement {
-        let said = |label: &'static str, value: String| {
-            h_flex()
-                .gap_1()
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(Label::new(value).size(LabelSize::XSmall))
-        };
-        let toggle = h_flex()
-            .id("metrics-toggle")
-            .debug_selector(|| "metrics-toggle".to_string())
-            .gap_1()
-            .items_center()
-            .cursor_pointer()
-            .on_click(cx.listener(|view, _, _window, cx| {
-                view.watching = !view.watching;
-                view.watch_the_run(cx);
-                cx.notify();
-            }))
-            .child(
-                Icon::new(match self.watching {
-                    true => IconName::Check,
-                    false => IconName::Close,
-                })
-                .size(IconSize::XSmall)
-                .color(match self.watching {
-                    true => Color::Accent,
-                    false => Color::Muted,
-                }),
-            )
-            .child(
-                Label::new("Watch the run")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-
-        let Some(metrics) = self.metrics.clone() else {
-            return h_flex()
-                .id("run-metrics")
-                .debug_selector(|| "run-metrics".to_string())
-                .w_full()
-                .gap_3()
-                .items_center()
-                // No sentence when there is nothing to say. Absent numbers
-                // already mean nothing is running, and the toggle beside them
-                // says whether the run is being watched; a line repeating both
-                // is one more thing to read and nothing more to learn.
-                .child(div().flex_1())
-                .child(toggle)
-                .into_any_element();
-        };
-
-        h_flex()
-            .id("run-metrics")
-            .debug_selector(|| "run-metrics-reading".to_string())
-            .w_full()
-            .gap_3()
-            .items_center()
-            .child(said("PID", metrics.pid.to_string()))
-            .child(said("processes", metrics.processes.to_string()))
-            .child(said(
-                "CPU",
-                match metrics.cpu {
-                    Some(cpu) => format!("{cpu:.1}%"),
-                    None => "-- reading".to_string(),
-                },
-            ))
-            .child(said(
-                "RAM",
-                crate::process_metrics::as_memory(metrics.memory),
-            ))
-            .child(said(
-                "network",
-                match metrics.network {
-                    Ok(bytes) => crate::process_metrics::as_memory(bytes),
-                    Err(why) => format!("-- {why}"),
-                },
-            ))
-            .child(said(
-                "video memory",
-                match metrics.video_memory {
-                    Ok(bytes) => crate::process_metrics::as_memory(bytes),
-                    Err(why) => format!("-- {why}"),
-                },
-            ))
-            .child(div().flex_1())
-            .child(toggle)
-            .into_any_element()
-    }
-
     /// How a run meets the terminal. Both are the task file's own settings, shown
     /// here because they decide what happens on the second press of Run.
     /// One row of the environment: a name, a value, and the two little editors
@@ -2408,18 +2175,6 @@ impl RunConfigurationsView {
                         })),
                     ),
             )
-            // What the run is using, and the way to stop watching it: this says
-            // plainly when nothing is running, so the line is always here and the
-            // switch is always reachable -- unless the row was turned off by
-            // setting, in which case none of it is painted at all.
-            .when(
-                RunConfigurationsSettings::get_global(cx).show_process_metrics,
-                |footer| {
-                    footer
-                        .child(div().w(px(12.)))
-                        .child(self.render_metrics(cx))
-                },
-            )
             .children(self.trouble.clone().map(|trouble| {
                 Label::new(trouble)
                     .size(LabelSize::XSmall)
@@ -3042,215 +2797,6 @@ mod tests {
                 .expect("a task the editor can read back")
                 .command,
             "go"
-        );
-    }
-
-    /// The row that says what a run is using is on screen from the moment the
-    /// window opens, and says plainly when there is nothing to watch rather than
-    /// showing zeroes.
-    #[gpui::test]
-    async fn the_metrics_row_says_when_there_is_nothing_to_watch(cx: &mut TestAppContext) {
-        let (view, _fs, mut cx) = a_view_of(None, cx).await;
-        draw(&mut cx);
-
-        assert!(
-            cx.debug_bounds("run-metrics").is_some(),
-            "the row is there whether or not anything is running"
-        );
-        assert!(
-            view.read_with(&cx, |view, _| view.metrics.is_none()),
-            "with nothing running there is nothing measured"
-        );
-        assert!(
-            view.read_with(&cx, |view, _| view.watching),
-            "and it is watching, ready for a run"
-        );
-
-        // Turned off, it stops watching and says so.
-        let toggle = debug_center(&mut cx, "metrics-toggle");
-        cx.simulate_click(toggle, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-        assert!(
-            !view.read_with(&cx, |view, _| view.watching),
-            "the reader can turn the watching off"
-        );
-        assert!(
-            cx.debug_bounds("run-metrics").is_some(),
-            "and the row still says what it is doing"
-        );
-    }
-
-    /// A poll costs a reading a second, and that is only worth paying while
-    /// somebody can actually see the row. The window losing focus stops it, and
-    /// the window getting focus back starts it again -- underneath the reader's
-    /// own toggle, which still means what it always did.
-    #[gpui::test]
-    async fn the_poll_stops_while_the_window_is_not_looked_at(cx: &mut TestAppContext) {
-        let (view, _fs, mut cx) = a_view_of(None, cx).await;
-
-        // The window this row lives in already has focus, the same as the real
-        // window does the moment the reader opens it.
-        assert!(
-            view.read_with(&cx, |view, _| view._watching_task.is_some()),
-            "the poll runs while the window has focus"
-        );
-
-        cx.deactivate_window();
-        assert!(
-            view.read_with(&cx, |view, _| view._watching_task.is_none()),
-            "losing focus stops it -- nobody left to read the row"
-        );
-
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-        assert!(
-            view.read_with(&cx, |view, _| view._watching_task.is_some()),
-            "and getting focus back starts it again"
-        );
-
-        // The reader's own toggle still works underneath all of this.
-        draw(&mut cx);
-        let toggle = debug_center(&mut cx, "metrics-toggle");
-        cx.simulate_click(toggle, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(
-            view.read_with(&cx, |view, _| !view.watching
-                && view._watching_task.is_none()),
-            "and turning it off by hand still turns it off, focus or no focus"
-        );
-    }
-
-    /// The per-window toggle only lasts as long as the window does. The setting
-    /// is the one that keeps the row gone for good, and it takes the whole row
-    /// with it -- the toggle included, since there is nothing left to toggle.
-    #[gpui::test]
-    async fn turning_the_row_off_by_setting_paints_none_of_it(cx: &mut TestAppContext) {
-        let (view, _fs, mut cx) = a_view_of(None, cx).await;
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("run-metrics").is_some(),
-            "the row is there by default"
-        );
-        assert!(
-            view.read_with(&cx, |view, _| view._watching_task.is_some()),
-            "and its poll is running while the window has focus"
-        );
-
-        cx.update(|_, cx| {
-            RunConfigurationsSettings::override_global(
-                RunConfigurationsSettings {
-                    show_process_metrics: false,
-                    ..RunConfigurationsSettings::get_global(cx).clone()
-                },
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        assert!(
-            cx.debug_bounds("run-metrics").is_none(),
-            "turned off by setting, none of the row is painted"
-        );
-        assert!(
-            cx.debug_bounds("metrics-toggle").is_none(),
-            "not even the toggle that would otherwise turn it back on"
-        );
-        assert!(
-            view.read_with(&cx, |view, _| view._watching_task.is_none()),
-            "and the poll behind an invisible row is not worth running either, \
-             even though the window still has focus"
-        );
-    }
-
-    /// A run that has ended leaves its terminal, and its pid, behind. The row
-    /// must go back to saying nothing is running rather than keep the pid of a
-    /// process that is gone.
-    #[gpui::test]
-    async fn the_row_lets_go_of_a_run_that_has_ended(cx: &mut TestAppContext) {
-        use crate::process_metrics::Sample;
-
-        let (view, _fs, mut cx) = a_view_of(None, cx).await;
-        let watched = 4242;
-        let running = [Sample {
-            pid: watched,
-            parent: 1,
-            ticks: 10,
-            memory: 8 * 1024 * 1024,
-            started: 5_000,
-        }];
-        let at = std::time::Instant::now();
-
-        view.update(&mut cx, |view, _| {
-            assert!(view.read_the_run(Some(watched), Some(&running), at));
-        });
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("run-metrics-reading").is_some(),
-            "while it runs, the row shows the reading"
-        );
-
-        // The machine is asked again and says nothing about that process.
-        let gone = [Sample {
-            pid: 1,
-            parent: 0,
-            ticks: 3,
-            memory: 1024,
-            started: 1,
-        }];
-        view.update(&mut cx, |view, _| {
-            assert!(
-                view.read_the_run(
-                    Some(watched),
-                    Some(&gone),
-                    at + crate::process_metrics::Watcher::HOW_OFTEN
-                ),
-                "the row changed"
-            );
-        });
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("run-metrics-reading").is_none(),
-            "the reading is gone with the run"
-        );
-        assert!(
-            cx.debug_bounds("run-metrics").is_some(),
-            "and the row says there is nothing running"
-        );
-    }
-
-    /// A machine that does not answer is not a run that has ended: an answer with
-    /// no processes in it at all leaves the row as it was.
-    #[gpui::test]
-    async fn a_machine_that_says_nothing_does_not_end_the_run(cx: &mut TestAppContext) {
-        use crate::process_metrics::Sample;
-
-        let (view, _fs, mut cx) = a_view_of(None, cx).await;
-        let watched = 4242;
-        let running = [Sample {
-            pid: watched,
-            parent: 1,
-            ticks: 10,
-            memory: 8 * 1024 * 1024,
-            started: 5_000,
-        }];
-        let at = std::time::Instant::now();
-        view.update(&mut cx, |view, _| {
-            view.read_the_run(Some(watched), Some(&running), at);
-            assert!(
-                !view.read_the_run(
-                    Some(watched),
-                    None,
-                    at + crate::process_metrics::Watcher::HOW_OFTEN
-                ),
-                "nothing to report from a reading that did not happen"
-            );
-        });
-        draw(&mut cx);
-        assert!(
-            cx.debug_bounds("run-metrics-reading").is_some(),
-            "the row still shows the run it was showing"
         );
     }
 

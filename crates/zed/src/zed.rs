@@ -650,6 +650,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         let db_exec_status = cx.new(db_client_ui::sql_exec::ExecStatusIndicator::new);
+        let run_metrics_status = cx.new(|cx| {
+            run_configurations::run_metrics_status_item::RunMetricsStatusItem::new(
+                workspace, window, cx,
+            )
+        });
         let session_restore_indicator = {
             let workspace_handle = cx.entity();
             cx.new(|cx| {
@@ -669,6 +674,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_left_item(session_restore_indicator, window, cx);
             status_bar.add_left_item(db_exec_status, window, cx);
+            status_bar.add_left_item(run_metrics_status, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
