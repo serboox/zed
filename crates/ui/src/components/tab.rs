@@ -107,6 +107,19 @@ impl Tab {
         px(6.)
     }
 
+    /// The widest a tab is allowed to be, whatever its name. A browser settles on
+    /// the same number, and for the same reason: a strip where one tab takes a
+    /// third of the window is a strip you cannot read, and the name is no more
+    /// legible for being whole -- what tells two files apart is the start and the
+    /// end of the name, which is what the middle ellipsis keeps.
+    ///
+    /// This is also what turns that ellipsis on: the label asks for the room it
+    /// is given, so without a bound there is nothing to truncate against and the
+    /// tab simply grows.
+    pub fn widest() -> Pixels {
+        px(240.)
+    }
+
     /// The radius of the tab's two top corners and of the two feet it stands on
     /// where it meets the strip. One number for both: the silhouette reads as a
     /// single swept shape only when the outward turn at the top and the inward
@@ -199,6 +212,7 @@ impl RenderOnce for Tab {
         self.div
             .relative()
             .h(card_height)
+            .max_w(Tab::widest())
             .mt(shoulder)
             // Room on both sides for the feet, so the selected tab never plants
             // one on the tab beside it.
@@ -250,6 +264,11 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(content_height)
+                    // Allowed to shrink, and to clip what will not fit: without
+                    // both, the name pushes the tab wider than the bound above
+                    // and takes the close button off its end.
+                    .min_w_0()
+                    .overflow_hidden()
                     .px(content_px)
                     .gap(content_gap)
                     .text_color(text_color)
@@ -430,6 +449,23 @@ mod tests {
         }
     }
 
+    struct LongNameHost;
+
+    impl Render for LongNameHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            TabBar::new("strip").child(
+                Tab::new("long")
+                    .position(TabPosition::First)
+                    .toggle_state(true)
+                    .child(
+                        Label::new("InstrumentsDB_instruments-db-qa_forexpros_com-3822039d.sql")
+                            .truncate_middle()
+                            .flex_1(),
+                    ),
+            )
+        }
+    }
+
     fn same(left: Pixels, right: Pixels) -> bool {
         (f32::from(left) - f32::from(right)).abs() < 0.5
     }
@@ -522,5 +558,33 @@ mod tests {
         assert_eq!(corner_that_fits(size(px(200.), px(10.)), wanted), px(5.));
         assert_eq!(corner_that_fits(size(px(12.), px(34.)), wanted), px(3.));
         assert_eq!(corner_that_fits(size(px(0.), px(0.)), wanted), px(0.));
+    }
+
+    // A name of any length has to fit the strip: a tab that grows to its title
+    // takes a third of the window for one file and leaves the rest unreadable.
+    // The bound is also what turns the middle ellipsis on -- the label asks for
+    // the room it is given, so with nothing to ask against it never truncates.
+    #[gpui::test]
+    async fn a_long_name_does_not_make_a_long_tab(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| LongNameHost);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("TAB-long").expect("the tab is painted");
+        assert!(
+            tab.size.width <= Tab::widest() + px(0.5),
+            "a tab with a long name painted {:?} wide, past the {:?} it is allowed",
+            tab.size.width,
+            Tab::widest()
+        );
     }
 }
