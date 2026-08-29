@@ -2851,8 +2851,11 @@ impl Pane {
                 deemphasized: !self.has_focus(window, cx),
                 // A tab strip that never truncates simply runs off the window,
                 // and the only hint that anything is to the right is a border
-                // that appears once the strip has already scrolled.
-                max_title_len: Some(28),
+                // that appears once the strip has already scrolled. Counted well
+                // inside the width a tab is allowed rather than right at it: a
+                // name measured to the last pixel is a name whose last character
+                // is cut off by whichever glyphs happen to be in it.
+                max_title_len: Some(24),
                 truncate_title_middle: true,
             },
             window,
@@ -4988,8 +4991,11 @@ impl Render for DraggedTab {
                 deemphasized: false,
                 // A tab strip that never truncates simply runs off the window,
                 // and the only hint that anything is to the right is a border
-                // that appears once the strip has already scrolled.
-                max_title_len: Some(28),
+                // that appears once the strip has already scrolled. Counted well
+                // inside the width a tab is allowed rather than right at it: a
+                // name measured to the last pixel is a name whose last character
+                // is cut off by whichever glyphs happen to be in it.
+                max_title_len: Some(24),
                 truncate_title_middle: true,
             },
             window,
