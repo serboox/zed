@@ -813,7 +813,15 @@ impl Item for Editor {
             })
             .child(
                 Label::new(if params.truncate_title_middle {
-                    self.title(cx).to_string()
+                    // Shortened here rather than left to the layout: the tab is
+                    // bounded, but a name that overflows a bounded row is clipped
+                    // by that bound before the ellipsis in the label ever gets a
+                    // width to work against -- and what the clip takes is the end
+                    // of the row, the close button with it.
+                    util::shorten_the_middle(
+                        &self.title(cx),
+                        params.max_title_len.unwrap_or(MAX_TAB_TITLE_LEN),
+                    )
                 } else {
                     util::truncate_and_trailoff(
                         &self.title(cx),

@@ -78,6 +78,36 @@ pub fn parse_os_release(content: &str) -> Option<String> {
     })
 }
 
+/// Shortens the middle of the string, keeping its start and its end, if it is
+/// longer than `max_chars`. What tells two generated names apart is where they
+/// begin and where they end, so a name cut off at the front reads as any other
+/// name with the same beginning.
+///
+/// Counted in characters and cut on character boundaries, so a name with any
+/// alphabet in it comes back whole.
+pub fn shorten_the_middle(s: &str, max_chars: usize) -> String {
+    debug_assert!(max_chars >= 5);
+
+    // Bytes are never fewer than characters, so a short string can skip the walk.
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let characters: Vec<char> = s.chars().collect();
+    if characters.len() <= max_chars {
+        return s.to_string();
+    }
+    // One character of the budget goes to the ellipsis itself, and what is left
+    // is split with the larger half at the front: a name is read from the left.
+    let kept = max_chars.saturating_sub(1);
+    let ending = kept / 2;
+    let beginning = kept - ending;
+    let mut shortened = String::with_capacity(s.len());
+    shortened.extend(characters.iter().take(beginning));
+    shortened.push('\u{2026}');
+    shortened.extend(characters.iter().skip(characters.len() - ending));
+    shortened
+}
+
 /// Removes characters from the end of the string if its length is greater than `max_chars` and
 /// appends "..." to the string. Returns string unchanged if its length is smaller than max_chars.
 pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String {
@@ -785,6 +815,36 @@ impl<O> From<anyhow::Result<O>> for ConnectionResult<O> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shortening_the_middle_keeps_both_ends() {
+        // Short enough to be left alone.
+        assert_eq!(shorten_the_middle("main.rs", 28), "main.rs");
+        assert_eq!(shorten_the_middle("", 28), "");
+
+        let name = "InstrumentsDB_instruments-db-qa_forexpros_com-3822039d.sql";
+        let shortened = shorten_the_middle(name, 28);
+        assert_eq!(shortened.chars().count(), 28);
+        assert!(
+            shortened.starts_with("InstrumentsDB_") && shortened.ends_with("3822039d.sql"),
+            "what tells two of these apart is the ends, and both have to survive: {shortened}"
+        );
+        assert!(shortened.contains('\u{2026}'));
+
+        // Two names that differ only at the end stay different once shortened,
+        // which is the whole point of keeping the end.
+        let one = shorten_the_middle("report_of_everything_2026_first.sql", 20);
+        let other = shorten_the_middle("report_of_everything_2026_second.sql", 20);
+        assert_ne!(one, other);
+    }
+
+    #[test]
+    fn shortening_the_middle_cuts_on_character_boundaries() {
+        let name = "черновик-запроса-к-инструментам-2026.sql";
+        let shortened = shorten_the_middle(name, 20);
+        assert_eq!(shortened.chars().count(), 20);
+        assert!(shortened.starts_with('ч') && shortened.ends_with(".sql"));
+    }
     use super::*;
 
     #[test]
