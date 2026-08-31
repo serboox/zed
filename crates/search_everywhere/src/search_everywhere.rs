@@ -118,8 +118,14 @@ pub fn init(cx: &mut App) {
                     // Wider than a plain picker: this window holds a tab strip, a
                     // path along its foot and a preview beside the list, and all
                     // three are there to be read at a glance.
+                    // Sized as a share of the window rather than in pixels: this
+                    // is the window a reader searches a whole project in, and on
+                    // a large screen a fixed 1040 points is a slot in the middle
+                    // of it. Two thirds across and two thirds down is what a
+                    // JetBrains editor gives the same job.
                     Picker::uniform_list_with_preview(delegate, preview, window, cx)
-                        .initial_width(ui::rems_from_px(1040.))
+                        .initial_width(picker::RelativeWidth::viewport(0.66))
+                        .max_height(picker::RelativeHeight::viewport(0.68))
                 });
             });
         },

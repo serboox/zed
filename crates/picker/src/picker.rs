@@ -30,9 +30,10 @@ mod preview;
 mod render;
 mod shape;
 
-use crate::shape::RelativeHeight;
-use crate::shape::RelativeWidth;
 pub use footer::PickerAction;
+// A picker that stands in for a whole window -- one that searches a project
+// rather than picking from a short list -- has to be sized as a share of the
+// window, so the types that say so belong to whoever builds one.
 pub use language::{HighlightedText, HighlightedTextBuilder};
 pub use preview::Layout as PreviewLayout;
 pub use preview::MatchLocation;
@@ -40,6 +41,7 @@ pub use preview::Preview;
 pub use preview::PreviewBackend;
 pub use preview::PreviewSource;
 pub use preview::Update as PreviewUpdate;
+pub use shape::{RelativeHeight, RelativeWidth};
 pub use ui_input::ErasedEditor;
 
 pub const DEFAULT_MODAL_WIDTH: Rems = Rems(34.0);
