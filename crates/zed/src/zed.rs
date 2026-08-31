@@ -945,6 +945,21 @@ fn initialize_panels(
 
         futures::join!(terminal_panel_load, other_panels_load);
 
+        // Whatever was in the left dock when this project was last closed, the
+        // file tree is what a reader opens a repository to see. Done once every
+        // panel is in, because a panel that arrives later would otherwise take
+        // the dock back with whatever the file remembered.
+        workspace_handle
+            .update_in(cx, |workspace, window, cx| {
+                let left = workspace.left_dock().clone();
+                left.update(cx, |dock, cx| {
+                    if let Some(at) = dock.panel_index_for_type::<ProjectPanel>() {
+                        dock.activate_panel(at, window, cx);
+                    }
+                });
+            })
+            .log_err();
+
         anyhow::Ok(())
     })
 }
