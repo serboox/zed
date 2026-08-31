@@ -81,6 +81,13 @@ fn main() -> Result<()> {
     anyhow::ensure!(cores >= 1, "the pass needs at least one thread");
 
     println!("reading {} on {cores} cores, {runs} times", root.display());
+    // One pass first whose numbers are thrown away. A cold page cache makes the
+    // first read of sixty megabytes a measurement of the disk rather than of the
+    // parse, and the runs then fall monotonically as the cache warms -- which
+    // reads as an unrepeatable stand when what is unrepeatable is the state of
+    // the cache. Every counted run therefore starts from the same warm cache.
+    measure(&root, cores).context("the warm-up pass")?;
+
     let mut every_run: Vec<Numbers> = Vec::new();
     for run in 1..=runs {
         let numbers = measure(&root, cores)?;

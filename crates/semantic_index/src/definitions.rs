@@ -62,6 +62,13 @@ pub fn in_file(
             // editor can attach them to what follows. They define nothing.
             continue;
         };
+        // Some languages' outline queries also yield captures that are not
+        // declarations at all -- an object literal's entries, a `let` nested in
+        // a function, a test runner's wrapper -- because the editor wants them
+        // in its outline. An index of definitions does not.
+        if !crate::per_language::is_declaration(&language.name, defined) {
+            continue;
+        }
         let named: Vec<&str> = matched
             .captures
             .iter()
