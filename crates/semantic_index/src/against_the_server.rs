@@ -435,6 +435,73 @@ impl Server {
         Ok(found)
     }
 
+    /// Asks `textDocument/references` for the symbol named `name` at
+    /// `path`:`line`:`column` -- zero-based, as the LSP protocol counts both,
+    /// not the one-based line the rest of the index uses -- and returns the
+    /// references that fall under the project root, in the index's own
+    /// `Definition` shape. `includeDeclaration` is `false`, to match what the
+    /// index's own references query is asked to find: uses, not the
+    /// definition itself.
+    ///
+    /// The response carries no name of its own -- a `Location` is only a
+    /// place -- so every `Definition` returned is stamped with the `name`
+    /// the caller asked about, which is the only name it could possibly be.
+    pub async fn references(
+        &mut self,
+        path: &str,
+        line: u32,
+        column: u32,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Vec<Definition>> {
+        let uri = url::Url::from_file_path(self.root.join(path)).map_err(|()| {
+            anyhow::anyhow!("{path} is not a path under {}", self.root.display())
+        })?;
+        let answered = self
+            .call(
+                "textDocument/references",
+                json!({
+                    "textDocument": {"uri": uri.as_str()},
+                    "position": {"line": line, "character": column},
+                    "context": {"includeDeclaration": false},
+                }),
+                timeout,
+            )
+            .await
+            .with_context(|| {
+                format!("asking rust-analyzer for references to {name} at {path}:{line}:{column}")
+            })?;
+        let locations = match answered {
+            Value::Null => Vec::new(),
+            Value::Array(locations) => locations,
+            other => anyhow::bail!("`textDocument/references` answered with {other}, not a list"),
+        };
+
+        let mut found = Vec::new();
+        for location in &locations {
+            let Some(uri) = location.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(path) = relative_to_root(uri, &self.root) else {
+                continue;
+            };
+            let Some(line) = location
+                .pointer("/range/start/line")
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            found.push(Definition {
+                path,
+                name: name.to_string(),
+                kind: String::new(),
+                line: line as u32 + 1,
+                language: "rust".to_string(),
+            });
+        }
+        Ok(found)
+    }
+
     /// Asks rust-analyzer to shut down cleanly and waits for the process to
     /// exit, falling back to killing it if it does not. Dropping a `Server`
     /// without calling this still cannot leak the process -- it was spawned

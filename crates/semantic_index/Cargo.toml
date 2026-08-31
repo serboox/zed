@@ -20,6 +20,10 @@ path = "src/measure_main.rs"
 name = "zed-index-recall"
 path = "src/recall_main.rs"
 
+[[bin]]
+name = "zed-index-references"
+path = "src/references_main.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-io.workspace = true
