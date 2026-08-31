@@ -16,20 +16,29 @@ doctest = false
 name = "zed-index-measure"
 path = "src/measure_main.rs"
 
+[[bin]]
+name = "zed-index-recall"
+path = "src/recall_main.rs"
+
 [dependencies]
 anyhow.workspace = true
+async-io.workspace = true
 fuzzy.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
 ignore.workspace = true
 log.workspace = true
 rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 smol.workspace = true
 tempfile.workspace = true
 sqlez.workspace = true
 streaming-iterator.workspace = true
 tree-sitter.workspace = true
+url.workspace = true
 util.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -1,3 +1,4 @@
+pub mod against_the_server;
 pub mod definitions;
 pub mod inventory;
 pub mod languages;
