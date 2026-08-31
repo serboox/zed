@@ -1305,9 +1305,15 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             cx,
         );
         task = Some(cx.spawn(async move |cx| {
+            // This branch also runs for a CLI request an already-running instance
+            // receives over IPC (e.g. a `file://` URL), long after that instance's
+            // own `main` set `STARTUP_TIME`, so `get_or_init` is redundant there.
+            // A caller that reaches this without ever running `main` (only tests,
+            // today) still gets a mark instead of a panic on a timing side channel
+            // that is off by default and never asserted on.
             crate::startup_timing::mark_since(
                 "about to open the paths named on the command line",
-                *STARTUP_TIME.get().unwrap(),
+                *STARTUP_TIME.get_or_init(Instant::now),
             );
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
@@ -1330,7 +1336,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             }
             crate::startup_timing::mark_since(
                 "the window for the paths named is open",
-                *STARTUP_TIME.get().unwrap(),
+                *STARTUP_TIME.get_or_init(Instant::now),
             );
             crate::startup_timing::report();
             anyhow::Ok(())

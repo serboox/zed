@@ -3221,7 +3221,9 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     assert_eq!(workspace.worktrees(cx).count(), 2);
-                    assert!(workspace.right_dock().read(cx).is_open());
+                    // The project panel docks left in this fork (`assets/settings/default.json`),
+                    // so a project with a visible directory auto-opens the left dock, not the right.
+                    assert!(workspace.left_dock().read(cx).is_open());
                     assert!(
                         workspace
                             .active_pane()
@@ -4779,7 +4781,12 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*window, cx);
 
-        let mouse_position = point(px(250.), px(250.));
+        // Anywhere well inside the editor's own pane works for a scroll-zoom
+        // check; the window's center avoids hardcoding a point that a later
+        // change to chrome around the pane (margins, docks, toolbars) could
+        // shift out from under the editor.
+        let viewport_size = cx.update(|window, _cx| window.viewport_size());
+        let mouse_position = point(viewport_size.width * 0.5, viewport_size.height * 0.5);
 
         let event_modifiers = {
             #[cfg(target_os = "macos")]
@@ -6007,11 +6014,15 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actions_without_namespace, Vec::<&str>::new());
 
+            // Namespaces below marked "fork" belong to actions this fork added
+            // (run configurations, the API client, the PDF preview) and have
+            // no counterpart upstream.
             let expected_namespaces = vec![
                 "action",
                 "activity_indicator",
                 "agent",
                 "agents_sidebar",
+                "api_client", // fork: api_client_ui table navigation (NextCell/PreviousCell)
                 "api_client_panel",
                 "app_menu",
                 "assistant",
@@ -6075,6 +6086,7 @@ mod tests {
                 "outline_panel",
                 "pane",
                 "panel",
+                "pdf", // fork: pdf_preview
                 "picker",
                 "preview",
                 "project_panel",
@@ -6084,6 +6096,7 @@ mod tests {
                 "recent_projects",
                 "remote_debug",
                 "repl",
+                "run_configurations", // fork: run configuration actions (zed_actions + run_configurations crate)
                 "search",
                 "settings_editor",
                 "settings_profile_selector",
