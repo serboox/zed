@@ -24,6 +24,7 @@ ignore.workspace = true
 log.workspace = true
 rayon.workspace = true
 sha2.workspace = true
+smol.workspace = true
 tempfile.workspace = true
 sqlez.workspace = true
 streaming-iterator.workspace = true
@@ -32,4 +33,3 @@ util.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-smol.workspace = true

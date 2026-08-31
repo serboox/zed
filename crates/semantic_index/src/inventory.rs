@@ -35,18 +35,34 @@ pub struct Stocktake {
     /// Rows written, whether new or changed in any field at all. The number the
     /// plan's second gate is about: a pass over an untouched project writes none.
     pub written: usize,
-    /// Rows whose *contents* changed -- a new file, or one whose fingerprint is
-    /// not what it was. The number the plan's third gate is about, and not the
-    /// same as `written`: a branch switch puts a new time of last change on files
-    /// whose contents it did not touch, so the row has to be written while the
-    /// file has not really changed. Confusing the two would have the index
-    /// reparse files it has already read.
-    pub contents_changed: usize,
+    /// The files whose *contents* changed -- new ones, and ones whose fingerprint
+    /// is not what it was. The plan's third gate is about how many of these there
+    /// are, and it is not the same number as `written`: a branch switch puts a
+    /// new time of last change on files whose contents it did not touch, so the
+    /// row has to be written while the file has not really changed. Confusing the
+    /// two would have an index reparse files it has already read.
+    ///
+    /// The paths themselves and not just their count, because whoever reparses
+    /// needs the list, and reconstructing it by reading the whole table twice is
+    /// both slower and a second place for the rule to live.
+    pub changed: Vec<String>,
     pub unchanged: usize,
-    /// Rows dropped for files that are no longer there.
-    pub gone: usize,
+    /// The files that are no longer there, whose rows were dropped.
+    pub dropped: Vec<String>,
     pub bytes: u64,
     pub took: Duration,
+}
+
+impl Stocktake {
+    /// How many files' contents changed. The plan's own number for this step.
+    pub fn contents_changed(&self) -> usize {
+        self.changed.len()
+    }
+
+    /// How many files are gone.
+    pub fn gone(&self) -> usize {
+        self.dropped.len()
+    }
 }
 
 /// The project's file inventory, in a table of its own.
@@ -166,7 +182,7 @@ impl Inventory {
                 continue;
             }
             if known_before.is_none_or(|before| before.fingerprint != known.fingerprint) {
-                stocktake.contents_changed += 1;
+                stocktake.changed.push(known.path.clone());
             }
             write.reset();
             write.bind_text(1, &known.path)?;
@@ -189,7 +205,7 @@ impl Inventory {
                 forget.reset();
                 forget.bind_text(1, path)?;
                 forget.exec()?;
-                stocktake.gone += 1;
+                stocktake.dropped.push(path.clone());
             }
         }
 
@@ -282,7 +298,7 @@ mod tests {
         assert_eq!(first.read, 3, "two files and the ignore file itself");
         assert_eq!(first.written, 3);
         assert_eq!(first.unchanged, 0);
-        assert_eq!(first.gone, 0);
+        assert_eq!(first.gone(), 0);
 
         let known = inventory.known().expect("what it recorded");
         assert_eq!(known.len(), 3);
@@ -324,9 +340,9 @@ mod tests {
                 again + 2,
                 repeated.written
             );
-            assert_eq!(repeated.contents_changed, 0);
+            assert_eq!(repeated.contents_changed(), 0);
             assert_eq!(repeated.unchanged, first.read);
-            assert_eq!(repeated.gone, 0);
+            assert_eq!(repeated.gone(), 0);
         }
     }
 
@@ -344,7 +360,8 @@ mod tests {
         .expect("editing one file");
         let after_an_edit = inventory.take_stock(at, 2).expect("a pass after the edit");
         assert_eq!(
-            after_an_edit.contents_changed, 1,
+            after_an_edit.contents_changed(),
+            1,
             "one file changed, one row written"
         );
         assert_eq!(after_an_edit.unchanged, 2);
@@ -353,7 +370,7 @@ mod tests {
         let after_a_removal = inventory
             .take_stock(at, 2)
             .expect("a pass after the removal");
-        assert_eq!(after_a_removal.gone, 1);
+        assert_eq!(after_a_removal.gone(), 1);
         assert_eq!(after_a_removal.written, 0);
         assert!(
             !inventory
@@ -457,17 +474,25 @@ mod tests {
             .into_keys()
             .collect();
 
-        let git_says = git(&["diff", "--name-only", "first", "second"])
+        let mut git_says: Vec<String> = git(&["diff", "--name-only", "first", "second"])
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count();
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        git_says.sort();
         assert_eq!(
-            git_says, 3,
+            git_says.len(),
+            3,
             "the branches were built to differ in three files"
         );
+        // The paths themselves, not just how many there are: a count that happens
+        // to agree while naming the wrong files would pass a weaker assertion, and
+        // whoever reparses is handed this very list.
+        let mut changed = after_the_switch.changed.clone();
+        changed.sort();
         assert_eq!(
-            after_the_switch.contents_changed, git_says,
-            "the contents of exactly the files git reports as different have to change.\n\
+            changed, git_says,
+            "exactly the files git reports as different have to be the ones that changed.\n\
              on the first: {on_the_first:?}\nafter the switch: {after_the_switch:?}\nheld: {held:?}"
         );
         // The switch also puts a new time of last change on files whose contents
@@ -475,11 +500,47 @@ mod tests {
         // Asserted rather than remarked on: it is the reason the two numbers
         // exist at all.
         assert!(
-            after_the_switch.written >= after_the_switch.contents_changed,
+            after_the_switch.written >= after_the_switch.contents_changed(),
             "written {} is fewer than changed {}",
             after_the_switch.written,
-            after_the_switch.contents_changed
+            after_the_switch.contents_changed()
         );
+    }
+
+    /// The lists, not only their lengths: whoever reparses works from them, so a
+    /// list that names the wrong file is worse than a count that is wrong.
+    #[test]
+    fn a_pass_names_the_files_that_changed_and_the_ones_that_are_gone() {
+        let project = a_project();
+        let at = project.path();
+        let inventory = Inventory::open_in_memory().expect("an inventory");
+
+        let first = inventory.take_stock(at, 2).expect("the first pass");
+        let mut named = first.changed.clone();
+        named.sort();
+        assert_eq!(
+            named,
+            vec![
+                ".gitignore".to_string(),
+                "cmd/main.rs".to_string(),
+                "notes.txt".to_string()
+            ],
+            "everything is new on a first pass"
+        );
+        assert!(first.dropped.is_empty());
+
+        std::fs::write(at.join("cmd/main.rs"), "pub fn only_this_one() {}\n")
+            .expect("editing one file");
+        let after_an_edit = inventory.take_stock(at, 2).expect("a pass after the edit");
+        assert_eq!(after_an_edit.changed, vec!["cmd/main.rs".to_string()]);
+        assert!(after_an_edit.dropped.is_empty());
+
+        std::fs::remove_file(at.join("notes.txt")).expect("removing one file");
+        let after_a_removal = inventory
+            .take_stock(at, 2)
+            .expect("a pass after the removal");
+        assert!(after_a_removal.changed.is_empty());
+        assert_eq!(after_a_removal.dropped, vec!["notes.txt".to_string()]);
     }
 
     #[test]
