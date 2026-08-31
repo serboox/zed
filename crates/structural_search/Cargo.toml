@@ -1,0 +1,38 @@
+[package]
+name = "structural_search"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/structural_search.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+editor.workspace = true
+futures.workspace = true
+gpui.workspace = true
+language.workspace = true
+project.workspace = true
+semantic_index.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
