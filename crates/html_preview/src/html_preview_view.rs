@@ -1703,7 +1703,7 @@ impl HtmlPreviewView {
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.toolbar_background)
-            .child(
+            .child(ui::cyberpunk::segmented([
                 IconButton::new("html-preview-back", IconName::ArrowLeft)
                     .icon_size(IconSize::Small)
                     .disabled(!behind)
@@ -1713,9 +1713,8 @@ impl HtmlPreviewView {
                             page.go_back();
                         }
                         cx.notify();
-                    })),
-            )
-            .child(
+                    }))
+                    .into_any_element(),
                 IconButton::new("html-preview-forward", IconName::ArrowRight)
                     .icon_size(IconSize::Small)
                     .disabled(!ahead)
@@ -1725,9 +1724,8 @@ impl HtmlPreviewView {
                             page.go_forward();
                         }
                         cx.notify();
-                    })),
-            )
-            .child(
+                    }))
+                    .into_any_element(),
                 IconButton::new("html-preview-refresh", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Reload this page"))
@@ -1736,8 +1734,9 @@ impl HtmlPreviewView {
                             page.refresh();
                         }
                         cx.notify();
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+            ]))
             .child(
                 div()
                     .flex_1()
@@ -1764,6 +1763,7 @@ impl HtmlPreviewView {
                     },
                 )
                 .icon_size(IconSize::Small)
+                .style(ui::cyberpunk::Rank::Neutral.style())
                 .tooltip(Tooltip::text(match only_the_page {
                     true => "Show everything again (F11)",
                     false => "Show only the page (F11)",
@@ -1772,33 +1772,42 @@ impl HtmlPreviewView {
                     window.dispatch_action(Box::new(workspace::ToggleOnlyTheDocument), cx);
                 })
             })
-            .child(
-                IconButton::new("html-preview-zoom-out", IconName::Dash)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Smaller"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.zoom_the_page(-1., cx);
-                    })),
-            )
-            // What the zoom is, and a way back to the page as written. Shown only
-            // when the page is not drawn as written: a browser says nothing while
-            // there is nothing to say.
-            .children(self.zoom_as_read().map(|zoom| {
-                Button::new("html-preview-zoom-back", zoom)
-                    .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text("Back to the page as written"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.zoom_the_page_back(cx);
-                    }))
-            }))
-            .child(
-                IconButton::new("html-preview-zoom-in", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Larger"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.zoom_the_page(1., cx);
-                    })),
-            )
+            .child({
+                // Zoom out, what the zoom is (a way back to the page as written,
+                // shown only when it is not drawn as written -- a browser says
+                // nothing while there is nothing to say), and zoom in: the
+                // classic three-part zoom control, one frame.
+                let mut zoom_controls: Vec<AnyElement> = vec![
+                    IconButton::new("html-preview-zoom-out", IconName::Dash)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Smaller"))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.zoom_the_page(-1., cx);
+                        }))
+                        .into_any_element(),
+                ];
+                if let Some(zoom) = self.zoom_as_read() {
+                    zoom_controls.push(
+                        Button::new("html-preview-zoom-back", zoom)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("Back to the page as written"))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.zoom_the_page_back(cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                zoom_controls.push(
+                    IconButton::new("html-preview-zoom-in", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Larger"))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.zoom_the_page(1., cx);
+                        }))
+                        .into_any_element(),
+                );
+                ui::cyberpunk::segmented(zoom_controls)
+            })
             .child({
                 // The switch that floats over a document is painted over the
                 // source, not over this: a preview opened in a tab of its own
@@ -1806,6 +1815,7 @@ impl HtmlPreviewView {
                 let appearance = workspace::preview_appearance::preview_appearance(cx);
                 Button::new("html-preview-reading-theme", appearance.initial())
                     .label_size(LabelSize::Small)
+                    .style(ui::cyberpunk::Rank::Neutral.style())
                     .tooltip(Tooltip::text(appearance.tooltip()))
                     .on_click(move |_, _, cx| {
                         workspace::preview_appearance::set_preview_appearance(
@@ -1842,26 +1852,25 @@ impl HtmlPreviewView {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
-                    .child(
+                    .child(ui::cyberpunk::segmented([
                         IconButton::new("html-preview-find-previous", IconName::ChevronUp)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Previous match"))
-                            .on_click(cx.listener(|view, _, _, cx| view.look_again(false, cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|view, _, _, cx| view.look_again(false, cx)))
+                            .into_any_element(),
                         IconButton::new("html-preview-find-next", IconName::ChevronDown)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Next match"))
-                            .on_click(cx.listener(|view, _, _, cx| view.look_again(true, cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|view, _, _, cx| view.look_again(true, cx)))
+                            .into_any_element(),
                         IconButton::new("html-preview-find-close", IconName::Close)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Stop looking"))
                             .on_click(
                                 cx.listener(|view, _, window, cx| view.stop_looking(window, cx)),
-                            ),
-                    )
+                            )
+                            .into_any_element(),
+                    ]))
             }))
             // A page on its way says so along the bottom of the bar. The engine
             // reports three stages and no more, so the strip moves in steps
@@ -2064,33 +2073,37 @@ fn navigation_row(
     ahead: bool,
 ) -> gpui::AnyElement {
     h_flex()
-        .gap_1()
         .px_1()
         .py_0p5()
-        .child(navigation_button(
-            "page-menu-back",
-            IconName::ArrowLeft,
-            "Back",
-            !behind,
-            view,
-            PageRequest::GoBack,
-        ))
-        .child(navigation_button(
-            "page-menu-forward",
-            IconName::ArrowRight,
-            "Forward",
-            !ahead,
-            view,
-            PageRequest::GoForward,
-        ))
-        .child(navigation_button(
-            "page-menu-reload",
-            IconName::RotateCw,
-            "Reload this page",
-            false,
-            view,
-            PageRequest::Reload,
-        ))
+        .child(ui::cyberpunk::segmented([
+            navigation_button(
+                "page-menu-back",
+                IconName::ArrowLeft,
+                "Back",
+                !behind,
+                view,
+                PageRequest::GoBack,
+            )
+            .into_any_element(),
+            navigation_button(
+                "page-menu-forward",
+                IconName::ArrowRight,
+                "Forward",
+                !ahead,
+                view,
+                PageRequest::GoForward,
+            )
+            .into_any_element(),
+            navigation_button(
+                "page-menu-reload",
+                IconName::RotateCw,
+                "Reload this page",
+                false,
+                view,
+                PageRequest::Reload,
+            )
+            .into_any_element(),
+        ]))
         .into_any_element()
 }
 

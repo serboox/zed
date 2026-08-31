@@ -1419,6 +1419,10 @@ impl BrowserToolsPanel {
                 let at = crumb.at;
                 Button::new(("crumb", which), crumb.text.clone())
                     .label_size(LabelSize::XSmall)
+                    // A shared `segmented` frame would clip this row's own
+                    // horizontal scroll once the ancestor chain runs deep, so
+                    // each crumb carries its own quiet outline instead.
+                    .style(ui::cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(move |panel, _, _, cx| {
                         if at >= 0 {
                             panel.pick(at as usize, cx);
@@ -1449,7 +1453,7 @@ impl BrowserToolsPanel {
             .py_0p5()
             .border_b_1()
             .border_color(edge)
-            .children(Side::ALL.map(|one| {
+            .child(ui::cyberpunk::segmented(Side::ALL.map(|one| {
                 div()
                     .id(("side-hitbox", one as usize))
                     .debug_selector(move || format!("SIDE-{}", one.label()))
@@ -1459,28 +1463,25 @@ impl BrowserToolsPanel {
                             .toggle_state(one == side)
                             .on_click(cx.listener(move |panel, _, _, cx| panel.show_side(one, cx))),
                     )
-            }))
+                    .into_any_element()
+            })))
             .when_some(picked, |this, at| {
                 this.child(div().flex_1())
-                    .child(
+                    .child(ui::cyberpunk::segmented([
                         IconButton::new("copy-selector", IconName::Copy)
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Copy this element's selector"))
-                            .on_click(
-                                cx.listener(move |panel, _, _, cx| {
-                                    panel.copy(selector.clone(), cx)
-                                }),
-                            ),
-                    )
-                    .child(
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.copy(selector.clone(), cx)
+                            }))
+                            .into_any_element(),
                         Button::new("copy-html", "HTML")
                             .label_size(LabelSize::XSmall)
                             .tooltip(Tooltip::text("Copy this element's HTML"))
-                            .on_click(
-                                cx.listener(move |panel, _, _, cx| panel.copy(html.clone(), cx)),
-                            ),
-                    )
-                    .child(
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.copy(html.clone(), cx)
+                            }))
+                            .into_any_element(),
                         div()
                             .id("edit-html-hitbox")
                             .debug_selector(|| "EDIT-OPEN".to_string())
@@ -1491,19 +1492,24 @@ impl BrowserToolsPanel {
                                     .on_click(cx.listener(|panel, _, window, cx| {
                                         panel.edit_the_html(window, cx)
                                     })),
-                            ),
-                    )
-                    .child(
+                            )
+                            .into_any_element(),
                         Button::new("bring-into-view", "Show")
                             .label_size(LabelSize::XSmall)
                             .tooltip(Tooltip::text("Scroll the page to this element"))
                             .on_click(cx.listener(move |panel, _, _, cx| {
                                 panel.put(Ask::Nothing, format!("bring({at})"), cx);
-                            })),
-                    )
+                            }))
+                            .into_any_element(),
+                    ]))
+                    // Kept out of the segmented group of ordinary element
+                    // actions, and given the destructive rank on its own: this
+                    // one takes the element out of the page, and should not
+                    // read as one more item beside a copy button.
                     .child(
                         IconButton::new("remove-element", IconName::Trash)
                             .icon_size(IconSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Destructive.style())
                             .tooltip(Tooltip::text("Take this element out of the page"))
                             .on_click(cx.listener(move |panel, _, _, cx| {
                                 panel.put(Ask::Nothing, format!("remove({at})"), cx);
@@ -1543,6 +1549,7 @@ impl BrowserToolsPanel {
                             .child(
                                 Button::new("apply-html", "Put it in the page")
                                     .label_size(LabelSize::XSmall)
+                                    .style(ui::cyberpunk::Rank::Accent.style())
                                     .on_click(
                                         cx.listener(|panel, _, _, cx| {
                                             panel.replace_the_element(cx)
@@ -1553,6 +1560,7 @@ impl BrowserToolsPanel {
                     .child(
                         Button::new("cancel-html", "Leave it as it is")
                             .label_size(LabelSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|panel, _, _, cx| {
                                 panel.editing_html = false;
                                 cx.notify();
@@ -1935,18 +1943,21 @@ impl BrowserToolsPanel {
                     .py_0p5()
                     .border_b_1()
                     .border_color(edge)
-                    .children(["error", "warn", "log", "info", "debug"].map(|level| {
-                        let quiet = self.quiet.contains(level);
-                        Button::new(SharedString::from(format!("level-{level}")), level)
-                            .label_size(LabelSize::XSmall)
-                            .toggle_state(!quiet)
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                if !panel.quiet.remove(level) {
-                                    panel.quiet.insert(level.to_string());
-                                }
-                                cx.notify();
-                            }))
-                    }))
+                    .child(ui::cyberpunk::segmented(
+                        ["error", "warn", "log", "info", "debug"].map(|level| {
+                            let quiet = self.quiet.contains(level);
+                            Button::new(SharedString::from(format!("level-{level}")), level)
+                                .label_size(LabelSize::XSmall)
+                                .toggle_state(!quiet)
+                                .on_click(cx.listener(move |panel, _, _, cx| {
+                                    if !panel.quiet.remove(level) {
+                                        panel.quiet.insert(level.to_string());
+                                    }
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        }),
+                    ))
                     .child(div().w(px(140.)).child(self.console_filter.clone()))
                     .child(div().flex_1())
                     .child(
@@ -1957,6 +1968,7 @@ impl BrowserToolsPanel {
                     .child(
                         IconButton::new("clear-console", IconName::Eraser)
                             .icon_size(IconSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Quiet.style())
                             .tooltip(Tooltip::text("Clear what has been said"))
                             .on_click(cx.listener(|panel, _, _, cx| {
                                 panel.said.clear();
@@ -2077,7 +2089,7 @@ impl BrowserToolsPanel {
                     .py_0p5()
                     .border_b_1()
                     .border_color(edge)
-                    .children(Kind::ALL.map(|kind| {
+                    .child(ui::cyberpunk::segmented(Kind::ALL.map(|kind| {
                         Button::new(("kind", kind as usize), kind.label())
                             .label_size(LabelSize::XSmall)
                             .toggle_state(!self.hidden_kinds.contains(&kind))
@@ -2087,7 +2099,8 @@ impl BrowserToolsPanel {
                                 }
                                 cx.notify();
                             }))
-                    }))
+                            .into_any_element()
+                    })))
                     .child(div().w(px(140.)).child(self.wire_filter.clone())),
             )
             .child(body)
@@ -2239,6 +2252,7 @@ impl BrowserToolsPanel {
                     .child(
                         Button::new("copy-curl", "Copy as cURL")
                             .label_size(LabelSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Quiet.style())
                             .on_click(
                                 cx.listener(move |panel, _, _, cx| panel.copy(curl.clone(), cx)),
                             ),
@@ -2246,6 +2260,7 @@ impl BrowserToolsPanel {
                     .child(
                         IconButton::new("close-request", IconName::Close)
                             .icon_size(IconSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|panel, _, _, cx| {
                                 panel.chosen_wire = None;
                                 panel.wire = None;
@@ -2563,6 +2578,7 @@ impl BrowserToolsPanel {
                                 "Clear",
                             )
                             .label_size(LabelSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Destructive.style())
                             .on_click(cx.listener(
                                 move |panel, _, _, cx| {
                                     panel.put_about(
@@ -2783,12 +2799,14 @@ impl BrowserToolsPanel {
                     .child(
                         Button::new("read-again", "Check the page")
                             .label_size(LabelSize::XSmall)
+                            .style(ui::cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|panel, _, _, cx| panel.read_the_page(cx))),
                     )
                     .child(
                         Button::new("tab-order", "Show the tab order")
                             .label_size(LabelSize::XSmall)
                             .toggle_state(self.numbering)
+                            .style(ui::cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|panel, _, _, cx| panel.toggle_numbering(cx))),
                     )
                     .child(div().flex_1())
@@ -2839,6 +2857,7 @@ impl BrowserToolsPanel {
                                 Button::new(("device", which), format!("{name}  {wide}×{tall}"))
                                     .label_size(LabelSize::XSmall)
                                     .toggle_state(chosen)
+                                    .style(ui::cyberpunk::Rank::Quiet.style())
                                     .on_click(cx.listener(move |panel, _, _, cx| {
                                         panel.show_the_page_at(
                                             Some(gpui::size(px(wide), px(tall))),
@@ -2860,6 +2879,7 @@ impl BrowserToolsPanel {
                                 Button::new("device-full", "The pane's own size")
                                     .label_size(LabelSize::XSmall)
                                     .toggle_state(shown_at.is_none())
+                                    .style(ui::cyberpunk::Rank::Quiet.style())
                                     .on_click(cx.listener(|panel, _, _, cx| {
                                         panel.show_the_page_at(None, cx)
                                     })),
@@ -2869,6 +2889,7 @@ impl BrowserToolsPanel {
                         this.child(
                             Button::new("device-turn", "Turn it")
                                 .label_size(LabelSize::XSmall)
+                                .style(ui::cyberpunk::Rank::Quiet.style())
                                 .tooltip(Tooltip::text("Stand the device the other way up"))
                                 .on_click(cx.listener(move |panel, _, _, cx| {
                                     panel
@@ -3251,6 +3272,11 @@ impl Render for BrowserToolsPanel {
                                         Button::new(("tools", tools as usize), tools.label())
                                             .label_size(LabelSize::Small)
                                             .toggle_state(tools == showing)
+                                            // A shared `segmented` frame would clip this
+                                            // row's own horizontal scroll once the tabs
+                                            // outrun a narrow dock, so each tab carries its
+                                            // own quiet outline instead.
+                                            .style(ui::cyberpunk::Rank::Quiet.style())
                                             .on_click(cx.listener(move |panel, _, _, cx| {
                                                 panel.show(tools, cx)
                                             })),
@@ -3264,10 +3290,14 @@ impl Render for BrowserToolsPanel {
                         h_flex()
                             .flex_none()
                             .gap_1()
+                            // The panel's own central action: picking an
+                            // element out of the page is what everything else
+                            // in these tools is about.
                             .child(
                                 IconButton::new("pick-an-element", IconName::Crosshair)
                                     .icon_size(IconSize::Small)
                                     .toggle_state(self.picking)
+                                    .style(ui::cyberpunk::Rank::Accent.style())
                                     .tooltip(Tooltip::text("Pick an element out of the page"))
                                     .on_click(
                                         cx.listener(|panel, _, _, cx| panel.start_picking(cx)),
@@ -3277,6 +3307,7 @@ impl Render for BrowserToolsPanel {
                                 Button::new("rulers", "Rulers")
                                     .label_size(LabelSize::XSmall)
                                     .toggle_state(self.ruled)
+                                    .style(ui::cyberpunk::Rank::Quiet.style())
                                     .tooltip(Tooltip::text("Lay a grid over the page"))
                                     .on_click(
                                         cx.listener(|panel, _, _, cx| panel.toggle_rulers(cx)),
@@ -3286,6 +3317,7 @@ impl Render for BrowserToolsPanel {
                                 Button::new("measure", "Measure")
                                     .label_size(LabelSize::XSmall)
                                     .toggle_state(self.measuring)
+                                    .style(ui::cyberpunk::Rank::Quiet.style())
                                     .tooltip(Tooltip::text("Drag across the page to measure it"))
                                     .on_click(
                                         cx.listener(|panel, _, _, cx| panel.toggle_measure(cx)),
@@ -3308,6 +3340,7 @@ impl Render for BrowserToolsPanel {
                                     .child(
                                         IconButton::new("close-tools", IconName::Close)
                                             .icon_size(IconSize::Small)
+                                            .style(ui::cyberpunk::Rank::Neutral.style())
                                             .tooltip(Tooltip::text("Close the tools"))
                                             .on_click(cx.listener(|panel, _, _, cx| {
                                                 panel.put_the_tools_away(cx);
@@ -4342,6 +4375,35 @@ mod tests {
         assert!(!armed, "picking one element disarms the picker");
         assert_eq!(picked, Some(4));
         assert_eq!(selector, "div#sheet");
+    }
+
+    /// The element actions -- copy the selector, copy the HTML, edit, show --
+    /// now sit under one shared `segmented` frame with a hairline between
+    /// them, rather than bare beside the side tabs. Grouping them must not
+    /// move where any one of them can be clicked.
+    ///
+    /// Painted style is not reachable from this crate's tests: `ButtonLike`'s
+    /// style field has no public getter, and `debug_bounds` reports only
+    /// where a control was painted, never a border colour. What is proven
+    /// here instead, as the honest fallback the task allows for: the framed
+    /// control still paints under its own selector, and a click there still
+    /// reaches the panel exactly as it did before it was grouped into a
+    /// segmented frame.
+    #[gpui::test]
+    async fn framing_the_element_actions_does_not_move_their_click(cx: &mut TestAppContext) {
+        let (frame, cx) = a_panel(cx).await;
+        answered(&frame, cx, &[(Ask::Tree, A_TREE)]);
+        click(cx, "TREE-5");
+        answered(&frame, cx, &[(Ask::Selector, "#the-chosen-element")]);
+
+        click(cx, "copy-selector");
+        let copied =
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            copied.as_deref(),
+            Some("#the-chosen-element"),
+            "a click on the now-segmented copy-selector control must still reach the panel"
+        );
     }
 
     #[gpui::test]
