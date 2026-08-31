@@ -3,5 +3,6 @@ pub mod inventory;
 pub mod languages;
 pub mod measure;
 pub mod refresh;
+pub mod structural;
 pub mod symbols;
 pub mod walk;
