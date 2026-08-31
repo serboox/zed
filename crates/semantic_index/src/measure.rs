@@ -7,6 +7,9 @@ use anyhow::{Context as _, Result};
 use rayon::prelude::*;
 use streaming_iterator::StreamingIterator as _;
 
+use crate::languages::{self, Readable};
+use crate::walk;
+
 /// The five numbers the whole plan is measured against. Nothing here is a target
 /// -- every later step states its own target *relative* to these, so they are
 /// taken first and written down.
@@ -89,110 +92,34 @@ pub fn all_within(measurements: &[Duration], fraction: f64) -> bool {
     apart / largest.as_secs_f64() <= fraction
 }
 
-/// One language the stand can read: the grammar that parses it, the query that
-/// finds its definitions, and the file names it claims.
-pub struct Readable {
-    pub name: String,
-    pub grammar: tree_sitter::Language,
-    pub outline: tree_sitter::Query,
-    pub suffixes: Vec<String>,
-}
-
-/// Every language the editor ships that already has an outline query, which is
-/// the set the plan starts from.
-///
-/// Worked out from the languages rather than from the grammars: a language may
-/// borrow another's grammar -- JavaScript is parsed by the TSX one -- so walking
-/// the grammars would silently leave such a language out of every number.
-///
-/// A query that does not compile is left out and named, rather than bringing the
-/// whole stand down: the stand's job is to measure what there is.
-pub fn readable_languages() -> (Vec<Readable>, Vec<String>) {
-    let grammars: HashMap<String, tree_sitter::Language> = grammars::native_grammars()
-        .into_iter()
-        .map(|(name, grammar)| (name.to_string(), grammar))
-        .collect();
-
-    let mut readable = Vec::new();
-    let mut refused = Vec::new();
-    for name in grammars::embedded_languages() {
-        let Some(outline) = grammars::load_queries(&name).outline else {
-            continue;
-        };
-        let config = grammars::load_config(&name);
-        // A config that names no grammar is parsed by the one named after it.
-        let parsed_by = config
-            .grammar
-            .as_ref()
-            .map(|grammar| grammar.to_string())
-            .unwrap_or_else(|| name.clone());
-        let Some(grammar) = grammars.get(&parsed_by) else {
-            refused.push(format!(
-                "{name}: its grammar {parsed_by:?} is not one of the built-in ones"
-            ));
-            continue;
-        };
-        match tree_sitter::Query::new(grammar, outline.as_ref()) {
-            Ok(outline) => readable.push(Readable {
-                name,
-                grammar: grammar.clone(),
-                outline,
-                suffixes: config.matcher.path_suffixes,
-            }),
-            Err(trouble) => refused.push(format!("{name}: {trouble}")),
-        }
-    }
-    (readable, refused)
-}
-
 /// A file the stand will read, with the language it belongs to.
 struct Reading {
     path: PathBuf,
     language: usize,
 }
 
-/// Everything under `root` that one of `languages` claims, as the editor's own
-/// scanner would see it: what the ignore files exclude is excluded here too,
-/// because a number that counts `target/` is not a number about the project.
-fn files_under(root: &Path, languages: &[Readable]) -> Vec<Reading> {
+/// Everything under `root` that one of `languages` claims.
+fn readings_under(root: &Path, languages: &[Readable]) -> Vec<Reading> {
     let mut by_suffix: HashMap<&str, usize> = HashMap::new();
     for (at, language) in languages.iter().enumerate() {
         for suffix in &language.suffixes {
             by_suffix.insert(suffix.as_str(), at);
         }
     }
-    let mut readings = Vec::new();
-    for found in ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        // Ignore files are read whether or not the project is a git checkout.
-        // Without this the walk of a plain directory counts its build output,
-        // and the first number the plan rests on would be measured on the wrong
-        // set of files.
-        .require_git(false)
-        .build()
-        .flatten()
-    {
-        if !found.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = found.into_path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        // Matched on the longest suffix that fits, so `.d.ts` wins over `.ts`
-        // where a language claims both.
-        let language = by_suffix
-            .iter()
-            .filter(|(suffix, _)| name.ends_with(*suffix))
-            .max_by_key(|(suffix, _)| suffix.len())
-            .map(|(_, at)| *at);
-        if let Some(language) = language {
-            readings.push(Reading { path, language });
-        }
-    }
-    readings
+    walk::files_under(root)
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            // The longest suffix that fits wins, so `.d.ts` beats `.ts` where a
+            // language claims both.
+            let language = by_suffix
+                .iter()
+                .filter(|(suffix, _)| name.ends_with(*suffix))
+                .max_by_key(|(suffix, _)| suffix.len())
+                .map(|(_, at)| *at)?;
+            Some(Reading { path, language })
+        })
+        .collect()
 }
 
 /// What one file cost.
@@ -208,7 +135,7 @@ struct Cost {
 /// one, which is what the editor's own scanner takes, so the number measured
 /// here is the number the editor would see.
 pub fn measure(root: &Path, cores: usize) -> Result<Numbers> {
-    let (languages, refused) = readable_languages();
+    let (languages, refused) = languages::readable();
     anyhow::ensure!(
         !languages.is_empty(),
         "no built-in language has an outline query to run"
@@ -217,7 +144,7 @@ pub fn measure(root: &Path, cores: usize) -> Result<Numbers> {
         log::warn!("outline query left out of the measurement -- {trouble}");
     }
 
-    let readings = files_under(root, &languages);
+    let readings = readings_under(root, &languages);
     anyhow::ensure!(
         !readings.is_empty(),
         "nothing under {} belongs to a language with an outline query",
@@ -444,37 +371,6 @@ mod tests {
         // Nothing measured, and one measurement, are both within any spread.
         assert!(all_within(&[], 0.1));
         assert!(all_within(&[milliseconds(7)], 0.0));
-    }
-
-    #[test]
-    fn every_built_in_outline_query_compiles_against_its_own_grammar() {
-        let (readable, refused) = readable_languages();
-        assert!(
-            refused.is_empty(),
-            "an outline query the editor ships does not compile: {refused:?}"
-        );
-        // Thirteen directories ship an outline query, and every one of them has
-        // to be readable -- including JavaScript, which is parsed by the TSX
-        // grammar and would be dropped by anything walking the grammars.
-        assert_eq!(
-            readable.len(),
-            13,
-            "readable: {:?}",
-            readable
-                .iter()
-                .map(|language| language.name.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            readable
-                .iter()
-                .any(|language| language.name == "javascript"),
-            "JavaScript borrows the TSX grammar and still has to be measured"
-        );
-        assert!(
-            readable.iter().any(|language| language.name == "rust"),
-            "Rust is the language the plan starts from and it has to be readable"
-        );
     }
 
     /// The stand end to end, on a project small enough to know the answer for.
