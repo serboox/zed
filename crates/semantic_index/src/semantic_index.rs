@@ -1,3 +1,4 @@
+pub mod definitions;
 pub mod inventory;
 pub mod languages;
 pub mod measure;
