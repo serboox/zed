@@ -1280,6 +1280,7 @@ impl Render for ModifyTableView {
             )
             .child(
                 Button::new("add-column", "Add Column")
+                    .style(cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_column(window, cx))),
             )
             .child(Divider::horizontal())
@@ -1298,6 +1299,7 @@ impl Render for ModifyTableView {
             )
             .child(
                 Button::new("add-index", "Add Index")
+                    .style(cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_index(window, cx))),
             )
             .child(Divider::horizontal())
@@ -1316,6 +1318,7 @@ impl Render for ModifyTableView {
             )
             .child(
                 Button::new("add-fk", "Add Foreign Key")
+                    .style(cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_fk(window, cx))),
             )
             .child(Divider::horizontal())
@@ -1334,6 +1337,7 @@ impl Render for ModifyTableView {
             )
             .child(
                 Button::new("add-check", "Add Check Constraint")
+                    .style(cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(|this, _, window, cx| this.add_blank_check(window, cx))),
             )
             .child(Divider::horizontal())
@@ -1369,9 +1373,11 @@ impl Render for ModifyTableView {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("cancel", "Cancel").on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(DismissEvent);
-                        })),
+                        Button::new("cancel", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(DismissEvent);
+                            })),
                     )
                     .child(
                         Button::new("execute", "Execute")

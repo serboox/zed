@@ -6,7 +6,7 @@ use gpui::{
     WeakEntity, Window, prelude::*, px,
 };
 use ui::prelude::*;
-use ui::{Button, ButtonStyle, Icon, IconName, Label, LabelSize};
+use ui::{Button, ButtonStyle, Icon, IconName, Label, LabelSize, cyberpunk};
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
 
@@ -519,7 +519,7 @@ impl Render for FullTextSearchView {
                     )
                     .child(
                         Button::new("full-text-search-run", "Search")
-                            .style(ButtonStyle::Filled)
+                            .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_search(window, cx);
                             })),

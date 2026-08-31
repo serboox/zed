@@ -7,7 +7,8 @@ use gpui::{
     Window,
 };
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*,
+    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, cyberpunk,
+    prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, item::ItemEvent};
@@ -220,7 +221,7 @@ impl Render for RunnerView {
             .debug_selector(|| "runner-run".to_string())
             .child(
                 Button::new("runner-run", "Run Collection")
-                    .style(ButtonStyle::Filled)
+                    .style(cyberpunk::Rank::Accent.style())
                     .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
             );
 

@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use ui::{
     ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, Tooltip,
-    WithScrollbar, prelude::*, right_click_menu,
+    WithScrollbar, cyberpunk, prelude::*, right_click_menu,
 };
 use util::ResultExt;
 use workspace::{
@@ -2547,21 +2547,18 @@ impl Render for ApiClientPanel {
                     // No title over the buttons: the dock's own icon already says
                     // which panel this is, and the row it took is the room the tree
                     // gets instead.
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(self.render_new_button(cx))
-                            .child(self.render_import_button(cx))
-                            .child(
-                                IconButton::new("api-client-open-history", IconName::HistoryRerun)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("History"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_history(window, cx)
-                                    })),
-                            )
-                            .child(environment_switcher),
-                    ),
+                    .child(cyberpunk::segmented(vec![
+                        self.render_new_button(cx),
+                        self.render_import_button(cx),
+                        IconButton::new("api-client-open-history", IconName::HistoryRerun)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("History"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_history(window, cx)
+                            }))
+                            .into_any_element(),
+                        environment_switcher,
+                    ])),
             )
             .child(
                 v_flex()

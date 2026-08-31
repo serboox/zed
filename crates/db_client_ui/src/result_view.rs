@@ -22,7 +22,7 @@ use std::time::Duration;
 use ui::{
     Button, ButtonCommon, ButtonStyle, Checkbox, Chip, Color, CommonAnimationExt, ContextMenu,
     CopyButton, Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, PopoverMenu,
-    ScrollableHandle, Tooltip, prelude::*, right_click_menu,
+    ScrollableHandle, Tooltip, cyberpunk, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 
@@ -2926,7 +2926,7 @@ impl ResultView {
                     .child(div().flex_1())
                     .child(
                         Button::new("special-show-as-table", "Show as Table")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.special_table_override = true;
@@ -2990,34 +2990,32 @@ impl ResultView {
         mode: MongoResultView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        h_flex()
-            .gap_1()
-            .child(
-                div().debug_selector(|| "mongo-view-table".into()).child(
+        cyberpunk::segmented(vec![
+            div()
+                .debug_selector(|| "mongo-view-table".into())
+                .child(
                     Button::new("mongo-view-table", "Table")
-                        .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
                         .toggle_state(mode == MongoResultView::Table)
                         .tooltip(Tooltip::text("Show documents projected into columns"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.set_mongo_view(MongoResultView::Table, cx);
                         })),
-                ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "mongo-view-documents".into())
-                    .child(
-                        Button::new("mongo-view-documents", "Documents")
-                            .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::Small)
-                            .toggle_state(mode == MongoResultView::Documents)
-                            .tooltip(Tooltip::text("Show documents as pretty-printed BSON/JSON"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_mongo_view(MongoResultView::Documents, cx);
-                            })),
-                    ),
-            )
+                )
+                .into_any_element(),
+            div()
+                .debug_selector(|| "mongo-view-documents".into())
+                .child(
+                    Button::new("mongo-view-documents", "Documents")
+                        .label_size(LabelSize::Small)
+                        .toggle_state(mode == MongoResultView::Documents)
+                        .tooltip(Tooltip::text("Show documents as pretty-printed BSON/JSON"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_mongo_view(MongoResultView::Documents, cx);
+                        })),
+                )
+                .into_any_element(),
+        ])
     }
 
     fn render_mongo_documents_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -6029,7 +6027,7 @@ impl ResultView {
                 .when_some(fk_button, |el, (label, tip)| {
                     el.child(
                         Button::new("fk-nav", label)
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .tooltip(Tooltip::text(tip))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate_to_fk_row(window, cx);
@@ -6149,6 +6147,7 @@ impl ResultView {
                 .child(div().flex_1().border_1().rounded_md().px_1().child(editor))
                 .child(
                     IconButton::new("refresh-data", IconName::RefreshTitle)
+                        .style(cyberpunk::Rank::Quiet.style())
                         .icon_size(IconSize::Small)
                         .disabled(is_loading)
                         .tooltip(Tooltip::text("Refresh (apply filter)"))
@@ -6347,6 +6346,7 @@ impl ResultView {
                             .debug_selector(|| "query-error-copy".to_string())
                             .child(
                                 CopyButton::new("query-error-copy", view.source.clone())
+                                    .style(ui::cyberpunk::Rank::Quiet.style())
                                     .tooltip_label("Copy the full error"),
                             ),
                     ),
@@ -7297,7 +7297,7 @@ impl ResultView {
                                 el.child(loading_spinner("fill-spinner", IconSize::XSmall))
                                 .child(
                                     Button::new("stop-fill", "Stop")
-                                        .style(ButtonStyle::Subtle)
+                                        .style(cyberpunk::Rank::Quiet.style())
                                         .tooltip(Tooltip::text("Stop loading more rows"))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.stop_fill(cx);
@@ -7442,7 +7442,7 @@ impl ResultView {
                                     format!("Copy: {}", copy_format.label()),
                                 )
                                 .width(px(148.0))
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .label_size(LabelSize::Small),
                                 Tooltip::text("Format used by Ctrl+C"),
                             ),
@@ -7452,7 +7452,7 @@ impl ResultView {
                         .when(selected_col_nullable, |el| {
                             el.child(
                                 Button::new("set-null", "Set NULL")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .tooltip(Tooltip::text("Set the selected cell to NULL (Ctrl+Alt+N / Cmd+Alt+N)"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_selected_cell_value(CellValue::Null, cx);
@@ -7462,7 +7462,7 @@ impl ResultView {
                         .when(selected_col_has_default, |el| {
                             el.child(
                                 Button::new("set-default", "Set DEFAULT")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .tooltip(Tooltip::text("Set the selected cell to the column DEFAULT (Ctrl+Alt+D / Cmd+Alt+D)"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_selected_cell_value(CellValue::Default, cx);
@@ -7471,7 +7471,7 @@ impl ResultView {
                         })
                         .child(
                             Button::new("set-empty-value", "Set Empty Value")
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .tooltip(Tooltip::text("Set the selected cell to an explicit empty string (Ctrl+Alt+E / Cmd+Alt+E)"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.set_selected_cell_value(CellValue::Text(String::new()), cx);
@@ -7482,7 +7482,7 @@ impl ResultView {
                         el.child(Divider::vertical())
                         .child(
                             Button::new("submit-edits", "Submit")
-                                .style(ButtonStyle::Filled)
+                                .style(cyberpunk::Rank::Accent.style())
                                 .tooltip(Tooltip::text("Write pending changes to the database"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.submit_pending_edits(window, cx);
@@ -7490,7 +7490,7 @@ impl ResultView {
                         )
                         .child(
                             Button::new("preview-pending", "Preview")
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .tooltip(Tooltip::text("Preview the SQL these changes will run"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.preview_open = !this.preview_open;
@@ -7499,7 +7499,7 @@ impl ResultView {
                         )
                         .child(
                             Button::new("revert-edits", "Revert")
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .tooltip(Tooltip::text("Discard pending changes"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.revert_pending_edits(cx);
@@ -7509,7 +7509,7 @@ impl ResultView {
                     .child(Divider::vertical())
                     .child(
                         Button::new("transaction-mode", transaction_mode.label())
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .label_size(LabelSize::Small)
                             .toggle_state(transaction_mode == TransactionMode::Manual)
                             .tooltip(Tooltip::text(
@@ -7522,7 +7522,7 @@ impl ResultView {
                     .when(staged_count > 0, |el| {
                         el.child(
                             Button::new("commit-transaction", "Commit")
-                                .style(ButtonStyle::Filled)
+                                .style(cyberpunk::Rank::Accent.style())
                                 .label_size(LabelSize::Small)
                                 .tooltip(Tooltip::text("Run the staged statements as one transaction"))
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -7531,7 +7531,7 @@ impl ResultView {
                         )
                         .child(
                             Button::new("rollback-transaction", "Roll Back")
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .label_size(LabelSize::Small)
                                 .tooltip(Tooltip::text("Discard the staged statements"))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -7540,24 +7540,24 @@ impl ResultView {
                         )
                     })
                     .child(Divider::vertical())
-                    .child(
+                    .child(cyberpunk::segmented(vec![
                         IconButton::new("toggle-local-filters", IconName::Filter)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Toggle column filters (Ctrl+F5)"))
                             .toggle_state(self.local_filter_visible)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_local_filter_row(window, cx);
-                            })),
-                    )
-                    .child(
+                            }))
+                            .into_any_element(),
                         IconButton::new("toggle-column-list", IconName::ListTree)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Show/hide columns (Ctrl+F12)"))
                             .toggle_state(self.column_list_visible)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_column_list(cx);
-                            })),
-                    )
+                            }))
+                            .into_any_element(),
+                    ]))
                     .when_some(mongo_mode, |el, mode| {
                         el.child(Divider::vertical())
                             .child(self.render_mongo_view_toggle(mode, cx))
@@ -7589,7 +7589,7 @@ impl ResultView {
                             .attach(Anchor::BottomRight)
                             .trigger_with_tooltip(
                                 Button::new("view-menu-btn", "View")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .label_size(LabelSize::Small),
                                 Tooltip::text("Panels and inspectors"),
                             ),
@@ -7745,7 +7745,7 @@ impl ResultView {
                             .attach(Anchor::BottomRight)
                             .trigger_with_tooltip(
                                 Button::new("export-menu-btn", "Export")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .label_size(LabelSize::Small),
                                 Tooltip::text("Export or copy data"),
                             )
@@ -9033,7 +9033,7 @@ impl ResultView {
                         .when(show_format_json, |row| {
                             row.child(
                                 Button::new("value-editor-format-json", "Format JSON")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .label_size(LabelSize::Small)
                                     .tooltip(Tooltip::text("Pretty-print the JSON value"))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -9044,7 +9044,7 @@ impl ResultView {
                         .when(editable, |row| {
                             row.child(
                                 Button::new("value-editor-save", "Submit")
-                                    .style(ButtonStyle::Filled)
+                                    .style(cyberpunk::Rank::Accent.style())
                                     .label_size(LabelSize::Small)
                                     .tooltip(Tooltip::text("Apply to pending edits (Ctrl+Enter)"))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -9052,15 +9052,14 @@ impl ResultView {
                                     })),
                             )
                         })
-                        .child(
+                        .child(cyberpunk::segmented(vec![
                             IconButton::new("value-editor-copy", IconName::Copy)
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Copy full value"))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
-                                })),
-                        )
-                        .child(
+                                }))
+                                .into_any_element(),
                             IconButton::new("value-editor-close", IconName::Close)
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Close value panel"))
@@ -9068,8 +9067,9 @@ impl ResultView {
                                     this.value_editor_open = false;
                                     this.value_editor_resize_drag = None;
                                     cx.notify();
-                                })),
-                        ),
+                                }))
+                                .into_any_element(),
+                        ])),
                 )
                 .child(
                     div()
@@ -9283,33 +9283,32 @@ impl ResultView {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(
+                    .child(cyberpunk::segmented(vec![
                         IconButton::new("rv-prev", IconName::ArrowLeft)
                             .icon_size(IconSize::Small)
                             .disabled(at_first)
                             .tooltip(Tooltip::text("Previous row"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.record_view_step(-1, cx);
-                            })),
-                    )
-                    .child(
+                            }))
+                            .into_any_element(),
                         IconButton::new("rv-next", IconName::ArrowRight)
                             .icon_size(IconSize::Small)
                             .disabled(at_last)
                             .tooltip(Tooltip::text("Next row"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.record_view_step(1, cx);
-                            })),
-                    )
-                    .child(
+                            }))
+                            .into_any_element(),
                         IconButton::new("rv-close", IconName::Close)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Close record view"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.record_view_open = false;
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                            .into_any_element(),
+                    ])),
             )
             .child(
                 div()
@@ -9402,6 +9401,7 @@ impl ResultView {
                     .child(div().flex_1())
                     .child(
                         IconButton::new("qdoc-close", IconName::Close)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Close"))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -9624,22 +9624,22 @@ impl ResultView {
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().surface_background)
-            .child(
+            .child(cyberpunk::segmented(vec![
                 IconButton::new("find-prev", IconName::ArrowUp)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Previous match (Shift+Ctrl+G)"))
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.find_previous(cx);
-                    })),
-            )
-            .child(
+                    }))
+                    .into_any_element(),
                 IconButton::new("find-next", IconName::ArrowDown)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Next match (Ctrl+G)"))
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.find_next(cx);
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+            ]))
             .child(div().w(gpui::px(200.0)).child(editor))
             .child(
                 Label::new(current_label)
@@ -9648,7 +9648,7 @@ impl ResultView {
             )
             .child(
                 Button::new("find-filter-rows", "Filter rows")
-                    .style(ButtonStyle::Subtle)
+                    .style(cyberpunk::Rank::Quiet.style())
                     .label_size(LabelSize::Small)
                     .toggle_state(self.find_filter_rows)
                     .tooltip(Tooltip::text("Hide rows without a match"))
@@ -9659,6 +9659,7 @@ impl ResultView {
             .child(div().flex_1())
             .child(
                 IconButton::new("find-close", IconName::Close)
+                    .style(cyberpunk::Rank::Neutral.style())
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Close (Escape)"))
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -9713,6 +9714,7 @@ impl ResultView {
             .child(div().flex_1())
             .child(
                 IconButton::new("goto-row-close", IconName::Close)
+                    .style(cyberpunk::Rank::Neutral.style())
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Close (Escape)"))
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -9773,7 +9775,7 @@ impl ResultView {
                                 .gap_1()
                                 .child(
                                     Button::new("preview-submit", "Submit")
-                                        .style(ButtonStyle::Filled)
+                                        .style(cyberpunk::Rank::Accent.style())
                                         .label_size(LabelSize::Small)
                                         .tooltip(Tooltip::text(
                                             "Write pending changes to the database",
@@ -9785,6 +9787,7 @@ impl ResultView {
                                 )
                                 .child(
                                     IconButton::new("preview-close", IconName::Close)
+                                        .style(cyberpunk::Rank::Neutral.style())
                                         .icon_size(IconSize::Small)
                                         .tooltip(Tooltip::text("Close"))
                                         .on_click(cx.listener(|this, _, _window, cx| {
@@ -10015,6 +10018,7 @@ impl ResultView {
                         .child(Label::new("Export Data").size(LabelSize::Default))
                         .child(
                             IconButton::new("export-dialog-close", IconName::Close)
+                                .style(cyberpunk::Rank::Neutral.style())
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.export_dialog_open = false;
@@ -10067,7 +10071,7 @@ impl ResultView {
                         .gap_2()
                         .child(
                             Button::new("export-clipboard", "Copy to Clipboard")
-                                .style(ButtonStyle::Filled)
+                                .style(cyberpunk::Rank::Neutral.style())
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.export_to_clipboard(cx);
@@ -10075,7 +10079,7 @@ impl ResultView {
                         )
                         .child(
                             Button::new("export-file", "Save to File…")
-                                .style(ButtonStyle::Subtle)
+                                .style(cyberpunk::Rank::Neutral.style())
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.export_to_file(cx);
@@ -10132,6 +10136,7 @@ impl ResultView {
                     )
                     .child(
                         IconButton::new("chart-close", IconName::Close)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .icon_size(IconSize::Small)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.chart_open = false;

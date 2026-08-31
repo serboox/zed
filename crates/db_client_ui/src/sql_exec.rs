@@ -311,21 +311,23 @@ impl Render for ExecDialog {
                     .justify_between()
                     .gap_2()
                     .child(
-                        Button::new("exec-load-file", "Load from file…").on_click(cx.listener(
-                            |this, _, window, cx| {
+                        Button::new("exec-load-file", "Load from file…")
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.load_from_file(window, cx);
-                            },
-                        )),
+                            })),
                     )
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Button::new("exec-cancel", "Cancel").on_click(cx.listener(
-                                |_, _, _, cx| {
-                                    cx.emit(ExecDialogEvent::Dismissed);
-                                    cx.emit(DismissEvent);
-                                },
-                            )))
+                            .child(
+                                Button::new("exec-cancel", "Cancel")
+                                    .style(cyberpunk::Rank::Neutral.style())
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ExecDialogEvent::Dismissed);
+                                        cx.emit(DismissEvent);
+                                    })),
+                            )
                             .child(
                                 Button::new("exec-run", "Run")
                                     .style(ButtonStyle::OutlinedCustom(
@@ -448,7 +450,7 @@ impl Render for ExecStatusIndicator {
                     .with_handle(self.popover_handle.clone())
                     .trigger(
                         Button::new("exec-status-trigger", summary)
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .start_icon(
                                 Icon::new(if running > 0 {
                                     IconName::ArrowCircle

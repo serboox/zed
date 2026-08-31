@@ -5,7 +5,7 @@ use gpui::{
     actions, prelude::*,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use ui::{Checkbox, Divider, Icon, Tooltip, prelude::*};
+use ui::{Checkbox, Divider, Icon, Tooltip, cyberpunk, prelude::*};
 use workspace::{Item, item::ItemEvent};
 
 const RENDERED_ROW_LIMIT: usize = 1000;
@@ -450,7 +450,7 @@ impl Render for CompareDataView {
             })
             .child(
                 Button::new("compare-recompute", "Re-compare")
-                    .style(ButtonStyle::Subtle)
+                    .style(cyberpunk::Rank::Quiet.style())
                     .on_click(cx.listener(|this, _, window, cx| this.recompute(window, cx))),
             );
 
@@ -542,6 +542,7 @@ impl Render for CompareDataView {
                     )
                     .child(
                         IconButton::new("close-compare", IconName::Close)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .tooltip(Tooltip::text("Close"))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     ),

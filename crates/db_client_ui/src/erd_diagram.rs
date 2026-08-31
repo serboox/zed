@@ -1,9 +1,9 @@
 use gpui::{
-    Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Window, actions, canvas, point, prelude::*, px,
+    AnyElement, Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, Window, actions, canvas, point, prelude::*, px,
 };
-use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*, rems_from_px};
+use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*, rems_from_px};
 use workspace::{Item, item::ItemEvent};
 
 actions!(
@@ -1014,57 +1014,50 @@ impl Render for ErdView {
                     .border_color(colors.border)
                     .child(Label::new(self.title.clone()).size(LabelSize::Small))
                     .child(div().flex_1())
-                    .child(
+                    .child(cyberpunk::segmented(vec![
                         IconButton::new("erd-zoom-out", IconName::Dash)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Zoom out"))
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx)))
+                            .into_any_element(),
                         Button::new(
                             "erd-zoom-reset",
                             format!("{}%", (zoom * 100.0).round() as i32),
                         )
-                        .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
                         .tooltip(Tooltip::text("Reset zoom to 100%"))
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
-                    )
-                    .child(
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx)))
+                        .into_any_element(),
                         IconButton::new("erd-zoom-in", IconName::Plus)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Zoom in"))
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx)))
+                            .into_any_element(),
                         IconButton::new("erd-zoom-fit", IconName::Maximize)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Zoom to fit the whole diagram"))
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_to_fit(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_to_fit(cx)))
+                            .into_any_element(),
+                    ]))
+                    .child(cyberpunk::segmented(vec![
                         Button::new("erd-copy-mermaid", "Copy Mermaid")
-                            .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .tooltip(Tooltip::text("Copy the diagram as Mermaid erDiagram"))
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_mermaid(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_mermaid(cx)))
+                            .into_any_element(),
                         Button::new("erd-copy-dot", "Copy DOT")
-                            .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .tooltip(Tooltip::text("Copy the diagram as Graphviz DOT"))
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_dot(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_dot(cx)))
+                            .into_any_element(),
                         Button::new("erd-copy-svg", "Export SVG")
-                            .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .tooltip(Tooltip::text(
                                 "Copy the diagram as a standalone SVG image document",
                             ))
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_svg(cx))),
-                    ),
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_svg(cx)))
+                            .into_any_element(),
+                    ])),
             )
             .child(
                 div()

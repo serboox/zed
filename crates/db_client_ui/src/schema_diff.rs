@@ -5,7 +5,7 @@ use gpui::{
     Window, actions, prelude::*,
 };
 use std::sync::Arc;
-use ui::{Divider, Icon, Tooltip, prelude::*};
+use ui::{Divider, Icon, Tooltip, cyberpunk, prelude::*};
 use workspace::{Item, item::ItemEvent};
 
 actions!(
@@ -396,7 +396,7 @@ impl Render for SchemaDiffView {
                             .gap_2()
                             .child(
                                 Button::new("schema-diff-copy", "Copy Script")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .disabled(is_empty)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
@@ -406,7 +406,7 @@ impl Render for SchemaDiffView {
                             )
                             .child(
                                 Button::new("schema-diff-run", "Run Script…")
-                                    .style(ButtonStyle::Filled)
+                                    .style(cyberpunk::Rank::Accent.style())
                                     .disabled(is_empty)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         (this.on_run.clone())(this.script_text(), window, cx);
@@ -414,6 +414,7 @@ impl Render for SchemaDiffView {
                             )
                             .child(
                                 IconButton::new("schema-diff-close", IconName::Close)
+                                    .style(cyberpunk::Rank::Neutral.style())
                                     .tooltip(Tooltip::text("Close"))
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                             ),

@@ -62,7 +62,7 @@ use time::macros::format_description;
 use ui::{
     CommonAnimationExt, ContextMenu, HighlightedLabel, Icon, IconButton, IconName, IconSize,
     Indicator, Label, LabelSize, PopoverMenu, ProgressBar, ScrollAxes, Scrollbars, Tooltip,
-    WithScrollbar, prelude::*, right_click_menu,
+    WithScrollbar, cyberpunk, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use util::TryFutureExt as _;
@@ -4552,16 +4552,18 @@ impl Render for MasterPasswordView {
                     .when(self.allow_skip, |row| {
                         row.child(
                             Button::new("master-password-skip", "Skip passwords")
+                                .style(cyberpunk::Rank::Quiet.style())
                                 .on_click(cx.listener(|this, _, window, cx| this.skip(window, cx))),
                         )
                     })
                     .child(
                         Button::new("master-password-cancel", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("master-password-confirm", self.confirm_label.clone())
-                            .style(ButtonStyle::Filled)
+                            .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
@@ -4668,16 +4670,19 @@ impl Render for QueryParamsView {
                     .gap_2()
                     .child(
                         Button::new("params-cancel", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new("params-strip", "Run as-is").on_click(
-                            cx.listener(|this, _, window, cx| this.run(true, window, cx)),
-                        ),
+                        Button::new("params-strip", "Run as-is")
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run(true, window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("params-run", "Run")
-                            .style(ButtonStyle::Filled)
+                            .style(cyberpunk::Rank::Accent.style())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.run(false, window, cx)),
                             ),
@@ -4841,6 +4846,7 @@ impl Render for RenameTableView {
                     .gap_2()
                     .child(
                         Button::new("rename-table-cancel", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
@@ -4848,7 +4854,7 @@ impl Render for RenameTableView {
                             .debug_selector(|| "rename-table-confirm".into())
                             .child(
                                 Button::new("rename-table-confirm", "Rename")
-                                    .style(ButtonStyle::Filled)
+                                    .style(cyberpunk::Rank::Accent.style())
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.confirm(window, cx)),
                                     ),
@@ -8030,97 +8036,98 @@ impl DatabasePanel {
                     .py_1()
                     .child(Label::new("Database Explorer").size(LabelSize::Small)),
             )
-            .child(
-                h_flex()
-                    .debug_selector(|| "db-explorer-icon-row".to_string())
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .pb_1()
-                    .child(
-                        div()
-                            .debug_selector(|| "db-explorer-add-connection".to_string())
-                            .child(
-                                IconButton::new("add-connection", IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Add Connection"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_add_connection_modal(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "selection-connect".to_string())
-                            .child(
-                                IconButton::new("selection-connect", IconName::PlayFilled)
-                                    .icon_size(IconSize::Small)
-                                    .disabled(!has_selection || is_connected)
-                                    .tooltip(Tooltip::text("Connect"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let Some(id) = id else { return };
-                                        this.store.update(cx, |store, cx| {
-                                            store.connect(id, cx).detach_and_log_err(cx);
-                                        });
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "selection-refresh".to_string())
-                            .child(
-                                IconButton::new("selection-refresh", IconName::RefreshTitle)
-                                    .icon_size(IconSize::Small)
-                                    .disabled(!has_selection || !is_connected)
-                                    .tooltip(Tooltip::text("Refresh"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let Some(id) = id else { return };
-                                        this.store.update(cx, |store, cx| {
-                                            store
-                                                .refresh_schema_cache(id, cx)
-                                                .detach_and_log_err(cx);
-                                        });
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "selection-new-query".to_string())
-                            .child(
-                                IconButton::new("selection-new-query", IconName::File)
-                                    .icon_size(IconSize::Small)
-                                    .disabled(!has_selection)
-                                    .tooltip(Tooltip::text(
-                                        driver.map_or("SQL Queries", new_query_button_label),
-                                    ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        let (Some(id), Some(label)) =
-                                            (id, label_for_new_query.clone())
-                                        else {
-                                            return;
-                                        };
-                                        if driver == Some(DatabaseDriver::Aerospike) {
-                                            this.open_new_aerospike_view(
-                                                id,
-                                                label,
-                                                database_for_new_query.clone(),
-                                                window,
-                                                cx,
+            .child({
+                let mut actions: Vec<AnyElement> = Vec::new();
+                actions.push(
+                    div()
+                        .debug_selector(|| "db-explorer-add-connection".to_string())
+                        .child(
+                            IconButton::new("add-connection", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Add Connection"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_add_connection_modal(window, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                actions.push(
+                    div()
+                        .debug_selector(|| "selection-connect".to_string())
+                        .child(
+                            IconButton::new("selection-connect", IconName::PlayFilled)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_selection || is_connected)
+                                .tooltip(Tooltip::text("Connect"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(id) = id else { return };
+                                    this.store.update(cx, |store, cx| {
+                                        store.connect(id, cx).detach_and_log_err(cx);
+                                    });
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                actions.push(
+                    div()
+                        .debug_selector(|| "selection-refresh".to_string())
+                        .child(
+                            IconButton::new("selection-refresh", IconName::RefreshTitle)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_selection || !is_connected)
+                                .tooltip(Tooltip::text("Refresh"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(id) = id else { return };
+                                    this.store.update(cx, |store, cx| {
+                                        store
+                                            .refresh_schema_cache(id, cx)
+                                            .detach_and_log_err(cx);
+                                    });
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                actions.push(
+                    div()
+                        .debug_selector(|| "selection-new-query".to_string())
+                        .child(
+                            IconButton::new("selection-new-query", IconName::File)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_selection)
+                                .tooltip(Tooltip::text(
+                                    driver.map_or("SQL Queries", new_query_button_label),
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let (Some(id), Some(label)) =
+                                        (id, label_for_new_query.clone())
+                                    else {
+                                        return;
+                                    };
+                                    if driver == Some(DatabaseDriver::Aerospike) {
+                                        this.open_new_aerospike_view(
+                                            id,
+                                            label,
+                                            database_for_new_query.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    this.workspace
+                                        .update(cx, |workspace, cx| {
+                                            open_new_sql_query(
+                                                workspace, id, label, window, cx,
                                             );
-                                            return;
-                                        }
-                                        this.workspace
-                                            .update(cx, |workspace, cx| {
-                                                open_new_sql_query(
-                                                    workspace, id, label, window, cx,
-                                                );
-                                            })
-                                            .log_err();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div().debug_selector(|| "selection-exec".to_string()).child(
+                                        })
+                                        .log_err();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                actions.push(
+                    div()
+                        .debug_selector(|| "selection-exec".to_string())
+                        .child(
                             IconButton::new("selection-exec", IconName::Terminal)
                                 .icon_size(IconSize::Small)
                                 .disabled(
@@ -8142,10 +8149,13 @@ impl DatabasePanel {
                                         cx,
                                     );
                                 })),
-                        ),
-                    )
-                    .child(
-                        div().debug_selector(|| "selection-edit".to_string()).child(
+                        )
+                        .into_any_element(),
+                );
+                actions.push(
+                    div()
+                        .debug_selector(|| "selection-edit".to_string())
+                        .child(
                             IconButton::new("selection-edit", IconName::Pencil)
                                 .icon_size(IconSize::Small)
                                 .disabled(!has_selection)
@@ -8156,10 +8166,15 @@ impl DatabasePanel {
                                     };
                                     this.open_edit_connection_modal(config, window, cx);
                                 })),
-                        ),
-                    )
-                    .child(self.render_overflow_menu(cx)),
-            )
+                        )
+                        .into_any_element(),
+                );
+                actions.push(self.render_overflow_menu(cx).into_any_element());
+                cyberpunk::segmented(actions)
+                    .debug_selector(|| "db-explorer-icon-row".to_string())
+                    .px_2()
+                    .pb_1()
+            })
             .child(
                 div().px_2().py_1().border_t_1().child(
                     h_flex()

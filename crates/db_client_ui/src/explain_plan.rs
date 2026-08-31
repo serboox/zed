@@ -6,7 +6,9 @@ use gpui::{
 };
 use std::collections::HashSet;
 use ui::prelude::*;
-use ui::{Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip, h_flex, v_flex};
+use ui::{
+    Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip, cyberpunk, h_flex, v_flex,
+};
 use workspace::{Item, item::ItemEvent};
 
 /// One node of a query plan tree. `children` are the sub-operations nested under
@@ -602,61 +604,60 @@ impl ExplainPlanView {
 impl Render for ExplainPlanView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
+        let toolbar_actions: Vec<AnyElement> = vec![
+            div()
+                .id("plan-mode-tree-hitbox")
+                .debug_selector(|| "plan-mode-tree".to_string())
+                .child(
+                    IconButton::new("plan-mode-tree", IconName::ListTree)
+                        .icon_size(IconSize::XSmall)
+                        .toggle_state(mode == PlanViewMode::Tree)
+                        .tooltip(Tooltip::text("Tree View"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.mode != PlanViewMode::Tree {
+                                this.toggle_mode(cx);
+                            }
+                        })),
+                )
+                .into_any_element(),
+            div()
+                .id("plan-mode-flame-hitbox")
+                .debug_selector(|| "plan-mode-flame".to_string())
+                .child(
+                    IconButton::new("plan-mode-flame", IconName::Flame)
+                        .icon_size(IconSize::XSmall)
+                        .toggle_state(mode == PlanViewMode::Flame)
+                        .tooltip(Tooltip::text("Flame View"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.mode != PlanViewMode::Flame {
+                                this.toggle_mode(cx);
+                            }
+                        })),
+                )
+                .into_any_element(),
+            div()
+                .id("plan-copy-native-hitbox")
+                .debug_selector(|| "plan-copy-native".to_string())
+                .child(
+                    IconButton::new("plan-copy-native", IconName::Copy)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(self.query_context.is_none())
+                        .tooltip(Tooltip::text("Copy Native Format"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.copy_native_format(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        ];
         let toolbar = h_flex()
             .id("explain-plan-toolbar")
             .debug_selector(|| "EXPLAIN_PLAN_TOOLBAR".to_string())
             .w_full()
             .px_2()
             .py_1()
-            .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                div()
-                    .id("plan-mode-tree-hitbox")
-                    .debug_selector(|| "plan-mode-tree".to_string())
-                    .child(
-                        IconButton::new("plan-mode-tree", IconName::ListTree)
-                            .icon_size(IconSize::XSmall)
-                            .toggle_state(mode == PlanViewMode::Tree)
-                            .tooltip(Tooltip::text("Tree View"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.mode != PlanViewMode::Tree {
-                                    this.toggle_mode(cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("plan-mode-flame-hitbox")
-                    .debug_selector(|| "plan-mode-flame".to_string())
-                    .child(
-                        IconButton::new("plan-mode-flame", IconName::Flame)
-                            .icon_size(IconSize::XSmall)
-                            .toggle_state(mode == PlanViewMode::Flame)
-                            .tooltip(Tooltip::text("Flame View"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.mode != PlanViewMode::Flame {
-                                    this.toggle_mode(cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("plan-copy-native-hitbox")
-                    .debug_selector(|| "plan-copy-native".to_string())
-                    .child(
-                        IconButton::new("plan-copy-native", IconName::Copy)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(self.query_context.is_none())
-                            .tooltip(Tooltip::text("Copy Native Format"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.copy_native_format(window, cx);
-                            })),
-                    ),
-            );
+            .child(cyberpunk::segmented(toolbar_actions));
 
         let body: AnyElement = match mode {
             PlanViewMode::Tree => div()

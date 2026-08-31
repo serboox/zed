@@ -1964,7 +1964,7 @@ impl RequestView {
                     .with_handle(self.variable_picker_handle.clone())
                     .trigger(
                         Button::new("request-variable-picker-trigger", "Variables")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .label_size(LabelSize::Small),
                     )
                     .menu(move |window, cx| {
@@ -2801,6 +2801,19 @@ impl RequestView {
         .detach();
     }
 
+    /// The comparison-source trigger's rank: accent-tinted once an environment
+    /// is chosen (it is then doing something), quiet otherwise -- but framed
+    /// either way, never the borderless default. Kept as its own function so
+    /// the "otherwise" branch is covered by a test independent of rendering
+    /// the whole Diff tab.
+    fn diff_comparison_trigger_style(has_comparison: bool) -> ButtonStyle {
+        if has_comparison {
+            ButtonStyle::Tinted(ui::TintColor::Accent)
+        } else {
+            cyberpunk::Rank::Quiet.style()
+        }
+    }
+
     /// The comparison-source selector shown at the top of the Diff tab:
     /// "vs Previous Response" (the default, always-available mode) or "vs
     /// Environment..." which reveals a picker of every environment to fire
@@ -2836,11 +2849,9 @@ impl RequestView {
                     .trigger(
                         Button::new("diff-comparison-selector-trigger", trigger_label)
                             .start_icon(Icon::new(IconName::Diff))
-                            .style(if comparison_name.is_some() {
-                                ButtonStyle::Tinted(ui::TintColor::Accent)
-                            } else {
-                                ButtonStyle::Subtle
-                            })
+                            .style(Self::diff_comparison_trigger_style(
+                                comparison_name.is_some(),
+                            ))
                             .disabled(self.comparing_environment),
                     )
                     .menu(move |window, cx| {
@@ -2948,7 +2959,7 @@ impl RequestView {
                     .with_handle(popover_handle)
                     .trigger(
                         ui::ButtonLike::new("request-method-selector-trigger")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .child(
                                 h_flex()
                                     .items_center()
@@ -3142,7 +3153,7 @@ impl RequestView {
                                 .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
                                 .style(match armed {
                                     true => ButtonStyle::Tinted(ui::TintColor::Accent),
-                                    false => ButtonStyle::Subtle,
+                                    false => cyberpunk::Rank::Quiet.style(),
                                 })
                                 .disabled(self.comparing_environments),
                             move |_window, cx| {
@@ -3196,7 +3207,7 @@ impl RequestView {
                                 .style(if is_chosen {
                                     ButtonStyle::Tinted(ui::TintColor::Accent)
                                 } else {
-                                    ButtonStyle::Subtle
+                                    cyberpunk::Rank::Quiet.style()
                                 }),
                             move |_window, cx| Tooltip::simple("Environment for this request", cx),
                             gpui::Anchor::TopLeft,
@@ -3811,7 +3822,7 @@ impl RequestView {
                                 .debug_selector(|| "request-format-body".to_string())
                                 .child(
                                     Button::new("request-format-body", "Format")
-                                        .style(ButtonStyle::Subtle)
+                                        .style(cyberpunk::Rank::Quiet.style())
                                         .label_size(LabelSize::Small)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.format_body(window, cx);
@@ -4068,7 +4079,7 @@ impl RequestView {
                                     .debug_selector(|| "oauth2-get-token".to_string())
                                     .child(
                                         Button::new("oauth2-get-token", "Get New Access Token")
-                                            .style(ButtonStyle::Subtle)
+                                            .style(cyberpunk::Rank::Accent.style())
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.get_new_access_token(window, cx)
                                             })),
@@ -4374,7 +4385,7 @@ impl RequestView {
                     )
                     .child(
                         Button::new("api-client-response-reveal-dock", "Show Response")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.reveal_response_dock(window, cx);
                             })),
@@ -4468,48 +4479,41 @@ impl RequestView {
                             )
                             .child(Label::new(size).size(LabelSize::Small).color(Color::Muted)),
                     )
-                    .child(
-                        h_flex()
-                            .gap_1()
+                    .child(cyberpunk::segmented(vec![
+                        div()
+                            .id("request-response-fullscreen-hitbox")
+                            .debug_selector(|| "request-response-fullscreen".to_string())
                             .child(
-                                div()
-                                    .id("request-response-fullscreen-hitbox")
-                                    .debug_selector(|| "request-response-fullscreen".to_string())
-                                    .child(
-                                        IconButton::new(
-                                            "request-response-fullscreen",
-                                            if self.response_fullscreen {
-                                                IconName::Minimize
-                                            } else {
-                                                IconName::Maximize
-                                            },
-                                        )
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text(if self.response_fullscreen {
-                                            "Exit fullscreen"
-                                        } else {
-                                            "View response fullscreen"
-                                        }))
-                                        .on_click(
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.toggle_response_fullscreen(cx)
-                                            }),
-                                        ),
-                                    ),
+                                IconButton::new(
+                                    "request-response-fullscreen",
+                                    if self.response_fullscreen {
+                                        IconName::Minimize
+                                    } else {
+                                        IconName::Maximize
+                                    },
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text(if self.response_fullscreen {
+                                    "Exit fullscreen"
+                                } else {
+                                    "View response fullscreen"
+                                }))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.toggle_response_fullscreen(cx)
+                                })),
                             )
+                            .into_any_element(),
+                        div()
+                            .id("request-save-example-hitbox")
+                            .debug_selector(|| "request-save-example".to_string())
                             .child(
-                                div()
-                                    .id("request-save-example-hitbox")
-                                    .debug_selector(|| "request-save-example".to_string())
-                                    .child(
-                                        Button::new("request-save-example", "Save as Example")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.save_response_as_example(window, cx)
-                                            })),
-                                    ),
-                            ),
-                    );
+                                Button::new("request-save-example", "Save as Example")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_response_as_example(window, cx)
+                                    })),
+                            )
+                            .into_any_element(),
+                    ]));
 
                 let mut tab_strip = h_flex().gap_2().child(Self::render_chip_scoped(
                     "response-tab",
@@ -4846,7 +4850,7 @@ impl Render for RequestView {
                     .debug_selector(|| "request-copy-curl".to_string())
                     .child(
                         Button::new("request-copy-curl", "Code")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .start_icon(Icon::new(IconName::Code).size(IconSize::Small))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.show_as_code(window, cx)),
@@ -5547,6 +5551,7 @@ impl Render for CodeSnippetModal {
                             .child(self.render_picker(cx))
                             .child(
                                 IconButton::new("code-snippet-close", IconName::Close)
+                                    .style(cyberpunk::Rank::Neutral.style())
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Close"))
                                     .on_click(
@@ -5621,6 +5626,22 @@ mod tests {
     use terminal_view::terminal_panel::TerminalPanel;
     use workspace::ItemHandle as _;
     use workspace::dock::Panel as _;
+
+    // Before this rank was wired in, an unarmed comparison trigger fell back to
+    // `ButtonStyle::Subtle`, which paints no border at rest -- the trigger read
+    // as a caption rather than an action until the reader hovered it. This
+    // guards the "otherwise" branch specifically, since the "armed" branch was
+    // already tinted (and so already framed) before this fix.
+    #[test]
+    fn diff_comparison_trigger_is_framed_even_when_unarmed() {
+        let unarmed = RequestView::diff_comparison_trigger_style(false);
+        assert_ne!(unarmed, ButtonStyle::Subtle);
+        assert_ne!(unarmed, ButtonStyle::Filled);
+
+        let armed = RequestView::diff_comparison_trigger_style(true);
+        assert_ne!(armed, ButtonStyle::Subtle);
+        assert_ne!(armed, ButtonStyle::Filled);
+    }
 
     #[test]
     fn every_raw_body_content_type_maps_to_the_matching_language_and_header_value() {

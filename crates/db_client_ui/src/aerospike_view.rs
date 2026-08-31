@@ -5,7 +5,7 @@ use gpui::{
     WeakEntity, Window, prelude::*, px,
 };
 use ui::prelude::*;
-use ui::{Button, ButtonStyle, IconName, Label, LabelSize};
+use ui::{Button, IconName, Label, LabelSize, cyberpunk};
 use util::ResultExt;
 use workspace::{Item, Workspace, item::ItemEvent};
 
@@ -379,7 +379,7 @@ impl Render for AerospikeView {
                     .child(
                         div().debug_selector(|| "aerospike-get".to_string()).child(
                             Button::new("aerospike-get", "Get")
-                                .style(ButtonStyle::Filled)
+                                .style(cyberpunk::Rank::Neutral.style())
                                 .disabled(self.is_running)
                                 .on_click(
                                     cx.listener(|view, _, window, cx| view.run_get(window, cx)),
@@ -389,7 +389,7 @@ impl Render for AerospikeView {
                     .child(
                         div().debug_selector(|| "aerospike-put".to_string()).child(
                             Button::new("aerospike-put", "Put")
-                                .style(ButtonStyle::Filled)
+                                .style(cyberpunk::Rank::Neutral.style())
                                 .disabled(self.is_running)
                                 .on_click(
                                     cx.listener(|view, _, window, cx| view.run_put(window, cx)),
@@ -398,7 +398,7 @@ impl Render for AerospikeView {
                     )
                     .child(
                         Button::new("aerospike-scan", "Scan")
-                            .style(ButtonStyle::Filled)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .disabled(self.is_running)
                             .on_click(cx.listener(|view, _, window, cx| view.run_scan(window, cx))),
                     ),

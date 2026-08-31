@@ -636,12 +636,14 @@ impl Render for NativeDumpDialog {
                     .child(
                         div()
                             .debug_selector(|| "DUMP_CANCEL_BTN".to_string())
-                            .child(Button::new("dump-cancel", "Cancel").on_click(cx.listener(
-                                |_, _, _, cx| {
-                                    cx.emit(NativeDumpEvent::Dismissed);
-                                    cx.emit(DismissEvent);
-                                },
-                            ))),
+                            .child(
+                                Button::new("dump-cancel", "Cancel")
+                                    .style(cyberpunk::Rank::Neutral.style())
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(NativeDumpEvent::Dismissed);
+                                        cx.emit(DismissEvent);
+                                    })),
+                            ),
                     )
                     .child(
                         div().debug_selector(|| "DUMP_RUN_BTN".to_string()).child(

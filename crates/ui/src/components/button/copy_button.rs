@@ -37,6 +37,7 @@ pub struct CopyButton {
     disabled: bool,
     tooltip_label: SharedString,
     visible_on_hover: Option<SharedString>,
+    style: Option<ButtonStyle>,
     custom_on_click: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
 
@@ -49,8 +50,20 @@ impl CopyButton {
             disabled: false,
             tooltip_label: "Copy".into(),
             visible_on_hover: None,
+            style: None,
             custom_on_click: None,
         }
+    }
+
+    /// Gives the button a style of its own, and with it a frame at rest.
+    ///
+    /// Left unset by default on purpose: most of these sit inside a row and
+    /// appear on hover, where a frame each would be noise. A copy button that
+    /// stands on its own in a footer or a toolbar is an action like any other
+    /// and has to say so.
+    pub fn style(mut self, style: ButtonStyle) -> Self {
+        self.style = Some(style);
+        self
     }
 
     pub fn icon_size(mut self, icon_size: IconSize) -> Self {
@@ -102,6 +115,7 @@ impl RenderOnce for CopyButton {
         let button = IconButton::new(id, icon)
             .icon_color(color)
             .icon_size(self.icon_size)
+            .when_some(self.style, |button, style| button.style(style))
             .disabled(self.disabled)
             .tooltip(Tooltip::text(tooltip))
             .on_click(move |_, window, cx| {

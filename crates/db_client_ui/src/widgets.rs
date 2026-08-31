@@ -41,6 +41,13 @@ pub(crate) fn text_field(editor: &Entity<Editor>, cx: &App) -> Div {
         .child(editor.clone())
 }
 
+/// The close button's rank: the way out of the dialog, same as a Cancel
+/// button elsewhere. Kept as its own function so the choice is covered by a
+/// test independent of rendering a whole dialog.
+pub(crate) fn dialog_close_button_style() -> ButtonStyle {
+    cyberpunk::Rank::Neutral.style()
+}
+
 /// Title row shared by the database client's centered dialogs: a large title on
 /// the left and a close button with a tooltip on the right.
 pub(crate) fn dialog_header(
@@ -60,7 +67,24 @@ pub(crate) fn dialog_header(
         )
         .child(
             IconButton::new(close_id, IconName::Close)
+                .style(dialog_close_button_style())
                 .tooltip(Tooltip::text("Close"))
                 .on_click(on_close),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The dialog close button appears in every dialog built on `dialog_header`
+    // (a dozen or more across this crate). If this ever regresses back to the
+    // unframed default, every one of them silently loses its border at once --
+    // this test exists to make that regression loud instead of silent.
+    #[test]
+    fn dialog_close_button_is_not_the_unframed_default() {
+        let style = dialog_close_button_style();
+        assert_ne!(style, ButtonStyle::Subtle);
+        assert_ne!(style, ButtonStyle::Filled);
+    }
 }

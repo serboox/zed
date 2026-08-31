@@ -4,7 +4,7 @@ use gpui::{
     actions, prelude::*, px,
 };
 use ui::prelude::*;
-use ui::{Button, Divider, Icon, Label};
+use ui::{Button, Divider, Icon, Label, cyberpunk};
 use util::ResultExt;
 use workspace::{Item, item::ItemEvent};
 
@@ -360,7 +360,7 @@ impl Render for DdlSourceView {
                     .child(crate::widgets::text_field(&self.path_editor, cx).flex_1())
                     .child(
                         Button::new("load-ddl", "Load")
-                            .style(ButtonStyle::Filled)
+                            .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|view, _, window, cx| view.load(window, cx))),
                     ),
             )

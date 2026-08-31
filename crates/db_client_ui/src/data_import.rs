@@ -596,9 +596,9 @@ impl Render for ImportDataView {
                             .debug_selector(|| "IMPORT_PATH_FIELD".to_string()),
                     )
                     .child(
-                        ui::Button::new("load-file", "Load").on_click(
-                            cx.listener(|view, _, window, cx| view.load_file(window, cx)),
-                        ),
+                        ui::Button::new("load-file", "Load")
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .on_click(cx.listener(|view, _, window, cx| view.load_file(window, cx))),
                     ),
             )
             .child(
@@ -685,6 +685,7 @@ impl Render for ImportDataView {
                     .gap_2()
                     .child(
                         ui::Button::new("cancel-import", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(

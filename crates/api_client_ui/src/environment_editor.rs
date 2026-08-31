@@ -551,7 +551,7 @@ impl EnvironmentEditorModal {
                             .debug_selector(|| "environment-editor-create".to_string())
                             .child(
                                 Button::new("environment-editor-create", "New")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Quiet.style())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.create_environment(window, cx);
                                     })),
@@ -749,7 +749,7 @@ impl EnvironmentEditorModal {
             if !matches!(self.scope, Scope::Global) {
                 column = column.child(
                     Button::new("environment-editor-duplicate", "Duplicate")
-                        .style(ButtonStyle::Subtle)
+                        .style(cyberpunk::Rank::Quiet.style())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.duplicate_environment(window, cx);
                         })),

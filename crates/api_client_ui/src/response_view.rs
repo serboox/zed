@@ -1,6 +1,6 @@
 use api_client::ParsedCookie;
 use gpui::{AnyElement, App, ClipboardItem, SharedString};
-use ui::{ButtonStyle, IconButton, IconName, IconSize, Tooltip, prelude::*};
+use ui::{IconButton, IconName, IconSize, Tooltip, cyberpunk, prelude::*};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseTab {
@@ -386,7 +386,7 @@ pub fn render_pairs(
                 .child(
                     Button::new(SharedString::from(format!("{id}-copy-all")), "Copy all")
                         .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Subtle)
+                        .style(cyberpunk::Rank::Quiet.style())
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(all_of_it.clone()));
                         }),

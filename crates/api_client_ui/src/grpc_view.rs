@@ -5,7 +5,8 @@ use gpui::{
     Subscription, Window,
 };
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*,
+    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, cyberpunk,
+    prelude::*,
 };
 use util::ResultExt;
 use workspace::{Item, item::ItemEvent};
@@ -566,6 +567,8 @@ impl Render for GrpcView {
                     .px_2()
                     .py_0p5()
                     .rounded_md()
+                    .border_1()
+                    .border_color(border)
                     .cursor_pointer()
                     .when(tls_enabled, |el| {
                         el.bg(cx.theme().colors().element_selected)
@@ -578,7 +581,9 @@ impl Render for GrpcView {
                     .id("grpc-connect-reflection-hitbox")
                     .debug_selector(|| "grpc-connect-reflection".to_string())
                     .child(
-                        Button::new("grpc-connect-reflection", "Connect via Reflection").on_click(
+                        Button::new("grpc-connect-reflection", "Connect via Reflection")
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.connect_via_reflection(window, cx)
                             }),
@@ -591,7 +596,7 @@ impl Render for GrpcView {
                     .debug_selector(|| "grpc-import-proto".to_string())
                     .child(
                         Button::new("grpc-import-proto", "Import .proto Files")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.import_proto_files(window, cx)
                             })),
@@ -684,7 +689,7 @@ impl Render for GrpcView {
                                 .debug_selector(|| "grpc-use-example".to_string())
                                 .child(
                                     Button::new("grpc-use-example", "Use Example Message")
-                                        .style(ButtonStyle::Subtle)
+                                        .style(cyberpunk::Rank::Quiet.style())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.use_example_message(window, cx)
                                         })),
@@ -696,7 +701,7 @@ impl Render for GrpcView {
                                 .debug_selector(|| "grpc-beautify".to_string())
                                 .child(
                                     Button::new("grpc-beautify", "Beautify")
-                                        .style(ButtonStyle::Subtle)
+                                        .style(cyberpunk::Rank::Quiet.style())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.beautify_request(window, cx)
                                         })),
@@ -707,7 +712,9 @@ impl Render for GrpcView {
                                 .id("grpc-send-hitbox")
                                 .debug_selector(|| "grpc-send".to_string())
                                 .when(can_send, |el| {
-                                    el.child(Button::new("grpc-send", "Send").on_click(
+                                    el.child(Button::new("grpc-send", "Send")
+                                        .style(cyberpunk::Rank::Accent.style())
+                                        .on_click(
                                         cx.listener(|this, _, window, cx| this.send(window, cx)),
                                     ))
                                 })

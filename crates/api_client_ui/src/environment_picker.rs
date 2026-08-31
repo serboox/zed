@@ -5,7 +5,7 @@ use gpui::{AnyElement, App, Context, DismissEvent, Entity, Task, WeakEntity, Win
 use picker::{Picker, PickerDelegate};
 use ui::{
     ElevationIndex, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
-    ListItemSpacing, SharedString, Tooltip, prelude::*,
+    ListItemSpacing, SharedString, Tooltip, cyberpunk, prelude::*,
 };
 use workspace::Workspace;
 
@@ -288,6 +288,7 @@ impl PickerDelegate for EnvironmentPickerDelegate {
                 .debug_selector(|| "environment-picker-new".to_string())
                 .child(
                     IconButton::new("environment-picker-new", IconName::Plus)
+                        .style(cyberpunk::Rank::Quiet.style())
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("New Environment"))
                         .on_click(move |_, window, cx| {

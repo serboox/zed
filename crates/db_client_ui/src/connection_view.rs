@@ -13,7 +13,7 @@ use platform_title_bar::PlatformTitleBar;
 use settings::Settings;
 use ui::{
     Button, ButtonCommon, ButtonStyle, Checkbox, Icon, IconName, Label, LabelSize, ToggleState,
-    prelude::*,
+    cyberpunk, prelude::*,
 };
 use util::ResultExt as _;
 use uuid::Uuid;
@@ -1073,7 +1073,7 @@ impl ConnectionView {
                             .child(
                                 div().debug_selector(|| "cancel-button".to_string()).child(
                                     Button::new("cancel", "Cancel")
-                                        .style(ButtonStyle::Filled)
+                                        .style(cyberpunk::Rank::Neutral.style())
                                         .size(ButtonSize::Large)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.close(window, cx);
@@ -1086,7 +1086,7 @@ impl ConnectionView {
                                 // dialled until the reader opens it.
                                 div().debug_selector(|| "save-button".to_string()).child(
                                     Button::new("save", "Save")
-                                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                        .style(cyberpunk::Rank::Accent.style())
                                         .size(ButtonSize::Large)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             if let Some(config) = this.build_config(cx) {

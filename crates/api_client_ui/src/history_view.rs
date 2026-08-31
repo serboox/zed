@@ -10,7 +10,8 @@ use gpui::{
     Render, ScrollHandle, Subscription, WeakEntity, Window, px,
 };
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*,
+    Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, cyberpunk,
+    prelude::*,
 };
 use uuid::Uuid;
 use workspace::{Item, Workspace, item::ItemEvent};
@@ -189,7 +190,7 @@ impl Render for HistoryView {
                             .debug_selector(|| "history-clear".to_string())
                             .child(
                                 Button::new("history-clear", "Clear")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Destructive.style())
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.clear(window, cx)),
                                     ),
@@ -704,7 +705,7 @@ impl Render for HistoryDetailView {
                             .debug_selector(|| "history-detail-edit".to_string())
                             .child(
                                 Button::new("history-detail-edit", "Edit & Resend")
-                                    .style(ButtonStyle::Subtle)
+                                    .style(cyberpunk::Rank::Accent.style())
                                     .disabled(!can_open_request)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_request(window, cx)
