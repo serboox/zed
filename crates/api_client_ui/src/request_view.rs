@@ -577,6 +577,10 @@ pub struct RequestView {
     test_results: Vec<api_client::TestResult>,
     visualize_data: Option<serde_json::Value>,
     scroll_handle: ScrollHandle,
+    /// The tab body's own scrolling. Separate from the response's: the two are
+    /// different regions of the window and a reader scrolls whichever one the
+    /// pointer is over.
+    tab_scroll_handle: ScrollHandle,
     /// The picker the chip opens, built once: it holds the reader's search text
     /// and which row they are on, and both belong to the picker rather than to
     /// each opening of it.
@@ -925,6 +929,7 @@ impl RequestView {
             test_results: Vec::new(),
             visualize_data: None,
             scroll_handle: ScrollHandle::new(),
+            tab_scroll_handle: ScrollHandle::new(),
             environment_picker,
             environment_pin_handle: ui::PopoverMenuHandle::default(),
             variable_picker_handle: ui::PopoverMenuHandle::default(),
@@ -1831,31 +1836,18 @@ impl RequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Only an existing row is updated; none is created. The automatic
+        // header already states the format, and writing a second, manual copy
+        // of it beside that one would give a reader two places to look and two
+        // things to keep in agreement.
+        let Some(index) = self.manual_content_type(cx) else {
+            return;
+        };
         let value = content_type_header_value(content_type);
-        let existing = self.header_rows.iter().position(|row| {
-            row.key_editor
-                .read(cx)
-                .text(cx)
-                .eq_ignore_ascii_case("Content-Type")
+        let value_editor = self.header_rows[index].value_editor.clone();
+        value_editor.update(cx, |editor, cx| {
+            editor.set_text(value, window, cx);
         });
-        match existing {
-            Some(index) => {
-                let value_editor = self.header_rows[index].value_editor.clone();
-                value_editor.update(cx, |editor, cx| {
-                    editor.set_text(value, window, cx);
-                });
-            }
-            None => {
-                self.push_header_row(
-                    "Content-Type".into(),
-                    value.into(),
-                    String::new(),
-                    true,
-                    window,
-                    cx,
-                );
-            }
-        }
         self.persist_headers(cx);
     }
 
@@ -3328,7 +3320,7 @@ impl RequestView {
     ///
     /// Each is switchable except the two the transport works out for itself
     /// (`Content-Length`, `Host`), which are there to be read.
-    fn automatic_header_rows(&self) -> Vec<FixedRow> {
+    fn automatic_header_rows(&self, cx: &App) -> Vec<FixedRow> {
         if !self.show_auto_headers {
             return Vec::new();
         }
@@ -3350,7 +3342,31 @@ impl RequestView {
                 toggle: None,
             });
         }
+        // Derived from the body rather than written down when a format is
+        // picked. A request opened with a format already chosen was never
+        // "picked" in this session, so a header written only on the click was
+        // simply missing -- and one written down once could then disagree with
+        // a format changed later. A row the reader typed themselves wins and is
+        // left alone: an explicit Content-Type is an override, not a mistake.
+        if self.body_kind == BodyKind::Raw && self.manual_content_type(cx).is_none() {
+            rows.push(FixedRow {
+                key: SharedString::from("Content-Type"),
+                value: SharedString::from(content_type_header_value(self.body_content_type)),
+                enabled: true,
+                toggle: None,
+            });
+        }
         rows
+    }
+
+    /// The reader's own Content-Type row, if they wrote one.
+    fn manual_content_type(&self, cx: &App) -> Option<usize> {
+        self.header_rows.iter().position(|row| {
+            row.key_editor
+                .read(cx)
+                .text(cx)
+                .eq_ignore_ascii_case("Content-Type")
+        })
     }
 
     /// The switch that shows or hides those rows.
@@ -3719,7 +3735,7 @@ impl RequestView {
                     Self::render_key_value_rows(
                         &self.header_rows,
                         "headers",
-                        self.automatic_header_rows(),
+                        self.automatic_header_rows(cx),
                         Self::toggle_auto_header,
                         Self::toggle_header_row,
                         Self::remove_header_row,
@@ -4498,19 +4514,20 @@ impl RequestView {
                                 } else {
                                     "View response fullscreen"
                                 }))
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.toggle_response_fullscreen(cx)
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| this.toggle_response_fullscreen(cx),
+                                )),
                             )
                             .into_any_element(),
                         div()
                             .id("request-save-example-hitbox")
                             .debug_selector(|| "request-save-example".to_string())
                             .child(
-                                Button::new("request-save-example", "Save as Example")
-                                    .on_click(cx.listener(|this, _, window, cx| {
+                                Button::new("request-save-example", "Save as Example").on_click(
+                                    cx.listener(|this, _, window, cx| {
                                         this.save_response_as_example(window, cx)
-                                    })),
+                                    }),
+                                ),
                             )
                             .into_any_element(),
                     ]));
@@ -4994,8 +5011,28 @@ impl Render for RequestView {
             .gap_3()
             .child(url_row)
             .when_some(url_warning, |this, warning| this.child(warning))
-            .child(tab_strip)
-            .child(div().child(tab_body));
+            .child(tab_strip);
+
+        // The tab's own body scrolls rather than growing. A request with thirty
+        // headers made the table as tall as it wanted to be, and everything
+        // under it -- the response, and the last rows of the table itself --
+        // went off the bottom of the window with no way to reach them. The
+        // address and the tab strip stay put, because they are how a reader
+        // gets anywhere at all.
+        let tab_region = div()
+            .id("api-client-tab-scroll-region")
+            .debug_selector(|| "api-client-tab-scroll-region".to_string())
+            .flex_initial()
+            .min_h(px(0.))
+            .overflow_scroll()
+            .track_scroll(&self.tab_scroll_handle)
+            .child(tab_body)
+            .custom_scrollbars(
+                Scrollbars::always_visible(ScrollAxes::Both)
+                    .tracked_scroll_handle(&self.tab_scroll_handle),
+                window,
+                cx,
+            );
 
         // `flex_initial` (grow: 0, shrink: 1, basis: auto) sizes this to the
         // response's own content height when there's room, and lets it shrink
@@ -5038,6 +5075,7 @@ impl Render for RequestView {
             .gap_3()
             .bg(editor_background)
             .child(top_section)
+            .child(tab_region)
             .child(response_region)
             .into_any_element()
     }
@@ -6397,6 +6435,69 @@ mod tests {
         cx.simulate_click(row, gpui::Modifiers::none());
         cx.run_until_parked();
         draw(cx);
+    }
+
+    /// A tab whose body is taller than the room it has scrolls, rather than
+    /// growing until the rest of the window is pushed off the bottom.
+    ///
+    /// Measured on the painted boxes and on the scroll region's own reach: a
+    /// table of thirty headers used to make the top of the window as tall as it
+    /// wanted, and the response beneath it -- along with the last rows of the
+    /// table itself -- went somewhere no reader could follow. Before this
+    /// existed there was no scroll region here at all, so the lookup below
+    /// fails against the older code.
+    #[gpui::test]
+    async fn a_tab_taller_than_its_room_scrolls_instead_of_pushing_the_rest_away(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
+        view.update_in(&mut cx, |view, window, cx| {
+            view.active_tab = RequestTab::Headers;
+            for at in 0..30 {
+                view.push_header_row(
+                    format!("x-header-{at}"),
+                    format!("value-{at}"),
+                    String::new(),
+                    true,
+                    window,
+                    cx,
+                );
+            }
+        });
+        // Short on purpose: the whole question is what happens when the body
+        // does not fit.
+        cx.simulate_resize(gpui::size(px(900.), px(420.)));
+        draw(&mut cx);
+
+        let window_bounds = cx
+            .debug_bounds("api-client-request-view")
+            .expect("the view is painted");
+        let region = cx
+            .debug_bounds("api-client-tab-scroll-region")
+            .expect("the tab body has a region of its own to scroll in");
+        assert!(
+            region.bottom() <= window_bounds.bottom() + px(1.),
+            "the tab body reaches {:?} in a window ending at {:?}: it is not bounded at all",
+            region.bottom(),
+            window_bounds.bottom()
+        );
+
+        let reach = view.read_with(&cx, |view, _| view.tab_scroll_handle.max_offset());
+        assert!(
+            reach.y > px(0.),
+            "thirty rows in a window this short have to leave something to scroll to,              and the region reports {reach:?}"
+        );
+
+        // And what sits below the tab is still on screen rather than pushed off.
+        let response = cx
+            .debug_bounds("api-client-response-scroll-region")
+            .expect("the response region is painted");
+        assert!(
+            response.bottom() <= window_bounds.bottom() + px(1.),
+            "the response ends at {:?} in a window ending at {:?}",
+            response.bottom(),
+            window_bounds.bottom()
+        );
     }
 
     /// The table of headers has room around it. Rows flush against the edges of
@@ -8519,48 +8620,82 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn picking_a_raw_body_content_type_auto_sets_the_content_type_header(
+    async fn the_content_type_header_follows_the_body_format_without_being_asked(
         cx: &mut TestAppContext,
     ) {
         let (_store, _request_id, view, mut cx) = build_request_view(cx).await;
-        view.update(&mut cx, |view, cx| {
-            view.set_body_kind(BodyKind::Raw, cx);
-            view.active_tab = RequestTab::Body;
+        // A request that was already in JSON when it was opened: nothing was
+        // clicked, which is exactly the case a header written on the click
+        // alone would miss.
+        view.update(&mut cx, |view, _| {
+            view.body_kind = BodyKind::Raw;
+            view.body_content_type = RawBodyContentType::Json;
+            view.active_tab = RequestTab::Headers;
         });
         draw(&mut cx);
 
-        let json_chip = debug_center(&mut cx, "content-type-chip-JSON");
-        cx.simulate_click(json_chip, gpui::Modifiers::none());
-        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("headers-fixed-Content-Type").is_some(),
+            "the format of the body states the header, so it is there to be read"
+        );
+        let shown = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.automatic_header_rows(cx)
+                    .into_iter()
+                    .find(|row| row.key == "Content-Type")
+                    .map(|row| row.value.to_string())
+            })
+        };
+        assert_eq!(shown(&mut cx).as_deref(), Some("application/json"));
 
-        view.read_with(&cx, |view, cx| {
-            let header = view
-                .header_rows
-                .iter()
-                .find(|row| row.key_editor.read(cx).text(cx) == "Content-Type")
-                .expect("the JSON chip must add a Content-Type header");
-            assert_eq!(header.value_editor.read(cx).text(cx), "application/json");
+        // And it follows the format rather than being written down once.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_content_type(RawBodyContentType::Xml, window, cx);
         });
+        draw(&mut cx);
+        assert_eq!(shown(&mut cx).as_deref(), Some("application/xml"));
 
-        let xml_chip = debug_center(&mut cx, "content-type-chip-XML");
-        cx.simulate_click(xml_chip, gpui::Modifiers::none());
-        cx.run_until_parked();
-
+        // A row the reader typed themselves wins, and there is then only one
+        // Content-Type in the table rather than two disagreeing ones.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.push_header_row(
+                "Content-Type".into(),
+                "application/vnd.custom+json".into(),
+                String::new(),
+                true,
+                window,
+                cx,
+            );
+        });
+        draw(&mut cx);
+        assert_eq!(
+            shown(&mut cx),
+            None,
+            "the automatic row steps aside for the one the reader wrote"
+        );
         view.read_with(&cx, |view, cx| {
-            let content_type_rows: Vec<_> = view
+            let mine: Vec<String> = view
                 .header_rows
                 .iter()
                 .filter(|row| row.key_editor.read(cx).text(cx) == "Content-Type")
+                .map(|row| row.value_editor.read(cx).text(cx))
                 .collect();
-            assert_eq!(
-                content_type_rows.len(),
-                1,
-                "switching content type must update the existing header, not add a duplicate"
-            );
-            assert_eq!(
-                content_type_rows[0].value_editor.read(cx).text(cx),
-                "application/xml"
-            );
+            assert_eq!(mine, vec!["application/vnd.custom+json".to_string()]);
+        });
+
+        // The reader's own row still follows the format, since it is theirs to
+        // keep but not theirs to have go stale.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.set_body_content_type(RawBodyContentType::Html, window, cx);
+        });
+        view.read_with(&cx, |view, cx| {
+            let mine: Vec<String> = view
+                .header_rows
+                .iter()
+                .filter(|row| row.key_editor.read(cx).text(cx) == "Content-Type")
+                .map(|row| row.value_editor.read(cx).text(cx))
+                .collect();
+            assert_eq!(mine, vec!["text/html".to_string()]);
         });
     }
 
