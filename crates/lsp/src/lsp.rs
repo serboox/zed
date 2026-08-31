@@ -122,6 +122,12 @@ pub struct LanguageServer {
     process_name: Arc<str>,
     binary: LanguageServerBinary,
     capabilities: RwLock<ServerCapabilities>,
+    /// The `capabilities` object from the server's `initialize` response, kept as raw JSON.
+    /// `lsp-types` does not model every capability the LSP spec defines (for example there
+    /// is no `type_hierarchy_provider` field on `ServerCapabilities` at all), so a capability
+    /// missing from the typed `capabilities` above is not necessarily a capability the server
+    /// lacks. Check here for anything the typed value cannot represent.
+    raw_capabilities: RwLock<Option<Value>>,
     /// Configuration sent to the server, stored for display in the language server logs
     /// buffer. This is represented as the message sent to the LSP in order to avoid cloning it (can
     /// be large in cases like sending schemas to the json server).
@@ -312,6 +318,18 @@ struct Error {
     message: String,
     #[serde(default)]
     data: Option<serde_json::Value>,
+}
+
+/// Same wire request as [`request::Initialize`], but with the response left as raw JSON
+/// instead of the typed `InitializeResult`. `lsp-types` does not model every capability the
+/// LSP spec defines, so deserializing straight into `InitializeResult` would silently drop
+/// anything it does not know about before this crate ever sees it.
+enum InitializeWithRawCapabilities {}
+
+impl request::Request for InitializeWithRawCapabilities {
+    type Params = InitializeParams;
+    type Result = Value;
+    const METHOD: &'static str = "initialize";
 }
 
 pub trait LspRequestFuture<O>: Future<Output = ConnectionResult<O>> {
@@ -610,6 +628,7 @@ impl LanguageServer {
                 .unwrap_or_default(),
             binary,
             capabilities: Default::default(),
+            raw_capabilities: Default::default(),
             configuration,
             code_action_kinds,
             next_id: Default::default(),
@@ -1068,8 +1087,8 @@ impl LanguageServer {
         cx: &App,
     ) -> Task<Result<Arc<Self>>> {
         cx.background_spawn(async move {
-            let response = self
-                .request::<request::Initialize>(params, timeout)
+            let raw_response = self
+                .request::<InitializeWithRawCapabilities>(params, timeout)
                 .await
                 .into_response()
                 .with_context(|| {
@@ -1079,11 +1098,21 @@ impl LanguageServer {
                         self.server_id()
                     )
                 })?;
+            let raw_capabilities = raw_response.get("capabilities").cloned();
+            let response: InitializeResult = serde_json::from_value(raw_response)
+                .with_context(|| {
+                    format!(
+                        "deserializing initialize response from server {}, id {}",
+                        self.name(),
+                        self.server_id()
+                    )
+                })?;
             if let Some(info) = response.server_info {
                 self.version = info.version.map(SharedString::from);
                 self.process_name = info.name.into();
             }
             self.capabilities = RwLock::new(response.capabilities);
+            self.raw_capabilities = RwLock::new(raw_capabilities);
             self.configuration = configuration;
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
@@ -1349,6 +1378,13 @@ impl LanguageServer {
     /// Get the reported capabilities of the running language server.
     pub fn capabilities(&self) -> ServerCapabilities {
         self.capabilities.read().clone()
+    }
+
+    /// Get the `capabilities` object from the server's `initialize` response as raw JSON. See
+    /// the doc comment on the `raw_capabilities` field for why this exists alongside
+    /// [`Self::capabilities`].
+    pub fn raw_capabilities(&self) -> Option<Value> {
+        self.raw_capabilities.read().clone()
     }
 
     /// Get the reported capabilities of the running language server and
