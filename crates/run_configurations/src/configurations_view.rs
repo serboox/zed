@@ -1363,17 +1363,6 @@ impl RunConfigurationsView {
                 view.show(&configuration, window, cx);
             }))
             .child(
-                Label::new(match kind {
-                    Kind::Task => "run",
-                    Kind::Debug => "debug",
-                })
-                .size(LabelSize::XSmall)
-                .color(match kind {
-                    Kind::Task => Color::Accent,
-                    Kind::Debug => Color::Warning,
-                }),
-            )
-            .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
@@ -1595,6 +1584,7 @@ impl RunConfigurationsView {
                     .child(boxed(&row.value, true))
                     .child(
                         IconButton::new(("env-remove", at), IconName::Dash)
+                            .style(ui::cyberpunk::Rank::Quiet.style())
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Take this variable out"))
                             .on_click(cx.listener(move |view, _, _, cx| {
@@ -1735,29 +1725,32 @@ impl RunConfigurationsView {
             .w_full()
             .gap_1()
             .child(
-                h_flex()
-                    .id("configuration-json-toggle")
-                    .debug_selector(|| "configuration-json-toggle".to_string())
-                    .gap_1()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _window, cx| {
-                        view.showing_json = !view.showing_json;
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(match self.showing_json {
-                            true => IconName::ChevronDown,
-                            false => IconName::ChevronRight,
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("Show as JSON")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                h_flex().child(
+                    div()
+                        .debug_selector(|| "configuration-json-toggle".to_string())
+                        // Framed like any other action: a line of grey words with
+                        // an arrow beside it reads as a heading, and a reader who
+                        // takes it for one never finds out the form can show what
+                        // it will write.
+                        .child(
+                            Button::new("configuration-json-toggle-button", "Show as JSON")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .style(ui::cyberpunk::Rank::Quiet.style())
+                                .start_icon(
+                                    Icon::new(match self.showing_json {
+                                        true => IconName::ChevronDown,
+                                        false => IconName::ChevronRight,
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(|view, _, _window, cx| {
+                                    view.showing_json = !view.showing_json;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             )
             .when(self.showing_json, |block| {
                 block.child(
@@ -1886,6 +1879,7 @@ impl RunConfigurationsView {
                         section("ENVIRONMENT").child(
                             IconButton::new("env-add", IconName::Plus)
                                 .icon_size(IconSize::XSmall)
+                                .style(ui::cyberpunk::Rank::Quiet.style())
                                 .tooltip(Tooltip::text("Add a variable"))
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     let row = view.an_env_row("", "", window, cx);
@@ -1912,6 +1906,7 @@ impl RunConfigurationsView {
                                     .trigger(
                                         Button::new("env-file-find", "…")
                                             .label_size(LabelSize::Small)
+                                            .style(ui::cyberpunk::Rank::Quiet.style())
                                             .tooltip(Tooltip::text("Pick the file of variables")),
                                     )
                                     .menu(move |window, cx| {
@@ -1982,110 +1977,112 @@ impl Focusable for RunConfigurationsView {
 }
 
 impl RunConfigurationsView {
-    /// The window's own row of controls, as the mockup has it: add, duplicate,
-    /// remove, and move the chosen one up or down the file.
+    /// The window's own row of controls, under one frame: add, duplicate, remove,
+    /// and move the chosen one up or down the file.
+    ///
+    /// There is no separate control for adding a way of *debugging*. A
+    /// configuration is a configuration; whether it starts under a debugger is
+    /// decided by which button is pressed to launch it, not by which kind of
+    /// thing was created. The two files remain two files -- that distinction
+    /// belongs to where things are written down, not to what a reader sees.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_one = self.chosen.is_some();
-        h_flex()
-            .gap_px()
-            .child({
-                // The templates belong to the moment of adding: this is where a
-                // reader decides what kind of thing they are running, and a
-                // dropdown sitting in the form afterwards only asks them to
-                // decide again about something already decided.
-                let view = cx.entity();
-                PopoverMenu::new("configuration-add-task")
-                    .trigger(
-                        IconButton::new("configuration-add-task", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Add a way of running")),
-                    )
-                    .menu(move |window, cx| {
-                        let view = view.clone();
-                        // What the project itself says can be run comes first and
-                        // whole: a command with its package, its arguments and the
-                        // directory it runs in, so nothing is left to type. The
-                        // bare templates stay underneath for a project this found
-                        // nothing in.
-                        let found = view.read(cx).found.clone();
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            let mut family = None;
-                            for point in found {
-                                if family != Some(point.family) {
-                                    family = Some(point.family);
-                                    menu = menu.header(point.family.shown());
-                                }
-                                let view = view.clone();
-                                menu = menu.entry(
-                                    SharedString::from(point.name.clone()),
-                                    None,
-                                    move |window, cx| {
-                                        let point = point.clone();
-                                        view.update(cx, |view, cx| {
-                                            view.start_a_new_one(Kind::Task, window, cx);
-                                            view.fill_in_from_way(&point, window, cx);
-                                        });
-                                    },
-                                );
+        let mut actions: Vec<AnyElement> = Vec::new();
+        actions.push({
+            // The templates belong to the moment of adding: this is where a
+            // reader decides what kind of thing they are running, and a
+            // dropdown sitting in the form afterwards only asks them to
+            // decide again about something already decided.
+            let view = cx.entity();
+            PopoverMenu::new("configuration-add-task")
+                .trigger(
+                    IconButton::new("configuration-add-task", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Add a way of running")),
+                )
+                .menu(move |window, cx| {
+                    let view = view.clone();
+                    // What the project itself says can be run comes first and
+                    // whole: a command with its package, its arguments and the
+                    // directory it runs in, so nothing is left to type. The
+                    // bare templates stay underneath for a project this found
+                    // nothing in.
+                    let found = view.read(cx).found.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        let mut family = None;
+                        for point in found {
+                            if family != Some(point.family) {
+                                family = Some(point.family);
+                                menu = menu.header(point.family.shown());
                             }
-                            if family.is_some() {
-                                menu = menu.separator().header("Fill in by hand");
-                            }
-                            for template in crate::templates::TEMPLATES {
-                                let view = view.clone();
-                                menu = menu.entry(template.name, None, move |window, cx| {
+                            let view = view.clone();
+                            menu = menu.entry(
+                                SharedString::from(point.name.clone()),
+                                None,
+                                move |window, cx| {
+                                    let point = point.clone();
                                     view.update(cx, |view, cx| {
                                         view.start_a_new_one(Kind::Task, window, cx);
-                                        view.fill_in_from(template, window, cx);
+                                        view.fill_in_from_way(&point, window, cx);
                                     });
+                                },
+                            );
+                        }
+                        if family.is_some() {
+                            menu = menu.separator().header("Fill in by hand");
+                        }
+                        for template in crate::templates::TEMPLATES {
+                            let view = view.clone();
+                            menu = menu.entry(template.name, None, move |window, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.start_a_new_one(Kind::Task, window, cx);
+                                    view.fill_in_from(template, window, cx);
                                 });
-                            }
-                            menu.separator()
-                                .entry("Something else", None, move |window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.start_a_new_one(Kind::Task, window, cx)
-                                    });
-                                })
-                        }))
-                    })
-            })
-            .child(
-                IconButton::new("configuration-add-debug", IconName::Debug)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Add a way of debugging"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_a_new_one(Kind::Debug, window, cx)
-                    })),
-            )
-            .child(
-                IconButton::new("configuration-duplicate", IconName::Copy)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_one)
-                    .tooltip(Tooltip::text("Make a copy of this one"))
-                    .on_click(cx.listener(|view, _, window, cx| view.duplicate(window, cx))),
-            )
-            .child(
-                IconButton::new("configuration-remove", IconName::Dash)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_one)
-                    .tooltip(Tooltip::text("Take this one out of the file"))
-                    .on_click(cx.listener(|view, _, window, cx| view.remove(window, cx))),
-            )
-            .child(
-                IconButton::new("configuration-earlier", IconName::ChevronUp)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_one)
-                    .tooltip(Tooltip::text("Move it earlier in the file"))
-                    .on_click(cx.listener(|view, _, _, cx| view.move_it(false, cx))),
-            )
-            .child(
-                IconButton::new("configuration-later", IconName::ChevronDown)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_one)
-                    .tooltip(Tooltip::text("Move it later in the file"))
-                    .on_click(cx.listener(|view, _, _, cx| view.move_it(true, cx))),
-            )
-            .into_any_element()
+                            });
+                        }
+                        menu.separator()
+                            .entry("Something else", None, move |window, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.start_a_new_one(Kind::Task, window, cx)
+                                });
+                            })
+                    }))
+                })
+                .into_any_element()
+        });
+        actions.push(
+            IconButton::new("configuration-duplicate", IconName::Copy)
+                .icon_size(IconSize::Small)
+                .disabled(!has_one)
+                .tooltip(Tooltip::text("Make a copy of this one"))
+                .on_click(cx.listener(|view, _, window, cx| view.duplicate(window, cx)))
+                .into_any_element(),
+        );
+        actions.push(
+            IconButton::new("configuration-remove", IconName::Dash)
+                .icon_size(IconSize::Small)
+                .disabled(!has_one)
+                .tooltip(Tooltip::text("Take this one out of the file"))
+                .on_click(cx.listener(|view, _, window, cx| view.remove(window, cx)))
+                .into_any_element(),
+        );
+        actions.push(
+            IconButton::new("configuration-earlier", IconName::ChevronUp)
+                .icon_size(IconSize::Small)
+                .disabled(!has_one)
+                .tooltip(Tooltip::text("Move it earlier in the file"))
+                .on_click(cx.listener(|view, _, _, cx| view.move_it(false, cx)))
+                .into_any_element(),
+        );
+        actions.push(
+            IconButton::new("configuration-later", IconName::ChevronDown)
+                .icon_size(IconSize::Small)
+                .disabled(!has_one)
+                .tooltip(Tooltip::text("Move it later in the file"))
+                .on_click(cx.listener(|view, _, _, cx| view.move_it(true, cx)))
+                .into_any_element(),
+        );
+        ui::cyberpunk::segmented(actions).into_any_element()
     }
 
     /// Moves the chosen configuration one place in its file, which is the order
@@ -2125,25 +2122,11 @@ impl RunConfigurationsView {
         .detach();
     }
 
-    /// Why the Debug button on the footer has to be withheld for the chosen
-    /// configuration, or `None` when it may be pressed. Only a task's own
-    /// command is judged: a debug configuration already names its debugger, so
-    /// deriving one from a command never comes up for it.
-    fn why_the_debug_button_is_withheld(&self, cx: &App) -> Option<&'static str> {
-        match self.chosen {
-            Some((Kind::Task, _)) => {
-                crate::debugging::why_it_cannot_be_debugged(&self.command.read(cx).text(cx))
-            }
-            _ => None,
-        }
-    }
-
     /// What the window is for, at the foot of it: where this is written down, and
     /// what can be done with the one in front of the reader.
     fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_one = self.chosen.is_some();
         let kind_being_edited = self.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
-        let cannot_debug = self.why_the_debug_button_is_withheld(cx);
         h_flex()
             .flex_none()
             .w_full()
@@ -2167,6 +2150,7 @@ impl RunConfigurationsView {
                         )
                         .label_size(LabelSize::XSmall)
                         .color(Color::Muted)
+                        .style(ui::cyberpunk::Rank::Quiet.style())
                         .tooltip(Tooltip::text("Open the file these are kept in"))
                         .disabled(!has_one)
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -2184,39 +2168,19 @@ impl RunConfigurationsView {
             .child(
                 Button::new("configuration-cancel", "Close")
                     .label_size(LabelSize::Small)
+                    .style(ui::cyberpunk::Rank::Neutral.style())
                     .on_click(cx.listener(|view, _, window, cx| view.close(window, cx))),
             )
+            // Saving is all this window does. Running and debugging live on the
+            // plaque in the title bar, where what is running is already shown --
+            // a form that both edits a thing and launches it asks the reader to
+            // hold two ideas at once for no gain.
             .child(
                 Button::new("configuration-save", "Save")
                     .label_size(LabelSize::Small)
+                    .style(ui::cyberpunk::Rank::Accent.style())
                     .disabled(!has_one)
                     .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
-            )
-            .child(
-                div()
-                    .id("configuration-debug-hit-area")
-                    .debug_selector(|| "configuration-debug".to_string())
-                    .child(
-                        Button::new("configuration-debug-button", "Debug")
-                            .label_size(LabelSize::Small)
-                            .disabled(!has_one || cannot_debug.is_some())
-                            .when_some(cannot_debug, |button, reason| {
-                                button.tooltip(Tooltip::text(reason))
-                            })
-                            .on_click(cx.listener(|view, _, window, cx| view.debug(window, cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .id("configuration-run-hit-area")
-                    .debug_selector(|| "configuration-run".to_string())
-                    .child(
-                        Button::new("configuration-run-button", "Run")
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .disabled(!has_one)
-                            .on_click(cx.listener(|view, _, window, cx| view.run(window, cx))),
-                    ),
             )
             .into_any_element()
     }
@@ -3511,109 +3475,6 @@ mod tests {
         }
     }
 
-    /// A Makefile target is opaque: no locator can say what it builds, so the
-    /// mockup calls for a Debug button that stays on screen but does nothing --
-    /// painted disabled, and unmoved by a click where it sits.
-    #[gpui::test]
-    async fn the_debug_button_is_withheld_with_a_reason_for_an_opaque_command(
-        cx: &mut TestAppContext,
-    ) {
-        let (view, _fs, mut cx) = a_view_of(
-            Some(r#"[{ "label": "build", "command": "make build" }]"#),
-            cx,
-        )
-        .await;
-        view.update_in(&mut cx, |view, window, cx| {
-            let first = view
-                .store
-                .read(cx)
-                .get(Kind::Task, 0)
-                .cloned()
-                .expect("the configuration");
-            view.show(&first, window, cx);
-        });
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        let reason = view.read_with(&cx, |view, cx| view.why_the_debug_button_is_withheld(cx));
-        assert!(
-            reason.is_some_and(|reason| !reason.is_empty()),
-            "a Makefile target's artifact cannot be worked out, so the button has to say why"
-        );
-
-        let before = view.read_with(&cx, |view, cx| {
-            (
-                view.chosen,
-                view.store
-                    .read(cx)
-                    .of_kind(Kind::Debug)
-                    .configurations
-                    .len(),
-            )
-        });
-        let at = debug_center(&mut cx, "configuration-debug");
-        cx.simulate_click(at, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-        let after = view.read_with(&cx, |view, cx| {
-            (
-                view.chosen,
-                view.store
-                    .read(cx)
-                    .of_kind(Kind::Debug)
-                    .configurations
-                    .len(),
-            )
-        });
-        assert_eq!(
-            before, after,
-            "the button is disabled, so a click where it is painted must do nothing"
-        );
-    }
-
-    /// The counterpart of the test above: a command a locator was written for
-    /// keeps offering a guess, exactly as it did before the button could be
-    /// withheld.
-    #[gpui::test]
-    async fn the_debug_button_still_offers_a_guess_for_a_command_a_locator_understands(
-        cx: &mut TestAppContext,
-    ) {
-        let (view, _fs, mut cx) = a_view_of(
-            Some(r#"[{ "label": "tests", "command": "cargo test" }]"#),
-            cx,
-        )
-        .await;
-        view.update_in(&mut cx, |view, window, cx| {
-            let first = view
-                .store
-                .read(cx)
-                .get(Kind::Task, 0)
-                .cloned()
-                .expect("the configuration");
-            view.show(&first, window, cx);
-        });
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        assert_eq!(
-            view.read_with(&cx, |view, cx| view.why_the_debug_button_is_withheld(cx)),
-            None,
-            "cargo has a locator, so nothing withholds the button"
-        );
-
-        let at = debug_center(&mut cx, "configuration-debug");
-        cx.simulate_click(at, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        assert_eq!(
-            view.read_with(&cx, |view, _| view.chosen.map(|(kind, _)| kind)),
-            Some(Kind::Debug),
-            "the button is enabled, so pressing it where it is painted offers a debug \
-             configuration to save"
-        );
-    }
-
     /// The footer's Open button, with a task shown, has to reach for tasks.json
     /// alone -- not the form-embedded pair the old block offered for both files
     /// at once, one of which was never the one being edited.
@@ -3689,11 +3550,12 @@ mod tests {
         );
     }
 
-    /// The window's own Run button used to resolve the task and throw the
-    /// result away in silence whenever a variable in it -- like an
-    /// `$ZED_...` one nothing supplies -- could not be resolved, the same
-    /// silent path the title bar's plaque took. A press that does nothing at
-    /// all reads as the press never having landed; the reader has to be told.
+    /// Running from this window happens by the action a keybinding dispatches,
+    /// the buttons having moved to the plaque. That path used to resolve the
+    /// task and throw the result away in silence whenever a variable in it --
+    /// like a `$ZED_...` one nothing supplies -- could not be resolved. A
+    /// press that does nothing at all reads as the press never having landed;
+    /// the reader has to be told.
     #[gpui::test]
     async fn pressing_run_says_when_the_command_cannot_be_resolved(cx: &mut TestAppContext) {
         let (view, _fs, mut cx) = a_view_of(
@@ -3714,16 +3576,22 @@ mod tests {
             "nothing has been said yet"
         );
 
-        let at = debug_center(&mut cx, "configuration-run");
-        cx.simulate_click(at, gpui::Modifiers::none());
+        // Dispatched, not called: this is the path a keybinding takes, and the
+        // window has to be focused for the action to reach it at all.
+        cx.update(|window, cx| {
+            let focus = view.read(cx).focus.clone();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(RunThisConfiguration);
         cx.run_until_parked();
 
         assert!(
             !workspace
                 .read_with(&cx, |workspace, _| workspace.notification_ids())
                 .is_empty(),
-            "pressing Run on a command that could not be resolved has to say \
-             so -- doing nothing looks exactly like the press never landed"
+            "running a command that could not be resolved has to say so -- \
+             doing nothing looks exactly like the press never landed"
         );
     }
 

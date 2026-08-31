@@ -15,7 +15,9 @@
 //! danger). Do not add a third without a matching argument for why every
 //! dialog that reads this module should carry it.
 
-use gpui::{App, BoxShadow, Hsla, Pixels, PromptLevel, Styled, px, rgb};
+use gpui::{App, BoxShadow, Hsla, ParentElement, Pixels, PromptLevel, Styled, px, rgb};
+
+use crate::{ButtonStyle, TintColor};
 
 /// Fixed spacing scale, independent of `DynamicSpacing`/UI density: the
 /// rhythm this style calls for must stay constant even if the user changes
@@ -127,6 +129,72 @@ pub fn row_pressed() -> Hsla {
 pub fn row_chosen() -> Hsla {
     Accent::Cyan.border().opacity(0.16)
 }
+
+/// How much an action matters. Four ranks and no more: the one the reader came
+/// for, the way out, the secondary one, and the one that destroys something.
+///
+/// The rank says how important the action is. The frame -- which every rank
+/// carries, without exception -- says it is an action at all rather than a
+/// caption. Those are two different messages, and a quiet rank without an
+/// outline degenerates into exactly the column of bare words this style exists
+/// to leave behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rank {
+    /// The action the reader came for. One per surface.
+    Accent,
+    /// The way out, and anything else of ordinary weight.
+    Neutral,
+    /// Secondary, still an action.
+    Quiet,
+    /// Destroys something. Reserved for that, so it keeps meaning it.
+    Destructive,
+}
+
+impl Rank {
+    pub fn style(self) -> ButtonStyle {
+        match self {
+            Rank::Accent => ButtonStyle::Tinted(TintColor::Accent),
+            Rank::Neutral => ButtonStyle::OutlinedCustom(border_raised()),
+            Rank::Quiet => ButtonStyle::OutlinedCustom(border_dim()),
+            Rank::Destructive => ButtonStyle::Tinted(TintColor::Error),
+        }
+    }
+}
+
+/// A row of icon actions under one frame, with a hairline between them.
+///
+/// A strip of bare icons reads as decoration and gives no hint that any of it is
+/// pressable; a frame around each one reads as a fence. One frame with dividers
+/// says both things at once, and is what every toolbar of adjacent icons in this
+/// chrome should be built from.
+pub fn segmented(actions: impl IntoIterator<Item = gpui::AnyElement>) -> gpui::Div {
+    let mut row = gpui::div().flex().flex_row().items_center().flex_none();
+    row = row
+        .rounded(RADIUS)
+        .border_1()
+        .border_color(border_dim())
+        .overflow_hidden();
+    for (at, action) in actions.into_iter().enumerate() {
+        if at > 0 {
+            row = row.child(
+                gpui::div()
+                    .w(px(1.))
+                    .h(SEGMENT_HEIGHT - px(8.))
+                    .bg(border_dim()),
+            );
+        }
+        row = row.child(action);
+    }
+    row
+}
+
+/// The corner radius every framed action shares. One number, so nothing in this
+/// chrome rounds by a different amount than anything else.
+pub const RADIUS: Pixels = px(6.);
+
+/// How tall a framed row of icon actions stands, and with it the hit area of
+/// each icon in it.
+pub const SEGMENT_HEIGHT: Pixels = px(28.);
 
 /// A soft outer glow for the one focal element of a view. Kept low-alpha per
 /// the source design doc: glow needs to read as a lit edge, not fog.

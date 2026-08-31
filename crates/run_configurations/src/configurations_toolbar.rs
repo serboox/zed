@@ -388,52 +388,53 @@ impl Render for ConfigurationsToolbar {
                     }),
             )
             .when(running, |plaque| {
-                plaque
-                    .child(
-                        // Wrapped in its own div, as the debug button below is:
-                        // `IconButton` paints another `IconName::PlayFilled` of
-                        // its own inside the plaque beside it, and a bare
-                        // `ICON-PlayFilled` selector would land on whichever
-                        // one painted last rather than on this button.
-                        div()
-                            .debug_selector(|| "run-configurations-run-button".to_string())
-                            .child(
-                                IconButton::new("run-configurations-run", IconName::PlayFilled)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Accent)
-                                    .tooltip(Tooltip::text("Run it"))
-                                    .on_click(cx.listener(|toolbar, _, window, cx| {
-                                        toolbar.run(window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        // Wrapped in its own div: `IconButton` has no
-                        // `debug_selector` of its own to tell a test which of
-                        // the two states was painted, and a `disabled` button
-                        // otherwise looks identical to an enabled one on
-                        // bounds alone.
-                        div()
-                            .debug_selector(move || {
-                                match cannot_be_debugged {
-                                    Some(_) => "run-configurations-debug-disabled",
-                                    None => "run-configurations-debug-enabled",
-                                }
-                                .to_string()
-                            })
-                            .child(
-                                IconButton::new("run-configurations-debug", IconName::Debug)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .disabled(cannot_be_debugged.is_some())
-                                    .tooltip(Tooltip::text(
-                                        cannot_be_debugged.unwrap_or("Debug it"),
-                                    ))
-                                    .on_click(cx.listener(|toolbar, _, window, cx| {
-                                        toolbar.debug(window, cx)
-                                    })),
-                            ),
-                    )
+                // Both under one frame with a hairline between them: two bare
+                // icons beside the plaque give no hint that either is pressable,
+                // and a frame each reads as a fence. The difference between
+                // running and debugging is these two buttons and nothing else --
+                // it is one configuration either way.
+                plaque.child(ui::cyberpunk::segmented([
+                    // Wrapped in its own div, as the debug button below is:
+                    // `IconButton` paints another `IconName::PlayFilled` of its
+                    // own inside the plaque beside it, and a bare
+                    // `ICON-PlayFilled` selector would land on whichever one
+                    // painted last rather than on this button.
+                    div()
+                        .debug_selector(|| "run-configurations-run-button".to_string())
+                        .child(
+                            IconButton::new("run-configurations-run", IconName::PlayFilled)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Accent)
+                                .tooltip(Tooltip::text("Run it"))
+                                .on_click(
+                                    cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx)),
+                                ),
+                        )
+                        .into_any_element(),
+                    // Wrapped in its own div: `IconButton` has no
+                    // `debug_selector` of its own to tell a test which of the two
+                    // states was painted, and a `disabled` button otherwise looks
+                    // identical to an enabled one on bounds alone.
+                    div()
+                        .debug_selector(move || {
+                            match cannot_be_debugged {
+                                Some(_) => "run-configurations-debug-disabled",
+                                None => "run-configurations-debug-enabled",
+                            }
+                            .to_string()
+                        })
+                        .child(
+                            IconButton::new("run-configurations-debug", IconName::Debug)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .disabled(cannot_be_debugged.is_some())
+                                .tooltip(Tooltip::text(cannot_be_debugged.unwrap_or("Debug it")))
+                                .on_click(
+                                    cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx)),
+                                ),
+                        )
+                        .into_any_element(),
+                ]))
             })
     }
 }
