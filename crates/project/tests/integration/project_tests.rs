@@ -6,6 +6,7 @@ mod color_extractor;
 mod context_server_store;
 mod debugger;
 mod git_store;
+mod hierarchies;
 mod image_store;
 mod lsp_command;
 mod lsp_store;
