@@ -13,10 +13,25 @@ const QUERY_COUNT: usize = 200;
 /// rust-analyzer finds.
 const REQUIRED_RECALL: f64 = 0.95;
 
-/// Asked of both sides for every query, generous enough that neither side's
-/// own result cap is what decides a divergence -- the queries are full symbol
-/// names, so neither side should come anywhere near this many matches.
-const RESULTS_PER_QUERY: usize = 500;
+/// Asked of the index without a cap at all.
+///
+/// The first version of this asked for the best five hundred and compared two
+/// capped lists, which measured the wrong thing: the index deliberately does not
+/// rank -- the editor's own matcher does that -- so a cap on its side is a cut
+/// through an unordered set, and its own tie-break keeps the shortest names. The
+/// server's longer answers were being thrown away before the comparison, and the
+/// result read as the index having missed them. Recall of an index is a question
+/// of coverage, not of order.
+const RESULTS_PER_QUERY: usize = usize::MAX;
+
+/// This measurement is about Rust, which is what the plan's step is about, and
+/// the server answers about Rust alone. The index reads thirteen languages, so
+/// without this the two sides are compared over different sets entirely -- a
+/// heading in a Markdown file counted against the index as something the server
+/// had not found.
+fn is_rust(definition: &semantic_index::definitions::Definition) -> bool {
+    definition.path.ends_with(".rs")
+}
 
 /// How long to wait for rust-analyzer to finish indexing before giving up.
 /// Generous on purpose: a real project can take minutes, and a run that gives
@@ -99,7 +114,10 @@ async fn run() -> Result<()> {
         "there is nothing to compare over zero queries"
     );
 
-    println!("building the index over {} on {cores} cores", root.display());
+    println!(
+        "building the index over {} on {cores} cores",
+        root.display()
+    );
     let store = Symbols::open_in_memory().context("opening an in-memory symbol store")?;
     let built = build(&root, cores, &store).context("building the index")?;
     let catalogue = Catalogue::read_from(&store).context("reading the symbols back")?;
@@ -123,7 +141,9 @@ async fn run() -> Result<()> {
         "starting rust-analyzer and waiting for it to finish indexing (up to {}s)...",
         indexing_timeout.as_secs()
     );
-    let mut server = Server::start(&root).await.context("starting rust-analyzer")?;
+    let mut server = Server::start(&root)
+        .await
+        .context("starting rust-analyzer")?;
     let indexing_started = Instant::now();
     server
         .wait_until_indexed(indexing_timeout)
@@ -139,15 +159,20 @@ async fn run() -> Result<()> {
     let mut server_timings = Vec::with_capacity(queries.len());
     for query in &queries {
         let index_started = Instant::now();
-        let the_index_found = catalogue.candidates(query, RESULTS_PER_QUERY);
+        let the_index_found: Vec<_> = catalogue
+            .candidates(query, RESULTS_PER_QUERY)
+            .into_iter()
+            .filter(is_rust)
+            .collect();
         index_timings.push(index_started.elapsed());
 
         let server_started = Instant::now();
-        let the_server_found = server
+        let answered = server
             .workspace_symbol(query, QUERY_TIMEOUT)
             .await
             .with_context(|| format!("asking rust-analyzer for `{query}`"))?;
         server_timings.push(server_started.elapsed());
+        let the_server_found: Vec<_> = answered.into_iter().filter(is_rust).collect();
 
         answers.push(QueryAnswers {
             query: query.clone(),
