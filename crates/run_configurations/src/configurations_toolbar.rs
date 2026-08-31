@@ -142,8 +142,13 @@ impl ConfigurationsToolbar {
         if self.matching_debug_scenario(pointing, cx).is_some() {
             return None;
         }
-        let command = self.task_at(pointing, cx).map(|task| task.command);
-        crate::debugging::why_it_cannot_be_debugged(command.as_deref().unwrap_or(""))
+        let Some(task) = self.task_at(pointing, cx) else {
+            return crate::debugging::why_it_cannot_be_debugged("");
+        };
+        if crate::debugging::a_debugger_can_be_worked_out(&task) {
+            return None;
+        }
+        crate::debugging::why_it_cannot_be_debugged(&task.command)
     }
 
     /// A debug configuration the project keeps whose label names the same
@@ -151,6 +156,39 @@ impl ConfigurationsToolbar {
     /// anything from. Tried before giving up on debugging a task: a project
     /// that already wrote "Debug API" beside "Run API" meant the two to be
     /// pressed together, not to have the second one refuse.
+    /// A debug session worked out from the configuration itself.
+    ///
+    /// The locators the editor already has read a command and say what it builds,
+    /// but they read the *command* -- and a project run through a script that
+    /// loads an environment and then execs the compiler hides the program in its
+    /// arguments. What is handed to them is therefore the task with the wrapper
+    /// taken off, which is the same run in every other respect.
+    fn derive_a_scenario(
+        &self,
+        pointing: &Pointing,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Task<Option<task::DebugScenario>>> {
+        let task = self.task_at(pointing, cx)?;
+        let readable = crate::debugging::unwrapped(&task).unwrap_or_else(|| task.clone());
+        let adapter = crate::debugging::adapter_for(&readable.command)?;
+        let dap_store = self
+            .workspace
+            .upgrade()?
+            .read(cx)
+            .project()
+            .read(cx)
+            .dap_store();
+        let label: SharedString = task.label.into();
+        Some(dap_store.update(cx, |dap_store, cx| {
+            dap_store.debug_scenario_for_build_task(
+                readable,
+                dap::adapters::DebugAdapterName(adapter.into()),
+                label,
+                cx,
+            )
+        }))
+    }
+
     fn matching_debug_scenario(
         &self,
         pointing: &Pointing,
@@ -215,6 +253,27 @@ impl ConfigurationsToolbar {
         }
         if let Some(scenario) = self.matching_debug_scenario(&pointing, cx) {
             self.start_debugging(scenario, window, cx);
+            return;
+        }
+        // Worked out from the configuration's own fields rather than from a
+        // second entry written by hand: one configuration, two presses.
+        if let Some(deriving) = self.derive_a_scenario(&pointing, cx) {
+            cx.spawn_in(window, async move |toolbar, cx| {
+                let derived = deriving.await;
+                toolbar
+                    .update_in(cx, |toolbar, window, cx| match derived {
+                        Some(scenario) => toolbar.start_debugging(scenario, window, cx),
+                        // The program was one a debugger knows, and it still could
+                        // not be worked out. The window that lists configurations
+                        // is where one is written by hand.
+                        None => window.dispatch_action(
+                            Box::new(zed_actions::run_configurations::OpenRunConfigurations),
+                            cx,
+                        ),
+                    })
+                    .log_err();
+            })
+            .detach();
             return;
         }
         // Neither a debug configuration of its own, nor one the project keeps

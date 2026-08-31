@@ -1,3 +1,5 @@
+use task::TaskTemplate;
+
 /// The first word of a command, which is the program being run.
 fn program(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or("")
@@ -46,6 +48,57 @@ pub fn why_it_cannot_be_debugged(command: &str) -> Option<&'static str> {
     ))
 }
 
+/// The debugger that goes with a program, when one does. The same mapping the
+/// locators use, said once here so the window that offers a debugger and the
+/// list of ways to run a project cannot drift apart.
+pub fn adapter_for(command: &str) -> Option<&'static str> {
+    let program = program(command);
+    let name = program.rsplit('/').next().unwrap_or(program);
+    if name.starts_with("python") {
+        return Some("Debugpy");
+    }
+    match name {
+        "go" => Some("Delve"),
+        "cargo" => Some("CodeLLDB"),
+        "npm" | "pnpm" | "yarn" | "node" => Some("JavaScript"),
+        "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++" => Some("CodeLLDB"),
+        _ => None,
+    }
+}
+
+/// The task as a debugger can read it, when the one the reader wrote hides the
+/// real program behind a wrapper.
+///
+/// A project run through a script that loads an environment and then execs the
+/// compiler -- `with-env go run ./cmd/api` -- tells a locator nothing: locators
+/// read the command, and the command is the script. The program is in the
+/// arguments, so the first argument that is a program a debugger knows becomes
+/// the command and the rest of the arguments follow it. Everything else about
+/// the task is kept, because the wrapper's whole job -- the working directory,
+/// the variables, the file they come from -- is what makes the run work.
+///
+/// `None` when the task needs no unwrapping or when nothing in it is a program
+/// a debugger knows, which is the honest answer for a Makefile target.
+pub fn unwrapped(task: &TaskTemplate) -> Option<TaskTemplate> {
+    if adapter_for(&task.command).is_some() {
+        return None;
+    }
+    let at = task
+        .args
+        .iter()
+        .position(|argument| adapter_for(argument).is_some())?;
+    let mut unwrapped = task.clone();
+    unwrapped.command = task.args[at].clone();
+    unwrapped.args = task.args[at + 1..].to_vec();
+    Some(unwrapped)
+}
+
+/// Whether a debugger can be worked out for this task, looking past a wrapper.
+pub fn a_debugger_can_be_worked_out(task: &TaskTemplate) -> bool {
+    can_be_derived_from(&task.command)
+        || unwrapped(task).is_some_and(|unwrapped| can_be_derived_from(&unwrapped.command))
+}
+
 /// The label with its leading word dropped, underscores turned to spaces, and
 /// lowercased -- "Run" in "Run API" and "Debug" in "Debug API" is the verb, and
 /// what is left is what the label is about.
@@ -78,6 +131,75 @@ pub fn name_the_same_thing(task_label: &str, debug_label: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A project run through a script that loads an environment and then execs
+    /// the compiler is the shape every one of these configurations has, and it
+    /// tells a locator nothing: locators read the command, and the command is the
+    /// script. The program is one argument along.
+    #[test]
+    fn a_wrapper_script_is_taken_off_so_the_program_can_be_seen() {
+        let wrapped = TaskTemplate {
+            label: "Run API".to_string(),
+            command: "$HOME/.envs/.zed/with-env".to_string(),
+            args: vec!["go".into(), "run".into(), "./cmd/api".into()],
+            cwd: Some("$ZED_WORKTREE_ROOT".to_string()),
+            env_file: Some(".env.local".to_string()),
+            ..TaskTemplate::default()
+        };
+        assert!(
+            !can_be_derived_from(&wrapped.command),
+            "the wrapper is what no locator can read anything from"
+        );
+
+        let unwrapped = unwrapped(&wrapped).expect("the program is in the arguments");
+        assert_eq!(unwrapped.command, "go");
+        assert_eq!(unwrapped.args, vec!["run", "./cmd/api"]);
+        assert!(a_debugger_can_be_worked_out(&wrapped));
+        assert_eq!(adapter_for(&unwrapped.command), Some("Delve"));
+
+        // Everything the wrapper was there for survives: without the working
+        // directory and the variables the run works for nobody.
+        assert_eq!(unwrapped.cwd.as_deref(), Some("$ZED_WORKTREE_ROOT"));
+        assert_eq!(unwrapped.env_file.as_deref(), Some(".env.local"));
+        assert_eq!(unwrapped.label, "Run API");
+    }
+
+    #[test]
+    fn a_task_that_needs_no_unwrapping_is_left_alone() {
+        let plain = TaskTemplate {
+            label: "Run API".to_string(),
+            command: "go".to_string(),
+            args: vec!["run".into(), "./cmd/api".into()],
+            ..TaskTemplate::default()
+        };
+        assert!(unwrapped(&plain).is_none());
+        assert!(a_debugger_can_be_worked_out(&plain));
+    }
+
+    /// A Makefile target could build anything, or nothing, and there is nothing
+    /// in it to unwrap either.
+    #[test]
+    fn a_target_that_says_nothing_is_not_pretended_to_be_debuggable() {
+        let opaque = TaskTemplate {
+            label: "Run everything".to_string(),
+            command: "make".to_string(),
+            args: vec!["all".into()],
+            ..TaskTemplate::default()
+        };
+        assert!(unwrapped(&opaque).is_none());
+        assert!(!a_debugger_can_be_worked_out(&opaque));
+        assert!(why_it_cannot_be_debugged(&opaque.command).is_some());
+    }
+
+    #[test]
+    fn every_program_a_locator_knows_has_a_debugger_named_for_it() {
+        assert_eq!(adapter_for("go"), Some("Delve"));
+        assert_eq!(adapter_for("cargo"), Some("CodeLLDB"));
+        assert_eq!(adapter_for("npm"), Some("JavaScript"));
+        assert_eq!(adapter_for("/usr/bin/python3.12"), Some("Debugpy"));
+        assert_eq!(adapter_for("make"), None);
+        assert_eq!(adapter_for(""), None);
+    }
     use super::*;
 
     #[test]
