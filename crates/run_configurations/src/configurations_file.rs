@@ -178,6 +178,43 @@ pub fn task_as_written(task: &TaskTemplate) -> Result<Value> {
     Ok(written)
 }
 
+/// The key a machine to run on is written under.
+///
+/// It lives here rather than on the editor's own task type, which more than a
+/// hundred places construct field by field: adding one there would touch all of
+/// them and every future merge with upstream. The entry is kept exactly as the
+/// file has it anyway, so a key the editor's types do not model survives a
+/// round trip as long as writing puts it back.
+pub const MACHINE_KEY: &str = "on";
+
+/// Adds the fork's own keys to a written entry. `None` removes the key rather
+/// than writing an empty one: a configuration that names no machine must read
+/// exactly like every configuration written before a machine could be named.
+pub fn with_the_machine(mut written: Value, machine: Option<&str>) -> Value {
+    let Value::Object(fields) = &mut written else {
+        return written;
+    };
+    match machine.map(str::trim).filter(|named| !named.is_empty()) {
+        Some(named) => {
+            fields.insert(MACHINE_KEY.to_string(), Value::String(named.to_string()));
+        }
+        None => {
+            fields.remove(MACHINE_KEY);
+        }
+    }
+    written
+}
+
+/// The machine an entry names, if it names one.
+pub fn machine_of(written: &Value) -> Option<String> {
+    written
+        .get(MACHINE_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|named| !named.is_empty())
+        .map(str::to_string)
+}
+
 /// A debug configuration as it should be written. Its own type already leaves out
 /// what it did not set, and the adapter's own keys are flattened into it, so it is
 /// written as it is.
