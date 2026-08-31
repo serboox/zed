@@ -106,6 +106,7 @@ members = [
     "crates/gpui_wgpu",
     "crates/gpui_windows",
     "crates/grammars",
+    "crates/hierarchy_view",
     "crates/html_preview",
     "crates/html_render",
     "crates/html_to_markdown",
@@ -373,6 +374,7 @@ gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 gpui_tokio = { path = "crates/gpui_tokio" }
 gpui_util = { path = "crates/gpui_util" }
+hierarchy_view = { path = "crates/hierarchy_view" }
 html_preview = { path = "crates/html_preview" }
 html_render = { path = "crates/html_render" }
 html_to_markdown = { path = "crates/html_to_markdown" }

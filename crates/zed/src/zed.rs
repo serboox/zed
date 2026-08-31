@@ -826,6 +826,8 @@ fn initialize_panels(
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
+        let hierarchy_panel =
+            hierarchy_view::HierarchyPanel::load(workspace_handle.clone(), cx.clone());
         let api_client_panel = ApiClientPanel::load(workspace_handle.clone(), cx.clone());
         // The panel is part of the web engine, which a build may leave out.
         #[cfg(feature = "servo")]
@@ -900,6 +902,7 @@ fn initialize_panels(
             in_the_panels_phase(debug_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(database_panel, workspace_handle.clone(), cx.clone()),
             in_the_panels_phase(api_client_panel, workspace_handle.clone(), cx.clone()),
+            in_the_panels_phase(hierarchy_panel, workspace_handle.clone(), cx.clone()),
         ];
         #[cfg(feature = "servo")]
         panel_loads.push(in_the_panels_phase(
@@ -6360,6 +6363,7 @@ mod tests {
             debugger_ui::init(cx);
             db_client_ui::init(cx);
             api_client_ui::init(cx);
+            hierarchy_view::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);
