@@ -214,14 +214,20 @@ impl RenderOnce for Tab {
             .h(card_height)
             .max_w(Tab::widest())
             .mt(shoulder)
-            // Room on both sides for the feet, so the selected tab never plants
-            // one on the tab beside it.
-            .mx(corner)
+            // Side by side, the way a browser puts them: a gap the width of a
+            // foot reads as a row of separate cards, which is the thing the
+            // shape exists to stop. The feet of the chosen tab therefore reach
+            // over its neighbours -- also what a browser does, and harmless
+            // because a tab that is not chosen paints no shape of its own.
+            .mx(px(1.))
             // The strip gets a real inset at its ends rather than a tab flush
             // against the window edge.
+            // The strip gets a real inset at its ends rather than a tab flush
+            // against the window edge, and the end tabs need room for the foot
+            // that has no neighbour to reach over.
             .map(|this| match self.position {
-                TabPosition::First => this.ml(corner + shoulder),
-                TabPosition::Last => this.mr(corner + shoulder),
+                TabPosition::First => this.ml(corner),
+                TabPosition::Last => this.mr(corner),
                 TabPosition::Middle(_) => this,
             })
             .rounded_t(corner)
@@ -529,20 +535,28 @@ mod tests {
         );
     }
 
-    // A foot that landed on the tab beside it would be painted over by that
-    // tab's own hover fill, and the join would come apart under the pointer.
+    // Side by side, the way a browser puts them. A gap the width of a foot reads
+    // as a row of separate cards, which is the one thing the shape exists to
+    // stop, so the tabs touch and the feet reach over their neighbours instead.
     #[gpui::test]
-    async fn a_foot_never_lands_on_the_tab_beside_it(cx: &mut TestAppContext) {
+    async fn tabs_stand_beside_each_other_as_a_browser_puts_them(cx: &mut TestAppContext) {
         let cx = draw_a_strip(cx);
 
         let resting = cx.debug_bounds("TAB-resting").expect("the tab is painted");
+        let chosen = cx.debug_bounds("TAB-chosen").expect("the tab is painted");
         let face = cx
             .debug_bounds("TAB-FACE-chosen")
             .expect("the chosen tab is drawn as a shape");
 
+        let between = chosen.left() - resting.right();
         assert!(
-            face.left() >= resting.right(),
-            "the shape starts at {:?}, inside the tab that ends at {:?}",
+            between <= px(4.),
+            "{between:?} of nothing between two tabs: a browser leaves none"
+        );
+        assert!(
+            face.left() < resting.right(),
+            "the foot has to reach over the tab beside it, and it starts at {:?} \
+             against a neighbour ending at {:?}",
             face.left(),
             resting.right()
         );
