@@ -3482,6 +3482,11 @@ impl Pane {
         }
         let unpinned_tabs = tab_items.split_off(self.pinned_tab_count);
         let pinned_tabs = tab_items;
+        // Dividers are put in after the split, not before it: the split counts
+        // tabs, and an element that is not a tab in that vector would move the
+        // boundary between pinned and unpinned.
+        let pinned_tabs = self.with_dividers(pinned_tabs, 0, cx);
+        let unpinned_tabs = self.with_dividers(unpinned_tabs, self.pinned_tab_count, cx);
 
         let tab_bar_settings = TabBarSettings::get_global(cx);
         let use_separate_rows = tab_bar_settings.show_pinned_tabs_in_separate_row;
@@ -3537,6 +3542,66 @@ impl Pane {
                     tab_bar
                 }
             })
+    }
+
+    /// A hairline in the gap between two tabs, the way a browser marks where one
+    /// ends and the next begins.
+    ///
+    /// Left out on both sides of the chosen tab: its own silhouette already
+    /// draws that edge, and a line beside it would read as a second one. This is
+    /// also what a browser does.
+    ///
+    /// `first_index` is which tab the first element of `tabs` is, since the row
+    /// is drawn in two groups and only the whole-row index says which tab is the
+    /// chosen one.
+    fn with_dividers(
+        &self,
+        tabs: Vec<AnyElement>,
+        first_index: usize,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        let colour = cx.theme().colors().border_variant;
+        let card_height = Tab::card_height(cx);
+        let shoulder = Tab::shoulder();
+        // Half the tab, as a browser draws it: a line the full height of the tab
+        // reads as a wall between two cards rather than a mark between two
+        // names.
+        let line = card_height / 2.;
+
+        let mut with = Vec::with_capacity(tabs.len() * 2);
+        for (at, tab) in tabs.into_iter().enumerate() {
+            let index = first_index + at;
+            // Worked out inside the guard, not before it: the first element of a
+            // group has nothing to its left, and asking about that neighbour
+            // would reach below zero.
+            let beside_the_chosen =
+                at > 0 && (index == self.active_item_index || index - 1 == self.active_item_index);
+            if at > 0 && !beside_the_chosen {
+                with.push(
+                    div()
+                        .debug_selector(move || format!("TAB-DIVIDER-{index}"))
+                        .flex_none()
+                        .h(card_height)
+                        .mt(shoulder)
+                        .flex()
+                        .items_center()
+                        // The wrapper stands the full height of a tab so the
+                        // line centres against it; the line itself is the mark
+                        // a reader sees, and carries its own name so a test can
+                        // measure the mark rather than the box around it.
+                        .child(
+                            div()
+                                .debug_selector(move || format!("TAB-DIVIDER-LINE-{index}"))
+                                .w(px(1.))
+                                .h(line)
+                                .bg(colour),
+                        )
+                        .into_any_element(),
+                );
+            }
+            with.push(tab);
+        }
+        with
     }
 
     fn render_single_row_tab_bar(
@@ -5592,6 +5657,77 @@ mod tests {
         assert!(
             pinned_row_bounds.is_none(),
             "pinned_tabs_row should not exist when setting is disabled"
+        );
+    }
+
+    /// A browser marks where one tab ends and the next begins with a hairline in
+    /// the gap between them, and leaves it out on both sides of the chosen tab,
+    /// whose own silhouette already draws that edge.
+    ///
+    /// Measured on the painted boxes rather than on state: the whole point of
+    /// the line is that a reader can see where one tab stops, so a test that
+    /// only checked a flag would prove nothing. Before this existed there was no
+    /// such element at all, so every lookup below fails against the older code.
+    #[gpui::test]
+    async fn a_hairline_marks_where_one_tab_ends_and_the_next_begins(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        add_labeled_item(&pane, "A", false, cx);
+        add_labeled_item(&pane, "B", false, cx);
+        add_labeled_item(&pane, "C", false, cx);
+        add_labeled_item(&pane, "D", false, cx);
+        assert_item_labels(&pane, ["A", "B", "C", "D*"], cx);
+
+        let between_a_and_b = cx
+            .debug_bounds("TAB-DIVIDER-1")
+            .expect("two resting tabs have a line between them");
+        cx.debug_bounds("TAB-DIVIDER-2")
+            .expect("so do the next two");
+        assert!(
+            cx.debug_bounds("TAB-DIVIDER-3").is_none(),
+            "the chosen tab draws its own edge, so there is no line beside it"
+        );
+        assert!(
+            cx.debug_bounds("TAB-DIVIDER-0").is_none(),
+            "there is nothing to the left of the first tab to divide it from"
+        );
+
+        // And the line really is in the gap rather than on top of a tab.
+        let a = cx.debug_bounds("TAB-0").expect("the first tab is painted");
+        let b = cx.debug_bounds("TAB-1").expect("the second tab is painted");
+        assert!(
+            between_a_and_b.left() >= a.right() && between_a_and_b.right() <= b.left(),
+            "the line spans {:?}..{:?}, between tabs ending at {:?} and starting at {:?}",
+            between_a_and_b.left(),
+            between_a_and_b.right(),
+            a.right(),
+            b.left()
+        );
+        assert!(
+            between_a_and_b.size.width <= px(2.),
+            "a hairline, not a wall: {:?} wide",
+            between_a_and_b.size.width
+        );
+        // The wrapper stands the full height of a tab so the mark centres
+        // against it; the mark itself is what a reader sees.
+        let mark = cx
+            .debug_bounds("TAB-DIVIDER-LINE-1")
+            .expect("the line inside the gap is painted");
+        assert!(
+            mark.size.height < a.size.height,
+            "shorter than the tab it stands beside: {:?} against {:?}",
+            mark.size.height,
+            a.size.height
+        );
+        assert!(
+            mark.size.width <= px(1.),
+            "a hairline: {:?} wide",
+            mark.size.width
         );
     }
 
