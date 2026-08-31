@@ -191,6 +191,7 @@ members = [
     "crates/schema_generator",
     "crates/search",
     "crates/search_everywhere",
+    "crates/semantic_index",
     "crates/session",
     "crates/settings",
     "crates/settings_content",
@@ -460,6 +461,7 @@ scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
 search_everywhere = { path = "crates/search_everywhere" }
+semantic_index = { path = "crates/semantic_index" }
 session = { path = "crates/session" }
 sidebar = { path = "crates/sidebar" }
 settings = { path = "crates/settings" }

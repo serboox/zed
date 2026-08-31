@@ -1,0 +1,30 @@
+[package]
+name = "semantic_index"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/semantic_index.rs"
+doctest = false
+
+[[bin]]
+name = "zed-index-measure"
+path = "src/measure_main.rs"
+
+[dependencies]
+anyhow.workspace = true
+grammars = { workspace = true, features = ["load-grammars"] }
+ignore.workspace = true
+log.workspace = true
+rayon.workspace = true
+streaming-iterator.workspace = true
+tree-sitter.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

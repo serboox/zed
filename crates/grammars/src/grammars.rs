@@ -43,6 +43,24 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
     ]
 }
 
+/// Every language whose files are embedded here, by the directory name its
+/// queries and its config live under.
+///
+/// Needed by anything that wants to work through all of them rather than through
+/// the grammars: a language may borrow another's grammar -- JavaScript is parsed
+/// by the TSX one -- so the grammars are not the list of languages.
+pub fn embedded_languages() -> Vec<String> {
+    let mut names: Vec<String> = GrammarDir::iter()
+        .filter_map(|path| {
+            let (name, rest) = path.as_ref().split_once('/')?;
+            (rest == "config.toml").then(|| name.to_string())
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Load and parse the `config.toml` for a given language name.
 pub fn load_config(name: &str) -> LanguageConfig {
     let config_toml = String::from_utf8(
