@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -100,23 +99,12 @@ struct Reading {
 
 /// Everything under `root` that one of `languages` claims.
 fn readings_under(root: &Path, languages: &[Readable]) -> Vec<Reading> {
-    let mut by_suffix: HashMap<&str, usize> = HashMap::new();
-    for (at, language) in languages.iter().enumerate() {
-        for suffix in &language.suffixes {
-            by_suffix.insert(suffix.as_str(), at);
-        }
-    }
+    let claimed = languages::suffixes_of(languages);
     walk::files_under(root)
         .into_iter()
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?;
-            // The longest suffix that fits wins, so `.d.ts` beats `.ts` where a
-            // language claims both.
-            let language = by_suffix
-                .iter()
-                .filter(|(suffix, _)| name.ends_with(*suffix))
-                .max_by_key(|(suffix, _)| suffix.len())
-                .map(|(_, at)| *at)?;
+            let language = languages::claimant(name, &claimed)?;
             Some(Reading { path, language })
         })
         .collect()
@@ -224,7 +212,7 @@ fn read_one(reading: &Reading, languages: &[Readable]) -> Option<Cost> {
 /// The highest the process has reached, in bytes. Read from the kernel's own
 /// high-water mark rather than sampled, because a sample taken after the pass
 /// has already missed the peak.
-fn the_most_memory_so_far() -> Option<u64> {
+pub fn the_most_memory_so_far() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -245,12 +233,14 @@ fn the_most_memory_so_far() -> Option<u64> {
     }
 }
 
-fn as_memory(bytes: u64) -> String {
+/// A size, for printing. Public so the stand prints every number the same way.
+pub fn as_memory(bytes: u64) -> String {
     const MEGABYTE: f64 = 1024. * 1024.;
-    format!("{:.0} MB", bytes as f64 / MEGABYTE)
+    format!("{:.1} MB", bytes as f64 / MEGABYTE)
 }
 
-fn as_time(how_long: Duration) -> String {
+/// A length of time, for printing, in whichever unit reads best.
+pub fn as_time(how_long: Duration) -> String {
     let seconds = how_long.as_secs_f64();
     if seconds >= 1. {
         return format!("{seconds:.2} s");
@@ -301,14 +291,14 @@ impl fmt::Display for Numbers {
             self.symbols,
             self.symbols_on_disk
                 .map(as_memory)
-                .unwrap_or_else(|| "-- nothing writes them down yet".to_string())
+                .unwrap_or_else(|| "-- see the index below".to_string())
         )?;
         write!(
             out,
             "  answering a search  {:>17}",
             self.answering_a_search
                 .map(|spread| as_time(spread.median))
-                .unwrap_or_else(|| "-- nothing to search yet".to_string())
+                .unwrap_or_else(|| "-- see the index below".to_string())
         )
     }
 }

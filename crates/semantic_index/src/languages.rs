@@ -36,6 +36,31 @@ pub fn of_file<'a>(name: &str, by_suffix: &'a HashMap<String, String>) -> Option
         .map(|(_, language)| language.as_str())
 }
 
+/// Which of these languages claims each file suffix.
+///
+/// Over a chosen set rather than over everything the editor ships, because a
+/// pass that only has grammars for some languages must not claim a file it
+/// cannot then read.
+pub fn suffixes_of(languages: &[Readable]) -> HashMap<&str, usize> {
+    let mut claimed = HashMap::new();
+    for (at, language) in languages.iter().enumerate() {
+        for suffix in &language.suffixes {
+            claimed.insert(suffix.as_str(), at);
+        }
+    }
+    claimed
+}
+
+/// Which of them claims a file name, by the longest suffix that fits -- so
+/// `.d.ts` wins over `.ts` where two languages claim both.
+pub fn claimant(name: &str, claimed: &HashMap<&str, usize>) -> Option<usize> {
+    claimed
+        .iter()
+        .filter(|(suffix, _)| name.ends_with(**suffix))
+        .max_by_key(|(suffix, _)| suffix.len())
+        .map(|(_, at)| *at)
+}
+
 /// Every language the editor ships that already has an outline query, which is
 /// the set the index plan starts from.
 ///
