@@ -76,6 +76,12 @@ impl RenderOnce for Modal {
                     .id(self.container_id.clone())
                     .w_full()
                     .flex_1()
+                    // Allowed to be shorter than what it holds. A flex child's
+                    // least height is otherwise the height of its contents, so
+                    // the scrolling below never engages and the dialog grows
+                    // instead -- past the window, where the rest of it cannot
+                    // be reached.
+                    .min_h_0()
                     .gap(DynamicSpacing::Base08.rems(cx))
                     .when_some(
                         self.container_scroll_handler,

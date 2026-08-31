@@ -120,6 +120,13 @@ impl Tab {
         px(240.)
     }
 
+    /// The room between a tab's own edge and what is written in it. A browser
+    /// leaves about this much, and it is why a name never looks as though it
+    /// has been pressed against the side.
+    pub fn side_padding() -> Pixels {
+        px(10.)
+    }
+
     /// The radius of the tab's two top corners and of the two feet it stands on
     /// where it meets the strip. One number for both: the silhouette reads as a
     /// single swept shape only when the outward turn at the top and the inward
@@ -177,12 +184,17 @@ impl RenderOnce for Tab {
         let tab_bg = self.bg_tint.map_or(tab_bg, |tint| tab_bg.blend(tint));
 
         let (start_slot, end_slot) = {
+            // Neither slot gives way: the close button squeezed out of a tab is
+            // a tab that cannot be closed, and an icon squeezed to nothing is a
+            // tab that says less than it did.
             let start_slot = h_flex()
+                .flex_none()
                 .size(START_TAB_SLOT_SIZE)
                 .justify_center()
                 .children(self.start_slot);
 
             let end_slot = h_flex()
+                .flex_none()
                 .size(END_TAB_SLOT_SIZE)
                 .justify_center()
                 .children(self.end_slot);
@@ -203,11 +215,11 @@ impl RenderOnce for Tab {
         let card_border = cx.theme().colors().border;
         let card_height = Tab::card_height(cx);
         let content_height = Tab::content_height(cx);
-        let content_px = DynamicSpacing::Base04.px(cx);
         let content_gap = DynamicSpacing::Base04.rems(cx);
         let shoulder = Tab::shoulder();
         let corner = Tab::corner();
         let face_of = self.id.clone();
+        let name_of = self.id.clone();
 
         self.div
             .relative()
@@ -279,11 +291,25 @@ impl RenderOnce for Tab {
                     .w_full()
                     .min_w_0()
                     .overflow_hidden()
-                    .px(content_px)
+                    .px(Tab::side_padding())
                     .gap(content_gap)
                     .text_color(text_color)
                     .child(start_slot)
-                    .children(self.children)
+                    // What the item writes in the tab is wrapped rather than
+                    // put in the row directly. A child of a row keeps the width
+                    // it asks for unless it is told it may shrink, so a long
+                    // name pushed itself past the tab's edge and was cut there
+                    // -- taking the close button with it. Told to shrink, it
+                    // shortens itself instead, which is what the middle ellipsis
+                    // is waiting for.
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .debug_selector(move || format!("TAB-NAME-{name_of}"))
+                            .children(self.children),
+                    )
                     .child(end_slot),
             )
     }
@@ -587,6 +613,33 @@ mod tests {
     // takes a third of the window for one file and leaves the rest unreadable.
     // The bound is also what turns the middle ellipsis on -- the label asks for
     // the room it is given, so with nothing to ask against it never truncates.
+    /// A name never touches the tab's own edge. A browser leaves a gutter on
+    /// both sides, and text pressed against the side reads as text that has
+    /// been cut rather than text that has been shortened.
+    #[gpui::test]
+    async fn a_name_keeps_a_gutter_between_itself_and_the_tab_edge(cx: &mut TestAppContext) {
+        let cx = draw_a_strip(cx);
+
+        let tab = cx.debug_bounds("TAB-chosen").expect("the tab is painted");
+        let name = cx
+            .debug_bounds("TAB-NAME-chosen")
+            .expect("what is written in the tab is painted");
+        let gutter = Tab::side_padding();
+
+        assert!(
+            name.left() - tab.left() >= gutter - px(1.),
+            "the name starts {:?} in from a tab beginning at {:?}, against a gutter of {gutter:?}",
+            name.left(),
+            tab.left()
+        );
+        assert!(
+            tab.right() - name.right() >= gutter - px(1.),
+            "the name ends at {:?} in a tab ending at {:?}, against a gutter of {gutter:?}",
+            name.right(),
+            tab.right()
+        );
+    }
+
     #[gpui::test]
     async fn a_long_name_does_not_make_a_long_tab(cx: &mut TestAppContext) {
         cx.update(|cx| {
