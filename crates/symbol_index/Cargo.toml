@@ -1,0 +1,30 @@
+[package]
+name = "symbol_index"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/symbol_index.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+log.workspace = true
+paths.workspace = true
+project.workspace = true
+semantic_index.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

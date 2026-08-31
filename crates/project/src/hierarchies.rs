@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context as _, Result};
 use gpui::{App, AsyncApp, Entity, SharedString};
 use language::{
-    Anchor, Bias, Buffer, File as _, LocalFile, Location, PointUtf16, SymbolKind, lsp_to_symbol_kind,
+    Anchor, Bias, Buffer, File as _, Location, PointUtf16, SymbolKind, lsp_to_symbol_kind,
     point_from_lsp,
 };
 use lsp::{LanguageServer, LanguageServerId};
@@ -164,7 +164,8 @@ pub async fn outgoing_calls(
     let queried_buffer = item.location.buffer.clone();
     let mut resolved = Vec::with_capacity(calls.len());
     for call in calls {
-        let to = resolve_call_hierarchy_item(lsp_store, item.language_server_id, call.to, cx).await?;
+        let to =
+            resolve_call_hierarchy_item(lsp_store, item.language_server_id, call.to, cx).await?;
         let from_ranges = anchor_ranges_for(&queried_buffer, call.from_ranges, cx);
         resolved.push(CallHierarchyOutgoingCall { to, from_ranges });
     }
@@ -237,8 +238,9 @@ pub async fn supertypes(
 
     let mut resolved = Vec::with_capacity(items.len());
     for raw_item in items {
-        resolved
-            .push(resolve_type_hierarchy_item(lsp_store, item.language_server_id, raw_item, cx).await?);
+        resolved.push(
+            resolve_type_hierarchy_item(lsp_store, item.language_server_id, raw_item, cx).await?,
+        );
     }
     Ok(HierarchyOutcome::Found(resolved))
 }
@@ -272,8 +274,9 @@ pub async fn subtypes(
 
     let mut resolved = Vec::with_capacity(items.len());
     for raw_item in items {
-        resolved
-            .push(resolve_type_hierarchy_item(lsp_store, item.language_server_id, raw_item, cx).await?);
+        resolved.push(
+            resolve_type_hierarchy_item(lsp_store, item.language_server_id, raw_item, cx).await?,
+        );
     }
     Ok(HierarchyOutcome::Found(resolved))
 }
