@@ -372,6 +372,18 @@ pub async fn run_a_task(
     task: TaskTemplate,
     cx: &mut gpui::AsyncWindowContext,
 ) {
+    run_a_task_on(workspace, task, None, cx).await
+}
+
+/// The same, on a named machine. Resolution happens first and untouched, so the
+/// variables in a configuration are worked out exactly as they are for a run on
+/// this machine; only the resolved command is then carried across.
+pub async fn run_a_task_on(
+    workspace: &WeakEntity<Workspace>,
+    task: TaskTemplate,
+    machine: Option<crate::over_ssh::Machine>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
     let Some(contexts) = workspace
         .update_in(cx, |workspace, window, cx| {
             tasks_ui::task_contexts(workspace, window, cx)
@@ -398,7 +410,31 @@ pub async fn run_a_task(
     // first means a reader who presses Run and sees nothing happen is told why,
     // instead of wondering whether the press even landed.
     match task.resolve_task(&comes_from.to_id_base(), &context) {
-        Some(resolved) => {
+        Some(mut resolved) => {
+            if let Some(machine) = machine {
+                // A file of variables is read here, on the side the file is on,
+                // so its contents travel with the command. Left to the spawn it
+                // would be read here and applied here, and the far side would
+                // run without half of its settings.
+                let from_the_file = match resolved.resolved.env_file.clone() {
+                    Some(path) => match smol::fs::read_to_string(&path).await {
+                        Ok(text) => task::env_file_variables(&text).into_iter().collect(),
+                        Err(error) => {
+                            say_why(
+                                workspace,
+                                format!(
+                                    "The file of variables {} could not be read: {error}",
+                                    path.display()
+                                ),
+                                cx,
+                            );
+                            return;
+                        }
+                    },
+                    None => Default::default(),
+                };
+                crate::over_ssh::send_to(&machine, &mut resolved.resolved, from_the_file);
+            }
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.schedule_resolved_task(comes_from, resolved, false, window, cx);
@@ -424,6 +460,19 @@ pub async fn run_a_task(
                 .ok();
         }
     }
+}
+
+/// Tells the reader why a run did not happen. A press that does nothing looks
+/// exactly like a press that never landed.
+fn say_why(workspace: &WeakEntity<Workspace>, said: String, cx: &mut gpui::AsyncWindowContext) {
+    workspace
+        .update_in(cx, |workspace, _window, cx| {
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<TaskTemplate>(), said),
+                cx,
+            );
+        })
+        .ok();
 }
 
 /// The offer the editor left behind, taken rather than read: it is answered once,
@@ -494,6 +543,8 @@ pub struct RunConfigurationsView {
     args: Entity<Editor>,
     cwd: Entity<Editor>,
     env_file: Entity<Editor>,
+    /// The machine to run on, blank for this one.
+    machine: Entity<Editor>,
     /// The environment, a row to a variable, as the model holds it. Each row is
     /// two little editors; an empty name is a row the reader has not filled in
     /// yet and is left out of what is written.
@@ -597,6 +648,11 @@ impl RunConfigurationsView {
         let args = lines("One argument a line", window, cx);
         let cwd = field("Where to run it, blank for the project root", window, cx);
         let env_file = field("A file of variables, such as .env.local", window, cx);
+        let machine = field(
+            "Blank for this machine, or user@host to run over SSH",
+            window,
+            cx,
+        );
         let adapter = field(
             "Which debugger: Delve, CodeLLDB, Debugpy, JavaScript, GDB",
             window,
@@ -611,6 +667,7 @@ impl RunConfigurationsView {
             &args,
             &cwd,
             &env_file,
+            &machine,
             &adapter,
             &adapter_config,
             &builds,
@@ -643,6 +700,7 @@ impl RunConfigurationsView {
             args,
             cwd,
             env_file,
+            machine,
             env_rows: Vec::new(),
             adapter,
             adapter_config,
@@ -869,6 +927,10 @@ impl RunConfigurationsView {
             (&self.args, args),
             (&self.cwd, cwd),
             (&self.env_file, env_file),
+            (
+                &self.machine,
+                configurations_file::machine_of(&configuration.as_written).unwrap_or_default(),
+            ),
             (&self.adapter, adapter),
             (&self.adapter_config, adapter_config),
             (&self.builds, builds),
@@ -990,6 +1052,12 @@ impl RunConfigurationsView {
         task
     }
 
+    /// The machine the form names, if it names one.
+    fn machine_in_the_form(&self, cx: &App) -> Option<String> {
+        let said = self.machine.read(cx).text(cx).trim().to_string();
+        (!said.is_empty()).then_some(said)
+    }
+
     /// What the form says, as a debug configuration.
     fn scenario_in_the_form(&self, cx: &App) -> DebugScenario {
         let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
@@ -1024,7 +1092,12 @@ impl RunConfigurationsView {
                     cx.notify();
                     return;
                 }
-                configurations_file::task_as_written(&task)
+                configurations_file::task_as_written(&task).map(|written| {
+                    configurations_file::with_the_machine(
+                        written,
+                        self.machine_in_the_form(cx).as_deref(),
+                    )
+                })
             }
             Kind::Debug => {
                 let scenario = self.scenario_in_the_form(cx);
@@ -1162,16 +1235,29 @@ impl RunConfigurationsView {
                     cx.notify();
                     return;
                 }
-                self.run_the_task(task, window, cx);
+                let machine = self
+                    .machine_in_the_form(cx)
+                    .and_then(|said| crate::over_ssh::Machine::parse(&said));
+                self.run_the_task_on(task, machine, window, cx);
             }
             Kind::Debug => self.debug(window, cx),
         }
     }
 
     fn run_the_task(&mut self, task: TaskTemplate, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_the_task_on(task, None, window, cx)
+    }
+
+    fn run_the_task_on(
+        &mut self,
+        task: TaskTemplate,
+        machine: Option<crate::over_ssh::Machine>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            run_a_task(&workspace, task, cx).await;
+            run_a_task_on(&workspace, task, machine, cx).await;
         })
         .detach();
     }
@@ -1183,6 +1269,19 @@ impl RunConfigurationsView {
         let Some((kind, at)) = self.chosen else {
             return;
         };
+        // Debugging a run on another machine is not built. The debugger would
+        // start here and the program would start there, with nothing between
+        // them -- so this refuses and says why, rather than starting the program
+        // locally under a debugger and looking as though it had worked.
+        if self.machine_in_the_form(cx).is_some() {
+            self.trouble = Some(
+                "This configuration runs on another machine, and debugging one of those is \
+                 not supported yet. Clear the machine to debug it here."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         match kind {
             Kind::Debug => {
                 let scenario = self.scenario_in_the_form(cx);
@@ -1708,7 +1807,14 @@ impl RunConfigurationsView {
     /// The entry as JSON, exactly as the block below the form shows it.
     fn json_for_test(&self, kind: Kind, cx: &App) -> String {
         let written = match kind {
-            Kind::Task => configurations_file::task_as_written(&self.task_in_the_form(cx)),
+            Kind::Task => {
+                configurations_file::task_as_written(&self.task_in_the_form(cx)).map(|written| {
+                    configurations_file::with_the_machine(
+                        written,
+                        self.machine_in_the_form(cx).as_deref(),
+                    )
+                })
+            }
             Kind::Debug => configurations_file::scenario_as_written(&self.scenario_in_the_form(cx)),
         };
         match written {
@@ -1873,6 +1979,10 @@ impl RunConfigurationsView {
                     .child(field("COMMAND", &self.command, false))
                     .child(field("ARGUMENTS", &self.args, true))
                     .child(field("WORKING DIRECTORY", &self.cwd, false))
+                    // Read after the working directory on purpose: naming a
+                    // machine changes what the line above means, from a path of
+                    // this machine to a path of that one.
+                    .child(field("MACHINE", &self.machine, false))
                     .child(
                         // The plus rides the rule that names the section rather
                         // than sitting alone on a line of its own beneath it.
