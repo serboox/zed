@@ -493,15 +493,20 @@ impl EnvironmentEditorModal {
             .map(|environment| (environment.id, environment.name.clone()))
             .collect();
 
-        let mut list =
-            v_flex()
-                .id("environment-editor-list")
-                .gap_0p5()
-                .child(
-                    self.render_scope_entry("Global", Scope::Global, cx, |this, window, cx| {
-                        this.select_scope(Scope::Global, window, cx);
-                    }),
-                );
+        let mut list = v_flex()
+            .id("environment-editor-list")
+            .debug_selector(|| "environment-editor-list".to_string())
+            // Kept at its own height inside the scrolling above it. A child
+            // of a bounded column is squeezed to fit by default, so
+            // twenty-five entries quietly compressed themselves into the
+            // room available and there was never anything to scroll to.
+            .flex_none()
+            .gap_0p5()
+            .child(
+                self.render_scope_entry("Global", Scope::Global, cx, |this, window, cx| {
+                    this.select_scope(Scope::Global, window, cx);
+                }),
+            );
         for (id, name) in environments {
             list = list.child(self.render_scope_entry(
                 name,
@@ -514,18 +519,37 @@ impl EnvironmentEditorModal {
         }
 
         v_flex()
+            .flex_none()
             .w(px(200.))
-            .h_full()
+            // No `h_full` here: it resolves against a parent whose height is
+            // *definite*, and the row this sits in takes its height from the
+            // layout instead -- so `h_full` fell back to the height of the
+            // contents, which is the very thing being bounded. A row stretches
+            // its children to its own height anyway.
+            // Allowed to be shorter than what is in it. Without this its least
+            // height is the height of every environment there is, the row it
+            // sits in grows to fit them, and the scrolling below has nothing to
+            // scroll inside -- which is how eleven environments pushed the other
+            // half of this window off the screen.
+            .min_h_0()
             .gap_2()
             .child(
                 div()
                     .id("environment-editor-list-scroll")
+                    .debug_selector(|| "environment-editor-list-scroll".to_string())
                     .flex_1()
+                    .min_h_0()
                     .overflow_scroll()
                     .track_scroll(&self.list_scroll_handle)
                     .child(list)
+                    // Told which handle to follow. Left unsaid, the bars take a
+                    // handle of their own, and the one the view holds -- the one
+                    // that answers how far there is left to scroll -- is never
+                    // updated at all. Two handles for one region also means the
+                    // bar and the wheel can disagree about where the reader is.
                     .custom_scrollbars(
-                        Scrollbars::always_visible(ScrollAxes::Vertical),
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.list_scroll_handle),
                         window,
                         cx,
                     ),
@@ -732,7 +756,7 @@ impl EnvironmentEditorModal {
             Some(format!("Variables for {}", self.scope_name(cx)))
         };
 
-        let mut column = v_flex().flex_1().gap_2();
+        let mut column = v_flex().flex_1().min_w_0().min_h_0().gap_2();
         if let Some(title) = title {
             column = column.child(Label::new(title).size(LabelSize::Large));
         } else {
@@ -757,7 +781,7 @@ impl EnvironmentEditorModal {
             }
         }
 
-        let mut rows = v_flex().id("variable-rows").gap_2();
+        let mut rows = v_flex().id("variable-rows").flex_none().gap_2();
         for index in 0..self.rows.len() {
             rows = rows.child(self.render_row(index, cx));
         }
@@ -777,11 +801,18 @@ impl EnvironmentEditorModal {
         column.child(
             div()
                 .id("environment-editor-rows-scroll")
+                .debug_selector(|| "environment-editor-rows-scroll".to_string())
                 .flex_1()
+                .min_h_0()
                 .overflow_scroll()
                 .track_scroll(&self.rows_scroll_handle)
                 .child(rows)
-                .custom_scrollbars(Scrollbars::always_visible(ScrollAxes::Vertical), window, cx),
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&self.rows_scroll_handle),
+                    window,
+                    cx,
+                ),
         )
     }
 }
@@ -862,6 +893,9 @@ impl Render for EnvironmentEditorModal {
             .top(self.position.y)
             .w(self.size.width)
             .h(self.size.height)
+            // Nothing leaves the window. It is placed and sized by hand, so a
+            // child that outgrew it would simply paint over whatever is behind.
+            .overflow_hidden()
             .p_3()
             .gap_3()
             .cyberpunk_surface()
@@ -888,6 +922,18 @@ impl Render for EnvironmentEditorModal {
             .child(
                 h_flex()
                     .flex_1()
+                    // Stretched, not centred. A row centres its children by
+                    // default here, and a centred child is given the height of
+                    // its own contents rather than the height of the row -- so
+                    // the column of environments stood 773px tall in a 480px
+                    // window, centred on it, with its top above the window's
+                    // own edge and nothing to scroll. Being allowed to shrink
+                    // means nothing until it is first told how tall it may be.
+                    .items_stretch()
+                    // The two halves may each be shorter and narrower than what
+                    // is in them; each scrolls its own contents instead.
+                    .min_h_0()
+                    .min_w_0()
                     .gap_3()
                     .when(self.show_scope_list, |el| {
                         el.child(self.render_scope_list(window, cx))
@@ -1153,6 +1199,63 @@ mod tests {
                 .unwrap();
             assert!(environment.variables.is_empty());
         });
+    }
+
+    /// More environments than the window is tall must scroll inside their own
+    /// column, not make the window grow until the half where variables are
+    /// edited is off the screen -- which is what a reader with eleven
+    /// environments saw.
+    ///
+    /// Measured on the painted boxes: the least height of a column is the
+    /// height of everything in it unless the column is told it may be shorter,
+    /// so before this the row grew and the scrolling below it had nothing to
+    /// scroll inside.
+    #[gpui::test]
+    async fn many_environments_scroll_inside_their_own_column(cx: &mut TestAppContext) {
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        store.update(&mut cx, |store, cx| {
+            for at in 0..24 {
+                store.create_environment(format!("environment-{at}"), cx);
+            }
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let modal = cx
+            .debug_bounds("environment-editor-modal-root")
+            .expect("the window is painted");
+        let asked_for = view.read_with(&cx, |view, _| view.size);
+        assert!(
+            modal.size.height <= asked_for.height + px(1.),
+            "the window is {:?} tall having been given {:?}: its contents made it grow",
+            modal.size.height,
+            asked_for.height
+        );
+
+        let reach = view.read_with(&cx, |view, _| view.list_scroll_handle.max_offset());
+        let list = cx.debug_bounds("environment-editor-list-scroll");
+        let entries = cx.debug_bounds("environment-editor-list");
+        assert!(
+            reach.y > px(0.),
+            "twenty-five environments in a window this size have to leave something to \
+             scroll to, and the column reports {reach:?}. The window is {:?} at {:?}; \
+             the column is painted {list:?} and what is in it {entries:?}",
+            modal.size,
+            modal.origin
+        );
+
+        // And the half where variables are edited is still inside the window.
+        let rows = cx
+            .debug_bounds("environment-editor-rows-scroll")
+            .expect("the variables are painted");
+        assert!(
+            rows.right() <= modal.right() + px(1.) && rows.bottom() <= modal.bottom() + px(1.),
+            "the variables reach {:?},{:?} in a window ending at {:?},{:?}",
+            rows.right(),
+            rows.bottom(),
+            modal.right(),
+            modal.bottom()
+        );
     }
 
     #[gpui::test]
