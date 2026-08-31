@@ -1,16 +1,18 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{AppContext as _, Context, Entity, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, Subscription, Task};
 use project::{Event as ProjectEvent, PathChange, Project, WorktreeId};
-use semantic_index::definitions::Definition;
+pub use semantic_index::definitions::Definition;
 use semantic_index::inventory::Inventory;
 use semantic_index::refresh;
 use semantic_index::symbols::{Catalogue, Symbols};
 use util::ResultExt as _;
+use workspace::Workspace;
 
 /// Which of four states the index is in, so a caller can tell "nothing
 /// matched" from "there is nothing to search yet" apart.
@@ -146,6 +148,15 @@ impl SymbolIndex {
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The worktree every [`Definition::path`] this index answers with is
+    /// relative to. `None` for a project with nothing local to index --
+    /// which is also the only case [`Self::state`] never leaves `NotBuilt`
+    /// for, so a caller with a `Definition` in hand already knows this is
+    /// `Some`.
+    pub fn worktree_id(&self) -> Option<WorktreeId> {
+        self.worktree_id
     }
 
     /// At most `most` definitions whose name contains `query`'s letters in
@@ -307,6 +318,92 @@ impl SymbolIndex {
     }
 }
 
+/// One [`SymbolIndex`] per project, so two windows open on the same project
+/// share the one build rather than each starting their own. Keyed by the
+/// project entity's own id rather than by root path: two `Entity<Project>`
+/// handles for the same directory are still two different projects as far as
+/// anything else in the editor is concerned, and keying by id keeps this
+/// consistent with that rather than inventing a second notion of identity.
+///
+/// The `Subscription` kept alongside each index is what drops the entry --
+/// index and subscription together -- the moment the project itself has no
+/// more strong references left; without it this map would hold every
+/// project's index for the life of the process; a leak, not a cache.
+#[derive(Default)]
+struct GlobalSymbolIndexes(HashMap<EntityId, (Entity<SymbolIndex>, Subscription)>);
+
+impl Global for GlobalSymbolIndexes {}
+
+/// Starts owning a [`SymbolIndex`] for every project as it appears.
+///
+/// `cx.observe_new` on [`Workspace`] is the pattern this fork already uses
+/// for exactly this shape of problem -- see `project_symbols::init` -- and it
+/// is used the same way here: run once per workspace, as soon as one exists,
+/// rather than waiting for a search surface to ask for one lazily. A second
+/// window opening on a project already indexed finds
+/// [`ensure_index`] a no-op, which is what makes two windows share one
+/// index rather than racing to build two.
+pub fn init(cx: &mut App) {
+    cx.observe_new(
+        |workspace: &mut Workspace, _window, cx: &mut Context<Workspace>| {
+            let project = workspace.project().clone();
+            ensure_index(project, cx);
+        },
+    )
+    .detach();
+}
+
+/// The index for `project`, building one first if this is the first time
+/// anything has asked. Returns the same entity on every call for the same
+/// project, which is the whole of what makes two windows over one project
+/// share one index.
+fn ensure_index(project: Entity<Project>, cx: &mut App) -> Entity<SymbolIndex> {
+    ensure_index_at(project, index_directory(), cx)
+}
+
+/// [`ensure_index`], with the index's own directory taken as a parameter
+/// rather than always `index_directory()` -- what production calls through
+/// [`ensure_index`], and what a test (in this crate, or in a consumer such
+/// as `search_everywhere` that needs a project indexed without touching the
+/// real, shared `paths::database_dir()`) calls directly with a scratch
+/// directory instead of going through [`init`]'s `cx.observe_new`. The same
+/// deduplication [`ensure_index`] is responsible for still applies: calling
+/// this twice for the same project, even from two different windows, still
+/// shares one index.
+pub fn ensure_index_at(
+    project: Entity<Project>,
+    index_dir: PathBuf,
+    cx: &mut App,
+) -> Entity<SymbolIndex> {
+    let id = project.entity_id();
+    if let Some((index, _)) = cx.default_global::<GlobalSymbolIndexes>().0.get(&id) {
+        return index.clone();
+    }
+
+    let index = cx.new(|cx| SymbolIndex::new_with_index_dir(project.clone(), index_dir, cx));
+    let release = cx.observe_release(&project, move |_project, cx| {
+        cx.default_global::<GlobalSymbolIndexes>().0.remove(&id);
+    });
+    cx.default_global::<GlobalSymbolIndexes>()
+        .0
+        .insert(id, (index.clone(), release));
+    index
+}
+
+/// The index already owned for `project`, if any. Never builds one and never
+/// touches `project` itself -- a plain read of a global, so a caller can
+/// reach the index for a project from inside a callback the project itself
+/// invoked (a subscription, an event handler) without the re-entrancy panic
+/// that updating or even reading `project` again in that position would
+/// risk. `None` before [`init`] has had a chance to run for this project, or
+/// if it never will (a project with no window at all).
+pub fn of_project(project: &Entity<Project>, cx: &App) -> Option<Entity<SymbolIndex>> {
+    cx.try_global::<GlobalSymbolIndexes>()?
+        .0
+        .get(&project.entity_id())
+        .map(|(index, _)| index.clone())
+}
+
 /// The directory every project's symbol index file lives under in
 /// production: alongside `db.sqlite`, the editor's own shared database, and
 /// for the same reason -- both are sqlite-backed state this process owns,
@@ -391,7 +488,6 @@ mod tests {
     use super::*;
     use fs::FakeFs;
     use gpui::TestAppContext;
-    use serde_json::json;
     use settings::SettingsStore;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -619,6 +715,29 @@ mod tests {
         assert!(
             found.is_empty(),
             "a failed index answers empty rather than panicking"
+        );
+    }
+
+    /// Two windows over the same project must not each build their own
+    /// index. `ensure_index_at` is what both `init`'s `cx.observe_new` and a
+    /// second window opening later would call, so calling it twice here is
+    /// exactly what two windows on one project do.
+    #[gpui::test]
+    async fn two_windows_over_one_project_share_one_index(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_project_at, project) = a_project(&[("one.rs", "pub fn first() {}\n")], cx).await;
+        let (_held, index_dir) = a_scratch_index_dir();
+
+        let (first, second) = cx.update(|cx| {
+            let first = ensure_index_at(project.clone(), index_dir.clone(), cx);
+            let second = ensure_index_at(project.clone(), index_dir, cx);
+            (first, second)
+        });
+
+        assert_eq!(
+            first.entity_id(),
+            second.entity_id(),
+            "two windows over the same project must share one index, not build two"
         );
     }
 }

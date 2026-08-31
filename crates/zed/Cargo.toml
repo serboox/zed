@@ -137,6 +137,7 @@ rayon.workspace = true
 
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
+hierarchy_view.workspace = true
 html_preview.workspace = true
 http_client.workspace = true
 image_viewer.workspace = true
@@ -202,6 +203,7 @@ split_preview.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
 pdf_preview.workspace = true
+symbol_index.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true
