@@ -282,7 +282,9 @@ impl Render for SecurityModal {
                     .gap_1()
                     .justify_end()
                     .child(
+                        // Neutral: the way out, staying on the safe side.
                         Button::new("rm", "Stay in Restricted Mode")
+                            .style(cyberpunk::Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action(
                                     &ToggleWorktreeSecurity,
@@ -297,6 +299,11 @@ impl Render for SecurityModal {
                             })),
                     )
                     .child(
+                        // Not `Rank::Destructive`: this grants trust, it does not
+                        // delete or discard anything, and that rank is reserved
+                        // for actions that do. Kept as its own red-outlined style,
+                        // the same danger/privilege accent the rest of this
+                        // dialog's chrome already uses for the same reason.
                         Button::new("tc", "Trust and Continue")
                             .style(ButtonStyle::OutlinedCustom(cyberpunk::Accent::Red.border()))
                             .layer(ui::ElevationIndex::ModalSurface)

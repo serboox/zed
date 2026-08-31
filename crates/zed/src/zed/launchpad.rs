@@ -14,7 +14,7 @@ use recent_projects::{RecentProjectEntry, get_recent_projects};
 use serde::{Deserialize, Serialize};
 use theme::{PlayerColor, SystemAppearance};
 use theme_settings::setup_ui_font;
-use ui::{ButtonLike, ButtonSize, ButtonStyle, KeyBinding, WithScrollbar, cyberpunk, prelude::*};
+use ui::{ButtonLike, ButtonSize, KeyBinding, WithScrollbar, cyberpunk, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use uuid::Uuid;
 use workspace::{
@@ -722,15 +722,18 @@ impl Launchpad {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let keybinding = KeyBinding::for_action_in(action.as_ref(), &self.focus_handle, cx);
-        // Outlined rather than filled, and square rather than rounded, since both
-        // are what the chrome around it is built from. Still a `ButtonLike`: a
-        // hand-drawn row loses the button role, the keyboard activation and the
-        // pressed state that assistive technology and the reader both rely on.
-        // The wrapper carries the debug selector a `ButtonLike` cannot, which is
-        // how a test measures where each button actually landed.
+        // Neutral rather than accent: the three ways in are equal alternatives to
+        // each other, and the accent on this surface belongs to the project list
+        // instead, per `render_mark`'s own reasoning above. Square rather than
+        // rounded, since both are what the chrome around it is built from. Still
+        // a `ButtonLike`: a hand-drawn row loses the button role, the keyboard
+        // activation and the pressed state that assistive technology and the
+        // reader both rely on. The wrapper carries the debug selector a
+        // `ButtonLike` cannot, which is how a test measures where each button
+        // actually landed.
         div().debug_selector(|| id.to_string()).child(
             ButtonLike::new(id)
-                .style(ButtonStyle::OutlinedCustom(cyberpunk::border_raised()))
+                .style(cyberpunk::Rank::Neutral.style())
                 .square()
                 // The default height leaves an outline too tight to read as a button
                 // among elements laid out on a 14-and-up rhythm.

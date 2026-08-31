@@ -741,8 +741,10 @@ impl PdfView {
                     .child(div().flex_1().child(self.password_field.clone())),
             )
             .child(
+                // Accent: the one action this whole surface exists for.
                 Button::new("pdf-password-open", "Open")
                     .label_size(LabelSize::Small)
+                    .style(ui::cyberpunk::Rank::Accent.style())
                     .on_click(cx.listener(|view, _, window, cx| view.try_the_password(window, cx))),
             )
             .into_any_element()
@@ -1769,7 +1771,7 @@ impl PdfView {
         let page_numbers = room >= ROOM_FOR_PAGE_NUMBERS;
         let zoom_label = room >= ROOM_FOR_A_ZOOM_LABEL;
         let width_of_the_strip = self.room_for_controls.clone();
-        h_flex()
+        let mut strip = h_flex()
             .relative()
             .flex_none()
             .w_full()
@@ -1791,145 +1793,181 @@ impl PdfView {
                 .top_0()
                 .left_0()
                 .size_full(),
-            )
-            .when(side_lists, |strip| {
-                strip
-                    .child(self.tool(
-                        "pdf-thumbnails",
-                        IconName::Image,
-                        "Page thumbnails",
-                        self.sidebar == Sidebar::Thumbnails,
-                        cx.listener(|view, _, _, cx| view.show_sidebar(Sidebar::Thumbnails, cx)),
-                    ))
-                    .child(self.tool(
-                        "pdf-outline",
-                        IconName::ListTree,
-                        "Contents",
-                        self.sidebar == Sidebar::Outline,
-                        cx.listener(|view, _, _, cx| view.show_sidebar(Sidebar::Outline, cx)),
-                    ))
-                    .child(self.divider())
-            })
-            .child(self.tool(
-                "pdf-zoom-out",
-                IconName::Dash,
-                "Zoom out",
+            );
+
+        // Adjacent icon actions share one frame with a hairline between them,
+        // rather than sitting bare in the strip: a group here is exactly the
+        // set that was already kept adjacent with no divider between its own
+        // members, now framed as the one thing it always visually was.
+        if side_lists {
+            let sidebar_toggles: Vec<AnyElement> = vec![
+                self.tool(
+                    "pdf-thumbnails",
+                    IconName::Image,
+                    "Page thumbnails",
+                    self.sidebar == Sidebar::Thumbnails,
+                    cx.listener(|view, _, _, cx| view.show_sidebar(Sidebar::Thumbnails, cx)),
+                ),
+                self.tool(
+                    "pdf-outline",
+                    IconName::ListTree,
+                    "Contents",
+                    self.sidebar == Sidebar::Outline,
+                    cx.listener(|view, _, _, cx| view.show_sidebar(Sidebar::Outline, cx)),
+                ),
+            ];
+            strip = strip
+                .child(ui::cyberpunk::segmented(sidebar_toggles))
+                .child(self.divider());
+        }
+
+        // The zoom stepper: minus, the size itself (a popover trigger when
+        // there is room to show it), plus -- one control, not three.
+        let mut zoom_group: Vec<AnyElement> = vec![self.tool(
+            "pdf-zoom-out",
+            IconName::Dash,
+            "Zoom out",
+            false,
+            cx.listener(|view, _, _, cx| view.zoom_by(-ZOOM_STEP, cx)),
+        )];
+        if zoom_label {
+            zoom_group.push(self.render_zoom_choices(cx));
+        }
+        zoom_group.push(self.tool(
+            "pdf-zoom-in",
+            IconName::Plus,
+            "Zoom in",
+            false,
+            cx.listener(|view, _, _, cx| view.zoom_by(ZOOM_STEP, cx)),
+        ));
+        strip = strip.child(ui::cyberpunk::segmented(zoom_group));
+
+        if searching {
+            let fit_group: Vec<AnyElement> = vec![
+                self.tool(
+                    "pdf-fit-width",
+                    IconName::ArrowRightLeft,
+                    "Fit the width",
+                    self.fit == Fit::Width,
+                    cx.listener(|view, _, _, cx| view.fit_to(Fit::Width, cx)),
+                ),
+                self.tool(
+                    "pdf-fit-page",
+                    IconName::Maximize,
+                    "Fit the page",
+                    self.fit == Fit::Page,
+                    cx.listener(|view, _, _, cx| view.fit_to(Fit::Page, cx)),
+                ),
+            ];
+            strip = strip.child(ui::cyberpunk::segmented(fit_group));
+        }
+        strip = strip.child(self.divider());
+
+        // First and previous sit either side of nothing, and next and last the
+        // same, so each pair keeps the frame the field between them would
+        // otherwise interrupt.
+        let mut before_the_field: Vec<AnyElement> = Vec::new();
+        if everything {
+            before_the_field.push(self.tool(
+                "pdf-first",
+                IconName::ChevronUpDown,
+                "First page",
                 false,
-                cx.listener(|view, _, _, cx| view.zoom_by(-ZOOM_STEP, cx)),
-            ))
-            .when(zoom_label, |strip| {
-                strip.child(self.render_zoom_choices(cx))
-            })
-            .child(self.tool(
-                "pdf-zoom-in",
-                IconName::Plus,
-                "Zoom in",
+                cx.listener(|view, _, _, cx| view.show_page(0, cx)),
+            ));
+        }
+        if page_numbers {
+            before_the_field.push(self.tool(
+                "pdf-previous",
+                IconName::ChevronUp,
+                "Previous page",
                 false,
-                cx.listener(|view, _, _, cx| view.zoom_by(ZOOM_STEP, cx)),
-            ))
-            .when(searching, |strip| {
-                strip
-                    .child(self.tool(
-                        "pdf-fit-width",
-                        IconName::ArrowRightLeft,
-                        "Fit the width",
-                        self.fit == Fit::Width,
-                        cx.listener(|view, _, _, cx| view.fit_to(Fit::Width, cx)),
-                    ))
-                    .child(self.tool(
-                        "pdf-fit-page",
-                        IconName::Maximize,
-                        "Fit the page",
-                        self.fit == Fit::Page,
-                        cx.listener(|view, _, _, cx| view.fit_to(Fit::Page, cx)),
-                    ))
-            })
-            .child(self.divider())
-            .when(everything, |strip| {
-                strip.child(self.tool(
-                    "pdf-first",
-                    IconName::ChevronUpDown,
-                    "First page",
-                    false,
-                    cx.listener(|view, _, _, cx| view.show_page(0, cx)),
-                ))
-            })
-            .when(page_numbers, |strip| {
-                strip
-                    .child(self.tool(
-                        "pdf-previous",
-                        IconName::ChevronUp,
-                        "Previous page",
-                        false,
-                        cx.listener(|view, _, _, cx| view.step_page(-1, cx)),
-                    ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(46.))
-                            .h(px(22.))
-                            .px_1()
-                            .border_1()
-                            .border_color(ui::cyberpunk::border_dim())
-                            .child(self.page_field.clone()),
-                    )
-            })
-            .when(side_lists, |strip| {
-                strip.child(
-                    Label::new(format!("of {pages}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                cx.listener(|view, _, _, cx| view.step_page(-1, cx)),
+            ));
+        }
+        if !before_the_field.is_empty() {
+            strip = strip.child(ui::cyberpunk::segmented(before_the_field));
+        }
+
+        if page_numbers {
+            strip = strip.child(
+                div()
+                    .flex_none()
+                    .w(px(46.))
+                    .h(px(22.))
+                    .px_1()
+                    .border_1()
+                    .border_color(ui::cyberpunk::border_dim())
+                    .child(self.page_field.clone()),
+            );
+        }
+        if side_lists {
+            strip = strip.child(
+                Label::new(format!("of {pages}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        }
+
+        let mut after_the_field: Vec<AnyElement> = Vec::new();
+        if page_numbers {
+            after_the_field.push(self.tool(
+                "pdf-next",
+                IconName::ChevronDown,
+                "Next page",
+                false,
+                cx.listener(|view, _, _, cx| view.step_page(1, cx)),
+            ));
+        }
+        if everything {
+            after_the_field.push(self.tool(
+                "pdf-last",
+                IconName::ChevronUpDown,
+                "Last page",
+                false,
+                cx.listener(move |view, _, _, cx| view.show_page(pages.saturating_sub(1), cx)),
+            ));
+        }
+        if !after_the_field.is_empty() {
+            strip = strip.child(ui::cyberpunk::segmented(after_the_field));
+        }
+
+        if searching {
+            strip = strip
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(if everything { 180. } else { 120. }))
+                        .child(self.render_find_field(window, cx)),
                 )
-            })
-            .when(page_numbers, |strip| {
-                strip.child(self.tool(
-                    "pdf-next",
-                    IconName::ChevronDown,
-                    "Next page",
+                .children(self.searched_for.clone().map(|needle| {
+                    Label::new(match matches {
+                        0 => format!("no {needle}"),
+                        found => format!("{} of {found}", self.at_match + 1),
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                }));
+            let match_nav: Vec<AnyElement> = vec![
+                self.tool(
+                    "pdf-find-previous",
+                    IconName::ChevronLeft,
+                    "Previous match",
                     false,
-                    cx.listener(|view, _, _, cx| view.step_page(1, cx)),
-                ))
-            })
-            .when(everything, |strip| {
-                strip.child(self.tool(
-                    "pdf-last",
-                    IconName::ChevronUpDown,
-                    "Last page",
+                    cx.listener(|view, _, _, cx| view.step_match(-1, cx)),
+                ),
+                self.tool(
+                    "pdf-find-next",
+                    IconName::ChevronRight,
+                    "Next match",
                     false,
-                    cx.listener(move |view, _, _, cx| view.show_page(pages.saturating_sub(1), cx)),
-                ))
-            })
-            .when(searching, |strip| {
-                strip
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(if everything { 180. } else { 120. }))
-                            .child(self.render_find_field(window, cx)),
-                    )
-                    .children(self.searched_for.clone().map(|needle| {
-                        Label::new(match matches {
-                            0 => format!("no {needle}"),
-                            found => format!("{} of {found}", self.at_match + 1),
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                    }))
-                    .child(self.tool(
-                        "pdf-find-previous",
-                        IconName::ChevronLeft,
-                        "Previous match",
-                        false,
-                        cx.listener(|view, _, _, cx| view.step_match(-1, cx)),
-                    ))
-                    .child(self.tool(
-                        "pdf-find-next",
-                        IconName::ChevronRight,
-                        "Next match",
-                        false,
-                        cx.listener(|view, _, _, cx| view.step_match(1, cx)),
-                    ))
-            })
+                    cx.listener(|view, _, _, cx| view.step_match(1, cx)),
+                ),
+            ];
+            strip = strip.child(ui::cyberpunk::segmented(match_nav));
+        }
+
+        strip
             .child(self.divider())
             .child(self.render_more_menu(cx))
             .into_any_element()
@@ -2124,8 +2162,10 @@ impl PdfView {
             .child(
                 ui::PopoverMenu::new("pdf-more")
                     .trigger(
+                        // Quiet: reached for rarely, per this function's own doc.
                         IconButton::new("pdf-more-button", IconName::Ellipsis)
                             .icon_size(IconSize::Small)
+                            .style(ui::cyberpunk::Rank::Quiet.style())
                             .tooltip(Tooltip::text("More")),
                     )
                     .menu({
@@ -2370,8 +2410,10 @@ impl PdfView {
                                 .justify_between()
                                 .child(Label::new("Document").size(LabelSize::Small))
                                 .child(
+                                    // Neutral: the way out of this overlay.
                                     IconButton::new("pdf-properties-close", IconName::Close)
                                         .icon_size(IconSize::XSmall)
+                                        .style(ui::cyberpunk::Rank::Neutral.style())
                                         .on_click(cx.listener(|view, _, _, cx| {
                                             view.facts = None;
                                             cx.notify();
@@ -3782,6 +3824,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The zoom-out, the size itself and the zoom-in control now sit under one
+    /// shared frame with a hairline between them, rather than bare in the
+    /// strip. Framing them must not move where any one of them can be
+    /// clicked.
+    ///
+    /// Painted style is not reachable from this crate's tests: `ButtonLike`'s
+    /// style field is `pub(super)` to the `ui` crate with no public getter,
+    /// and `debug_bounds` reports only where a control was painted, never a
+    /// border colour. What is proven here instead, as the honest fallback the
+    /// task allows for: the framed control still paints under its own
+    /// selector, and a click there still reaches the view exactly as it did
+    /// before it was grouped into a segmented frame.
+    #[gpui::test]
+    async fn framing_the_zoom_stepper_does_not_move_its_click(cx: &mut TestAppContext) {
+        a_working_editor(cx);
+        let window = cx.add_window(|window, cx| {
+            PdfView::open_path(PathBuf::from("/nowhere/document.pdf"), window, cx)
+        });
+        let view = window.root(cx).expect("the reader was built");
+        view.update(cx, |view, _| {
+            view.pages = vec![None; 3];
+            view.page_sizes = (0..3).map(|_| a4()).collect();
+            view.page_bounds = (0..3)
+                .map(|_| Rc::new(Cell::new(Bounds::default())))
+                .collect();
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1200.), px(600.)));
+        // Twice, as the narrow-window test above does: the strip lays itself
+        // out from the room it had last frame.
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| window.draw(cx).clear());
+
+        let before = view.update_in(&mut visual, |view, _, _| view.zoom());
+        let zoom_in = visual
+            .debug_bounds("pdf-zoom-in")
+            .expect("the zoom-in control is painted, now inside its own segmented frame");
+        visual.simulate_click(zoom_in.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        let after = view.update_in(&mut visual, |view, _, _| view.zoom());
+
+        assert!(
+            after > before,
+            "a click on the framed zoom-in control must still reach the view: {before} -> {after}"
+        );
     }
 
     fn selection_over(from: (f32, f32), to: (f32, f32)) -> Selection {
