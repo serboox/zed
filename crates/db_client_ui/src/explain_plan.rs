@@ -596,6 +596,7 @@ impl ExplainPlanView {
         div()
             .id("flame-scroll")
             .flex_1()
+            .min_h_0()
             .overflow_scroll()
             .child(container)
     }
@@ -663,6 +664,7 @@ impl Render for ExplainPlanView {
             PlanViewMode::Tree => div()
                 .id("plan-scroll")
                 .flex_1()
+                .min_h_0()
                 .overflow_y_scroll()
                 .child(self.render_tree_body(cx))
                 .into_any_element(),

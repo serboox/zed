@@ -434,6 +434,7 @@ impl Render for SchemaDiffView {
                         .id("schema-diff-rows")
                         .gap_0p5()
                         .flex_1()
+                        .min_h_0()
                         .overflow_y_scroll()
                         .children(rows),
                 )
