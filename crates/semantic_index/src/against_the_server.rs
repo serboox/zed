@@ -80,6 +80,26 @@ impl std::fmt::Display for ServerRefused {
 
 impl std::error::Error for ServerRefused {}
 
+/// When the server does its thinking.
+///
+/// Priming ahead is the server's own default and what a person editing the
+/// project gets: it works the whole workspace out before the first question, so
+/// every answer afterwards is quick. It also holds all of that at once, and on
+/// a project with this crate graph that does not fit in the machine the
+/// measurements run on.
+///
+/// Lazily is the other end: nothing is computed until something is asked, so
+/// the run fits, but the first question pays for what the priming would have
+/// done -- which a stand with a short per-query limit will read as a timeout.
+///
+/// Neither is more honest than the other; they answer the same questions with
+/// the same information. Each stand picks the end it can afford.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priming {
+    Ahead,
+    Lazily,
+}
+
 /// How many queries rust-analyzer may keep cached. Read from `RA_LRU_CAP` when
 /// it is already set, so a run can widen or remove the bound deliberately.
 pub fn lru_capacity() -> u32 {
@@ -346,7 +366,7 @@ impl Server {
     /// Starts rust-analyzer over `root` and carries out the `initialize` /
     /// `initialized` handshake. Indexing itself is not waited for here --
     /// call [`Server::wait_until_indexed`] before trusting any answer.
-    pub async fn start(root: &Path) -> Result<Self> {
+    pub async fn start(root: &Path, priming: Priming) -> Result<Self> {
         let binary = which::which("rust-analyzer").context(
             "rust-analyzer is not on PATH; install it (for example `rustup component add \
              rust-analyzer`) before measuring recall against it",
@@ -413,12 +433,12 @@ impl Server {
                     // be exactly what a person editing this project would get.
                     // Only what it computes *ahead of being asked* is changed.
                     "initializationOptions": {
-                        // Priming walks the whole workspace before the first
-                        // question and holds all of it. This project's graph
-                        // does not fit in the measuring machine that way, and
-                        // the run then measures the machine. Off, the server
-                        // computes what each request needs and no more.
-                        "cachePriming": {"enable": false},
+                        // Whether the server works the whole project out before
+                        // the first question or as each one arrives. See
+                        // [`Priming`]: it is a trade of memory against the cost
+                        // of the first answer, and the two stands want opposite
+                        // ends of it.
+                        "cachePriming": {"enable": matches!(priming, Priming::Ahead)},
                         "lru": {"capacity": lru_capacity()},
                     },
                 }),

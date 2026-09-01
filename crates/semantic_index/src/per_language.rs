@@ -217,6 +217,85 @@ fn per_megabyte_cost(took: Duration, bytes: u64) -> Duration {
 /// with and ships no `outline.scm` of its own, so it inherits the same
 /// query. Whatever is noise in one is noise in all three, which is why this
 /// function is keyed by three names rather than one.
+/// The names a macro invocation declares that the outline query cannot see.
+///
+/// A macro body is an opaque token tree to the grammar, so a query over the
+/// parse tree finds nothing inside it -- and a project's own macros are where
+/// a great many of its findable names live. Measured on this repository:
+/// ninety-five per cent of the definitions the index missed against
+/// rust-analyzer were inside a macro, and nearly half of those were one macro.
+///
+/// This is deliberately not a `macro_rules!` interpreter. It knows the shape of
+/// the handful of macros that actually account for the gap, and knows nothing
+/// else: a macro it does not recognise contributes nothing, exactly as before.
+/// The alternative -- expanding macros in general -- needs the compiler for
+/// procedural ones, which is the dependency this index exists to do without.
+pub fn names_a_macro_declares(
+    language: &str,
+    node: tree_sitter::Node,
+    contents: &[u8],
+) -> Vec<(String, u32)> {
+    if language != "rust" || node.kind() != "macro_invocation" {
+        return Vec::new();
+    }
+    let Some(called) = node
+        .child_by_field_name("macro")
+        .and_then(|name| name.utf8_text(contents).ok())
+    else {
+        return Vec::new();
+    };
+    // `actions!(namespace, [Name, Name])` and `actions!([Name, Name])` both
+    // declare one unit struct per name in the bracketed list. Attributes and
+    // doc comments sit between them and are nested a level deeper in the token
+    // tree, so the names are exactly the identifiers directly inside it.
+    if called != "actions" {
+        return Vec::new();
+    }
+    // Only the macro's own name is a named field; its token tree is just the
+    // last child, so it is found by kind rather than by asking for a field
+    // that does not exist.
+    let mut walking = node.walk();
+    let Some(tokens) = node
+        .children(&mut walking)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return Vec::new();
+    };
+    let Some(listed) = bracketed_list(tokens) else {
+        return Vec::new();
+    };
+    let mut named = Vec::new();
+    let mut walking = listed.walk();
+    for child in listed.children(&mut walking) {
+        if child.kind() != "identifier" {
+            continue;
+        }
+        if let Ok(name) = child.utf8_text(contents) {
+            named.push((name.to_string(), child.start_position().row as u32 + 1));
+        }
+    }
+    named
+}
+
+/// The `[ ... ]`-delimited token tree inside `tokens`, which is where the list
+/// of names lives in both shapes of the invocation.
+fn bracketed_list(tokens: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let opens_with_a_bracket = |node: tree_sitter::Node| {
+        node.child(0)
+            .map(|first| first.kind() == "[")
+            .unwrap_or(false)
+    };
+    // `actions![...]` delimits the invocation itself with brackets, so the list
+    // is the token tree already in hand rather than one nested inside it.
+    if opens_with_a_bracket(tokens) {
+        return Some(tokens);
+    }
+    let mut walking = tokens.walk();
+    tokens
+        .children(&mut walking)
+        .find(|child| child.kind() == "token_tree" && opens_with_a_bracket(*child))
+}
+
 pub fn is_declaration(language: &str, defined: tree_sitter::Node) -> bool {
     if !matches!(language, "typescript" | "tsx" | "javascript") {
         return true;

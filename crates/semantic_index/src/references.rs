@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use streaming_iterator::StreamingIterator as _;
 
 use crate::against_the_server::{
-    Comparison, Identity, QueryAnswers, Server, ServerRefused, compare,
+    Comparison, Identity, Priming, QueryAnswers, Server, ServerRefused, compare,
 };
 use crate::definitions::Definition;
 use crate::languages::{self, Readable};
@@ -749,7 +749,10 @@ pub async fn measure(
         "there is nothing to compare over zero symbols"
     );
 
-    let mut server = Server::start(root)
+    // Lazily: finding every reference needs whole-graph inference, and
+    // priming that ahead does not fit in the machine this runs on -- the
+    // server is killed before it answers anything at all.
+    let mut server = Server::start(root, Priming::Lazily)
         .await
         .context("starting rust-analyzer")?;
     server

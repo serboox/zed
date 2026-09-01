@@ -86,6 +86,33 @@ pub fn in_file(
             language: language.name.clone(),
         });
     }
+
+    // What the query cannot reach. A macro body is opaque to the grammar, so
+    // the names a macro declares are invisible to any query over the tree --
+    // and on this project they were most of what the index was missing.
+    let mut walking = vec![tree.root_node()];
+    while let Some(node) = walking.pop() {
+        for (name, line) in
+            crate::per_language::names_a_macro_declares(&language.name, node, contents)
+        {
+            found.push(Definition {
+                path: path.to_string(),
+                name,
+                // What the macro really writes out. The kind is what the
+                // editor draws an icon from, so it has to be the kind of the
+                // thing that ends up in the crate, not of the macro that
+                // wrote it.
+                kind: "struct_item".to_string(),
+                line,
+                language: language.name.clone(),
+            });
+        }
+        for at in 0..node.named_child_count() as u32 {
+            if let Some(child) = node.named_child(at) {
+                walking.push(child);
+            }
+        }
+    }
     Ok(found)
 }
 
@@ -239,6 +266,70 @@ mod tests {
         // And the moment it parses, everything in it is there.
         let finished = found_in("pub struct Half {}\npub fn work() {}\n");
         assert_eq!(finished.len(), 2, "{finished:?}");
+    }
+
+    /// A macro body is opaque to the grammar, so nothing a query does can find
+    /// what a macro declares. Measured against rust-analyzer on this project,
+    /// that was ninety-five per cent of everything the index missed, and one
+    /// macro was nearly half of it -- so that one is expanded by hand.
+    #[test]
+    fn the_names_an_actions_macro_declares_are_found_though_the_query_cannot_see_them() {
+        let found = found_in(
+            "actions!(\n\
+             \x20   feedback,\n\
+             \x20   [\n\
+             \x20       /// Opens the repository.\n\
+             \x20       OpenRepo,\n\
+             \x20       #[action(deprecated)]\n\
+             \x20       CopyDiagnostics\n\
+             \x20   ]\n\
+             );\n",
+        );
+        let named: Vec<(&str, &str, u32)> = found
+            .iter()
+            .map(|one| (one.name.as_str(), one.kind.as_str(), one.line))
+            .collect();
+        assert!(
+            named.contains(&("OpenRepo", "struct_item", 5)),
+            "the first action, on its own line: {named:?}"
+        );
+        assert!(
+            named.contains(&("CopyDiagnostics", "struct_item", 7)),
+            "and the second, past a doc comment and an attribute: {named:?}"
+        );
+        assert!(
+            !named.iter().any(|(name, _, _)| *name == "feedback"),
+            "the namespace is not a declaration: {named:?}"
+        );
+        assert!(
+            !named.iter().any(|(name, _, _)| *name == "action"),
+            "nor is anything inside an attribute: {named:?}"
+        );
+    }
+
+    /// The short form, with no namespace, declares the same things.
+    #[test]
+    fn an_actions_macro_without_a_namespace_declares_its_names_too() {
+        let found = found_in("actions!([Save, SaveAll]);\n");
+        let named: Vec<&str> = found.iter().map(|one| one.name.as_str()).collect();
+        assert!(
+            named.contains(&"Save") && named.contains(&"SaveAll"),
+            "{named:?}"
+        );
+    }
+
+    /// A macro this does not know declares nothing, rather than guessing.
+    #[test]
+    fn a_macro_that_is_not_recognised_contributes_nothing() {
+        let found = found_in("write_bindings!(host, [Thing, Other]);\n");
+        assert!(
+            found.is_empty(),
+            "an unrecognised macro is left alone: {:?}",
+            found
+                .iter()
+                .map(|one| one.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
