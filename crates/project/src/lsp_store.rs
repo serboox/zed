@@ -4318,6 +4318,10 @@ impl LspStore {
         client.add_entity_request_handler(Self::handle_resolve_inlay_hint);
         client.add_entity_request_handler(Self::handle_resolve_code_action);
         client.add_entity_request_handler(Self::handle_resolve_document_link);
+        client.add_entity_request_handler(crate::hierarchies::handle_prepare_call_hierarchy);
+        client.add_entity_request_handler(crate::hierarchies::handle_call_hierarchy_calls);
+        client.add_entity_request_handler(crate::hierarchies::handle_prepare_type_hierarchy);
+        client.add_entity_request_handler(crate::hierarchies::handle_type_hierarchy_relatives);
         client.add_entity_request_handler(Self::handle_get_color_presentation);
         client.add_entity_request_handler(Self::handle_open_buffer_for_symbol);
         client.add_entity_request_handler(Self::handle_refresh_inlay_hints);

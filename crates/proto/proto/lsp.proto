@@ -1100,3 +1100,72 @@ message GetFoldingRangesResponse {
   repeated VectorClockEntry version = 2;
   repeated string collapsed_texts = 3;
 }
+
+// A call or type hierarchy request has three outcomes a guest must tell apart:
+// no attached server can answer at all, a capable server answered with nothing,
+// or it answered with results. `supported` carries the first distinction and
+// emptiness carries the second, so the three states need no separate enum.
+
+// The item's name, kind and detail are not repeated here: they are already in
+// `lsp_item`, which the guest has to keep anyway to ask the follow-up question,
+// so reading them from anywhere else would be a second source of truth.
+message HierarchyItem {
+  uint64 buffer_id = 1;
+  AnchorRange range = 2;
+  AnchorRange selection_range = 3;
+  uint64 language_server_id = 4;
+  bytes lsp_item = 5;
+}
+
+message PrepareCallHierarchy {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  Anchor position = 3;
+  repeated VectorClockEntry version = 4;
+}
+
+message PrepareCallHierarchyResponse {
+  bool supported = 1;
+  repeated HierarchyItem items = 2;
+}
+
+message HierarchyCall {
+  HierarchyItem item = 1;
+  repeated AnchorRange from_ranges = 2;
+}
+
+message CallHierarchyCalls {
+  uint64 project_id = 1;
+  HierarchyItem item = 2;
+  // Incoming calls when false, outgoing calls when true.
+  bool outgoing = 3;
+}
+
+message CallHierarchyCallsResponse {
+  bool supported = 1;
+  repeated HierarchyCall calls = 2;
+}
+
+message PrepareTypeHierarchy {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  Anchor position = 3;
+  repeated VectorClockEntry version = 4;
+}
+
+message PrepareTypeHierarchyResponse {
+  bool supported = 1;
+  repeated HierarchyItem items = 2;
+}
+
+message TypeHierarchyRelatives {
+  uint64 project_id = 1;
+  HierarchyItem item = 2;
+  // Supertypes when false, subtypes when true.
+  bool subtypes = 3;
+}
+
+message TypeHierarchyRelativesResponse {
+  bool supported = 1;
+  repeated HierarchyItem items = 2;
+}

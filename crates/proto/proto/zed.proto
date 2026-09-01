@@ -499,7 +499,15 @@ message Envelope {
     RestoreProjectEntry restore_project_entry = 468;
     RestoreProjectEntryResponse restore_project_entry_response = 469;
     GitAddPathToGitignore git_add_path_to_gitignore = 470;
-    GitAddPathToGitInfoExclude git_add_path_to_git_info_exclude = 471; // current max
+    GitAddPathToGitInfoExclude git_add_path_to_git_info_exclude = 471;
+    PrepareCallHierarchy prepare_call_hierarchy = 472;
+    PrepareCallHierarchyResponse prepare_call_hierarchy_response = 473;
+    CallHierarchyCalls call_hierarchy_calls = 474;
+    CallHierarchyCallsResponse call_hierarchy_calls_response = 475;
+    PrepareTypeHierarchy prepare_type_hierarchy = 476;
+    PrepareTypeHierarchyResponse prepare_type_hierarchy_response = 477;
+    TypeHierarchyRelatives type_hierarchy_relatives = 478;
+    TypeHierarchyRelativesResponse type_hierarchy_relatives_response = 479; // current max
   }
 
   reserved 87 to 88;
