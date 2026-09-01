@@ -2,7 +2,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use semantic_index::against_the_server::{QueryAnswers, Server, compare, sample_queries};
+use semantic_index::against_the_server::{
+    QueryAnswers, Server, attribute_lines, compare, macro_body_lines, re_export_lines,
+    sample_queries,
+};
+use std::collections::{HashMap, HashSet};
+
+use semantic_index::definitions::Definition;
 use semantic_index::measure::{as_time, spread_of};
 use semantic_index::symbols::{Catalogue, Symbols, build};
 
@@ -31,6 +37,18 @@ const RESULTS_PER_QUERY: usize = usize::MAX;
 /// had not found.
 fn is_rust(definition: &semantic_index::definitions::Definition) -> bool {
     definition.path.ends_with(".rs")
+}
+
+/// Whether the index ever reads this file at all.
+///
+/// The server indexes generated build output under `target/`; the index walks
+/// the project the way the editor's own scanner does, which leaves build output
+/// out. Counting a symbol in a generated file as something the index missed
+/// measures the difference between two scopes rather than the index's coverage
+/// of its own. How many are set aside this way is printed, so the difference is
+/// stated rather than hidden.
+fn within_reach(read: &HashSet<String>, definition: &Definition) -> bool {
+    read.contains(&definition.path)
 }
 
 /// How long to wait for rust-analyzer to finish indexing before giving up.
@@ -154,6 +172,58 @@ async fn run() -> Result<()> {
         as_time(indexing_started.elapsed())
     );
 
+    // Every file the index actually read, so the server's answers can be held to
+    // the same set of files rather than to a larger one. Taken from the files
+    // the index read, not from the files its symbols came from: a file that
+    // defines nothing was still read, and setting its symbols aside would flatter
+    // the number by shrinking the denominator.
+    let read_by_the_index: HashSet<String> = store
+        .file_paths()
+        .context("reading back which files the index read")?
+        .into_iter()
+        .collect();
+    // Where each file re-exports something, so a name the server lists at the
+    // place it is re-exported is not counted against an index that holds it at
+    // the place it is defined. The plan's step is about definitions, and
+    // `workspace/symbol` answers with more than those.
+    let rust = semantic_index::languages::readable()
+        .0
+        .into_iter()
+        .find(|language| language.name == "rust")
+        .context("Rust is one of the languages the editor ships")?;
+    let mut re_exports: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    for path in &read_by_the_index {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read(root.join(path)) else {
+            continue;
+        };
+        let spans = re_export_lines(&contents, &rust.grammar);
+        if !spans.is_empty() {
+            re_exports.insert(path.clone(), spans);
+        }
+    }
+    let is_a_re_export = |found: &Definition| {
+        re_exports.get(&found.path).is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|(from, to)| found.line >= *from && found.line <= *to)
+        })
+    };
+    // A file is a module, and a server says so; an index of what a file defines
+    // has nothing to say about the file itself.
+    let is_the_file_itself = |found: &Definition| {
+        found.line == 1
+            && std::path::Path::new(&found.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == found.name)
+    };
+
+    let mut set_aside = 0usize;
+    let mut re_exported = 0usize;
+    let mut modules = 0usize;
     let mut answers = Vec::with_capacity(queries.len());
     let mut index_timings = Vec::with_capacity(queries.len());
     let mut server_timings = Vec::with_capacity(queries.len());
@@ -172,7 +242,27 @@ async fn run() -> Result<()> {
             .await
             .with_context(|| format!("asking rust-analyzer for `{query}`"))?;
         server_timings.push(server_started.elapsed());
-        let the_server_found: Vec<_> = answered.into_iter().filter(is_rust).collect();
+        let asked_about: Vec<Definition> = answered.into_iter().filter(is_rust).collect();
+        let before = asked_about.len();
+        let within: Vec<Definition> = asked_about
+            .into_iter()
+            .filter(|found| within_reach(&read_by_the_index, found))
+            .collect();
+        set_aside += before - within.len();
+        let the_server_found: Vec<Definition> = within
+            .into_iter()
+            .filter(|found| {
+                if is_a_re_export(found) {
+                    re_exported += 1;
+                    return false;
+                }
+                if is_the_file_itself(found) {
+                    modules += 1;
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         answers.push(QueryAnswers {
             query: query.clone(),
@@ -189,7 +279,60 @@ async fn run() -> Result<()> {
     let answering_the_index = spread_of(index_timings);
     let answering_the_server = spread_of(server_timings);
 
+    if set_aside > 0 {
+        println!(
+            "\n{set_aside} of the server's findings were in files the index never reads -- \
+             generated build output and the like -- and are counted on neither side."
+        );
+    }
+    if re_exported > 0 || modules > 0 {
+        println!(
+            "{re_exported} of the server's findings were names re-exported rather than defined, \
+             and {modules} were files reported as modules. An index of definitions holds \
+             neither, and each is counted on neither side."
+        );
+    }
+    // What is left over after the comparison is aligned has to be named, not
+    // waved at: a miss inside a macro body is one no query over a parse tree can
+    // ever close, and a miss outside one is a gap in the queries themselves.
+    let mut inside_a_macro = 0usize;
+    let mut on_an_attribute = 0usize;
+    let mut elsewhere = 0usize;
+    let mut spans_by_file: HashMap<String, (Vec<(u32, u32)>, Vec<(u32, u32)>)> = HashMap::new();
+    let covers = |spans: &[(u32, u32)], line: u32| {
+        spans.iter().any(|(from, to)| line >= *from && line <= *to)
+    };
+    for diverged in &comparison.divergent_queries {
+        for missed in &diverged.the_server_found_and_the_index_missed {
+            let (macros, attributes) =
+                spans_by_file.entry(missed.path.clone()).or_insert_with(|| {
+                    match std::fs::read(root.join(&missed.path)) {
+                        Ok(contents) => (
+                            macro_body_lines(&contents, &rust.grammar),
+                            attribute_lines(&contents, &rust.grammar),
+                        ),
+                        Err(_) => (Vec::new(), Vec::new()),
+                    }
+                });
+            if covers(macros, missed.line) {
+                inside_a_macro += 1;
+            } else if covers(attributes, missed.line) {
+                on_an_attribute += 1;
+            } else {
+                elsewhere += 1;
+            }
+        }
+    }
+
     println!("\n{comparison}");
+    let missed = inside_a_macro + on_an_attribute + elsewhere;
+    if missed > 0 {
+        println!(
+            "of the {missed} the index missed, {inside_a_macro} are inside a macro body, which \
+             the grammar keeps as an opaque token tree; {on_an_attribute} are on an attribute, \
+             where a derive expands code and a `cfg` does not; and {elsewhere} are elsewhere"
+        );
+    }
     println!(
         "answering a query   index: median {:>10} 95th {:>10}   rust-analyzer: median {:>10} \
          95th {:>10}",

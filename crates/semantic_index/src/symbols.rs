@@ -160,6 +160,15 @@ impl Symbols {
         Ok(counted.unwrap_or_default() as usize)
     }
 
+    /// Every file the store has read, whether it defined anything or not.
+    /// Not the same set as the files named by `everything()`: a file that
+    /// defines nothing is still a file the index has an opinion about, namely
+    /// that there is nothing in it.
+    pub fn file_paths(&self) -> Result<Vec<String>> {
+        let mut statement = Statement::prepare(&self.connection, "SELECT path FROM files")?;
+        statement.map(|row| Ok(row.column_text(0)?.to_string()))
+    }
+
     /// Everything the store holds, which is what a search is built from.
     pub fn everything(&self) -> Result<Vec<Definition>> {
         let mut statement = Statement::prepare(

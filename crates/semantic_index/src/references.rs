@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use streaming_iterator::StreamingIterator as _;
 
-use crate::against_the_server::{Comparison, Identity, QueryAnswers, Server, compare};
+use crate::against_the_server::{
+    Comparison, Identity, QueryAnswers, Server, ServerRefused, compare,
+};
 use crate::definitions::Definition;
 use crate::languages::{self, Readable};
 use crate::measure::{Spread, as_time, spread_of};
@@ -649,6 +651,10 @@ fn duration_ratio(numerator: Duration, denominator: Duration) -> f64 {
 /// Everything this measurement produces.
 pub struct Report {
     pub symbols_sampled: usize,
+    /// Sampled symbols the server refused because it has no such file. Counted
+    /// on neither side, and printed, so a shrinking sample is visible rather
+    /// than silent.
+    pub outside_the_servers_project: usize,
     pub comparison: Comparison,
     pub precision: f64,
     pub catalogue: ErrorCatalogue,
@@ -670,6 +676,14 @@ impl fmt::Display for Report {
             self.precision * 100.0,
             self.comparison.recall * 100.0
         )?;
+        if self.outside_the_servers_project > 0 {
+            writeln!(
+                out,
+                "{} sampled symbols were in files rust-analyzer does not have -- outside the \
+                 cargo graph -- and are counted on neither side",
+                self.outside_the_servers_project
+            )?;
+        }
         writeln!(out, "{}", self.comparison)?;
         writeln!(
             out,
@@ -743,13 +757,14 @@ pub async fn measure(
     let mut answers = Vec::with_capacity(sampled.len());
     let mut index_timings = Vec::with_capacity(sampled.len());
     let mut server_timings = Vec::with_capacity(sampled.len());
+    let mut outside_the_servers_project = 0usize;
     for symbol in &sampled {
         let index_started = Instant::now();
         let the_index_found = scan.index.references_to(&symbol.name);
         index_timings.push(index_started.elapsed());
 
         let server_started = Instant::now();
-        let the_server_found = server
+        let answered = server
             .references(
                 &symbol.path,
                 symbol.row,
@@ -757,13 +772,31 @@ pub async fn measure(
                 &symbol.name,
                 query_timeout,
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "asking rust-analyzer for references to {} at {}:{}:{}",
-                    symbol.name, symbol.path, symbol.row, symbol.column
-                )
-            })?;
+            .await;
+        let the_server_found = match answered {
+            Ok(found) => found,
+            Err(error) => {
+                // A file the server has never heard of is outside the cargo
+                // graph, so neither side can be held to it. That is a smaller
+                // sample, counted and printed -- not a failed run, and not a
+                // reason to keep going after a request that failed for any
+                // other reason.
+                let refused = error
+                    .downcast_ref::<ServerRefused>()
+                    .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+                if refused {
+                    outside_the_servers_project += 1;
+                    index_timings.pop();
+                    continue;
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "asking rust-analyzer for references to {} at {}:{}:{}",
+                        symbol.name, symbol.path, symbol.row, symbol.column
+                    )
+                });
+            }
+        };
         server_timings.push(server_started.elapsed());
 
         answers.push(QueryAnswers {
@@ -772,6 +805,12 @@ pub async fn measure(
             the_index_found,
         });
     }
+    anyhow::ensure!(
+        !answers.is_empty(),
+        "every one of the {} sampled symbols was in a file rust-analyzer does not have; \
+         there is nothing to compare",
+        sampled.len()
+    );
 
     if let Err(error) = server.shut_down().await {
         log::warn!("rust-analyzer did not shut down cleanly: {error:#}");
@@ -782,7 +821,8 @@ pub async fn measure(
     let catalogue = ErrorCatalogue::build(&scan, &comparison);
 
     Ok(Report {
-        symbols_sampled: sampled.len(),
+        symbols_sampled: answers.len(),
+        outside_the_servers_project,
         comparison,
         precision,
         catalogue,

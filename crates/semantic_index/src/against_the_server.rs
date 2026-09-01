@@ -38,6 +38,48 @@ pub struct Identity {
     pub name: String,
 }
 
+/// An error the server answered a request with, kept as its own type so a
+/// caller can tell one refusal apart from another instead of reading a
+/// formatted message.
+#[derive(Debug, Clone)]
+pub struct ServerRefused {
+    pub code: i64,
+    pub message: String,
+}
+
+impl ServerRefused {
+    fn from(error: &Value) -> Self {
+        Self {
+            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message")
+                .to_string(),
+        }
+    }
+
+    /// Whether the refusal is "I have never heard of this file". The server's
+    /// view of a project is the cargo graph; anything outside it -- a vendored
+    /// copy, a scratch file, generated output -- is a file it was never going
+    /// to answer about, which is a different thing from a request that failed.
+    pub fn is_a_file_the_server_does_not_have(&self) -> bool {
+        self.message.starts_with("file not found")
+    }
+}
+
+impl std::fmt::Display for ServerRefused {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "rust-analyzer answered with an error {}: {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ServerRefused {}
+
 impl Identity {
     pub fn of(definition: &Definition) -> Self {
         Self {
@@ -454,9 +496,8 @@ impl Server {
         name: &str,
         timeout: Duration,
     ) -> Result<Vec<Definition>> {
-        let uri = url::Url::from_file_path(self.root.join(path)).map_err(|()| {
-            anyhow::anyhow!("{path} is not a path under {}", self.root.display())
-        })?;
+        let uri = url::Url::from_file_path(self.root.join(path))
+            .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
         let answered = self
             .call(
                 "textDocument/references",
@@ -627,7 +668,7 @@ impl Server {
         }
 
         if let Some(error) = error {
-            anyhow::bail!("rust-analyzer answered with an error: {error}");
+            anyhow::bail!(ServerRefused::from(&error));
         }
         let id = id
             .as_ref()
@@ -687,6 +728,75 @@ pub struct QueryDivergence {
     pub query: String,
     pub the_server_found_and_the_index_missed: Vec<Identity>,
     pub the_index_found_and_the_server_did_not: Vec<Identity>,
+}
+
+/// Which of a Rust file's lines are inside a `use` declaration, one-based and
+/// inclusive.
+///
+/// A language server answers `workspace/symbol` with definitions, re-exports
+/// and modules alike; an index of definitions holds only the first. A symbol
+/// the index knows at the place it is defined, which the server *also* lists at
+/// the place it is re-exported, is otherwise counted as missing -- so the
+/// comparison must be able to tell a re-export apart from a definition.
+pub fn re_export_lines(contents: &[u8], grammar: &tree_sitter::Language) -> Vec<(u32, u32)> {
+    line_spans_of(contents, grammar, &["use_declaration"])
+}
+
+/// Which of a Rust file's lines a macro invocation spans, one-based and
+/// inclusive.
+///
+/// A macro body is an opaque token tree to the grammar, so whatever the macro
+/// expands to is not in the parse tree and no query over that tree can find it.
+/// A name the server reports from inside such a span is a miss the index cannot
+/// close by any change to its queries, and separating those from the rest is
+/// what tells a fixable gap apart from a structural one.
+pub fn macro_body_lines(contents: &[u8], grammar: &tree_sitter::Language) -> Vec<(u32, u32)> {
+    line_spans_of(contents, grammar, &["macro_invocation"])
+}
+
+/// Which of a Rust file's lines an attribute spans, one-based and inclusive.
+///
+/// Kept apart from `macro_body_lines` on purpose. Some attributes expand code
+/// -- a `derive` writes the trait implementations the server then reports --
+/// and some, `cfg` and `allow` among them, expand nothing at all. Counting the
+/// two together would claim more for macros than the measurement shows, so the
+/// split is reported rather than resolved here.
+pub fn attribute_lines(contents: &[u8], grammar: &tree_sitter::Language) -> Vec<(u32, u32)> {
+    line_spans_of(contents, grammar, &["attribute_item"])
+}
+
+/// The line spans of every node of one of `kinds`, one-based and inclusive.
+/// A matching node's own children are not descended into: the outermost span is
+/// the one that matters, and the inner ones are inside it anyway.
+fn line_spans_of(
+    contents: &[u8],
+    grammar: &tree_sitter::Language,
+    kinds: &[&str],
+) -> Vec<(u32, u32)> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(contents, None) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let mut walking = vec![tree.root_node()];
+    while let Some(node) = walking.pop() {
+        if kinds.contains(&node.kind()) {
+            spans.push((
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            ));
+            continue;
+        }
+        for at in 0..node.named_child_count() as u32 {
+            if let Some(child) = node.named_child(at) {
+                walking.push(child);
+            }
+        }
+    }
+    spans
 }
 
 /// The result of comparing the index's answers with the server's, over every
@@ -909,15 +1019,25 @@ mod tests {
     fn two_messages_written_back_to_back_are_read_back_in_order() {
         smol::block_on(async {
             let mut writer = smol::io::Cursor::new(Vec::new());
-            write_message(&mut writer, b"first").await.expect("writing the first");
-            write_message(&mut writer, b"second").await.expect("writing the second");
+            write_message(&mut writer, b"first")
+                .await
+                .expect("writing the first");
+            write_message(&mut writer, b"second")
+                .await
+                .expect("writing the second");
             let mut reader = smol::io::Cursor::new(writer.into_inner());
             assert_eq!(
-                read_message(&mut reader).await.expect("reading").expect("a message"),
+                read_message(&mut reader)
+                    .await
+                    .expect("reading")
+                    .expect("a message"),
                 b"first"
             );
             assert_eq!(
-                read_message(&mut reader).await.expect("reading").expect("a message"),
+                read_message(&mut reader)
+                    .await
+                    .expect("reading")
+                    .expect("a message"),
                 b"second"
             );
         });
@@ -935,7 +1055,9 @@ mod tests {
     fn a_message_with_no_content_length_header_is_rejected() {
         smol::block_on(async {
             let mut reader = smol::io::Cursor::new(b"X-Other: 1\r\n\r\nbody".to_vec());
-            let failure = read_message(&mut reader).await.expect_err("no length header");
+            let failure = read_message(&mut reader)
+                .await
+                .expect_err("no length header");
             assert_eq!(failure.kind(), std::io::ErrorKind::InvalidData);
         });
     }
@@ -956,8 +1078,7 @@ mod tests {
     #[test]
     fn a_close_in_the_middle_of_the_body_is_an_error() {
         smol::block_on(async {
-            let mut reader =
-                smol::io::Cursor::new(b"Content-Length: 10\r\n\r\ntoo short".to_vec());
+            let mut reader = smol::io::Cursor::new(b"Content-Length: 10\r\n\r\ntoo short".to_vec());
             let failure = read_message(&mut reader)
                 .await
                 .expect_err("fewer body bytes than promised is an error");
