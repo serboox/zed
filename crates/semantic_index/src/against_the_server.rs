@@ -80,6 +80,19 @@ impl std::fmt::Display for ServerRefused {
 
 impl std::error::Error for ServerRefused {}
 
+/// How many queries rust-analyzer may keep cached. Read from `RA_LRU_CAP` when
+/// it is already set, so a run can widen or remove the bound deliberately.
+pub fn lru_capacity() -> u32 {
+    std::env::var("RA_LRU_CAP")
+        .ok()
+        .and_then(|set| set.parse().ok())
+        .unwrap_or(DEFAULT_LRU_CAPACITY)
+}
+
+/// rust-analyzer's own default is 128. This is lower because the measuring
+/// machine has 18 GiB and the default does not fit in it.
+const DEFAULT_LRU_CAPACITY: u32 = 16;
+
 impl Identity {
     pub fn of(definition: &Definition) -> Self {
         Self {
@@ -335,6 +348,12 @@ impl Server {
 
         let mut child = smol::process::Command::new(&binary)
             .current_dir(root)
+            // Bound the server's query cache. Left alone, answering reference
+            // queries across a project this size grows past 18 GiB and the
+            // machine kills it, which measures the machine rather than the
+            // server. Whatever this is set to is printed with the numbers, so
+            // a constrained run never reads as an unconstrained one.
+            .env("RA_LRU_CAP", lru_capacity().to_string())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             // Not read: a short-lived comparison run has no use for

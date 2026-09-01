@@ -24,8 +24,12 @@ const INDEXING_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long one request may take before it counts as a failure of the run. A
 /// request that hangs is a sign something is systemically wrong, not something
-/// to quietly leave out of the sample.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// to quietly leave out of the sample -- and dropping the slow ones would bias
+/// the sample towards symbols with few references, which is exactly the
+/// direction that flatters the result. So the limit is generous, and the
+/// slowest answer is printed beside it: a run that came close to the limit
+/// says so instead of looking comfortable.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn main() -> Result<()> {
     smol::block_on(run())
@@ -35,6 +39,7 @@ async fn run() -> Result<()> {
     let mut root: Option<PathBuf> = None;
     let mut symbol_count = SYMBOL_COUNT;
     let mut indexing_timeout = INDEXING_TIMEOUT;
+    let mut query_timeout = QUERY_TIMEOUT;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -46,6 +51,14 @@ async fn run() -> Result<()> {
                     .context("--symbols wants a number")?
                     .parse()
                     .context("--symbols wants a number")?
+            }
+            "--query-timeout" => {
+                let seconds: u64 = arguments
+                    .next()
+                    .context("--query-timeout wants a number of seconds")?
+                    .parse()
+                    .context("--query-timeout wants a number of seconds")?;
+                query_timeout = Duration::from_secs(seconds);
             }
             "--indexing-timeout" => {
                 let seconds: u64 = arguments
@@ -61,7 +74,9 @@ async fn run() -> Result<()> {
                      \n\
                      --root <path>               the project to read; the working directory by default\n\
                      --symbols <n>               how many symbols to compare over ({SYMBOL_COUNT})\n\
-                     --indexing-timeout <secs>   how long to wait for the server to finish indexing"
+                     --indexing-timeout <secs>   how long to wait for the server to finish indexing\n\
+                     --query-timeout <secs>      how long one request may take ({})",
+                    QUERY_TIMEOUT.as_secs()
                 );
                 return Ok(());
             }
@@ -82,7 +97,12 @@ async fn run() -> Result<()> {
         "comparing references under {} over {symbol_count} symbols",
         root.display()
     );
-    let report = measure(&root, symbol_count, indexing_timeout, QUERY_TIMEOUT).await?;
+    println!(
+        "rust-analyzer's query cache is capped at {} entries (RA_LRU_CAP); its own default is \
+         128, which does not fit in this machine's memory",
+        semantic_index::against_the_server::lru_capacity()
+    );
+    let report = measure(&root, symbol_count, indexing_timeout, query_timeout).await?;
     // Printed before anything is judged: the divergences are the point of this
     // run, and a gate that failed before they were shown would hide them.
     println!("\n{report}");

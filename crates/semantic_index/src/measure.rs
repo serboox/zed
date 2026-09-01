@@ -46,6 +46,10 @@ pub struct Numbers {
 pub struct Spread {
     pub median: Duration,
     pub ninety_fifth: Duration,
+    /// The slowest sample. Carried because a run under a time limit has to be
+    /// able to say how close it came to it: a percentile hides exactly the one
+    /// measurement that decides whether the limit was the thing being measured.
+    pub slowest: Duration,
 }
 
 /// The middle and the ninety-fifth percentile of a set of measurements.
@@ -61,6 +65,7 @@ pub fn spread_of(mut samples: Vec<Duration>) -> Spread {
     Spread {
         median: at_rank(&samples, 0.5),
         ninety_fifth: at_rank(&samples, 0.95),
+        slowest: at_rank(&samples, 1.0),
     }
 }
 

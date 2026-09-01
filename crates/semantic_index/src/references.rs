@@ -694,12 +694,15 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             out,
-            "answering a query   index: median {:>10} 95th {:>10}   rust-analyzer: median {:>10} \
-             95th {:>10}",
+            "answering a query   index: median {:>10} 95th {:>10} slowest {:>10}\n\
+             {:20}rust-analyzer: median {:>10} 95th {:>10} slowest {:>10}",
             as_time(self.answering_the_index.median),
             as_time(self.answering_the_index.ninety_fifth),
+            as_time(self.answering_the_index.slowest),
+            "",
             as_time(self.answering_the_server.median),
             as_time(self.answering_the_server.ninety_fifth),
+            as_time(self.answering_the_server.slowest),
         )?;
         write!(out, "{}", self.catalogue)
     }
