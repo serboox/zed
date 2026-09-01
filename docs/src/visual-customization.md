@@ -327,7 +327,7 @@ TBD: Centered layout related settings
   "tabs": {
     "git_status": false,              // Color to show git status
     "close_position": "right",        // Close button position (left, right, hidden)
-    "show_close_button": "hover",     // Close button shown (hover, always, hidden)
+    "show_close_button": "always",    // Close button shown (always, hover, hidden)
     "file_icons": false,              // Icon showing file type
     // Show diagnostics in file icon (off, errors, all). Requires file_icons=true
     "show_diagnostics": "off"

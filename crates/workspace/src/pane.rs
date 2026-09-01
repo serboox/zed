@@ -3006,7 +3006,7 @@ impl Pane {
                     IconButton::new("unpin tab", IconName::Pin)
                         .shape(IconButtonShape::Square)
                         .icon_color(Color::Muted)
-                        .size(ButtonSize::None)
+                        .size(ButtonSize::Compact)
                         .icon_size(IconSize::Small)
                         .on_click(cx.listener(move |pane, _, window, cx| {
                             pane.unpin_tab_at(ix, window, cx);
@@ -3024,9 +3024,13 @@ impl Pane {
                         }
                         ShowCloseButton::Hidden => return this,
                     }
-                    .shape(IconButtonShape::Square)
+                    // Deliberately not `Square`: that shape sizes the button
+                    // from the icon it draws, so the target stays as small as
+                    // the cross and no `size` can grow it. What the pointer has
+                    // to hit is the button, not the cross drawn in it.
+                    .shape(IconButtonShape::Wide)
                     .icon_color(Color::Muted)
-                    .size(ButtonSize::None)
+                    .size(ButtonSize::Compact)
                     .icon_size(IconSize::Small)
                     .on_click(cx.listener(move |pane, _, window, cx| {
                         pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
@@ -3048,6 +3052,17 @@ impl Pane {
                         this.tooltip(Tooltip::text(end_slot_tooltip_text))
                     }
                 });
+                // Wrapped only to be nameable: the button sets its own selector
+                // from the icon it draws, which is the same for every tab.
+                let end_slot = div()
+                    .debug_selector(move || {
+                        if is_pinned {
+                            format!("TAB-UNPIN-{ix}")
+                        } else {
+                            format!("TAB-CLOSE-{ix}")
+                        }
+                    })
+                    .child(end_slot);
                 this.end_slot(end_slot)
             })
             .child(
@@ -3568,40 +3583,51 @@ impl Pane {
         // names.
         let line = card_height / 2.;
 
-        let mut with = Vec::with_capacity(tabs.len() * 2);
-        for (at, tab) in tabs.into_iter().enumerate() {
-            let index = first_index + at;
-            // Worked out inside the guard, not before it: the first element of a
-            // group has nothing to its left, and asking about that neighbour
-            // would reach below zero.
-            let beside_the_chosen =
-                at > 0 && (index == self.active_item_index || index - 1 == self.active_item_index);
-            if at > 0 && !beside_the_chosen {
-                with.push(
-                    div()
-                        .debug_selector(move || format!("TAB-DIVIDER-{index}"))
-                        .flex_none()
-                        .h(card_height)
-                        .mt(shoulder)
-                        .flex()
-                        .items_center()
-                        // The wrapper stands the full height of a tab so the
-                        // line centres against it; the line itself is the mark
-                        // a reader sees, and carries its own name so a test can
-                        // measure the mark rather than the box around it.
-                        .child(
-                            div()
-                                .debug_selector(move || format!("TAB-DIVIDER-LINE-{index}"))
-                                .w(px(1.))
-                                .h(line)
-                                .bg(colour),
-                        )
-                        .into_any_element(),
-                );
-            }
-            with.push(tab);
-        }
-        with
+        // One element out for one element in. The row this returns is scrolled
+        // by tab index -- `update_active_tab` asks the handle for the nth child
+        // and means the nth tab -- so a divider that took a place of its own in
+        // this vector would shift every tab after it and send the row to the
+        // wrong place. Each divider therefore rides in front of the tab it
+        // precedes, inside that tab's own element.
+        tabs.into_iter()
+            .enumerate()
+            .map(|(at, tab)| {
+                let index = first_index + at;
+                // Worked out inside the guard, not before it: the first element
+                // of a group has nothing to its left, and asking about that
+                // neighbour would reach below zero.
+                let beside_the_chosen = at > 0
+                    && (index == self.active_item_index || index - 1 == self.active_item_index);
+                if at == 0 || beside_the_chosen {
+                    return tab;
+                }
+                h_flex()
+                    .flex_none()
+                    .child(
+                        div()
+                            .debug_selector(move || format!("TAB-DIVIDER-{index}"))
+                            .flex_none()
+                            .h(card_height)
+                            .mt(shoulder)
+                            .flex()
+                            .items_center()
+                            // The wrapper stands the full height of a tab so the
+                            // line centres against it; the line itself is the
+                            // mark a reader sees, and carries its own name so a
+                            // test can measure the mark rather than the box
+                            // around it.
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("TAB-DIVIDER-LINE-{index}"))
+                                    .w(px(1.))
+                                    .h(line)
+                                    .bg(colour),
+                            ),
+                    )
+                    .child(tab)
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn render_single_row_tab_bar(
@@ -5729,6 +5755,49 @@ mod tests {
             "a hairline: {:?} wide",
             mark.size.width
         );
+    }
+
+    /// The close button is the control a reader reaches for most, and two things
+    /// were wrong with it: it appeared only under the pointer, so it could not be
+    /// aimed at until it was already there, and at the size of its own icon it
+    /// was a target smaller than the pointer looking for it.
+    ///
+    /// Measured on painted boxes and without hovering anything. Against the older
+    /// code the first lookup finds nothing at all, because a resting tab drew no
+    /// close button.
+    #[gpui::test]
+    async fn every_tab_shows_a_close_button_big_enough_to_aim_at(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        add_labeled_item(&pane, "A", false, cx);
+        add_labeled_item(&pane, "B", false, cx);
+        assert_item_labels(&pane, ["A", "B*"], cx);
+
+        for (index, which) in ["the resting tab", "the chosen tab"].iter().enumerate() {
+            let close = cx
+                .debug_bounds(format!("TAB-CLOSE-{index}").leak())
+                .unwrap_or_else(|| panic!("{which} draws a close button without being hovered"));
+            assert!(
+                close.size.width >= px(20.) && close.size.height >= px(20.),
+                "{which}'s close button is {:?} -- too small to aim at",
+                close.size
+            );
+            let tab = cx
+                .debug_bounds(format!("TAB-{index}").leak())
+                .unwrap_or_else(|| panic!("{which} is painted"));
+            assert!(
+                close.left() >= tab.left()
+                    && close.right() <= tab.right()
+                    && close.top() >= tab.top()
+                    && close.bottom() <= tab.bottom(),
+                "{which}'s close button at {close:?} hangs outside the tab at {tab:?}"
+            );
+        }
     }
 
     #[gpui::test]

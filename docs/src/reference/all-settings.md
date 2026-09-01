@@ -1409,7 +1409,7 @@ or
     "file_icons": false,
     "git_status": false,
     "activate_on_close": "history",
-    "show_close_button": "hover",
+    "show_close_button": "always",
     "show_diagnostics": "off"
   }
 }
@@ -1497,7 +1497,7 @@ or
 
 - Description: Controls the appearance behavior of the tab's close button.
 - Setting: `show_close_button`
-- Default: `hover`
+- Default: `always`
 
 **Options**
 

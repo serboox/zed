@@ -8,7 +8,11 @@ use smallvec::SmallVec;
 use crate::prelude::*;
 
 const START_TAB_SLOT_SIZE: Pixels = px(12.);
-const END_TAB_SLOT_SIZE: Pixels = px(14.);
+/// Wide enough to aim at. The close button is the one control a reader uses
+/// dozens of times an hour, and at the size of its own icon it is a target of
+/// about fourteen pixels -- smaller than the pointer that has to find it. The
+/// icon inside stays the same size; only the box that answers the click grows.
+const END_TAB_SLOT_SIZE: Pixels = px(24.);
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]

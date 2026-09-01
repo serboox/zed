@@ -241,8 +241,11 @@ pub enum ClosePosition {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ShowCloseButton {
-    Always,
+    // A close button that appears only under the pointer is a control the
+    // reader has to go looking for, and one they cannot aim at until it is
+    // already there. It stays.
     #[default]
+    Always,
     Hover,
     Hidden,
 }
