@@ -15,7 +15,13 @@
 //! danger). Do not add a third without a matching argument for why every
 //! dialog that reads this module should carry it.
 
-use gpui::{App, BoxShadow, Hsla, ParentElement, Pixels, PromptLevel, Styled, px, rgb};
+use gpui::prelude::FluentBuilder as _;
+use gpui::{
+    App, BoxShadow, Hsla, InteractiveElement, ParentElement, Pixels, PromptLevel, Styled, px, rgb,
+};
+use theme::ActiveTheme as _;
+
+use crate::LabelCommon as _;
 
 use crate::{ButtonStyle, TintColor};
 
@@ -195,6 +201,114 @@ pub const RADIUS: Pixels = px(6.);
 /// How tall a framed row of icon actions stands, and with it the hit area of
 /// each icon in it.
 pub const SEGMENT_HEIGHT: Pixels = px(28.);
+
+/// The heading a dialog opens with: its own name, in the monospace face, small
+/// and loud. Every dialog in this chrome says what it is in the same voice, so
+/// the voice lives here rather than being written out again in each of them.
+pub fn dialog_title(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div {
+    let name = name.into();
+    gpui::div()
+        .font(theme::theme_settings(cx).buffer_font(cx).clone())
+        .font_weight(gpui::FontWeight::EXTRA_BOLD)
+        .text_size(crate::HeadlineSize::Small.rems())
+        .text_color(text_primary())
+        .child(name.to_uppercase())
+}
+
+/// A rule across a form with a name on it, marking where one group of fields
+/// ends and the next begins.
+///
+/// Returned as the row itself rather than a finished element, so a section can
+/// carry its own action on the rule -- an "add" beside the name it belongs to,
+/// rather than orphaned on a line beneath it.
+pub fn dialog_section(name: impl Into<crate::SharedString>) -> gpui::Div {
+    let name = name.into();
+    let shown = name.to_uppercase();
+    gpui::div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .pt_2()
+        .gap_2()
+        .items_center()
+        .debug_selector(move || format!("DIALOG-SECTION-{name}"))
+        .child(
+            crate::Label::new(shown)
+                .size(crate::LabelSize::XSmall)
+                .color(crate::Color::Accent),
+        )
+        .child(gpui::div().flex_1().h(px(1.)).bg(border_dim()))
+}
+
+/// One labelled place to type: the name above it in small muted capitals, and
+/// below it a box on a ground of its own.
+///
+/// The ground matters. A box drawn with a line alone reads as a rule across the
+/// form rather than as somewhere to type, which is how a field can look subtly
+/// wrong without anything being obviously broken.
+pub fn dialog_field(
+    name: impl Into<crate::SharedString>,
+    tall: bool,
+    cx: &App,
+    inside: impl gpui::IntoElement,
+) -> gpui::Div {
+    dialog_field_on(name, tall, cx.theme().colors().editor_background, inside)
+}
+
+/// Same field, for a caller that has already read the ground colour out of the
+/// theme. A form that builds many of these cannot hold the context open across
+/// all of them, so it resolves the colour once and passes it along.
+pub fn dialog_field_on(
+    name: impl Into<crate::SharedString>,
+    tall: bool,
+    ground: Hsla,
+    inside: impl gpui::IntoElement,
+) -> gpui::Div {
+    let name = name.into();
+    let shown = name.to_uppercase();
+    gpui::div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_1()
+        .child(
+            crate::Label::new(shown)
+                .size(crate::LabelSize::XSmall)
+                .color(crate::Color::Muted),
+        )
+        .child(
+            gpui::div()
+                .w_full()
+                .debug_selector(move || format!("DIALOG-FIELD-{name}"))
+                .bg(ground)
+                .rounded_lg()
+                // A minimum rather than a fixed height, with the line centred in
+                // it: a fixed box stops fitting the moment the text scale moves.
+                .when(!tall, |field| field.flex().items_center().min_h(px(34.)))
+                .when(tall, |field| field.min_h(px(84.)))
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(border_dim())
+                .child(inside),
+        )
+}
+
+/// The bar a dialog ends with: a rule above it, and the actions on it. What goes
+/// on it is the caller's, but where it sits and how it is spaced is not.
+pub fn dialog_footer() -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_2()
+        .items_center()
+        .border_t_1()
+        .border_color(border_dim())
+}
 
 /// A soft outer glow for the one focal element of a view. Kept low-alpha per
 /// the source design doc: glow needs to read as a lit edge, not fog.

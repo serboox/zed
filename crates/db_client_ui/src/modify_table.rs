@@ -1268,6 +1268,7 @@ impl Render for ModifyTableView {
                 title,
                 "close-modify",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(Divider::horizontal())
             .child(

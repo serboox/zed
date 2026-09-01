@@ -3,7 +3,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
 };
 use std::sync::Arc;
-use ui::{ElevationIndex, cyberpunk, prelude::*};
+use ui::{ElevationIndex, Tooltip, cyberpunk, prelude::*};
 use workspace::ModalView;
 
 /// A single-field text-input modal shared by every "give this a name" flow in
@@ -144,12 +144,18 @@ impl Render for TextPromptModal {
             .cyberpunk_surface()
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .child(
-                div()
-                    .cyberpunk_monospace(cx)
-                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
-                    .text_size(HeadlineSize::Small.rems())
-                    .text_color(cyberpunk::text_primary())
-                    .child(self.title.to_uppercase()),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(cyberpunk::dialog_title(self.title.clone(), cx))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("text-prompt-dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
             )
             .child(
                 div()

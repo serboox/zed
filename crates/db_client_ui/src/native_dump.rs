@@ -595,6 +595,7 @@ impl Render for NativeDumpDialog {
                     cx.emit(NativeDumpEvent::Dismissed);
                     cx.emit(DismissEvent);
                 }),
+                cx,
             ))
             .child(self.field_row("Path to executable:", &self.executable_editor.clone(), cx))
             .child(self.field_row("Output result to:", &self.output_editor.clone(), cx))

@@ -4537,6 +4537,7 @@ impl Render for MasterPasswordView {
                 self.title.clone(),
                 "master-password-close",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(
                 Label::new(self.subtitle.clone())
@@ -4661,6 +4662,7 @@ impl Render for QueryParamsView {
                 "Query Parameters",
                 "query-params-close",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(v_flex().gap_1().children(rows))
             .child(
@@ -4791,6 +4793,7 @@ impl Render for RenameTableView {
                 "Rename Table",
                 "rename-table-close",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(
                 v_flex()
@@ -4933,6 +4936,7 @@ impl Render for ComparePickerView {
                 SharedString::from(format!("Compare {} with", self.left_table)),
                 "compare-pick-close",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .when(rows.is_empty(), |column| {
                 column.child(
@@ -5017,6 +5021,7 @@ impl Render for QuickDocView {
                 self.title.clone(),
                 "quick-doc-close",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(
                 div()

@@ -1889,59 +1889,14 @@ impl RunConfigurationsView {
                 .into_any_element();
         };
 
-        let editor_background = cx.theme().colors().editor_background;
+        let ground = cx.theme().colors().editor_background;
         let field = |name: &'static str, editor: &Entity<Editor>, tall: bool| {
-            v_flex()
-                .w_full()
-                .gap_1()
-                .child(
-                    div()
-                        .debug_selector(move || format!("configuration-label-{name}"))
-                        .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted)),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .debug_selector(move || format!("configuration-field-{name}"))
-                        // A ground of its own under every field: a box drawn with
-                        // a line alone reads as a rule across the form rather
-                        // than as somewhere to type.
-                        .bg(editor_background)
-                        .rounded_lg()
-                        // A minimum rather than a fixed height, and the line
-                        // centred inside it. A fixed box stops fitting the moment
-                        // the text scale moves, and the line then sits nearer the
-                        // top than the bottom -- which is the whole reason a
-                        // field can look subtly wrong without anything being
-                        // obviously broken.
-                        .when(!tall, |field| field.flex().items_center().min_h(px(34.)))
-                        // Tall fields take the height their editor asks for, and
-                        // no less than three lines of it.
-                        .when(tall, |field| field.min_h(px(84.)))
-                        .px_2()
-                        .py_1()
-                        .border_1()
-                        .border_color(ui::cyberpunk::border_dim())
-                        .child(editor.clone()),
-                )
+            ui::cyberpunk::dialog_field_on(name, tall, ground, editor.clone())
         };
 
         // A rule with a few words on it, to break a long column of fields into
         // the handful of things a reader is actually deciding.
-        let section = |name: &'static str| {
-            h_flex()
-                .w_full()
-                .pt_2()
-                .gap_2()
-                .items_center()
-                .debug_selector(move || format!("configuration-section-{name}"))
-                .child(
-                    Label::new(name)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Accent),
-                )
-                .child(div().flex_1().h(px(1.)).bg(ui::cyberpunk::border_dim()))
-        };
+        let section = ui::cyberpunk::dialog_section;
 
         v_flex()
             .id("configuration-form")
@@ -2233,15 +2188,7 @@ impl RunConfigurationsView {
     fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_one = self.chosen.is_some();
         let kind_being_edited = self.chosen.map(|(kind, _)| kind).unwrap_or(Kind::Task);
-        h_flex()
-            .flex_none()
-            .w_full()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .items_center()
-            .border_t_1()
-            .border_color(ui::cyberpunk::border_dim())
+        ui::cyberpunk::dialog_footer()
             // One quiet control instead of a sentence plus a button beside it:
             // the file's own name says where the configurations are kept, and a
             // name that opens the file needs no verb next to it.
@@ -2990,10 +2937,10 @@ mod tests {
         show_the_first_configuration(&view, &mut window_cx);
 
         let arguments = window_cx
-            .debug_bounds("configuration-field-ARGUMENTS")
+            .debug_bounds("DIALOG-FIELD-ARGUMENTS")
             .expect("the arguments are a field of the form");
         let command = window_cx
-            .debug_bounds("configuration-field-COMMAND")
+            .debug_bounds("DIALOG-FIELD-COMMAND")
             .expect("and so is the command");
         assert!(
             arguments.size.height >= px(60.),

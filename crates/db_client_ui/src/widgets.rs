@@ -1,7 +1,7 @@
 use editor::Editor;
 use gpui::{App, ClickEvent, Div, ElementId, Entity, SharedString, Window, div, prelude::*};
 use ui::prelude::*;
-use ui::{ElevationIndex, IconButton, IconName, Label, LabelSize, Tooltip, cyberpunk};
+use ui::{ElevationIndex, IconButton, IconName, Tooltip, cyberpunk};
 
 /// Standard floating surface for the database client's popups -- a history list,
 /// a column picker, a chart, a date picker. These are not dialogs, so they keep
@@ -54,17 +54,15 @@ pub(crate) fn dialog_header(
     title: impl Into<SharedString>,
     close_id: impl Into<ElementId>,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> impl IntoElement {
     h_flex()
         .w_full()
         .justify_between()
         .items_center()
-        .child(
-            Label::new(title.into().to_uppercase())
-                .size(LabelSize::Large)
-                .weight(gpui::FontWeight::EXTRA_BOLD)
-                .color(Color::Custom(cyberpunk::text_primary())),
-        )
+        // The shared voice, so a dialog in this crate names itself exactly the
+        // way a dialog anywhere else in the editor does.
+        .child(cyberpunk::dialog_title(title, cx))
         .child(
             IconButton::new(close_id, IconName::Close)
                 .style(dialog_close_button_style())

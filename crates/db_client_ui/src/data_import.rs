@@ -586,6 +586,7 @@ impl Render for ImportDataView {
                 format!("Import data into {}", self.table),
                 "close-import",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(
                 h_flex()

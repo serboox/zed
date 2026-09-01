@@ -4,7 +4,10 @@ use gpui::{
 };
 use serde_json::Value;
 use task::{BuildTaskDefinition, DebugScenario, TaskTemplate};
-use ui::{ElevationIndex, KeyBinding, ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
+use ui::{
+    ElevationIndex, KeyBinding, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk,
+    prelude::*,
+};
 use workspace::{ModalView, Workspace};
 use zed_actions::run_configurations::EntryPointOffer;
 
@@ -557,9 +560,18 @@ impl Render for WaysToRunModal {
                 }),
             )
             .child(
-                Label::new("How to run this")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(cyberpunk::dialog_title("How to run this", cx))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("ways-to-run-dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
             )
             .child(
                 div()

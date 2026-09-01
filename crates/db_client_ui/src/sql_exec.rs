@@ -285,6 +285,7 @@ impl Render for ExecDialog {
                     cx.emit(ExecDialogEvent::Dismissed);
                     cx.emit(DismissEvent);
                 }),
+                cx,
             ))
             .child(
                 Label::new(

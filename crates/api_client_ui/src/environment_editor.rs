@@ -7,7 +7,7 @@ use gpui::{
 };
 use ui::{
     Checkbox, ElevationIndex, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
-    ToggleState, WithScrollbar, cyberpunk, prelude::*,
+    ToggleState, Tooltip, WithScrollbar, cyberpunk, prelude::*,
 };
 use workspace::ModalView;
 
@@ -16,6 +16,10 @@ use workspace::ModalView;
 /// columns scroll inside this, which is why the height is a ceiling rather
 /// than something the content is allowed to push past.
 const DIALOG_WIDTH: f32 = 680.;
+
+/// What a newly added environment is called until it is named. Selected for
+/// editing the moment it appears, so the reader types over it.
+const NEW_ENVIRONMENT_NAME: &str = "New environment";
 const DIALOG_MAX_HEIGHT: f32 = 480.;
 
 /// Which variable list is being edited. `Global` and `Environment` share the
@@ -71,11 +75,17 @@ pub struct EnvironmentEditorModal {
     /// and unused for `Collection` scope, which shows a static title
     /// instead since a collection's name is edited from the panel tree).
     name_editor: Entity<Editor>,
-    new_environment_name_editor: Entity<Editor>,
     rows: Vec<VariableRow>,
     rows_scroll_handle: ScrollHandle,
     list_scroll_handle: ScrollHandle,
+    /// The row editors' subscriptions, thrown away and rebuilt whenever the
+    /// scope changes, because the rows themselves are.
     _subscriptions: Vec<Subscription>,
+    /// Watching the name field, kept apart from the rows on purpose. It belongs
+    /// to the dialog rather than to whichever environment is being looked at,
+    /// and living in the same list as the rows meant the first switch of scope
+    /// cleared it -- after which renaming quietly did nothing.
+    _watching_the_name: Option<Subscription>,
 }
 
 impl EnvironmentEditorModal {
@@ -112,8 +122,6 @@ impl EnvironmentEditorModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let name_editor = new_single_line_editor("Environment name", "", window, cx);
-        let new_environment_name_editor =
-            new_single_line_editor("New environment name", "", window, cx);
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -121,11 +129,11 @@ impl EnvironmentEditorModal {
             show_scope_list,
             scope,
             name_editor,
-            new_environment_name_editor,
             rows: Vec::new(),
             rows_scroll_handle: ScrollHandle::new(),
             list_scroll_handle: ScrollHandle::new(),
             _subscriptions: Vec::new(),
+            _watching_the_name: None,
         };
         this.rebuild_for_scope(window, cx);
         this.watch_name_editor(window, cx);
@@ -257,7 +265,7 @@ impl EnvironmentEditorModal {
                 }
             },
         );
-        self._subscriptions.push(subscription);
+        self._watching_the_name = Some(subscription);
     }
 
     fn row_variable(row: &VariableRow, cx: &App) -> Variable {
@@ -335,22 +343,27 @@ impl EnvironmentEditorModal {
         cx.notify();
     }
 
+    /// Adds one and moves to it, so the name field on the right is where it gets
+    /// its name. Naming it before it exists, in a field of its own under the
+    /// list, meant two places to type a name in one window.
     fn create_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self
-            .new_environment_name_editor
-            .read(cx)
-            .text(cx)
-            .trim()
-            .to_string();
-        if name.is_empty() {
-            return;
-        }
-        let id = self
-            .store
-            .update(cx, |store, cx| store.create_environment(name, cx));
-        self.new_environment_name_editor
-            .update(cx, |editor, cx| editor.set_text(String::new(), window, cx));
+        let id = self.store.update(cx, |store, cx| {
+            store.create_environment(NEW_ENVIRONMENT_NAME.to_string(), cx)
+        });
         self.select_scope(Scope::Environment(id), window, cx);
+        self.name_editor.update(cx, |editor, cx| {
+            editor.select_all(&Default::default(), window, cx)
+        });
+        window.focus(&self.name_editor.focus_handle(cx), cx);
+    }
+
+    /// Removes whichever environment is being looked at. Global is not one of
+    /// them and cannot go.
+    fn delete_chosen_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Scope::Environment(id) = self.scope else {
+            return;
+        };
+        self.delete_environment(id, window, cx);
     }
 
     fn duplicate_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -451,6 +464,11 @@ impl EnvironmentEditorModal {
         v_flex()
             .flex_none()
             .w(px(200.))
+            .child(
+                Label::new("ENVIRONMENTS")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             // No `h_full` here: it resolves against a parent whose height is
             // *definite*, and the row this sits in takes its height from the
             // layout instead -- so `h_full` fell back to the height of the
@@ -484,34 +502,6 @@ impl EnvironmentEditorModal {
                         cx,
                     ),
             )
-            .child({
-                let colors = cx.theme().colors();
-                h_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.background)
-                            .child(self.new_environment_name_editor.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("environment-editor-create-hitbox")
-                            .debug_selector(|| "environment-editor-create".to_string())
-                            .child(
-                                Button::new("environment-editor-create", "New")
-                                    .style(cyberpunk::Rank::Quiet.style())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_environment(window, cx);
-                                    })),
-                            ),
-                    )
-            })
     }
 
     fn render_scope_entry(
@@ -679,54 +669,56 @@ impl EnvironmentEditorModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let title = if self.show_scope_list {
-            None
-        } else {
-            Some(format!("Variables for {}", self.scope_name(cx)))
-        };
-
         let mut column = v_flex().flex_1().min_w_0().min_h_0().gap_2();
-        if let Some(title) = title {
-            column = column.child(Label::new(title).size(LabelSize::Large));
-        } else {
-            column = column.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.background)
-                    .child(self.name_editor.clone()),
-            );
+        if self.show_scope_list {
+            column = column.child(cyberpunk::dialog_field(
+                "name",
+                false,
+                cx,
+                self.name_editor.clone(),
+            ));
             if !matches!(self.scope, Scope::Global) {
                 column = column.child(
                     Button::new("environment-editor-duplicate", "Duplicate")
+                        .label_size(LabelSize::Small)
                         .style(cyberpunk::Rank::Quiet.style())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.duplicate_environment(window, cx);
                         })),
                 );
             }
+        } else {
+            column = column.child(
+                Label::new(format!("Variables for {}", self.scope_name(cx))).size(LabelSize::Large),
+            );
         }
+        // The plus rides the rule that names the section, rather than sitting
+        // alone on a line beneath it as a bare blue word.
+        column = column.child(
+            cyberpunk::dialog_section("variables").child(
+                div()
+                    .debug_selector(|| "variable-row-add".to_string())
+                    .child(
+                        IconButton::new("variable-row-add", IconName::Plus)
+                            .icon_size(IconSize::XSmall)
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .tooltip(Tooltip::text("Add a variable"))
+                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
+                    ),
+            ),
+        );
 
         let mut rows = v_flex().id("variable-rows").flex_none().gap_2();
         for index in 0..self.rows.len() {
             rows = rows.child(self.render_row(index, cx));
         }
-        rows = rows.child(
-            div()
-                .id("variable-row-add")
-                .debug_selector(|| "variable-row-add".to_string())
-                .cursor_pointer()
-                .child(
-                    Label::new("Add Variable")
-                        .size(LabelSize::Small)
-                        .color(Color::Accent),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
-        );
+        if self.rows.is_empty() {
+            rows = rows.child(
+                Label::new("No variables yet.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        }
 
         column.child(
             div()
@@ -765,18 +757,55 @@ impl Render for EnvironmentEditorModal {
             "Edit Variables"
         };
 
+        // The way out sits where every window in this editor keeps it -- top
+        // right, on the row the window names itself.
         let title_bar = h_flex()
             .id("environment-editor-title-bar")
             .debug_selector(|| "environment-editor-title-bar".to_string())
             .w_full()
+            .items_center()
+            .child(cyberpunk::dialog_title(title, cx))
+            .child(div().flex_1())
             .child(
-                div()
-                    .cyberpunk_monospace(cx)
-                    .font_weight(gpui::FontWeight::EXTRA_BOLD)
-                    .text_size(ui::HeadlineSize::Small.rems())
-                    .text_color(cyberpunk::text_primary())
-                    .child(title.to_uppercase()),
+                IconButton::new("environment-editor-dismiss", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .style(cyberpunk::Rank::Quiet.style())
+                    .tooltip(Tooltip::text("Close"))
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             );
+
+        // Adding and removing live on one frame above the list, the way the run
+        // configurations window does it, rather than as a trash icon on every
+        // row and a second name field under them.
+        let can_delete = matches!(self.scope, Scope::Environment(_));
+        // Each wrapped in a box that carries its own name: a button takes its
+        // debug name from the icon it draws, and two buttons drawing different
+        // icons in one frame still need telling apart from outside.
+        let toolbar = cyberpunk::segmented([
+            div()
+                .debug_selector(|| "environment-editor-create".to_string())
+                .child(
+                    IconButton::new("environment-editor-create", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Add an environment"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.create_environment(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+            div()
+                .debug_selector(|| "environment-editor-delete".to_string())
+                .child(
+                    IconButton::new("environment-editor-delete", IconName::Dash)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Remove this environment"))
+                        .disabled(!can_delete)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.delete_chosen_environment(window, cx)
+                        })),
+                )
+                .into_any_element(),
+        ]);
 
         v_flex()
             .id("environment-editor-modal-root")
@@ -795,6 +824,7 @@ impl Render for EnvironmentEditorModal {
             .cyberpunk_surface()
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .child(title_bar)
+            .when(self.show_scope_list, |dialog| dialog.child(toolbar))
             .child(
                 h_flex()
                     .flex_1()
@@ -816,12 +846,20 @@ impl Render for EnvironmentEditorModal {
                     })
                     .child(self.render_variable_panel(window, cx)),
             )
+            // Outside the padded body on purpose: the rule above it has to
+            // reach both edges of the window, the way it does in every other
+            // dialog here.
             .child(
-                h_flex().justify_end().child(
-                    Button::new("environment-editor-close", "Close")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-                ),
+                cyberpunk::dialog_footer()
+                    .mx_neg_3()
+                    .mb_neg_3()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("environment-editor-close", "Close")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
             )
     }
 }
@@ -890,29 +928,46 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Adding one and naming it are one motion now: the plus makes it, moves to
+    /// it, and hands the reader the name field with the placeholder selected --
+    /// so typing replaces it. Two places to type a name is what this replaced.
     #[gpui::test]
-    async fn creating_an_environment_through_the_new_environment_field_adds_it_to_the_store(
-        cx: &mut TestAppContext,
-    ) {
+    async fn adding_an_environment_names_it_in_the_field_on_the_right(cx: &mut TestAppContext) {
         let (store, view, mut cx) = build_environments_modal(cx).await;
         draw(&mut cx);
-
-        let new_name_editor =
-            view.read_with(&cx, |view, _| view.new_environment_name_editor.clone());
-        view.update_in(&mut cx, |_, window, cx| {
-            new_name_editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
-        });
-        cx.simulate_input("Staging");
-        cx.run_until_parked();
 
         let create_button = debug_center(&mut cx, "environment-editor-create");
         cx.simulate_click(create_button, gpui::Modifiers::none());
         cx.run_until_parked();
-
+        draw(&mut cx);
         store.read_with(&cx, |store, _| {
             assert_eq!(store.environments.len(), 1);
-            assert_eq!(store.environments[0].name, "Staging");
+            assert_eq!(store.environments[0].name, NEW_ENVIRONMENT_NAME);
         });
+
+        cx.simulate_input("Staging");
+        cx.run_until_parked();
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store.environments[0].name, "Staging",
+                "typing goes straight into the name, over the placeholder"
+            );
+        });
+
+        // And the one control that removes it is the one beside the plus. It
+        // asks first, the way it always has.
+        let delete_button = debug_center(&mut cx, "environment-editor-delete");
+        cx.simulate_click(delete_button, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(
+                matches!(view.scope, Scope::Global),
+                "removing what was being looked at falls back to Global"
+            );
+        });
+        store.read_with(&cx, |store, _| assert!(store.environments.is_empty()));
     }
 
     #[gpui::test]

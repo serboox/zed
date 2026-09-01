@@ -353,6 +353,7 @@ impl Render for DdlSourceView {
                 "SQL schema source",
                 "close-ddl",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
             ))
             .child(
                 h_flex()
