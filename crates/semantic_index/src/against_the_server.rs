@@ -266,6 +266,12 @@ impl ProgressTracker {
         self.last_activity = Some(Instant::now());
     }
 
+    /// Whether the server has reported any work at all yet. Told apart from
+    /// "finished" so a wait that times out can say which of the two happened.
+    fn has_started(&self) -> bool {
+        self.ever_opened
+    }
+
     fn finished_indexing(&self, quiet_for: Duration) -> bool {
         self.ever_opened
             && self.open.is_empty()
@@ -402,6 +408,19 @@ impl Server {
                     "rootUri": root_uri.as_str(),
                     "capabilities": {"window": {"workDoneProgress": true}},
                     "workspaceFolders": [{"uri": root_uri.as_str(), "name": folder_name}],
+                    // Left at their defaults on purpose: which files the server
+                    // can answer about, and what it considers a reference, must
+                    // be exactly what a person editing this project would get.
+                    // Only what it computes *ahead of being asked* is changed.
+                    "initializationOptions": {
+                        // Priming walks the whole workspace before the first
+                        // question and holds all of it. This project's graph
+                        // does not fit in the measuring machine that way, and
+                        // the run then measures the machine. Off, the server
+                        // computes what each request needs and no more.
+                        "cachePriming": {"enable": false},
+                        "lru": {"capacity": lru_capacity()},
+                    },
                 }),
                 INITIALIZE_TIMEOUT,
             )
@@ -427,15 +446,22 @@ impl Server {
     /// by making the server look worse than it is.
     pub async fn wait_until_indexed(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
+        let mut said_anything = false;
         loop {
             if self.progress.finished_indexing(QUIET_PERIOD_AFTER_INDEXING) {
                 return Ok(());
             }
+            said_anything |= self.progress.has_started();
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
-                "rust-analyzer did not finish indexing within {timeout:?}; the timeout ended the \
-                 wait, not the server -- treat this run as inconclusive, not a pass"
+                "rust-analyzer {} within {timeout:?}; the timeout ended the wait, not the \
+                 server -- treat this run as inconclusive, not a pass",
+                if said_anything {
+                    "did not finish indexing"
+                } else {
+                    "never reported any work at all"
+                }
             );
             self.pump_one(remaining.min(QUIET_PERIOD_AFTER_INDEXING))
                 .await?;
