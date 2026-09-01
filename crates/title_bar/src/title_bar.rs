@@ -30,7 +30,7 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, AnyView, App, Context, Element, Entity,
     Focusable, Global, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
-    pulsating_between, px,
+    pulsating_between, px, relative,
 };
 use onboarding_banner::OnboardingBanner;
 use project::{
@@ -391,6 +391,13 @@ impl Render for TitleBar {
                     // the account controls past its own edge.
                     .flex_shrink(1.)
                     .min_w_0()
+                    // A third of the bar at most, because what the plaque asks
+                    // for is an absolute width while the groups either side of
+                    // it ask only for what is left over. Without a bound the
+                    // plaque is served first at every window size, and the
+                    // branch and the project name are cut off to pay for it. A
+                    // third each is the share three groups in a row are owed.
+                    .max_w(relative(1. / 3.))
                     .overflow_hidden()
                     .justify_center()
                     // Nudged off dead centre, which is where it reads as centred:
@@ -1159,6 +1166,7 @@ impl TitleBar {
         Some(
             h_flex()
                 .gap_px()
+                .debug_selector(|| "title-bar-worktree-and-branch".to_string())
                 .children(worktree_button)
                 .when(show_separator, |this| {
                     this.child(
@@ -1514,5 +1522,122 @@ impl TitleBar {
                 .into()
             })
             .anchor(Anchor::TopRight)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext, size};
+    use project::{FakeFs, Project};
+    use workspace::{AppState, Workspace};
+
+    fn init_test(cx: &mut TestAppContext) -> std::sync::Arc<AppState> {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            release_channel::init(semver::Version::parse("0.0.0").unwrap(), cx);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            let app_state = AppState::test(cx);
+            call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+            workspace::init(app_state.clone(), cx);
+            // Puts a title bar on every workspace, which is how the real
+            // application gets one; without it the window has no bar to measure.
+            crate::init(cx);
+            app_state
+        })
+    }
+
+    /// The plaque in the middle asks for an absolute width; the groups either
+    /// side of it ask only for what is left over. Served in that order the
+    /// plaque is paid first at every window size, and on a narrower window the
+    /// branch control is cut in half to pay for it -- which is what a reader
+    /// sees as the branch having disappeared.
+    ///
+    /// Measured on painted boxes at a width where the old code clipped: the
+    /// control's own bounds are laid out whether or not they are then clipped
+    /// away, so a control that reaches past the group it lives in is exactly
+    /// the fault being tested.
+    #[gpui::test]
+    async fn the_branch_control_stays_whole_when_the_plaque_is_in_the_middle(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let one_third = px(320.);
+        cx.update(|cx| {
+            set_middle_of_the_bar(cx, move |_workspace, _window, cx| {
+                Some(
+                    cx.new(|_| WideThing {
+                        width: one_third * 3.,
+                    })
+                    .into(),
+                )
+            });
+        });
+
+        // A branch control is only drawn for a project that has a repository,
+        // so the fixture has to have one.
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/project"),
+            serde_json::json!({ ".git": {}, "a.txt": "" }),
+        )
+        .await;
+        fs.set_branch_name(
+            std::path::Path::new(util::path!("/project/.git")),
+            Some("main"),
+        );
+        let project = Project::test(fs, [util::path!("/project").as_ref()], cx).await;
+        let window = cx
+            .add_window(|window, cx| Workspace::new(None, project, app_state.clone(), window, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        // Two widths, because two separate faults hid behind this one symptom:
+        // at the wider one the row beside the branch was claiming the whole
+        // group, and at the narrower one the plaque was claiming an absolute
+        // width the sides then had to make up.
+        for bar in [one_third * 3., px(700.)] {
+            cx.simulate_resize(size(bar, px(600.)));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let inside = cx
+                .debug_bounds("title-bar-project-end")
+                .expect("the group the branch control lives in is painted");
+            let control = cx
+                .debug_bounds("title-bar-worktree-and-branch")
+                .expect("the branch control is painted");
+            assert!(
+                control.right() <= inside.right(),
+                "in a {bar:?} bar the branch control reaches to {:?}, past its group's edge at \
+                 {:?} -- what is drawn past that edge is cut off",
+                control.right(),
+                inside.right()
+            );
+            let middle = cx
+                .debug_bounds("title-bar-middle")
+                .expect("the plaque is painted");
+            assert!(
+                middle.size.width <= bar / 3. + px(1.),
+                "in a {bar:?} bar the plaque takes {:?}; a third is what three groups in a row \
+                 are owed",
+                middle.size.width
+            );
+        }
+    }
+
+    /// Stands in for the plaque: something that asks for more room than the bar
+    /// can spare, which is the only property of it this test depends on.
+    struct WideThing {
+        width: Pixels,
+    }
+
+    impl Render for WideThing {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(self.width).h(px(20.))
+        }
     }
 }

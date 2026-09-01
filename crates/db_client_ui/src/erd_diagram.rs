@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Window, actions, canvas, point, prelude::*, px,
+    Context, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable, Hsla, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Window, actions, canvas, point, prelude::*, px,
 };
 use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*, rems_from_px};
 use workspace::{Item, item::ItemEvent};

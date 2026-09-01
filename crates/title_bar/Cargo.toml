@@ -23,6 +23,10 @@ test-support = [
 
     "project/test-support",
     "remote/test-support",
+    # Without this the list is one crate short of itself: `remote/test-support`
+    # adds a connection variant that `remote_connection` only matches on when
+    # its own test-support is on, and the crate then cannot build its tests.
+    "remote_connection/test-support",
     "util/test-support",
     "workspace/test-support",
     "recent_projects/test-support",
@@ -78,6 +82,7 @@ release_channel.workspace = true
 remote = { workspace = true, features = ["test-support"] }
 rpc = { workspace = true, features = ["test-support"] }
 semver.workspace = true
+serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

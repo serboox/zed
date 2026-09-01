@@ -155,7 +155,12 @@ impl TitleBar {
 
         h_flex()
             .id("collaborator-list")
-            .w_full()
+            // Takes what is left over, not the whole row. Asking for the full
+            // width squeezes the project name and the branch beside it down to
+            // nothing -- even with nobody in the call and no face to show --
+            // because they are the shrinkable ones and this was not.
+            .flex_1()
+            .min_w_0()
             .gap_1()
             .overflow_x_scroll()
             .when_some(
