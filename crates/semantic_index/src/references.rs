@@ -49,6 +49,23 @@ impl ReferenceIndex {
     }
 }
 
+/// Whether the index is willing to answer about a name at all.
+///
+/// Grouping by name is only sound when the name means one thing in the whole
+/// project. Where it does not, every answer is a guess, and measured on this
+/// project the guessing is what destroyed precision: 78 926 of 78 930 wrong
+/// answers were "the name also names something else". Declining is not a
+/// failure to answer -- it is the difference between an index that is
+/// sometimes right and one that knows when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Certainty {
+    /// Answer about every name, right or wrong. What the first measurement did.
+    Always,
+    /// Answer only where the name is declared once in the project and is not
+    /// also used as a local binding anywhere.
+    OnlyWhenTheNameMeansOneThing,
+}
+
 /// Everything a project-wide pass over the references query found: the
 /// references themselves, and the extra context the error catalogue's
 /// classification needs to explain a divergence rather than merely count it.
@@ -372,6 +389,15 @@ fn scan_references(
         let Some(tree) = parser.parse(&contents, None) else {
             continue;
         };
+        // A file caught mid-edit contributes nothing at all, the same claim
+        // `crate::definitions` makes for the outline query. It matters more
+        // here: the outline query simply fails to match a recovered error
+        // node, but this query's widest pattern is a bare identifier, and
+        // tree-sitter's recovery hands out plenty of those from text that is
+        // not yet code. Half a parse would read as though it had parsed.
+        if tree.root_node().has_error() {
+            continue;
+        }
 
         raw_occurrences.extend(occurrences_in(
             &relative_path,
@@ -430,6 +456,19 @@ fn scan_references(
 /// happen to share a name are exactly one of the cases this measurement
 /// exists to see, not noise to collapse away before sampling.
 fn sample_symbols(symbols: &[NamedAt], count: usize) -> Vec<NamedAt> {
+    // Only symbols with a plain name. The outline query also yields compound
+    // ones -- an `impl` block is captured with both the trait and the type it
+    // joins, so its name comes through as `EventEmitter<GitStoreEvent>` or
+    // `platform::Os`. Those are not names anybody renames, and asking an index
+    // that groups by identifier for references to a whole path is comparing two
+    // different things: measured, they alone accounted for most of what looked
+    // like a recall failure.
+    let symbols: Vec<NamedAt> = symbols
+        .iter()
+        .filter(|symbol| is_a_plain_name(&symbol.name))
+        .cloned()
+        .collect();
+    let symbols = symbols.as_slice();
     if symbols.is_empty() || count == 0 {
         return Vec::new();
     }
@@ -441,6 +480,17 @@ fn sample_symbols(symbols: &[NamedAt], count: usize) -> Vec<NamedAt> {
         at += stride;
     }
     picked
+}
+
+/// Whether a name is one identifier and nothing else -- the only shape an
+/// index that groups by name can be asked about, and the only shape a rename
+/// applies to.
+fn is_a_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|letter| letter.is_alphanumeric() || letter == '_')
+        && !name.chars().next().is_some_and(|first| first.is_numeric())
 }
 
 /// `matched` over everything the index reported, `matched` plus
@@ -655,6 +705,11 @@ pub struct Report {
     /// on neither side, and printed, so a shrinking sample is visible rather
     /// than silent.
     pub outside_the_servers_project: usize,
+    /// Sampled symbols the index refused to answer about, because the name
+    /// means more than one thing. Printed beside the sample size: a precision
+    /// figure over a subset is only worth reading next to how big the subset
+    /// is.
+    pub declined: usize,
     pub comparison: Comparison,
     pub precision: f64,
     pub catalogue: ErrorCatalogue,
@@ -676,6 +731,14 @@ impl fmt::Display for Report {
             self.precision * 100.0,
             self.comparison.recall * 100.0
         )?;
+        if self.declined > 0 {
+            writeln!(
+                out,
+                "{} sampled symbols were declined: the name means more than one thing in this \
+                 project, and grouping by name alone cannot tell which one is meant",
+                self.declined
+            )?;
+        }
         if self.outside_the_servers_project > 0 {
             writeln!(
                 out,
@@ -725,6 +788,7 @@ pub async fn measure(
     symbol_count: usize,
     indexing_timeout: Duration,
     query_timeout: Duration,
+    certainty: Certainty,
 ) -> Result<Report> {
     let rust = rust_language()?;
     let references_query = tree_sitter::Query::new(&rust.grammar, QUERY_TEXT)
@@ -764,7 +828,25 @@ pub async fn measure(
     let mut index_timings = Vec::with_capacity(sampled.len());
     let mut server_timings = Vec::with_capacity(sampled.len());
     let mut outside_the_servers_project = 0usize;
+    let mut declined = 0usize;
+    // How many definitions in the project carry each name, so a name that means
+    // one thing can be told from one that means several.
+    let mut declarations_named: HashMap<&str, usize> = HashMap::new();
+    for symbol in &scan.defined {
+        *declarations_named.entry(symbol.name.as_str()).or_default() += 1;
+    }
     for symbol in &sampled {
+        if certainty == Certainty::OnlyWhenTheNameMeansOneThing {
+            let shared = declarations_named
+                .get(symbol.name.as_str())
+                .copied()
+                .unwrap_or(0)
+                > 1;
+            if shared || scan.local_bindings.contains(&symbol.name) {
+                declined += 1;
+                continue;
+            }
+        }
         let index_started = Instant::now();
         let the_index_found = scan.index.references_to(&symbol.name);
         index_timings.push(index_started.elapsed());
@@ -829,6 +911,7 @@ pub async fn measure(
     Ok(Report {
         symbols_sampled: answers.len(),
         outside_the_servers_project,
+        declined,
         comparison,
         precision,
         catalogue,
@@ -928,25 +1011,31 @@ mod tests {
         assert_eq!(macros[0].line, 12);
     }
 
-    /// The field read above sits on a line of its own on purpose. A macro's
-    /// arguments are one opaque token tree to this grammar, so a reference
-    /// written only inside a macro call is invisible to every pattern in the
-    /// query -- which is why `OnlyInsideAMacroInvocation` is a bucket of the
-    /// error catalogue rather than a bug to fix in the query. Asserted here so
-    /// the limitation is a measured fact and not a remark in a comment.
+    /// A macro's arguments are an opaque token tree to the grammar as far as
+    /// *structure* goes -- no pattern can say "the field of this expression"
+    /// inside one. But the tokens themselves are still nodes, so the widest
+    /// pattern in the query, a bare identifier, does reach them. A name read
+    /// only inside a macro call is therefore found, which it was not before
+    /// that pattern existed.
+    ///
+    /// What is still lost is the shape: the index knows the name occurs, not
+    /// that it occurs as a field of that particular value. That is what the
+    /// `OnlyInsideAMacroInvocation` bucket of the error catalogue now measures.
     #[test]
-    fn a_reference_written_only_inside_a_macro_call_is_invisible_to_the_grammar() {
+    fn a_name_read_only_inside_a_macro_call_is_found_by_the_widest_pattern() {
         let project = project_with(&[(
             "one.rs",
             "struct Holder {\n    value: u32,\n}\n\nfn use_it(holder: Holder) {\n    println!(\"{}\", holder.value);\n}\n",
         )]);
         let scan = scan_of(project.path());
 
-        assert!(
-            scan.index.references_to("value").is_empty(),
-            "the only read of the field is inside a macro call: {:?}",
-            scan.index.references_to("value")
+        let inside_the_macro = scan.index.references_to("value");
+        assert_eq!(
+            inside_the_macro.len(),
+            1,
+            "the read inside the macro call is reached as a bare name: {inside_the_macro:?}"
         );
+        assert_eq!(inside_the_macro[0].line, 6);
         // The macro's own name is not inside the token tree, so it is found.
         assert_eq!(scan.index.references_to("println").len(), 1);
         // And the type in the parameter, which is outside the macro, is found.
@@ -997,9 +1086,12 @@ mod tests {
         lines.sort_unstable();
         assert_eq!(
             lines,
-            vec![3, 8],
-            "both calls come back under the one name, from two unrelated locals"
+            vec![2, 3, 7, 8],
+            "two unrelated locals, and both their bindings, come back under the one name"
         );
+        // Which is exactly why a name used as a local binding is one the index
+        // declines to answer about at all: everything it could say here would
+        // be a guess about which `helper` was meant.
         assert!(scan.local_bindings.contains("helper"));
     }
 

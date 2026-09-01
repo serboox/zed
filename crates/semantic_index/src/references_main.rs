@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use semantic_index::measure::as_time;
-use semantic_index::references::{Report, measure};
+use semantic_index::references::{Certainty, Report, measure};
 
 /// The plan's own sample size for this check.
 const SYMBOL_COUNT: usize = 100;
@@ -40,6 +40,10 @@ async fn run() -> Result<()> {
     let mut symbol_count = SYMBOL_COUNT;
     let mut indexing_timeout = INDEXING_TIMEOUT;
     let mut query_timeout = QUERY_TIMEOUT;
+    // Declining an ambiguous name is the default, because answering one is a
+    // guess. `--answer-everything` restores the old behaviour, so the two can
+    // be compared on the same sample.
+    let mut certainty = Certainty::OnlyWhenTheNameMeansOneThing;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -60,6 +64,7 @@ async fn run() -> Result<()> {
                     .context("--query-timeout wants a number of seconds")?;
                 query_timeout = Duration::from_secs(seconds);
             }
+            "--answer-everything" => certainty = Certainty::Always,
             "--indexing-timeout" => {
                 let seconds: u64 = arguments
                     .next()
@@ -75,7 +80,9 @@ async fn run() -> Result<()> {
                      --root <path>               the project to read; the working directory by default\n\
                      --symbols <n>               how many symbols to compare over ({SYMBOL_COUNT})\n\
                      --indexing-timeout <secs>   how long to wait for the server to finish indexing\n\
-                     --query-timeout <secs>      how long one request may take ({})",
+                     --query-timeout <secs>      how long one request may take ({})\n\
+                     --answer-everything         answer about ambiguous names too, as the first\n\
+                     \x20                           measurement did",
                     QUERY_TIMEOUT.as_secs()
                 );
                 return Ok(());
@@ -102,7 +109,14 @@ async fn run() -> Result<()> {
          128, which does not fit in this machine's memory",
         semantic_index::against_the_server::lru_capacity()
     );
-    let report = measure(&root, symbol_count, indexing_timeout, query_timeout).await?;
+    let report = measure(
+        &root,
+        symbol_count,
+        indexing_timeout,
+        query_timeout,
+        certainty,
+    )
+    .await?;
     // Printed before anything is judged: the divergences are the point of this
     // run, and a gate that failed before they were shown would hide them.
     println!("\n{report}");

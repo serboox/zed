@@ -62,3 +62,16 @@
 ; honestly as a miss, named as such in the error catalogue, rather than
 ; silently supported by a pattern this file does not claim to have.
 (type_identifier) @reference.type
+
+; Every other occurrence of a plain name. A constant read, a function passed
+; by name, an enum variant, a name brought in by `use` -- none of these are a
+; call, a field or a type, and all of them are references a person renaming
+; the symbol would have to change.
+;
+; This is deliberately the widest pattern in the file, and it is safe only
+; because of what sits above it: the Rust side drops any match at a position
+; the outline query already calls a declaration, and the index declines to
+; answer at all about a name that means more than one thing in the project.
+; Without that second rule this pattern would be a precision disaster --
+; measured, before it existed, at 0.9 per cent.
+(identifier) @reference.value
