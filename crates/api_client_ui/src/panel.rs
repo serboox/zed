@@ -1306,6 +1306,32 @@ impl ApiClientPanel {
         });
     }
 
+    fn start_rename_request(&mut self, id: RequestId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.store.read(cx).requests.iter().find(|r| r.id == id) else {
+            return;
+        };
+        let current_name = current.name.clone();
+        let store = self.store.clone();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                TextPromptModal::new(
+                    "Rename Request",
+                    "Rename",
+                    "Request name",
+                    &current_name,
+                    Arc::new(move |name, _window, cx| {
+                        store.update(cx, |store, cx| store.rename_request(id, name, cx));
+                    }),
+                    window,
+                    cx,
+                )
+            });
+        });
+    }
+
     fn start_edit_collection_variables(
         &mut self,
         collection_id: CollectionId,
@@ -1764,6 +1790,14 @@ impl ApiClientPanel {
                 menu
             };
             menu.separator()
+                .entry("Rename", None, {
+                    let panel = panel.clone();
+                    move |window, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.start_rename_request(request_id, window, cx)
+                        });
+                    }
+                })
                 .entry("Duplicate", None, {
                     let panel = panel.clone();
                     move |_window, cx| {
@@ -2553,9 +2587,9 @@ impl Render for ApiClientPanel {
                         IconButton::new("api-client-open-history", IconName::HistoryRerun)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("History"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_history(window, cx)
-                            }))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_history(window, cx)),
+                            )
                             .into_any_element(),
                         environment_switcher,
                     ])),
@@ -3768,6 +3802,108 @@ mod tests {
             assert!(
                 first_order > second_order,
                 "Move Down should push `first` past `second`"
+            );
+        });
+    }
+
+    /// A request is named when it is created, and the name is the only thing in
+    /// the tree that tells two of them apart, so there has to be a way to change
+    /// it. Driven by a real right-click on the row and a click on the painted
+    /// entry, because what was missing was the entry itself.
+    #[gpui::test]
+    async fn a_request_can_be_renamed_from_its_context_menu(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+
+        let (collection, request) = store.update(&mut cx, |store, cx| {
+            let collection = store.create_collection("Collection".to_string(), cx);
+            let request = store.create_request(collection, "Before".to_string(), None, cx);
+            (collection, request)
+        });
+        cx.run_until_parked();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ApiClientPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        // Collections start collapsed, so the request has to be brought into
+        // view the way a reader would before it can be right-clicked at all.
+        let collection_row = debug_center(
+            &mut cx,
+            format!("api-client-collection-row-{collection}").leak(),
+        );
+        cx.simulate_click(collection_row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let row = debug_center(&mut cx, format!("api-client-request-row-{request}").leak());
+        cx.simulate_mouse_down(row, MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(row, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let rename = debug_center(&mut cx, "MENU_ITEM-Rename");
+        cx.simulate_click(rename, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_modal::<TextPromptModal>(cx)
+            })
+            .expect("choosing Rename opens the rename modal");
+        modal.read_with(&cx, |modal, cx| {
+            assert_eq!(
+                modal.editor.read(cx).text(cx),
+                "Before",
+                "the modal opens on the name the request already has"
+            );
+        });
+        modal.update_in(&mut cx, |modal, window, cx| {
+            modal
+                .editor
+                .update(cx, |editor, cx| editor.set_text("After", window, cx));
+        });
+        modal.update_in(&mut cx, |modal, window, cx| modal.confirm(window, cx));
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            let renamed = store
+                .requests
+                .iter()
+                .find(|r| r.id == request)
+                .expect("the request is still there");
+            assert_eq!(renamed.name, "After");
+        });
+    }
+
+    /// A name of nothing but spaces would leave a row with no label at all, so it
+    /// is refused and the request keeps the name it had.
+    #[gpui::test]
+    async fn renaming_a_request_to_blank_leaves_the_name_alone(cx: &mut TestAppContext) {
+        let (_workspace, panel, mut cx) = build_panel(cx).await;
+        let store = panel.read_with(&cx, |panel, _| panel.store.clone());
+
+        let request = store.update(&mut cx, |store, cx| {
+            let collection = store.create_collection("Collection".to_string(), cx);
+            store.create_request(collection, "Before".to_string(), None, cx)
+        });
+        cx.run_until_parked();
+
+        store.update(&mut cx, |store, cx| {
+            store.rename_request(request, "   ".to_string(), cx)
+        });
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .find(|r| r.id == request)
+                    .expect("the request is still there")
+                    .name,
+                "Before"
             );
         });
     }

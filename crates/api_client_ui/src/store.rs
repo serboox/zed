@@ -864,6 +864,20 @@ impl ApiClientStore {
         Some(new_id)
     }
 
+    pub fn rename_request(&mut self, id: RequestId, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(request) = self.requests.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        request.name = trimmed.to_string();
+        cx.emit(ApiClientStoreEvent::TreeChanged);
+        cx.notify();
+        self.persist_collections(cx);
+    }
+
     pub fn update_request(
         &mut self,
         id: RequestId,
