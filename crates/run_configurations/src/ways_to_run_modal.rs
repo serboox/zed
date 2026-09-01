@@ -1,10 +1,10 @@
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, WeakEntity, Window, px,
+    ScrollHandle, SharedString, WeakEntity, Window, px,
 };
 use serde_json::Value;
 use task::{BuildTaskDefinition, DebugScenario, TaskTemplate};
-use ui::{ElevationIndex, KeyBinding, prelude::*};
+use ui::{ElevationIndex, KeyBinding, ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
 use workspace::{ModalView, Workspace};
 use zed_actions::run_configurations::EntryPointOffer;
 
@@ -77,6 +77,10 @@ enum DebugOffer {
 /// The window the gutter's run button opens: every way of running this project,
 /// the one the editor found for this very line first, and the way to write a new
 /// one or go and edit them all.
+/// Tall enough for a handful of ways at once, short enough to leave the window
+/// its own edges; beyond that the list scrolls.
+const WAYS_TO_RUN_MAX_HEIGHT: f32 = 420.;
+
 pub struct WaysToRunModal {
     focus: FocusHandle,
     store: Entity<ConfigurationsStore>,
@@ -85,6 +89,7 @@ pub struct WaysToRunModal {
     ways: Vec<Way>,
     chosen: usize,
     trouble: Option<SharedString>,
+    list_scroll_handle: ScrollHandle,
 }
 
 impl EventEmitter<DismissEvent> for WaysToRunModal {}
@@ -176,6 +181,7 @@ impl WaysToRunModal {
             ways,
             chosen: 0,
             trouble: None,
+            list_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -529,6 +535,10 @@ impl Render for WaysToRunModal {
             .track_focus(&self.focus)
             .debug_selector(|| "ways-to-run".to_string())
             .w(px(560.))
+            // A ceiling, because the list grows with however many ways there
+            // are to run the project and would otherwise push the window's own
+            // bottom past the screen. The list scrolls inside it instead.
+            .max_h(px(WAYS_TO_RUN_MAX_HEIGHT))
             .p_3()
             .gap_2()
             .elevation_3(cx)
@@ -551,7 +561,22 @@ impl Render for WaysToRunModal {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(list)
+            .child(
+                div()
+                    .id("ways-to-run-list-scroll")
+                    .debug_selector(|| "ways-to-run-list-scroll".to_string())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.list_scroll_handle)
+                    .child(list)
+                    .custom_scrollbars(
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.list_scroll_handle),
+                        window,
+                        cx,
+                    ),
+            )
             .children(self.trouble.clone().map(|trouble| {
                 Label::new(trouble)
                     .size(LabelSize::XSmall)

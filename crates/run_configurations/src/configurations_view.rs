@@ -1244,10 +1244,6 @@ impl RunConfigurationsView {
         }
     }
 
-    fn run_the_task(&mut self, task: TaskTemplate, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_the_task_on(task, None, window, cx)
-    }
-
     fn run_the_task_on(
         &mut self,
         task: TaskTemplate,

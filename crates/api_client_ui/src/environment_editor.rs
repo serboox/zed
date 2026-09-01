@@ -2,9 +2,8 @@ use crate::store::ApiClientStore;
 use api_client::{CollectionId, EnvironmentId, Variable};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollHandle, Size,
-    Subscription, Window, point, size,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Render,
+    ScrollHandle, Subscription, Window,
 };
 use ui::{
     Checkbox, ElevationIndex, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
@@ -12,27 +11,12 @@ use ui::{
 };
 use workspace::ModalView;
 
-/// The dialog's width/height on first open, before any user resize.
-const DEFAULT_WIDTH: f32 = 680.;
-const DEFAULT_HEIGHT: f32 = 480.;
-/// Never allow the dialog to shrink small enough to lose its own controls.
-const MIN_WIDTH: f32 = 420.;
-const MIN_HEIGHT: f32 = 320.;
-/// Fixed distance from the top of the window on first open, matching where
-/// the standard `ModalLayer` used to place this dialog before it became
-/// freely repositionable.
-const DEFAULT_TOP_OFFSET: f32 = 80.;
-/// However far the dialog is dragged, this much of it must stay reachable
-/// on screen so it can always be dragged back.
-const VISIBLE_MARGIN: f32 = 48.;
-
-/// Marker payload for dragging the dialog's title bar to reposition it.
-#[derive(Debug, Clone)]
-struct DraggedEnvironmentEditorMove;
-
-/// Marker payload for dragging the bottom-right handle to resize the dialog.
-#[derive(Debug, Clone)]
-struct DraggedEnvironmentEditorResize;
+/// Two columns side by side, so wider than a one-question dialog, and short
+/// enough that the modal layer's own top offset leaves it on screen. Both
+/// columns scroll inside this, which is why the height is a ceiling rather
+/// than something the content is allowed to push past.
+const DIALOG_WIDTH: f32 = 680.;
+const DIALOG_MAX_HEIGHT: f32 = 480.;
 
 /// Which variable list is being edited. `Global` and `Environment` share the
 /// sidebar list (opened via "Manage Environments..."); `Collection` is
@@ -91,20 +75,6 @@ pub struct EnvironmentEditorModal {
     rows: Vec<VariableRow>,
     rows_scroll_handle: ScrollHandle,
     list_scroll_handle: ScrollHandle,
-    /// Top-left corner of the dialog, in window coordinates. The dialog
-    /// renders itself `absolute()`-positioned so it can be dragged anywhere,
-    /// rather than relying on `ModalLayer`'s fixed centered placement.
-    position: Point<Pixels>,
-    size: Size<Pixels>,
-    /// Absolute cursor position captured on mouse-down over the title bar or
-    /// resize handle, before GPUI's own drag-threshold has necessarily been
-    /// crossed. `on_drag`'s own reported offset reflects wherever the cursor
-    /// happened to be when the threshold was crossed, not the original
-    /// mouse-down point, so it can't be used to compute a stable delta --
-    /// this field and the two below are the real drag-start reference.
-    drag_start_mouse: Point<Pixels>,
-    drag_start_position: Point<Pixels>,
-    drag_start_size: Size<Pixels>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -145,13 +115,6 @@ impl EnvironmentEditorModal {
         let new_environment_name_editor =
             new_single_line_editor("New environment name", "", window, cx);
 
-        let dialog_size = size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT));
-        let viewport = window.viewport_size();
-        let initial_position = point(
-            ((viewport.width - dialog_size.width) / 2.).max(px(0.)),
-            px(DEFAULT_TOP_OFFSET).min((viewport.height - dialog_size.height).max(px(0.))),
-        );
-
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             store,
@@ -162,44 +125,11 @@ impl EnvironmentEditorModal {
             rows: Vec::new(),
             rows_scroll_handle: ScrollHandle::new(),
             list_scroll_handle: ScrollHandle::new(),
-            position: initial_position,
-            size: dialog_size,
-            drag_start_mouse: point(px(0.), px(0.)),
-            drag_start_position: initial_position,
-            drag_start_size: dialog_size,
             _subscriptions: Vec::new(),
         };
         this.rebuild_for_scope(window, cx);
         this.watch_name_editor(window, cx);
         this
-    }
-
-    /// Clamps a proposed size so the dialog never shrinks below its usable
-    /// minimum, nor grows past the window's own bounds from its current
-    /// top-left corner.
-    fn clamp_size(&self, proposed: Size<Pixels>, window: &Window) -> Size<Pixels> {
-        let viewport = window.viewport_size();
-        let max_width = (viewport.width - self.position.x).max(px(MIN_WIDTH));
-        let max_height = (viewport.height - self.position.y).max(px(MIN_HEIGHT));
-        size(
-            proposed.width.clamp(px(MIN_WIDTH), max_width),
-            proposed.height.clamp(px(MIN_HEIGHT), max_height),
-        )
-    }
-
-    /// Clamps a proposed top-left corner so at least `VISIBLE_MARGIN` of the
-    /// dialog always stays reachable within the window, in every direction.
-    fn clamp_position(&self, proposed: Point<Pixels>, window: &Window) -> Point<Pixels> {
-        let viewport = window.viewport_size();
-        let margin = px(VISIBLE_MARGIN);
-        let min_x = margin - self.size.width;
-        let max_x = viewport.width - margin;
-        let min_y = px(0.);
-        let max_y = viewport.height - margin;
-        point(
-            proposed.x.clamp(min_x, max_x),
-            proposed.y.clamp(min_y, max_y),
-        )
     }
 
     fn scope_name(&self, cx: &App) -> String {
@@ -839,17 +769,6 @@ impl Render for EnvironmentEditorModal {
             .id("environment-editor-title-bar")
             .debug_selector(|| "environment-editor-title-bar".to_string())
             .w_full()
-            .cursor_grab()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                    this.drag_start_mouse = event.position;
-                    this.drag_start_position = this.position;
-                }),
-            )
-            .on_drag(DraggedEnvironmentEditorMove, |_, _, _, cx| {
-                cx.new(|_| Empty)
-            })
             .child(
                 div()
                     .cyberpunk_monospace(cx)
@@ -859,65 +778,22 @@ impl Render for EnvironmentEditorModal {
                     .child(title.to_uppercase()),
             );
 
-        let resize_handle = div()
-            .id("environment-editor-resize-handle")
-            .debug_selector(|| "environment-editor-resize-handle".to_string())
-            .absolute()
-            .right(px(2.))
-            .bottom(px(2.))
-            .w(px(14.))
-            .h(px(14.))
-            .cursor_nwse_resize()
-            .border_r_2()
-            .border_b_2()
-            .border_color(cyberpunk::border_raised())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                    this.drag_start_mouse = event.position;
-                    this.drag_start_size = this.size;
-                }),
-            )
-            .on_drag(DraggedEnvironmentEditorResize, |_, _, _, cx| {
-                cx.new(|_| Empty)
-            });
-
         v_flex()
             .id("environment-editor-modal-root")
             .debug_selector(|| "environment-editor-modal-root".to_string())
             .key_context("EnvironmentEditorModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel(cx)))
-            .absolute()
-            .left(self.position.x)
-            .top(self.position.y)
-            .w(self.size.width)
-            .h(self.size.height)
-            // Nothing leaves the window. It is placed and sized by hand, so a
-            // child that outgrew it would simply paint over whatever is behind.
+            // Placed and sized like every other dialog in the editor: the modal
+            // layer centres it. Placing itself was what put it against the left
+            // edge with its second column hanging off the right.
+            .w(px(DIALOG_WIDTH))
+            .max_h(px(DIALOG_MAX_HEIGHT))
             .overflow_hidden()
             .p_3()
             .gap_3()
             .cyberpunk_surface()
             .shadow(ElevationIndex::ModalSurface.shadow(cx))
-            .on_drag_move::<DraggedEnvironmentEditorMove>(cx.listener(
-                |this, event: &DragMoveEvent<DraggedEnvironmentEditorMove>, window, cx| {
-                    let delta = event.event.position - this.drag_start_mouse;
-                    this.position = this.clamp_position(this.drag_start_position + delta, window);
-                    cx.notify();
-                },
-            ))
-            .on_drag_move::<DraggedEnvironmentEditorResize>(cx.listener(
-                |this, event: &DragMoveEvent<DraggedEnvironmentEditorResize>, window, cx| {
-                    let delta = event.event.position - this.drag_start_mouse;
-                    let proposed = size(
-                        this.drag_start_size.width + delta.x,
-                        this.drag_start_size.height + delta.y,
-                    );
-                    this.size = this.clamp_size(proposed, window);
-                    cx.notify();
-                },
-            ))
             .child(title_bar)
             .child(
                 h_flex()
@@ -947,7 +823,6 @@ impl Render for EnvironmentEditorModal {
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 ),
             )
-            .child(resize_handle)
     }
 }
 
@@ -955,7 +830,7 @@ impl Render for EnvironmentEditorModal {
 mod tests {
     use super::*;
     use crate::store::ApiClientStore;
-    use gpui::{MouseButton, TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -982,38 +857,6 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         let view = window.root(&mut cx).unwrap();
         (store, view, cx)
-    }
-
-    /// Renders the modal one level below the window root, inside a
-    /// `relative()`-positioned full-size container -- mirroring how
-    /// `ModalLayer` actually embeds it in the real app. `.absolute()`
-    /// positioning has no containing block to anchor to when an element
-    /// *is* the window root, so drag-to-move/resize can only be observed
-    /// correctly with a real positioned ancestor present, same as production.
-    struct PositionedTestRoot {
-        modal: Entity<EnvironmentEditorModal>,
-    }
-
-    impl Render for PositionedTestRoot {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().relative().size_full().child(self.modal.clone())
-        }
-    }
-
-    async fn build_environments_modal_for_drag_tests(
-        cx: &mut TestAppContext,
-    ) -> (Entity<EnvironmentEditorModal>, VisualTestContext) {
-        init_test(cx);
-        let store = cx.new(|cx| ApiClientStore::new(cx));
-        let window = cx.add_window(move |window, cx| {
-            let modal =
-                cx.new(|cx| EnvironmentEditorModal::new_for_environments(store, window, cx));
-            PositionedTestRoot { modal }
-        });
-        let mut cx = VisualTestContext::from_window(window.into(), cx);
-        let root = window.root(&mut cx).unwrap();
-        let modal = root.read_with(&cx, |root, _| root.modal.clone());
-        (modal, cx)
     }
 
     async fn build_collection_modal(
@@ -1210,6 +1053,63 @@ mod tests {
     /// height of everything in it unless the column is told it may be shorter,
     /// so before this the row grew and the scrolling below it had nothing to
     /// scroll inside.
+    /// The dialog places itself the way every other one does, and nothing in it
+    /// reaches past its own edge. Before this it positioned and sized itself by
+    /// hand, which put it against the left of the window with its second column
+    /// hanging off the right, where `overflow_hidden` then cut it off.
+    ///
+    /// Measured on painted boxes: a laid-out box exists whether or not it is
+    /// then clipped away, so a child reaching past its parent is exactly the
+    /// fault being tested.
+    #[gpui::test]
+    async fn nothing_in_the_dialog_reaches_past_its_own_edge(cx: &mut TestAppContext) {
+        let (store, _view, mut cx) = build_environments_modal(cx).await;
+        store.update(&mut cx, |store, cx| {
+            for name in [
+                "de-canary-gcp",
+                "ams-prod-gcp",
+                "QA Test POD",
+                "qagke-stage",
+            ] {
+                store.create_environment(name.to_string(), cx);
+            }
+        });
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        let dialog = cx
+            .debug_bounds("environment-editor-modal-root")
+            .expect("the dialog is painted");
+        assert!(
+            dialog.size.width <= px(DIALOG_WIDTH) + px(1.),
+            "the dialog is {:?} wide; it asks for {DIALOG_WIDTH}px",
+            dialog.size.width
+        );
+        assert!(
+            dialog.size.height <= px(DIALOG_MAX_HEIGHT) + px(1.),
+            "the dialog is {:?} tall; {DIALOG_MAX_HEIGHT}px is its ceiling",
+            dialog.size.height
+        );
+
+        for name in [
+            "environment-editor-list",
+            "environment-editor-rows-scroll",
+            "environment-editor-title-bar",
+            "variable-row-add",
+        ] {
+            let inside = cx
+                .debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is painted"));
+            assert!(
+                inside.left() >= dialog.left()
+                    && inside.right() <= dialog.right()
+                    && inside.top() >= dialog.top()
+                    && inside.bottom() <= dialog.bottom(),
+                "{name} at {inside:?} reaches past the dialog at {dialog:?}"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn many_environments_scroll_inside_their_own_column(cx: &mut TestAppContext) {
         let (store, view, mut cx) = build_environments_modal(cx).await;
@@ -1224,12 +1124,11 @@ mod tests {
         let modal = cx
             .debug_bounds("environment-editor-modal-root")
             .expect("the window is painted");
-        let asked_for = view.read_with(&cx, |view, _| view.size);
         assert!(
-            modal.size.height <= asked_for.height + px(1.),
-            "the window is {:?} tall having been given {:?}: its contents made it grow",
-            modal.size.height,
-            asked_for.height
+            modal.size.height <= px(DIALOG_MAX_HEIGHT) + px(1.),
+            "the window is {:?} tall against a ceiling of {DIALOG_MAX_HEIGHT}px: its contents \
+             made it grow",
+            modal.size.height
         );
 
         let reach = view.read_with(&cx, |view, _| view.list_scroll_handle.max_offset());
@@ -1301,73 +1200,5 @@ mod tests {
             assert_eq!(collection.variables.len(), 1);
             assert_eq!(collection.variables[0].key, "api_version");
         });
-    }
-
-    #[gpui::test]
-    async fn dragging_the_title_bar_moves_the_dialog(cx: &mut TestAppContext) {
-        let (_view, mut cx) = build_environments_modal_for_drag_tests(cx).await;
-        draw(&mut cx);
-
-        let before = cx
-            .debug_bounds("environment-editor-modal-root")
-            .expect("modal root must have debug bounds");
-        let title_bar_center = debug_center(&mut cx, "environment-editor-title-bar");
-        let target = title_bar_center + gpui::point(gpui::px(120.), gpui::px(60.));
-
-        cx.simulate_mouse_down(title_bar_center, MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::none());
-        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::none());
-        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        let after = cx
-            .debug_bounds("environment-editor-modal-root")
-            .expect("modal root must still have debug bounds");
-        assert_eq!(
-            after.origin.x - before.origin.x,
-            gpui::px(120.),
-            "dragging the title bar right by 120px must move the dialog right by 120px"
-        );
-        assert_eq!(
-            after.origin.y - before.origin.y,
-            gpui::px(60.),
-            "dragging the title bar down by 60px must move the dialog down by 60px"
-        );
-    }
-
-    #[gpui::test]
-    async fn dragging_the_resize_handle_resizes_the_dialog(cx: &mut TestAppContext) {
-        let (_view, mut cx) = build_environments_modal_for_drag_tests(cx).await;
-        draw(&mut cx);
-
-        let before = cx
-            .debug_bounds("environment-editor-modal-root")
-            .expect("modal root must have debug bounds");
-        let handle_center = debug_center(&mut cx, "environment-editor-resize-handle");
-        let target = handle_center + gpui::point(gpui::px(80.), gpui::px(40.));
-
-        cx.simulate_mouse_down(handle_center, MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::none());
-        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::none());
-        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::none());
-        cx.run_until_parked();
-        draw(&mut cx);
-
-        let after = cx
-            .debug_bounds("environment-editor-modal-root")
-            .expect("modal root must still have debug bounds");
-        assert!(
-            after.size.width > before.size.width,
-            "dragging the resize handle outward must grow the dialog's width, before={:?} after={:?}",
-            before.size,
-            after.size
-        );
-        assert!(
-            after.size.height > before.size.height,
-            "dragging the resize handle outward must grow the dialog's height, before={:?} after={:?}",
-            before.size,
-            after.size
-        );
     }
 }

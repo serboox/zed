@@ -16,8 +16,16 @@ pub struct TextPromptModal {
     title: SharedString,
     confirm_label: SharedString,
     pub(crate) editor: Entity<Editor>,
+    /// A multi-line editor has no height of its own, so the box around it has
+    /// to be given one or the reader gets a sliver to paste a whole document
+    /// into.
+    multiline: bool,
     on_confirm: Arc<dyn Fn(String, &mut Window, &mut App)>,
 }
+
+/// Room for a pasted command or document without the dialog outgrowing the
+/// window; the editor scrolls inside it.
+const MULTILINE_HEIGHT: f32 = 200.;
 
 impl TextPromptModal {
     pub fn new(
@@ -94,6 +102,7 @@ impl TextPromptModal {
             title: title.into(),
             confirm_label: confirm_label.into(),
             editor,
+            multiline,
             on_confirm,
         }
     }
@@ -129,7 +138,7 @@ impl Render for TextPromptModal {
             .key_context("TextPromptModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel(cx)))
-            .w(px(420.))
+            .w(px(if self.multiline { 640. } else { 420. }))
             .p_3()
             .gap_3()
             .cyberpunk_surface()
@@ -145,6 +154,8 @@ impl Render for TextPromptModal {
             .child(
                 div()
                     .p_2()
+                    .when(self.multiline, |this| this.h(px(MULTILINE_HEIGHT)))
+                    .debug_selector(|| "text-prompt-editor-box".to_string())
                     .rounded_none()
                     .border_1()
                     .border_color(cyberpunk::border_dim())
