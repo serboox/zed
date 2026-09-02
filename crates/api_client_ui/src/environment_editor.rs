@@ -6,7 +6,7 @@ use gpui::{
     ScrollHandle, Subscription, Window,
 };
 use ui::{
-    Checkbox, ElevationIndex, Icon, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
+    Checkbox, ElevationIndex, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
     ToggleState, Tooltip, WithScrollbar, cyberpunk, prelude::*,
 };
 use workspace::ModalView;
@@ -15,12 +15,42 @@ use workspace::ModalView;
 /// enough that the modal layer's own top offset leaves it on screen. Both
 /// columns scroll inside this, which is why the height is a ceiling rather
 /// than something the content is allowed to push past.
-const DIALOG_WIDTH: f32 = 680.;
+///
+/// The right half carries five columns -- an on/off box, three values and the
+/// row's own actions -- and only the three values may stretch. Narrower than
+/// this and each value box comes out shorter than the words heading it, which
+/// is the difference between a table that is tight and one that cannot be
+/// read.
+const DIALOG_WIDTH: f32 = 760.;
 
 /// What a newly added environment is called until it is named. Selected for
 /// editing the moment it appears, so the reader types over it.
 const NEW_ENVIRONMENT_NAME: &str = "New environment";
 const DIALOG_MAX_HEIGHT: f32 = 480.;
+
+/// How wide the column of environments stands.
+const LIST_WIDTH: Pixels = px(200.);
+
+/// Room at the end of every variable row for its three actions under one
+/// frame, and the same room reserved by the heading above them. Fixed rather
+/// than left to the contents: the three value columns can only line up with
+/// the words naming them if what sits either side of them never changes width.
+const ROW_ACTIONS_WIDTH: Pixels = px(84.);
+
+/// One action inside that frame.
+const ROW_ACTION_WIDTH: Pixels = px(26.);
+
+/// How tall a value box stands at least.
+const ROW_CELL_HEIGHT: Pixels = px(30.);
+
+/// How many variables a scope holds, for the line under its name in the list.
+fn how_many_variables(count: usize) -> String {
+    match count {
+        0 => "no variables".to_string(),
+        1 => "1 variable".to_string(),
+        _ => format!("{count} variables"),
+    }
+}
 
 /// Which variable list is being edited. `Global` and `Environment` share the
 /// sidebar list (opened via "Manage Environments..."); `Collection` is
@@ -427,14 +457,39 @@ impl EnvironmentEditorModal {
         cx.emit(DismissEvent);
     }
 
+    /// A small heading over a group of rows in the list on the left, so the
+    /// one scope that is always read is not mistaken for one of the ones a
+    /// reader made.
+    fn group_heading(said: impl Into<SharedString>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(Label::new(said).size(LabelSize::XSmall).color(Color::Muted))
+    }
+
+    /// The left half: everything there is to look at, and which of them is
+    /// being looked at. The rows carry no controls of their own -- adding,
+    /// copying and removing sit on the one frame above the list, so a reader
+    /// looks for them in a single place rather than on every row.
     fn render_scope_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let environments: Vec<(EnvironmentId, String)> = self
-            .store
-            .read(cx)
+        let store = self.store.read(cx);
+        let global_variables = store.global_environment.variables.len();
+        let in_use = store.active_environment().map(|environment| environment.id);
+        let environments: Vec<(EnvironmentId, String, usize, bool)> = store
             .environments
             .iter()
-            .map(|environment| (environment.id, environment.name.clone()))
+            .map(|environment| {
+                (
+                    environment.id,
+                    environment.name.clone(),
+                    environment.variables.len(),
+                    in_use == Some(environment.id),
+                )
+            })
             .collect();
+        let how_many = environments.len();
 
         let mut list = v_flex()
             .id("environment-editor-list")
@@ -445,14 +500,37 @@ impl EnvironmentEditorModal {
             // room available and there was never anything to scroll to.
             .flex_none()
             .gap_0p5()
-            .child(
-                self.render_scope_entry("Global", Scope::Global, cx, |this, window, cx| {
+            .child(Self::group_heading("ALWAYS ON"))
+            .child(self.render_scope_entry(
+                "Global",
+                how_many_variables(global_variables),
+                Scope::Global,
+                cx,
+                |this, window, cx| {
                     this.select_scope(Scope::Global, window, cx);
-                }),
+                },
+            ))
+            .child(Self::group_heading(match how_many {
+                0 => "ENVIRONMENTS".to_string(),
+                _ => format!("ENVIRONMENTS · {how_many}"),
+            }));
+        if environments.is_empty() {
+            list = list.child(
+                div().px_2().pb_1().child(
+                    Label::new("None yet. Press + above to make one.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
             );
-        for (id, name) in environments {
+        }
+        for (id, name, variables, is_in_use) in environments {
+            let beneath = match is_in_use {
+                true => format!("{} · in use", how_many_variables(variables)),
+                false => how_many_variables(variables),
+            };
             list = list.child(self.render_scope_entry(
                 name,
+                beneath,
                 Scope::Environment(id),
                 cx,
                 move |this, window, cx| {
@@ -463,12 +541,12 @@ impl EnvironmentEditorModal {
 
         v_flex()
             .flex_none()
-            .w(px(200.))
-            .child(
-                Label::new("ENVIRONMENTS")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .w(LIST_WIDTH)
+            // A rule between the two halves, the way the run configurations
+            // window separates its list from its form.
+            .pr_2()
+            .border_r_1()
+            .border_color(cyberpunk::border_dim())
             // No `h_full` here: it resolves against a parent whose height is
             // *definite*, and the row this sits in takes its height from the
             // layout instead -- so `h_full` fell back to the height of the
@@ -480,7 +558,6 @@ impl EnvironmentEditorModal {
             // scroll inside -- which is how eleven environments pushed the other
             // half of this window off the screen.
             .min_h_0()
-            .gap_2()
             .child(
                 div()
                     .id("environment-editor-list-scroll")
@@ -507,161 +584,324 @@ impl EnvironmentEditorModal {
     fn render_scope_entry(
         &self,
         label: impl Into<SharedString>,
+        beneath: String,
         scope: Scope,
         cx: &Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let is_selected = self.scope == scope;
         let label = label.into();
-        let is_global = matches!(scope, Scope::Global);
-        let mut row = h_flex()
-            .id(SharedString::from(format!(
-                "environment-editor-entry-{label}"
-            )))
+        let name = SharedString::from(format!("environment-editor-entry-{label}"));
+        h_flex()
+            .id(name.clone())
+            .debug_selector(move || name.to_string())
             .w_full()
             .px_2()
             .py_1()
             .gap_2()
             .items_center()
-            .rounded_md()
+            .rounded(cyberpunk::RADIUS)
             .cursor_pointer()
-            .when(is_selected, |el| el.bg(colors.element_selected))
-            .when(!is_selected, |el| {
-                el.hover(|el| el.bg(colors.element_hover))
+            .when(is_selected, |row| row.bg(cyberpunk::row_chosen()))
+            .when(!is_selected, |row| {
+                row.hover(|row| row.bg(cyberpunk::row_hovered()))
             })
+            // A stripe drawn on every row and coloured in on the chosen one,
+            // rather than a border that only the chosen one carries: a border
+            // that comes and goes moves the words beside it each time the
+            // choice changes.
             .child(
-                Label::new(label)
-                    .size(LabelSize::Small)
-                    .color(if is_selected {
-                        Color::Default
-                    } else {
-                        Color::Muted
+                div()
+                    .flex_none()
+                    .w(px(2.))
+                    .h(px(26.))
+                    .rounded(cyberpunk::RADIUS)
+                    .when(is_selected, |stripe| {
+                        stripe.bg(cyberpunk::Accent::Cyan.border())
                     }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)));
-        if !is_global {
-            let Scope::Environment(id) = scope else {
-                return row;
-            };
-            row = row.child(div().flex_1()).child(
-                div()
-                    .id(SharedString::from(format!(
-                        "environment-editor-delete-{id}"
-                    )))
-                    .debug_selector(move || format!("environment-editor-delete-{id}"))
-                    .cursor_pointer()
-                    .child(Icon::new(IconName::Trash).size(IconSize::Small))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.delete_environment(id, window, cx);
-                    })),
-            );
-        }
-        row
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(match is_selected {
+                                true => Color::Default,
+                                false => Color::Muted,
+                            }),
+                    )
+                    .child(
+                        Label::new(beneath)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
     }
 
+    /// The words over the table. Three boxes of text side by side say nothing
+    /// about which is which, and the difference between the two values is the
+    /// whole point of keeping both.
+    fn render_variables_heading(&self) -> impl IntoElement {
+        let column = |said: &'static str, selector: &'static str, hint: &'static str| {
+            div()
+                .id(selector)
+                .debug_selector(move || selector.to_string())
+                .flex_1()
+                .min_w_0()
+                .px_2()
+                .tooltip(Tooltip::text(hint))
+                .child(Label::new(said).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        h_flex()
+            .id("variables-heading")
+            .debug_selector(|| "variables-heading".to_string())
+            .w_full()
+            .flex_none()
+            .gap_2()
+            .items_center()
+            .pb_1()
+            .border_b_1()
+            .border_color(cyberpunk::border_dim())
+            .child(
+                div()
+                    .flex_none()
+                    .w(Checkbox::container_size())
+                    .flex()
+                    .justify_center()
+                    .child(Label::new("ON").size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .child(column(
+                "KEY",
+                "variables-heading-key",
+                "The name a request writes as {{key}}",
+            ))
+            .child(column(
+                "INITIAL VALUE",
+                "variables-heading-initial",
+                "What is written down and shared with everyone",
+            ))
+            .child(column(
+                "CURRENT VALUE",
+                "variables-heading-current",
+                "What this machine actually sends, which may differ",
+            ))
+            .child(div().flex_none().w(ROW_ACTIONS_WIDTH))
+    }
+
+    /// One variable: whether it is sent, its name, the value that is written
+    /// down and the value being used, then the three things that can be done
+    /// to the row.
     fn render_row(&self, index: usize, cx: &Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
+        let ground = cx.theme().colors().editor_background;
         let row = &self.rows[index];
         let enabled = row.enabled;
         let secret = row.secret;
         let revealed = row.revealed;
+        let cell = move |editor: &Entity<Editor>, column: &'static str| {
+            div()
+                .debug_selector(move || format!("variable-row-{column}-{index}"))
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                // A minimum with the line centred in it rather than a fixed
+                // height, the same rule every other field in this chrome
+                // follows: a fixed box stops fitting the moment the text
+                // scale moves.
+                .min_h(ROW_CELL_HEIGHT)
+                .px_2()
+                .py_1()
+                .rounded(cyberpunk::RADIUS)
+                .border_1()
+                .border_color(cyberpunk::border_dim())
+                .bg(ground)
+                // A variable that is switched off stays readable, but says so.
+                .when(!enabled, |cell| cell.opacity(0.5))
+                .child(editor.clone())
+        };
+
+        let actions = cyberpunk::segmented([
+            div()
+                .debug_selector(move || format!("variable-row-secret-{index}"))
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("variable-row-secret-{index}")),
+                        match secret {
+                            true => IconName::Lock,
+                            false => IconName::LockOff,
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .size(ButtonSize::Compact)
+                    .width(ROW_ACTION_WIDTH)
+                    // Cyan rather than amber: this chrome has exactly two
+                    // accents and amber is not one of them.
+                    .icon_color(match secret {
+                        true => Color::Accent,
+                        false => Color::Muted,
+                    })
+                    .tooltip(Tooltip::text(match secret {
+                        true => "Stop hiding this value",
+                        false => "Hide this value",
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_row_secret(index, cx))),
+                )
+                .into_any_element(),
+            div()
+                .debug_selector(move || format!("variable-row-reveal-{index}"))
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("variable-row-reveal-{index}")),
+                        match revealed {
+                            true => IconName::EyeOff,
+                            false => IconName::Eye,
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .size(ButtonSize::Compact)
+                    .width(ROW_ACTION_WIDTH)
+                    // Always drawn, and dead unless the value is hidden. An
+                    // action that appeared on some rows only made those rows
+                    // one button wider, which slid their three value columns
+                    // out of line with every other row's.
+                    .disabled(!secret)
+                    .tooltip(Tooltip::text(match revealed {
+                        true => "Hide it again",
+                        false => "Show what it says",
+                    }))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_row_revealed(index, cx)),
+                    ),
+                )
+                .into_any_element(),
+            div()
+                .debug_selector(move || format!("variable-row-remove-{index}"))
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("variable-row-remove-{index}")),
+                        IconName::Trash,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .size(ButtonSize::Compact)
+                    .width(ROW_ACTION_WIDTH)
+                    .tooltip(Tooltip::text("Take this variable out"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_row(index, cx))),
+                )
+                .into_any_element(),
+        ]);
+
         h_flex()
             .id(SharedString::from(format!("variable-row-{index}")))
             .w_full()
             .gap_2()
             .items_center()
             .child(
-                Checkbox::new(
-                    SharedString::from(format!("variable-row-enabled-{index}")),
-                    if enabled {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_row_enabled(index, cx))),
-            )
-            .child(
                 div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.background)
-                    .child(row.key_editor.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.background)
-                    .child(row.initial_value_editor.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.background)
-                    .child(row.current_value_editor.clone()),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("variable-row-secret-{index}")))
-                    .debug_selector(move || format!("variable-row-secret-{index}"))
-                    .cursor_pointer()
+                    .flex_none()
+                    .w(Checkbox::container_size())
+                    .flex()
+                    .justify_center()
                     .child(
-                        Icon::new(if secret {
-                            IconName::Lock
-                        } else {
-                            IconName::LockOff
-                        })
-                        .size(IconSize::Small)
-                        .color(if secret {
-                            Color::Warning
-                        } else {
-                            Color::Muted
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_row_secret(index, cx))),
-            )
-            .when(secret, |el| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("variable-row-reveal-{index}")))
-                        .debug_selector(move || format!("variable-row-reveal-{index}"))
-                        .cursor_pointer()
-                        .child(
-                            Icon::new(if revealed {
-                                IconName::EyeOff
-                            } else {
-                                IconName::Eye
-                            })
-                            .size(IconSize::Small),
+                        Checkbox::new(
+                            SharedString::from(format!("variable-row-enabled-{index}")),
+                            match enabled {
+                                true => ToggleState::Selected,
+                                false => ToggleState::Unselected,
+                            },
                         )
+                        .tooltip(Tooltip::text("Send this variable with requests"))
                         .on_click(
-                            cx.listener(move |this, _, _, cx| this.toggle_row_revealed(index, cx)),
+                            cx.listener(move |this, _, _, cx| this.toggle_row_enabled(index, cx)),
                         ),
-                )
-            })
+                    ),
+            )
+            .child(cell(&row.key_editor, "key"))
+            .child(cell(&row.initial_value_editor, "initial"))
+            .child(cell(&row.current_value_editor, "current"))
             .child(
                 div()
-                    .id(SharedString::from(format!("variable-row-remove-{index}")))
-                    .debug_selector(move || format!("variable-row-remove-{index}"))
-                    .cursor_pointer()
-                    .child(Icon::new(IconName::Trash).size(IconSize::Small))
-                    .on_click(cx.listener(move |this, _, _, cx| this.remove_row(index, cx))),
+                    .flex_none()
+                    .w(ROW_ACTIONS_WIDTH)
+                    .flex()
+                    .justify_end()
+                    .child(actions),
             )
+    }
+
+    /// Nothing to show yet. An empty table saying so and no more leaves the
+    /// reader to go looking for the plus, so the one thing there is to do is
+    /// offered here instead.
+    fn render_no_variables(&self, cx: &Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("variable-rows-empty")
+            .debug_selector(|| "variable-rows-empty".to_string())
+            .w_full()
+            .py_6()
+            .px_4()
+            .gap_2()
+            .items_center()
+            .child(Label::new("No variables here yet.").size(LabelSize::Small))
+            .child(
+                Label::new(
+                    "A variable holds a value in one place, and every request that names \
+                     it picks up whatever it says.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "variable-row-empty-add".to_string())
+                    .child(
+                        Button::new("variable-row-empty-add-button", "Add the first variable")
+                            .label_size(LabelSize::Small)
+                            // The accent is allowed here because nothing else
+                            // on this half competes for it while the table is
+                            // empty: it is the only thing there is to press.
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
+                    ),
+            )
+    }
+
+    /// What the right half is looking at, said once above the variables. Only
+    /// an environment has a name that is changed here; Global has none to
+    /// change and a collection is renamed from the panel tree, so both of
+    /// those read as a caption rather than as a box that looks typed-in and is
+    /// not.
+    fn render_scope_header(&self, cx: &Context<Self>) -> AnyElement {
+        let caption = |said: &'static str, name: String, beneath: &'static str| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(Label::new(said).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(name).size(LabelSize::Small))
+                .child(
+                    Label::new(beneath)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        };
+        match self.scope {
+            Scope::Environment(_) => {
+                cyberpunk::dialog_field("name", false, cx, self.name_editor.clone())
+                    .into_any_element()
+            }
+            Scope::Global => caption(
+                "SCOPE",
+                "Global".to_string(),
+                "Read by every request, whichever environment is on.",
+            ),
+            Scope::Collection(_) => caption(
+                "COLLECTION",
+                self.scope_name(cx),
+                "Read by every request in this collection.",
+            ),
+        }
     }
 
     fn render_variable_panel(
@@ -669,55 +909,43 @@ impl EnvironmentEditorModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut column = v_flex().flex_1().min_w_0().min_h_0().gap_2();
-        if self.show_scope_list {
-            column = column.child(cyberpunk::dialog_field(
-                "name",
-                false,
-                cx,
-                self.name_editor.clone(),
-            ));
-            if !matches!(self.scope, Scope::Global) {
-                column = column.child(
-                    Button::new("environment-editor-duplicate", "Duplicate")
-                        .label_size(LabelSize::Small)
-                        .style(cyberpunk::Rank::Quiet.style())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.duplicate_environment(window, cx);
-                        })),
-                );
-            }
-        } else {
-            column = column.child(
-                Label::new(format!("Variables for {}", self.scope_name(cx))).size(LabelSize::Large),
+        let column = v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .gap_2()
+            .child(self.render_scope_header(cx))
+            // The plus rides the rule that names the section, rather than
+            // sitting alone on a line beneath it as a bare blue word.
+            .child(
+                cyberpunk::dialog_section("variables").child(
+                    div()
+                        .debug_selector(|| "variable-row-add".to_string())
+                        .child(
+                            IconButton::new("variable-row-add", IconName::Plus)
+                                .icon_size(IconSize::XSmall)
+                                .style(cyberpunk::Rank::Quiet.style())
+                                .tooltip(Tooltip::text("Add a variable"))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.add_row(window, cx)),
+                                ),
+                        ),
+                ),
             );
-        }
-        // The plus rides the rule that names the section, rather than sitting
-        // alone on a line beneath it as a bare blue word.
-        column = column.child(
-            cyberpunk::dialog_section("variables").child(
-                div()
-                    .debug_selector(|| "variable-row-add".to_string())
-                    .child(
-                        IconButton::new("variable-row-add", IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .style(cyberpunk::Rank::Quiet.style())
-                            .tooltip(Tooltip::text("Add a variable"))
-                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
-                    ),
-            ),
-        );
 
-        let mut rows = v_flex().id("variable-rows").flex_none().gap_2();
-        for index in 0..self.rows.len() {
-            rows = rows.child(self.render_row(index, cx));
-        }
+        let mut rows = v_flex().id("variable-rows").flex_none().w_full().gap_1();
         if self.rows.is_empty() {
-            rows = rows.child(
-                Label::new("No variables yet.")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            );
+            rows = rows.child(self.render_no_variables(cx));
+        } else {
+            // The heading scrolls with the rows rather than standing above
+            // them: the bar reserves room on the right only while there is
+            // something to scroll, so a heading kept outside would sit a
+            // scrollbar's width wider than the rows it names, and would do so
+            // exactly when the list is long enough to need one.
+            rows = rows.child(self.render_variables_heading());
+            for index in 0..self.rows.len() {
+                rows = rows.child(self.render_row(index, cx));
+            }
         }
 
         column.child(
@@ -774,9 +1002,12 @@ impl Render for EnvironmentEditorModal {
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             );
 
-        // Adding and removing live on one frame above the list, the way the run
-        // configurations window does it, rather than as a trash icon on every
-        // row and a second name field under them.
+        // Adding, copying and removing live on one frame above the list, the
+        // way the run configurations window does it, rather than as a trash
+        // icon on every row and a second name field under them. All three act
+        // on whichever environment is being looked at, which is also the one
+        // whose variables fill the other half -- so there is never a doubt
+        // about what is about to be copied or removed.
         let can_delete = matches!(self.scope, Scope::Environment(_));
         // Each wrapped in a box that carries its own name: a button takes its
         // debug name from the icon it draws, and two buttons drawing different
@@ -791,6 +1022,18 @@ impl Render for EnvironmentEditorModal {
                         .on_click(
                             cx.listener(|this, _, window, cx| this.create_environment(window, cx)),
                         ),
+                )
+                .into_any_element(),
+            div()
+                .debug_selector(|| "environment-editor-duplicate".to_string())
+                .child(
+                    IconButton::new("environment-editor-duplicate", IconName::Copy)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Make a copy of this environment"))
+                        .disabled(!can_delete)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.duplicate_environment(window, cx)
+                        })),
                 )
                 .into_any_element(),
             div()
@@ -853,6 +1096,11 @@ impl Render for EnvironmentEditorModal {
                 cyberpunk::dialog_footer()
                     .mx_neg_3()
                     .mb_neg_3()
+                    .child(
+                        Label::new("Write one as {{name}} in a URL, a header or a body.")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .child(div().flex_1())
                     .child(
                         Button::new("environment-editor-close", "Close")
@@ -1118,7 +1366,8 @@ mod tests {
     /// fault being tested.
     #[gpui::test]
     async fn nothing_in_the_dialog_reaches_past_its_own_edge(cx: &mut TestAppContext) {
-        let (store, _view, mut cx) = build_environments_modal(cx).await;
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        let mut first = None;
         store.update(&mut cx, |store, cx| {
             for name in [
                 "de-canary-gcp",
@@ -1126,8 +1375,24 @@ mod tests {
                 "QA Test POD",
                 "qagke-stage",
             ] {
-                store.create_environment(name.to_string(), cx);
+                let id = store.create_environment(name.to_string(), cx);
+                first.get_or_insert(id);
             }
+        });
+        let first = first.expect("four environments were made");
+        store.update(&mut cx, |store, cx| {
+            store.update_environment(Some(first), cx, |environment| {
+                environment.variables.push(Variable::new(
+                    "base_url".into(),
+                    "https://a-fairly-long-host-name.example.com/v1".into(),
+                ));
+            });
+        });
+        // Looked at, so the table on the right is a table rather than the
+        // offer of a first variable: what must not reach past the edge is the
+        // widest thing this window ever draws.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.select_scope(Scope::Environment(first), window, cx);
         });
         cx.run_until_parked();
         draw(&mut cx);
@@ -1151,6 +1416,10 @@ mod tests {
             "environment-editor-rows-scroll",
             "environment-editor-title-bar",
             "variable-row-add",
+            "variables-heading",
+            "variables-heading-current",
+            "variable-row-current-0",
+            "variable-row-remove-0",
         ] {
             let inside = cx
                 .debug_bounds(name)
@@ -1255,5 +1524,223 @@ mod tests {
             assert_eq!(collection.variables.len(), 1);
             assert_eq!(collection.variables[0].key, "api_version");
         });
+    }
+
+    #[test]
+    fn the_line_under_a_name_counts_in_words() {
+        assert_eq!(how_many_variables(0), "no variables");
+        assert_eq!(how_many_variables(1), "1 variable");
+        assert_eq!(how_many_variables(4), "4 variables");
+    }
+
+    /// Three boxes of text side by side say nothing about which is which, so
+    /// the table carries headings -- and a heading is worth nothing unless it
+    /// stands over the column it names on every row, whatever state that row
+    /// happens to be in.
+    ///
+    /// Measured on painted boxes. Hiding a value used to add an eye to that
+    /// row and to no other, which made the row one button wider and slid its
+    /// three values out of line with every other row's.
+    #[gpui::test]
+    async fn the_value_columns_line_up_with_their_headings(cx: &mut TestAppContext) {
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        let environment_id = store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.update_environment(Some(environment_id), cx, |environment| {
+                environment
+                    .variables
+                    .push(Variable::new("token".into(), "super-secret".into()));
+                environment.variables.push(Variable::new(
+                    "base_url".into(),
+                    "https://staging.example.com".into(),
+                ));
+            });
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.select_scope(Scope::Environment(environment_id), window, cx);
+        });
+        draw(&mut cx);
+
+        // One of the two is hidden, which is the state that used to move it.
+        let secret_toggle = debug_center(&mut cx, "variable-row-secret-0");
+        cx.simulate_click(secret_toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+        assert!(
+            view.read_with(&cx, |view, _| view.rows[0].secret),
+            "the first row is the hidden one"
+        );
+
+        for (heading, hidden_row, plain_row) in [
+            (
+                "variables-heading-key",
+                "variable-row-key-0",
+                "variable-row-key-1",
+            ),
+            (
+                "variables-heading-initial",
+                "variable-row-initial-0",
+                "variable-row-initial-1",
+            ),
+            (
+                "variables-heading-current",
+                "variable-row-current-0",
+                "variable-row-current-1",
+            ),
+        ] {
+            let over = cx
+                .debug_bounds(heading)
+                .unwrap_or_else(|| panic!("{heading} is painted"));
+            let hidden = cx
+                .debug_bounds(hidden_row)
+                .unwrap_or_else(|| panic!("{hidden_row} is painted"));
+            let plain = cx
+                .debug_bounds(plain_row)
+                .unwrap_or_else(|| panic!("{plain_row} is painted"));
+
+            assert_eq!(
+                hidden.origin.x, plain.origin.x,
+                "{hidden_row} starts at {:?} and {plain_row} at {:?}: a hidden row and a \
+                 plain one disagree about where the column is",
+                hidden.origin.x, plain.origin.x
+            );
+            assert_eq!(
+                hidden.size.width, plain.size.width,
+                "{hidden_row} is {:?} wide and {plain_row} {:?}",
+                hidden.size.width, plain.size.width
+            );
+            // The heading has no border of its own, so a pixel of slack.
+            assert!(
+                (over.origin.x.as_f32() - hidden.origin.x.as_f32()).abs() <= 1.
+                    && (over.right().as_f32() - hidden.right().as_f32()).abs() <= 1.,
+                "{heading} spans {:?}..{:?} over a column spanning {:?}..{:?}",
+                over.origin.x,
+                over.right(),
+                hidden.origin.x,
+                hidden.right()
+            );
+        }
+
+        let dialog = cx
+            .debug_bounds("environment-editor-modal-root")
+            .expect("the dialog is painted");
+        let actions = cx
+            .debug_bounds("variable-row-remove-0")
+            .expect("the row's own actions are painted");
+        assert!(
+            actions.right() <= dialog.right(),
+            "the row's actions reach {:?} in a dialog ending at {:?}",
+            actions.right(),
+            dialog.right()
+        );
+    }
+
+    /// An empty half used to say "No variables yet." and leave the reader to
+    /// go looking for the plus. It offers the first one instead.
+    #[gpui::test]
+    async fn an_empty_scope_offers_the_first_variable(cx: &mut TestAppContext) {
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("variables-heading").is_none(),
+            "there is nothing for a heading to stand over"
+        );
+        assert!(
+            cx.debug_bounds("variable-rows-empty").is_some(),
+            "the empty half says so"
+        );
+
+        let offer = debug_center(&mut cx, "variable-row-empty-add");
+        cx.simulate_click(offer, gpui::Modifiers::none());
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        view.read_with(&cx, |view, _| assert_eq!(view.rows.len(), 1));
+        store.read_with(&cx, |store, _| {
+            assert_eq!(
+                store.global_environment.variables.len(),
+                1,
+                "the row is written to the scope being looked at"
+            );
+        });
+        assert!(
+            cx.debug_bounds("variable-rows-empty").is_none(),
+            "the offer goes once it has been taken"
+        );
+        assert!(
+            cx.debug_bounds("variables-heading").is_some(),
+            "and the headings arrive with the first row"
+        );
+    }
+
+    /// Copying moved onto the frame above the list, beside adding and
+    /// removing, instead of sitting as a lone word in the middle of the form.
+    #[gpui::test]
+    async fn the_toolbar_copies_the_environment_being_looked_at(cx: &mut TestAppContext) {
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        let environment_id = store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        store.update(&mut cx, |store, cx| {
+            store.update_environment(Some(environment_id), cx, |environment| {
+                environment.variables.push(Variable::new(
+                    "base_url".into(),
+                    "https://staging.example.com".into(),
+                ));
+            });
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.select_scope(Scope::Environment(environment_id), window, cx);
+        });
+        draw(&mut cx);
+
+        let duplicate = debug_center(&mut cx, "environment-editor-duplicate");
+        cx.simulate_click(duplicate, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        store.read_with(&cx, |store, _| {
+            assert_eq!(store.environments.len(), 2);
+            let copy = store
+                .environments
+                .iter()
+                .find(|environment| environment.id != environment_id)
+                .expect("the copy exists");
+            assert_eq!(copy.name, "Staging Copy");
+            assert_eq!(copy.variables.len(), 1);
+            assert_eq!(copy.variables[0].key, "base_url");
+        });
+        view.read_with(&cx, |view, _| {
+            assert!(
+                !matches!(view.scope, Scope::Environment(id) if id == environment_id),
+                "the copy is what the reader is looking at afterwards"
+            );
+        });
+    }
+
+    /// A box that looks typed-in and is not is worse than a caption. Global
+    /// has no name to change, so it does not get one; an environment does.
+    #[gpui::test]
+    async fn only_a_scope_that_can_be_renamed_shows_a_name_field(cx: &mut TestAppContext) {
+        let (store, view, mut cx) = build_environments_modal(cx).await;
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("DIALOG-FIELD-name").is_none(),
+            "Global has no name of its own to change"
+        );
+
+        let environment_id = store.update(&mut cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.select_scope(Scope::Environment(environment_id), window, cx);
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("DIALOG-FIELD-name").is_some(),
+            "an environment is renamed here"
+        );
     }
 }
