@@ -964,6 +964,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "api_client",
+ "buffer_diff",
  "credentials_provider",
  "db_client_ui",
  "editor",
@@ -973,6 +974,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "paths",
+ "picker",
  "project",
  "serde",
  "serde_json",
@@ -983,6 +985,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "unindent",
  "util",
  "uuid",
  "workspace",
@@ -1461,25 +1464,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "async-tungstenite"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee88b4c88ac8c9ea446ad43498955750a4bbe64c4392f21ccfe5d952865e318f"
-dependencies = [
- "atomic-waker",
- "futures-core",
- "futures-io",
- "futures-task",
- "futures-util",
- "log",
- "pin-project-lite",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls 0.26.4",
- "tungstenite 0.27.0",
 ]
 
 [[package]]
@@ -3584,7 +3568,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "chrono",
  "clock",
@@ -4061,6 +4045,16 @@ checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
 dependencies = [
  "cfg-if",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "console_log"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86919cef3e37b9356ccf54d4421208c17ecfda01beae61393e7ffd72916c0ef1"
+dependencies = [
+ "log",
+ "web-sys",
 ]
 
 [[package]]
@@ -5497,9 +5491,12 @@ dependencies = [
  "paths",
  "pbkdf2 0.11.0",
  "picker",
+ "platform_title_bar",
  "project",
  "regex",
+ "release_channel",
  "schemars 1.0.4",
+ "semver 1.0.27",
  "serde",
  "serde_json",
  "settings",
@@ -9441,6 +9438,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hierarchy_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures 0.3.32",
+ "gpui",
+ "language",
+ "lsp",
+ "project",
+ "release_channel",
+ "semver 1.0.27",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9585,6 +9605,7 @@ dependencies = [
  "log",
  "primeorder",
  "rustls 0.23.40",
+ "serde_json",
  "servo",
  "smallvec",
  "surfman",
@@ -11217,7 +11238,7 @@ checksum = "7c2ae4d8d5344f69bf9734b264e969c2139e30e932ce9b6455de9f65663ed614"
 dependencies = [
  "anyhow",
  "async-trait",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "bytes 1.11.1",
  "futures 0.3.32",
  "jupyter-protocol",
@@ -15178,6 +15199,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0008e816fcdaf229cdd540e9b6ca2dc4a10d65c31624abb546c6420a02846e61"
 
 [[package]]
+name = "pdf_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "image",
+ "log",
+ "menu",
+ "paths",
+ "pdfium-render",
+ "project",
+ "smallvec",
+ "smol",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
+name = "pdfium-render"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "826f8f64bc88cb15381cbb5aa245c1500632cd8a453b244bc2b0cbaff7098077"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "bytes 1.11.1",
+ "chrono",
+ "console_error_panic_hook",
+ "console_log",
+ "image",
+ "itertools 0.15.0",
+ "js-sys",
+ "libloading",
+ "log",
+ "maybe-owned",
+ "once_cell",
+ "utf16string",
+ "vecmath",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "peek-poke"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16003,6 +16071,12 @@ dependencies = [
  "fastrand 2.3.0",
  "futures-io",
 ]
+
+[[package]]
+name = "piston-float"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad78bf43dcf80e8f950c92b84f938a0fc7590b7f6866fbcbeca781609c115590"
 
 [[package]]
 name = "pkcs1"
@@ -17887,6 +17961,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rename_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clock",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "project",
+ "semantic_index",
+ "serde_json",
+ "settings",
+ "symbol_index",
+ "text",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17900,7 +17996,7 @@ dependencies = [
  "async-dispatcher",
  "async-task",
  "async-trait",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "client",
  "collections",
@@ -18209,7 +18305,7 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "collections",
  "futures 0.3.32",
@@ -18288,15 +18384,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "dap",
  "editor",
  "fs",
  "futures 0.3.32",
  "gpui",
+ "language",
  "libc",
  "log",
  "menu",
  "path",
+ "paths",
+ "platform_title_bar",
  "project",
+ "release_channel",
+ "semver 1.0.27",
  "serde_json",
  "settings",
  "settings_json",
@@ -18310,6 +18412,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "uuid",
  "workspace",
  "zed_actions",
 ]
@@ -19039,6 +19142,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "search_everywhere"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "command_palette",
+ "command_palette_hooks",
+ "editor",
+ "futures 0.3.32",
+ "fuzzy",
+ "gpui",
+ "language",
+ "menu",
+ "picker",
+ "picker_preview",
+ "project",
+ "release_channel",
+ "semver 1.0.27",
+ "serde_json",
+ "settings",
+ "symbol_index",
+ "tempfile",
+ "text",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "sec1"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19151,6 +19284,31 @@ name = "self_cell"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
+
+[[package]]
+name = "semantic_index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-io",
+ "fuzzy",
+ "gpui",
+ "grammars",
+ "ignore",
+ "log",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smol",
+ "sqlez",
+ "streaming-iterator",
+ "tempfile",
+ "tree-sitter",
+ "url",
+ "util",
+ "which 6.0.3",
+]
 
 [[package]]
 name = "semver"
@@ -20240,7 +20398,7 @@ checksum = "23359296e734fe0dd9a9ee52a7e44f2304659b8c79b78e79eb7a44bef82181de"
 dependencies = [
  "async-compression",
  "async-recursion",
- "async-tungstenite 0.34.1",
+ "async-tungstenite",
  "base64 0.22.1",
  "bytes 1.11.1",
  "chrono",
@@ -21633,6 +21791,7 @@ name = "split_preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "db",
  "editor",
  "gpui",
  "html_preview",
@@ -21642,6 +21801,7 @@ dependencies = [
  "project",
  "serde_json",
  "settings",
+ "svg_preview",
  "theme_settings",
  "ui",
  "util",
@@ -22073,6 +22233,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "structural_search"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "futures 0.3.32",
+ "gpui",
+ "language",
+ "project",
+ "release_channel",
+ "semantic_index",
+ "semver 1.0.27",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22370,6 +22553,24 @@ dependencies = [
  "skrifa 0.37.0",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "symbol_index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs",
+ "gpui",
+ "log",
+ "paths",
+ "project",
+ "semantic_index",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "util",
+ "workspace",
 ]
 
 [[package]]
@@ -23430,6 +23631,7 @@ dependencies = [
  "schemars 1.0.4",
  "semver 1.0.27",
  "serde",
+ "serde_json",
  "settings",
  "smallvec",
  "telemetry",
@@ -24287,25 +24489,6 @@ dependencies = [
 
 [[package]]
 name = "tungstenite"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
-dependencies = [
- "bytes 1.11.1",
- "data-encoding",
- "http 1.5.0",
- "httparse",
- "log",
- "rand 0.9.4",
- "rustls 0.23.40",
- "rustls-pki-types",
- "sha1 0.10.6",
- "thiserror 2.0.19",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
@@ -24762,6 +24945,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8232dd3cdaed5356e0f716d285e4b40b932ac434100fe9b7e0e8e935b9e6246"
 
 [[package]]
+name = "utf16string"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b62a1e85e12d5d712bf47a85f426b73d303e2d00a90de5f3004df3596e9d216"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "utf8-chars"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -24885,6 +25077,15 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vecmath"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "956ae1e0d85bca567dee1dcf87fb1ca2e792792f66f87dced8381f99cd91156a"
+dependencies = [
+ "piston-float",
+]
 
 [[package]]
 name = "vello_common"
@@ -28184,6 +28385,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "hdrhistogram",
+ "hierarchy_view",
  "html_preview",
  "http_client",
  "image",
@@ -28219,6 +28421,7 @@ dependencies = [
  "outline_panel",
  "parking_lot",
  "paths",
+ "pdf_preview",
  "picker",
  "pkg-config",
  "platform_title_bar",
@@ -28233,12 +28436,14 @@ dependencies = [
  "recent_projects",
  "release_channel",
  "remote",
+ "rename_preview",
  "repl",
  "reqwest_client",
  "rope",
  "run_configurations",
  "sandbox",
  "search",
+ "search_everywhere",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -28252,7 +28457,9 @@ dependencies = [
  "snippet_provider",
  "snippets_ui",
  "split_preview",
+ "structural_search",
  "svg_preview",
+ "symbol_index",
  "sysinfo 0.37.2",
  "system_specs",
  "tab_switcher",

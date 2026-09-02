@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod watching;
+
+pub use watching::{Check, init};
+
 /// One diagnostic the compiler reported, at a place the editor can put it.
 ///
 /// The range is in the units the protocol means by a character -- UTF-16 code
