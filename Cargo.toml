@@ -29,6 +29,7 @@ members = [
     "crates/breadcrumbs",
     "crates/buffer_diff",
     "crates/call",
+    "crates/cargo_diagnostics",
     "crates/channel",
     "crates/cli",
     "crates/client",
@@ -306,6 +307,7 @@ bedrock = { path = "crates/bedrock" }
 breadcrumbs = { path = "crates/breadcrumbs" }
 buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
+cargo_diagnostics = { path = "crates/cargo_diagnostics" }
 channel = { path = "crates/channel" }
 cli = { path = "crates/cli" }
 client = { path = "crates/client" }
