@@ -14,7 +14,9 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+clock.workspace = true
 collections.workspace = true
+semantic_index.workspace = true
 editor.workspace = true
 gpui.workspace = true
 language.workspace = true

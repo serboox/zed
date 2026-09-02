@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -205,6 +206,131 @@ fn defined_symbols_in(
         }
     }
     found
+}
+
+/// One reference the grammar recognises in a file's own text: where it is and
+/// what it is called, both zero-based.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FoundInText {
+    pub row: u32,
+    pub column: u32,
+    pub name: String,
+}
+
+/// One language, read and compiled once: the grammar, its outline query and
+/// its references query.
+struct Ready {
+    readable: Readable,
+    references: tree_sitter::Query,
+}
+
+fn prepare(language: &str) -> Result<Ready> {
+    let query_text = per_language::references_query(language)
+        .with_context(|| format!("no references query is written for {language}"))?;
+    let readable = language_named(language)?;
+    let references = tree_sitter::Query::new(&readable.grammar, query_text)
+        .with_context(|| format!("the {language} references query does not compile"))?;
+    Ok(Ready {
+        readable,
+        references,
+    })
+}
+
+/// The same as [`references_in_text`], for a caller that has a file name
+/// rather than a language name. The two are not the same word: a file is
+/// `Rust` to the editor and `rust` to the grammar directory the queries live
+/// in, and passing the editor's name straight through returns `None` for
+/// every file there is.
+pub fn references_in_file(file_name: &str, contents: &[u8]) -> Result<Option<Vec<FoundInText>>> {
+    static CLAIMED: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let claimed = CLAIMED.get_or_init(languages::by_suffix);
+    let Some(language) = languages::of_file(file_name, claimed) else {
+        return Ok(None);
+    };
+    references_in_text(language, contents)
+}
+
+/// Every reference the language's own query recognises in one file's text,
+/// with no language server and no project index -- the grammar and the two
+/// queries, and nothing else.
+///
+/// This is the answer the editor has when no server is running, and the whole
+/// reason it is worth having is what it *leaves out*: a name written only in a
+/// comment or inside a string literal is not here, because the grammar never
+/// decomposes either into identifier nodes; a declaration's own name is not
+/// here, because the outline query says where those are; and a name recovery
+/// invented from text that is not yet code is not here either. A plain text
+/// search for the same word offers all three, and measured against a language
+/// server that way of answering has a precision of 0.9 per cent.
+///
+/// `Ok(None)` where the language has no references query written for it --
+/// which is a different thing from a file with no references in it, and the
+/// caller has to be able to tell them apart.
+pub fn references_in_text(language: &str, contents: &[u8]) -> Result<Option<Vec<FoundInText>>> {
+    if per_language::references_query(language).is_none() {
+        return Ok(None);
+    }
+    // Compiled once and kept. Reading a language costs compiling the outline
+    // query of every language the editor ships, and doing that per file put a
+    // fifth of a second on a preview of two hundred occurrences.
+    static READY: OnceLock<Mutex<HashMap<String, Arc<Ready>>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashMap::new()));
+    let prepared = {
+        // A poisoned lock is recovered rather than propagated: the cache holds
+        // nothing a panic could have left half-written, and refusing forever
+        // after one panic would turn this into a feature that silently stops
+        // working for the rest of the session.
+        let mut kept = ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match kept.get(language) {
+            Some(prepared) => prepared.clone(),
+            None => {
+                let prepared = Arc::new(prepare(language)?);
+                kept.insert(language.to_string(), prepared.clone());
+                prepared
+            }
+        }
+    };
+    let readable = &prepared.readable;
+    let references_query = &prepared.references;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&readable.grammar)
+        .with_context(|| format!("loading the {language} grammar"))?;
+    let tree = parser
+        .parse(contents, None)
+        .with_context(|| format!("parsing this {language} text"))?;
+
+    let mut recovered = Vec::new();
+    recovered_rows(tree.root_node(), &mut recovered);
+
+    // Where the file's own declarations are, so that a declaring position is
+    // not offered as a place that refers to itself.
+    let declared: HashSet<(u32, u32)> =
+        defined_symbols_in("", language, contents, &readable.outline, &tree)
+            .into_iter()
+            .map(|symbol| (symbol.row, symbol.column))
+            .collect();
+
+    // A file on its own says nothing about which of its imports leave the
+    // project, so nothing is treated as foreign here. The measurement, which
+    // reads the whole project, does know and does use it.
+    let foreign = HashSet::new();
+    let mut found: Vec<FoundInText> =
+        occurrences_in("", language, contents, references_query, &tree, &foreign)
+            .into_iter()
+            .filter(|named| !row_falls_in(&recovered, named.row))
+            .filter(|named| !declared.contains(&(named.row, named.column)))
+            .map(|named| FoundInText {
+                row: named.row,
+                column: named.column,
+                name: named.name,
+            })
+            .collect();
+    found.sort_unstable();
+    found.dedup();
+    Ok(Some(found))
 }
 
 /// Every symbol the outline query defines under `root`. A pass distinct from
@@ -2661,6 +2787,52 @@ mod tests {
         // anywhere rather than everywhere.
         assert!(!written_at(project.path(), "one.rs", 99, "Effort"));
         assert!(!written_at(project.path(), "one.rs", 1, ""));
+    }
+
+    /// What the editor can answer with no server running at all. The point
+    /// of the test is what is *absent*: the name in the comment, the one in
+    /// the string, and the declaration's own position. A plain text search
+    /// for the same word offers all three, and answering that way measured
+    /// 0.9 per cent precision against a language server.
+    #[test]
+    fn the_text_alone_answers_without_a_server_and_leaves_out_what_is_not_code() {
+        let contents = b"// make_holder is only mentioned here\n                         fn make_holder() -> u32 {\n    7\n}\n\n                         fn use_it() -> u32 {\n    let named = \"make_holder\";\n                             let _ = named;\n    make_holder()\n}\n";
+        let found = references_in_text("rust", contents)
+            .expect("Rust has a references query")
+            .expect("Rust has a references query");
+
+        let rows: Vec<u32> = found
+            .iter()
+            .filter(|one| one.name == "make_holder")
+            .map(|one| one.row)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![8],
+            "only the call on the ninth line; found {:?}",
+            found
+                .iter()
+                .filter(|one| one.name == "make_holder")
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A language with an outline query and no references query answers
+    /// `None`, which is not the same as a file with nothing in it -- and the
+    /// editor has to be able to tell the two apart before it decides whether
+    /// to fall back to a plain text search.
+    #[test]
+    fn a_language_with_no_references_query_says_so_rather_than_answering_nothing() {
+        assert!(
+            references_in_text("yaml", b"key: value\n")
+                .expect("asking is not an error")
+                .is_none()
+        );
+        assert!(
+            references_in_text("go", b"package holding\n")
+                .expect("Go has a references query")
+                .is_some()
+        );
     }
 
     /// A gate is only called shut where that can be shown. The target keys
