@@ -318,6 +318,28 @@ mod tests {
         );
     }
 
+    /// Two more of the same kind, whose declared name is an argument rather
+    /// than a list. Their first argument is the protocol method, a string, so
+    /// the name is the first identifier the call holds -- and the types after
+    /// it are not names this declares.
+    #[test]
+    fn a_request_or_notification_macro_declares_the_name_it_is_given() {
+        let found = found_in(
+            "request!(\"initialize\", Initialize, InitializeParams, InitializeResponse);\n\
+             notification!(\"notifications/progress\", Progress, ProgressParams);\n",
+        );
+        let named: Vec<(&str, u32)> = found
+            .iter()
+            .map(|one| (one.name.as_str(), one.line))
+            .collect();
+        assert!(named.contains(&("Initialize", 1)), "{named:?}");
+        assert!(named.contains(&("Progress", 2)), "{named:?}");
+        assert!(
+            !named.iter().any(|(name, _)| name.ends_with("Params")),
+            "a parameter type is named, not declared, here: {named:?}"
+        );
+    }
+
     /// A macro this does not know declares nothing, rather than guessing.
     #[test]
     fn a_macro_that_is_not_recognised_contributes_nothing() {

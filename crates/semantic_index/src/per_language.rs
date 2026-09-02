@@ -244,13 +244,6 @@ pub fn names_a_macro_declares(
     else {
         return Vec::new();
     };
-    // `actions!(namespace, [Name, Name])` and `actions!([Name, Name])` both
-    // declare one unit struct per name in the bracketed list. Attributes and
-    // doc comments sit between them and are nested a level deeper in the token
-    // tree, so the names are exactly the identifiers directly inside it.
-    if called != "actions" {
-        return Vec::new();
-    }
     // Only the macro's own name is a named field; its token tree is just the
     // last child, so it is found by kind rather than by asking for a field
     // that does not exist.
@@ -261,12 +254,37 @@ pub fn names_a_macro_declares(
     else {
         return Vec::new();
     };
-    let Some(listed) = bracketed_list(tokens) else {
-        return Vec::new();
-    };
+    match called {
+        // `actions!(namespace, [Name, Name])` and `actions!([Name, Name])`
+        // both declare one unit struct per name in the bracketed list.
+        // Attributes and doc comments sit between them and are nested a level
+        // deeper in the token tree, so the names are exactly the identifiers
+        // directly inside it.
+        "actions" => {
+            let Some(listed) = bracketed_list(tokens) else {
+                return Vec::new();
+            };
+            identifiers_directly_inside(listed, contents)
+        }
+        // `request!("method", Name, Params, Response)` and
+        // `notification!("method", Name, Params)` each declare one unit struct,
+        // named by their second argument. The first is a string, so the name is
+        // simply the first identifier the invocation holds.
+        "request" | "notification" => identifiers_directly_inside(tokens, contents)
+            .into_iter()
+            .take(1)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every identifier that is a direct child of `tokens`, with its one-based
+/// line. Anything nested deeper -- an attribute's own contents, a type's
+/// parameters -- is not one of them.
+fn identifiers_directly_inside(tokens: tree_sitter::Node, contents: &[u8]) -> Vec<(String, u32)> {
     let mut named = Vec::new();
-    let mut walking = listed.walk();
-    for child in listed.children(&mut walking) {
+    let mut walking = tokens.walk();
+    for child in tokens.children(&mut walking) {
         if child.kind() != "identifier" {
             continue;
         }
