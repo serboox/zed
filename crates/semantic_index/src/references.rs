@@ -16,17 +16,6 @@ use crate::measure::{Spread, as_time, spread_of};
 use crate::per_language;
 use crate::walk;
 
-/// The references query this measurement runs for `language`, compiled once
-/// per call to [`measure`] and reused for the whole project.
-fn query_text(language: &str) -> Result<&'static str> {
-    per_language::references_query(language).with_context(|| {
-        format!(
-            "no references query is written for {language}; the ones that are: {}",
-            per_language::LANGUAGES_WITH_A_REFERENCES_QUERY.join(", ")
-        )
-    })
-}
-
 /// A name found at an exact position: row and column both zero-based, as
 /// tree-sitter and the LSP protocol both count them.
 ///
@@ -224,11 +213,30 @@ struct Ready {
     references: tree_sitter::Query,
 }
 
-fn prepare(language: &str) -> Result<Ready> {
-    let query_text = per_language::references_query(language)
-        .with_context(|| format!("no references query is written for {language}"))?;
+/// Which references query a run uses. The built one exists for every grammar
+/// and the written one only for some, so asking for the built one on a
+/// language that has both is the only way to say what a language without a
+/// written query gives up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Queries {
+    /// A hand-written query where one exists, and a built one otherwise --
+    /// what the editor uses.
+    Written,
+    /// The built one, always: what a language nobody has written a query for
+    /// actually gets.
+    BuiltFromTheGrammar,
+}
+
+fn prepare(language: &str, queries: Queries) -> Result<Ready> {
     let readable = language_named(language)?;
-    let references = tree_sitter::Query::new(&readable.grammar, query_text)
+    // A hand-written query where one exists, and one built from the grammar's
+    // own node kinds where none does -- so a language nobody has written a
+    // query for still answers, rather than answering nothing at all.
+    let query_text = match (queries, per_language::references_query(language)) {
+        (Queries::Written, Some(written)) => written.to_string(),
+        _ => per_language::generic_references_query(&readable.grammar),
+    };
+    let references = tree_sitter::Query::new(&readable.grammar, &query_text)
         .with_context(|| format!("the {language} references query does not compile"))?;
     Ok(Ready {
         readable,
@@ -267,14 +275,23 @@ pub fn references_in_file(file_name: &str, contents: &[u8]) -> Result<Option<Vec
 /// which is a different thing from a file with no references in it, and the
 /// caller has to be able to tell them apart.
 pub fn references_in_text(language: &str, contents: &[u8]) -> Result<Option<Vec<FoundInText>>> {
-    if per_language::references_query(language).is_none() {
-        return Ok(None);
-    }
+    references_in_text_with(language, contents, Queries::Written)
+}
+
+/// The same, saying which query to use. The editor always wants the written
+/// one where there is one; the measuring stand wants to be able to ask for
+/// the built one, to say what it costs.
+pub fn references_in_text_with(
+    language: &str,
+    contents: &[u8],
+    queries: Queries,
+) -> Result<Option<Vec<FoundInText>>> {
     // Compiled once and kept. Reading a language costs compiling the outline
     // query of every language the editor ships, and doing that per file put a
     // fifth of a second on a preview of two hundred occurrences.
-    static READY: OnceLock<Mutex<HashMap<String, Arc<Ready>>>> = OnceLock::new();
+    static READY: OnceLock<Mutex<HashMap<(String, Queries), Arc<Ready>>>> = OnceLock::new();
     let ready = READY.get_or_init(|| Mutex::new(HashMap::new()));
+    let asked_for = (language.to_string(), queries);
     let prepared = {
         // A poisoned lock is recovered rather than propagated: the cache holds
         // nothing a panic could have left half-written, and refusing forever
@@ -283,11 +300,11 @@ pub fn references_in_text(language: &str, contents: &[u8]) -> Result<Option<Vec<
         let mut kept = ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match kept.get(language) {
+        match kept.get(&asked_for) {
             Some(prepared) => prepared.clone(),
             None => {
-                let prepared = Arc::new(prepare(language)?);
-                kept.insert(language.to_string(), prepared.clone());
+                let prepared = Arc::new(prepare(language, queries)?);
+                kept.insert(asked_for, prepared.clone());
                 prepared
             }
         }
@@ -1885,14 +1902,19 @@ impl fmt::Display for Report {
 pub async fn measure(
     root: &Path,
     language: &str,
+    queries: Queries,
     symbol_count: usize,
     indexing_timeout: Duration,
     query_timeout: Duration,
     certainty: Certainty,
 ) -> Result<Report> {
     let rust = language_named(language)?;
-    let references_query = tree_sitter::Query::new(&rust.grammar, query_text(language)?)
-        .with_context(|| {
+    let prepared_query = match (queries, per_language::references_query(language)) {
+        (Queries::Written, Some(written)) => written.to_string(),
+        _ => per_language::generic_references_query(&rust.grammar),
+    };
+    let references_query =
+        tree_sitter::Query::new(&rust.grammar, &prepared_query).with_context(|| {
             format!("the references query does not compile against the {language} grammar")
         })?;
 
@@ -2222,7 +2244,7 @@ mod tests {
         let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
         tree_sitter::Query::new(
             &rust.grammar,
-            query_text("rust").expect("Rust has a references query"),
+            per_language::references_query("rust").expect("Rust has a references query"),
         )
         .expect("the references query compiles")
     }
@@ -2248,7 +2270,10 @@ mod tests {
             language_named(name).expect("the language is one the editor ships an outline for");
         let references_query = tree_sitter::Query::new(
             &language.grammar,
-            query_text(name).expect("the language has a references query"),
+            &match per_language::references_query(name) {
+                Some(written) => written.to_string(),
+                None => per_language::generic_references_query(&language.grammar),
+            },
         )
         .expect("the references query compiles");
         let defined = defined_symbols_pass(project, name, &language);
@@ -2817,22 +2842,53 @@ mod tests {
         );
     }
 
-    /// A language with an outline query and no references query answers
-    /// `None`, which is not the same as a file with nothing in it -- and the
-    /// editor has to be able to tell the two apart before it decides whether
-    /// to fall back to a plain text search.
+    /// Every language the editor has a grammar for answers, whether anybody
+    /// wrote a query for it or not: where there is no written query, one is
+    /// built from the grammar's own node kinds. `None` is left to mean the
+    /// one thing it should -- the editor has no grammar for this file at all
+    /// -- so the caller can tell "nothing better to say" from "nothing here".
     #[test]
-    fn a_language_with_no_references_query_says_so_rather_than_answering_nothing() {
-        assert!(
-            references_in_text("yaml", b"key: value\n")
-                .expect("asking is not an error")
-                .is_none()
-        );
+    fn a_language_with_no_written_query_still_answers_from_its_grammar() {
+        // Go has a written query and answers from it.
         assert!(
             references_in_text("go", b"package holding\n")
-                .expect("Go has a references query")
+                .expect("Go has a grammar")
                 .is_some()
         );
+        // YAML has none written, and answers from a built one. Its grammar
+        // calls nothing an identifier, so the built query finds nothing --
+        // which is the truthful answer for YAML, not a failure to answer.
+        let yaml = references_in_text("yaml", b"key: value\n")
+            .expect("YAML has a grammar")
+            .expect("and therefore a query built from it");
+        assert!(yaml.is_empty(), "found {yaml:?}");
+        // A language the editor ships no grammar for is the only `None`.
+        assert!(
+            references_in_text("cobol", b"MOVE X TO Y.\n").is_err(),
+            "a language the editor does not have is an error, not an empty answer"
+        );
+    }
+
+    /// The built query names only node kinds the grammar actually has --
+    /// naming one it does not have would stop the query compiling, which is
+    /// why a single hand-written fallback could not have worked for every
+    /// language.
+    #[test]
+    fn the_built_query_names_only_kinds_the_grammar_has() {
+        let go = language_named("go").expect("Go is one of the languages the editor ships");
+        let built = per_language::generic_references_query(&go.grammar);
+        for has in ["(identifier)", "(type_identifier)", "(field_identifier)"] {
+            assert!(built.contains(has), "{has} is missing from:\n{built}");
+        }
+        // Go has no such kind, and naming it would break the query.
+        assert!(!built.contains("(property_identifier)"), "{built}");
+
+        let python =
+            language_named("python").expect("Python is one of the languages the editor ships");
+        let built = per_language::generic_references_query(&python.grammar);
+        assert!(built.contains("(identifier)"), "{built}");
+        // Python's grammar has one node kind for every name there is.
+        assert!(!built.contains("(type_identifier)"), "{built}");
     }
 
     /// The reference kinds C has: a call, a member selection, a designated

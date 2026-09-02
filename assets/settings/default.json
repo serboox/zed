@@ -1335,7 +1335,20 @@
   // The list of language servers to use (or disable) for all languages.
   //
   // This is typically customized on a per-language basis.
-  "language_servers": ["..."],
+  //
+  // `eslint` and the two Tailwind servers are off by default here. Each does
+  // nothing at all in a project that is not configured for it -- eslint needs
+  // an `eslint.config.*` or `.eslintrc*`, Tailwind a `tailwind.config.*` --
+  // and the editor starts them regardless, so every JavaScript or CSS project
+  // without those files pays for a node process that has nothing to say.
+  // Add `"eslint"` or `"tailwindcss-language-server"` to this list, or to one
+  // language's own, to turn either back on.
+  "language_servers": [
+    "!eslint",
+    "!tailwindcss-language-server",
+    "!tailwindcss-intellisense-css",
+    "..."
+  ],
   // Controls how semantic tokens from language servers are used for syntax highlighting.
   //
   // Options:

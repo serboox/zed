@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use semantic_index::measure::as_time;
-use semantic_index::references::{Certainty, REQUIRED_PRECISION, Report, measure};
+use semantic_index::references::{Certainty, Queries, REQUIRED_PRECISION, Report, measure};
 
 /// The plan's own sample size for this check.
 const SYMBOL_COUNT: usize = 100;
@@ -38,6 +38,7 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let mut root: Option<PathBuf> = None;
     let mut language = "rust".to_string();
+    let mut queries = Queries::Written;
     let mut symbol_count = SYMBOL_COUNT;
     let mut indexing_timeout = INDEXING_TIMEOUT;
     let mut query_timeout = QUERY_TIMEOUT;
@@ -71,6 +72,9 @@ async fn run() -> Result<()> {
                 query_timeout = Duration::from_secs(seconds);
             }
             "--answer-everything" => certainty = Certainty::Always,
+            // What a language nobody has written a query for actually gets,
+            // so the difference can be measured rather than guessed at.
+            "--built-query" => queries = Queries::BuiltFromTheGrammar,
             "--indexing-timeout" => {
                 let seconds: u64 = arguments
                     .next()
@@ -124,6 +128,7 @@ async fn run() -> Result<()> {
     let report = measure(
         &root,
         &language,
+        queries,
         symbol_count,
         indexing_timeout,
         query_timeout,

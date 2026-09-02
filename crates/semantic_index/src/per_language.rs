@@ -335,7 +335,55 @@ pub fn references_query(language: &str) -> Option<&'static str> {
     }
 }
 
-/// Every language a references query exists for, in the order they were
+/// A references query for a language nobody has written one for: every
+/// name-like node kind the grammar actually has, captured as a reference.
+///
+/// Built from the grammar rather than written down, because a query naming a
+/// node kind the grammar does not have fails to compile -- so a single
+/// hand-written fallback would work for one language and refuse to load for
+/// the next. Asking the grammar what it calls its names works for all of
+/// them.
+///
+/// This is deliberately the shape a hand-written query reduces to once the
+/// narrowing patterns are stripped off, and the measurement says how much
+/// that costs: Python's own query is very nearly this and nothing else, and
+/// it measured 100 per cent precision -- because in that language the
+/// declining rules carry the whole weight. A language with no declining rules
+/// written for it has less holding it up, and the number for it should be read
+/// with that in mind.
+pub fn generic_references_query(grammar: &tree_sitter::Language) -> String {
+    // Every kind here names something a rename would have to change. Kinds
+    // that name a *keyword* or a *builtin* are deliberately absent: CSS's
+    // `function_name` is `var` or `rgb`, and renaming those is not a thing.
+    const NAME_LIKE: &[&str] = &[
+        "identifier",
+        "type_identifier",
+        "field_identifier",
+        "property_identifier",
+        "shorthand_property_identifier",
+        "namespace_identifier",
+        "variable_name",
+        "constant",
+    ];
+    let mut written = String::from(
+        "; Built from this grammar's own node kinds -- see
+         ; `per_language::generic_references_query`.
+",
+    );
+    for kind in NAME_LIKE {
+        // A kind the grammar does not have gets id 0, and naming it in a
+        // query would stop the query from compiling at all.
+        if grammar.id_for_node_kind(kind, true) != 0 {
+            written.push_str(&format!(
+                "({kind}) @reference.value
+"
+            ));
+        }
+    }
+    written
+}
+
+/// Every language a references query exists for, in the order they were/// Every language a references query exists for, in the order they were
 /// written, so a caller can say what is covered rather than guess.
 pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "rust",
