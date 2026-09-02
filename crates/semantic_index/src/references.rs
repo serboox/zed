@@ -2454,6 +2454,103 @@ mod tests {
         );
     }
 
+    /// The reference kinds Python has. There is only one node kind for a
+    /// name in this grammar, so the point of the test is not that the
+    /// patterns narrow anything down -- they do not -- but that a
+    /// declaration is still dropped and a call, an attribute and a keyword
+    /// argument are all found.
+    #[test]
+    fn each_reference_kind_in_python_is_found_with_the_right_line() {
+        let project = project_with(&[(
+            "one.py",
+            "class Holder:\n    def __init__(self, value):\n        self.value = value\n\n    def read(self):\n        return self.value\n\n\ndef make_holder(value):\n    return Holder(value=value)\n\n\ndef use_it():\n    holder = make_holder(1)\n    return holder.read()\n",
+        )]);
+        let scan = scan_of_language(project.path(), "python");
+
+        let calls = scan.index.references_to("make_holder");
+        assert_eq!(
+            calls.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![14],
+            "the call site, not the declaration on line 9; found {calls:?}"
+        );
+
+        let mut value_lines: Vec<u32> = scan
+            .index
+            .references_to("value")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        value_lines.sort_unstable();
+        // Lines 2 and 9 declare a parameter called `value`, line 3 assigns
+        // the attribute and reads the parameter, line 6 reads the attribute,
+        // line 10 is the keyword argument's name and the value passed to it.
+        // A parameter's own name is among them because the outline query
+        // does not call a parameter a declaration -- and it is right not to:
+        // renaming the parameter has to change that position too. Every one
+        // of these is a place a rename of one of the two names has to look,
+        // which is exactly why the index declines to answer about a name
+        // that means two things, as this one does.
+        assert_eq!(value_lines, vec![2, 3, 3, 6, 9, 10, 10], "{value_lines:?}");
+
+        let attributes = scan.index.references_to("read");
+        assert_eq!(
+            attributes
+                .iter()
+                .map(|found| found.line)
+                .collect::<Vec<_>>(),
+            vec![15],
+            "the attribute read, not the method's declaration on line 5"
+        );
+    }
+
+    /// What Python binds in a scope. The list is long because the grammar
+    /// spells a parameter five ways and a binding six, and every form missed
+    /// here shows up directly as a wrong answer: with one node kind for all
+    /// names, the declining rules carry the whole weight in this language.
+    #[test]
+    fn python_binds_names_with_assignments_parameters_and_aliases() {
+        let project = project_with(&[(
+            "one.py",
+            "import numpy as aliased\nfrom typing import Any as Anything\n\n\ndef work(parameter, defaulted=1, annotated: int = 2, *splatted, **keyworded):\n    assigned = 1\n    first, second = (2, 3)\n    for looped in range(3):\n        _ = looped\n    comprehended = [inner for inner in range(3)]\n    with open(\"x\") as handle:\n        _ = handle\n    try:\n        pass\n    except ValueError as failure:\n        _ = failure\n    if (walrus := parameter) is not None:\n        _ = walrus\n    lambdaed = lambda shadowed: shadowed\n    return (assigned, first, second, comprehended, lambdaed, aliased, Anything,\n            defaulted, annotated, splatted, keyworded)\n",
+        )]);
+        let scan = scan_of_language(project.path(), "python");
+
+        for bound in [
+            "parameter",
+            "defaulted",
+            "annotated",
+            "splatted",
+            "keyworded",
+            "assigned",
+            "first",
+            "second",
+            "looped",
+            "comprehended",
+            "inner",
+            "handle",
+            "failure",
+            "walrus",
+            "lambdaed",
+            "shadowed",
+            "aliased",
+            "Anything",
+        ] {
+            assert!(
+                scan.local_bindings.contains(bound),
+                "{bound} is bound in a scope; bindings were {:?}",
+                scan.local_bindings
+            );
+        }
+        // The near miss: what a binding is bound *to* is not itself one.
+        for named in ["work", "range", "open", "ValueError"] {
+            assert!(
+                !scan.local_bindings.contains(named),
+                "{named} is not a name bound in a scope; bindings were {:?}",
+                scan.local_bindings
+            );
+        }
+    }
+
     /// A gate is only called shut where that can be shown. The target keys
     /// this project gates on are decided; a feature, `test` and anything else
     /// is unknown, and an unknown gate is never called shut -- calling one

@@ -366,6 +366,9 @@ pub struct Server {
     root: PathBuf,
     next_id: u64,
     progress: ProgressTracker,
+    /// Whether this server announces indexing at all -- see
+    /// [`crate::per_language::Spoken::announces_indexing`].
+    announces_indexing: bool,
 }
 
 impl Server {
@@ -383,6 +386,7 @@ impl Server {
         })?;
 
         let mut child = smol::process::Command::new(&binary)
+            .args(spoken.arguments)
             .current_dir(root)
             // Bound the server's query cache. Left alone, answering reference
             // queries across a project this size grows past 18 GiB and the
@@ -421,6 +425,7 @@ impl Server {
             root: root.to_path_buf(),
             next_id: 1,
             progress: ProgressTracker::default(),
+            announces_indexing: spoken.announces_indexing,
         };
 
         let root_uri = url::Url::from_directory_path(root).map_err(|()| {
@@ -493,6 +498,17 @@ impl Server {
                 return Ok(());
             }
             said_anything |= self.progress.has_started();
+            // A server with nothing to announce is ready once it has settled:
+            // waiting for progress it never sends would end every run in a
+            // timeout. Only after the quiet period, and only while it has
+            // indeed said nothing -- one that does announce work is still
+            // waited for.
+            if !self.announces_indexing
+                && !said_anything
+                && Instant::now() >= deadline - timeout + QUIET_PERIOD_AFTER_INDEXING
+            {
+                return Ok(());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),

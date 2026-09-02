@@ -323,21 +323,33 @@ pub fn references_query(language: &str) -> Option<&'static str> {
     match language {
         "rust" => Some(include_str!("rust_references.scm")),
         "go" => Some(include_str!("go_references.scm")),
+        "python" => Some(include_str!("python_references.scm")),
         _ => None,
     }
 }
 
 /// Every language a references query exists for, in the order they were
 /// written, so a caller can say what is covered rather than guess.
-pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &["rust", "go"];
+pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &["rust", "go", "python"];
 
 /// The language server to measure a language against, and the environment it
 /// needs. `None` where no server is wired up.
 pub struct Spoken {
     /// The executable to look for on `PATH`.
     pub binary: &'static str,
+    /// The arguments it needs to speak the protocol over its own stdin and
+    /// stdout. Most servers do that with none; some refuse to start without
+    /// being told.
+    pub arguments: &'static [&'static str],
     /// What to tell a person who does not have it.
     pub how_to_install: &'static str,
+    /// Whether the server announces the work of indexing the project over
+    /// `$/progress`. rust-analyzer and gopls do, and waiting for them to
+    /// finish is the difference between measuring a server and measuring a
+    /// half-built one. pyright announces none, because it has none: it
+    /// analyses each file as it is asked about. Waiting for progress from a
+    /// server that never sends any is a guaranteed timeout.
+    pub announces_indexing: bool,
     /// Whether the server takes rust-analyzer's `cachePriming` and `lru`
     /// options. Nothing else understands them, and sending them to a server
     /// that does not is asking it to ignore part of the request silently.
@@ -348,12 +360,23 @@ pub fn language_server(language: &str) -> Option<Spoken> {
     match language {
         "rust" => Some(Spoken {
             binary: "rust-analyzer",
+            announces_indexing: true,
+            arguments: &[],
             how_to_install: "rustup component add rust-analyzer",
             takes_rust_analyzer_options: true,
         }),
         "go" => Some(Spoken {
             binary: "gopls",
+            announces_indexing: true,
+            arguments: &[],
             how_to_install: "go install golang.org/x/tools/gopls@latest",
+            takes_rust_analyzer_options: false,
+        }),
+        "python" => Some(Spoken {
+            binary: "pyright-langserver",
+            announces_indexing: false,
+            arguments: &["--stdio"],
+            how_to_install: "pip install pyright",
             takes_rust_analyzer_options: false,
         }),
         _ => None,
@@ -694,6 +717,7 @@ pub fn names_bound_in_a_scope(
 ) -> Vec<String> {
     match language {
         "go" => go_names_bound_in_a_scope(node, contents),
+        "python" => python_names_bound_in_a_scope(node, contents),
         // Rust's own unpacking lives beside the measurement that needs it,
         // because it recurses through pattern nodes rather than reading one.
         _ => Vec::new(),
@@ -729,6 +753,54 @@ fn go_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Vec<St
         "label_name" | "labeled_statement" => {
             vec![]
         }
+        _ => Vec::new(),
+    }
+}
+
+/// What Python binds in a scope. Nearly everything in the language is a plain
+/// identifier to the grammar -- there is no separate node kind for a type or
+/// for a field -- so the declining rules carry the whole weight here, and
+/// missing one shows up directly as a wrong answer.
+fn python_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    let named_field = |field: &str| -> Vec<String> {
+        node.child_by_field_name(field)
+            .map(|named| identifiers_under(named, contents))
+            .unwrap_or_default()
+    };
+    match node.kind() {
+        // `value = 1`, `first, second = pair`, `value: int = 1`. The right
+        // side is a value, not a name, so only the left is taken.
+        "assignment" | "augmented_assignment" => named_field("left"),
+        // `for key in mapping:` and the same inside a comprehension.
+        "for_statement" | "for_in_clause" => named_field("left"),
+        // `with open(path) as handle:`, `except Error as failure:`, and the
+        // `case Thing() as matched:` of a match statement -- the grammar
+        // spells all three with an alias.
+        "as_pattern" | "except_clause" => named_field("alias"),
+        // The walrus, `if (found := look()) is not None:`.
+        "named_expression" => named_field("name"),
+        // A parameter in any of the forms the grammar separates: bare,
+        // defaulted, annotated, both, and the two splats.
+        "default_parameter" | "typed_default_parameter" => named_field("name"),
+        "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            identifiers_under(node, contents)
+        }
+        // `import numpy as np` and `from x import y as z` both give a name to
+        // something declared elsewhere.
+        "aliased_import" => named_field("alias"),
+        // `def method(self, ...)` -- the parameter list's bare identifiers.
+        // Taken from the list rather than from each parameter, because a bare
+        // parameter has no node of its own.
+        "parameters" | "lambda_parameters" => {
+            let mut walking = node.walk();
+            node.named_children(&mut walking)
+                .filter(|child| child.kind() == "identifier")
+                .filter_map(|child| child.utf8_text(contents).ok())
+                .map(str::to_string)
+                .collect()
+        }
+        // A type parameter, `def f[T](value: T) -> T:`.
+        "type_parameter" => identifiers_under(node, contents),
         _ => Vec::new(),
     }
 }
