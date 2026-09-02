@@ -608,6 +608,76 @@ impl Server {
         Ok(found)
     }
 
+    /// Whether the server has read `path` at all. `textDocument/documentSymbol`
+    /// answers with an empty list, or refuses outright, for a file that is in
+    /// no cargo target it builds -- a crate whose root is switched off for
+    /// this platform, an optional module, a test target whose
+    /// `required-features` are not on. Asking is the point: the alternative
+    /// is reading the `#[cfg]` text and guessing, which is how a measurement
+    /// starts flattering itself.
+    pub async fn has_read(&mut self, path: &str, timeout: Duration) -> Result<bool> {
+        let uri = url::Url::from_file_path(self.root.join(path))
+            .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
+        let answered = self
+            .call(
+                "textDocument/documentSymbol",
+                json!({"textDocument": {"uri": uri.as_str()}}),
+                timeout,
+            )
+            .await;
+        match answered {
+            // An answer of any shape means the file is loaded. An empty list
+            // is not the same as an unread file: `crates/util/src/test/git.rs`
+            // legitimately declares no symbols, and reading that as "never
+            // read" would excuse every wrong answer in it.
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let refused = error
+                    .downcast_ref::<ServerRefused>()
+                    .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+                if refused { Ok(false) } else { Err(error) }
+            }
+        }
+    }
+
+    /// Whether the server resolves the name at `path`:`line`:`column` --
+    /// zero-based, as the protocol counts -- to a definition. Answering
+    /// nothing means it has no such name there: an item its build switched
+    /// off, or a file it never read.
+    ///
+    /// `textDocument/definition` and not `textDocument/hover`: hover is
+    /// documentation, and the server can resolve a name perfectly well while
+    /// having nothing to say about it, which would read as "does not know
+    /// it" and quietly excuse a wrong answer. Resolution is the question, so
+    /// resolution is what is asked.
+    pub async fn resolves_at(
+        &mut self,
+        path: &str,
+        line: u32,
+        column: u32,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let uri = url::Url::from_file_path(self.root.join(path))
+            .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
+        let answered = self
+            .call(
+                "textDocument/definition",
+                json!({
+                    "textDocument": {"uri": uri.as_str()},
+                    "position": {"line": line, "character": column},
+                }),
+                timeout,
+            )
+            .await?;
+        Ok(match answered {
+            Value::Null => false,
+            Value::Array(places) => !places.is_empty(),
+            // A single `Location` or `LocationLink`, which the protocol also
+            // allows, is one place and therefore an answer.
+            _ => true,
+        })
+    }
+
     /// Asks rust-analyzer to shut down cleanly and waits for the process to
     /// exit, falling back to killing it if it does not. Dropping a `Server`
     /// without calling this still cannot leak the process -- it was spawned
@@ -790,6 +860,11 @@ pub struct QueryAnswers {
 
 /// Where the two sides disagreed on one query.
 pub struct QueryDivergence {
+    /// Which of [`Comparison::per_query`] this divergence belongs to. Two
+    /// sampled symbols can share a name, so the name alone does not identify
+    /// a query -- and attributing one query's set-aside findings to another's
+    /// would subtract a real wrong answer from the wrong figure.
+    pub at: usize,
     pub query: String,
     pub the_server_found_and_the_index_missed: Vec<Identity>,
     pub the_index_found_and_the_server_did_not: Vec<Identity>,
@@ -884,6 +959,21 @@ pub struct Comparison {
     /// Every query where the two sides did not fully agree, in the order the
     /// queries were asked.
     pub divergent_queries: Vec<QueryDivergence>,
+    /// What each query on its own produced. Kept because a figure pooled over
+    /// every finding lets one symbol decide the whole number: a single
+    /// sampled name that answers three and a half thousand times counts as
+    /// much as three and a half thousand ordinary ones, and a rename is
+    /// always invoked on one symbol.
+    pub per_query: Vec<QueryOutcome>,
+}
+
+/// What one query produced on each side.
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    pub query: String,
+    pub the_server_found: usize,
+    pub matched: usize,
+    pub extra: usize,
 }
 
 /// Compares the index's answers with the server's, query by query, on
@@ -894,6 +984,7 @@ pub fn compare(answers: &[QueryAnswers]) -> Comparison {
     let mut the_servers_findings = 0usize;
     let mut the_indexs_extra_findings = 0usize;
     let mut divergent_queries = Vec::new();
+    let mut per_query = Vec::with_capacity(answers.len());
 
     for answer in answers {
         let server_identities: HashSet<Identity> =
@@ -902,7 +993,8 @@ pub fn compare(answers: &[QueryAnswers]) -> Comparison {
             answer.the_index_found.iter().map(Identity::of).collect();
 
         the_servers_findings += server_identities.len();
-        matched += server_identities.intersection(&index_identities).count();
+        let matched_here = server_identities.intersection(&index_identities).count();
+        matched += matched_here;
 
         let mut missed: Vec<Identity> = server_identities
             .difference(&index_identities)
@@ -915,9 +1007,16 @@ pub fn compare(answers: &[QueryAnswers]) -> Comparison {
             .collect();
         extra.sort();
         the_indexs_extra_findings += extra.len();
+        per_query.push(QueryOutcome {
+            query: answer.query.clone(),
+            the_server_found: server_identities.len(),
+            matched: matched_here,
+            extra: extra.len(),
+        });
 
         if !missed.is_empty() || !extra.is_empty() {
             divergent_queries.push(QueryDivergence {
+                at: per_query.len() - 1,
                 query: answer.query.clone(),
                 the_server_found_and_the_index_missed: missed,
                 the_index_found_and_the_server_did_not: extra,
@@ -938,6 +1037,7 @@ pub fn compare(answers: &[QueryAnswers]) -> Comparison {
         recall,
         the_indexs_extra_findings,
         divergent_queries,
+        per_query,
     }
 }
 

@@ -3,15 +3,15 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use semantic_index::measure::as_time;
-use semantic_index::references::{Certainty, Report, measure};
+use semantic_index::references::{Certainty, REQUIRED_PRECISION, Report, measure};
 
 /// The plan's own sample size for this check.
 const SYMBOL_COUNT: usize = 100;
 
-/// The plan's own gates. Below either of them, references are not fit to base a
+/// The plan's own recall gate. Below it, references are not fit to base a
 /// rename on, and the step that would have done so is cancelled rather than
-/// built on a guess.
-const REQUIRED_PRECISION: f64 = 0.90;
+/// built on a guess. The precision gate lives beside the measurement, which
+/// reads it too.
 const REQUIRED_RECALL: f64 = 0.85;
 
 /// How many passes over definitions a pass over references may cost.

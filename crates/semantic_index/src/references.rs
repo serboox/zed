@@ -85,9 +85,21 @@ struct ProjectScan {
     /// -- the grammar parses every branch unconditionally; rust-analyzer does
     /// not.
     cfg_gated_spans: HashMap<String, Vec<(u32, u32)>>,
-    /// Every name bound as a `let`, a function parameter, or a closure
-    /// parameter anywhere in the project.
+    /// Every name that means something local somewhere in the project: a
+    /// `let`, a function or closure parameter, a name a destructuring pattern
+    /// unpacks, or a generic parameter. All of them are names whose meaning
+    /// depends on the scope they are read in, which is exactly what the index
+    /// cannot resolve.
     local_bindings: HashSet<String>,
+    /// Files rust-analyzer never reads at all: the `mod` line declaring them
+    /// is behind a `#[cfg(...)]`, the file itself opens with one, or they
+    /// belong to a cargo target the server does not build because its
+    /// `required-features` are off. The grammar reads them regardless.
+    files_out_of_the_servers_sight: HashSet<String>,
+    /// How many files the grammar could only parse with recovery, and how
+    /// many matches were dropped for falling inside a recovered range.
+    files_with_recovery: usize,
+    dropped_to_recovery: usize,
 }
 
 /// The Rust language the rest of the crate already knows how to read, found
@@ -185,12 +197,15 @@ fn defined_symbols_pass(root: &Path, rust: &Readable) -> Vec<NamedAt> {
         let Some(tree) = parser.parse(&contents, None) else {
             continue;
         };
-        found.extend(defined_symbols_in(
-            &relative_path,
-            &contents,
-            &rust.outline,
-            &tree,
-        ));
+        // A name recovery invented is not a definition, the same claim the
+        // references side makes for a reference.
+        let mut recovered = Vec::new();
+        recovered_rows(tree.root_node(), &mut recovered);
+        found.extend(
+            defined_symbols_in(&relative_path, &contents, &rust.outline, &tree)
+                .into_iter()
+                .filter(|symbol| !row_falls_in(&recovered, symbol.row)),
+        );
     }
     found
 }
@@ -231,6 +246,260 @@ fn occurrences_in(
     found
 }
 
+/// Every name a crate in this workspace answers to: the workspace's own
+/// members and everything they depend on, with `-` written the way code
+/// writes it. A project symbol under one of these names cannot be told apart
+/// from the crate: `crates/util/src/util.rs` declares `pub mod serde`, and
+/// asking about `serde` by text alone answers with every `#[serde(...)]`
+/// attribute and every `use serde::...` in the project -- three and a half
+/// thousand findings for one sampled name, none of them about that module.
+fn names_of_crates(root: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for manifest_path in member_manifests(root) {
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let mut inside_dependencies = false;
+        let mut inside_a_named_table = false;
+        let mut depth = 0i32;
+        for line in manifest.lines() {
+            let line = line.trim();
+            let continuing = depth > 0;
+            depth = (depth + bracket_depth_change(line)).max(0);
+            if continuing {
+                continue;
+            }
+            if let Some(table) = line.strip_prefix('[') {
+                let table = table.trim_end_matches(']');
+                inside_dependencies = table.ends_with("dependencies");
+                inside_a_named_table = matches!(table, "package" | "lib");
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if inside_a_named_table {
+                if let Some(value) = line.strip_prefix("name")
+                    && let Some(value) = value.split('=').nth(1)
+                {
+                    names.insert(value.trim().trim_matches('"').replace('-', "_"));
+                }
+                continue;
+            }
+            if inside_dependencies {
+                let key = line
+                    .split(['=', '.'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_matches('"');
+                if !key.is_empty() {
+                    names.insert(key.replace('-', "_"));
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Every file a file opening with `#![cfg(...)]` covers. The file itself
+/// always; and where it is a crate's root -- `src/lib.rs`, `src/main.rs`, or
+/// the `src/<crate>.rs` this project's own guidelines ask new crates to use
+/// -- the whole crate, since a gate on the root removes every module
+/// reachable from it. `crates/gpui_macos` is the real case: one
+/// `#![cfg(target_os = "macos")]` and rust-analyzer reads none of its
+/// twenty-odd files on any other platform.
+fn files_a_gated_file_covers(gated: &str, all_files: &HashSet<String>) -> Vec<String> {
+    let mut covered = vec![gated.to_string()];
+    let Some((directory, file)) = gated.rsplit_once('/') else {
+        return covered;
+    };
+    let Some(crate_root_directory) = directory.strip_suffix("/src") else {
+        return covered;
+    };
+    let stem = file.strip_suffix(".rs").unwrap_or(file);
+    let crate_name = crate_root_directory.rsplit('/').next().unwrap_or_default();
+    let is_a_crate_root = stem == "lib" || stem == "main" || stem == crate_name;
+    if !is_a_crate_root {
+        return covered;
+    }
+    let inside = format!("{directory}/");
+    covered.extend(
+        all_files
+            .iter()
+            .filter(|path| path.starts_with(&inside))
+            .cloned(),
+    );
+    covered
+}
+
+/// Every file belonging to a cargo target the server does not build. A
+/// `[[test]]`, `[[bin]]`, `[[bench]]` or `[[example]]` with
+/// `required-features` is built only when those features are on, and
+/// rust-analyzer resolves the workspace with the default set -- so it never
+/// reads the target's files, while the grammar reads every file it finds.
+/// `crates/collab`'s integration tests and `crates/html_render`'s engine
+/// tests are the real cases.
+///
+/// The manifest is read the same crude way [`excluded_from_the_workspace`]
+/// reads the workspace one, which is enough for the shape cargo actually
+/// writes: a target's own table, one key per line.
+fn files_behind_a_required_feature(root: &Path, all_files: &HashSet<String>) -> Vec<String> {
+    let mut covered = Vec::new();
+    for manifest_path in member_manifests(root) {
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Some(directory) = manifest_path.parent().and_then(|parent| {
+            parent
+                .strip_prefix(root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        }) else {
+            continue;
+        };
+        for target in targets_needing_a_feature(&manifest) {
+            let path = if directory.is_empty() {
+                target
+            } else {
+                format!("{directory}/{target}")
+            };
+            if all_files.contains(&path) {
+                covered.push(path.clone());
+            }
+            // A target's own modules live beside its root file -- but only
+            // where that directory belongs to the target alone. A `[[bin]]`
+            // rooted at `src/helper.rs` shares `src` with the crate's whole
+            // library, and taking the directory there would set aside the
+            // crate, not the target: `crates/sandbox` and `crates/zed` both
+            // have such a bin, and the mistake would have quietly flattered
+            // precision by the size of two crates.
+            if let Some(inside) = a_directory_of_its_own(&path) {
+                covered.extend(
+                    all_files
+                        .iter()
+                        .filter(|other| other.starts_with(&inside))
+                        .cloned(),
+                );
+            }
+        }
+    }
+    covered
+}
+
+/// The directory holding `path`, where that directory belongs to one cargo
+/// target alone -- a subdirectory of `tests`, `benches` or `examples`, the
+/// layout cargo gives a target with its own modules. `src` and the roots of
+/// those three are shared, and are never returned.
+fn a_directory_of_its_own(path: &str) -> Option<String> {
+    let (directory, _) = path.rsplit_once('/')?;
+    let (above, _) = directory.rsplit_once('/')?;
+    let owner = above.rsplit('/').next()?;
+    matches!(owner, "tests" | "benches" | "examples").then(|| format!("{directory}/"))
+}
+
+/// Whether `line` closes as many brackets as it opens, and how the running
+/// depth changes. A dependency written as a multi-line inline table --
+/// `image = { features = [\n  "bmp",\n] }` -- puts bare strings on their own
+/// lines, and reading those as keys invented crate names like `bmp` and
+/// `File`, each of which then silenced a real symbol for the wrong reason.
+fn bracket_depth_change(line: &str) -> i32 {
+    line.chars()
+        .map(|character| match character {
+            '{' | '[' => 1,
+            '}' | ']' => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The `path` of every target table in `manifest` that also carries
+/// `required-features`.
+fn targets_needing_a_feature(manifest: &str) -> Vec<String> {
+    let mut needing = Vec::new();
+    let mut path: Option<String> = None;
+    let mut needs_a_feature = false;
+    let mut depth = 0i32;
+    fn finish(path: &mut Option<String>, needs: &mut bool, into: &mut Vec<String>) {
+        if let Some(found) = path.take()
+            && *needs
+        {
+            into.push(found);
+        }
+        *needs = false;
+    }
+    for line in manifest.lines() {
+        let line = line.trim();
+        let continuing = depth > 0;
+        depth = (depth + bracket_depth_change(line)).max(0);
+        if continuing {
+            continue;
+        }
+        if line.starts_with('[') {
+            finish(&mut path, &mut needs_a_feature, &mut needing);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("path") {
+            path = value
+                .split('=')
+                .nth(1)
+                .map(|value| value.trim().trim_matches('"').to_string());
+        }
+        if line.starts_with("required-features") {
+            needs_a_feature = true;
+        }
+    }
+    finish(&mut path, &mut needs_a_feature, &mut needing);
+    needing
+}
+
+/// The root manifest and one manifest per workspace member -- not every
+/// `Cargo.toml` under the tree. The difference matters twice: the root
+/// excludes `crates/collab`, whose package name would otherwise decline the
+/// unrelated `pub mod collab` in `crates/title_bar`; and nested example
+/// packages such as `crates/gpui_web/examples/hello_web` are their own
+/// workspaces the server never resolves at all.
+fn member_manifests(root: &Path) -> Vec<PathBuf> {
+    let root_manifest = root.join("Cargo.toml");
+    let mut manifests = vec![root_manifest.clone()];
+    let Ok(manifest) = std::fs::read_to_string(&root_manifest) else {
+        return manifests;
+    };
+    for member in quoted_list_named("members", &manifest) {
+        if excluded_from_the_workspace(root, &member) {
+            continue;
+        }
+        let at = root.join(&member).join("Cargo.toml");
+        if at.is_file() {
+            manifests.push(at);
+        }
+    }
+    manifests
+}
+
+/// The quoted entries of a `<name> = [ ... ]` array, which cargo writes one
+/// per line. Read the same crude way [`excluded_from_the_workspace`] reads
+/// the workspace's `exclude`, and for the same reason: one shape, written by
+/// one tool.
+fn quoted_list_named(name: &str, manifest: &str) -> Vec<String> {
+    let opening = format!("{name} = [");
+    let Some(after) = manifest.split(&opening).nth(1) else {
+        return Vec::new();
+    };
+    let Some(inside) = after.split(']').next() else {
+        return Vec::new();
+    };
+    inside
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.split('#').next().unwrap_or_default().trim();
+            let entry = line.trim_end_matches(',').trim().trim_matches('"');
+            (!entry.is_empty()).then(|| entry.to_string())
+        })
+        .collect()
+}
+
 /// The classification-support spans and names one file's own tree yields, on
 /// the side, while it is parsed for the references pass anyway.
 #[derive(Default)]
@@ -238,21 +507,139 @@ struct FileSpans {
     macro_invocations: Vec<(u32, u32)>,
     use_declarations: Vec<(u32, u32)>,
     cfg_gated: Vec<(u32, u32)>,
+    /// Row ranges of every `ERROR` and `MISSING` node in the file. Recovery
+    /// hands out identifiers from text that is not yet code, so a match
+    /// inside one of these is not a reference -- but the rest of the file is
+    /// parsed correctly and dropping all of it would lose the largest files
+    /// in the project to one construct the grammar cannot read.
+    recovered: Vec<(u32, u32)>,
+    /// Whether the file carries a root-level `#![cfg(...)]`, which takes the
+    /// whole file, and at a crate root the whole crate, out of the server's
+    /// sight.
+    gated_as_a_whole: bool,
+    /// Names of modules this file declares behind a `#[cfg(...)]`. A gate on
+    /// the `mod` line takes the module's whole file out of the server's sight,
+    /// which a span inside that file cannot express.
+    cfg_gated_modules: Vec<String>,
     local_bindings: HashSet<String>,
 }
 
-/// Whether `attribute_item`'s own attribute is a bare `#[cfg(...)]` --
-/// `cfg_attr` is deliberately not included: unlike `cfg`, it does not remove
-/// the item it decorates when its predicate is false, so it does not belong
-/// in the same bucket as one that does.
-fn is_cfg_attribute(attribute_item: tree_sitter::Node, contents: &[u8]) -> bool {
+/// Whether `attribute_item`'s own attribute is a bare `#[cfg(...)]` whose
+/// predicate does **not** hold where this runs. `cfg_attr` is deliberately
+/// not included: unlike `cfg`, it does not remove the item it decorates when
+/// its predicate is false.
+///
+/// Evaluating the predicate is the whole point. `crates/gpui_linux` opens
+/// with `#![cfg(any(target_os = "linux", target_os = "freebsd"))]`, and on
+/// the Linux machine this measurement runs on that gate is *open*: treating
+/// every `#[cfg]` as shut would have set the crate aside from the comparison
+/// and quietly flattered the number by the size of it.
+fn is_a_shut_cfg_attribute(attribute_item: tree_sitter::Node, contents: &[u8]) -> bool {
+    // Both `attribute_item` and `inner_attribute_item` hold the attribute as
+    // their only named child, so one reader serves both.
     let Some(attribute) = attribute_item.named_child(0) else {
         return false;
     };
     let Some(name) = attribute.named_child(0) else {
         return false;
     };
-    name.kind() == "identifier" && name.utf8_text(contents) == Ok("cfg")
+    if name.kind() != "identifier" || name.utf8_text(contents) != Ok("cfg") {
+        return false;
+    }
+    let Some(arguments) = attribute.child_by_field_name("arguments") else {
+        return false;
+    };
+    let Ok(text) = arguments.utf8_text(contents) else {
+        return false;
+    };
+    cfg_holds(text.trim_start_matches('(').trim_end_matches(')')) == Some(false)
+}
+
+/// Whether a `cfg` predicate holds on the platform this runs on, or `None`
+/// where nothing here can tell. Only the keys this project actually gates on
+/// are decided: the target, and the two shorthands for its family. A feature,
+/// `test`, `debug_assertions` and anything else is `None` -- unknown, and an
+/// unknown gate is never called shut, because calling it shut is what
+/// excuses a wrong answer.
+fn cfg_holds(predicate: &str) -> Option<bool> {
+    let predicate = predicate.trim();
+    let combinators: [(&str, fn(&str) -> Option<bool>); 3] =
+        [("any", any_of), ("all", all_of), ("not", negation)];
+    for (combinator, verdict) in combinators {
+        if let Some(rest) = predicate.strip_prefix(combinator)
+            && let Some(inside) = rest.trim_start().strip_prefix('(')
+            && let Some(inside) = inside.strip_suffix(')')
+        {
+            return verdict(inside);
+        }
+    }
+    if let Some((key, value)) = predicate.split_once('=') {
+        let key = key.trim();
+        let value = value.trim().trim_matches('"');
+        return match key {
+            "target_os" => Some(value == std::env::consts::OS),
+            "target_family" => Some(value == std::env::consts::FAMILY),
+            "target_arch" => Some(value == std::env::consts::ARCH),
+            _ => None,
+        };
+    }
+    match predicate {
+        "unix" => Some(std::env::consts::FAMILY == "unix"),
+        "windows" => Some(std::env::consts::FAMILY == "windows"),
+        _ => None,
+    }
+}
+
+/// The comma-separated predicates of a combinator, split at the top level so
+/// that a nested `any(a, b)` stays whole.
+fn predicates_of(inside: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (at, character) in inside.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(inside[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = inside[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
+}
+
+fn any_of(inside: &str) -> Option<bool> {
+    let mut anything_unknown = false;
+    for part in predicates_of(inside) {
+        match cfg_holds(part) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => anything_unknown = true,
+        }
+    }
+    (!anything_unknown).then_some(false)
+}
+
+fn all_of(inside: &str) -> Option<bool> {
+    let mut anything_unknown = false;
+    for part in predicates_of(inside) {
+        match cfg_holds(part) {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => anything_unknown = true,
+        }
+    }
+    (!anything_unknown).then_some(true)
+}
+
+fn negation(inside: &str) -> Option<bool> {
+    cfg_holds(inside).map(|held| !held)
 }
 
 /// The item an attribute applies to: its next named sibling, skipping over
@@ -272,24 +659,128 @@ fn item_gated_by(attribute_item: tree_sitter::Node) -> Option<tree_sitter::Node>
     None
 }
 
-/// Records `pattern`'s own name as a local binding, where the pattern is
-/// simple enough to have one: a bare identifier, or one wrapped in `mut`.
-/// Destructuring patterns (tuples, structs, references) are deliberately not
-/// unpacked -- a best-effort heuristic does not need to be an exhaustive
-/// pattern matcher to be honest about what it does cover.
+/// Records every name `pattern` binds, unpacking destructuring patterns down
+/// to the identifiers they introduce. Two parts of a pattern name something
+/// other than a binding and are skipped: the path a pattern matches *against*
+/// (`Some(value)` binds `value` and names `Some`) and a match arm's guard
+/// expression. Reading either as a binding would decline every symbol sharing
+/// a name with a matched-on variant or a guard's variable.
 fn record_binding_name(pattern: tree_sitter::Node, contents: &[u8], into: &mut FileSpans) {
-    let identifier = match pattern.kind() {
-        "identifier" => Some(pattern),
-        "mut_pattern" => pattern
-            .named_child(0)
-            .filter(|child| child.kind() == "identifier"),
-        _ => None,
-    };
-    if let Some(identifier) = identifier
-        && let Ok(text) = identifier.utf8_text(contents)
-    {
-        into.local_bindings.insert(text.to_string());
+    match pattern.kind() {
+        "identifier" | "shorthand_field_identifier" => {
+            if let Ok(text) = pattern.utf8_text(contents) {
+                into.local_bindings.insert(text.to_string());
+            }
+        }
+        // `Point { x: left }` binds `left`, not `x`; `Point { x }` binds `x`.
+        "field_pattern" => {
+            if let Some(inner) = pattern.child_by_field_name("pattern") {
+                record_binding_name(inner, contents, into);
+            } else {
+                let mut cursor = pattern.walk();
+                for child in pattern.named_children(&mut cursor) {
+                    if child.kind() == "shorthand_field_identifier" {
+                        record_binding_name(child, contents, into);
+                    }
+                }
+            }
+        }
+        "tuple_struct_pattern"
+        | "struct_pattern"
+        | "match_pattern"
+        | "mut_pattern"
+        | "ref_pattern"
+        | "reference_pattern"
+        | "tuple_pattern"
+        | "slice_pattern"
+        | "or_pattern"
+        | "captured_pattern" => {
+            let matched_against = pattern.child_by_field_name("type");
+            let guard = pattern.child_by_field_name("condition");
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                if Some(child) != matched_against && Some(child) != guard {
+                    record_binding_name(child, contents, into);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+/// The row ranges of every `ERROR` and `MISSING` node under `node`, pruning
+/// whole subtrees that parsed cleanly -- `has_error` is true only where the
+/// node or one of its descendants is one, so a correct file costs one check.
+fn recovered_rows(node: tree_sitter::Node, into: &mut Vec<(u32, u32)>) {
+    if node.is_error() || node.is_missing() {
+        into.push((
+            node.start_position().row as u32,
+            node.end_position().row as u32,
+        ));
+        return;
+    }
+    if !node.has_error() {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        recovered_rows(child, into);
+    }
+}
+
+/// Whether one row falls inside any of `spans`.
+fn row_falls_in(spans: &[(u32, u32)], row: u32) -> bool {
+    spans
+        .iter()
+        .any(|(start, end)| *start <= row && row <= *end)
+}
+
+/// Every file the module `module`, declared in `declaring_file` behind a
+/// `#[cfg(...)]`, covers. Both module layouts are tried, since which one
+/// applies depends on whether the declaring file is its directory's root --
+/// something only the crate manifest settles, and guessing wrong in the
+/// harmless direction (a file that happens to sit at the other candidate
+/// path) costs a set-aside finding, not a wrong number. Files under the
+/// module's own directory are covered by the same prefix, which is what makes
+/// the gate transitive: a module nested inside a gated one is gated too.
+fn files_a_gated_module_covers(
+    declaring_file: &str,
+    module: &str,
+    all_files: &HashSet<String>,
+) -> Vec<String> {
+    let directory = match declaring_file.rfind('/') {
+        Some(cut) => &declaring_file[..cut],
+        None => "",
+    };
+    let stem = declaring_file
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".rs"))
+        .unwrap_or_default();
+    let mut roots = Vec::new();
+    if directory.is_empty() {
+        roots.push(module.to_string());
+        roots.push(format!("{stem}/{module}"));
+    } else {
+        roots.push(format!("{directory}/{module}"));
+        roots.push(format!("{directory}/{stem}/{module}"));
+    }
+
+    let mut covered = Vec::new();
+    for root in roots {
+        let as_a_file = format!("{root}.rs");
+        if all_files.contains(&as_a_file) {
+            covered.push(as_a_file);
+        }
+        let as_a_directory = format!("{root}/");
+        covered.extend(
+            all_files
+                .iter()
+                .filter(|path| path.starts_with(&as_a_directory))
+                .cloned(),
+        );
+    }
+    covered
 }
 
 /// Walks the whole tree once, collecting everything [`FileSpans`] needs.
@@ -307,25 +798,62 @@ fn walk_for_classification(node: tree_sitter::Node, contents: &[u8], into: &mut 
                 node.end_position().row as u32,
             ));
         }
+        // A root-level `#![cfg(...)]` gates everything the file contains --
+        // `crates/gpui_macos` opens with `#![cfg(target_os = "macos")]`, and
+        // on any other platform the server never reads a line of it.
+        "inner_attribute_item" => {
+            if is_a_shut_cfg_attribute(node, contents)
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+            {
+                into.gated_as_a_whole = true;
+            }
+        }
+        // A generic parameter is a name whose meaning is its scope's, exactly
+        // like a local: `impl<V: Bound> Trait for V` puts `V` in the outline
+        // as a type, and answering about it means answering about every `V`
+        // in the project.
+        "type_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if matches!(child.kind(), "type_parameter" | "const_parameter")
+                    && let Some(name) = child.child_by_field_name("name")
+                    && let Ok(text) = name.utf8_text(contents)
+                {
+                    into.local_bindings.insert(text.to_string());
+                }
+            }
+        }
         "attribute_item" => {
-            if is_cfg_attribute(node, contents)
+            if is_a_shut_cfg_attribute(node, contents)
                 && let Some(gated) = item_gated_by(node)
             {
                 into.cfg_gated.push((
                     gated.start_position().row as u32,
                     gated.end_position().row as u32,
                 ));
-            }
-        }
-        "let_declaration" | "parameter" => {
-            if let Some(pattern) = node.child_by_field_name("pattern") {
-                record_binding_name(pattern, contents, into);
+                if gated.kind() == "mod_item"
+                    && let Some(name) = gated.child_by_field_name("name")
+                    && let Ok(text) = name.utf8_text(contents)
+                {
+                    into.cfg_gated_modules.push(text.to_string());
+                }
             }
         }
         "closure_parameters" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 record_binding_name(child, contents, into);
+            }
+        }
+        // Every grammar node that owns a `pattern` field is a binding site:
+        // `let`, a parameter, an `if let`/`while let` condition, a match arm,
+        // a `for` loop. Named rather than enumerated, so a grammar that grows
+        // another one does not quietly stop being covered.
+        _ if node.child_by_field_name("pattern").is_some() => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                record_binding_name(pattern, contents, into);
             }
         }
         _ => {}
@@ -372,6 +900,11 @@ fn scan_references(
     let mut use_spans: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     let mut cfg_gated_spans: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     let mut local_bindings: HashSet<String> = HashSet::new();
+    let mut all_files: HashSet<String> = HashSet::new();
+    let mut gated_modules: Vec<(String, String)> = Vec::new();
+    let mut gated_files: Vec<String> = Vec::new();
+    let mut files_with_recovery = 0usize;
+    let mut dropped_to_recovery = 0usize;
 
     for path in rust_files_under(root, rust) {
         let Ok(contents) = std::fs::read(&path) else {
@@ -381,6 +914,7 @@ fn scan_references(
             continue;
         };
         let relative_path = relative.to_string_lossy().replace('\\', "/");
+        all_files.insert(relative_path.clone());
 
         let mut parser = tree_sitter::Parser::new();
         if parser.set_language(&rust.grammar).is_err() {
@@ -389,25 +923,33 @@ fn scan_references(
         let Some(tree) = parser.parse(&contents, None) else {
             continue;
         };
-        // A file caught mid-edit contributes nothing at all, the same claim
-        // `crate::definitions` makes for the outline query. It matters more
-        // here: the outline query simply fails to match a recovered error
-        // node, but this query's widest pattern is a bare identifier, and
-        // tree-sitter's recovery hands out plenty of those from text that is
-        // not yet code. Half a parse would read as though it had parsed.
-        if tree.root_node().has_error() {
-            continue;
-        }
-
-        raw_occurrences.extend(occurrences_in(
-            &relative_path,
-            &contents,
-            references_query,
-            &tree,
-        ));
-
         let mut spans = FileSpans::default();
         walk_for_classification(tree.root_node(), &contents, &mut spans);
+        recovered_rows(tree.root_node(), &mut spans.recovered);
+
+        // What recovery produced is not code, and this query's widest pattern
+        // is a bare identifier -- so a match inside a recovered range would
+        // read as a reference when it is not. Only those ranges are dropped,
+        // not the file: the fifteen files this project cannot parse include
+        // the largest and most-referenced ones in it (`editor.rs`,
+        // `gpui/src/window.rs`, `language.rs`), each over one construct the
+        // grammar does not read, and dropping them whole made the index look
+        // like it had never heard of them.
+        if !spans.recovered.is_empty() {
+            files_with_recovery += 1;
+        }
+        let found = occurrences_in(&relative_path, &contents, references_query, &tree);
+        let before = found.len();
+        let kept: Vec<NamedAt> = found
+            .into_iter()
+            .filter(|occurrence| !row_falls_in(&spans.recovered, occurrence.row))
+            .collect();
+        dropped_to_recovery += before - kept.len();
+        raw_occurrences.extend(kept);
+
+        if spans.gated_as_a_whole {
+            gated_files.push(relative_path.clone());
+        }
         if !spans.macro_invocations.is_empty() {
             macro_spans.insert(relative_path.clone(), spans.macro_invocations);
         }
@@ -417,8 +959,24 @@ fn scan_references(
         if !spans.cfg_gated.is_empty() {
             cfg_gated_spans.insert(relative_path.clone(), spans.cfg_gated);
         }
+        for module in spans.cfg_gated_modules {
+            gated_modules.push((relative_path.clone(), module));
+        }
         local_bindings.extend(spans.local_bindings);
     }
+
+    let mut files_out_of_the_servers_sight: HashSet<String> = HashSet::new();
+    for (declaring_file, module) in &gated_modules {
+        files_out_of_the_servers_sight.extend(files_a_gated_module_covers(
+            declaring_file,
+            module,
+            &all_files,
+        ));
+    }
+    for gated in &gated_files {
+        files_out_of_the_servers_sight.extend(files_a_gated_file_covers(gated, &all_files));
+    }
+    files_out_of_the_servers_sight.extend(files_behind_a_required_feature(root, &all_files));
 
     let declared: HashSet<(String, u32, u32)> = defined
         .iter()
@@ -444,6 +1002,9 @@ fn scan_references(
         use_spans,
         cfg_gated_spans,
         local_bindings,
+        files_out_of_the_servers_sight,
+        files_with_recovery,
+        dropped_to_recovery,
     }
 }
 
@@ -482,6 +1043,47 @@ fn sample_symbols(symbols: &[NamedAt], count: usize) -> Vec<NamedAt> {
     picked
 }
 
+/// Whether the project's own manifest excludes the crate this path is in, and
+/// with it the server's knowledge of the file. Read from `exclude` in the root
+/// `Cargo.toml` rather than hard-coded: which crates are left out of the
+/// workspace is the project's decision and it changes.
+fn excluded_from_the_workspace(root: &Path, path: &str) -> bool {
+    use std::sync::OnceLock;
+    static EXCLUDED: OnceLock<Vec<String>> = OnceLock::new();
+    let excluded = EXCLUDED.get_or_init(|| {
+        let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+            return Vec::new();
+        };
+        let Some(after) = manifest.split("exclude = [").nth(1) else {
+            return Vec::new();
+        };
+        let Some(inside) = after.split(']').next() else {
+            return Vec::new();
+        };
+        inside
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim().trim_matches('"');
+                (!entry.is_empty()).then(|| entry.to_string())
+            })
+            .collect()
+    });
+    excluded
+        .iter()
+        .any(|left_out| path.starts_with(left_out.as_str()))
+}
+
+/// Which crate a project-relative path belongs to, or the path's first
+/// component where it is not under `crates/`.
+fn crate_of(path: &str) -> &str {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("crates"), Some(name)) => name,
+        (Some(first), _) => first,
+        _ => path,
+    }
+}
+
 /// Whether a name is one identifier and nothing else -- the only shape an
 /// index that groups by name can be asked about, and the only shape a rename
 /// applies to.
@@ -499,13 +1101,165 @@ fn is_a_plain_name(name: &str) -> bool {
 /// the standard convention for precision over an empty result set, the same
 /// vacuous-truth shape [`compare`]'s own `recall` already uses for the
 /// opposite case.
-fn precision_of(comparison: &Comparison) -> f64 {
-    let index_findings = comparison.matched + comparison.the_indexs_extra_findings;
+/// Precision with `set_aside` of the extra findings not counted against the
+/// index, because they are not wrong.
+///
+/// Two kinds qualify, and both are the same fault as the ones this measurement
+/// has already had to correct: the two sides are looking at different code.
+///
+/// A reference behind a `#[cfg(...)]` that is off in this build exists in the
+/// file and a rename has to change it; rust-analyzer does not list it because
+/// it is not compiling that branch. Holding that against the index measures
+/// the server's configuration.
+///
+/// A reference in a crate the workspace excludes is outside the server's cargo
+/// graph, so the server has no opinion about it at all -- while the code is
+/// still there and still has to be renamed.
+fn precision_over(comparison: &Comparison, set_aside: usize) -> f64 {
+    let wrong = comparison
+        .the_indexs_extra_findings
+        .saturating_sub(set_aside);
+    let index_findings = comparison.matched + wrong;
     if index_findings == 0 {
         1.0
     } else {
         comparison.matched as f64 / index_findings as f64
     }
+}
+
+/// The plan's own precision gate: below it, references are not fit to base a
+/// rename on. Read here as well as by the binary that enforces it, so the
+/// share of symbols that clear the gate can be reported beside the figure.
+pub const REQUIRED_PRECISION: f64 = 0.90;
+
+/// Precision read one symbol at a time. A pooled figure weights every symbol
+/// by how many times its name occurs, which lets a single name decide the
+/// whole number -- and a rename is invoked on one symbol, never on a pool.
+/// Reported beside the pooled figure, never instead of it.
+#[derive(Debug, Clone, Copy)]
+pub struct PerSymbol {
+    pub mean: f64,
+    pub median: f64,
+    /// How many symbols answered at or above the gate, and how many were
+    /// judged at all -- a symbol the index answered nothing about, and the
+    /// server nothing either, is not a clean answer, it is no answer.
+    pub at_or_above_the_gate: usize,
+    pub judged: usize,
+    /// Symbols the index answered nothing about, so there was no precision to
+    /// read. Excluded from the figures above -- precision is about the answers
+    /// given, and scoring a silence either way would be a claim about recall.
+    /// Printed, so the figures are never read without knowing how many
+    /// symbols they left out.
+    pub answered_nothing: usize,
+}
+
+fn precision_per_symbol(
+    comparison: &Comparison,
+    catalogue: &ErrorCatalogue,
+    never_looking: &impl Fn(&ClassifiedDivergence) -> bool,
+) -> PerSymbol {
+    let mut set_aside_by_query: HashMap<usize, usize> = HashMap::new();
+    for extra in &catalogue.extra {
+        if never_looking(extra) {
+            *set_aside_by_query.entry(extra.at).or_default() += 1;
+        }
+    }
+    let mut precisions = Vec::with_capacity(comparison.per_query.len());
+    let mut answered_nothing = 0usize;
+    for (at, outcome) in comparison.per_query.iter().enumerate() {
+        let set_aside = set_aside_by_query.get(&at).copied().unwrap_or(0);
+        let wrong = outcome.extra.saturating_sub(set_aside);
+        let findings = outcome.matched + wrong;
+        if findings == 0 {
+            answered_nothing += 1;
+            continue;
+        }
+        precisions.push(outcome.matched as f64 / findings as f64);
+    }
+    if precisions.is_empty() {
+        return PerSymbol {
+            mean: 1.0,
+            median: 1.0,
+            at_or_above_the_gate: 0,
+            judged: 0,
+            answered_nothing,
+        };
+    }
+    let judged = precisions.len();
+    let mean = precisions.iter().sum::<f64>() / judged as f64;
+    let at_or_above_the_gate = precisions
+        .iter()
+        .filter(|precision| **precision >= REQUIRED_PRECISION)
+        .count();
+    precisions.sort_by(|left, right| left.total_cmp(right));
+    let median = if judged % 2 == 1 {
+        precisions[judged / 2]
+    } else {
+        (precisions[judged / 2 - 1] + precisions[judged / 2]) / 2.0
+    };
+    PerSymbol {
+        mean,
+        median,
+        at_or_above_the_gate,
+        judged,
+        answered_nothing,
+    }
+}
+
+/// Every zero-based column on the reported line where `identity`'s name
+/// stands as a whole identifier. The index's own `Definition` carries no
+/// column, and asking a language server about a position needs one -- so the
+/// name is found in the line again.
+///
+/// Every occurrence, not the first: the first may be inside a string or a
+/// comment, and a finding is only treated as one the server never saw when
+/// the server resolves nothing at *any* of them. Guessing one position and
+/// trusting the answer would excuse a wrong answer on a coin toss.
+///
+/// Columns are counted in UTF-16 code units, which is what the protocol
+/// means by a character; counting scalars is short by one per astral-plane
+/// character, and this project has source lines with those in them.
+fn columns_of(root: &Path, identity: &Identity) -> Vec<u32> {
+    let Some(row) = identity.line.checked_sub(1) else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(root.join(&identity.path)) else {
+        return Vec::new();
+    };
+    let Some(line) = contents.lines().nth(row as usize) else {
+        return Vec::new();
+    };
+    let name = identity.name.as_str();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut columns = Vec::new();
+    for (at, _) in line.match_indices(name) {
+        let before = line[..at].chars().next_back();
+        let after = line[at + name.len()..].chars().next();
+        if before.is_some_and(is_name_character) || after.is_some_and(is_name_character) {
+            continue;
+        }
+        if let Ok(column) = u32::try_from(line[..at].encode_utf16().count()) {
+            columns.push(column);
+        }
+    }
+    columns
+}
+
+fn is_name_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// Whether an extra finding sits in code the server was never looking at, as
+/// far as reading the source can tell: a `#[cfg]` that is shut here, or a
+/// crate the workspace excludes. The caller adds what the server itself
+/// says about the file, which is the part that decides.
+fn was_the_server_never_looking(root: &Path, extra: &ClassifiedDivergence) -> bool {
+    matches!(
+        extra.reason,
+        DivergenceReason::BehindACfgAttribute | DivergenceReason::InAModuleGatedByACfg
+    ) || excluded_from_the_workspace(root, &extra.identity.path)
 }
 
 /// Why a divergence happened, named honestly rather than forced into a
@@ -524,6 +1278,10 @@ pub enum DivergenceReason {
     /// unconditionally, while rust-analyzer resolves only the one that is
     /// actually active.
     BehindACfgAttribute,
+    /// The reference lives in a file rust-analyzer never reads, because the
+    /// `mod` line declaring it is behind a `#[cfg(...)]` -- an optional module
+    /// of a crate, switched off by the feature set the server resolves with.
+    InAModuleGatedByACfg,
     /// The reference lives only inside a macro invocation's own argument
     /// tokens, which this grammar does not parse as expressions at all -- an
     /// interpolated `format!` argument is the common real example.
@@ -549,11 +1307,16 @@ impl fmt::Display for DivergenceReason {
                 "the name also names another definition in the project"
             }
             DivergenceReason::NameSharedByALocalBinding => {
-                "the name is also bound as a local variable or a parameter somewhere in the project"
+                "the name is also bound as a local variable, a parameter or a generic parameter \
+                 somewhere in the project"
             }
             DivergenceReason::BehindACfgAttribute => {
                 "the reference sits behind a #[cfg(...)] the grammar parses but \
                  rust-analyzer does not activate"
+            }
+            DivergenceReason::InAModuleGatedByACfg => {
+                "the reference is in a module declared behind a #[cfg(...)], so rust-analyzer \
+                 never read the file at all"
             }
             DivergenceReason::OnlyInsideAMacroInvocation => {
                 "the reference lives only inside a macro invocation's own argument tokens"
@@ -575,6 +1338,11 @@ impl fmt::Display for DivergenceReason {
 /// One divergence, classified.
 #[derive(Debug, Clone)]
 pub struct ClassifiedDivergence {
+    /// Which of `Comparison::per_query` this came from. Two sampled symbols
+    /// can share a name, so the name alone does not identify a query -- and
+    /// attributing one query's set-aside findings to another's would subtract
+    /// a real wrong answer from the wrong figure.
+    pub at: usize,
     pub query: String,
     pub identity: Identity,
     pub reason: DivergenceReason,
@@ -616,6 +1384,9 @@ fn classify_extra(scan: &ProjectScan, name: &str, identity: &Identity) -> Diverg
     if line_falls_in(&scan.cfg_gated_spans, &identity.path, identity.line) {
         return DivergenceReason::BehindACfgAttribute;
     }
+    if scan.files_out_of_the_servers_sight.contains(&identity.path) {
+        return DivergenceReason::InAModuleGatedByACfg;
+    }
     DivergenceReason::Unclassified
 }
 
@@ -637,6 +1408,7 @@ impl ErrorCatalogue {
         for divergence in &comparison.divergent_queries {
             for identity in &divergence.the_server_found_and_the_index_missed {
                 missed.push(ClassifiedDivergence {
+                    at: divergence.at,
                     query: divergence.query.clone(),
                     identity: identity.clone(),
                     reason: classify_missed(scan, identity),
@@ -644,6 +1416,7 @@ impl ErrorCatalogue {
             }
             for identity in &divergence.the_index_found_and_the_server_did_not {
                 extra.push(ClassifiedDivergence {
+                    at: divergence.at,
                     query: divergence.query.clone(),
                     identity: identity.clone(),
                     reason: classify_extra(scan, &divergence.query, identity),
@@ -705,13 +1478,36 @@ pub struct Report {
     /// on neither side, and printed, so a shrinking sample is visible rather
     /// than silent.
     pub outside_the_servers_project: usize,
+    /// Sampled symbols whose own declaration the server cannot see -- gated by
+    /// a `#[cfg]` its build switches off, or in a file it never reads. It
+    /// answers nothing about them, so neither side can be held to the
+    /// comparison. Counted and printed rather than excused afterwards.
+    pub declaration_the_server_cannot_see: usize,
     /// Sampled symbols the index refused to answer about, because the name
     /// means more than one thing. Printed beside the sample size: a precision
     /// figure over a subset is only worth reading next to how big the subset
     /// is.
     pub declined: usize,
+    /// Extra findings not counted against precision, because the server was
+    /// never looking at that code: a branch its build has switched off, or a
+    /// crate the workspace excludes. Printed, so a precision figure is never
+    /// quietly helped along.
+    pub outside_the_servers_sight: usize,
+    /// Of those, how many for each reason. Which rule costs the coverage is the
+    /// thing that decides whether it is worth refining.
+    pub declined_shared_declaration: usize,
+    pub declined_local_binding: usize,
+    /// Sampled symbols declined because a crate in the workspace, or one it
+    /// depends on, answers to the same name.
+    pub declined_crate_name: usize,
+    /// Of the names declared more than once: how many were declared several
+    /// times inside a single crate. Kept because it is the number that closed
+    /// off import-based narrowing -- see the note below.
+    pub declined_within_one_crate: usize,
     pub comparison: Comparison,
     pub precision: f64,
+    /// The same precision read one symbol at a time -- see [`PerSymbol`].
+    pub per_symbol: PerSymbol,
     pub catalogue: ErrorCatalogue,
     /// How long a project-wide pass over the outline query took.
     pub definitions_pass: Duration,
@@ -720,6 +1516,12 @@ pub struct Report {
     pub references_pass: Duration,
     pub answering_the_index: Spread,
     pub answering_the_server: Spread,
+    /// How many files the grammar could only parse with recovery, and how
+    /// many matches were dropped for falling inside a recovered range.
+    /// Printed, because a grammar gap is a coverage hole either way: the
+    /// alternative to naming it is losing the file silently.
+    pub files_with_recovery: usize,
+    pub dropped_to_recovery: usize,
 }
 
 impl fmt::Display for Report {
@@ -731,12 +1533,60 @@ impl fmt::Display for Report {
             self.precision * 100.0,
             self.comparison.recall * 100.0
         )?;
+        writeln!(
+            out,
+            "read one symbol at a time: precision is {:.1}% on average and {:.1}% at the median; \
+             {} of {} symbols answered at {:.0}% or better",
+            self.per_symbol.mean * 100.0,
+            self.per_symbol.median * 100.0,
+            self.per_symbol.at_or_above_the_gate,
+            self.per_symbol.judged,
+            REQUIRED_PRECISION * 100.0
+        )?;
+        if self.per_symbol.answered_nothing > 0 {
+            writeln!(
+                out,
+                "{} more symbols the index answered nothing about, left out of those two \
+                 figures: a silence is not a wrong answer, and scoring it either way would be a \
+                 claim about recall",
+                self.per_symbol.answered_nothing
+            )?;
+        }
+        if self.outside_the_servers_sight > 0 {
+            writeln!(
+                out,
+                "{} of the index's extra findings are not counted against it: the code is behind \
+                 a switched-off `#[cfg]`, in a module or file a `#[cfg]` gates, in a cargo target \
+                 whose `required-features` are off, or in a crate the workspace excludes -- so \
+                 the server was never looking at it, while a rename still has to change it",
+                self.outside_the_servers_sight
+            )?;
+        }
         if self.declined > 0 {
             writeln!(
                 out,
-                "{} sampled symbols were declined: the name means more than one thing in this \
-                 project, and grouping by name alone cannot tell which one is meant",
-                self.declined
+                "{} sampled symbols were declined: {} because the name is declared more than \
+                 once, {} because it is also a local binding or a generic parameter somewhere, \
+                 {} because a crate answers to the same name",
+                self.declined,
+                self.declined_shared_declaration,
+                self.declined_local_binding,
+                self.declined_crate_name
+            )?;
+            writeln!(
+                out,
+                "{} of those were declared several times inside one crate, which nothing but a \
+                 type could separate",
+                self.declined_within_one_crate
+            )?;
+        }
+        if self.declaration_the_server_cannot_see > 0 {
+            writeln!(
+                out,
+                "{} sampled symbols were not asked about at all: their own declaration is behind \
+                 a `#[cfg]` the server switches off, or in a file it never reads, so it knows of \
+                 no such symbol",
+                self.declaration_the_server_cannot_see
             )?;
         }
         if self.outside_the_servers_project > 0 {
@@ -745,6 +1595,14 @@ impl fmt::Display for Report {
                 "{} sampled symbols were in files rust-analyzer does not have -- outside the \
                  cargo graph -- and are counted on neither side",
                 self.outside_the_servers_project
+            )?;
+        }
+        if self.files_with_recovery > 0 {
+            writeln!(
+                out,
+                "the grammar needed recovery in {} files and {} matches were dropped for falling \
+                 inside a recovered range; the rest of each file still counts",
+                self.files_with_recovery, self.dropped_to_recovery
             )?;
         }
         writeln!(out, "{}", self.comparison)?;
@@ -829,6 +1687,16 @@ pub async fn measure(
     let mut server_timings = Vec::with_capacity(sampled.len());
     let mut outside_the_servers_project = 0usize;
     let mut declined = 0usize;
+    // Split, because the two rules cost very different amounts of coverage and
+    // only one of them is as coarse as it looks: a name declared twice is
+    // genuinely ambiguous everywhere, while a name that is also somebody's
+    // local variable is ambiguous only where that local is in scope.
+    let mut declined_shared_declaration = 0usize;
+    let mut declined_local_binding = 0usize;
+    let mut declined_crate_name = 0usize;
+    let mut declined_within_one_crate = 0usize;
+    let mut declaration_the_server_cannot_see = 0usize;
+    let crate_names = names_of_crates(root);
     // How many definitions in the project carry each name, so a name that means
     // one thing can be told from one that means several.
     let mut declarations_named: HashMap<&str, usize> = HashMap::new();
@@ -836,13 +1704,71 @@ pub async fn measure(
         *declarations_named.entry(symbol.name.as_str()).or_default() += 1;
     }
     for symbol in &sampled {
+        // A symbol the server does not know is a question neither side can be
+        // held to: `clear_globals` carries `#[cfg(any(test, feature =
+        // "test-support"))]`, so the server knows of no such function and
+        // answers nothing, while the index answers with every real call in
+        // the project. The server is asked rather than the `#[cfg]` text
+        // read: a gate that reads shut in the source can be open here --
+        // `crates/gpui_linux` is gated on Linux, and this runs on Linux.
+        let known = server
+            .resolves_at(&symbol.path, symbol.row, symbol.column, query_timeout)
+            .await;
+        match known {
+            Ok(true) => {}
+            Ok(false) => {
+                declaration_the_server_cannot_see += 1;
+                continue;
+            }
+            Err(error) => {
+                let refused = error
+                    .downcast_ref::<ServerRefused>()
+                    .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+                if refused {
+                    outside_the_servers_project += 1;
+                    continue;
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "asking rust-analyzer whether it resolves {} at {}:{}:{}",
+                        symbol.name, symbol.path, symbol.row, symbol.column
+                    )
+                });
+            }
+        }
         if certainty == Certainty::OnlyWhenTheNameMeansOneThing {
             let shared = declarations_named
                 .get(symbol.name.as_str())
                 .copied()
                 .unwrap_or(0)
                 > 1;
-            if shared || scan.local_bindings.contains(&symbol.name) {
+            if shared {
+                // Where the several declarations live decides whether anything
+                // short of type inference could tell them apart. Declarations
+                // spread across crates are narrowed below by what each file
+                // imports; several in one crate under one name are, as a rule,
+                // the same method on different types, and only a type separates
+                // those.
+                let crates: HashSet<&str> = scan
+                    .defined
+                    .iter()
+                    .filter(|other| other.name == symbol.name)
+                    .map(|other| crate_of(&other.path))
+                    .collect();
+                declined_shared_declaration += 1;
+                if crates.len() <= 1 {
+                    declined_within_one_crate += 1;
+                }
+                declined += 1;
+                continue;
+            }
+            if scan.local_bindings.contains(&symbol.name) {
+                declined_local_binding += 1;
+                declined += 1;
+                continue;
+            }
+            if crate_names.contains(&symbol.name) {
+                declined_crate_name += 1;
                 declined += 1;
                 continue;
             }
@@ -900,25 +1826,98 @@ pub async fn measure(
         sampled.len()
     );
 
+    let comparison = compare(&answers);
+    let catalogue = ErrorCatalogue::build(&scan, &comparison);
+
+    // Whether the server sees anything at each extra finding's own position
+    // is asked of the server, while it is still running. Everything the
+    // classification walk worked out from `#[cfg]` text stays -- it is what
+    // names the reason in the catalogue -- but what counts against precision
+    // is decided here, so no wrong answer can be excused by a gate this
+    // measurement only thought was shut.
+    let mut seen_by_the_server: HashMap<Identity, bool> = HashMap::new();
+    for extra in &catalogue.extra {
+        if seen_by_the_server.contains_key(&extra.identity) {
+            continue;
+        }
+        let columns = columns_of(root, &extra.identity);
+        let row = extra.identity.line.saturating_sub(1);
+        let mut answers = Vec::new();
+        for column in &columns {
+            answers.push(
+                server
+                    .resolves_at(&extra.identity.path, row, *column, query_timeout)
+                    .await,
+            );
+        }
+        if columns.is_empty() {
+            // The name is not on the line the index reported, which should not
+            // happen; asking whether the file is loaded at all is the honest
+            // fallback, rather than deciding it without asking.
+            answers.push(server.has_read(&extra.identity.path, query_timeout).await);
+        }
+        let mut seen = false;
+        for answered in answers {
+            match answered {
+                Ok(true) => seen = true,
+                Ok(false) => {}
+                Err(error) => {
+                    let refused = error
+                        .downcast_ref::<ServerRefused>()
+                        .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+                    if !refused {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "asking rust-analyzer what it resolves at {}:{}",
+                                extra.identity.path, extra.identity.line
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        seen_by_the_server.insert(extra.identity.clone(), seen);
+    }
+
     if let Err(error) = server.shut_down().await {
         log::warn!("rust-analyzer did not shut down cleanly: {error:#}");
     }
 
-    let comparison = compare(&answers);
-    let precision = precision_of(&comparison);
-    let catalogue = ErrorCatalogue::build(&scan, &comparison);
+    let never_looking = |extra: &ClassifiedDivergence| {
+        was_the_server_never_looking(root, extra)
+            || !seen_by_the_server
+                .get(&extra.identity)
+                .copied()
+                .unwrap_or(true)
+    };
+    let outside_the_servers_sight = catalogue
+        .extra
+        .iter()
+        .filter(|extra| never_looking(extra))
+        .count();
+    let precision = precision_over(&comparison, outside_the_servers_sight);
+    let per_symbol = precision_per_symbol(&comparison, &catalogue, &never_looking);
 
     Ok(Report {
         symbols_sampled: answers.len(),
         outside_the_servers_project,
+        declaration_the_server_cannot_see,
+        outside_the_servers_sight,
         declined,
+        declined_shared_declaration,
+        declined_local_binding,
+        declined_crate_name,
+        declined_within_one_crate,
         comparison,
         precision,
+        per_symbol,
         catalogue,
         definitions_pass,
         references_pass,
         answering_the_index: spread_of(index_timings),
         answering_the_server: spread_of(server_timings),
+        files_with_recovery: scan.files_with_recovery,
+        dropped_to_recovery: scan.dropped_to_recovery,
     })
 }
 
@@ -1095,6 +2094,378 @@ mod tests {
         assert!(scan.local_bindings.contains("helper"));
     }
 
+    /// The column a language server is asked about is found by looking the
+    /// name up in the line again, and two things about that are easy to get
+    /// wrong: a name inside a longer identifier is not the name, and the
+    /// protocol counts a character as a UTF-16 code unit, not as a scalar.
+    #[test]
+    fn every_whole_occurrence_of_a_name_on_its_line_is_offered() {
+        let project = project_with(&[(
+            "one.rs",
+            "let holder = \"\u{1f980}\u{1f525}\"; let unholder = holder + holder_of;\n",
+        )]);
+        let identity = Identity {
+            path: "one.rs".to_string(),
+            line: 1,
+            name: "holder".to_string(),
+        };
+        let columns = columns_of(project.path(), &identity);
+
+        // `unholder` and `holder_of` contain the name but are not it; the two
+        // real occurrences are the binding and the use. Both crab and fire
+        // are astral-plane, so each counts as two code units, which is what
+        // puts the second column at 36 rather than 34.
+        assert_eq!(columns, vec![4, 36], "columns were {columns:?}");
+    }
+
+    /// A gate is only called shut where that can be shown. The target keys
+    /// this project gates on are decided; a feature, `test` and anything else
+    /// is unknown, and an unknown gate is never called shut -- calling one
+    /// shut is what excuses a wrong answer.
+    #[test]
+    fn a_cfg_predicate_is_only_called_shut_where_that_can_be_shown() {
+        let here = std::env::consts::OS;
+        let nowhere = "nothing_is_built_for_this";
+        assert_eq!(cfg_holds(&format!("target_os = \"{here}\"")), Some(true));
+        assert_eq!(
+            cfg_holds(&format!("target_os = \"{nowhere}\"")),
+            Some(false)
+        );
+        assert_eq!(
+            cfg_holds(&format!(
+                "any(target_os = \"{nowhere}\", target_os = \"{here}\")"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            cfg_holds(&format!(
+                "all(target_os = \"{here}\", target_os = \"{nowhere}\")"
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            cfg_holds(&format!("not(target_os = \"{here}\")")),
+            Some(false)
+        );
+        // A nested combinator keeps its own commas.
+        assert_eq!(
+            cfg_holds(&format!(
+                "all(not(target_os = \"{nowhere}\"), any(target_os = \"{here}\"))"
+            )),
+            Some(true)
+        );
+        for unknown in [
+            "feature = \"test-support\"",
+            "test",
+            "debug_assertions",
+            "any(feature = \"a\", feature = \"b\")",
+        ] {
+            assert_eq!(cfg_holds(unknown), None, "{unknown} should read as unknown");
+        }
+        // An unknown branch leaves `any` unknown, but a true one settles it
+        // regardless -- and a false branch settles `all` the same way.
+        assert_eq!(
+            cfg_holds(&format!("any(feature = \"a\", target_os = \"{here}\")")),
+            Some(true)
+        );
+        assert_eq!(
+            cfg_holds(&format!("all(feature = \"a\", target_os = \"{nowhere}\")")),
+            Some(false)
+        );
+    }
+
+    /// A struct pattern's field shorthand introduces a local under the
+    /// field's own name, which is why a field name used that way anywhere in
+    /// the project is one the index declines to answer about. Before this was
+    /// unpacked, the local went unrecorded and every use of the local counted
+    /// against precision as a reference to the field.
+    #[test]
+    fn a_destructuring_pattern_binds_every_name_it_unpacks() {
+        let project = project_with(&[(
+            "one.rs",
+            "enum Track {\n    Playing { publication: u32 },\n    None,\n}\n\n             fn look(track: &Track) -> u32 {\n                 if let Track::Playing { publication } = track {\n                     return *publication;\n    }\n    0\n}\n\n             fn pair() {\n    let (left, right) = (1, 2);\n    let _ = left + right;\n}\n",
+        )]);
+        let scan = scan_of(project.path());
+
+        assert!(
+            scan.local_bindings.contains("publication"),
+            "a field shorthand binds a local under the field's name; bindings were {:?}",
+            scan.local_bindings
+        );
+        assert!(scan.local_bindings.contains("left"));
+        assert!(scan.local_bindings.contains("right"));
+        // The near miss that makes unpacking safe: a pattern's path is matched
+        // against, not bound. Reading `Track` or `Playing` as a binding would
+        // decline every symbol sharing a name with a matched-on variant.
+        assert!(
+            !scan.local_bindings.contains("Track"),
+            "the type a pattern matches against is not a binding"
+        );
+        assert!(!scan.local_bindings.contains("Playing"));
+    }
+
+    /// A `#[cfg(...)]` on the `mod` line takes the module's whole file out of
+    /// the server's sight -- rust-analyzer never reads it, while the grammar
+    /// reads every file it finds. Nothing inside that file can be held
+    /// against the index, and no span inside the file can say so: the gate is
+    /// written one level up, in the file that declares the module.
+    #[test]
+    fn a_cfg_on_a_mod_line_takes_the_whole_module_file_out_of_the_servers_sight() {
+        let project = project_with(&[
+            (
+                "lib.rs",
+                "#[cfg(target_os = \"nothing_is_built_for_this\")]\npub mod optional;\npub mod always;\n",
+            ),
+            ("optional/inner.rs", "pub fn deep() -> u32 {\n    1\n}\n"),
+            (
+                "optional.rs",
+                "pub mod inner;\n\npub fn only_on_that_target() -> u32 {\n    2\n}\n",
+            ),
+            ("always.rs", "pub fn plain() -> u32 {\n    3\n}\n"),
+        ]);
+        let scan = scan_of(project.path());
+
+        assert!(
+            scan.files_out_of_the_servers_sight.contains("optional.rs"),
+            "out of sight: {:?}",
+            scan.files_out_of_the_servers_sight
+        );
+        // The gate is transitive through the module's own directory: a module
+        // nested inside a switched-off one is switched off too.
+        assert!(
+            scan.files_out_of_the_servers_sight
+                .contains("optional/inner.rs"),
+            "out of sight: {:?}",
+            scan.files_out_of_the_servers_sight
+        );
+        assert!(
+            !scan.files_out_of_the_servers_sight.contains("always.rs"),
+            "an ungated module stays in the server's sight"
+        );
+
+        let identity = Identity {
+            path: "optional.rs".to_string(),
+            line: 3,
+            name: "only_on_that_target".to_string(),
+        };
+        assert_eq!(
+            classify_extra(&scan, "only_on_that_target", &identity),
+            DivergenceReason::InAModuleGatedByACfg
+        );
+    }
+
+    /// The grammar cannot read `Box<dyn \'static + Send + ...>` -- a lifetime
+    /// bound written first in a trait object -- and this project writes it
+    /// that way in fifteen files, among them the largest and most-referenced
+    /// ones it has. Dropping such a file whole cost every reference in it;
+    /// only the recovered range is dropped now.
+    #[test]
+    fn a_file_the_grammar_cannot_parse_keeps_everything_outside_the_error() {
+        let project = project_with(&[(
+            "one.rs",
+            "type Queued = Box<dyn \'static + Send + FnOnce()>;\n\n             fn make_holder() -> u32 {\n    7\n}\n\n             fn use_it() -> u32 {\n    make_holder()\n}\n",
+        )]);
+        let scan = scan_of(project.path());
+
+        assert_eq!(
+            scan.files_with_recovery, 1,
+            "the fixture is only meaningful while the grammar still cannot read it"
+        );
+        let calls = scan.index.references_to("make_holder");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the call below the unparsable line is still a reference; found {calls:?}"
+        );
+        assert_eq!(calls[0].line, 8);
+    }
+
+    /// `crates/gpui_macos` opens with `#![cfg(target_os = "macos")]`: on any
+    /// other platform rust-analyzer reads none of its files, while the
+    /// grammar reads all of them. A gate on a crate's root covers the crate.
+    #[test]
+    fn a_crate_root_behind_an_inner_cfg_takes_the_whole_crate_out_of_sight() {
+        let open_here = format!(
+            "#![cfg(any(target_os = \"{}\", target_os = \"nothing_is_built_for_this\"))]\npub fn here() -> u32 {{\n    3\n}}\n",
+            std::env::consts::OS
+        );
+        let project = project_with(&[
+            (
+                "crates/only_there/src/only_there.rs",
+                "#![cfg(target_os = \"nothing_is_built_for_this\")]\n\npub mod window;\n",
+            ),
+            (
+                "crates/only_there/src/window.rs",
+                "pub fn draw() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "crates/everywhere/src/everywhere.rs",
+                "pub fn draw_too() -> u32 {\n    2\n}\n",
+            ),
+            ("crates/right_here/src/right_here.rs", open_here.as_str()),
+        ]);
+        let scan = scan_of(project.path());
+
+        for covered in [
+            "crates/only_there/src/only_there.rs",
+            "crates/only_there/src/window.rs",
+        ] {
+            assert!(
+                scan.files_out_of_the_servers_sight.contains(covered),
+                "{covered} is not covered; out of sight: {:?}",
+                scan.files_out_of_the_servers_sight
+            );
+        }
+        assert!(
+            !scan
+                .files_out_of_the_servers_sight
+                .contains("crates/everywhere/src/everywhere.rs"),
+            "an ungated crate stays in the server's sight"
+        );
+        // The near miss that would have cost a whole crate: `crates/gpui_linux`
+        // opens with `#![cfg(any(target_os = "linux", target_os = "freebsd"))]`,
+        // and on the machine this measurement runs on that gate is open.
+        // Reading every `#[cfg]` as shut would have set the crate aside from
+        // the comparison and flattered the number by the size of it.
+        assert!(
+            !scan
+                .files_out_of_the_servers_sight
+                .contains("crates/right_here/src/right_here.rs"),
+            "a gate that holds here is open; out of sight: {:?}",
+            scan.files_out_of_the_servers_sight
+        );
+    }
+
+    /// A cargo target with `required-features` is built only when they are
+    /// on, and rust-analyzer resolves the workspace with the default set --
+    /// so it never reads the target\'s files. `crates/collab`\'s integration
+    /// tests are the real case.
+    #[test]
+    fn a_target_behind_required_features_is_out_of_the_servers_sight() {
+        let project = project_with(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\n    \"crates/served\",\n]\n",
+            ),
+            (
+                "crates/served/Cargo.toml",
+                "[package]\nname = \"served\"\n\n[lib]\npath = \"src/served.rs\"\n\n[[test]]\nname = \"integration\"\nrequired-features = [\"test-support\"]\npath = \"tests/integration/integration.rs\"\n\n[[test]]\nname = \"plain\"\npath = \"tests/plain.rs\"\n\n[[bin]]\nname = \"helper\"\npath = \"src/helper.rs\"\nrequired-features = [\"test-support\"]\n",
+            ),
+            ("crates/served/src/served.rs", "pub fn work() {}\n"),
+            ("crates/served/src/helper.rs", "pub fn helping() {}\n"),
+            (
+                "crates/served/tests/integration/integration.rs",
+                "mod helpers;\n",
+            ),
+            (
+                "crates/served/tests/integration/helpers.rs",
+                "pub fn help() {}\n",
+            ),
+            ("crates/served/tests/plain.rs", "pub fn plain() {}\n"),
+        ]);
+        let scan = scan_of(project.path());
+
+        for covered in [
+            "crates/served/tests/integration/integration.rs",
+            "crates/served/tests/integration/helpers.rs",
+        ] {
+            assert!(
+                scan.files_out_of_the_servers_sight.contains(covered),
+                "{covered} is not covered; out of sight: {:?}",
+                scan.files_out_of_the_servers_sight
+            );
+        }
+        // The near miss that cost the most: a `[[bin]]` rooted at
+        // `src/helper.rs` shares `src` with the crate's library, so its
+        // directory is not its own and must not be taken with it.
+        assert!(
+            !scan
+                .files_out_of_the_servers_sight
+                .contains("crates/served/src/served.rs"),
+            "a bin rooted in src must not set aside the crate; out of sight: {:?}",
+            scan.files_out_of_the_servers_sight
+        );
+        assert!(
+            scan.files_out_of_the_servers_sight
+                .contains("crates/served/src/helper.rs"),
+            "the gated bin's own file is still out of sight"
+        );
+        // The near miss: a target with no `required-features` is built with
+        // the default set, so the server does read it.
+        assert!(
+            !scan
+                .files_out_of_the_servers_sight
+                .contains("crates/served/tests/plain.rs"),
+            "out of sight: {:?}",
+            scan.files_out_of_the_servers_sight
+        );
+    }
+
+    /// A dependency written as a multi-line inline table puts bare strings
+    /// on their own lines. Read as keys they invented crate names -- `bmp`,
+    /// `File` -- and each invented name then silenced a real symbol for a
+    /// reason that was not true.
+    #[test]
+    fn a_multi_line_dependency_table_does_not_invent_crate_names() {
+        let project = project_with(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\n    \"crates/inner\",\n]\n\n[package]\nname = \"outer\"\n\n[dependencies]\nanyhow = \"1\"\nimage = { version = \"0.25\", default-features = false, features = [\n    \"bmp\",\n    \"gif\",\n] }\nserde = \"1\"\n",
+            ),
+            (
+                "crates/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\n\n[dependencies]\nlog = \"0.4\"\n",
+            ),
+            (
+                "crates/outside/Cargo.toml",
+                "[package]\nname = \"outside\"\n",
+            ),
+        ]);
+        let names = names_of_crates(project.path());
+
+        for real in ["outer", "anyhow", "image", "serde", "inner", "log"] {
+            assert!(names.contains(real), "{real} is missing from {names:?}");
+        }
+        for invented in ["bmp", "gif"] {
+            assert!(
+                !names.contains(invented),
+                "{invented} is a feature name, not a crate; got {names:?}"
+            );
+        }
+        // A package the workspace does not list is its own workspace as far as
+        // the server is concerned, and its name is not a name in this project.
+        assert!(
+            !names.contains("outside"),
+            "a package outside the workspace is not one of its names; got {names:?}"
+        );
+    }
+
+    /// `impl<V: Bound> Trait for V` puts `V` in the outline as though it were
+    /// a type, and every `V` in the project answers to it. One such symbol in
+    /// a sample of 181 produced 299 of 343 wrong findings -- 87 per cent of
+    /// them -- until a generic parameter was read for what it is: a name
+    /// whose meaning is its scope\'s, exactly like a local.
+    #[test]
+    fn a_generic_parameter_is_a_name_the_index_declines_to_answer_about() {
+        let project = project_with(&[(
+            "one.rs",
+            "pub type Holder<K, V> = std::collections::HashMap<K, V>;\n\n             pub fn take<Element>(seen: Element) -> Element {\n    seen\n}\n\n             pub const N: usize = 1;\n",
+        )]);
+        let scan = scan_of(project.path());
+
+        for parameter in ["K", "V", "Element"] {
+            assert!(
+                scan.local_bindings.contains(parameter),
+                "{parameter} is a generic parameter; bindings were {:?}",
+                scan.local_bindings
+            );
+        }
+        assert!(
+            !scan.local_bindings.contains("Holder"),
+            "the name a generic parameter list belongs to is not itself one"
+        );
+    }
+
     /// A method name shared by two types: with no type resolution, a call to
     /// either type's method comes back under the one name. In the real error
     /// catalogue this classifies as `NameSharedByAnotherDefinition`, since
@@ -1134,7 +2505,7 @@ mod tests {
             the_server_found: vec![definition("a.rs", "work", 1)],
             the_index_found: vec![definition("a.rs", "work", 1), definition("b.rs", "work", 9)],
         }]);
-        assert_eq!(precision_of(&comparison), 0.5);
+        assert_eq!(precision_over(&comparison, 0), 0.5);
     }
 
     #[test]
@@ -1144,7 +2515,7 @@ mod tests {
             the_server_found: Vec::new(),
             the_index_found: vec![definition("a.rs", "work", 1)],
         }]);
-        assert_eq!(precision_of(&comparison), 0.0);
+        assert_eq!(precision_over(&comparison, 0), 0.0);
     }
 
     #[test]
@@ -1155,15 +2526,46 @@ mod tests {
             the_index_found: Vec::new(),
         }]);
         assert_eq!(
-            precision_of(&comparison),
+            precision_over(&comparison, 0),
             1.0,
             "finding nothing is not the same as finding something wrongly"
         );
     }
 
+    /// Findings the server was never looking at are not wrong answers, and
+    /// leaving them in would measure the server's build configuration rather
+    /// than the index. The count is printed with the number for that reason.
+    #[test]
+    fn what_the_server_could_not_see_is_not_held_against_the_index() {
+        let comparison = compare(&[QueryAnswers {
+            query: "work".to_string(),
+            the_server_found: vec![definition("a.rs", "work", 4)],
+            the_index_found: vec![
+                definition("a.rs", "work", 4),
+                definition("a.rs", "work", 9),
+                definition("a.rs", "work", 14),
+            ],
+        }]);
+        assert_eq!(
+            precision_over(&comparison, 0),
+            1.0 / 3.0,
+            "counted against the index, two of its three answers are wrong"
+        );
+        assert_eq!(
+            precision_over(&comparison, 2),
+            1.0,
+            "set aside as code the server never compiled, none of them are"
+        );
+        assert_eq!(
+            precision_over(&comparison, 9),
+            1.0,
+            "setting aside more than there were does not go below zero wrong"
+        );
+    }
+
     #[test]
     fn precision_of_the_empty_case_is_also_a_vacuous_one() {
-        assert_eq!(precision_of(&compare(&[])), 1.0);
+        assert_eq!(precision_over(&compare(&[]), 0), 1.0);
     }
 
     #[test]
@@ -1190,6 +2592,9 @@ mod tests {
             use_spans: HashMap::new(),
             cfg_gated_spans: HashMap::new(),
             local_bindings: HashSet::new(),
+            files_out_of_the_servers_sight: HashSet::new(),
+            files_with_recovery: 0,
+            dropped_to_recovery: 0,
         };
         let comparison = compare(&[QueryAnswers {
             query: "work".to_string(),
@@ -1220,6 +2625,9 @@ mod tests {
             use_spans: HashMap::new(),
             cfg_gated_spans: HashMap::new(),
             local_bindings: HashSet::new(),
+            files_out_of_the_servers_sight: HashSet::new(),
+            files_with_recovery: 0,
+            dropped_to_recovery: 0,
         };
         let comparison = compare(&[QueryAnswers {
             query: "x".to_string(),
