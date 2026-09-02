@@ -6365,6 +6365,7 @@ mod tests {
             api_client_ui::init(cx);
             hierarchy_view::init(cx);
             structural_search::init(cx);
+            rename_preview::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

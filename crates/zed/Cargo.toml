@@ -203,6 +203,7 @@ split_preview.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
 pdf_preview.workspace = true
+rename_preview.workspace = true
 structural_search.workspace = true
 symbol_index.workspace = true
 svg_preview.workspace = true

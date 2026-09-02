@@ -182,6 +182,7 @@ members = [
     "crates/remote",
     "crates/remote_connection",
     "crates/remote_server",
+    "crates/rename_preview",
     "crates/repl",
     "crates/reqwest_client",
     "crates/rope",
@@ -450,6 +451,7 @@ project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
 recent_projects = { path = "crates/recent_projects" }
+rename_preview = { path = "crates/rename_preview" }
 refineable = { path = "crates/refineable" }
 release_channel = { path = "crates/release_channel" }
 remote = { path = "crates/remote" }
