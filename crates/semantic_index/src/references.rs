@@ -154,6 +154,7 @@ fn rust_files_under(root: &Path, rust: &Readable) -> Vec<PathBuf> {
 /// the exact position of its own name.
 fn defined_symbols_in(
     path: &str,
+    language: &str,
     contents: &[u8],
     outline: &tree_sitter::Query,
     tree: &tree_sitter::Tree,
@@ -161,10 +162,32 @@ fn defined_symbols_in(
     let Some(name_index) = capture_index(outline, "name") else {
         return Vec::new();
     };
+    let item_index = capture_index(outline, "item");
     let mut found = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(outline, tree.root_node(), contents);
     while let Some(matched) = matches.next() {
+        // The same filter the index itself applies, and for the same reason:
+        // some languages' outline queries yield what the editor wants to show
+        // -- an object literal's entries, a `let` nested in a function -- and
+        // an index of definitions holds none of it. Without this, the
+        // measurement's idea of what is declared was not the index's, and
+        // TypeScript's every local `const` counted as a definition: names
+        // like `result` looked declared in hundreds of places, so the index
+        // declined nearly every symbol it was offered.
+        let declared = item_index
+            .and_then(|item| {
+                matched
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == item)
+                    .map(|capture| capture.node)
+            })
+            .map(|node| per_language::is_declaration(language, node))
+            .unwrap_or(true);
+        if !declared {
+            continue;
+        }
         for capture in matched.captures {
             if capture.index != name_index {
                 continue;
@@ -190,7 +213,7 @@ fn defined_symbols_in(
 /// position needs. This one keeps nothing on disk and answers to nothing but
 /// this measurement -- and its own timing is the plan's "a pass over
 /// definitions" half of the cost ratio this step is gated on.
-fn defined_symbols_pass(root: &Path, rust: &Readable) -> Vec<NamedAt> {
+fn defined_symbols_pass(root: &Path, language: &str, rust: &Readable) -> Vec<NamedAt> {
     let mut found = Vec::new();
     for path in rust_files_under(root, rust) {
         let Ok(contents) = std::fs::read(&path) else {
@@ -212,7 +235,7 @@ fn defined_symbols_pass(root: &Path, rust: &Readable) -> Vec<NamedAt> {
         let mut recovered = Vec::new();
         recovered_rows(tree.root_node(), &mut recovered);
         found.extend(
-            defined_symbols_in(&relative_path, &contents, &rust.outline, &tree)
+            defined_symbols_in(&relative_path, language, &contents, &rust.outline, &tree)
                 .into_iter()
                 .filter(|symbol| !row_falls_in(&recovered, symbol.row)),
         );
@@ -1716,7 +1739,7 @@ pub async fn measure(
         })?;
 
     let definitions_started = Instant::now();
-    let defined = defined_symbols_pass(root, &rust);
+    let defined = defined_symbols_pass(root, language, &rust);
     let definitions_pass = definitions_started.elapsed();
     anyhow::ensure!(
         !defined.is_empty(),
@@ -1776,6 +1799,12 @@ pub async fn measure(
         // the project. The server is asked rather than the `#[cfg]` text
         // read: a gate that reads shut in the source can be open here --
         // `crates/gpui_linux` is gated on Linux, and this runs on Linux.
+        // Told the file is open first, the way an editor would: a server
+        // that answers only about what something has opened -- `tsserver`
+        // does -- otherwise reports every file as one it does not have.
+        if let Err(error) = server.open(&symbol.path, language, query_timeout).await {
+            log::warn!("{error:#}");
+        }
         let known = server
             .resolves_at(&symbol.path, symbol.row, symbol.column, query_timeout)
             .await;
@@ -1915,6 +1944,12 @@ pub async fn measure(
         if seen_by_the_server.contains_key(&extra.identity) {
             continue;
         }
+        if let Err(error) = server
+            .open(&extra.identity.path, language, query_timeout)
+            .await
+        {
+            log::warn!("{error:#}");
+        }
         let columns = columns_of(root, &extra.identity);
         let row = extra.identity.line.saturating_sub(1);
         let mut answers = Vec::new();
@@ -2045,7 +2080,7 @@ mod tests {
             query_text(name).expect("the language has a references query"),
         )
         .expect("the references query compiles");
-        let defined = defined_symbols_pass(project, &language);
+        let defined = defined_symbols_pass(project, name, &language);
         scan_references(project, name, &language, &references_query, defined)
     }
 
@@ -3082,7 +3117,7 @@ mod tests {
     fn a_file_that_does_not_parse_contributes_nothing_rather_than_partial_results() {
         let project = project_with(&[("broken.rs", "pub struct Half {\npub fn work(\n")]);
         let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
-        let defined = defined_symbols_pass(project.path(), &rust);
+        let defined = defined_symbols_pass(project.path(), "rust", &rust);
         assert!(
             defined.is_empty(),
             "a file that does not parse defines nothing: {defined:?}"

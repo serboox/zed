@@ -113,7 +113,7 @@ async fn run() -> Result<()> {
         root.display()
     );
     if semantic_index::per_language::language_server(&language)
-        .is_some_and(|spoken| spoken.takes_rust_analyzer_options)
+        .is_some_and(|spoken| spoken.options == semantic_index::per_language::Options::RustAnalyzer)
     {
         println!(
             "rust-analyzer's query cache is capped at {} entries (RA_LRU_CAP); its own default \

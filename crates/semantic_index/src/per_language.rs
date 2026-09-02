@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rayon::prelude::*;
+use serde_json::{Value, json};
 use streaming_iterator::StreamingIterator as _;
 
 use crate::languages::{self, Readable};
@@ -324,13 +325,18 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "rust" => Some(include_str!("rust_references.scm")),
         "go" => Some(include_str!("go_references.scm")),
         "python" => Some(include_str!("python_references.scm")),
+        // One file for both TypeScript dialects: they differ in what they
+        // parse, not in how they spell a name.
+        "typescript" | "tsx" => Some(include_str!("typescript_references.scm")),
+        "javascript" => Some(include_str!("javascript_references.scm")),
         _ => None,
     }
 }
 
 /// Every language a references query exists for, in the order they were
 /// written, so a caller can say what is covered rather than guess.
-pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &["rust", "go", "python"];
+pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] =
+    &["rust", "go", "python", "typescript", "tsx", "javascript"];
 
 /// The language server to measure a language against, and the environment it
 /// needs. `None` where no server is wired up.
@@ -341,43 +347,86 @@ pub struct Spoken {
     /// stdout. Most servers do that with none; some refuse to start without
     /// being told.
     pub arguments: &'static [&'static str],
-    /// What to tell a person who does not have it.
-    pub how_to_install: &'static str,
     /// Whether the server announces the work of indexing the project over
     /// `$/progress`. rust-analyzer and gopls do, and waiting for them to
     /// finish is the difference between measuring a server and measuring a
-    /// half-built one. pyright announces none, because it has none: it
-    /// analyses each file as it is asked about. Waiting for progress from a
-    /// server that never sends any is a guaranteed timeout.
+    /// half-built one. pyright and tsserver announce none, because they have
+    /// none: they analyse each file as they are asked about it. Waiting for
+    /// progress from a server that never sends any is a guaranteed timeout.
     pub announces_indexing: bool,
-    /// Whether the server takes rust-analyzer's `cachePriming` and `lru`
-    /// options. Nothing else understands them, and sending them to a server
-    /// that does not is asking it to ignore part of the request silently.
-    pub takes_rust_analyzer_options: bool,
+    /// What to tell a person who does not have it.
+    pub how_to_install: &'static str,
+    /// Which `initializationOptions` this server understands. Sending one
+    /// server another's options is asking it to ignore part of the request
+    /// without saying so.
+    pub options: Options,
+}
+
+/// The `initializationOptions` a server takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Options {
+    /// rust-analyzer's own: whether to work the project out ahead of the
+    /// first question, and how large a query cache to keep.
+    RustAnalyzer,
+    /// `typescript-language-server` refuses to start unless it can find
+    /// `tsserver`, which it looks for in the project's own `node_modules`.
+    /// A project whose dependencies are not installed has to be told where
+    /// one is, and version 6 takes that as an option rather than a flag.
+    /// The path comes from `ZED_INDEX_TSSERVER`, and is logged when the
+    /// server starts so a run never hides what it reached for.
+    TypeScript,
+    /// Nothing, which is the common case.
+    None,
+}
+
+impl Spoken {
+    /// The options to send with `initialize`.
+    pub fn initialization_options(&self, prime_ahead: bool, cache_entries: u32) -> Value {
+        match self.options {
+            Options::RustAnalyzer => json!({
+                "cachePriming": {"enable": prime_ahead},
+                "lru": {"capacity": cache_entries},
+            }),
+            Options::TypeScript => match std::env::var("ZED_INDEX_TSSERVER") {
+                Ok(path) if !path.is_empty() => json!({"tsserver": {"path": path}}),
+                _ => json!({}),
+            },
+            Options::None => json!({}),
+        }
+    }
 }
 
 pub fn language_server(language: &str) -> Option<Spoken> {
     match language {
         "rust" => Some(Spoken {
             binary: "rust-analyzer",
-            announces_indexing: true,
             arguments: &[],
+            announces_indexing: true,
             how_to_install: "rustup component add rust-analyzer",
-            takes_rust_analyzer_options: true,
+            options: Options::RustAnalyzer,
         }),
         "go" => Some(Spoken {
             binary: "gopls",
-            announces_indexing: true,
             arguments: &[],
+            announces_indexing: true,
             how_to_install: "go install golang.org/x/tools/gopls@latest",
-            takes_rust_analyzer_options: false,
+            options: Options::None,
         }),
         "python" => Some(Spoken {
             binary: "pyright-langserver",
-            announces_indexing: false,
             arguments: &["--stdio"],
+            announces_indexing: false,
             how_to_install: "pip install pyright",
-            takes_rust_analyzer_options: false,
+            options: Options::None,
+        }),
+        // One server for all three: it reads a project's `tsconfig.json` and
+        // serves `.ts`, `.tsx` and `.js` from the same analysis.
+        "typescript" | "tsx" | "javascript" => Some(Spoken {
+            binary: "typescript-language-server",
+            arguments: &["--stdio"],
+            announces_indexing: false,
+            how_to_install: "npm install -g typescript-language-server typescript",
+            options: Options::TypeScript,
         }),
         _ => None,
     }
@@ -718,6 +767,7 @@ pub fn names_bound_in_a_scope(
     match language {
         "go" => go_names_bound_in_a_scope(node, contents),
         "python" => python_names_bound_in_a_scope(node, contents),
+        "typescript" | "tsx" | "javascript" => typescript_names_bound_in_a_scope(node, contents),
         // Rust's own unpacking lives beside the measurement that needs it,
         // because it recurses through pattern nodes rather than reading one.
         _ => Vec::new(),
@@ -801,6 +851,48 @@ fn python_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Ve
         }
         // A type parameter, `def f[T](value: T) -> T:`.
         "type_parameter" => identifiers_under(node, contents),
+        _ => Vec::new(),
+    }
+}
+
+/// What TypeScript and JavaScript bind in a scope. The grammar spells a
+/// parameter four ways and a destructuring pattern five, and a form missed
+/// here is a name the index answers about when it should not.
+fn typescript_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    let named_field = |field: &str| -> Vec<String> {
+        node.child_by_field_name(field)
+            .map(|named| identifiers_under(named, contents))
+            .unwrap_or_default()
+    };
+    match node.kind() {
+        // `const value = 1`, `let { first, second } = pair`.
+        "variable_declarator" => named_field("name"),
+        // A parameter, annotated or not, optional or not.
+        "required_parameter" | "optional_parameter" => named_field("name"),
+        // `value => value * 2` has one bare parameter and no list.
+        "arrow_function" => named_field("parameter"),
+        // Destructuring, in every form the grammar separates. The *key* of a
+        // pattern pair is the property being read and not the name being
+        // bound -- `const { key: bound } = thing` binds `bound` -- so only
+        // the value side is taken.
+        "pair_pattern" => named_field("value"),
+        "shorthand_property_identifier_pattern" => node
+            .utf8_text(contents)
+            .ok()
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default(),
+        "rest_pattern" => identifiers_under(node, contents),
+        "assignment_pattern" | "object_assignment_pattern" => named_field("left"),
+        // `catch (failure)`, and `for (const key in thing)`.
+        "catch_clause" => named_field("parameter"),
+        "for_in_statement" => named_field("left"),
+        // `import * as namespace from "..."` and `import { name as alias }`.
+        // A plain `import { name }` is deliberately not bound: that name is
+        // the exported one, and a rename has to change it here too.
+        "namespace_import" => identifiers_under(node, contents),
+        "import_specifier" => named_field("alias"),
+        // `function f<Element>(...)`.
+        "type_parameter" => named_field("name"),
         _ => Vec::new(),
     }
 }

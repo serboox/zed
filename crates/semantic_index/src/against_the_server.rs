@@ -369,6 +369,8 @@ pub struct Server {
     /// Whether this server announces indexing at all -- see
     /// [`crate::per_language::Spoken::announces_indexing`].
     announces_indexing: bool,
+    /// Which files this server has been told are open, so each is told once.
+    opened: HashSet<String>,
 }
 
 impl Server {
@@ -385,6 +387,13 @@ impl Server {
             )
         })?;
 
+        let options =
+            spoken.initialization_options(matches!(priming, Priming::Ahead), lru_capacity());
+        log::info!(
+            "starting {} {} with {options}",
+            binary.display(),
+            spoken.arguments.join(" ")
+        );
         let mut child = smol::process::Command::new(&binary)
             .args(spoken.arguments)
             .current_dir(root)
@@ -394,8 +403,7 @@ impl Server {
             // server. Whatever this is set to is printed with the numbers, so
             // a constrained run never reads as an unconstrained one.
             .envs(
-                spoken
-                    .takes_rust_analyzer_options
+                (spoken.options == crate::per_language::Options::RustAnalyzer)
                     .then(|| ("RA_LRU_CAP".to_string(), lru_capacity().to_string())),
             )
             .stdin(std::process::Stdio::piped())
@@ -426,6 +434,7 @@ impl Server {
             next_id: 1,
             progress: ProgressTracker::default(),
             announces_indexing: spoken.announces_indexing,
+            opened: HashSet::new(),
         };
 
         let root_uri = url::Url::from_directory_path(root).map_err(|()| {
@@ -451,22 +460,7 @@ impl Server {
                     // can answer about, and what it considers a reference, must
                     // be exactly what a person editing this project would get.
                     // Only what it computes *ahead of being asked* is changed.
-                    // Only a server that understands these is given them.
-                    // Sending them to one that does not is asking it to
-                    // ignore part of the request without saying so.
-                    "initializationOptions": if spoken.takes_rust_analyzer_options {
-                        json!({
-                            // Whether the server works the whole project out
-                            // before the first question or as each one
-                            // arrives. See [`Priming`]: it is a trade of
-                            // memory against the cost of the first answer,
-                            // and the two stands want opposite ends of it.
-                            "cachePriming": {"enable": matches!(priming, Priming::Ahead)},
-                            "lru": {"capacity": lru_capacity()},
-                        })
-                    } else {
-                        json!({})
-                    },
+                    "initializationOptions": options,
                 }),
                 INITIALIZE_TIMEOUT,
             )
@@ -643,6 +637,39 @@ impl Server {
             });
         }
         Ok(found)
+    }
+
+    /// Tells the server a file is open, the way an editor does. Servers that
+    /// index a whole project ahead of time do not need it; `tsserver` does --
+    /// it answers about a file only once something has opened it, or once the
+    /// file falls inside a `tsconfig.json` it has loaded. Sent once per file,
+    /// and harmless to a server that had already read it.
+    pub async fn open(&mut self, path: &str, language: &str, timeout: Duration) -> Result<()> {
+        let uri = url::Url::from_file_path(self.root.join(path))
+            .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
+        if !self.opened.insert(path.to_string()) {
+            return Ok(());
+        }
+        let text = smol::unblock({
+            let at = self.root.join(path);
+            move || std::fs::read_to_string(at)
+        })
+        .await
+        .with_context(|| format!("reading {path} to tell the server it is open"))?;
+        let _ = timeout;
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
+                    "languageId": language,
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )
+        .await
+        .with_context(|| format!("telling the server {path} is open"))
     }
 
     /// Whether the server has read `path` at all. `textDocument/documentSymbol`
