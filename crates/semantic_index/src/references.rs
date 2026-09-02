@@ -1288,16 +1288,35 @@ fn precision_per_symbol(
 /// means by a character; counting scalars is short by one per astral-plane
 /// character, and this project has source lines with those in them.
 fn columns_of(root: &Path, identity: &Identity) -> Vec<u32> {
-    let Some(row) = identity.line.checked_sub(1) else {
+    columns_where_written(root, &identity.path, identity.line, &identity.name)
+}
+
+/// Whether `name` is written, as a whole identifier, on the one-based `line`
+/// of `path`.
+///
+/// A language server answers about a *symbol*, and a symbol can be reached
+/// under more than one name: `settings_content` re-exports
+/// `language_model_core`'s `ReasoningEffort` as `OpenAiReasoningEffort`, and
+/// asked about the alias the server reports all three hundred uses of the
+/// original. Renaming the alias changes none of them, so they are not places
+/// a rename has to touch -- they are the same symbol under a different
+/// spelling, and belong to neither side of this comparison. The recall stand
+/// already leaves re-exports out for the same reason; this is that rule where
+/// references need it.
+fn written_at(root: &Path, path: &str, line: u32, name: &str) -> bool {
+    !columns_where_written(root, path, line, name).is_empty()
+}
+
+fn columns_where_written(root: &Path, path: &str, line: u32, name: &str) -> Vec<u32> {
+    let Some(row) = line.checked_sub(1) else {
         return Vec::new();
     };
-    let Ok(contents) = std::fs::read_to_string(root.join(&identity.path)) else {
+    let Ok(contents) = std::fs::read_to_string(root.join(path)) else {
         return Vec::new();
     };
     let Some(line) = contents.lines().nth(row as usize) else {
         return Vec::new();
     };
-    let name = identity.name.as_str();
     if name.is_empty() {
         return Vec::new();
     }
@@ -1557,6 +1576,10 @@ pub struct Report {
     /// and counted here, because a run where the server failed on many of
     /// them is a run to distrust, not one to report.
     pub probes_the_server_failed: usize,
+    /// Server findings left out because the name asked about is not written
+    /// there: the same symbol reached under an alias or a re-export. Counted
+    /// on neither side -- see [`written_at`].
+    pub under_another_spelling: usize,
     /// Sampled symbols the index refused to answer about, because the name
     /// means more than one thing. Printed beside the sample size: a precision
     /// figure over a subset is only worth reading next to how big the subset
@@ -1661,6 +1684,15 @@ impl fmt::Display for Report {
                  at their own declaration, so it knows of no such symbol -- a branch its build \
                  switches off, or a file it never loaded",
                 self.declaration_the_server_cannot_see
+            )?;
+        }
+        if self.under_another_spelling > 0 {
+            writeln!(
+                out,
+                "{} of the server's findings are counted on neither side: the name asked about \
+                 is not written there, so they are the same symbol under an alias or a re-export \
+                 -- renaming this name changes none of them",
+                self.under_another_spelling
             )?;
         }
         if self.probes_the_server_failed > 0 {
@@ -1783,6 +1815,7 @@ pub async fn measure(
     let mut declined_within_one_crate = 0usize;
     let mut declaration_the_server_cannot_see = 0usize;
     let mut probes_the_server_failed = 0usize;
+    let mut under_another_spelling = 0usize;
     let mut crate_names = names_of_crates(root);
     crate_names.extend(per_language::names_of_packages(language, root, &rust));
     // How many definitions in the project carry each name, so a name that means
@@ -1917,6 +1950,17 @@ pub async fn measure(
         };
         server_timings.push(server_started.elapsed());
 
+        // What the server found under a different spelling is the same symbol
+        // reached through an alias or a re-export, and not a place a rename of
+        // *this* name changes. Counted on neither side, and counted here so a
+        // shrinking comparison is visible rather than silent.
+        let before = the_server_found.len();
+        let the_server_found: Vec<Definition> = the_server_found
+            .into_iter()
+            .filter(|found| written_at(root, &found.path, found.line, &symbol.name))
+            .collect();
+        under_another_spelling += before - the_server_found.len();
+
         answers.push(QueryAnswers {
             query: symbol.name.clone(),
             the_server_found,
@@ -2014,6 +2058,7 @@ pub async fn measure(
         outside_the_servers_project,
         declaration_the_server_cannot_see,
         probes_the_server_failed,
+        under_another_spelling,
         outside_the_servers_sight,
         declined,
         declined_shared_declaration,
@@ -2584,6 +2629,38 @@ mod tests {
                 scan.local_bindings
             );
         }
+    }
+
+    /// A server answers about a symbol, and a symbol can be reached under
+    /// more than one name. Asked about `OpenAiReasoningEffort` -- which is
+    /// how `settings_content` re-exports `language_model_core`'s
+    /// `ReasoningEffort` -- rust-analyzer reported all three hundred uses of
+    /// the original, none of which a rename of the alias would change. Those
+    /// findings belong to neither side.
+    #[test]
+    fn a_finding_where_the_name_is_not_written_belongs_to_neither_side() {
+        let project = project_with(&[
+            ("one.rs", "pub enum Effort {\n    Low,\n}\n"),
+            ("two.rs", "pub use crate::one::Effort as Aliased;\n"),
+            (
+                "three.rs",
+                "fn work(effort: Effort) -> Effort {\n    effort\n}\n",
+            ),
+        ]);
+
+        // The alias is written on line 1 of `two.rs` and nowhere else; the
+        // uses in `three.rs` are the original's spelling.
+        assert!(written_at(project.path(), "two.rs", 1, "Aliased"));
+        assert!(!written_at(project.path(), "three.rs", 1, "Aliased"));
+        // The original is written where it is written, and the boundary check
+        // is the same one the column lookup uses: a longer name that merely
+        // contains it does not count.
+        assert!(written_at(project.path(), "three.rs", 1, "Effort"));
+        assert!(!written_at(project.path(), "two.rs", 1, "ffort"));
+        // A line that does not exist, and an empty name, are not written
+        // anywhere rather than everywhere.
+        assert!(!written_at(project.path(), "one.rs", 99, "Effort"));
+        assert!(!written_at(project.path(), "one.rs", 1, ""));
     }
 
     /// A gate is only called shut where that can be shown. The target keys
