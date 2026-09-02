@@ -329,14 +329,24 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         // parse, not in how they spell a name.
         "typescript" | "tsx" => Some(include_str!("typescript_references.scm")),
         "javascript" => Some(include_str!("javascript_references.scm")),
+        "c" => Some(include_str!("c_references.scm")),
+        "cpp" => Some(include_str!("cpp_references.scm")),
         _ => None,
     }
 }
 
 /// Every language a references query exists for, in the order they were
 /// written, so a caller can say what is covered rather than guess.
-pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] =
-    &["rust", "go", "python", "typescript", "tsx", "javascript"];
+pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
+    "rust",
+    "go",
+    "python",
+    "typescript",
+    "tsx",
+    "javascript",
+    "c",
+    "cpp",
+];
 
 /// The language server to measure a language against, and the environment it
 /// needs. `None` where no server is wired up.
@@ -360,6 +370,11 @@ pub struct Spoken {
     /// server another's options is asking it to ignore part of the request
     /// without saying so.
     pub options: Options,
+    /// An environment variable naming something the server needs to be
+    /// pointed at, and the flag to pass it under. Whatever it resolves to is
+    /// logged when the server starts, so a run never hides what it reached
+    /// for outside the project.
+    pub tool_from_the_environment: Option<(&'static str, &'static str)>,
 }
 
 /// The `initializationOptions` a server takes.
@@ -380,6 +395,22 @@ pub enum Options {
 }
 
 impl Spoken {
+    /// The whole command line, with whatever the environment supplies.
+    pub fn whole_command(&self) -> Vec<String> {
+        let mut whole: Vec<String> = self
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string())
+            .collect();
+        if let Some((variable, flag)) = self.tool_from_the_environment
+            && let Ok(value) = std::env::var(variable)
+            && !value.is_empty()
+        {
+            whole.push(format!("{flag}={value}"));
+        }
+        whole
+    }
+
     /// The options to send with `initialize`.
     pub fn initialization_options(&self, prime_ahead: bool, cache_entries: u32) -> Value {
         match self.options {
@@ -400,6 +431,7 @@ pub fn language_server(language: &str) -> Option<Spoken> {
     match language {
         "rust" => Some(Spoken {
             binary: "rust-analyzer",
+            tool_from_the_environment: None,
             arguments: &[],
             announces_indexing: true,
             how_to_install: "rustup component add rust-analyzer",
@@ -407,6 +439,7 @@ pub fn language_server(language: &str) -> Option<Spoken> {
         }),
         "go" => Some(Spoken {
             binary: "gopls",
+            tool_from_the_environment: None,
             arguments: &[],
             announces_indexing: true,
             how_to_install: "go install golang.org/x/tools/gopls@latest",
@@ -414,15 +447,42 @@ pub fn language_server(language: &str) -> Option<Spoken> {
         }),
         "python" => Some(Spoken {
             binary: "pyright-langserver",
+            tool_from_the_environment: None,
             arguments: &["--stdio"],
             announces_indexing: false,
             how_to_install: "pip install pyright",
+            options: Options::None,
+        }),
+        // One server for both: it reads a project's `compile_commands.json`
+        // and serves the translation units in it, whichever of the two
+        // languages they are written in.
+        "c" | "cpp" => Some(Spoken {
+            binary: "clangd",
+            arguments: &[],
+            // Without a compile database clangd cannot resolve a name across
+            // translation units, and it then reports fewer references than
+            // the grammar does -- measured on `redis/src`, where it missed
+            // real calls to `incrRefCount` in three files. Where the project
+            // has no `compile_commands.json` of its own, one can be pointed
+            // at through the environment.
+            tool_from_the_environment: Some((
+                "ZED_INDEX_COMPILE_COMMANDS",
+                "--compile-commands-dir",
+            )),
+            // clangd does announce indexing, but only once a file is open,
+            // and this stand opens files as it asks about them -- so waiting
+            // for progress before the first question waits for work that has
+            // not been asked for. Measured: it says nothing for two minutes
+            // and then the run gives up.
+            announces_indexing: false,
+            how_to_install: "dnf install clang-tools-extra",
             options: Options::None,
         }),
         // One server for all three: it reads a project's `tsconfig.json` and
         // serves `.ts`, `.tsx` and `.js` from the same analysis.
         "typescript" | "tsx" | "javascript" => Some(Spoken {
             binary: "typescript-language-server",
+            tool_from_the_environment: None,
             arguments: &["--stdio"],
             announces_indexing: false,
             how_to_install: "npm install -g typescript-language-server typescript",
@@ -768,6 +828,7 @@ pub fn names_bound_in_a_scope(
         "go" => go_names_bound_in_a_scope(node, contents),
         "python" => python_names_bound_in_a_scope(node, contents),
         "typescript" | "tsx" | "javascript" => typescript_names_bound_in_a_scope(node, contents),
+        "c" | "cpp" => c_names_bound_in_a_scope(node, contents),
         // Rust's own unpacking lives beside the measurement that needs it,
         // because it recurses through pattern nodes rather than reading one.
         _ => Vec::new(),
@@ -895,6 +956,80 @@ fn typescript_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -
         "type_parameter" => named_field("name"),
         _ => Vec::new(),
     }
+}
+
+/// What C and C++ bind in a scope. The two share every shape that matters
+/// here; C++ adds three of its own, and a shape one grammar does not have
+/// simply never matches.
+fn c_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    let named_field = |field: &str| -> Vec<String> {
+        node.child_by_field_name(field)
+            .map(|named| declared_name_under(named, contents))
+            .unwrap_or_default()
+    };
+    match node.kind() {
+        // `int value = 1;` and `int *pointer, array[4];`. The declarator is
+        // wrapped once per `*`, `[]` or `&`, so the name is looked for
+        // through those rather than at the top of it.
+        //
+        // A struct's own member is deliberately not here: it is a declaration
+        // the outline query records, not a name whose meaning is a scope's.
+        "declaration" | "init_declarator" => named_field("declarator"),
+        // A parameter, with or without a default.
+        "parameter_declaration" | "optional_parameter_declaration" => named_field("declarator"),
+        // `for (auto &item : items)`, and C++'s `auto [first, second] = pair`.
+        "for_range_loop" => named_field("declarator"),
+        "structured_binding_declarator" => declared_name_under(node, contents),
+        // `catch (const Trouble &trouble)` binds its parameter.
+        "catch_clause" => named_field("parameters"),
+        // `using Alias = Thing;` and `namespace fs = std::filesystem;` both
+        // give something declared elsewhere a name here.
+        "alias_declaration" | "namespace_alias_definition" => named_field("name"),
+        // What a lambda captures by name it also binds.
+        "lambda_capture_specifier" => declared_name_under(node, contents),
+        // `template <typename Element>`.
+        "type_parameter_declaration" => declared_name_under(node, contents),
+        _ => Vec::new(),
+    }
+}
+
+/// The name a declarator declares, looked for through the wrappers C puts
+/// around it -- a pointer, a reference, an array, a function's parentheses.
+///
+/// Two parts of a declarator are not the name it declares, and reading either
+/// as one records names that are not bindings at all. A parameter list holds
+/// names belonging to that function's own scope. And what a declarator is
+/// initialised *to* is a value: `int counted = make_holder(1);` declares
+/// `counted`, and reading its initialiser recorded `make_holder` as though a
+/// scope had bound it.
+fn declared_name_under(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    if matches!(
+        node.kind(),
+        // `namespace_identifier` among them for `namespace fs = ...`, whose
+        // name the grammar gives a kind of its own.
+        "identifier" | "field_identifier" | "type_identifier" | "namespace_identifier"
+    ) {
+        return node
+            .utf8_text(contents)
+            .ok()
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default();
+    }
+    if node.kind() == "parameter_list" {
+        return Vec::new();
+    }
+    let initialised_to = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("default_value"));
+    let mut found = Vec::new();
+    let mut walking = node.walk();
+    for child in node.named_children(&mut walking) {
+        if Some(child) == initialised_to {
+            continue;
+        }
+        found.extend(declared_name_under(child, contents));
+    }
+    found
 }
 
 /// Every identifier at or under `node`, which for a name list is exactly the

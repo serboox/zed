@@ -2835,6 +2835,104 @@ mod tests {
         );
     }
 
+    /// The reference kinds C has: a call, a member selection, a designated
+    /// initialiser's member, and a type. A primitive type is deliberately
+    /// absent -- `int` is its own node kind and nobody renames it.
+    #[test]
+    fn each_reference_kind_in_c_is_found_with_the_right_line() {
+        let project = project_with(&[(
+            "one.c",
+            "struct Holder {\n    int value;\n};\n\ntypedef struct Holder Named;\n\nint make_holder(int given) {\n    struct Holder held = {.value = given};\n    return held.value;\n}\n\nint use_it(void) {\n    Named *pointer = 0;\n    int counted = make_holder(1);\n    return counted + pointer->value;\n}\n",
+        )]);
+        let scan = scan_of_language(project.path(), "c");
+
+        let calls = scan.index.references_to("make_holder");
+        assert_eq!(
+            calls.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![14],
+            "the call site, not the declaration on line 7; found {calls:?}"
+        );
+
+        let mut member_lines: Vec<u32> = scan
+            .index
+            .references_to("value")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        member_lines.sort_unstable();
+        assert_eq!(
+            member_lines,
+            vec![8, 9, 15],
+            "the designated initialiser, the `.` read and the `->` read -- never \
+             the member's declaration on line 2"
+        );
+
+        let types = scan.index.references_to("Named");
+        assert_eq!(
+            types.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![13],
+            "the use of the typedef; found {types:?}"
+        );
+        assert!(
+            scan.index.references_to("int").is_empty(),
+            "a primitive type is not a name anybody renames"
+        );
+    }
+
+    /// What C and C++ bind in a scope, over the shapes each one adds: a
+    /// declarator wrapped in `*` or `&`, a structured binding, a range-for, a
+    /// lambda capture, a template parameter, a namespace alias.
+    #[test]
+    fn c_and_cpp_bind_names_through_the_wrappers_around_a_declarator() {
+        let project = project_with(&[
+            (
+                "one.c",
+                "struct Holder {\n    int value;\n};\n\ntypedef struct Holder Named;\n\nint make_holder(int given) {\n    struct Holder held = {.value = given};\n    return held.value;\n}\n\nint use_it(void) {\n    Named *pointer = 0;\n    int counted = make_holder(1);\n    return counted + pointer->value;\n}\n",
+            ),
+            (
+                "two.cpp",
+                "namespace outer {\nclass Holder {\npublic:\n    Holder() : value(1) {}\n    int read() const { return value; }\nprivate:\n    int value;\n};\n}\n\nnamespace shortened = outer;\n\ntemplate <typename Element>\nint work(Element given, const outer::Holder &held) {\n    auto [first, second] = given;\n    for (auto &item : first) {\n        (void)item;\n    }\n    return held.read() + second;\n}\n",
+            ),
+        ]);
+
+        let c = scan_of_language(project.path(), "c");
+        for bound in ["held", "given", "pointer", "counted"] {
+            assert!(
+                c.local_bindings.contains(bound),
+                "{bound} is bound in a scope; bindings were {:?}",
+                c.local_bindings
+            );
+        }
+        // The near misses, each of which recorded a name that is not a
+        // binding: the declarator's own type, the function called in its
+        // initialiser, and the struct member -- a member is a declaration the
+        // outline query records, not a name a scope bound.
+        for named in ["Holder", "Named", "make_holder", "value"] {
+            assert!(
+                !c.local_bindings.contains(named),
+                "{named} is not a name bound in a scope; bindings were {:?}",
+                c.local_bindings
+            );
+        }
+
+        let cpp = scan_of_language(project.path(), "cpp");
+        for bound in [
+            "given",
+            "held",
+            "first",
+            "second",
+            "item",
+            "Element",
+            "shortened",
+        ] {
+            assert!(
+                cpp.local_bindings.contains(bound),
+                "{bound} is bound in a scope; bindings were {:?}",
+                cpp.local_bindings
+            );
+        }
+    }
+
     /// A gate is only called shut where that can be shown. The target keys
     /// this project gates on are decided; a feature, `test` and anything else
     /// is unknown, and an unknown gate is never called shut -- calling one

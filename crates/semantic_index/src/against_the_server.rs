@@ -389,13 +389,14 @@ impl Server {
 
         let options =
             spoken.initialization_options(matches!(priming, Priming::Ahead), lru_capacity());
+        let arguments = spoken.whole_command();
         log::info!(
             "starting {} {} with {options}",
             binary.display(),
-            spoken.arguments.join(" ")
+            arguments.join(" ")
         );
         let mut child = smol::process::Command::new(&binary)
-            .args(spoken.arguments)
+            .args(&arguments)
             .current_dir(root)
             // Bound the server's query cache. Left alone, answering reference
             // queries across a project this size grows past 18 GiB and the
