@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -312,6 +313,445 @@ fn bracketed_list(tokens: tree_sitter::Node) -> Option<tree_sitter::Node> {
     tokens
         .children(&mut walking)
         .find(|child| child.kind() == "token_tree" && opens_with_a_bracket(*child))
+}
+
+/// The references query for a language, or `None` where this fork has not
+/// written one. A language with an `outline.scm` and no references query is
+/// covered for definitions and not for references, which is the honest state
+/// of most of them.
+pub fn references_query(language: &str) -> Option<&'static str> {
+    match language {
+        "rust" => Some(include_str!("rust_references.scm")),
+        "go" => Some(include_str!("go_references.scm")),
+        _ => None,
+    }
+}
+
+/// Every language a references query exists for, in the order they were
+/// written, so a caller can say what is covered rather than guess.
+pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &["rust", "go"];
+
+/// The language server to measure a language against, and the environment it
+/// needs. `None` where no server is wired up.
+pub struct Spoken {
+    /// The executable to look for on `PATH`.
+    pub binary: &'static str,
+    /// What to tell a person who does not have it.
+    pub how_to_install: &'static str,
+    /// Whether the server takes rust-analyzer's `cachePriming` and `lru`
+    /// options. Nothing else understands them, and sending them to a server
+    /// that does not is asking it to ignore part of the request silently.
+    pub takes_rust_analyzer_options: bool,
+}
+
+pub fn language_server(language: &str) -> Option<Spoken> {
+    match language {
+        "rust" => Some(Spoken {
+            binary: "rust-analyzer",
+            how_to_install: "rustup component add rust-analyzer",
+            takes_rust_analyzer_options: true,
+        }),
+        "go" => Some(Spoken {
+            binary: "gopls",
+            how_to_install: "go install golang.org/x/tools/gopls@latest",
+            takes_rust_analyzer_options: false,
+        }),
+        _ => None,
+    }
+}
+
+/// The names a package in the project answers to, which a symbol of the same
+/// name cannot be told apart from by text. For Rust that is the workspace's
+/// crates and their dependencies; for Go it is the last element of every
+/// import path the project writes, plus its own module's.
+///
+/// The disease this closes was measured on Rust: `crates/util` declares
+/// `pub mod serde`, and asking about `serde` by text answered with every
+/// `#[serde(...)]` attribute in the project -- 3552 findings for one name.
+/// Go has it worse, because the qualifier of every call into the standard
+/// library is a plain identifier: `fmt`, `log`, `time`, `errors`, `context`.
+pub fn names_of_packages(language: &str, root: &Path, readable: &Readable) -> HashSet<String> {
+    match language {
+        "go" => go_package_names(root, readable),
+        _ => HashSet::new(),
+    }
+}
+
+/// Every import path under `root`, reduced to the identifier Go code writes
+/// for it, plus the module's own last element from `go.mod`.
+///
+/// Read from the parse tree rather than from the text: a quoted string in a
+/// line before the first declaration is not always an import.
+/// `imports/forward.go` opens with `// Package imports implements a Go
+/// pretty-printer (like package "go/format")`, and reading that as an import
+/// silenced the real `format` symbol in `internal/lsp/cmd/format.go` for a
+/// reason that was not true.
+fn go_package_names(root: &Path, go: &Readable) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Ok(module) = std::fs::read_to_string(root.join("go.mod"))
+        && let Some(path) = module
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("module "))
+        && let Some(last) = path.trim().rsplit('/').next()
+    {
+        names.insert(last.to_string());
+    }
+    for path in walk::files_under(root) {
+        if path.extension().is_none_or(|suffix| suffix != "go") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&go.grammar).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&contents, None) else {
+            continue;
+        };
+        collect_import_names(tree.root_node(), &contents, &mut names);
+    }
+    names
+}
+
+/// The last path element of every `import_spec` under `node`. An import
+/// declaration is a top-level item, so a subtree with none is not walked.
+fn collect_import_names(node: tree_sitter::Node, contents: &[u8], into: &mut HashSet<String>) {
+    if node.kind() == "import_spec" {
+        if let Some(quoted) = node.child_by_field_name("path")
+            && let Ok(text) = quoted.utf8_text(contents)
+            && let Some(last) = text.trim_matches(['"', '`']).rsplit('/').next()
+            && !last.is_empty()
+        {
+            into.insert(last.to_string());
+        }
+        return;
+    }
+    // Nothing inside a function or a type can be an import, and those are
+    // most of a file.
+    if matches!(
+        node.kind(),
+        "function_declaration" | "method_declaration" | "type_declaration"
+    ) {
+        return;
+    }
+    let mut walking = node.walk();
+    for child in node.named_children(&mut walking) {
+        collect_import_names(child, contents, into);
+    }
+}
+
+/// The module path a project's own packages live under, or an empty string
+/// where the language has no such thing. For Go it is `go.mod`'s `module`
+/// line, which is what tells an import inside the project apart from one
+/// outside it.
+pub fn own_path(language: &str, root: &Path) -> String {
+    match language {
+        "go" => std::fs::read_to_string(root.join("go.mod"))
+            .ok()
+            .and_then(|module| {
+                module
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("module "))
+                    .map(|path| path.trim().to_string())
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// The local names, in one file, of packages imported from outside the
+/// project. A name selected through one of these belongs to that package, not
+/// to a same-named symbol in this project -- `*types.Slice` is `go/types`'s
+/// `Slice`, and answering about the project's own `Slice` with all 98 of them
+/// is how one sampled name took a pooled precision figure from 99.7 to 85.5
+/// per cent.
+///
+/// A package inside the project is deliberately not listed: `ssa.Slice` in
+/// this module *is* a reference to this module's `Slice`, and a rename has to
+/// change it.
+pub fn foreign_qualifiers(
+    language: &str,
+    root_node: tree_sitter::Node,
+    contents: &[u8],
+    own_path: &str,
+) -> HashSet<String> {
+    if language != "go" {
+        return HashSet::new();
+    }
+    let mut foreign = HashSet::new();
+    collect_foreign_imports(root_node, contents, own_path, &mut foreign);
+    foreign
+}
+
+fn collect_foreign_imports(
+    node: tree_sitter::Node,
+    contents: &[u8],
+    own_path: &str,
+    into: &mut HashSet<String>,
+) {
+    if node.kind() == "import_spec" {
+        let Some(quoted) = node
+            .child_by_field_name("path")
+            .and_then(|path| path.utf8_text(contents).ok())
+        else {
+            return;
+        };
+        let path = quoted.trim_matches(['"', '`']);
+        // An import of the project's own module is not foreign, and neither
+        // is a relative one.
+        if !own_path.is_empty() && (path == own_path || path.starts_with(&format!("{own_path}/"))) {
+            return;
+        }
+        if path.starts_with('.') {
+            return;
+        }
+        // An alias renames the package locally; without one the local name is
+        // the last element of the path. A dot import puts every name in this
+        // file's own scope, so nothing about it is a qualifier.
+        let local = match node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(contents).ok())
+        {
+            Some(".") | Some("_") => return,
+            Some(alias) => alias.to_string(),
+            None => match path.rsplit('/').next() {
+                Some(last) if !last.is_empty() => last.to_string(),
+                _ => return,
+            },
+        };
+        into.insert(local);
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "function_declaration" | "method_declaration" | "type_declaration"
+    ) {
+        return;
+    }
+    let mut walking = node.walk();
+    for child in node.named_children(&mut walking) {
+        collect_foreign_imports(child, contents, own_path, into);
+    }
+}
+
+/// Whether `named` is selected through a package from outside the project, so
+/// that it names that package's symbol rather than one of this project's.
+pub fn selected_from_a_foreign_package(
+    language: &str,
+    named: tree_sitter::Node,
+    contents: &[u8],
+    foreign: &HashSet<String>,
+) -> bool {
+    if language != "go" || foreign.is_empty() {
+        return false;
+    }
+    let Some(parent) = named.parent() else {
+        return false;
+    };
+    let qualifier = match parent.kind() {
+        // `types.Slice` in a type position.
+        "qualified_type" => parent.child_by_field_name("package"),
+        // `types.NewSlice(...)` and `fmt.Println` in an expression position.
+        // Only where the name is the selected field: the operand of a
+        // selection is not selected through anything.
+        "selector_expression" if parent.child_by_field_name("field") == Some(named) => {
+            parent.child_by_field_name("operand")
+        }
+        _ => return false,
+    };
+    qualifier
+        .filter(|node| matches!(node.kind(), "identifier" | "package_identifier"))
+        .and_then(|node| node.utf8_text(contents).ok())
+        .is_some_and(|text| foreign.contains(text))
+}
+
+/// Whether the server never reads this file at all, as far as reading the
+/// project can tell. What decides the measurement is the server's own answer;
+/// this only names the reason.
+///
+/// For Go the reason is usually the file's name: the go tool takes
+/// `_GOOS.go`, `_GOARCH.go` and `_GOOS_GOARCH.go` as build constraints, so
+/// `mmap_windows.go` is not part of a Linux build and `gopls` never loads it.
+/// A `testdata` directory is skipped by the tool for the same reason -- it
+/// holds inputs, not code.
+pub fn out_of_the_servers_build(language: &str, path: &str) -> bool {
+    match language {
+        "go" => go_out_of_the_build(path),
+        _ => false,
+    }
+}
+
+fn go_out_of_the_build(path: &str) -> bool {
+    if path.split('/').any(|segment| segment == "testdata") {
+        return true;
+    }
+    let Some(stem) = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".go"))
+    else {
+        return false;
+    };
+    // Only the last one or two `_`-separated words can be a constraint, and
+    // only when they name a target the go tool knows.
+    let words: Vec<&str> = stem.split('_').collect();
+    let host_os = go_name_for_os(std::env::consts::OS);
+    let host_arch = go_name_for_arch(std::env::consts::ARCH);
+    let names_a_target =
+        |word: &str| GO_OPERATING_SYSTEMS.contains(&word) || GO_ARCHITECTURES.contains(&word);
+    let matches_the_host = |word: &str| word == host_os || word == host_arch;
+    match words.as_slice() {
+        [.., second_last, last] if names_a_target(second_last) && names_a_target(last) => {
+            !(matches_the_host(second_last) && matches_the_host(last))
+        }
+        [.., last] if names_a_target(last) => !matches_the_host(last),
+        _ => false,
+    }
+}
+
+/// The `GOOS` value for a Rust target-os name, where the two differ. Only the
+/// ones this measurement can actually run on need to agree.
+fn go_name_for_os(rust_name: &str) -> &str {
+    match rust_name {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// The `GOARCH` value for a Rust target-arch name.
+fn go_name_for_arch(rust_name: &str) -> &str {
+    match rust_name {
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        other => other,
+    }
+}
+
+const GO_OPERATING_SYSTEMS: &[&str] = &[
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "hurd",
+    "illumos",
+    "ios",
+    "js",
+    "linux",
+    "nacl",
+    "netbsd",
+    "openbsd",
+    "plan9",
+    "solaris",
+    "wasip1",
+    "windows",
+    "zos",
+];
+
+const GO_ARCHITECTURES: &[&str] = &[
+    "386",
+    "amd64",
+    "amd64p32",
+    "arm",
+    "arm64",
+    "arm64be",
+    "armbe",
+    "loong64",
+    "mips",
+    "mips64",
+    "mips64le",
+    "mips64p32",
+    "mips64p32le",
+    "mipsle",
+    "ppc",
+    "ppc64",
+    "ppc64le",
+    "riscv",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sparc",
+    "sparc64",
+    "wasm",
+];
+
+/// Whether `node` declares names whose meaning is the scope they are read in
+/// -- a local, a parameter, a generic parameter, an import's alias. Such a
+/// name cannot be answered about by text alone, so the index declines to.
+/// Returns the names it declares, or nothing where `node` declares none.
+///
+/// Named per language because the shapes are per language and nothing else
+/// about them generalises: Rust unpacks destructuring patterns, Go declares
+/// with `:=` and with `var`, and neither reads the other's tree.
+pub fn names_bound_in_a_scope(
+    language: &str,
+    node: tree_sitter::Node,
+    contents: &[u8],
+) -> Vec<String> {
+    match language {
+        "go" => go_names_bound_in_a_scope(node, contents),
+        // Rust's own unpacking lives beside the measurement that needs it,
+        // because it recurses through pattern nodes rather than reading one.
+        _ => Vec::new(),
+    }
+}
+
+fn go_names_bound_in_a_scope(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    let named_field = |field: &str| -> Vec<String> {
+        node.child_by_field_name(field)
+            .map(|named| identifiers_under(named, contents))
+            .unwrap_or_default()
+    };
+    match node.kind() {
+        // `x, err := f()` and `var x, y int` and `const limit = 1`.
+        "short_var_declaration" => named_field("left"),
+        "var_spec" | "const_spec" => named_field("name"),
+        // A parameter, a result name, and a method's receiver, which the
+        // grammar writes as a parameter as well.
+        "parameter_declaration" | "variadic_parameter_declaration" => named_field("name"),
+        // `func F[T any]()` and `type S[T any] struct{}`.
+        "type_parameter_declaration" => named_field("name"),
+        // `for key, value := range m` and `for i := range n`.
+        "range_clause" => named_field("left"),
+        // `switch value := thing.(type)` binds `value` once per case arm,
+        // and the grammar hands it over as the switch's own `alias`.
+        "type_switch_statement" => named_field("alias"),
+        // `case received := <-channel:` in a `select`.
+        "receive_statement" => named_field("left"),
+        // `import fancy "path/to/pkg"` gives the package a local name.
+        "import_spec" => named_field("name"),
+        // A labelled statement's name lives in its own namespace, and a
+        // `goto` to it is not a reference to anything a rename touches.
+        "label_name" | "labeled_statement" => {
+            vec![]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Every identifier at or under `node`, which for a name list is exactly the
+/// names it declares.
+fn identifiers_under(node: tree_sitter::Node, contents: &[u8]) -> Vec<String> {
+    if matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "package_identifier"
+    ) {
+        return node
+            .utf8_text(contents)
+            .ok()
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default();
+    }
+    let mut found = Vec::new();
+    let mut walking = node.walk();
+    for child in node.named_children(&mut walking) {
+        found.extend(identifiers_under(child, contents));
+    }
+    found
 }
 
 pub fn is_declaration(language: &str, defined: tree_sitter::Node) -> bool {

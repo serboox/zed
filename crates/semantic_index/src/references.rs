@@ -12,11 +12,19 @@ use crate::against_the_server::{
 use crate::definitions::Definition;
 use crate::languages::{self, Readable};
 use crate::measure::{Spread, as_time, spread_of};
+use crate::per_language;
 use crate::walk;
 
-/// The references query this measurement runs, compiled once per call to
-/// [`measure`] and reused for the whole project.
-const QUERY_TEXT: &str = include_str!("rust_references.scm");
+/// The references query this measurement runs for `language`, compiled once
+/// per call to [`measure`] and reused for the whole project.
+fn query_text(language: &str) -> Result<&'static str> {
+    per_language::references_query(language).with_context(|| {
+        format!(
+            "no references query is written for {language}; the ones that are: {}",
+            per_language::LANGUAGES_WITH_A_REFERENCES_QUERY.join(", ")
+        )
+    })
+}
 
 /// A name found at an exact position: row and column both zero-based, as
 /// tree-sitter and the LSP protocol both count them.
@@ -105,12 +113,14 @@ struct ProjectScan {
 /// The Rust language the rest of the crate already knows how to read, found
 /// the same way [`crate::symbols::build`] and [`crate::structural::search`]
 /// do.
-fn rust_language() -> Result<Readable> {
+fn language_named(name: &str) -> Result<Readable> {
     let (readable, _) = languages::readable();
     readable
         .into_iter()
-        .find(|language| language.name == "rust")
-        .context("Rust is not one of the languages the editor ships an outline query for")
+        .find(|language| language.name == name)
+        .with_context(|| {
+            format!("{name} is not one of the languages the editor ships an outline query for")
+        })
 }
 
 /// The index of a capture by name, or `None` where the query has no such
@@ -215,9 +225,11 @@ fn defined_symbols_pass(root: &Path, rust: &Readable) -> Vec<NamedAt> {
 /// came from.
 fn occurrences_in(
     path: &str,
+    language: &str,
     contents: &[u8],
     query: &tree_sitter::Query,
     tree: &tree_sitter::Tree,
+    foreign: &HashSet<String>,
 ) -> Vec<NamedAt> {
     let capture_names = query.capture_names();
     let mut found = Vec::new();
@@ -234,6 +246,16 @@ fn occurrences_in(
             let Ok(text) = capture.node.utf8_text(contents) else {
                 continue;
             };
+            // A name selected through a package from outside the project is
+            // that package's, not this project's -- whatever it is called.
+            if per_language::selected_from_a_foreign_package(
+                language,
+                capture.node,
+                contents,
+                foreign,
+            ) {
+                continue;
+            }
             let start = capture.node.start_position();
             found.push(NamedAt {
                 path: path.to_string(),
@@ -784,7 +806,19 @@ fn files_a_gated_module_covers(
 }
 
 /// Walks the whole tree once, collecting everything [`FileSpans`] needs.
-fn walk_for_classification(node: tree_sitter::Node, contents: &[u8], into: &mut FileSpans) {
+fn walk_for_classification(
+    language: &str,
+    node: tree_sitter::Node,
+    contents: &[u8],
+    into: &mut FileSpans,
+) {
+    // What a language other than Rust binds in a scope is described beside
+    // the language, not here: the shapes have nothing in common beyond being
+    // names whose meaning is their scope's.
+    into.local_bindings
+        .extend(per_language::names_bound_in_a_scope(
+            language, node, contents,
+        ));
     match node.kind() {
         "macro_invocation" => {
             into.macro_invocations.push((
@@ -860,7 +894,7 @@ fn walk_for_classification(node: tree_sitter::Node, contents: &[u8], into: &mut 
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_for_classification(child, contents, into);
+        walk_for_classification(language, child, contents, into);
     }
 }
 
@@ -868,13 +902,13 @@ fn walk_for_classification(node: tree_sitter::Node, contents: &[u8], into: &mut 
 /// `kind` is left empty: a reference's grammar node kind (`identifier`,
 /// `field_identifier`, and so on) is not the vocabulary `Definition::kind`
 /// otherwise carries, and is not something the comparison needs.
-fn definition_of(named: &NamedAt) -> Definition {
+fn definition_of(named: &NamedAt, language: &str) -> Definition {
     Definition {
         path: named.path.clone(),
         name: named.name.clone(),
         kind: String::new(),
         line: named.row + 1,
-        language: "rust".to_string(),
+        language: language.to_string(),
     }
 }
 
@@ -891,6 +925,7 @@ fn definition_of(named: &NamedAt) -> Definition {
 /// it.
 fn scan_references(
     root: &Path,
+    language: &str,
     rust: &Readable,
     references_query: &tree_sitter::Query,
     defined: Vec<NamedAt>,
@@ -905,6 +940,7 @@ fn scan_references(
     let mut gated_files: Vec<String> = Vec::new();
     let mut files_with_recovery = 0usize;
     let mut dropped_to_recovery = 0usize;
+    let own_path = per_language::own_path(language, root);
 
     for path in rust_files_under(root, rust) {
         let Ok(contents) = std::fs::read(&path) else {
@@ -924,7 +960,7 @@ fn scan_references(
             continue;
         };
         let mut spans = FileSpans::default();
-        walk_for_classification(tree.root_node(), &contents, &mut spans);
+        walk_for_classification(language, tree.root_node(), &contents, &mut spans);
         recovered_rows(tree.root_node(), &mut spans.recovered);
 
         // What recovery produced is not code, and this query's widest pattern
@@ -938,7 +974,16 @@ fn scan_references(
         if !spans.recovered.is_empty() {
             files_with_recovery += 1;
         }
-        let found = occurrences_in(&relative_path, &contents, references_query, &tree);
+        let foreign =
+            per_language::foreign_qualifiers(language, tree.root_node(), &contents, &own_path);
+        let found = occurrences_in(
+            &relative_path,
+            language,
+            &contents,
+            references_query,
+            &tree,
+            &foreign,
+        );
         let before = found.len();
         let kept: Vec<NamedAt> = found
             .into_iter()
@@ -992,7 +1037,7 @@ fn scan_references(
         by_name
             .entry(occurrence.name.clone())
             .or_default()
-            .push(definition_of(&occurrence));
+            .push(definition_of(&occurrence, language));
     }
 
     ProjectScan {
@@ -1255,11 +1300,12 @@ fn is_name_character(character: char) -> bool {
 /// far as reading the source can tell: a `#[cfg]` that is shut here, or a
 /// crate the workspace excludes. The caller adds what the server itself
 /// says about the file, which is the part that decides.
-fn was_the_server_never_looking(root: &Path, extra: &ClassifiedDivergence) -> bool {
+fn was_the_server_never_looking(root: &Path, language: &str, extra: &ClassifiedDivergence) -> bool {
     matches!(
         extra.reason,
         DivergenceReason::BehindACfgAttribute | DivergenceReason::InAModuleGatedByACfg
     ) || excluded_from_the_workspace(root, &extra.identity.path)
+        || per_language::out_of_the_servers_build(language, &extra.identity.path)
 }
 
 /// Why a divergence happened, named honestly rather than forced into a
@@ -1483,6 +1529,11 @@ pub struct Report {
     /// answers nothing about them, so neither side can be held to the
     /// comparison. Counted and printed rather than excused afterwards.
     pub declaration_the_server_cannot_see: usize,
+    /// How many probes the server answered with an error rather than a yes or
+    /// a no. Each is read as a no -- that is the question the probe asks --
+    /// and counted here, because a run where the server failed on many of
+    /// them is a run to distrust, not one to report.
+    pub probes_the_server_failed: usize,
     /// Sampled symbols the index refused to answer about, because the name
     /// means more than one thing. Printed beside the sample size: a precision
     /// figure over a subset is only worth reading next to how big the subset
@@ -1497,8 +1548,8 @@ pub struct Report {
     /// thing that decides whether it is worth refining.
     pub declined_shared_declaration: usize,
     pub declined_local_binding: usize,
-    /// Sampled symbols declined because a crate in the workspace, or one it
-    /// depends on, answers to the same name.
+    /// Sampled symbols declined because a crate or package in the project, or
+    /// one it depends on, answers to the same name.
     pub declined_crate_name: usize,
     /// Of the names declared more than once: how many were declared several
     /// times inside a single crate. Kept because it is the number that closed
@@ -1555,10 +1606,10 @@ impl fmt::Display for Report {
         if self.outside_the_servers_sight > 0 {
             writeln!(
                 out,
-                "{} of the index's extra findings are not counted against it: the code is behind \
-                 a switched-off `#[cfg]`, in a module or file a `#[cfg]` gates, in a cargo target \
-                 whose `required-features` are off, or in a crate the workspace excludes -- so \
-                 the server was never looking at it, while a rename still has to change it",
+                "{} of the index's extra findings are not counted against it: the server itself \
+                 resolves nothing there -- a branch its build switches off, a file it never \
+                 loaded, a package outside the project -- so it was never looking at that code, \
+                 while a rename still has to change it",
                 self.outside_the_servers_sight
             )?;
         }
@@ -1567,7 +1618,7 @@ impl fmt::Display for Report {
                 out,
                 "{} sampled symbols were declined: {} because the name is declared more than \
                  once, {} because it is also a local binding or a generic parameter somewhere, \
-                 {} because a crate answers to the same name",
+                 {} because a crate or a package answers to the same name",
                 self.declined,
                 self.declined_shared_declaration,
                 self.declined_local_binding,
@@ -1575,25 +1626,34 @@ impl fmt::Display for Report {
             )?;
             writeln!(
                 out,
-                "{} of those were declared several times inside one crate, which nothing but a \
-                 type could separate",
+                "{} of those were declared several times inside one crate or package, which \
+                 nothing but a type could separate",
                 self.declined_within_one_crate
             )?;
         }
         if self.declaration_the_server_cannot_see > 0 {
             writeln!(
                 out,
-                "{} sampled symbols were not asked about at all: their own declaration is behind \
-                 a `#[cfg]` the server switches off, or in a file it never reads, so it knows of \
-                 no such symbol",
+                "{} sampled symbols were not asked about at all: the server resolves nothing \
+                 at their own declaration, so it knows of no such symbol -- a branch its build \
+                 switches off, or a file it never loaded",
                 self.declaration_the_server_cannot_see
+            )?;
+        }
+        if self.probes_the_server_failed > 0 {
+            writeln!(
+                out,
+                "{} probes the server answered with an error rather than yes or no; each was \
+                 read as a no, which is the question the probe asks -- but a large number here \
+                 means the figures above rest on the server failing, not on it disagreeing",
+                self.probes_the_server_failed
             )?;
         }
         if self.outside_the_servers_project > 0 {
             writeln!(
                 out,
-                "{} sampled symbols were in files rust-analyzer does not have -- outside the \
-                 cargo graph -- and are counted on neither side",
+                "{} sampled symbols were in files the language server does not have -- outside the \
+                 project it loaded -- and are counted on neither side",
                 self.outside_the_servers_project
             )?;
         }
@@ -1616,7 +1676,7 @@ impl fmt::Display for Report {
         writeln!(
             out,
             "answering a query   index: median {:>10} 95th {:>10} slowest {:>10}\n\
-             {:20}rust-analyzer: median {:>10} 95th {:>10} slowest {:>10}",
+             {:20}the server:    median {:>10} 95th {:>10} slowest {:>10}",
             as_time(self.answering_the_index.median),
             as_time(self.answering_the_index.ninety_fifth),
             as_time(self.answering_the_index.slowest),
@@ -1643,14 +1703,17 @@ impl fmt::Display for Report {
 /// never a report that quietly reads as a pass.
 pub async fn measure(
     root: &Path,
+    language: &str,
     symbol_count: usize,
     indexing_timeout: Duration,
     query_timeout: Duration,
     certainty: Certainty,
 ) -> Result<Report> {
-    let rust = rust_language()?;
-    let references_query = tree_sitter::Query::new(&rust.grammar, QUERY_TEXT)
-        .context("the references query does not compile against the Rust grammar")?;
+    let rust = language_named(language)?;
+    let references_query = tree_sitter::Query::new(&rust.grammar, query_text(language)?)
+        .with_context(|| {
+            format!("the references query does not compile against the {language} grammar")
+        })?;
 
     let definitions_started = Instant::now();
     let defined = defined_symbols_pass(root, &rust);
@@ -1662,7 +1725,7 @@ pub async fn measure(
     );
 
     let references_started = Instant::now();
-    let scan = scan_references(root, &rust, &references_query, defined);
+    let scan = scan_references(root, language, &rust, &references_query, defined);
     let references_pass = references_started.elapsed();
 
     let sampled = sample_symbols(&scan.defined, symbol_count);
@@ -1674,13 +1737,13 @@ pub async fn measure(
     // Lazily: finding every reference needs whole-graph inference, and
     // priming that ahead does not fit in the machine this runs on -- the
     // server is killed before it answers anything at all.
-    let mut server = Server::start(root, Priming::Lazily)
+    let mut server = Server::start(root, language, Priming::Lazily)
         .await
-        .context("starting rust-analyzer")?;
+        .context("starting the language server")?;
     server
         .wait_until_indexed(indexing_timeout)
         .await
-        .context("waiting for rust-analyzer to finish indexing")?;
+        .context("waiting for the language server to finish indexing")?;
 
     let mut answers = Vec::with_capacity(sampled.len());
     let mut index_timings = Vec::with_capacity(sampled.len());
@@ -1696,7 +1759,9 @@ pub async fn measure(
     let mut declined_crate_name = 0usize;
     let mut declined_within_one_crate = 0usize;
     let mut declaration_the_server_cannot_see = 0usize;
-    let crate_names = names_of_crates(root);
+    let mut probes_the_server_failed = 0usize;
+    let mut crate_names = names_of_crates(root);
+    crate_names.extend(per_language::names_of_packages(language, root, &rust));
     // How many definitions in the project carry each name, so a name that means
     // one thing can be told from one that means several.
     let mut declarations_named: HashMap<&str, usize> = HashMap::new();
@@ -1728,12 +1793,22 @@ pub async fn measure(
                     outside_the_servers_project += 1;
                     continue;
                 }
-                return Err(error).with_context(|| {
-                    format!(
-                        "asking rust-analyzer whether it resolves {} at {}:{}:{}",
-                        symbol.name, symbol.path, symbol.row, symbol.column
-                    )
-                });
+                // The probe asks one thing -- does the server resolve this
+                // name here -- and an error is that question answered no.
+                // Counted and printed rather than swallowed: a run where the
+                // server failed on half the probes has to read as suspect,
+                // not as clean.
+                log::warn!(
+                    "the language server could not say whether it resolves {} at {}:{}:{}: \
+                     {error:#}",
+                    symbol.name,
+                    symbol.path,
+                    symbol.row,
+                    symbol.column
+                );
+                probes_the_server_failed += 1;
+                declaration_the_server_cannot_see += 1;
+                continue;
             }
         }
         if certainty == Certainty::OnlyWhenTheNameMeansOneThing {
@@ -1805,7 +1880,7 @@ pub async fn measure(
                 }
                 return Err(error).with_context(|| {
                     format!(
-                        "asking rust-analyzer for references to {} at {}:{}:{}",
+                        "asking the language server for references to {} at {}:{}:{}",
                         symbol.name, symbol.path, symbol.row, symbol.column
                     )
                 });
@@ -1821,7 +1896,7 @@ pub async fn measure(
     }
     anyhow::ensure!(
         !answers.is_empty(),
-        "every one of the {} sampled symbols was in a file rust-analyzer does not have; \
+        "every one of the {} sampled symbols was in a file the language server does not have; \
          there is nothing to compare",
         sampled.len()
     );
@@ -1866,12 +1941,13 @@ pub async fn measure(
                         .downcast_ref::<ServerRefused>()
                         .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
                     if !refused {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "asking rust-analyzer what it resolves at {}:{}",
-                                extra.identity.path, extra.identity.line
-                            )
-                        });
+                        log::warn!(
+                            "the language server could not say what it resolves at {}:{}: \
+                             {error:#}",
+                            extra.identity.path,
+                            extra.identity.line
+                        );
+                        probes_the_server_failed += 1;
                     }
                 }
             }
@@ -1880,11 +1956,11 @@ pub async fn measure(
     }
 
     if let Err(error) = server.shut_down().await {
-        log::warn!("rust-analyzer did not shut down cleanly: {error:#}");
+        log::warn!("the language server did not shut down cleanly: {error:#}");
     }
 
     let never_looking = |extra: &ClassifiedDivergence| {
-        was_the_server_never_looking(root, extra)
+        was_the_server_never_looking(root, language, extra)
             || !seen_by_the_server
                 .get(&extra.identity)
                 .copied()
@@ -1902,6 +1978,7 @@ pub async fn measure(
         symbols_sampled: answers.len(),
         outside_the_servers_project,
         declaration_the_server_cannot_see,
+        probes_the_server_failed,
         outside_the_servers_sight,
         declined,
         declined_shared_declaration,
@@ -1936,8 +2013,12 @@ mod tests {
     }
 
     fn query() -> tree_sitter::Query {
-        let rust = rust_language().expect("Rust is one of the languages the editor ships");
-        tree_sitter::Query::new(&rust.grammar, QUERY_TEXT).expect("the references query compiles")
+        let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
+        tree_sitter::Query::new(
+            &rust.grammar,
+            query_text("rust").expect("Rust has a references query"),
+        )
+        .expect("the references query compiles")
     }
 
     fn project_with(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -1953,10 +2034,19 @@ mod tests {
     }
 
     fn scan_of(project: &std::path::Path) -> ProjectScan {
-        let rust = rust_language().expect("Rust is one of the languages the editor ships");
-        let references_query = query();
-        let defined = defined_symbols_pass(project, &rust);
-        scan_references(project, &rust, &references_query, defined)
+        scan_of_language(project, "rust")
+    }
+
+    fn scan_of_language(project: &std::path::Path, name: &str) -> ProjectScan {
+        let language =
+            language_named(name).expect("the language is one the editor ships an outline for");
+        let references_query = tree_sitter::Query::new(
+            &language.grammar,
+            query_text(name).expect("the language has a references query"),
+        )
+        .expect("the references query compiles");
+        let defined = defined_symbols_pass(project, &language);
+        scan_references(project, name, &language, &references_query, defined)
     }
 
     /// A call, a type use, a field access and a macro invocation are each
@@ -1997,12 +2087,18 @@ mod tests {
              annotation -- never the struct's own declaration on line 1"
         );
 
-        let fields = scan.index.references_to("value");
-        assert_eq!(fields.len(), 1, "{fields:?}");
+        let mut field_lines: Vec<u32> = scan
+            .index
+            .references_to("value")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        field_lines.sort_unstable();
         assert_eq!(
-            fields[0].line, 11,
-            "the field read, not the field's declaration or its use as a struct \
-             literal's own key"
+            field_lines,
+            vec![6, 11],
+            "the struct expression's own key and the field read -- both are places a \
+             rename has to change; never the field's declaration on line 2"
         );
 
         let macros = scan.index.references_to("println");
@@ -2116,6 +2212,246 @@ mod tests {
         // are astral-plane, so each counts as two code units, which is what
         // puts the second column at 36 rather than 34.
         assert_eq!(columns, vec![4, 36], "columns were {columns:?}");
+    }
+
+    /// A field named in a struct expression is a reference to the field, and
+    /// the place a rename most obviously has to change. The grammar calls it a
+    /// `field_identifier` inside a `field_initializer`, not the plain
+    /// `identifier` the widest pattern catches, so it needed its own pattern:
+    /// eight of eighteen misses in one run were exactly this.
+    #[test]
+    fn a_field_named_in_a_struct_expression_is_a_reference_to_it() {
+        let project = project_with(&[(
+            "one.rs",
+            "struct Holder {\n    value: u32,\n    other: u32,\n}\n\n             fn make(other: u32) -> Holder {\n                 Holder {\n        value: 42,\n        other,\n    }\n}\n",
+        )]);
+        let scan = scan_of(project.path());
+
+        let named = scan.index.references_to("value");
+        assert_eq!(
+            named.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![8],
+            "the initialiser names the field; found {named:?}"
+        );
+        // The shorthand form is a plain identifier, which the widest pattern
+        // already catches -- the parameter it reads and the field it fills
+        // are one word, and neither side can tell them apart anyway.
+        let shorthand = scan.index.references_to("other");
+        assert!(
+            shorthand.iter().any(|found| found.line == 9),
+            "found {shorthand:?}"
+        );
+    }
+
+    /// The four reference kinds in Go: a call, a selected field, a type use
+    /// and a plain name. Written as its own test rather than shared with the
+    /// Rust one, because what the grammar calls each of them is different and
+    /// a shared test would only prove that both languages have identifiers.
+    #[test]
+    fn each_reference_kind_in_go_is_found_with_the_right_line() {
+        let project = project_with(&[(
+            "one.go",
+            "package holding\n\n\
+             type Holder struct {\n\tValue int\n}\n\n\
+             func MakeHolder() Holder {\n\treturn Holder{Value: 42}\n}\n\n\
+             func UseIt() int {\n\th := MakeHolder()\n\treturn h.Value\n}\n",
+        )]);
+        let scan = scan_of_language(project.path(), "go");
+
+        let calls = scan.index.references_to("MakeHolder");
+        assert_eq!(
+            calls.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![12],
+            "the call site, not the declaration on line 7; found {calls:?}"
+        );
+
+        let mut type_lines: Vec<u32> = scan
+            .index
+            .references_to("Holder")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        type_lines.sort_unstable();
+        assert_eq!(
+            type_lines,
+            vec![7, 8],
+            "the result type and the composite literal's own type -- never the \
+             declaration on line 3"
+        );
+
+        let mut field_lines: Vec<u32> = scan
+            .index
+            .references_to("Value")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        field_lines.sort_unstable();
+        assert_eq!(
+            field_lines,
+            vec![8, 13],
+            "the composite literal's key and the selection -- never the field's \
+             declaration on line 4"
+        );
+    }
+
+    /// What Go binds in a scope. Every one of these is a name the index
+    /// declines to answer about, for the same reason a Rust local is: its
+    /// meaning is the scope it is read in, and the index resolves no scopes.
+    #[test]
+    fn go_binds_names_with_short_declarations_parameters_and_ranges() {
+        let project = photographed_go_project();
+        let scan = scan_of_language(project.path(), "go");
+
+        for bound in [
+            "shortly",
+            "declared",
+            "parameter",
+            "result",
+            "receiver",
+            "element",
+            "key",
+            "value",
+            "Element",
+            "aliased",
+            // `switch switched := thing.(type)` and `case received := <-channel:`
+            "switched",
+            "received",
+            "channel",
+            "thing",
+        ] {
+            assert!(
+                scan.local_bindings.contains(bound),
+                "{bound} is bound in a scope; bindings were {:?}",
+                scan.local_bindings
+            );
+        }
+        // The near miss: the type a parameter is declared with, and the
+        // function's own name, are not bindings.
+        for named in ["Holder", "Work"] {
+            assert!(
+                !scan.local_bindings.contains(named),
+                "{named} is not a name bound in a scope; bindings were {:?}",
+                scan.local_bindings
+            );
+        }
+    }
+
+    fn photographed_go_project() -> tempfile::TempDir {
+        project_with(&[(
+            "one.go",
+            "package holding\n\nimport aliased \"encoding/json\"\n\ntype Holder struct {\n\tValue int\n}\n\nfunc Work[Element any](parameter Holder) (result int) {\n\tshortly := 1\n\tvar declared int\n\tfor key, value := range map[int]int{} {\n\t\t_ = key + value\n\t}\n\tfor _, element := range []int{} {\n\t\t_ = element\n\t}\n\tvar thing any\n\tswitch switched := thing.(type) {\n\tcase int:\n\t\t_ = switched\n\t}\n\tchannel := make(chan int)\n\tselect {\n\tcase received := <-channel:\n\t\t_ = received\n\t}\n\t_ = aliased.Marshal\n\treturn shortly + declared\n}\n\nfunc (receiver Holder) Read() int {\n\treturn receiver.Value\n}\n",
+        )])
+    }
+
+    /// A Go file named for another target is not part of this build, and the
+    /// server never loads it. The file's own name is the constraint -- the go
+    /// tool reads `_GOOS.go`, `_GOARCH.go` and `_GOOS_GOARCH.go` that way --
+    /// so the reason can be named without opening the file.
+    #[test]
+    fn a_go_file_named_for_another_target_is_out_of_the_build() {
+        let elsewhere = if std::env::consts::OS == "windows" {
+            "linux"
+        } else {
+            "windows"
+        };
+        for out in [
+            format!("internal/mmap_{elsewhere}.go"),
+            format!("internal/mmap_{elsewhere}_amd64.go"),
+            "internal/testdata/broken.go".to_string(),
+        ] {
+            assert!(
+                per_language::out_of_the_servers_build("go", &out),
+                "{out} should be out of the build"
+            );
+        }
+        for inside in [
+            "internal/mmap.go",
+            "internal/mmap_test.go",
+            "internal/parser_helper.go",
+        ] {
+            assert!(
+                !per_language::out_of_the_servers_build("go", inside),
+                "{inside} is part of this build"
+            );
+        }
+        // And nothing here applies to a language that has no such rule.
+        assert!(!per_language::out_of_the_servers_build(
+            "rust",
+            "crates/gpui_macos/src/window.rs"
+        ));
+    }
+
+    /// The names Go packages answer to, which a symbol of the same name
+    /// cannot be told from. Read from the imports, because that is where the
+    /// identifier a file writes for a package actually appears.
+    #[test]
+    fn go_package_names_are_read_from_the_imports_and_the_module() {
+        let project = project_with(&[
+            ("go.mod", "module example.com/holding\n\ngo 1.24\n"),
+            (
+                "one.go",
+                "// Package holding prints things (like package \"go/format\").\npackage holding\n\nimport (\n\t\"fmt\"\n\t\"encoding/json\"\n)\n\nfunc Work() {\n\tfmt.Println(json.Marshal, \"net/http\")\n}\n",
+            ),
+        ]);
+        let go = language_named("go").expect("Go is one of the languages the editor ships");
+        let names = per_language::names_of_packages("go", project.path(), &go);
+
+        for named in ["holding", "fmt", "json"] {
+            assert!(names.contains(named), "{named} is missing from {names:?}");
+        }
+        // The full path is not what code writes, so it is not a name here.
+        assert!(!names.contains("encoding/json"));
+        // The near miss that silenced a real symbol: a quoted path inside a
+        // package comment is not an import, and neither is a string in a
+        // function body. `x/tools` opens `imports/forward.go` with exactly
+        // the first shape, and reading it as an import declined the real
+        // `format` symbol for a reason that was not true.
+        for invented in ["format", "http"] {
+            assert!(
+                !names.contains(invented),
+                "{invented} is quoted text, not an import; got {names:?}"
+            );
+        }
+    }
+
+    /// A name selected through a package from outside the project is that
+    /// package's, whatever it is called here. `x/tools` declares one
+    /// `type Slice`, and `*types.Slice` -- `go/types`'s own -- occurs 98
+    /// times; answering about the project's `Slice` with all of them took a
+    /// pooled precision figure from 99.7 to 85.5 per cent on one symbol.
+    ///
+    /// The near miss that makes the rule safe: a package *inside* the project
+    /// is not foreign, and a name selected through it is a real reference a
+    /// rename has to change.
+    #[test]
+    fn a_name_selected_through_a_foreign_package_is_not_a_reference_here() {
+        let project = project_with(&[
+            ("go.mod", "module example.com/holding\n\ngo 1.24\n"),
+            (
+                "one.go",
+                "package holding\n\nimport (\n\t\"go/types\"\n\t\"example.com/holding/inner\"\n)\n\ntype Slice struct{}\n\nfunc Work(outside *types.Slice, inside *inner.Slice, own *Slice) {\n\t_, _, _ = outside, inside, own\n}\n",
+            ),
+            ("inner/inner.go", "package inner\n\ntype Slice struct{}\n"),
+        ]);
+        let scan = scan_of_language(project.path(), "go");
+
+        let mut lines: Vec<u32> = scan
+            .index
+            .references_to("Slice")
+            .iter()
+            .map(|found| found.line)
+            .collect();
+        lines.sort_unstable();
+        // Line 10 holds `inner.Slice` and the bare `*Slice`; `types.Slice` on
+        // the same line is `go/types`'s and is not one of them. The two
+        // declarations, on line 8 here and line 3 of the inner package, are
+        // dropped as declarations.
+        assert_eq!(
+            lines,
+            vec![10, 10],
+            "found {:?}",
+            scan.index.references_to("Slice")
+        );
     }
 
     /// A gate is only called shut where that can be shown. The target keys
@@ -2648,14 +2984,14 @@ mod tests {
     #[test]
     fn a_file_that_does_not_parse_contributes_nothing_rather_than_partial_results() {
         let project = project_with(&[("broken.rs", "pub struct Half {\npub fn work(\n")]);
-        let rust = rust_language().expect("Rust is one of the languages the editor ships");
+        let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
         let defined = defined_symbols_pass(project.path(), &rust);
         assert!(
             defined.is_empty(),
             "a file that does not parse defines nothing: {defined:?}"
         );
 
-        let scan = scan_references(project.path(), &rust, &query(), defined);
+        let scan = scan_references(project.path(), "rust", &rust, &query(), defined);
         assert!(scan.index.references_to("Half").is_empty());
         assert!(scan.index.references_to("work").is_empty());
     }

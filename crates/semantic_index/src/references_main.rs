@@ -37,6 +37,7 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let mut root: Option<PathBuf> = None;
+    let mut language = "rust".to_string();
     let mut symbol_count = SYMBOL_COUNT;
     let mut indexing_timeout = INDEXING_TIMEOUT;
     let mut query_timeout = QUERY_TIMEOUT;
@@ -49,6 +50,11 @@ async fn run() -> Result<()> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--root" => root = arguments.next().map(PathBuf::from),
+            "--language" => {
+                language = arguments
+                    .next()
+                    .context("--language wants a language name")?;
+            }
             "--symbols" => {
                 symbol_count = arguments
                     .next()
@@ -78,11 +84,13 @@ async fn run() -> Result<()> {
                     "Measures how well the index's references agree with a language server's.\n\
                      \n\
                      --root <path>               the project to read; the working directory by default\n\
+                     --language <name>           which language to compare (rust; also {})\n\
                      --symbols <n>               how many symbols to compare over ({SYMBOL_COUNT})\n\
                      --indexing-timeout <secs>   how long to wait for the server to finish indexing\n\
                      --query-timeout <secs>      how long one request may take ({})\n\
                      --answer-everything         answer about ambiguous names too, as the first\n\
                      \x20                           measurement did",
+                    semantic_index::per_language::LANGUAGES_WITH_A_REFERENCES_QUERY.join(", "),
                     QUERY_TIMEOUT.as_secs()
                 );
                 return Ok(());
@@ -101,16 +109,21 @@ async fn run() -> Result<()> {
     );
 
     println!(
-        "comparing references under {} over {symbol_count} symbols",
+        "comparing {language} references under {} over {symbol_count} symbols",
         root.display()
     );
-    println!(
-        "rust-analyzer's query cache is capped at {} entries (RA_LRU_CAP); its own default is \
-         128, which does not fit in this machine's memory",
-        semantic_index::against_the_server::lru_capacity()
-    );
+    if semantic_index::per_language::language_server(&language)
+        .is_some_and(|spoken| spoken.takes_rust_analyzer_options)
+    {
+        println!(
+            "rust-analyzer's query cache is capped at {} entries (RA_LRU_CAP); its own default \
+             is 128, which does not fit in this machine's memory",
+            semantic_index::against_the_server::lru_capacity()
+        );
+    }
     let report = measure(
         &root,
+        &language,
         symbol_count,
         indexing_timeout,
         query_timeout,

@@ -35,6 +35,15 @@
       field: (field_identifier) @reference.call)
   ])
 
+; A field named in a struct expression: `Holder { value: 42 }`. The grammar
+; gives this its own node, and the name is a `field_identifier` rather than
+; the `identifier` the widest pattern below would catch -- so without this
+; pattern a field's own initialiser was not a reference to it, which is
+; exactly the place a rename has to change. The shorthand form,
+; `Holder { value }`, *is* a plain `identifier` and needs no pattern here.
+(field_initializer
+  field: (field_identifier) @reference.field)
+
 ; Field access: reading or writing a named field. A method call's own field
 ; expression also matches this pattern -- `x.foo()` is both a call and,
 ; structurally, a field access -- and the Rust side of this measurement keeps

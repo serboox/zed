@@ -64,7 +64,13 @@ impl ServerRefused {
     /// copy, a scratch file, generated output -- is a file it was never going
     /// to answer about, which is a different thing from a request that failed.
     pub fn is_a_file_the_server_does_not_have(&self) -> bool {
+        // Each server words it its own way, and the words are all there is:
+        // both send it as a plain request error with no distinguishing code.
+        // rust-analyzer says "file not found in VFS"; gopls says "no package
+        // metadata for file <uri>", which is what it answers for anything
+        // outside the module it loaded -- a `testdata` directory, most often.
         self.message.starts_with("file not found")
+            || self.message.starts_with("no package metadata for file")
     }
 }
 
@@ -366,11 +372,15 @@ impl Server {
     /// Starts rust-analyzer over `root` and carries out the `initialize` /
     /// `initialized` handshake. Indexing itself is not waited for here --
     /// call [`Server::wait_until_indexed`] before trusting any answer.
-    pub async fn start(root: &Path, priming: Priming) -> Result<Self> {
-        let binary = which::which("rust-analyzer").context(
-            "rust-analyzer is not on PATH; install it (for example `rustup component add \
-             rust-analyzer`) before measuring recall against it",
-        )?;
+    pub async fn start(root: &Path, language: &str, priming: Priming) -> Result<Self> {
+        let spoken = crate::per_language::language_server(language)
+            .with_context(|| format!("no language server is wired up for {language}"))?;
+        let binary = which::which(spoken.binary).with_context(|| {
+            format!(
+                "{} is not on PATH; install it (`{}`) before measuring against it",
+                spoken.binary, spoken.how_to_install
+            )
+        })?;
 
         let mut child = smol::process::Command::new(&binary)
             .current_dir(root)
@@ -379,7 +389,11 @@ impl Server {
             // machine kills it, which measures the machine rather than the
             // server. Whatever this is set to is printed with the numbers, so
             // a constrained run never reads as an unconstrained one.
-            .env("RA_LRU_CAP", lru_capacity().to_string())
+            .envs(
+                spoken
+                    .takes_rust_analyzer_options
+                    .then(|| ("RA_LRU_CAP".to_string(), lru_capacity().to_string())),
+            )
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             // Not read: a short-lived comparison run has no use for
@@ -394,11 +408,11 @@ impl Server {
         let stdin = child
             .stdin
             .take()
-            .context("rust-analyzer's stdin was not piped")?;
+            .with_context(|| format!("{}'s stdin was not piped", spoken.binary))?;
         let stdout = child
             .stdout
             .take()
-            .context("rust-analyzer's stdout was not piped")?;
+            .with_context(|| format!("{}'s stdout was not piped", spoken.binary))?;
 
         let mut server = Self {
             stdin,
@@ -411,7 +425,7 @@ impl Server {
 
         let root_uri = url::Url::from_directory_path(root).map_err(|()| {
             anyhow::anyhow!(
-                "{} is not an absolute path rust-analyzer can use as a workspace root",
+                "{} is not an absolute path a language server can use as a workspace root",
                 root.display()
             )
         })?;
@@ -432,24 +446,31 @@ impl Server {
                     // can answer about, and what it considers a reference, must
                     // be exactly what a person editing this project would get.
                     // Only what it computes *ahead of being asked* is changed.
-                    "initializationOptions": {
-                        // Whether the server works the whole project out before
-                        // the first question or as each one arrives. See
-                        // [`Priming`]: it is a trade of memory against the cost
-                        // of the first answer, and the two stands want opposite
-                        // ends of it.
-                        "cachePriming": {"enable": matches!(priming, Priming::Ahead)},
-                        "lru": {"capacity": lru_capacity()},
+                    // Only a server that understands these is given them.
+                    // Sending them to one that does not is asking it to
+                    // ignore part of the request without saying so.
+                    "initializationOptions": if spoken.takes_rust_analyzer_options {
+                        json!({
+                            // Whether the server works the whole project out
+                            // before the first question or as each one
+                            // arrives. See [`Priming`]: it is a trade of
+                            // memory against the cost of the first answer,
+                            // and the two stands want opposite ends of it.
+                            "cachePriming": {"enable": matches!(priming, Priming::Ahead)},
+                            "lru": {"capacity": lru_capacity()},
+                        })
+                    } else {
+                        json!({})
                     },
                 }),
                 INITIALIZE_TIMEOUT,
             )
             .await
-            .context("rust-analyzer did not answer `initialize`")?;
+            .with_context(|| format!("{} did not answer `initialize`", spoken.binary))?;
         server
             .notify("initialized", json!({}))
             .await
-            .context("telling rust-analyzer it is initialized")?;
+            .with_context(|| format!("telling {} it is initialized", spoken.binary))?;
         Ok(server)
     }
 
@@ -475,8 +496,8 @@ impl Server {
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
-                "rust-analyzer {} within {timeout:?}; the timeout ended the wait, not the \
-                 server -- treat this run as inconclusive, not a pass",
+                "the language server {} within {timeout:?}; the timeout ended the wait, not \
+                 the server -- treat this run as inconclusive, not a pass",
                 if said_anything {
                     "did not finish indexing"
                 } else {

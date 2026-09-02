@@ -169,7 +169,7 @@ async fn run() -> Result<()> {
     // Primed ahead: `workspace/symbol` is answered from the server's name
     // index, which fits here, and a first query that had to build it would
     // blow past this stand's per-query limit.
-    let mut server = Server::start(&root, Priming::Ahead)
+    let mut server = Server::start(&root, "rust", Priming::Ahead)
         .await
         .context("starting rust-analyzer")?;
     let indexing_started = Instant::now();
