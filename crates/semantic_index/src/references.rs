@@ -47,6 +47,39 @@ impl ReferenceIndex {
     }
 }
 
+/// Which of the occurrences text matching found belong to one declaration.
+///
+/// An occurrence the module tree resolves to *another* declaration of the
+/// name is dropped -- that is the whole point of having the tree.
+///
+/// An occurrence the tree cannot explain is the case that decides whether
+/// answering about a shared name is honest at all. It has no explanation for
+/// a method call, a name the prelude brought in, or one a glob did. Where the
+/// name is declared **once**, such an occurrence can only mean that one
+/// declaration, so it is kept. Where the name is declared **several** times it
+/// cannot: keeping it would hand the same occurrence to every declaration of
+/// the name, which is exactly the text matching this replaces, and which
+/// measured 0.9% precision. So it is dropped, and the recall lost with it is
+/// the price of not guessing.
+fn occurrences_of(
+    found_by_text: Vec<Definition>,
+    name: &str,
+    declaration: (&str, u32),
+    shared: bool,
+    module_tree: &crate::modules::ModuleTree,
+) -> Vec<Definition> {
+    let (path, row) = declaration;
+    found_by_text
+        .into_iter()
+        .filter(
+            |found| match module_tree.what_a_name_means(&found.path, name) {
+                Some(means) => means.path == path && means.row == row,
+                None => !shared,
+            },
+        )
+        .collect()
+}
+
 /// Whether the index is willing to answer about a name at all.
 ///
 /// Grouping by name is only sound when the name means one thing in the whole
@@ -647,7 +680,7 @@ fn targets_needing_a_feature(manifest: &str) -> Vec<String> {
 /// unrelated `pub mod collab` in `crates/title_bar`; and nested example
 /// packages such as `crates/gpui_web/examples/hello_web` are their own
 /// workspaces the server never resolves at all.
-fn member_manifests(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn member_manifests(root: &Path) -> Vec<PathBuf> {
     let root_manifest = root.join("Cargo.toml");
     let mut manifests = vec![root_manifest.clone()];
     let Ok(manifest) = std::fs::read_to_string(&root_manifest) else {
@@ -1744,6 +1777,21 @@ pub struct Report {
     /// times inside a single crate. Kept because it is the number that closed
     /// off import-based narrowing -- see the note below.
     pub declined_within_one_crate: usize,
+    /// Of the names declined for being declared more than once: how many have
+    /// their declarations in different modules, and would therefore be told
+    /// apart by a module tree alone -- no types needed. The number that says
+    /// whether resolving names is worth building.
+    pub a_module_tree_would_separate: usize,
+    /// Symbols answered about *although* their name is declared more than
+    /// once, because the module tree knows which module this one is in and
+    /// the occurrences could be filtered by what each file resolves the name
+    /// to. Every one of these would have been a decline before.
+    pub answered_because_the_tree_resolves_it: usize,
+    /// How many of those the index then had something to show for. A shared
+    /// name whose occurrences the tree cannot attribute is answered with an
+    /// empty list, which costs nothing in precision and gains nothing either
+    /// -- so the two numbers have to be read together.
+    pub shared_names_with_something_to_show: usize,
     pub comparison: Comparison,
     pub precision: f64,
     /// The same precision read one symbol at a time -- see [`PerSymbol`].
@@ -1802,6 +1850,18 @@ impl fmt::Display for Report {
                 self.outside_the_servers_sight
             )?;
         }
+        if self.answered_because_the_tree_resolves_it > 0 {
+            writeln!(
+                out,
+                "{} of the symbols answered about have a name declared more than once, and were \
+                 answered anyway -- every one of them was a decline before. Only occurrences the \
+                 module tree attributes to this very declaration are reported for them, so {} of \
+                 the {} had anything to show and the rest answered with an empty list",
+                self.answered_because_the_tree_resolves_it,
+                self.shared_names_with_something_to_show,
+                self.answered_because_the_tree_resolves_it
+            )?;
+        }
         if self.declined > 0 {
             writeln!(
                 out,
@@ -1819,6 +1879,14 @@ impl fmt::Display for Report {
                  nothing but a type could separate",
                 self.declined_within_one_crate
             )?;
+            if self.a_module_tree_would_separate > 0 {
+                writeln!(
+                    out,
+                    "{} of them have their declarations in different modules, and a module tree \
+                     alone would tell those apart -- no types needed",
+                    self.a_module_tree_would_separate
+                )?;
+            }
         }
         if self.declaration_the_server_cannot_see > 0 {
             writeln!(
@@ -1931,6 +1999,40 @@ pub async fn measure(
     let scan = scan_references(root, language, &rust, &references_query, defined);
     let references_pass = references_started.elapsed();
 
+    // Built before the language server starts, and for a reason measured
+    // rather than guessed: rust-analyzer stands at 16.2 GiB of the 18 this
+    // machine allows, so a few hundred megabytes built *after* it is what
+    // puts the container over and gets it killed. Nothing here needs the
+    // server, so nothing here waits for it.
+    let declared_for_the_tree: Vec<(&str, &str, u32, u32)> = scan
+        .defined
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.path.as_str(),
+                symbol.name.as_str(),
+                symbol.row,
+                symbol.column,
+            )
+        })
+        .collect();
+    let module_tree =
+        match crate::modules::read_with(root, &rust, declared_for_the_tree.into_iter()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                // A tree that cannot be read is not a reason to abandon the
+                // run: without one every shared name is declined, which is
+                // where this measurement started. But it must not be silent,
+                // because the numbers would then look like a decision rather
+                // than a failure.
+                log::warn!(
+                    "the module tree could not be read, so every shared name will be \
+                     declined: {error:#}"
+                );
+                crate::modules::ModuleTree::default()
+            }
+        };
+
     let sampled = sample_symbols(&scan.defined, symbol_count);
     anyhow::ensure!(
         !sampled.is_empty(),
@@ -1958,9 +2060,12 @@ pub async fn measure(
     // genuinely ambiguous everywhere, while a name that is also somebody's
     // local variable is ambiguous only where that local is in scope.
     let mut declined_shared_declaration = 0usize;
+    let mut answered_because_the_tree_resolves_it = 0usize;
+    let mut shared_names_with_something_to_show = 0usize;
     let mut declined_local_binding = 0usize;
     let mut declined_crate_name = 0usize;
     let mut declined_within_one_crate = 0usize;
+    let mut a_module_tree_would_separate = 0usize;
     let mut declaration_the_server_cannot_see = 0usize;
     let mut probes_the_server_failed = 0usize;
     let mut under_another_spelling = 0usize;
@@ -2021,13 +2126,20 @@ pub async fn measure(
                 continue;
             }
         }
+        let shared = declarations_named
+            .get(symbol.name.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1;
         if certainty == Certainty::OnlyWhenTheNameMeansOneThing {
-            let shared = declarations_named
-                .get(symbol.name.as_str())
-                .copied()
-                .unwrap_or(0)
-                > 1;
-            if shared {
+            // A name declared more than once used to be declined outright,
+            // because answering by text alone measured 0.9% precision. Now
+            // the module tree is asked first: where it knows which module
+            // this declaration is in, the occurrences can be filtered by
+            // what each one's own file resolves the name to, and answering
+            // is no longer a guess.
+            let resolvable = module_tree.placed(&symbol.path).is_some();
+            if shared && !resolvable {
                 // Where the several declarations live decides whether anything
                 // short of type inference could tell them apart. Declarations
                 // spread across crates are narrowed below by what each file
@@ -2044,6 +2156,19 @@ pub async fn measure(
                 if crates.len() <= 1 {
                     declined_within_one_crate += 1;
                 }
+                // Where the declarations sit in different modules, knowing
+                // which module each is in separates them -- and knowing that
+                // is the module tree and nothing more.
+                let modules: HashSet<(&str, &str)> = scan
+                    .defined
+                    .iter()
+                    .filter(|other| other.name == symbol.name)
+                    .filter_map(|other| module_tree.placed(&other.path))
+                    .map(|placed| (placed.crate_name.as_str(), placed.module_path.as_str()))
+                    .collect();
+                if modules.len() > 1 {
+                    a_module_tree_would_separate += 1;
+                }
                 declined += 1;
                 continue;
             }
@@ -2058,8 +2183,24 @@ pub async fn measure(
                 continue;
             }
         }
+        if certainty == Certainty::OnlyWhenTheNameMeansOneThing && shared {
+            answered_because_the_tree_resolves_it += 1;
+        }
         let index_started = Instant::now();
-        let the_index_found = scan.index.references_to(&symbol.name);
+        let found_by_text = scan.index.references_to(&symbol.name);
+        let the_index_found = occurrences_of(
+            found_by_text,
+            &symbol.name,
+            (symbol.path.as_str(), symbol.row),
+            shared,
+            &module_tree,
+        );
+        if certainty == Certainty::OnlyWhenTheNameMeansOneThing
+            && shared
+            && !the_index_found.is_empty()
+        {
+            shared_names_with_something_to_show += 1;
+        }
         index_timings.push(index_started.elapsed());
 
         let server_started = Instant::now();
@@ -2132,6 +2273,22 @@ pub async fn measure(
     // is decided here, so no wrong answer can be excused by a gate this
     // measurement only thought was shut.
     let mut seen_by_the_server: HashMap<Identity, bool> = HashMap::new();
+    // A probe the server refused because it does not have the file is not a
+    // failed probe -- that is an answer, and `never_looking` uses it. Anything
+    // else is a failure, and is counted and said out loud.
+    let worth_counting = |error: &anyhow::Error, at: &Identity| -> bool {
+        let refused = error
+            .downcast_ref::<ServerRefused>()
+            .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+        if !refused {
+            log::warn!(
+                "the language server could not say what it resolves at {}:{}: {error:#}",
+                at.path,
+                at.line
+            );
+        }
+        !refused
+    };
     for extra in &catalogue.extra {
         if seen_by_the_server.contains_key(&extra.identity) {
             continue;
@@ -2144,36 +2301,36 @@ pub async fn measure(
         }
         let columns = columns_of(root, &extra.identity);
         let row = extra.identity.line.saturating_sub(1);
-        let mut answers = Vec::new();
+        let mut seen = false;
         for column in &columns {
-            answers.push(
-                server
-                    .resolves_at(&extra.identity.path, row, *column, query_timeout)
-                    .await,
-            );
+            match server
+                .resolves_at(&extra.identity.path, row, *column, query_timeout)
+                .await
+            {
+                // One column answering settles the question, which is whether
+                // the server sees this name on this line at all. Asking about
+                // the rest would only grow what the server holds.
+                Ok(true) => {
+                    seen = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if worth_counting(&error, &extra.identity) {
+                        probes_the_server_failed += 1;
+                    }
+                }
+            }
         }
         if columns.is_empty() {
             // The name is not on the line the index reported, which should not
             // happen; asking whether the file is loaded at all is the honest
             // fallback, rather than deciding it without asking.
-            answers.push(server.has_read(&extra.identity.path, query_timeout).await);
-        }
-        let mut seen = false;
-        for answered in answers {
-            match answered {
+            match server.has_read(&extra.identity.path, query_timeout).await {
                 Ok(true) => seen = true,
                 Ok(false) => {}
                 Err(error) => {
-                    let refused = error
-                        .downcast_ref::<ServerRefused>()
-                        .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
-                    if !refused {
-                        log::warn!(
-                            "the language server could not say what it resolves at {}:{}: \
-                             {error:#}",
-                            extra.identity.path,
-                            extra.identity.line
-                        );
+                    if worth_counting(&error, &extra.identity) {
                         probes_the_server_failed += 1;
                     }
                 }
@@ -2213,6 +2370,9 @@ pub async fn measure(
         declined_local_binding,
         declined_crate_name,
         declined_within_one_crate,
+        a_module_tree_would_separate,
+        answered_because_the_tree_resolves_it,
+        shared_names_with_something_to_show,
         comparison,
         precision,
         per_symbol,
@@ -2238,6 +2398,86 @@ mod tests {
             line,
             language: "rust".to_string(),
         }
+    }
+
+    /// Whether an occurrence the module tree cannot explain belongs to the
+    /// declaration being asked about is the whole question behind answering
+    /// about a shared name at all.
+    ///
+    /// `Handle` is declared in two crates here. A file that imports one of
+    /// them explains itself; a file that imports neither -- a method call, a
+    /// prelude name, one a glob brought in -- does not. Keeping the
+    /// unexplained one would hand it to *both* declarations, which is the
+    /// text matching this is meant to replace.
+    #[test]
+    fn an_unexplained_occurrence_goes_to_a_name_declared_once_and_to_no_shared_one() {
+        let project = project_with(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\n    \"crates/first\",\n    \"crates/second\",\n    \"crates/user\",\n]\n",
+            ),
+            ("crates/first/Cargo.toml", "[package]\nname = \"first\"\n"),
+            ("crates/first/src/lib.rs", "pub struct Handle;\n"),
+            ("crates/second/Cargo.toml", "[package]\nname = \"second\"\n"),
+            ("crates/second/src/lib.rs", "pub struct Handle;\n"),
+            ("crates/user/Cargo.toml", "[package]\nname = \"user\"\n"),
+            (
+                "crates/user/src/lib.rs",
+                "pub mod takes_first;\npub mod takes_second;\npub mod takes_neither;\n",
+            ),
+            (
+                "crates/user/src/takes_first.rs",
+                "use first::Handle;\npub fn work(_: Handle) {}\n",
+            ),
+            (
+                "crates/user/src/takes_second.rs",
+                "use second::Handle;\npub fn work(_: Handle) {}\n",
+            ),
+            (
+                "crates/user/src/takes_neither.rs",
+                "pub fn work<T: Named>(thing: T) -> usize { thing.Handle() }\n",
+            ),
+        ]);
+        let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
+        let declared = [
+            ("crates/first/src/lib.rs", "Handle", 0u32, 11u32),
+            ("crates/second/src/lib.rs", "Handle", 0u32, 11u32),
+        ];
+        let tree = crate::modules::read_with(project.path(), &rust, declared.into_iter())
+            .expect("the module tree reads");
+        let found = || {
+            vec![
+                definition("crates/user/src/takes_first.rs", "Handle", 2),
+                definition("crates/user/src/takes_second.rs", "Handle", 2),
+                definition("crates/user/src/takes_neither.rs", "Handle", 1),
+            ]
+        };
+        let kept = |shared: bool| -> Vec<String> {
+            occurrences_of(
+                found(),
+                "Handle",
+                ("crates/first/src/lib.rs", 0),
+                shared,
+                &tree,
+            )
+            .into_iter()
+            .map(|found| found.path)
+            .collect()
+        };
+
+        assert_eq!(
+            kept(true),
+            vec!["crates/user/src/takes_first.rs".to_string()],
+            "a shared name keeps only what the tree attributes to this declaration"
+        );
+        assert_eq!(
+            kept(false),
+            vec![
+                "crates/user/src/takes_first.rs".to_string(),
+                "crates/user/src/takes_neither.rs".to_string(),
+            ],
+            "a name declared once can only mean itself where the tree says nothing"
+        );
     }
 
     fn query() -> tree_sitter::Query {

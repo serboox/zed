@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -118,6 +118,37 @@ pub fn lru_capacity() -> u32 {
 /// rust-analyzer's own default is 128. This is lower because the measuring
 /// machine has 18 GiB and the default does not fit in it.
 const DEFAULT_LRU_CAPACITY: u32 = 16;
+
+/// How many files this measurement leaves open at the same time. rust-analyzer
+/// keeps a syntax tree and the inference it has been asked for live for every
+/// open document, and `lru.capacity` does not bound that -- so a run that
+/// opens a file per sampled symbol and per divergence, and closes none, grows
+/// until the machine's ceiling stops it. Measured: at 600 symbols the
+/// container was `OOMKilled` at 18 GiB.
+///
+/// Closing the oldest changes no answer. `open` sends the file's text with the
+/// notification, so a file asked about again is simply opened again.
+const OPEN_DOCUMENT_BUDGET: usize = 8;
+
+/// Moves `path` to the young end of `opened`, so the budget never closes the
+/// file that is about to be asked about, and says whether it was open at all.
+fn was_already_open(opened: &mut VecDeque<String>, path: &str) -> bool {
+    let Some(at) = opened.iter().position(|open| open == path) else {
+        return false;
+    };
+    if let Some(open) = opened.remove(at) {
+        opened.push_back(open);
+    }
+    true
+}
+
+/// The file the budget gives up, if opening one more has put `opened` over it.
+fn over_the_budget(opened: &mut VecDeque<String>) -> Option<String> {
+    if opened.len() <= OPEN_DOCUMENT_BUDGET {
+        return None;
+    }
+    opened.pop_front()
+}
 
 impl Identity {
     pub fn of(definition: &Definition) -> Self {
@@ -369,8 +400,9 @@ pub struct Server {
     /// Whether this server announces indexing at all -- see
     /// [`crate::per_language::Spoken::announces_indexing`].
     announces_indexing: bool,
-    /// Which files this server has been told are open, so each is told once.
-    opened: HashSet<String>,
+    /// Which files this server has been told are open, oldest first and
+    /// bounded by [`OPEN_DOCUMENT_BUDGET`].
+    opened: VecDeque<String>,
 }
 
 impl Server {
@@ -435,7 +467,7 @@ impl Server {
             next_id: 1,
             progress: ProgressTracker::default(),
             announces_indexing: spoken.announces_indexing,
-            opened: HashSet::new(),
+            opened: VecDeque::new(),
         };
 
         let root_uri = url::Url::from_directory_path(root).map_err(|()| {
@@ -648,7 +680,7 @@ impl Server {
     pub async fn open(&mut self, path: &str, language: &str, timeout: Duration) -> Result<()> {
         let uri = url::Url::from_file_path(self.root.join(path))
             .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
-        if !self.opened.insert(path.to_string()) {
+        if was_already_open(&mut self.opened, path) {
             return Ok(());
         }
         let text = smol::unblock({
@@ -670,7 +702,29 @@ impl Server {
             }),
         )
         .await
-        .with_context(|| format!("telling the server {path} is open"))
+        .with_context(|| format!("telling the server {path} is open"))?;
+        self.opened.push_back(path.to_string());
+        if let Some(oldest) = over_the_budget(&mut self.opened) {
+            // A file this run has finished with. Failing to close it costs
+            // memory, not an answer, so the run goes on and says so.
+            if let Err(error) = self.close(&oldest).await {
+                log::warn!("{error:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells the server a file is closed again, the way an editor does when a
+    /// tab is shut. Nothing asked here depends on a file staying open.
+    async fn close(&mut self, path: &str) -> Result<()> {
+        let uri = url::Url::from_file_path(self.root.join(path))
+            .map_err(|()| anyhow::anyhow!("{path} is not a path under {}", self.root.display()))?;
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri.as_str()}}),
+        )
+        .await
+        .with_context(|| format!("telling the server {path} is closed"))
     }
 
     /// Whether the server has read `path` at all. `textDocument/documentSymbol`
@@ -1395,5 +1449,52 @@ mod tests {
         }];
         let comparison = compare(&answers);
         assert!(comparison.divergent_queries.is_empty());
+    }
+
+    fn open_files(names: &[&str]) -> VecDeque<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_file_already_open_is_not_opened_twice() {
+        let mut opened = open_files(&["one.rs", "two.rs"]);
+        assert!(was_already_open(&mut opened, "one.rs"));
+        assert_eq!(opened.len(), 2);
+    }
+
+    #[test]
+    fn asking_about_an_open_file_again_saves_it_from_the_budget() {
+        let mut opened = open_files(&["one.rs", "two.rs", "three.rs"]);
+        assert!(was_already_open(&mut opened, "one.rs"));
+        assert_eq!(
+            opened.back().map(String::as_str),
+            Some("one.rs"),
+            "the file just asked about must be the last one the budget closes"
+        );
+        assert_eq!(opened.front().map(String::as_str), Some("two.rs"));
+    }
+
+    #[test]
+    fn a_file_never_opened_is_not_reported_as_open() {
+        let mut opened = open_files(&["one.rs"]);
+        assert!(!was_already_open(&mut opened, "two.rs"));
+        assert_eq!(opened.len(), 1);
+    }
+
+    #[test]
+    fn the_budget_gives_up_the_oldest_file_and_only_when_it_is_over() {
+        let mut opened: VecDeque<String> = (0..OPEN_DOCUMENT_BUDGET)
+            .map(|at| format!("file{at}.rs"))
+            .collect();
+        assert_eq!(over_the_budget(&mut opened), None, "exactly at the budget");
+
+        opened.push_back("one-too-many.rs".to_string());
+        assert_eq!(over_the_budget(&mut opened), Some("file0.rs".to_string()));
+        assert_eq!(opened.len(), OPEN_DOCUMENT_BUDGET);
+        assert_eq!(
+            opened.back().map(String::as_str),
+            Some("one-too-many.rs"),
+            "the file just opened is never the one given up"
+        );
     }
 }

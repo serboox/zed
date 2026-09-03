@@ -462,9 +462,17 @@ impl Spoken {
     /// The options to send with `initialize`.
     pub fn initialization_options(&self, prime_ahead: bool, cache_entries: u32) -> Value {
         match self.options {
+            // Nothing switched off here can change an answer this stand
+            // asks for. Definitions, references and document symbols all
+            // come from the same analysis; diagnostics and `cargo check` are
+            // separate passes over it that nothing here reads, and each holds
+            // memory the measuring machine has to find elsewhere -- a
+            // `cargo check` of this workspace alone is 2.6 GiB.
             Options::RustAnalyzer => json!({
                 "cachePriming": {"enable": prime_ahead},
                 "lru": {"capacity": cache_entries},
+                "checkOnSave": false,
+                "diagnostics": {"enable": false},
             }),
             Options::TypeScript => match std::env::var("ZED_INDEX_TSSERVER") {
                 Ok(path) if !path.is_empty() => json!({"tsserver": {"path": path}}),
@@ -1418,5 +1426,23 @@ describe("a suite", () => {
         let mut language = cost(1, 1024 * 1024, 1, Duration::ZERO);
         language.per_megabyte = Duration::from_millis(120);
         assert!(!language.costs_over_twice(rust));
+    }
+
+    #[test]
+    fn rust_analyzer_is_told_to_compute_nothing_this_stand_never_reads() {
+        let spoken = language_server("rust").expect("rust has a language server");
+        let options = spoken.initialization_options(false, 16);
+        assert_eq!(options["checkOnSave"], json!(false));
+        assert_eq!(options["diagnostics"]["enable"], json!(false));
+        assert_eq!(options["cachePriming"]["enable"], json!(false));
+        assert_eq!(options["lru"]["capacity"], json!(16));
+    }
+
+    #[test]
+    fn priming_ahead_and_the_cache_bound_reach_the_server_as_given() {
+        let spoken = language_server("rust").expect("rust has a language server");
+        let options = spoken.initialization_options(true, 128);
+        assert_eq!(options["cachePriming"]["enable"], json!(true));
+        assert_eq!(options["lru"]["capacity"], json!(128));
     }
 }
