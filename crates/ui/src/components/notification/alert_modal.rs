@@ -1,9 +1,8 @@
 use crate::component_prelude::*;
 use crate::prelude::*;
-use crate::{Checkbox, ElevationIndex, ListBulletItem, ToggleState, cyberpunk};
+use crate::{Checkbox, ListBulletItem, ToggleState, cyberpunk};
 use gpui::Action;
 use gpui::FocusHandle;
-use gpui::FontWeight;
 use gpui::IntoElement;
 use gpui::Stateful;
 use smallvec::{SmallVec, smallvec};
@@ -98,7 +97,9 @@ impl RenderOnce for AlertModal {
         let width = self.width.unwrap_or_else(|| px(440.).into());
         let has_default_footer = self.primary_action.is_some() || self.dismiss_label.is_some();
 
-        let mut modal = v_flex()
+        // The shell every window in this fork is built from, narrowed: an
+        // alert asks one question and does not need a form's width.
+        let mut modal = cyberpunk::dialog_shell(cx)
             .when_some(self.key_context, |this, key_context| {
                 this.key_context(key_context.as_str())
             })
@@ -106,10 +107,7 @@ impl RenderOnce for AlertModal {
                 this.track_focus(&focus_handle)
             })
             .id(self.id)
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
-            .w(width)
-            .overflow_hidden();
+            .w(width);
 
         for handler in self.action_handlers {
             modal = handler(modal);
@@ -118,16 +116,7 @@ impl RenderOnce for AlertModal {
         if let Some(header) = self.header {
             modal = modal.child(header);
         } else if let Some(title) = self.title {
-            modal = modal.child(
-                v_flex().pt_3().pr_3().pl_3().pb_1().child(
-                    div()
-                        .cyberpunk_monospace(cx)
-                        .font_weight(FontWeight::EXTRA_BOLD)
-                        .text_size(HeadlineSize::Small.rems())
-                        .text_color(cyberpunk::text_primary())
-                        .child(title.to_uppercase()),
-                ),
-            );
+            modal = modal.child(cyberpunk::dialog_header(title, cx));
         }
 
         if !self.children.is_empty() {
@@ -148,11 +137,7 @@ impl RenderOnce for AlertModal {
             let dismiss_label = self.dismiss_label.unwrap_or_else(|| "Cancel".into());
 
             modal = modal.child(
-                h_flex()
-                    .p_3()
-                    .items_center()
-                    .justify_end()
-                    .gap_1()
+                cyberpunk::dialog_footer()
                     .child(Button::new(dismiss_label.clone(), dismiss_label).color(Color::Muted))
                     .child(Button::new(primary_action.clone(), primary_action)),
             );
