@@ -1154,6 +1154,47 @@ pub fn is_declaration(language: &str, defined: tree_sitter::Node) -> bool {
 /// (`(class_body (method_definition ...))`). A `method_definition`'s parent
 /// is always exactly one of those two node kinds in this grammar, so one
 /// direct parent check is enough; no need to walk further.
+/// Whether `defined` is declared as a member of a type rather than as an
+/// item of a module -- a method, an associated function, a field.
+///
+/// This is the one thing that decides whether a name declared more than once
+/// can be answered about without knowing any types. Two module-level items
+/// of one name are told apart by which module each is in, which a module tree
+/// knows. Two members of one name are told apart by the type of what they are
+/// written on, which nothing short of inference knows -- so a name declared
+/// as a member anywhere is declined rather than half-answered.
+pub fn declares_a_member(language: &str, defined: tree_sitter::Node) -> bool {
+    // Two lists, because the grammars split the same idea two ways. `itself`
+    // holds kinds that *are* a member declaration -- Go writes a method as a
+    // `method_declaration` of its own. `inside` holds the type bodies a
+    // member is declared within.
+    //
+    // The distinction is load-bearing, not tidiness. Rust's outline query
+    // captures `impl Thing` with `@item` on the `impl_item` and `Thing` as
+    // its name, so a rule that counted a container as a member would call
+    // every type with an `impl` block a member -- which is nearly every type
+    // in the project, and exactly the names this is meant to keep answerable.
+    let (itself, inside): (&[&str], &[&str]) = match language {
+        "rust" => (&[], &["impl_item", "trait_item"]),
+        "go" => (&["method_declaration"], &["interface_type"]),
+        "python" => (&[], &["class_definition"]),
+        "typescript" | "tsx" | "javascript" => (&[], &["class_body", "object", "interface_body"]),
+        "c" | "cpp" => (&[], &["field_declaration_list"]),
+        _ => return false,
+    };
+    if itself.contains(&defined.kind()) {
+        return true;
+    }
+    let mut current = defined;
+    while let Some(parent) = current.parent() {
+        if inside.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn is_object_literal_method(defined: tree_sitter::Node) -> bool {
     defined
         .parent()

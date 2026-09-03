@@ -47,37 +47,47 @@ impl ReferenceIndex {
     }
 }
 
-/// Which of the occurrences text matching found belong to one declaration.
+/// Which of the occurrences text matching found belong to one declaration, or
+/// `None` where this cannot answer completely and so must not answer at all.
 ///
 /// An occurrence the module tree resolves to *another* declaration of the
 /// name is dropped -- that is the whole point of having the tree.
 ///
-/// An occurrence the tree cannot explain is the case that decides whether
-/// answering about a shared name is honest at all. It has no explanation for
-/// a method call, a name the prelude brought in, or one a glob did. Where the
-/// name is declared **once**, such an occurrence can only mean that one
-/// declaration, so it is kept. Where the name is declared **several** times it
-/// cannot: keeping it would hand the same occurrence to every declaration of
-/// the name, which is exactly the text matching this replaces, and which
-/// measured 0.9% precision. So it is dropped, and the recall lost with it is
-/// the price of not guessing.
+/// An occurrence the tree cannot explain -- a method call, a name the prelude
+/// brought in, one a glob did -- is the case that decides everything. Where
+/// the name is declared **once**, it can only mean that one declaration, so
+/// it is kept and the answer stands.
+///
+/// Where the name is declared **several** times, one unexplained occurrence
+/// withdraws the whole answer. Renaming is not a search: an answer holding
+/// most of the occurrences renames those and leaves the rest pointing at a
+/// name that no longer exists, which breaks the build without saying so. Two
+/// readings of the same sample say why this is the only honest shape --
+/// keeping the unexplained ones put precision at 60.1%, and dropping them
+/// while answering anyway left 75 of 110 shared names answering with an empty
+/// list and per-symbol recall at 61%. Completeness is checkable here, without
+/// the server, so it is checked.
 fn occurrences_of(
     found_by_text: Vec<Definition>,
     name: &str,
     declaration: (&str, u32),
     shared: bool,
     module_tree: &crate::modules::ModuleTree,
-) -> Vec<Definition> {
+) -> Option<Vec<Definition>> {
     let (path, row) = declaration;
-    found_by_text
-        .into_iter()
-        .filter(
-            |found| match module_tree.what_a_name_means(&found.path, name) {
-                Some(means) => means.path == path && means.row == row,
-                None => !shared,
-            },
-        )
-        .collect()
+    let mut mine = Vec::new();
+    for found in found_by_text {
+        match module_tree.what_a_name_means(&found.path, name) {
+            Some(means) => {
+                if means.path == path && means.row == row {
+                    mine.push(found);
+                }
+            }
+            None if shared => return None,
+            None => mine.push(found),
+        }
+    }
+    Some(mine)
 }
 
 /// Whether the index is willing to answer about a name at all.
@@ -105,6 +115,12 @@ struct ProjectScan {
     /// symbols to ask about, and telling whether a name is ambiguous (defined
     /// more than once in the project) when a divergence is classified.
     defined: Vec<NamedAt>,
+    /// Names the project declares as a member of a type somewhere -- a
+    /// method, an associated function, a field. A name declared more than
+    /// once is answered about only when it is not one of these: two
+    /// module-level items of one name are separated by which module each is
+    /// in, two members of one name only by the type they are written on.
+    members: HashSet<String>,
     index: ReferenceIndex,
     /// Line ranges, one-based inclusive, of every `macro_invocation` per file
     /// -- a reference living only inside one is invisible to this grammar.
@@ -175,18 +191,27 @@ fn rust_files_under(root: &Path, rust: &Readable) -> Vec<PathBuf> {
 
 /// Every symbol the outline query defines in one already-parsed file, with
 /// the exact position of its own name.
+/// What one file declares: where each declaration is, and which of those
+/// names it declares as a member of a type. The two travel together because
+/// `NamedAt` is shared with occurrences, where the distinction means nothing.
+#[derive(Default)]
+struct Declares {
+    at: Vec<NamedAt>,
+    members: HashSet<String>,
+}
+
 fn defined_symbols_in(
     path: &str,
     language: &str,
     contents: &[u8],
     outline: &tree_sitter::Query,
     tree: &tree_sitter::Tree,
-) -> Vec<NamedAt> {
+) -> Declares {
     let Some(name_index) = capture_index(outline, "name") else {
-        return Vec::new();
+        return Declares::default();
     };
     let item_index = capture_index(outline, "item");
-    let mut found = Vec::new();
+    let mut found = Declares::default();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(outline, tree.root_node(), contents);
     while let Some(matched) = matches.next() {
@@ -198,14 +223,14 @@ fn defined_symbols_in(
         // TypeScript's every local `const` counted as a definition: names
         // like `result` looked declared in hundreds of places, so the index
         // declined nearly every symbol it was offered.
-        let declared = item_index
-            .and_then(|item| {
-                matched
-                    .captures
-                    .iter()
-                    .find(|capture| capture.index == item)
-                    .map(|capture| capture.node)
-            })
+        let item = item_index.and_then(|item| {
+            matched
+                .captures
+                .iter()
+                .find(|capture| capture.index == item)
+                .map(|capture| capture.node)
+        });
+        let declared = item
             .map(|node| per_language::is_declaration(language, node))
             .unwrap_or(true);
         if !declared {
@@ -219,7 +244,10 @@ fn defined_symbols_in(
                 continue;
             };
             let start = capture.node.start_position();
-            found.push(NamedAt {
+            if per_language::declares_a_member(language, item.unwrap_or(capture.node)) {
+                found.members.insert(text.to_string());
+            }
+            found.at.push(NamedAt {
                 path: path.to_string(),
                 name: text.to_string(),
                 row: start.row as u32,
@@ -359,6 +387,7 @@ pub fn references_in_text_with(
     // not offered as a place that refers to itself.
     let declared: HashSet<(u32, u32)> =
         defined_symbols_in("", language, contents, &readable.outline, &tree)
+            .at
             .into_iter()
             .map(|symbol| (symbol.row, symbol.column))
             .collect();
@@ -389,8 +418,8 @@ pub fn references_in_text_with(
 /// position needs. This one keeps nothing on disk and answers to nothing but
 /// this measurement -- and its own timing is the plan's "a pass over
 /// definitions" half of the cost ratio this step is gated on.
-fn defined_symbols_pass(root: &Path, language: &str, rust: &Readable) -> Vec<NamedAt> {
-    let mut found = Vec::new();
+fn defined_symbols_pass(root: &Path, language: &str, rust: &Readable) -> Declares {
+    let mut found = Declares::default();
     for path in rust_files_under(root, rust) {
         let Ok(contents) = std::fs::read(&path) else {
             continue;
@@ -410,8 +439,12 @@ fn defined_symbols_pass(root: &Path, language: &str, rust: &Readable) -> Vec<Nam
         // references side makes for a reference.
         let mut recovered = Vec::new();
         recovered_rows(tree.root_node(), &mut recovered);
-        found.extend(
-            defined_symbols_in(&relative_path, language, &contents, &rust.outline, &tree)
+        let declares =
+            defined_symbols_in(&relative_path, language, &contents, &rust.outline, &tree);
+        found.members.extend(declares.members);
+        found.at.extend(
+            declares
+                .at
                 .into_iter()
                 .filter(|symbol| !row_falls_in(&recovered, symbol.row)),
         );
@@ -1127,8 +1160,12 @@ fn scan_references(
     language: &str,
     rust: &Readable,
     references_query: &tree_sitter::Query,
-    defined: Vec<NamedAt>,
+    declares: Declares,
 ) -> ProjectScan {
+    let Declares {
+        at: defined,
+        members,
+    } = declares;
     let mut raw_occurrences = Vec::new();
     let mut macro_spans: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     let mut use_spans: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
@@ -1241,6 +1278,7 @@ fn scan_references(
 
     ProjectScan {
         defined,
+        members,
         index: ReferenceIndex { by_name },
         macro_spans,
         use_spans,
@@ -1376,6 +1414,12 @@ fn precision_over(comparison: &Comparison, set_aside: usize) -> f64 {
 /// share of symbols that clear the gate can be reported beside the figure.
 pub const REQUIRED_PRECISION: f64 = 0.90;
 
+/// The recall a symbol's answer needs for a rename from it to be complete.
+/// Read per symbol and not pooled: pooled recall is decided almost entirely
+/// by whichever symbol the server found the most references to, so it says
+/// nothing about whether renaming any particular symbol would be safe.
+pub const REQUIRED_RECALL: f64 = 0.85;
+
 /// Precision read one symbol at a time. A pooled figure weights every symbol
 /// by how many times its name occurs, which lets a single name decide the
 /// whole number -- and a rename is invoked on one symbol, never on a pool.
@@ -1395,6 +1439,30 @@ pub struct PerSymbol {
     /// Printed, so the figures are never read without knowing how many
     /// symbols they left out.
     pub answered_nothing: usize,
+    /// The same reading for recall: what the index matched over what the
+    /// server found, symbol by symbol. This is the number that says whether
+    /// a rename would be complete, which the pooled figure cannot.
+    pub recall_mean: f64,
+    pub recall_median: f64,
+    pub recall_at_or_above_the_gate: usize,
+    pub recall_judged: usize,
+}
+
+/// The mean, the median, and how many of `readings` reach `gate`.
+fn spread_over(mut readings: Vec<f64>, gate: f64) -> (f64, f64, usize) {
+    if readings.is_empty() {
+        return (1.0, 1.0, 0);
+    }
+    let judged = readings.len();
+    let mean = readings.iter().sum::<f64>() / judged as f64;
+    let at_or_above = readings.iter().filter(|one| **one >= gate).count();
+    readings.sort_by(|left, right| left.total_cmp(right));
+    let median = if judged % 2 == 1 {
+        readings[judged / 2]
+    } else {
+        (readings[judged / 2 - 1] + readings[judged / 2]) / 2.0
+    };
+    (mean, median, at_or_above)
 }
 
 fn precision_per_symbol(
@@ -1409,8 +1477,16 @@ fn precision_per_symbol(
         }
     }
     let mut precisions = Vec::with_capacity(comparison.per_query.len());
+    let mut recalls = Vec::with_capacity(comparison.per_query.len());
     let mut answered_nothing = 0usize;
     for (at, outcome) in comparison.per_query.iter().enumerate() {
+        // Recall is read over every query the server found anything for,
+        // including the ones the index answered nothing about: a silence is
+        // not a wrong answer, but it is a missed one, and leaving it out
+        // would read as though the rename had been complete.
+        if outcome.the_server_found > 0 {
+            recalls.push(outcome.matched as f64 / outcome.the_server_found as f64);
+        }
         let set_aside = set_aside_by_query.get(&at).copied().unwrap_or(0);
         let wrong = outcome.extra.saturating_sub(set_aside);
         let findings = outcome.matched + wrong;
@@ -1420,33 +1496,21 @@ fn precision_per_symbol(
         }
         precisions.push(outcome.matched as f64 / findings as f64);
     }
-    if precisions.is_empty() {
-        return PerSymbol {
-            mean: 1.0,
-            median: 1.0,
-            at_or_above_the_gate: 0,
-            judged: 0,
-            answered_nothing,
-        };
-    }
+    let recall_judged = recalls.len();
+    let (recall_mean, recall_median, recall_at_or_above_the_gate) =
+        spread_over(recalls, REQUIRED_RECALL);
     let judged = precisions.len();
-    let mean = precisions.iter().sum::<f64>() / judged as f64;
-    let at_or_above_the_gate = precisions
-        .iter()
-        .filter(|precision| **precision >= REQUIRED_PRECISION)
-        .count();
-    precisions.sort_by(|left, right| left.total_cmp(right));
-    let median = if judged % 2 == 1 {
-        precisions[judged / 2]
-    } else {
-        (precisions[judged / 2 - 1] + precisions[judged / 2]) / 2.0
-    };
+    let (mean, median, at_or_above_the_gate) = spread_over(precisions, REQUIRED_PRECISION);
     PerSymbol {
         mean,
         median,
         at_or_above_the_gate,
         judged,
         answered_nothing,
+        recall_mean,
+        recall_median,
+        recall_at_or_above_the_gate,
+        recall_judged,
     }
 }
 
@@ -1777,6 +1841,15 @@ pub struct Report {
     /// times inside a single crate. Kept because it is the number that closed
     /// off import-based narrowing -- see the note below.
     pub declined_within_one_crate: usize,
+    /// Of the names declined for being declared more than once: how many are
+    /// declared as a member of a type somewhere, which is what puts them out
+    /// of a module tree's reach for good rather than for now.
+    pub declined_a_member: usize,
+    /// Names declared more than once whose answer was withdrawn because one
+    /// of their occurrences could not be placed. The module tree separated
+    /// the declarations; it could not account for every use, and a rename
+    /// that misses one is not worth having.
+    pub declined_incomplete: usize,
     /// Of the names declined for being declared more than once: how many have
     /// their declarations in different modules, and would therefore be told
     /// apart by a module tree alone -- no types needed. The number that says
@@ -1831,6 +1904,17 @@ impl fmt::Display for Report {
             self.per_symbol.judged,
             REQUIRED_PRECISION * 100.0
         )?;
+        writeln!(
+            out,
+            "and the same for recall: {:.1}% on average and {:.1}% at the median; {} of {} \
+             symbols the server found anything for were answered at {:.0}% or better -- the \
+             figure a rename's completeness turns on",
+            self.per_symbol.recall_mean * 100.0,
+            self.per_symbol.recall_median * 100.0,
+            self.per_symbol.recall_at_or_above_the_gate,
+            self.per_symbol.recall_judged,
+            REQUIRED_RECALL * 100.0
+        )?;
         if self.per_symbol.answered_nothing > 0 {
             writeln!(
                 out,
@@ -1879,6 +1963,24 @@ impl fmt::Display for Report {
                  nothing but a type could separate",
                 self.declined_within_one_crate
             )?;
+            if self.declined_incomplete > 0 {
+                writeln!(
+                    out,
+                    "{} of those were separated by the module tree and still declined: one of \
+                     their occurrences could not be placed, so the answer would have renamed \
+                     some uses and left the rest behind",
+                    self.declined_incomplete
+                )?;
+            }
+            if self.declined_a_member > 0 {
+                writeln!(
+                    out,
+                    "{} of those name a member of a type somewhere -- a method, an associated \
+                     function, a field. Their occurrences are written on a value, so which \
+                     declaration each means is a question about types and not about modules",
+                    self.declined_a_member
+                )?;
+            }
             if self.a_module_tree_would_separate > 0 {
                 writeln!(
                     out,
@@ -1990,7 +2092,7 @@ pub async fn measure(
     let defined = defined_symbols_pass(root, language, &rust);
     let definitions_pass = definitions_started.elapsed();
     anyhow::ensure!(
-        !defined.is_empty(),
+        !defined.at.is_empty(),
         "no definitions were found under {} to sample symbols from",
         root.display()
     );
@@ -2065,6 +2167,8 @@ pub async fn measure(
     let mut declined_local_binding = 0usize;
     let mut declined_crate_name = 0usize;
     let mut declined_within_one_crate = 0usize;
+    let mut declined_a_member = 0usize;
+    let mut declined_incomplete = 0usize;
     let mut a_module_tree_would_separate = 0usize;
     let mut declaration_the_server_cannot_see = 0usize;
     let mut probes_the_server_failed = 0usize;
@@ -2138,7 +2242,17 @@ pub async fn measure(
             // this declaration is in, the occurrences can be filtered by
             // what each one's own file resolves the name to, and answering
             // is no longer a guess.
-            let resolvable = module_tree.placed(&symbol.path).is_some();
+            // A name the project declares as a member of a type anywhere is
+            // declined however well the module tree places it. The tree
+            // separates the declarations, but almost every occurrence of such
+            // a name is written on a value -- `thing.name()` -- and which
+            // type that value has is the one thing this knows nothing about.
+            // Measured: answering these put recall at 6.3%, because 119 of
+            // 166 shared names had nothing the tree could attribute, and a
+            // rename that finds a fraction of its occurrences breaks the
+            // build without saying so.
+            let a_member = scan.members.contains(symbol.name.as_str());
+            let resolvable = module_tree.placed(&symbol.path).is_some() && !a_member;
             if shared && !resolvable {
                 // Where the several declarations live decides whether anything
                 // short of type inference could tell them apart. Declarations
@@ -2153,6 +2267,9 @@ pub async fn measure(
                     .map(|other| crate_of(&other.path))
                     .collect();
                 declined_shared_declaration += 1;
+                if a_member {
+                    declined_a_member += 1;
+                }
                 if crates.len() <= 1 {
                     declined_within_one_crate += 1;
                 }
@@ -2188,20 +2305,29 @@ pub async fn measure(
         }
         let index_started = Instant::now();
         let found_by_text = scan.index.references_to(&symbol.name);
-        let the_index_found = occurrences_of(
+        let complete = occurrences_of(
             found_by_text,
             &symbol.name,
             (symbol.path.as_str(), symbol.row),
             shared,
             &module_tree,
         );
+        index_timings.push(index_started.elapsed());
+        let Some(the_index_found) = complete else {
+            // A shared name with an occurrence the tree cannot place. The
+            // answer would be incomplete, and an incomplete rename is worse
+            // than none, so this is a decline like any other.
+            declined_shared_declaration += 1;
+            declined_incomplete += 1;
+            declined += 1;
+            continue;
+        };
         if certainty == Certainty::OnlyWhenTheNameMeansOneThing
             && shared
             && !the_index_found.is_empty()
         {
             shared_names_with_something_to_show += 1;
         }
-        index_timings.push(index_started.elapsed());
 
         let server_started = Instant::now();
         let answered = server
@@ -2370,6 +2496,8 @@ pub async fn measure(
         declined_local_binding,
         declined_crate_name,
         declined_within_one_crate,
+        declined_a_member,
+        declined_incomplete,
         a_module_tree_would_separate,
         answered_because_the_tree_resolves_it,
         shared_names_with_something_to_show,
@@ -2452,7 +2580,7 @@ mod tests {
                 definition("crates/user/src/takes_neither.rs", "Handle", 1),
             ]
         };
-        let kept = |shared: bool| -> Vec<String> {
+        let kept = |shared: bool| -> Option<Vec<String>> {
             occurrences_of(
                 found(),
                 "Handle",
@@ -2460,23 +2588,112 @@ mod tests {
                 shared,
                 &tree,
             )
-            .into_iter()
-            .map(|found| found.path)
-            .collect()
+            .map(|found| found.into_iter().map(|one| one.path).collect())
         };
 
         assert_eq!(
             kept(true),
-            vec!["crates/user/src/takes_first.rs".to_string()],
-            "a shared name keeps only what the tree attributes to this declaration"
+            None,
+            "one occurrence the tree cannot place withdraws a shared name's whole answer: \
+             renaming the two it could place and leaving the third breaks the build"
         );
         assert_eq!(
             kept(false),
-            vec![
+            Some(vec![
                 "crates/user/src/takes_first.rs".to_string(),
                 "crates/user/src/takes_neither.rs".to_string(),
-            ],
+            ]),
             "a name declared once can only mean itself where the tree says nothing"
+        );
+    }
+
+    /// The other half of the rule: a shared name every one of whose
+    /// occurrences the tree places *is* answered, and answered with exactly
+    /// those. Without this the rule above would be indistinguishable from
+    /// declining every shared name outright.
+    #[test]
+    fn a_shared_name_whose_every_occurrence_is_placed_is_answered() {
+        let project = project_with(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\n    \"crates/first\",\n    \"crates/second\",\n    \"crates/user\",\n]\n",
+            ),
+            ("crates/first/Cargo.toml", "[package]\nname = \"first\"\n"),
+            ("crates/first/src/lib.rs", "pub struct Handle;\n"),
+            ("crates/second/Cargo.toml", "[package]\nname = \"second\"\n"),
+            ("crates/second/src/lib.rs", "pub struct Handle;\n"),
+            ("crates/user/Cargo.toml", "[package]\nname = \"user\"\n"),
+            (
+                "crates/user/src/lib.rs",
+                "pub mod takes_first;\npub mod takes_second;\n",
+            ),
+            (
+                "crates/user/src/takes_first.rs",
+                "use first::Handle;\npub fn work(_: Handle) {}\n",
+            ),
+            (
+                "crates/user/src/takes_second.rs",
+                "use second::Handle;\npub fn work(_: Handle) {}\n",
+            ),
+        ]);
+        let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
+        let declared = [
+            ("crates/first/src/lib.rs", "Handle", 0u32, 11u32),
+            ("crates/second/src/lib.rs", "Handle", 0u32, 11u32),
+        ];
+        let tree = crate::modules::read_with(project.path(), &rust, declared.into_iter())
+            .expect("the module tree reads");
+        let answered = occurrences_of(
+            vec![
+                definition("crates/user/src/takes_first.rs", "Handle", 2),
+                definition("crates/user/src/takes_second.rs", "Handle", 2),
+            ],
+            "Handle",
+            ("crates/first/src/lib.rs", 0),
+            true,
+            &tree,
+        );
+        assert_eq!(
+            answered.map(|found| found
+                .into_iter()
+                .map(|one| one.path)
+                .collect::<Vec<String>>()),
+            Some(vec!["crates/user/src/takes_first.rs".to_string()]),
+            "every occurrence placed, so the answer stands -- and holds only this \
+             declaration's own"
+        );
+    }
+
+    /// Whether a name is declared as a member of a type is what decides
+    /// whether the index may answer about it at all when the project declares
+    /// it more than once. A module tree separates two module-level items; it
+    /// cannot separate two members, because their occurrences are written on
+    /// a value whose type this knows nothing about.
+    #[test]
+    fn a_name_declared_on_a_type_is_known_to_be_a_member() {
+        let project = project_with(&[(
+            "lib.rs",
+            "pub struct Thing;\nimpl Thing {\n    pub fn shared(&self) {}\n}\npub trait Speaks {\n    fn spoken(&self);\n}\npub fn free_standing() {}\n",
+        )]);
+        let scan = scan_of(project.path());
+
+        assert!(
+            scan.members.contains("shared"),
+            "an inherent method is a member: {:?}",
+            scan.members
+        );
+        assert!(
+            scan.members.contains("spoken"),
+            "a trait method is a member too: {:?}",
+            scan.members
+        );
+        assert!(
+            !scan.members.contains("free_standing"),
+            "a module-level function is not a member, and must stay answerable"
+        );
+        assert!(
+            !scan.members.contains("Thing"),
+            "the type itself is declared by the module, not on a type"
         );
     }
 
@@ -3682,6 +3899,7 @@ mod tests {
     #[test]
     fn a_divergence_whose_name_has_two_definitions_is_classified_as_shared() {
         let scan = ProjectScan {
+            members: HashSet::new(),
             defined: vec![
                 NamedAt {
                     path: "a.rs".to_string(),
@@ -3729,6 +3947,7 @@ mod tests {
         macro_spans.insert("a.rs".to_string(), vec![(4, 4)]);
         let scan = ProjectScan {
             defined: Vec::new(),
+            members: HashSet::new(),
             index: ReferenceIndex {
                 by_name: HashMap::new(),
             },
@@ -3762,8 +3981,9 @@ mod tests {
         let rust = language_named("rust").expect("Rust is one of the languages the editor ships");
         let defined = defined_symbols_pass(project.path(), "rust", &rust);
         assert!(
-            defined.is_empty(),
-            "a file that does not parse defines nothing: {defined:?}"
+            defined.at.is_empty(),
+            "a file that does not parse defines nothing: {:?}",
+            defined.at
         );
 
         let scan = scan_references(project.path(), "rust", &rust, &query(), defined);
