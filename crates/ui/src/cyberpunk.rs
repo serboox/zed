@@ -356,15 +356,17 @@ pub fn dialog_field_on(
     inside: impl gpui::IntoElement,
 ) -> gpui::Div {
     let name = name.into();
-    let shown = name.to_uppercase();
     gpui::div()
         .flex()
         .flex_col()
         .w_full()
         .gap_1()
+        // Mixed case at the same size the reference window labels its fields
+        // with. A field label is read alongside the value under it, not
+        // announced.
         .child(
-            crate::Label::new(shown)
-                .size(crate::LabelSize::XSmall)
+            crate::Label::new(name.clone())
+                .size(crate::LabelSize::Small)
                 .color(crate::Color::Muted),
         )
         .child(
