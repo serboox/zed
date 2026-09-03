@@ -296,6 +296,16 @@ pub fn dialog_field_on(
 
 /// The bar a dialog ends with: a rule above it, and the actions on it. What goes
 /// on it is the caller's, but where it sits and how it is spaced is not.
+///
+/// The actions end in the bottom-right corner of the surface, with the
+/// confirming one last. That is the whole point of the helper and not a default
+/// a call site may override: a row of actions packed at the left edge reads as
+/// part of the form above it rather than as the answer the dialog is waiting
+/// for. `flex_none` goes with it, so the row keeps its full height when the
+/// window is short and the scrollable middle gives way instead.
+///
+/// Anything that belongs on the left -- a path, an error, a count -- is added
+/// before [`dialog_footer_spacer`].
 pub fn dialog_footer() -> gpui::Div {
     gpui::div()
         .flex()
@@ -306,8 +316,18 @@ pub fn dialog_footer() -> gpui::Div {
         .py_2()
         .gap_2()
         .items_center()
+        .justify_end()
         .border_t_1()
         .border_color(border_dim())
+        .debug_selector(|| "DIALOG-FOOTER".to_string())
+}
+
+/// What holds a footer's left-hand side apart from the actions it ends with.
+///
+/// Needed because the row right-aligns everything on it: without this, a leading
+/// label rides along to the right edge and sits against the buttons.
+pub fn dialog_footer_spacer() -> gpui::Div {
+    gpui::div().flex_1()
 }
 
 /// A soft outer glow for the one focal element of a view. Kept low-alpha per
@@ -348,6 +368,7 @@ impl<E: Styled> CyberpunkSurface for E {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Context, Render, Window};
 
     #[test]
     fn warning_and_critical_prompts_confirm_in_red_info_stays_cyan() {
@@ -385,6 +406,126 @@ mod tests {
         assert!(
             surface.l > canvas.l,
             "surface should sit above canvas in the ramp"
+        );
+    }
+
+    struct FooterHost {
+        with_a_left_hand_label: bool,
+    }
+
+    impl Render for FooterHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div().w(gpui::px(600.0)).h(gpui::px(120.0)).child(
+                dialog_footer()
+                    .when(self.with_a_left_hand_label, |this| {
+                        this.child(crate::Label::new("path/to/file"))
+                            .child(dialog_footer_spacer())
+                    })
+                    .child(crate::Button::new("close", "Close"))
+                    .child(crate::Button::new("save", "Save")),
+            )
+        }
+    }
+
+    fn draw_a_footer(
+        cx: &mut gpui::TestAppContext,
+        with_a_left_hand_label: bool,
+    ) -> &mut gpui::VisualTestContext {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| FooterHost {
+            with_a_left_hand_label,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    // Where a dialog's actions are painted, not where the element tree says
+    // they were put: a row packed at the left edge reads as part of the form
+    // above it rather than as the answer the dialog is waiting for. Measured
+    // on the boxes, because that is the whole of the bug.
+    #[gpui::test]
+    async fn a_dialog_footers_actions_are_painted_in_the_bottom_right_corner(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_footer(cx, false);
+
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let save = cx
+            .debug_bounds("BUTTON-Save")
+            .expect("the confirming action is painted");
+        let close = cx
+            .debug_bounds("BUTTON-Close")
+            .expect("the dismissing action is painted");
+
+        let last_seventh = footer.left() + footer.size.width * 0.85;
+        assert!(
+            save.right() > last_seventh,
+            "the confirming action ends at {:?}, left of the corner it belongs in -- \
+             the footer spans {:?}..{:?}",
+            save.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            close.left() > footer.left() + footer.size.width * 0.5,
+            "both actions belong in the right half; the dismissing one starts at {:?} \
+             in a footer spanning {:?}..{:?}",
+            close.left(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            close.right() <= save.left(),
+            "the confirming action comes last, so Close at {:?}..{:?} sits left of \
+             Save at {:?}..{:?}",
+            close.left(),
+            close.right(),
+            save.left(),
+            save.right()
+        );
+    }
+
+    // A footer that also carries something on its left -- a path, a count, an
+    // error -- keeps that on the left while the actions still end in the
+    // corner. A guard rather than a proof: the spacer's `flex_1` would push
+    // the actions right on its own, so this cannot fail from the alignment
+    // being absent, only from the spacer being wired wrongly.
+    #[gpui::test]
+    async fn a_left_hand_label_does_not_ride_along_to_the_corner(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_footer(cx, true);
+
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let close = cx
+            .debug_bounds("BUTTON-Close")
+            .expect("the dismissing action is painted");
+        let save = cx
+            .debug_bounds("BUTTON-Save")
+            .expect("the confirming action is painted");
+
+        assert!(
+            save.right() > footer.left() + footer.size.width * 0.85,
+            "the actions still end in the corner beside a left-hand label"
+        );
+        assert!(
+            close.left() > footer.left() + footer.size.width * 0.5,
+            "the label holds the left, so neither action is dragged into it"
         );
     }
 }

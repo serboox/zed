@@ -1418,7 +1418,7 @@ impl PickerDelegate for WorktreePickerDelegate {
             .w_full()
             .p_1p5()
             .gap_0p5()
-            .justify_between()
+            .justify_end()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
             .child(

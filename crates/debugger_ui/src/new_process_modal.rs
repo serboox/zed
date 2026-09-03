@@ -724,7 +724,7 @@ impl Render for NewProcessModal {
                     .w_full()
                     .p_1p5()
                     .gap_2()
-                    .justify_between()
+                    .justify_end()
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant);
                 let secondary_action = menu::SecondaryConfirm.boxed_clone();
@@ -1484,7 +1484,7 @@ impl PickerDelegate for DebugDelegate {
         let footer = h_flex()
             .w_full()
             .p_1p5()
-            .justify_between()
+            .justify_end()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
             .child({

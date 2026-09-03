@@ -100,9 +100,10 @@ impl Button {
     /// properties to their default values, which can be customized using the
     /// builder pattern methods provided by this struct.
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        Self {
+        let label = label.into();
+        let mut this = Self {
             base: ButtonLike::new(id),
-            label: label.into(),
+            label: label.clone(),
             label_color: None,
             label_size: None,
             selected_label: None,
@@ -114,7 +115,14 @@ impl Button {
             alpha: None,
             truncate: false,
             loading: false,
-        }
+        };
+        // The same lookup key `IconButton` sets, so a test can measure where a
+        // named action was actually painted rather than trusting the tree.
+        this.base.base = this
+            .base
+            .base
+            .debug_selector(move || format!("BUTTON-{label}"));
+        this
     }
 
     /// Sets the color of the button's label.

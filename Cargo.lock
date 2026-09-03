@@ -3162,6 +3162,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "cargo_metadata"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28337,6 +28356,7 @@ dependencies = [
  "auto_update_ui",
  "breadcrumbs",
  "call",
+ "cargo_diagnostics",
  "channel",
  "chrono",
  "clap",

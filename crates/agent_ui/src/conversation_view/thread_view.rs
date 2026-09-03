@@ -9260,7 +9260,7 @@ impl ThreadView {
             .w_full()
             .p_1()
             .gap_2()
-            .justify_between()
+            .justify_end()
             .border_t_1()
             .border_color(self.tool_card_border_color(cx))
             .child(

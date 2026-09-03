@@ -654,7 +654,7 @@ impl PickerDelegate for TasksModalDelegate {
             h_flex()
                 .w_full()
                 .p_1p5()
-                .justify_between()
+                .justify_end()
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child(

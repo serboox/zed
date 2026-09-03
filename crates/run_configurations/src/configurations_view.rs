@@ -2218,6 +2218,9 @@ impl RunConfigurationsView {
                     .color(Color::Error)
                     .into_any_element()
             }))
+            // Where the file is kept, and any trouble with it, stay on the left;
+            // everything the reader can press ends in the corner.
+            .child(ui::cyberpunk::dialog_footer_spacer())
             .child(
                 Button::new("configuration-cancel", "Close")
                     .label_size(LabelSize::Small)
