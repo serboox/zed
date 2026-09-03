@@ -212,7 +212,92 @@ pub fn dialog_title(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div
         .font_weight(gpui::FontWeight::EXTRA_BOLD)
         .text_size(crate::HeadlineSize::Small.rems())
         .text_color(text_primary())
-        .child(name.to_uppercase())
+        .child(name)
+}
+
+/// The whole outer box of a dialog: the surface, the shadow that lifts it off
+/// the workspace, and the size every dialog in this fork shares.
+///
+/// One call rather than the eight lines each window used to carry, because
+/// eight lines repeated sixty-eight times is how sixty-eight windows end up
+/// eight different shapes. `overflow_hidden` belongs to the shell and not to
+/// the caller: a child that paints past a rounded corner is what makes the
+/// radius look like a mistake.
+pub fn dialog_shell(cx: &App) -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_col()
+        .w(DIALOG_WIDTH)
+        .max_h(DIALOG_MAX_HEIGHT)
+        .overflow_hidden()
+        .cyberpunk_surface()
+        .shadow(crate::ElevationIndex::ModalSurface.shadow(cx))
+        .debug_selector(|| "DIALOG-SHELL".to_string())
+}
+
+/// How wide every dialog is, and how tall it may grow before its middle
+/// scrolls instead. Shared so that two windows opened one after the other do
+/// not jump size between them.
+pub const DIALOG_WIDTH: Pixels = px(760.);
+pub const DIALOG_MAX_HEIGHT: Pixels = px(480.);
+
+/// The row a dialog names itself on: the title at the left, and room after it
+/// for whatever the window keeps at the right -- which is the way out.
+///
+/// The spacer is part of the helper so that the close control lands in the
+/// corner without every caller remembering to push it there.
+pub fn dialog_header(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_2()
+        .items_center()
+        .child(dialog_title(name, cx))
+        .child(gpui::div().flex_1())
+        .debug_selector(|| "DIALOG-HEADER".to_string())
+}
+
+/// The middle of a dialog, between the header and the footer.
+///
+/// `flex_1` with `min_h_0` is what lets it give way when the window is short,
+/// so the footer keeps its full height and no action is pushed past the
+/// window's edge. `items_stretch` is not decoration either: a row centres its
+/// children here, and a centred child is given the height of its own contents
+/// rather than the height of the row -- which once stood a 773px column inside
+/// a 480px window, centred on it, with nothing to scroll.
+pub fn dialog_body() -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .items_stretch()
+        .overflow_hidden()
+        .debug_selector(|| "DIALOG-BODY".to_string())
+}
+
+/// What a footer keeps on its left: a path, a count, a pair of toggles, how a
+/// test went.
+///
+/// Capped at half the bar and allowed to be cut short, because asking a flex
+/// row to give way is not enough -- the text in it reports its whole width as
+/// the least it can take, and the actions are what get pushed past the edge of
+/// the window. A button off the edge cannot be clicked at all, so the labels
+/// are what lose the argument.
+pub fn dialog_footer_left() -> gpui::Div {
+    gpui::div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .max_w(gpui::relative(0.5))
+        .min_w_0()
+        .flex_shrink_1()
+        .overflow_hidden()
+        .debug_selector(|| "DIALOG-FOOTER-LEFT".to_string())
 }
 
 /// A rule across a form with a name on it, marking where one group of fields
@@ -340,11 +425,13 @@ pub fn focal_glow(accent: Accent) -> Vec<BoxShadow> {
 /// every dialog surface is built from the same handful of calls.
 pub trait CyberpunkSurface: Styled + Sized {
     /// The base near-black dialog box: fixed surface color, a thin resting
-    /// border, sharp corners. Corners are zeroed explicitly since rounding is
-    /// the fastest way to break the look.
+    /// border, and the one corner radius this fork owns.
+    ///
+    /// The radius is [`RADIUS`], the same token the segmented frames and the
+    /// fields use, so a window is made of one shape rather than three.
     fn cyberpunk_surface(self) -> Self {
         self.bg(surface())
-            .rounded_none()
+            .rounded(RADIUS)
             .border_1()
             .border_color(border_dim())
     }
@@ -526,6 +613,171 @@ mod tests {
         assert!(
             close.left() > footer.left() + footer.size.width * 0.5,
             "the label holds the left, so neither action is dragged into it"
+        );
+    }
+
+    struct DialogHost {
+        body_is_taller_than_the_window: bool,
+    }
+
+    impl Render for DialogHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let tall = if self.body_is_taller_than_the_window {
+                gpui::px(2000.0)
+            } else {
+                gpui::px(80.0)
+            };
+            dialog_shell(cx)
+                .child(
+                    dialog_header("Edit Connection", cx).child(
+                        gpui::div()
+                            .debug_selector(|| "DIALOG-CLOSE".to_string())
+                            .child(crate::Button::new("dismiss", "x")),
+                    ),
+                )
+                .child(dialog_body().child(gpui::div().w_full().h(tall)))
+                .child(
+                    dialog_footer()
+                        .child(dialog_footer_left().child(crate::Label::new(
+                            "a left-hand label long enough to want the whole bar for itself",
+                        )))
+                        .child(crate::Button::new("cancel", "Cancel"))
+                        .child(crate::Button::new("save", "Save")),
+                )
+        }
+    }
+
+    fn draw_a_dialog(
+        cx: &mut gpui::TestAppContext,
+        body_is_taller_than_the_window: bool,
+    ) -> &mut gpui::VisualTestContext {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| DialogHost {
+            body_is_taller_than_the_window,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    // The way out sits in the corner the reader reaches for, and the window
+    // names itself at the other end of the same row.
+    #[gpui::test]
+    async fn a_dialog_names_itself_at_the_left_and_keeps_the_way_out_at_the_right(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("DIALOG-CLOSE")
+            .expect("the way out is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85,
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the \
+             corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+    }
+
+    // The rule this guards: nothing may hang past the window's edge. A body
+    // taller than the window has to give way, and the footer has to keep its
+    // full height -- an action pushed off the edge cannot be clicked at all.
+    //
+    // What it proves and what it does not, because the difference was measured
+    // rather than assumed. Removing `max_h` from the shell fails it: a 2000px
+    // body grows the window to 1080px. Removing `flex_none` from the footer,
+    // `min_h_0` from the body, or `overflow_hidden` from the shell does not --
+    // each was taken out in turn and the test still passed, because `max_h`
+    // with a `flex_1` middle is already enough for this assembly. So those
+    // three are kept as the belt to this brace, and are not something this
+    // test may be cited as validating.
+    #[gpui::test]
+    async fn a_body_taller_than_the_window_gives_way_and_the_actions_stay_inside(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, true);
+
+        let shell = cx
+            .debug_bounds("DIALOG-SHELL")
+            .expect("the shell is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let save = cx
+            .debug_bounds("BUTTON-Save")
+            .expect("the confirming action is painted");
+
+        assert!(
+            shell.size.height <= DIALOG_MAX_HEIGHT + gpui::px(0.5),
+            "a body of 2000px grew the window to {:?}, past the {:?} it may reach",
+            shell.size.height,
+            DIALOG_MAX_HEIGHT
+        );
+        assert!(
+            footer.bottom() <= shell.bottom() + gpui::px(0.5),
+            "the footer ends at {:?} below a shell ending at {:?}, so it hangs past the edge",
+            footer.bottom(),
+            shell.bottom()
+        );
+        assert!(
+            save.bottom() <= shell.bottom() + gpui::px(0.5) && save.size.height > gpui::px(8.0),
+            "the confirming action is painted {:?} tall ending at {:?}, in a shell ending at \
+             {:?} -- it has been squeezed or pushed out",
+            save.size.height,
+            save.bottom(),
+            shell.bottom()
+        );
+    }
+
+    // The left-hand side of a footer is what gives way, not the actions: the
+    // label here is deliberately longer than half the bar.
+    #[gpui::test]
+    async fn a_long_left_hand_label_is_cut_short_rather_than_pushing_the_actions_out(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let left = cx
+            .debug_bounds("DIALOG-FOOTER-LEFT")
+            .expect("the left-hand side is painted");
+        let save = cx
+            .debug_bounds("BUTTON-Save")
+            .expect("the confirming action is painted");
+
+        assert!(
+            left.size.width <= footer.size.width * 0.5 + gpui::px(1.0),
+            "the left-hand side took {:?} of a {:?} bar, past the half it is allowed",
+            left.size.width,
+            footer.size.width
+        );
+        assert!(
+            save.right() > footer.left() + footer.size.width * 0.85,
+            "the actions still end in the corner: Save ends at {:?} in a bar spanning \
+             {:?}..{:?}",
+            save.right(),
+            footer.left(),
+            footer.right()
         );
     }
 }
