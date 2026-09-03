@@ -11,7 +11,7 @@ use project::git_store::{Repository, RepositoryEvent};
 use std::sync::Arc;
 use time::{OffsetDateTime, UtcOffset};
 use time_format;
-use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, Tooltip, cyberpunk, prelude::*};
 use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
@@ -634,16 +634,10 @@ impl PickerDelegate for StashListDelegate {
         let focus_handle = self.focus_handle.clone();
 
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .gap_0p5()
-                .justify_end()
-                .flex_wrap()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            cyberpunk::dialog_footer()
                 .child(
                     Button::new("drop-stash", "Drop")
+                        .style(cyberpunk::Rank::Destructive.style())
                         .key_binding(
                             KeyBinding::for_action_in(
                                 &stash_picker::DropStashItem,
@@ -658,6 +652,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("view-stash", "View")
+                        .style(cyberpunk::Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action_in(
                                 &stash_picker::ShowStashItem,
@@ -674,6 +669,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("pop-stash", "Pop")
+                        .style(cyberpunk::Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::SecondaryConfirm, &focus_handle, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
@@ -684,6 +680,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("apply-stash", "Apply")
+                        .style(cyberpunk::Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),

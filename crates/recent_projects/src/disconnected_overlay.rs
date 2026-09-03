@@ -2,7 +2,10 @@ use gpui::{ClickEvent, DismissEvent, EventEmitter, FocusHandle, Focusable, Rende
 use project::project_settings::ProjectSettings;
 use remote::RemoteConnectionOptions;
 use settings::Settings;
-use ui::{ElevationIndex, Modal, ModalFooter, ModalHeader, Section, prelude::*};
+use ui::{
+    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    prelude::*,
+};
 use workspace::{
     ModalView, MultiWorkspace, OpenOptions, Workspace, notifications::DetachAndPromptErr,
 };
@@ -171,44 +174,38 @@ impl Render for DisconnectedOverlay {
             }
         };
 
-        div()
+        dialog_shell(cx)
             .track_focus(&self.focus_handle(cx))
-            .elevation_3(cx)
             .on_action(cx.listener(Self::cancel))
             .occlude()
-            .w(rems(24.))
-            .max_h(rems(40.))
             .child(
-                Modal::new("disconnected", None)
-                    .header(
-                        ModalHeader::new()
-                            .show_dismiss_button(true)
-                            .child(Headline::new("Disconnected").size(HeadlineSize::Small)),
+                dialog_header("Disconnected", cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel(&menu::Cancel, window, cx)
+                        })),
+                ),
+            )
+            .child(dialog_body().px_3().py_2().child(Label::new(message)))
+            .child(
+                dialog_footer()
+                    .child(
+                        Button::new("close-window", "Close Window")
+                            .style(Rank::Neutral.style())
+                            .on_click(cx.listener(move |_, _, window, _| {
+                                window.remove_window();
+                            })),
                     )
-                    .section(Section::new().child(Label::new(message)))
-                    .footer(
-                        ModalFooter::new().end_slot(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("close-window", "Close Window")
-                                        .style(ButtonStyle::Filled)
-                                        .layer(ElevationIndex::ModalSurface)
-                                        .on_click(cx.listener(move |_, _, window, _| {
-                                            window.remove_window();
-                                        })),
-                                )
-                                .when(can_reconnect, |el| {
-                                    el.child(
-                                        Button::new("reconnect", "Reconnect")
-                                            .style(ButtonStyle::Filled)
-                                            .layer(ElevationIndex::ModalSurface)
-                                            .start_icon(Icon::new(IconName::ArrowCircle))
-                                            .on_click(cx.listener(Self::handle_reconnect)),
-                                    )
-                                }),
-                        ),
-                    ),
+                    .when(can_reconnect, |el| {
+                        el.child(
+                            Button::new("reconnect", "Reconnect")
+                                .style(Rank::Accent.style())
+                                .start_icon(Icon::new(IconName::ArrowCircle))
+                                .on_click(cx.listener(Self::handle_reconnect)),
+                        )
+                    }),
             )
     }
 }

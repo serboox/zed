@@ -253,6 +253,30 @@ pub const DIALOG_MAX_HEIGHT: Pixels = px(480.);
 /// The spacer is part of the helper so that the close control lands in the
 /// corner without every caller remembering to push it there.
 pub fn dialog_header(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div {
+    header_row().child(dialog_title(name, cx)).child(after())
+}
+
+/// The naming row with a mark before the name, the way the reference window
+/// puts an icon left of its title.
+///
+/// It is a slot rather than something a caller appends, because a child added
+/// to [`dialog_header`] lands after the room that pushes the way out into the
+/// corner -- so an icon added that way arrives on the right, where it reads as
+/// a control rather than as what the window is about. That is what happened to
+/// the connection prompt's mark, and the two flags that chose it went unread
+/// until the compiler said so.
+pub fn dialog_header_marked(
+    mark: impl gpui::IntoElement,
+    name: impl Into<crate::SharedString>,
+    cx: &App,
+) -> gpui::Div {
+    header_row()
+        .child(mark)
+        .child(dialog_title(name, cx))
+        .child(after())
+}
+
+fn header_row() -> gpui::Div {
     gpui::div()
         .flex()
         .flex_row()
@@ -262,9 +286,12 @@ pub fn dialog_header(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Di
         .py_2()
         .gap_2()
         .items_center()
-        .child(dialog_title(name, cx))
-        .child(gpui::div().flex_1())
         .debug_selector(|| "DIALOG-HEADER".to_string())
+}
+
+/// The room between the name and whatever the window keeps at its right end.
+fn after() -> gpui::Div {
+    gpui::div().flex_1()
 }
 
 /// The middle of a dialog, between the header and the footer.

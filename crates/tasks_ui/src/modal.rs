@@ -14,7 +14,9 @@ use project::{TaskSourceKind, task_store::TaskStore};
 use task::{DebugScenario, ResolvedTask, RevealTarget, TaskContext, TaskTemplate};
 use ui::{
     ActiveTheme, Clickable, FluentBuilder as _, IconButtonShape, IconWithIndicator, Indicator,
-    IntoElement, KeyBinding, ListItem, ListItemSpacing, RenderOnce, Toggleable, Tooltip, div,
+    IntoElement, KeyBinding, ListItem, ListItemSpacing, RenderOnce, Toggleable, Tooltip,
+    cyberpunk::{Rank, dialog_footer},
+    div,
     prelude::*,
 };
 
@@ -651,26 +653,17 @@ impl PickerDelegate for TasksModalDelegate {
             None
         };
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    left_button
-                        .map(|(label, action)| {
-                            let keybind = KeyBinding::for_action(&*action, cx);
+            dialog_footer()
+                .children(left_button.map(|(label, action)| {
+                    let keybind = KeyBinding::for_action(&*action, cx);
 
-                            Button::new("edit-current-task", label)
-                                .key_binding(keybind)
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(action.boxed_clone(), cx);
-                                })
-                                .into_any_element()
+                    Button::new("edit-current-task", label)
+                        .style(Rank::Neutral.style())
+                        .key_binding(keybind)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(action.boxed_clone(), cx);
                         })
-                        .unwrap_or_else(|| h_flex().into_any_element()),
-                )
+                }))
                 .map(|this| {
                     if (current_modifiers.alt || self.matches.is_empty()) && !self.prompt.is_empty()
                     {
@@ -686,6 +679,7 @@ impl PickerDelegate for TasksModalDelegate {
                             };
 
                             Button::new("spawn-onehshot", spawn_oneshot_label)
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&*action, cx))
                                 .on_click(move |_, window, cx| {
                                     window.dispatch_action(action.boxed_clone(), cx)
@@ -699,6 +693,7 @@ impl PickerDelegate for TasksModalDelegate {
                                 "Spawn Without History"
                             };
                             Button::new("spawn", label)
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
                                 .on_click(move |_, window, cx| {
                                     window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
@@ -710,6 +705,7 @@ impl PickerDelegate for TasksModalDelegate {
                                 if is_recent_selected { "Rerun" } else { "Spawn" };
 
                             Button::new("spawn", run_entry_label)
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(menu::Confirm.boxed_clone(), cx);

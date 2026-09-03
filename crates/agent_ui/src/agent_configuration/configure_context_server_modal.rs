@@ -25,8 +25,9 @@ use settings::{Settings as _, update_settings_file};
 use std::sync::Arc;
 use theme_settings::ThemeSettings;
 use ui::{
-    CommonAnimationExt, KeyBinding, Modal, ModalFooter, ModalHeader, Section, Tooltip,
-    WithScrollbar, prelude::*,
+    CommonAnimationExt, KeyBinding, Tooltip, WithScrollbar,
+    cyberpunk::{Rank, dialog_body, dialog_field, dialog_footer, dialog_header, dialog_shell},
+    prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
@@ -792,12 +793,11 @@ impl Focusable for ConfigureContextServerModal {
 impl EventEmitter<DismissEvent> for ConfigureContextServerModal {}
 
 impl ConfigureContextServerModal {
-    fn render_modal_header(&self) -> ModalHeader {
-        let text: SharedString = match &self.source {
+    fn title(&self) -> SharedString {
+        match &self.source {
             ConfigurationSource::Existing { .. } => "Configure MCP Server".into(),
             ConfigurationSource::Extension { id, .. } => format!("Configure {}", id.0).into(),
-        };
-        ModalHeader::new().headline(text)
+        }
     }
 
     fn render_modal_description(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -835,107 +835,93 @@ impl ConfigureContextServerModal {
             }
         };
 
-        div()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border_variant)
-            .bg(cx.theme().colors().editor_background)
-            .child({
-                let settings = ThemeSettings::get_global(cx);
-                let text_style = TextStyle {
-                    color: cx.theme().colors().text,
-                    font_family: settings.buffer_font.family.clone(),
-                    font_fallbacks: settings.buffer_font.fallbacks.clone(),
-                    font_size: settings.buffer_font_size(cx).into(),
-                    font_weight: settings.buffer_font.weight,
-                    line_height: relative(settings.buffer_line_height.value()),
+        dialog_field("Configuration", true, cx, {
+            let settings = ThemeSettings::get_global(cx);
+            let text_style = TextStyle {
+                color: cx.theme().colors().text,
+                font_family: settings.buffer_font.family.clone(),
+                font_fallbacks: settings.buffer_font.fallbacks.clone(),
+                font_size: settings.buffer_font_size(cx).into(),
+                font_weight: settings.buffer_font.weight,
+                line_height: relative(settings.buffer_line_height.value()),
+                ..Default::default()
+            };
+            EditorElement::new(
+                editor,
+                EditorStyle {
+                    background: cx.theme().colors().editor_background,
+                    local_player: cx.theme().players().local(),
+                    text: text_style,
+                    syntax: cx.theme().syntax().clone(),
                     ..Default::default()
-                };
-                EditorElement::new(
-                    editor,
-                    EditorStyle {
-                        background: cx.theme().colors().editor_background,
-                        local_player: cx.theme().players().local(),
-                        text: text_style,
-                        syntax: cx.theme().syntax().clone(),
-                        ..Default::default()
-                    },
-                )
-            })
-            .into_any_element()
+                },
+            )
+        })
+        .into_any_element()
     }
 
-    fn render_modal_footer(&self, cx: &mut Context<Self>) -> ModalFooter {
+    fn render_modal_footer(&self, cx: &mut Context<Self>) -> Div {
         let focus_handle = self.focus_handle(cx);
         let is_busy = matches!(self.state, State::Waiting | State::Authenticating { .. });
 
-        ModalFooter::new()
-            .start_slot::<Button>(
-                if let ConfigurationSource::Extension {
-                    repository_url: Some(repository_url),
-                    ..
-                } = &self.source
-                {
-                    Some(
-                        Button::new("open-repository", "Open Repository")
-                            .end_icon(
-                                Icon::new(IconName::ArrowUpRight)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .tooltip({
-                                let repository_url = repository_url.clone();
-                                move |_window, cx| {
-                                    Tooltip::with_meta(
-                                        "Open Repository",
-                                        None,
-                                        repository_url.clone(),
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let repository_url = repository_url.clone();
-                                move |_, _, cx| cx.open_url(&repository_url)
-                            }),
+        let repository = if let ConfigurationSource::Extension {
+            repository_url: Some(repository_url),
+            ..
+        } = &self.source
+        {
+            Some(
+                Button::new("open-repository", "Open Repository")
+                    .style(Rank::Quiet.style())
+                    .end_icon(
+                        Icon::new(IconName::ArrowUpRight)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
                     )
-                } else {
-                    None
-                },
+                    .tooltip({
+                        let repository_url = repository_url.clone();
+                        move |_window, cx| {
+                            Tooltip::with_meta("Open Repository", None, repository_url.clone(), cx)
+                        }
+                    })
+                    .on_click({
+                        let repository_url = repository_url.clone();
+                        move |_, _, cx| cx.open_url(&repository_url)
+                    }),
             )
-            .end_slot(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(
-                            "cancel",
-                            if self.source.has_configuration_options() {
-                                "Cancel"
-                            } else {
-                                "Dismiss"
-                            },
-                        )
-                        .key_binding(
-                            KeyBinding::for_action_in(&menu::Cancel, &focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
-                        )
-                        .on_click(
-                            cx.listener(|this, _event, _window, cx| this.cancel(&menu::Cancel, cx)),
-                        ),
+        } else {
+            None
+        };
+
+        dialog_footer()
+            .children(repository)
+            .child(
+                Button::new(
+                    "cancel",
+                    if self.source.has_configuration_options() {
+                        "Cancel"
+                    } else {
+                        "Dismiss"
+                    },
+                )
+                .style(Rank::Neutral.style())
+                .key_binding(
+                    KeyBinding::for_action_in(&menu::Cancel, &focus_handle, cx)
+                        .map(|kb| kb.size(rems_from_px(12.))),
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.cancel(&menu::Cancel, cx))),
+            )
+            .children(self.source.has_configuration_options().then(|| {
+                Button::new("configure-server", "Configure Server")
+                    .style(Rank::Accent.style())
+                    .disabled(is_busy)
+                    .key_binding(
+                        KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
+                            .map(|kb| kb.size(rems_from_px(12.))),
                     )
-                    .children(self.source.has_configuration_options().then(|| {
-                        Button::new("configure-server", "Configure Server")
-                            .disabled(is_busy)
-                            .key_binding(
-                                KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
-                            )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.confirm(&menu::Confirm, cx)
-                            }))
-                    })),
-            )
+                    .on_click(
+                        cx.listener(|this, _event, _window, cx| this.confirm(&menu::Confirm, cx)),
+                    )
+            }))
     }
 
     fn render_loading(&self, label: impl Into<SharedString>) -> Div {
@@ -975,7 +961,7 @@ impl ConfigureContextServerModal {
             )
             .child(
                 Button::new("authenticate-server", "Authenticate")
-                    .style(ButtonStyle::Outlined)
+                    .style(Rank::Neutral.style())
                     .label_size(LabelSize::Small)
                     .on_click({
                         let server_id = server_id.clone();
@@ -1047,7 +1033,7 @@ impl ConfigureContextServerModal {
                     )))
                     .child(
                         Button::new("submit-client-secret", "Submit")
-                            .style(ButtonStyle::Outlined)
+                            .style(Rank::Neutral.style())
                             .label_size(LabelSize::Small)
                             .on_click({
                                 let server_id = server_id.clone();
@@ -1081,7 +1067,7 @@ impl ConfigureContextServerModal {
             )
             .child(
                 Button::new("cancel-authentication", "Cancel")
-                    .style(ButtonStyle::Outlined)
+                    .style(Rank::Neutral.style())
                     .label_size(LabelSize::Small)
                     .on_click({
                         let server_id = server_id.clone();
@@ -1112,9 +1098,7 @@ impl ConfigureContextServerModal {
 
 impl Render for ConfigureContextServerModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .elevation_3(cx)
-            .w(rems(40.))
+        dialog_shell(cx)
             .key_context("ConfigureContextServerModal")
             .on_action(
                 cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel(&menu::Cancel, cx)),
@@ -1128,48 +1112,52 @@ impl Render for ConfigureContextServerModal {
                 this.focus_handle(cx).focus(window, cx);
             }))
             .child(
-                Modal::new("configure-context-server", None)
-                    .header(self.render_modal_header())
-                    .section(
-                        Section::new().child(
-                            div()
-                                .size_full()
-                                .child(
-                                    div()
-                                        .id("modal-content")
-                                        .max_h(vh(0.7, window))
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.scroll_handle)
-                                        .child(self.render_modal_description(window, cx))
-                                        .child(self.render_modal_content(cx))
-                                        .child(match &self.state {
-                                            State::Idle => div(),
-                                            State::Waiting => {
-                                                self.render_loading("Connecting Server…")
-                                            }
-                                            State::AuthRequired { server_id } => {
-                                                self.render_auth_required(&server_id.clone(), cx)
-                                            }
-                                            State::ClientSecretRequired { server_id, error } => {
-                                                self.render_client_secret_required(
-                                                    &server_id.clone(),
-                                                    error.clone(),
-                                                    cx,
-                                                )
-                                            }
-                                            State::Authenticating { server_id } => {
-                                                self.render_authenticating(&server_id.clone(), cx)
-                                            }
-                                            State::Error(error) => {
-                                                Self::render_modal_error(error.clone())
-                                            }
-                                        }),
-                                )
-                                .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                dialog_header(self.title(), cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(
+                            cx.listener(|this, _, _window, cx| this.cancel(&menu::Cancel, cx)),
                         ),
-                    )
-                    .footer(self.render_modal_footer(cx)),
+                ),
             )
+            .child(
+                dialog_body().child(
+                    div()
+                        .size_full()
+                        .child(
+                            v_flex()
+                                .id("modal-content")
+                                .size_full()
+                                .px_3()
+                                .py_2()
+                                .gap_2()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll_handle)
+                                .child(self.render_modal_description(window, cx))
+                                .child(self.render_modal_content(cx))
+                                .child(match &self.state {
+                                    State::Idle => div(),
+                                    State::Waiting => self.render_loading("Connecting Server…"),
+                                    State::AuthRequired { server_id } => {
+                                        self.render_auth_required(&server_id.clone(), cx)
+                                    }
+                                    State::ClientSecretRequired { server_id, error } => self
+                                        .render_client_secret_required(
+                                            &server_id.clone(),
+                                            error.clone(),
+                                            cx,
+                                        ),
+                                    State::Authenticating { server_id } => {
+                                        self.render_authenticating(&server_id.clone(), cx)
+                                    }
+                                    State::Error(error) => Self::render_modal_error(error.clone()),
+                                }),
+                        )
+                        .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                ),
+            )
+            .child(self.render_modal_footer(cx))
     }
 }
 

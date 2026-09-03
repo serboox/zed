@@ -3,10 +3,9 @@ use editor::Editor;
 use futures::channel::oneshot;
 use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Styled};
 use ui::{
-    ActiveTheme, AnyElement, App, Button, Clickable, Color, Context, DynamicSpacing, Headline,
-    HeadlineSize, Icon, IconName, IconSize, InteractiveElement, IntoElement, Label, LabelCommon,
-    LabelSize, ParentElement, Render, SharedString, StyledExt, StyledTypography, Window, div,
-    h_flex, v_flex,
+    AnyElement, App, Button, ButtonCommon, Clickable, Color, Context, Icon, IconButton, IconName,
+    IconSize, InteractiveElement, IntoElement, Label, LabelCommon, LabelSize, ParentElement,
+    Render, SharedString, Tooltip, Window, cyberpunk, div, h_flex, v_flex,
 };
 use util::maybe;
 use workspace::ModalView;
@@ -73,32 +72,37 @@ impl AskPassModal {
         cx.emit(DismissEvent);
     }
 
-    fn render_hint(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let color = cx.theme().status().info_background;
+    /// Lives on the footer's left rather than in a band of its own: it is
+    /// incidental to the one thing this window is waiting for.
+    fn render_hint(&self) -> Option<AnyElement> {
         if (self.prompt.contains("Password") || self.prompt.contains("Username"))
             && self.prompt.contains("github.com")
         {
             return Some(
-            div()
-                .p_2()
-                .bg(color)
-                .border_t_1()
-                .border_color(cx.theme().status().info_border)
-                .child(
-                    h_flex().gap_2()
-                        .child(
-                            Icon::new(IconName::Github).size(IconSize::Small)
-                        )
-                        .child(
-                            Label::new("You may need to configure git for Github.")
-                                .size(LabelSize::Small),
-                        )
-                        .child(Button::new("learn-more", "Learn more").color(Color::Accent).label_size(LabelSize::Small).on_click(|_, _, cx| {
-                            cx.open_url("https://docs.github.com/en/get-started/git-basics/set-up-git#authenticating-with-github-from-git")
-                        })),
-                )
-                .into_any_element(),
-        );
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(Icon::new(IconName::Github).size(IconSize::Small))
+                    .child(
+                        Label::new("You may need to configure git for GitHub.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(
+                        Button::new("learn-more", "Learn more")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .on_click(|_, _, cx| {
+                                cx.open_url(
+                                    "https://docs.github.com/en/get-started/git-basics/set-up-git\
+                                     #authenticating-with-github-from-git",
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
         }
         None
     }
@@ -106,42 +110,167 @@ impl AskPassModal {
 
 impl Render for AskPassModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        let hint = self.render_hint();
+        cyberpunk::dialog_shell(cx)
             .key_context("PasswordPrompt")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .elevation_2(cx)
-            .size_full()
             .child(
-                h_flex()
-                    .font_buffer(cx)
-                    .px(DynamicSpacing::Base12.rems(cx))
-                    .pt(DynamicSpacing::Base08.rems(cx))
-                    .pb(DynamicSpacing::Base04.rems(cx))
-                    .rounded_t_sm()
-                    .w_full()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
-                    .child(h_flex().gap_1().overflow_x_hidden().child(
-                        div().max_w_96().overflow_x_hidden().text_ellipsis().child(
-                            Headline::new(self.operation.clone()).size(HeadlineSize::XSmall),
-                        ),
-                    )),
+                cyberpunk::dialog_header(self.operation.clone(), cx).child(
+                    div().debug_selector(|| "DIALOG-CLOSE".to_string()).child(
+                        IconButton::new("askpass-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                ),
             )
             .child(
-                div()
-                    .font_buffer(cx)
-                    .text_buffer(cx)
-                    .py_2()
-                    .px_3()
-                    .bg(cx.theme().colors().editor_background)
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .size_full()
-                    .overflow_hidden()
-                    .child(self.prompt.clone())
-                    .child(self.editor.clone()),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .child(
+                            Label::new(self.prompt.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(cyberpunk::dialog_field(
+                            "Answer",
+                            false,
+                            cx,
+                            self.editor.clone(),
+                        )),
+                ),
             )
-            .children(self.render_hint(cx))
+            .child(
+                cyberpunk::dialog_footer()
+                    .child(cyberpunk::dialog_footer_left().children(hint))
+                    .child(cyberpunk::dialog_footer_spacer())
+                    .child(
+                        Button::new("askpass-cancel", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("askpass-confirm", "Continue")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    fn draw_the_prompt(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        init_test(cx);
+        let (sender, _receiver) = oneshot::channel();
+        let (_modal, cx) = cx.add_window_view(|window, cx| {
+            AskPassModal::new(
+                "git fetch".into(),
+                "Password for 'https://github.com':".into(),
+                sender,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    #[gpui::test]
+    async fn the_password_prompt_ends_its_answer_in_the_bottom_right_corner(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = draw_the_prompt(cx);
+
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let confirm = cx
+            .debug_bounds("BUTTON-Continue")
+            .expect("the confirming action is painted");
+        let cancel = cx
+            .debug_bounds("BUTTON-Cancel")
+            .expect("the dismissing action is painted");
+
+        assert!(
+            confirm.right() > footer.left() + footer.size.width * 0.85,
+            "the confirming action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in \
+             the corner",
+            confirm.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            cancel.right() <= confirm.left(),
+            "the confirming action comes last, so Cancel at {:?}..{:?} sits left of Continue at \
+             {:?}..{:?}",
+            cancel.left(),
+            cancel.right(),
+            confirm.left(),
+            confirm.right()
+        );
+        assert!(
+            confirm.bottom() <= footer.bottom() + gpui::px(0.5),
+            "the confirming action ends at {:?} below the bar ending at {:?}",
+            confirm.bottom(),
+            footer.bottom()
+        );
+    }
+
+    #[gpui::test]
+    async fn the_password_prompt_keeps_its_way_out_in_the_top_right_corner(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = draw_the_prompt(cx);
+
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("DIALOG-CLOSE")
+            .expect("the way out is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85,
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        assert!(
+            close.top() >= header.top() - gpui::px(0.5)
+                && close.bottom() <= header.bottom() + gpui::px(0.5),
+            "the way out is painted {:?}..{:?} outside a header spanning {:?}..{:?}",
+            close.top(),
+            close.bottom(),
+            header.top(),
+            header.bottom()
+        );
     }
 }

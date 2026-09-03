@@ -1,13 +1,10 @@
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    ScrollHandle, SharedString, WeakEntity, Window, px,
+    ScrollHandle, SharedString, WeakEntity, Window,
 };
 use serde_json::Value;
 use task::{BuildTaskDefinition, DebugScenario, TaskTemplate};
-use ui::{
-    ElevationIndex, KeyBinding, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk,
-    prelude::*,
-};
+use ui::{KeyBinding, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, cyberpunk, prelude::*};
 use workspace::{ModalView, Workspace};
 use zed_actions::run_configurations::EntryPointOffer;
 
@@ -76,13 +73,6 @@ enum DebugOffer {
     /// hidden, per the mockup's rule that this limitation stays visible.
     Withheld(SharedString),
 }
-
-/// The window the gutter's run button opens: every way of running this project,
-/// the one the editor found for this very line first, and the way to write a new
-/// one or go and edit them all.
-/// Tall enough for a handful of ways at once, short enough to leave the window
-/// its own edges; beyond that the list scrolls.
-const WAYS_TO_RUN_MAX_HEIGHT: f32 = 420.;
 
 pub struct WaysToRunModal {
     focus: FocusHandle,
@@ -472,7 +462,7 @@ impl Render for WaysToRunModal {
                             .when(pinnable, |row| {
                                 row.child(
                                     Button::new(("pin-way", at), "Keep")
-                                        .style(ButtonStyle::Subtle)
+                                        .style(cyberpunk::Rank::Quiet.style())
                                         .tooltip(ui::Tooltip::text(
                                             "Write it into the project's tasks.json",
                                         ))
@@ -533,19 +523,10 @@ impl Render for WaysToRunModal {
             );
         }
 
-        v_flex()
+        cyberpunk::dialog_shell(cx)
             .key_context("WaysToRun")
             .track_focus(&self.focus)
             .debug_selector(|| "ways-to-run".to_string())
-            .w(px(560.))
-            // A ceiling, because the list grows with however many ways there
-            // are to run the project and would otherwise push the window's own
-            // bottom past the screen. The list scrolls inside it instead.
-            .max_h(px(WAYS_TO_RUN_MAX_HEIGHT))
-            .p_3()
-            .gap_2()
-            .elevation_3(cx)
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|modal, _: &menu::SelectNext, _, cx| modal.move_by(1, cx)))
             .on_action(cx.listener(|modal, _: &menu::SelectPrevious, _, cx| modal.move_by(-1, cx)))
@@ -560,55 +541,54 @@ impl Render for WaysToRunModal {
                 }),
             )
             .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .child(cyberpunk::dialog_title("How to run this", cx))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("ways-to-run-dismiss", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .style(cyberpunk::Rank::Quiet.style())
-                            .tooltip(Tooltip::text("Close"))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    ),
+                cyberpunk::dialog_header("How to run this", cx).child(
+                    IconButton::new("ways-to-run-dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(cyberpunk::Rank::Quiet.style())
+                        .tooltip(Tooltip::text("Close"))
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                ),
             )
             .child(
-                div()
-                    .id("ways-to-run-list-scroll")
-                    .debug_selector(|| "ways-to-run-list-scroll".to_string())
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.list_scroll_handle)
-                    .child(list)
-                    .custom_scrollbars(
-                        Scrollbars::always_visible(ScrollAxes::Vertical)
-                            .tracked_scroll_handle(&self.list_scroll_handle),
-                        window,
-                        cx,
-                    ),
+                cyberpunk::dialog_body().child(
+                    div()
+                        .id("ways-to-run-list-scroll")
+                        .debug_selector(|| "ways-to-run-list-scroll".to_string())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.list_scroll_handle)
+                        .child(list)
+                        .custom_scrollbars(
+                            Scrollbars::always_visible(ScrollAxes::Vertical)
+                                .tracked_scroll_handle(&self.list_scroll_handle),
+                            window,
+                            cx,
+                        ),
+                ),
             )
-            .children(self.trouble.clone().map(|trouble| {
-                Label::new(trouble)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error)
-            }))
             .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .justify_end()
+                cyberpunk::dialog_footer()
+                    .children(self.trouble.clone().map(|trouble| {
+                        cyberpunk::dialog_footer_left().child(
+                            Label::new(trouble)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .truncate(),
+                        )
+                    }))
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("ways-new", "New configuration...")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|modal, _, window, cx| {
                                 modal.write_a_new_one(window, cx)
                             })),
                     )
                     .child(
                         Button::new("ways-all", "All configurations")
-                            .style(ButtonStyle::Subtle)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .on_click(
                                 cx.listener(|modal, _, window, cx| modal.open_them_all(window, cx)),
                             ),
@@ -884,6 +864,72 @@ mod tests {
             opaque.read_with(&cx, |modal, _| modal.trouble.clone()),
             crate::debugging::why_it_cannot_be_debugged("make build").map(Into::into),
             "an opaque command has to say why it cannot be debugged"
+        );
+    }
+
+    // Where the window's own chrome is painted, not where the element tree
+    // says it was put: the way out belongs in the corner the reader reaches
+    // for, and the actions belong at the far end of the bar the window ends
+    // with rather than packed against the list above them.
+    #[gpui::test]
+    async fn the_window_keeps_the_way_out_top_right_and_its_actions_bottom_right(
+        cx: &mut TestAppContext,
+    ) {
+        let (_modal, _project, mut cx) = a_ways_modal_for(
+            r#"[{ "label": "unit tests", "command": "cargo test" }]"#,
+            cx,
+        )
+        .await;
+        draw(&mut cx);
+
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the naming row is painted");
+        let close = cx
+            .debug_bounds("ICON-Close")
+            .expect("the way out is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let all = cx
+            .debug_bounds("BUTTON-All configurations")
+            .expect("the last action is painted");
+        let new_one = cx
+            .debug_bounds("BUTTON-New configuration...")
+            .expect("the secondary action is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85,
+            "the way out ends at {:?} in a naming row spanning {:?}..{:?}, so it is not in the \
+             corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        assert!(
+            all.right() > footer.left() + footer.size.width * 0.85,
+            "the last action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in the \
+             corner",
+            all.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            new_one.left() > footer.left() + footer.size.width * 0.5,
+            "both actions belong in the right half; the secondary one starts at {:?} in a bar \
+             spanning {:?}..{:?}",
+            new_one.left(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            new_one.right() <= all.left(),
+            "the actions keep their order, so the secondary one at {:?}..{:?} sits left of the \
+             last at {:?}..{:?}",
+            new_one.left(),
+            new_one.right(),
+            all.left(),
+            all.right()
         );
     }
 }

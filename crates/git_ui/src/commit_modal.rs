@@ -8,8 +8,8 @@ use git::{Amend, Commit, GenerateCommitMessage, Signoff};
 use project::DisableAiSettings;
 use settings::Settings;
 use ui::{
-    ButtonLike, ContextMenu, ElevationIndex, KeybindingHint, PopoverMenu, PopoverMenuHandle,
-    SplitButton, Tooltip, prelude::*,
+    ButtonLike, ContextMenu, KeybindingHint, PopoverMenu, PopoverMenuHandle, SplitButton, Tooltip,
+    cyberpunk, prelude::*,
 };
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
@@ -21,52 +21,16 @@ use workspace::{
     dock::{Dock, PanelHandle},
 };
 
-// nate: It is a pain to get editors to size correctly and not overflow.
-//
-// this can get replaced with a simple flex layout with more time/a more thoughtful approach.
-#[derive(Debug, Clone, Copy)]
-pub struct ModalContainerProperties {
-    pub modal_width: f32,
-    pub editor_height: f32,
-    pub footer_height: f32,
-    pub container_padding: f32,
-    pub modal_border_radius: f32,
-}
-
-impl ModalContainerProperties {
-    pub fn new(window: &Window, preferred_char_width: usize) -> Self {
-        let container_padding = 5.0;
-
-        // Calculate width based on character width
-        let mut modal_width = 460.0;
-        let style = window.text_style();
-        let font_id = window.text_system().resolve_font(&style.font());
-        let font_size = style.font_size.to_pixels(window.rem_size());
-
-        if let Ok(em_width) = window.text_system().em_width(font_id, font_size) {
-            modal_width =
-                f32::from(preferred_char_width as f32 * em_width + px(container_padding * 2.0));
-        }
-
-        Self {
-            modal_width,
-            editor_height: 300.0,
-            footer_height: 24.0,
-            container_padding,
-            modal_border_radius: 12.0,
-        }
-    }
-
-    pub fn editor_border_radius(&self) -> Pixels {
-        px(self.modal_border_radius - self.container_padding / 2.0)
-    }
-}
+/// How tall the message editor stands inside the dialog's body. The window's
+/// width and corner radius are the shell's, not this file's, and this has to
+/// leave the header, the footer and the over-limit warning room inside the
+/// height every dialog here shares.
+const COMMIT_EDITOR_HEIGHT: f32 = 260.0;
 
 pub struct CommitModal {
     git_panel: Entity<GitPanel>,
     commit_editor: Entity<Editor>,
     restore_dock: RestoreDock,
-    properties: ModalContainerProperties,
     branch_list_handle: PopoverMenuHandle<BranchList>,
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
 }
@@ -218,13 +182,10 @@ impl CommitModal {
         })
         .detach();
 
-        let properties = ModalContainerProperties::new(window, 50);
-
         Self {
             git_panel,
             commit_editor,
             restore_dock,
-            properties,
             branch_list_handle: PopoverMenuHandle::default(),
             commit_menu_handle: PopoverMenuHandle::default(),
         }
@@ -241,24 +202,23 @@ impl CommitModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let properties = self.properties;
         let padding_t = 3.0;
         let padding_b = 6.0;
-        // magic number for editor not to overflow the container??
+        // The editor reports a height that is one and a half lines short of what
+        // it goes on to paint, so the box it sits in has to be that much taller
+        // or the last line is clipped.
         let extra_space_hack = 1.5 * window.line_height();
 
         v_flex()
-            .h(px(properties.editor_height + padding_b + padding_t) + extra_space_hack)
+            .h(px(COMMIT_EDITOR_HEIGHT + padding_b + padding_t) + extra_space_hack)
             .w_full()
             .flex_none()
-            .rounded(properties.editor_border_radius())
             .overflow_hidden()
-            .px_1p5()
             .pt(px(padding_t))
             .pb(px(padding_b))
             .child(
                 div()
-                    .h(px(properties.editor_height))
+                    .h(px(COMMIT_EDITOR_HEIGHT))
                     .w_full()
                     .child(self.commit_editor_element(window, cx)),
             )
@@ -411,25 +371,17 @@ impl CommitModal {
 
         let focus_handle = self.focus_handle(cx);
 
-        let close_kb_hint = ui::KeyBinding::for_action(&menu::Cancel, cx).map(|close_kb| {
-            KeybindingHint::new(close_kb, cx.theme().colors().editor_background).suffix("Cancel")
-        });
+        let close_kb_hint = ui::KeyBinding::for_action(&menu::Cancel, cx)
+            .map(|close_kb| KeybindingHint::new(close_kb, cyberpunk::canvas()).suffix("Cancel"));
 
-        h_flex()
+        cyberpunk::dialog_footer()
             .group("commit_editor_footer")
-            .w_full()
-            .h(px(self.properties.footer_height))
-            .w_full()
-            .gap_1()
-            .flex_none()
-            .justify_between()
             .child(
-                h_flex()
+                cyberpunk::dialog_footer_left()
                     .gap_1()
-                    .flex_shrink_1()
-                    .overflow_x_hidden()
                     .child(
                         h_flex()
+                            .min_w_0()
                             .flex_shrink_1()
                             .overflow_x_hidden()
                             .child(branch_picker),
@@ -437,13 +389,14 @@ impl CommitModal {
                     .children(generate_commit_message)
                     .children(co_authors),
             )
+            .child(cyberpunk::dialog_footer_spacer())
             .child(
                 h_flex()
-                    .gap_4()
+                    .gap_2()
                     .child(close_kb_hint)
                     .child(SplitButton::new(
                         ButtonLike::new_rounded_left(format!("split-button-left-{}", commit_label))
-                            .layer(ElevationIndex::ModalSurface)
+                            .style(cyberpunk::Rank::Accent.style())
                             .size(ButtonSize::Compact)
                             .disabled(!can_commit)
                             .child(Label::new(commit_label).size(LabelSize::Small).mr_0p5())
@@ -569,11 +522,9 @@ impl CommitModal {
 
 impl Render for CommitModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let properties = self.properties;
-        let width = px(properties.modal_width);
-        let container_padding = px(properties.container_padding);
-        let border_radius = properties.modal_border_radius;
         let editor_focus_handle = self.commit_editor.focus_handle(cx);
+        let commit_editor = self.render_commit_editor(window, cx).into_any_element();
+        let footer = self.render_footer(window, cx).into_any_element();
 
         let max_title_length = GitPanelSettings::get_global(cx).commit_title_max_length;
         let title_exceeds_limit = if max_title_length > 0 {
@@ -587,7 +538,7 @@ impl Render for CommitModal {
             false
         };
 
-        v_flex()
+        cyberpunk::dialog_shell(cx)
             .id("commit-modal")
             .key_context("GitCommit")
             .on_action(cx.listener(Self::dismiss))
@@ -618,62 +569,51 @@ impl Render for CommitModal {
                     this.toggle_branch_selector(window, cx);
                 }),
             )
-            .w(width)
-            .min_h_112()
-            .p(container_padding)
-            .elevation_3(cx)
-            .overflow_hidden()
-            .flex_none()
-            .relative()
-            .bg(cx.theme().colors().elevated_surface_background)
-            .rounded(px(border_radius))
-            .border_1()
-            .border_color(cx.theme().colors().border)
             .child(
-                v_flex()
-                    .id("editor-container")
-                    .cursor_text()
-                    .p_2()
-                    .size_full()
-                    .gap_2()
-                    .justify_between()
-                    .rounded(properties.editor_border_radius())
-                    .overflow_hidden()
-                    .bg(cx.theme().colors().editor_background)
-                    .border_1()
-                    .border_color(if title_exceeds_limit {
-                        cx.theme().status().warning_border
-                    } else {
-                        cx.theme().colors().border_variant
-                    })
-                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
-                        window.focus(&editor_focus_handle, cx);
-                    }))
-                    .child(self.render_commit_editor(window, cx))
-                    .when(title_exceeds_limit, |this| {
-                        this.child(
-                            h_flex()
-                                .absolute()
-                                .bottom_12()
-                                .w_full()
-                                .py_1()
-                                .px_2()
-                                .gap_1()
-                                .justify_center()
-                                .child(
-                                    Icon::new(IconName::Warning)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Warning),
-                                )
-                                .child(
-                                    Label::new(format!(
-                                        "Commit message title exceeds {max_title_length}-character limit."
-                                    ))
-                                    .size(LabelSize::Small),
-                                ),
-                        )
-                    })
-                    .child(self.render_footer(window, cx)),
+                cyberpunk::dialog_header("Commit", cx).child(
+                    div().debug_selector(|| "DIALOG-CLOSE".to_string()).child(
+                        IconButton::new("commit-modal-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                ),
             )
+            .child(
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("editor-container")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_1()
+                        .cursor_text()
+                        .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                            window.focus(&editor_focus_handle, cx);
+                        }))
+                        .child(cyberpunk::dialog_field("Message", true, cx, commit_editor))
+                        .when(title_exceeds_limit, |this| {
+                            this.child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(IconName::Warning)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Error),
+                                    )
+                                    .child(
+                                        Label::new(format!(
+                                            "Commit message title exceeds \
+                                             {max_title_length}-character limit."
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
+                                    ),
+                            )
+                        }),
+                ),
+            )
+            .child(footer)
     }
 }

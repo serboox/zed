@@ -41,7 +41,9 @@ use workspace::ProjectGroupKey;
 use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
-    ListSubHeader, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip, prelude::*,
+    ListSubHeader, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip,
+    cyberpunk::{Rank, dialog_footer},
+    prelude::*,
 };
 use util::{ResultExt, paths::PathExt};
 use workspace::{
@@ -1772,6 +1774,7 @@ impl PickerDelegate for RecentProjectsDelegate {
         let secondary_footer_actions: Option<AnyElement> = match selected_entry {
             Some(ProjectPickerEntry::OpenFolder { .. }) => Some(
                 Button::new("remove_selected", "Remove Folder")
+                    .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
                         &focus_handle,
@@ -1784,6 +1787,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             ),
             Some(ProjectPickerEntry::ProjectGroup(_)) if !is_current_workspace_entry => Some(
                 Button::new("remove_selected", "Remove from Window")
+                    .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
                         &focus_handle,
@@ -1796,6 +1800,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             ),
             Some(ProjectPickerEntry::RecentProject(_)) => Some(
                 Button::new("delete_recent", "Remove")
+                    .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
                         &focus_handle,
@@ -1809,14 +1814,83 @@ impl PickerDelegate for RecentProjectsDelegate {
             _ => None,
         };
 
+        let actions_menu = PopoverMenu::new("actions-menu-popover")
+            .with_handle(self.actions_menu_handle.clone())
+            .anchor(gpui::Anchor::BottomRight)
+            .offset(gpui::Point {
+                x: px(0.0),
+                y: px(-2.0),
+            })
+            .trigger(
+                Button::new("actions-trigger", "Actions")
+                    .style(Rank::Quiet.style())
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .key_binding(KeyBinding::for_action_in(
+                        &ToggleActionsMenu,
+                        &focus_handle,
+                        cx,
+                    )),
+            )
+            .menu({
+                let focus_handle = focus_handle.clone();
+                let workspace_handle = self.workspace.clone();
+                let create_new_window = self.create_new_window;
+                let open_action = workspace::Open {
+                    create_new_window: Some(create_new_window),
+                };
+                let show_add_to_workspace = match selected_entry {
+                    Some(ProjectPickerEntry::RecentProject(hit)) => self
+                        .workspaces
+                        .get(hit.candidate_id)
+                        .map(|workspace| {
+                            matches!(workspace.location, SerializedWorkspaceLocation::Local)
+                        })
+                        .unwrap_or(false),
+                    _ => false,
+                };
+
+                move |window, cx| {
+                    Some(ContextMenu::build(window, cx, {
+                        let focus_handle = focus_handle.clone();
+                        let workspace_handle = workspace_handle.clone();
+                        let open_action = open_action.clone();
+                        move |menu, _, _| {
+                            menu.context(focus_handle)
+                                .when(show_add_to_workspace, |menu| {
+                                    menu.action(
+                                        "Add Folder to this Project",
+                                        AddToWorkspace.boxed_clone(),
+                                    )
+                                    .separator()
+                                })
+                                .entry("Open Local Folders", Some(open_action.boxed_clone()), {
+                                    let workspace_handle = workspace_handle.clone();
+                                    move |window, cx| {
+                                        open_local_project(
+                                            workspace_handle.clone(),
+                                            create_new_window,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .action(
+                                    "Open Remote Folder",
+                                    OpenRemote {
+                                        from_existing_connection: false,
+                                        create_new_window: Some(create_new_window),
+                                    }
+                                    .boxed_clone(),
+                                )
+                        }
+                    }))
+                }
+            });
+
         Some(
-            h_flex()
-                .flex_1()
-                .p_1p5()
-                .gap_1()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            dialog_footer()
+                .child(actions_menu)
+                .child(Divider::vertical())
                 .when_some(secondary_footer_actions, |this, actions| {
                     this.child(actions)
                 })
@@ -1828,6 +1902,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let selected_index = self.selected_index;
                                 let filtered_entries = self.filtered_entries.clone();
                                 Button::new("move_to_new_window", "New Window")
+                                    .style(Rank::Neutral.style())
                                     .key_binding(KeyBinding::for_action_in(
                                         &menu::SecondaryConfirm,
                                         &focus_handle,
@@ -1848,6 +1923,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         })
                         .child(
                             Button::new("activate", "Activate")
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
                                     &focus_handle,
@@ -1860,6 +1936,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     } else if self.create_new_window {
                         this.child(
                             Button::new("open_here", "This Window")
+                                .style(Rank::Neutral.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
                                     &focus_handle,
@@ -1871,6 +1948,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                         .child(
                             Button::new("open_new_window", "Open")
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
                                     &focus_handle,
@@ -1883,6 +1961,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     } else {
                         this.child(
                             Button::new("open_new_window", "New Window")
+                                .style(Rank::Neutral.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
                                     &focus_handle,
@@ -1894,6 +1973,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                         .child(
                             Button::new("open_here", "Open")
+                                .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
                                     &focus_handle,
@@ -1905,87 +1985,6 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                     }
                 })
-                .child(Divider::vertical())
-                .child(
-                    PopoverMenu::new("actions-menu-popover")
-                        .with_handle(self.actions_menu_handle.clone())
-                        .anchor(gpui::Anchor::BottomRight)
-                        .offset(gpui::Point {
-                            x: px(0.0),
-                            y: px(-2.0),
-                        })
-                        .trigger(
-                            Button::new("actions-trigger", "Actions")
-                                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                .key_binding(KeyBinding::for_action_in(
-                                    &ToggleActionsMenu,
-                                    &focus_handle,
-                                    cx,
-                                )),
-                        )
-                        .menu({
-                            let focus_handle = focus_handle.clone();
-                            let workspace_handle = self.workspace.clone();
-                            let create_new_window = self.create_new_window;
-                            let open_action = workspace::Open {
-                                create_new_window: Some(create_new_window),
-                            };
-                            let show_add_to_workspace = match selected_entry {
-                                Some(ProjectPickerEntry::RecentProject(hit)) => self
-                                    .workspaces
-                                    .get(hit.candidate_id)
-                                    .map(|workspace| {
-                                        matches!(
-                                            workspace.location,
-                                            SerializedWorkspaceLocation::Local
-                                        )
-                                    })
-                                    .unwrap_or(false),
-                                _ => false,
-                            };
-
-                            move |window, cx| {
-                                Some(ContextMenu::build(window, cx, {
-                                    let focus_handle = focus_handle.clone();
-                                    let workspace_handle = workspace_handle.clone();
-                                    let open_action = open_action.clone();
-                                    move |menu, _, _| {
-                                        menu.context(focus_handle)
-                                            .when(show_add_to_workspace, |menu| {
-                                                menu.action(
-                                                    "Add Folder to this Project",
-                                                    AddToWorkspace.boxed_clone(),
-                                                )
-                                                .separator()
-                                            })
-                                            .entry(
-                                                "Open Local Folders",
-                                                Some(open_action.boxed_clone()),
-                                                {
-                                                    let workspace_handle = workspace_handle.clone();
-                                                    move |window, cx| {
-                                                        open_local_project(
-                                                            workspace_handle.clone(),
-                                                            create_new_window,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    }
-                                                },
-                                            )
-                                            .action(
-                                                "Open Remote Folder",
-                                                OpenRemote {
-                                                    from_existing_connection: false,
-                                                    create_new_window: Some(create_new_window),
-                                                }
-                                                .boxed_clone(),
-                                            )
-                                    }
-                                }))
-                            }
-                        }),
-                )
                 .into_any(),
         )
     }

@@ -20,8 +20,12 @@ use project::{AgentId, AgentRegistryStore, AgentServerStore};
 use release_channel::ReleaseChannel;
 use remote::RemoteConnectionOptions;
 use ui::{
-    Checkbox, CommonAnimationExt, KeyBinding, ListItem, ListItemSpacing, Modal, ModalFooter,
-    ModalHeader, Section, Tooltip, prelude::*,
+    Checkbox, CommonAnimationExt, KeyBinding, ListItem, ListItemSpacing, Tooltip,
+    cyberpunk::{
+        Rank, dialog_body, dialog_footer, dialog_footer_left, dialog_footer_spacer, dialog_header,
+        dialog_shell,
+    },
+    prelude::*,
 };
 use util::ResultExt;
 use workspace::{ModalView, MultiWorkspace, Workspace};
@@ -551,12 +555,9 @@ impl Render for ThreadImportModal {
             })
             .collect::<Vec<_>>();
 
-        v_flex()
+        dialog_shell(cx)
             .id("thread-import-modal")
             .key_context("ThreadImportModal")
-            .w(rems(34.))
-            .elevation_3(cx)
-            .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
@@ -567,72 +568,93 @@ impl Render for ThreadImportModal {
                 this.focus_handle.focus(window, cx);
             }))
             .child(
-                Modal::new("import-threads", None)
-                    .header(
-                        ModalHeader::new()
-                            .headline("Import External Agent Threads")
-                            .description(
+                dialog_header("Import External Agent Threads", cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel(&menu::Cancel, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                dialog_body().child(
+                    v_flex()
+                        .id("thread-import-agent-list")
+                        .size_full()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .overflow_y_scroll()
+                        .child(
+                            Label::new(
                                 "Import threads from agents like Claude Agent, Codex, and more, whether started in Zed or another client. \
                                 Choose which agents to include, and their threads will appear in your thread history."
                             )
-                            .show_dismiss_button(true),
-
-                    )
-                    .section(
-                        Section::new().child(
-                            v_flex()
-                                .id("thread-import-agent-list")
-                                .max_h(rems_from_px(320.))
-                                .pb_1()
-                                .overflow_y_scroll()
-                                .when(has_agents, |this| this.children(agent_rows))
-                                .when(!has_agents, |this| {
-                                    this.child(
-                                        Label::new("No external agents available.")
-                                            .color(Color::Muted)
-                                            .size(LabelSize::Small),
-                                    )
-                                }),
-                        ),
-                    )
-                    .footer(
-                        ModalFooter::new()
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .when(has_agents, |this| this.children(agent_rows))
+                        .when(!has_agents, |this| {
+                            this.child(
+                                Label::new("No external agents available.")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                        }),
+                ),
+            )
+            .child(
+                dialog_footer()
+                    .child(
+                        dialog_footer_left()
                             .when(self.is_fetching_sessions, |this| {
-                                this.start_slot(
+                                this.child(
                                     h_flex()
                                         .gap_1()
+                                        .min_w_0()
                                         .child(
                                             Icon::new(IconName::LoadCircle)
                                                 .size(IconSize::Small)
                                                 .color(Color::Muted)
                                                 .with_rotate_animation(3),
                                         )
-                                        .child(Label::new("Fetching Agent Threads…")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted))
-
+                                        .child(
+                                            Label::new("Fetching Agent Threads…")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
                                 )
                             })
                             .when_some(self.last_error.clone(), |this, error| {
-                                this.start_slot(
+                                this.child(
                                     Label::new(error)
                                         .size(LabelSize::Small)
                                         .color(Color::Error)
                                         .truncate(),
                                 )
-                            })
-                            .end_slot(
-                                Button::new("import-threads", "Import Threads")
-                                    .loading(self.is_importing)
-                                    .disabled(disabled_import_thread)
-                                    .key_binding(
-                                        KeyBinding::for_action(&menu::SecondaryConfirm, cx)
-                                            .map(|kb| kb.size(rems_from_px(12.))),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.import_threads(&menu::SecondaryConfirm, window, cx);
-                                    })),
-                            ),
+                            }),
+                    )
+                    .child(dialog_footer_spacer())
+                    .child(
+                        Button::new("cancel", "Cancel")
+                            .style(Rank::Neutral.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("import-threads", "Import Threads")
+                            .style(Rank::Accent.style())
+                            .loading(self.is_importing)
+                            .disabled(disabled_import_thread)
+                            .key_binding(
+                                KeyBinding::for_action(&menu::SecondaryConfirm, cx)
+                                    .map(|kb| kb.size(rems_from_px(12.))),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.import_threads(&menu::SecondaryConfirm, window, cx);
+                            })),
                     ),
             )
     }

@@ -9,7 +9,7 @@ use settings::Settings;
 use std::collections::HashMap;
 use theme_settings::ThemeSettings;
 use ui::{
-    Divider, DividerColor, DynamicSpacing, LabelSize, WithScrollbar, prelude::*,
+    Divider, DividerColor, DynamicSpacing, ElevationIndex, LabelSize, WithScrollbar, prelude::*,
     text_for_keystrokes,
 };
 use workspace::{ModalView, Workspace};
@@ -243,7 +243,8 @@ impl Render for WhichKeyModal {
             .right(px(16.))
             .min_w(px(220.))
             .max_w(max_panel_width)
-            .elevation_3(cx)
+            .cyberpunk_surface()
+            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .px(px(12.))
             .child(v_flex().child(title_section).when(has_rows, |el| {
                 el.child(

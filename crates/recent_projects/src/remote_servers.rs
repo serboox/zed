@@ -41,7 +41,9 @@ use std::{
 
 use ui::{
     CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, ListSeparator,
-    ModalHeader, Navigable, NavigableEntry, Tooltip, prelude::*,
+    Navigable, NavigableEntry, Tooltip,
+    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    prelude::*,
 };
 use util::{
     ResultExt,
@@ -319,31 +321,27 @@ impl PickerDelegate for DevContainerPickerDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .gap_1()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Button::new("run-action", "Start Dev Container")
-                        .key_binding(
-                            KeyBinding::for_action(&menu::Confirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
-                        )
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
-                        }),
-                )
+            dialog_footer()
                 .child(
                     Button::new("run-action-secondary", "Open devcontainer.json")
+                        .style(Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
+                        }),
+                )
+                .child(
+                    Button::new("run-action", "Start Dev Container")
+                        .style(Rank::Accent.style())
+                        .key_binding(
+                            KeyBinding::for_action(&menu::Confirm, cx)
+                                .map(|kb| kb.size(rems_from_px(12.))),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
                         }),
                 )
                 .into_any_element(),
@@ -1349,36 +1347,32 @@ impl PickerDelegate for RemoteServerPickerDelegate {
             Some(RemoteMatch::Project { .. })
         );
 
-        let confirm_button = |label: SharedString| {
-            Button::new("select", label)
-                .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
-                .on_click(|_, window, cx| window.dispatch_action(menu::Confirm.boxed_clone(), cx))
-        };
-
-        let buttons = if is_project_selected {
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("open_new_window", "New Window")
-                        .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                        }),
-                )
-                .child(confirm_button("Open".into()))
-                .into_any_element()
+        let confirm_label: SharedString = if is_project_selected {
+            "Open".into()
         } else {
-            confirm_button("Select".into()).into_any_element()
+            "Select".into()
         };
 
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(buttons)
+            dialog_footer()
+                .when(is_project_selected, |footer| {
+                    footer.child(
+                        Button::new("open_new_window", "New Window")
+                            .style(Rank::Neutral.style())
+                            .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
+                            }),
+                    )
+                })
+                .child(
+                    Button::new("select", confirm_label)
+                        .style(Rank::Accent.style())
+                        .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                        }),
+                )
                 .into_any(),
         )
     }
@@ -2420,32 +2414,24 @@ impl RemoteServerProjects {
                     .track_focus(&self.focus_handle(cx))
                     .size_full()
                     .child(
-                        v_flex()
-                            .pb_1()
-                            .child(
-                                ModalHeader::new().child(
-                                    Headline::new("Dev Containers").size(HeadlineSize::XSmall),
+                        v_flex().pb_1().child(
+                            ListItem::new("creating")
+                                .inset(true)
+                                .spacing(ui::ListItemSpacing::Sparse)
+                                .disabled(true)
+                                .start_slot(
+                                    Icon::new(IconName::ArrowCircle)
+                                        .color(Color::Muted)
+                                        .with_rotate_animation(2),
+                                )
+                                .child(
+                                    h_flex()
+                                        .opacity(0.6)
+                                        .gap_1()
+                                        .child(Label::new("Creating Dev Container"))
+                                        .child(LoadingLabel::new("")),
                                 ),
-                            )
-                            .child(ListSeparator)
-                            .child(
-                                ListItem::new("creating")
-                                    .inset(true)
-                                    .spacing(ui::ListItemSpacing::Sparse)
-                                    .disabled(true)
-                                    .start_slot(
-                                        Icon::new(IconName::ArrowCircle)
-                                            .color(Color::Muted)
-                                            .with_rotate_animation(2),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .opacity(0.6)
-                                            .gap_1()
-                                            .child(Label::new("Creating Dev Container"))
-                                            .child(LoadingLabel::new("")),
-                                    ),
-                            ),
+                        ),
                     )
                     .into_any_element()
             }
@@ -3075,9 +3061,18 @@ impl EventEmitter<DismissEvent> for RemoteServerProjects {}
 
 impl Render for RemoteServerProjects {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .elevation_3(cx)
-            .w(rems(34.))
+        let title = match &self.mode {
+            Mode::Default => "Remote Projects",
+            Mode::ViewServerOptions(_) => "Server Options",
+            Mode::EditNickname(_) => "Edit Nickname",
+            Mode::ProjectPicker(_) => "Open Folder",
+            Mode::CreateRemoteServer(_) => "Connect New Server",
+            Mode::CreateRemoteDevContainer(_) => "Dev Containers",
+            #[cfg(target_os = "windows")]
+            Mode::AddWslDistro(_) => "Add WSL Distro",
+        };
+
+        dialog_shell(cx)
             .key_context("RemoteServerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
@@ -3089,26 +3084,38 @@ impl Render for RemoteServerProjects {
                     cx.emit(DismissEvent)
                 }
             }))
-            .child(match &self.mode {
-                Mode::Default => self.render_default(window, cx).into_any_element(),
-                Mode::ViewServerOptions(state) => self
-                    .render_view_options(state.clone(), window, cx)
-                    .into_any_element(),
-                Mode::ProjectPicker(element) => element.clone().into_any_element(),
-                Mode::CreateRemoteServer(state) => self
-                    .render_create_remote_server(state, window, cx)
-                    .into_any_element(),
-                Mode::CreateRemoteDevContainer(state) => self
-                    .render_create_dev_container(state, window, cx)
-                    .into_any_element(),
-                Mode::EditNickname(state) => self
-                    .render_edit_nickname(state, window, cx)
-                    .into_any_element(),
-                #[cfg(target_os = "windows")]
-                Mode::AddWslDistro(state) => self
-                    .render_add_wsl_distro(state, window, cx)
-                    .into_any_element(),
-            })
+            .child(
+                dialog_header(title, cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel(&menu::Cancel, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                dialog_body().child(match &self.mode {
+                    Mode::Default => self.render_default(window, cx).into_any_element(),
+                    Mode::ViewServerOptions(state) => self
+                        .render_view_options(state.clone(), window, cx)
+                        .into_any_element(),
+                    Mode::ProjectPicker(element) => element.clone().into_any_element(),
+                    Mode::CreateRemoteServer(state) => self
+                        .render_create_remote_server(state, window, cx)
+                        .into_any_element(),
+                    Mode::CreateRemoteDevContainer(state) => self
+                        .render_create_dev_container(state, window, cx)
+                        .into_any_element(),
+                    Mode::EditNickname(state) => self
+                        .render_edit_nickname(state, window, cx)
+                        .into_any_element(),
+                    #[cfg(target_os = "windows")]
+                    Mode::AddWslDistro(state) => self
+                        .render_add_wsl_distro(state, window, cx)
+                        .into_any_element(),
+                }),
+            )
     }
 }
 

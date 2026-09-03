@@ -173,7 +173,7 @@ impl Render for ZedPromptRenderer {
                                     .w_full()
                                     .justify_center()
                                     .cyberpunk_monospace(cx)
-                                    .child(Label::new(action.to_uppercase()).color(Color::Custom(
+                                    .child(Label::new(action.clone()).color(Color::Custom(
                                         if selected {
                                             accent.bright()
                                         } else {

@@ -16,8 +16,8 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::Arc;
-use ui::ActiveTheme;
 use ui::Button;
+use ui::ButtonCommon;
 use ui::Clickable;
 use ui::FluentBuilder;
 use ui::KeyBinding;
@@ -25,7 +25,6 @@ use ui::StatefulInteractiveElement;
 use ui::Switch;
 use ui::ToggleState;
 use ui::Tooltip;
-use ui::h_flex;
 use ui::rems_from_px;
 use ui::v_flex;
 use util::shell::Shell;
@@ -33,9 +32,11 @@ use util::shell::Shell;
 use gpui::{Action, DismissEvent, EventEmitter, FocusHandle, Focusable, RenderOnce};
 use serde::Deserialize;
 use ui::{
-    AnyElement, App, Color, CommonAnimationExt, Context, Headline, HeadlineSize, Icon, IconName,
-    InteractiveElement, IntoElement, Label, ListItem, ListSeparator, ModalHeader, Navigable,
-    NavigableEntry, ParentElement, Render, Styled, StyledExt, Toggleable, Window, div, rems,
+    AnyElement, App, Color, CommonAnimationExt, Context, Icon, IconButton, IconName, IconSize,
+    InteractiveElement, IntoElement, Label, ListItem, ListSeparator, Navigable, NavigableEntry,
+    ParentElement, Render, SharedString, Styled, Toggleable, Window,
+    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    div,
 };
 use util::ResultExt;
 use util::rel_path::RelPath;
@@ -421,15 +422,10 @@ impl PickerDelegate for TemplatePickerDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .gap_1()
-                .justify_start()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            dialog_footer()
                 .child(
                     Button::new("run-action", "Continue")
+                        .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
@@ -618,15 +614,10 @@ impl PickerDelegate for FeaturePickerDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         Some(
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .gap_1()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            dialog_footer()
                 .child(
                     Button::new("run-action", "Select Feature")
+                        .style(Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
@@ -637,6 +628,7 @@ impl PickerDelegate for FeaturePickerDelegate {
                 )
                 .child(
                     Button::new("run-action-secondary", "Confirm Selections")
+                        .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
@@ -663,20 +655,33 @@ impl DevContainerModal {
         }
     }
 
+    fn render_dialog_header(
+        &self,
+        title: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        dialog_header(title, cx).child(
+            IconButton::new("dismiss", IconName::Close)
+                .icon_size(IconSize::Small)
+                .style(Rank::Quiet.style())
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.dismiss(&menu::Cancel, window, cx)),
+                ),
+        )
+    }
+
     fn render_initial(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut view = Navigable::new(
             div()
-                .p_1()
                 .child(
-                    div().track_focus(&self.focus_handle).child(
-                        ModalHeader::new().child(
-                            Headline::new("Create Dev Container").size(HeadlineSize::XSmall),
-                        ),
-                    ),
+                    div()
+                        .track_focus(&self.focus_handle)
+                        .child(self.render_dialog_header("Create Dev Container", cx)),
                 )
                 .child(ListSeparator)
                 .child(
-                    div()
+                    dialog_body()
+                        .flex_col()
                         .track_focus(&self.confirm_entry.focus_handle)
                         .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
                             this.accept_message(DevContainerMessage::SearchTemplates, window, cx);
@@ -713,18 +718,21 @@ impl DevContainerModal {
         error_title: String,
         error: impl Display,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         v_flex()
-            .p_1()
-            .child(div().track_focus(&self.focus_handle).child(
-                ModalHeader::new().child(Headline::new(error_title).size(HeadlineSize::XSmall)),
-            ))
+            .child(
+                div()
+                    .track_focus(&self.focus_handle)
+                    .child(self.render_dialog_header(error_title, cx)),
+            )
             .child(ListSeparator)
             .child(
-                v_flex()
-                    .child(Label::new(format!("{}", error)))
-                    .whitespace_normal(),
+                dialog_body().flex_col().px_3().py_2().child(
+                    v_flex()
+                        .child(Label::new(format!("{}", error)))
+                        .whitespace_normal(),
+                ),
             )
             .into_any_element()
     }
@@ -762,16 +770,10 @@ impl DevContainerModal {
                         .id("title")
                         .tooltip(Tooltip::text(next_option_entries.description.clone()))
                         .track_focus(&self.focus_handle)
-                        .child(
-                            ModalHeader::new()
-                                .child(
-                                    Headline::new("Template Option: ").size(HeadlineSize::XSmall),
-                                )
-                                .child(
-                                    Headline::new(&next_option_entries.option_name)
-                                        .size(HeadlineSize::XSmall),
-                                ),
-                        ),
+                        .child(self.render_dialog_header(
+                            format!("Template Option: {}", next_option_entries.option_name),
+                            cx,
+                        )),
                 )
                 .child(ListSeparator)
                 .children(
@@ -883,14 +885,9 @@ impl DevContainerModal {
         Navigable::new(
             div()
                 .child(
-                    div().track_focus(&self.focus_handle).child(
-                        ModalHeader::new()
-                            .icon(Icon::new(IconName::Warning).color(Color::Warning))
-                            .child(
-                                Headline::new("Overwrite Existing Configuration?")
-                                    .size(HeadlineSize::XSmall),
-                            ),
-                    ),
+                    div()
+                        .track_focus(&self.focus_handle)
+                        .child(self.render_dialog_header("Overwrite Existing Configuration?", cx)),
                 )
                 .child(
                     div()
@@ -959,11 +956,9 @@ impl DevContainerModal {
         Navigable::new(
             div()
                 .child(
-                    div().track_focus(&self.focus_handle).child(
-                        ModalHeader::new().child(
-                            Headline::new("Create Dev Container").size(HeadlineSize::XSmall),
-                        ),
-                    ),
+                    div()
+                        .track_focus(&self.focus_handle)
+                        .child(self.render_dialog_header("Create Dev Container", cx)),
                 )
                 .child(ListSeparator)
                 .child(
@@ -1011,11 +1006,9 @@ impl DevContainerModal {
         Navigable::new(
             div()
                 .child(
-                    div().track_focus(&self.focus_handle).child(
-                        ModalHeader::new().child(
-                            Headline::new("Create Dev Container").size(HeadlineSize::XSmall),
-                        ),
-                    ),
+                    div()
+                        .track_focus(&self.focus_handle)
+                        .child(self.render_dialog_header("Create Dev Container", cx)),
                 )
                 .child(ListSeparator)
                 .child(
@@ -1389,9 +1382,7 @@ trait StatefulModal: ModalView + EventEmitter<DismissEvent> + Render {
 
     fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let element = self.render_for_state(self.state(), window, cx);
-        div()
-            .elevation_3(cx)
-            .w(rems(34.))
+        dialog_shell(cx)
             .key_context("ContainerModal")
             .on_action(cx.listener(Self::dismiss))
             .child(element)

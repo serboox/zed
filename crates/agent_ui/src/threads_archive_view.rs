@@ -33,7 +33,9 @@ use settings::Settings as _;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar, prelude::*,
+    Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar,
+    cyberpunk::{Rank, dialog_footer},
+    prelude::*,
     utils::platform_title_bar_height,
 };
 use util::ResultExt;
@@ -1601,15 +1603,10 @@ impl PickerDelegate for ProjectPickerDelegate {
         let focus_handle = self.focus_handle.clone();
 
         Some(
-            h_flex()
-                .flex_1()
-                .p_1p5()
-                .gap_1()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            dialog_footer()
                 .child(
                     Button::new("open_local_folder", "Choose from Local Folders")
+                        .style(Rank::Quiet.style())
                         .key_binding(KeyBinding::for_action_in(
                             &workspace::Open::default(),
                             &focus_handle,
@@ -1621,6 +1618,7 @@ impl PickerDelegate for ProjectPickerDelegate {
                 )
                 .child(
                     Button::new("select_project", "Select")
+                        .style(Rank::Accent.style())
                         .disabled(!has_selection)
                         .key_binding(KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx))
                         .on_click(cx.listener(move |picker, _, window, cx| {

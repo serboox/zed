@@ -19,7 +19,10 @@ use menu::{Cancel, Confirm};
 use project::git_store::Repository;
 use project_diff::ProjectDiff;
 use time::OffsetDateTime;
-use ui::{ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, prelude::*};
+use ui::{
+    ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, Tooltip, cyberpunk,
+    prelude::*,
+};
 use workspace::{
     ModalView, OpenMode, Workspace,
     notifications::{DetachAndPromptErr, NotifyTaskExt},
@@ -470,26 +473,51 @@ impl Focusable for RenameBranchModal {
 
 impl Render for RenameBranchModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        cyberpunk::dialog_shell(cx)
             .key_context("RenameBranchModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .elevation_2(cx)
-            .w(rems(34.))
             .child(
-                h_flex()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .w_full()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                cyberpunk::dialog_header("Rename Branch", cx).child(
+                    div().debug_selector(|| "DIALOG-CLOSE".to_string()).child(
+                        IconButton::new("rename-branch-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_body().child(v_flex().w_full().px_3().pb_3().child(
+                    cyberpunk::dialog_field("New name", false, cx, self.editor.clone()),
+                )),
+            )
+            .child(
+                cyberpunk::dialog_footer()
                     .child(
-                        Headline::new(format!("Rename Branch ({})", self.current_branch))
-                            .size(HeadlineSize::XSmall),
+                        cyberpunk::dialog_footer_left().child(
+                            Label::new(self.current_branch.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .child(cyberpunk::dialog_footer_spacer())
+                    .child(
+                        Button::new("rename-branch-cancel", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("rename-branch-confirm", "Rename")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&Confirm, window, cx);
+                            })),
                     ),
             )
-            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
     }
 }
 
@@ -688,7 +716,6 @@ impl Focusable for RefPickerModal {
 
 impl Render for RefPickerModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_commit_details = self.commit_details.is_some();
         let commit_preview = self.commit_details.as_ref().map(|details| {
             let commit_time = OffsetDateTime::from_unix_timestamp(details.commit_timestamp)
                 .unwrap_or_else(|_| OffsetDateTime::now_utc());
@@ -724,27 +751,53 @@ impl Render for RefPickerModal {
                 )
         });
 
-        v_flex()
+        cyberpunk::dialog_shell(cx)
             .key_context("RefPickerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .elevation_2(cx)
-            .w(rems(34.))
             .child(
-                h_flex()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .w_full()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::Hash).size(IconSize::XSmall))
-                    .child(Headline::new("View Commit").size(HeadlineSize::XSmall)),
+                cyberpunk::dialog_header("View Commit", cx).child(
+                    div().debug_selector(|| "DIALOG-CLOSE".to_string()).child(
+                        IconButton::new("ref-picker-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                ),
             )
-            .child(div().px_3().w_full().child(self.editor.clone()))
-            .when_some(commit_preview, |el, preview| {
-                el.child(div().px_3().pb_3().w_full().child(preview))
-            })
-            .when(!has_commit_details, |el| el.child(div().pb_3()))
+            .child(
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .child(cyberpunk::dialog_field(
+                            "Git ref",
+                            false,
+                            cx,
+                            self.editor.clone(),
+                        ))
+                        .children(commit_preview),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_footer()
+                    .child(
+                        Button::new("ref-picker-cancel", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("ref-picker-confirm", "View")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&Confirm, window, cx);
+                            })),
+                    ),
+            )
     }
 }
 
@@ -1266,38 +1319,54 @@ impl Focusable for GitCloneModal {
 
 impl Render for GitCloneModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .elevation_3(cx)
-            .w(rems(34.))
-            .flex_1()
-            .overflow_hidden()
+        cyberpunk::dialog_shell(cx)
+            .key_context("GitCloneModal")
             .child(
-                div()
-                    .w_full()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(self.repo_input.clone()),
+                cyberpunk::dialog_header("Clone Repository", cx).child(
+                    div().debug_selector(|| "DIALOG-CLOSE".to_string()).child(
+                        IconButton::new("git-clone-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                ),
             )
             .child(
-                h_flex()
-                    .w_full()
-                    .p_2()
-                    .gap_0p5()
-                    .rounded_b_sm()
-                    .bg(cx.theme().colors().editor_background)
+                cyberpunk::dialog_body().child(v_flex().w_full().px_3().pb_3().child(
+                    cyberpunk::dialog_field("Repository URL", false, cx, self.repo_input.clone()),
+                )),
+            )
+            .child(
+                cyberpunk::dialog_footer()
                     .child(
-                        Label::new("Clone a repository from GitHub or other sources.")
-                            .color(Color::Muted)
-                            .size(LabelSize::Small),
+                        cyberpunk::dialog_footer_left().child(
+                            Label::new("Clone a repository from GitHub or other sources.")
+                                .color(Color::Muted)
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
                     )
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("learn-more", "Learn More")
                             .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Quiet.style())
                             .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
                             .on_click(|_, _, cx| {
                                 cx.open_url("https://github.com/git-guides/git-clone");
                             }),
+                    )
+                    .child(
+                        Button::new("git-clone-confirm", "Clone")
+                            .label_size(LabelSize::Small)
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let repo = this.repo_input.read(cx).text(cx);
+                                this.panel.update(cx, |panel, cx| {
+                                    panel.git_clone(repo, window, cx);
+                                });
+                                cx.emit(DismissEvent);
+                            })),
                     ),
             )
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
@@ -1416,5 +1485,100 @@ mod view_commit_tests {
 
         assert!(!initial_modal_state);
         assert!(final_modal_state);
+    }
+
+    // Where the window's parts are painted, not where the element tree says they
+    // were put: the way out in the corner the reader reaches for, and the answer
+    // the window is waiting for at the far end of the bar, last.
+    #[gpui::test]
+    async fn the_ref_picker_corners_hold_the_way_out_and_the_confirming_action(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = setup_git_repo(cx).await;
+        // The repository has to have a status before it counts as the active
+        // one, and `show_ref_picker` returns without a word when there is no
+        // active repository -- so without this the window never opens and the
+        // measurements below have nothing to measure.
+        fs.set_status_for_repo(
+            Path::new("/root/project/.git"),
+            &[("src/main.rs", git::status::StatusCode::Modified.worktree())],
+        );
+        let (_project, workspace) = create_test_workspace(fs, cx).await;
+        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+        // The window is built into a window of its own rather than opened
+        // through the workspace's modal layer. Both paths render the same
+        // element tree, but the modal layer draws deferred, and a deferred
+        // pass does not leave the painted rectangles of its children in the
+        // frame this reads -- the same test through `show_ref_picker` finds
+        // nothing to measure. `active_modal` is asserted separately by
+        // `test_show_ref_picker_with_repository`, so the action's own path
+        // stays covered.
+        let repo = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).active_repository(cx)
+            })
+            .expect("the fixture has a repository")
+            .expect("it is the active one");
+        let workspace_entity = workspace.root(cx).expect("the workspace is rooted");
+        let (_modal, cx) = cx
+            .add_window_view(|window, cx| RefPickerModal::new(repo, workspace_entity, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("DIALOG-CLOSE")
+            .expect("the way out is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let view = cx
+            .debug_bounds("BUTTON-View")
+            .expect("the confirming action is painted");
+        let cancel = cx
+            .debug_bounds("BUTTON-Cancel")
+            .expect("the dismissing action is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85,
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        assert!(
+            view.right() > footer.left() + footer.size.width * 0.85,
+            "the confirming action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in \
+             the corner",
+            view.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            cancel.right() <= view.left(),
+            "the confirming action comes last, so Cancel at {:?}..{:?} sits left of View at \
+             {:?}..{:?}",
+            cancel.left(),
+            cancel.right(),
+            view.left(),
+            view.right()
+        );
+        assert!(
+            view.bottom() <= footer.bottom() + gpui::px(0.5)
+                && view.top() >= footer.top() - gpui::px(0.5),
+            "the confirming action is painted {:?}..{:?} outside a bar spanning {:?}..{:?}",
+            view.top(),
+            view.bottom(),
+            footer.top(),
+            footer.bottom()
+        );
     }
 }

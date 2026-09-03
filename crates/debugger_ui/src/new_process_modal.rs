@@ -25,6 +25,9 @@ use task::{DebugScenario, RevealTarget, SharedTaskContext, VariableName, ZedDebu
 use ui::{
     ContextMenu, DropdownMenu, IconWithIndicator, Indicator, KeyBinding, ListItem, ListItemSpacing,
     Switch, SwitchLabelPosition, ToggleButtonGroup, ToggleButtonSimple, ToggleState, Tooltip,
+    cyberpunk::{
+        Rank, dialog_body, dialog_footer, dialog_footer_left, dialog_header, dialog_shell,
+    },
     prelude::*,
 };
 use ui_input::InputField;
@@ -297,7 +300,7 @@ impl NewProcessModal {
                 this.clone().render(dap_menu, window, cx).into_any_element()
             }),
             NewProcessMode::Debug => v_flex()
-                .w(rems(34.))
+                .w_full()
                 .child(self.debug_picker.clone())
                 .into_any_element(),
         }
@@ -568,17 +571,13 @@ impl Render for NewProcessModal {
         let attach_focus_handle = focus_handle.clone();
         let launch_focus_handle = focus_handle;
 
-        v_flex()
+        dialog_shell(cx)
             .key_context({
                 let mut key_context = KeyContext::new_with_defaults();
                 key_context.add("Pane");
                 key_context.add("RunModal");
                 key_context
             })
-            .size_full()
-            .w(rems(34.))
-            .elevation_3(cx)
-            .overflow_hidden()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
                 cx.emit(DismissEvent);
             }))
@@ -628,129 +627,132 @@ impl Render for NewProcessModal {
                 cx.notify();
             }))
             .child(
-                h_flex().p_2().pb_0p5().w_full().child(
-                    ToggleButtonGroup::single_row(
-                        "debugger-mode-buttons",
-                        [
-                            ToggleButtonSimple::new(
-                                NewProcessMode::Task.to_string(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.mode = NewProcessMode::Task;
-                                    this.mode_focus_handle(cx).focus(window, cx);
-                                    cx.notify();
-                                }),
-                            )
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in(
-                                    "Run predefined task",
-                                    &ActivateTaskTab,
-                                    &task_focus_handle,
-                                    cx,
+                dialog_header("New Process", cx)
+                    .child(
+                        ToggleButtonGroup::single_row(
+                            "debugger-mode-buttons",
+                            [
+                                ToggleButtonSimple::new(
+                                    NewProcessMode::Task.to_string(),
+                                    cx.listener(|this, _, window, cx| {
+                                        this.mode = NewProcessMode::Task;
+                                        this.mode_focus_handle(cx).focus(window, cx);
+                                        cx.notify();
+                                    }),
                                 )
-                            }),
-                            ToggleButtonSimple::new(
-                                NewProcessMode::Debug.to_string(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.mode = NewProcessMode::Debug;
-                                    this.mode_focus_handle(cx).focus(window, cx);
-                                    cx.notify();
+                                .tooltip(move |_, cx| {
+                                    Tooltip::for_action_in(
+                                        "Run predefined task",
+                                        &ActivateTaskTab,
+                                        &task_focus_handle,
+                                        cx,
+                                    )
                                 }),
-                            )
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in(
-                                    "Start a predefined debug scenario",
-                                    &ActivateDebugTab,
-                                    &debug_focus_handle,
-                                    cx,
+                                ToggleButtonSimple::new(
+                                    NewProcessMode::Debug.to_string(),
+                                    cx.listener(|this, _, window, cx| {
+                                        this.mode = NewProcessMode::Debug;
+                                        this.mode_focus_handle(cx).focus(window, cx);
+                                        cx.notify();
+                                    }),
                                 )
-                            }),
-                            ToggleButtonSimple::new(
-                                NewProcessMode::Attach.to_string(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.mode = NewProcessMode::Attach;
+                                .tooltip(move |_, cx| {
+                                    Tooltip::for_action_in(
+                                        "Start a predefined debug scenario",
+                                        &ActivateDebugTab,
+                                        &debug_focus_handle,
+                                        cx,
+                                    )
+                                }),
+                                ToggleButtonSimple::new(
+                                    NewProcessMode::Attach.to_string(),
+                                    cx.listener(|this, _, window, cx| {
+                                        this.mode = NewProcessMode::Attach;
 
-                                    if let Some(debugger) = this.debugger.as_ref() {
-                                        Self::update_attach_picker(
-                                            &this.attach_mode,
-                                            debugger,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                    this.mode_focus_handle(cx).focus(window, cx);
-                                    cx.notify();
-                                }),
-                            )
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in(
-                                    "Attach the debugger to a running process",
-                                    &ActivateAttachTab,
-                                    &attach_focus_handle,
-                                    cx,
+                                        if let Some(debugger) = this.debugger.as_ref() {
+                                            Self::update_attach_picker(
+                                                &this.attach_mode,
+                                                debugger,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        this.mode_focus_handle(cx).focus(window, cx);
+                                        cx.notify();
+                                    }),
                                 )
-                            }),
-                            ToggleButtonSimple::new(
-                                NewProcessMode::Launch.to_string(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.mode = NewProcessMode::Launch;
-                                    this.mode_focus_handle(cx).focus(window, cx);
-                                    cx.notify();
+                                .tooltip(move |_, cx| {
+                                    Tooltip::for_action_in(
+                                        "Attach the debugger to a running process",
+                                        &ActivateAttachTab,
+                                        &attach_focus_handle,
+                                        cx,
+                                    )
                                 }),
-                            )
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in(
-                                    "Launch a new process with a debugger",
-                                    &ActivateLaunchTab,
-                                    &launch_focus_handle,
-                                    cx,
+                                ToggleButtonSimple::new(
+                                    NewProcessMode::Launch.to_string(),
+                                    cx.listener(|this, _, window, cx| {
+                                        this.mode = NewProcessMode::Launch;
+                                        this.mode_focus_handle(cx).focus(window, cx);
+                                        cx.notify();
+                                    }),
                                 )
-                            }),
-                        ],
+                                .tooltip(move |_, cx| {
+                                    Tooltip::for_action_in(
+                                        "Launch a new process with a debugger",
+                                        &ActivateLaunchTab,
+                                        &launch_focus_handle,
+                                        cx,
+                                    )
+                                }),
+                            ],
+                        )
+                        .style(ui::ToggleButtonGroupStyle::Outlined)
+                        .label_size(LabelSize::Default)
+                        .auto_width()
+                        .selected_index(match self.mode {
+                            NewProcessMode::Task => 0,
+                            NewProcessMode::Debug => 1,
+                            NewProcessMode::Attach => 2,
+                            NewProcessMode::Launch => 3,
+                        }),
                     )
-                    .style(ui::ToggleButtonGroupStyle::Outlined)
-                    .label_size(LabelSize::Default)
-                    .auto_width()
-                    .selected_index(match self.mode {
-                        NewProcessMode::Task => 0,
-                        NewProcessMode::Debug => 1,
-                        NewProcessMode::Attach => 2,
-                        NewProcessMode::Launch => 3,
-                    }),
-                ),
+                    .child(
+                        IconButton::new("dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(Rank::Quiet.style())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
             )
-            .child(v_flex().child(self.render_mode(window, cx)))
+            .child(dialog_body().flex_col().child(self.render_mode(window, cx)))
             .map(|el| {
-                let container = h_flex()
-                    .w_full()
-                    .p_1p5()
-                    .gap_2()
-                    .justify_end()
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant);
+                let container = dialog_footer();
                 let secondary_action = menu::SecondaryConfirm.boxed_clone();
                 match self.mode {
                     NewProcessMode::Launch => el.child(
                         container
                             .child(
-                                h_flex().child(
-                                    Button::new("edit-custom-debug", "Edit in debug.json")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.save_debug_scenario(window, cx);
-                                        }))
-                                        .key_binding(KeyBinding::for_action(&*secondary_action, cx))
-                                        .disabled(
-                                            self.debugger.is_none()
-                                                || self
-                                                    .configure_mode
-                                                    .read(cx)
-                                                    .program
-                                                    .read(cx)
-                                                    .is_empty(cx),
-                                        ),
-                                ),
+                                Button::new("edit-custom-debug", "Edit in debug.json")
+                                    .style(Rank::Neutral.style())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_debug_scenario(window, cx);
+                                    }))
+                                    .key_binding(KeyBinding::for_action(&*secondary_action, cx))
+                                    .disabled(
+                                        self.debugger.is_none()
+                                            || self
+                                                .configure_mode
+                                                .read(cx)
+                                                .program
+                                                .read(cx)
+                                                .is_empty(cx),
+                                    ),
                             )
                             .child(
                                 Button::new("debugger-spawn", "Start")
+                                    .style(Rank::Accent.style())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.start_new_session(window, cx)
                                     }))
@@ -779,18 +781,18 @@ impl Render for NewProcessModal {
                                 == 0;
                         let secondary_action = menu::SecondaryConfirm.boxed_clone();
                         container
-                            .child(div().child({
+                            .child(
+                                dialog_footer_left().child(self.adapter_drop_down_menu(window, cx)),
+                            )
+                            .child({
                                 Button::new("edit-attach-task", "Edit in debug.json")
+                                    .style(Rank::Neutral.style())
                                     .key_binding(KeyBinding::for_action(&*secondary_action, cx))
                                     .on_click(move |_, window, cx| {
                                         window.dispatch_action(secondary_action.boxed_clone(), cx)
                                     })
                                     .disabled(disabled)
-                            }))
-                            .child(
-                                h_flex()
-                                    .child(div().child(self.adapter_drop_down_menu(window, cx))),
-                            )
+                            })
                     }),
                     NewProcessMode::Debug => el,
                     NewProcessMode::Task => el,
@@ -1481,26 +1483,22 @@ impl PickerDelegate for DebugDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<ui::AnyElement> {
         let current_modifiers = window.modifiers();
-        let footer = h_flex()
-            .w_full()
-            .p_1p5()
-            .justify_end()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
+        let footer = dialog_footer()
             .child({
                 let action = menu::SecondaryConfirm.boxed_clone();
                 if self.matches.is_empty() {
-                    Button::new("edit-debug-json", "Edit debug.json").on_click(cx.listener(
-                        |_picker, _, window, cx| {
+                    Button::new("edit-debug-json", "Edit debug.json")
+                        .style(Rank::Neutral.style())
+                        .on_click(cx.listener(|_picker, _, window, cx| {
                             window.dispatch_action(
                                 zed_actions::OpenProjectDebugTasks.boxed_clone(),
                                 cx,
                             );
                             cx.emit(DismissEvent);
-                        },
-                    ))
+                        }))
                 } else {
                     Button::new("edit-debug-task", "Edit in debug.json")
+                        .style(Rank::Neutral.style())
                         .key_binding(KeyBinding::for_action(&*action, cx))
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(action.boxed_clone(), cx)
@@ -1512,6 +1510,7 @@ impl PickerDelegate for DebugDelegate {
                     let action = picker::ConfirmInput { secondary: false }.boxed_clone();
                     this.child({
                         Button::new("launch-custom", "Launch Custom")
+                            .style(Rank::Accent.style())
                             .key_binding(KeyBinding::for_action(&*action, cx))
                             .on_click(move |_, window, cx| {
                                 window.dispatch_action(action.boxed_clone(), cx)
@@ -1523,6 +1522,7 @@ impl PickerDelegate for DebugDelegate {
                         let run_entry_label = if is_recent_selected { "Rerun" } else { "Spawn" };
 
                         Button::new("spawn", run_entry_label)
+                            .style(Rank::Accent.style())
                             .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(menu::Confirm.boxed_clone(), cx);

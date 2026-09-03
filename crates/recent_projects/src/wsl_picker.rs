@@ -4,8 +4,9 @@ use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Subscripti
 use picker::Picker;
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use ui::{
-    App, Context, HighlightedLabel, Icon, IconName, InteractiveElement, ListItem, ParentElement,
-    Render, Styled, StyledExt, Toggleable, Window, div, h_flex, rems, v_flex,
+    HighlightedLabel, ListItem, Render,
+    cyberpunk::{Rank, dialog_body, dialog_header, dialog_shell},
+    prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, MultiWorkspace};
@@ -284,13 +285,19 @@ impl EventEmitter<DismissEvent> for WslOpenModal {}
 
 impl Render for WslOpenModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
-        div()
+        dialog_shell(cx)
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(Self::cancel))
-            .elevation_3(cx)
-            .w(rems(34.))
-            .flex_1()
-            .overflow_hidden()
-            .child(self.picker.clone())
+            .child(
+                dialog_header("Open WSL Distro", cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel(&menu::Cancel, window, cx)
+                        })),
+                ),
+            )
+            .child(dialog_body().child(self.picker.clone()))
     }
 }

@@ -13,7 +13,12 @@ use theme::{Appearance, SystemAppearance, Theme, ThemeMeta, ThemeRegistry};
 use theme_settings::{
     ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings, appearance_to_mode,
 };
-use ui::{ListItem, ListItemSpacing, prelude::*, v_flex};
+use ui::{
+    ListItem, ListItemSpacing,
+    cyberpunk::{Rank, dialog_footer},
+    prelude::*,
+    v_flex,
+};
 use util::ResultExt;
 use workspace::{ModalView, Workspace, ui::HighlightedLabel, with_active_or_new_workspace};
 use zed_actions::{ExtensionCategoryFilter, Extensions};
@@ -535,15 +540,10 @@ impl PickerDelegate for ThemeSelectorDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<gpui::AnyElement> {
         Some(
-            h_flex()
-                .p_2()
-                .w_full()
-                .justify_between()
-                .gap_2()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
+            dialog_footer()
                 .child(
                     Button::new("docs", "View Theme Docs")
+                        .style(Rank::Quiet.style())
                         .end_icon(
                             Icon::new(IconName::ArrowUpRight)
                                 .size(IconSize::Small)
@@ -554,17 +554,19 @@ impl PickerDelegate for ThemeSelectorDelegate {
                         })),
                 )
                 .child(
-                    Button::new("more-themes", "Install Themes").on_click(cx.listener({
-                        move |_, _, window, cx| {
-                            window.dispatch_action(
-                                Box::new(Extensions {
-                                    category_filter: Some(ExtensionCategoryFilter::Themes),
-                                    id: None,
-                                }),
-                                cx,
-                            );
-                        }
-                    })),
+                    Button::new("more-themes", "Install Themes")
+                        .style(Rank::Neutral.style())
+                        .on_click(cx.listener({
+                            move |_, _, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(Extensions {
+                                        category_filter: Some(ExtensionCategoryFilter::Themes),
+                                        id: None,
+                                    }),
+                                    cx,
+                                );
+                            }
+                        })),
                 )
                 .into_any_element(),
         )
@@ -715,6 +717,63 @@ mod tests {
             previewed_theme_name(&picker, cx),
             "Test Light",
             "previewed theme should be preserved after clearing an empty filter"
+        );
+    }
+
+    // Where the footer's actions are painted, not where the element tree says
+    // they were put: a row packed at the left edge reads as part of the list
+    // above it rather than as the bar the window ends with.
+    #[gpui::test]
+    async fn the_theme_selectors_footer_actions_are_painted_in_the_bottom_right_corner(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = setup_test(cx).await;
+        let project = Project::test(app_state.fs.clone(), [path!("/test").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let _picker = open_theme_selector(&workspace, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let install = cx
+            .debug_bounds("BUTTON-Install Themes")
+            .expect("the last action is painted");
+        let docs = cx
+            .debug_bounds("BUTTON-View Theme Docs")
+            .expect("the secondary action is painted");
+
+        assert!(
+            install.right() > footer.left() + footer.size.width * 0.85,
+            "the last action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in the \
+             corner",
+            install.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            docs.left() > footer.left() + footer.size.width * 0.5,
+            "both actions belong in the right half; the secondary one starts at {:?} in a bar \
+             spanning {:?}..{:?}",
+            docs.left(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            docs.right() <= install.left(),
+            "the last action comes last, so the docs action at {:?}..{:?} sits left of it at \
+             {:?}..{:?}",
+            docs.left(),
+            docs.right(),
+            install.left(),
+            install.right()
         );
     }
 }

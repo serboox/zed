@@ -15,7 +15,7 @@ use project::Project;
 use project::git_store::RepositoryEvent;
 use ui::{
     Button, CommonAnimationExt as _, Divider, HighlightedLabel, IconButton, KeyBinding, ListItem,
-    ListItemSpacing, ListSubHeader, Tooltip, prelude::*,
+    ListItemSpacing, ListSubHeader, Tooltip, cyberpunk, prelude::*,
 };
 use util::ResultExt as _;
 use util::paths::PathExt;
@@ -1414,15 +1414,12 @@ impl PickerDelegate for WorktreePickerDelegate {
             matches!(e, WorktreeEntry::Worktree { worktree, .. } if self.deleting_worktree_paths.contains(&worktree.path))
         });
 
-        let footer = h_flex()
-            .w_full()
-            .p_1p5()
-            .gap_0p5()
-            .justify_end()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(
+        // "Automate Setup" is incidental to whatever the reader came here to do,
+        // so it holds the left of the bar and the answer still ends in the corner.
+        let footer = cyberpunk::dialog_footer().child(
+            cyberpunk::dialog_footer_left().child(
                 Button::new("configure-worktree-tasks", "Automate Setup")
+                    .style(cyberpunk::Rank::Quiet.style())
                     .key_binding(
                         KeyBinding::for_action_in(&OpenWorktreeSetupTasks, &focus_handle, cx)
                             .map(|kb| kb.size(rems_from_px(12.))),
@@ -1430,13 +1427,15 @@ impl PickerDelegate for WorktreePickerDelegate {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(OpenWorktreeSetupTasks.boxed_clone(), cx)
                     }),
-            );
+            ),
+        );
 
         if is_creating {
             Some(
                 footer
                     .child(
                         Button::new("create-worktree", "Create")
+                            .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                     .map(|kb| kb.size(rems_from_px(12.))),
@@ -1456,6 +1455,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .when(is_deleting, |this| {
                                 this.child(
                                     Button::new("delete-worktree", "Deleting…")
+                                        .style(cyberpunk::Rank::Destructive.style())
                                         .loading(true)
                                         .disabled(true),
                                 )
@@ -1464,6 +1464,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 let focus_handle = focus_handle.clone();
                                 this.child(
                                     Button::new("delete-worktree", "Delete")
+                                        .style(cyberpunk::Rank::Destructive.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(
                                                 &DeleteWorktree,
@@ -1481,6 +1482,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 let focus_handle = focus_handle.clone();
                                 this.child(
                                     Button::new("open-in-new-window", "Open in New Window")
+                                        .style(cyberpunk::Rank::Neutral.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(
                                                 &menu::SecondaryConfirm,
@@ -1500,6 +1502,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .when(!is_deleting, |this| {
                                 this.child(
                                     Button::new("open-worktree", "Open")
+                                        .style(cyberpunk::Rank::Accent.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(
                                                 &menu::Confirm,

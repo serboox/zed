@@ -20,7 +20,8 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use ui::{
     Banner, ContextMenu, Divider, HighlightedLabel, Indicator, KeyBinding, ListItem,
-    ListItemSpacing, ListSubHeader, PopoverMenu, PopoverMenuHandle, Severity, Tooltip, prelude::*,
+    ListItemSpacing, ListSubHeader, PopoverMenu, PopoverMenuHandle, Severity, Tooltip, cyberpunk,
+    prelude::*,
 };
 use ui_input::ErasedEditor;
 use util::ResultExt;
@@ -1982,15 +1983,6 @@ impl PickerDelegate for BranchListDelegate {
         }
         let focus_handle = self.focus_handle.clone();
 
-        let footer_container = || {
-            h_flex()
-                .w_full()
-                .p_1p5()
-                .justify_end()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant)
-        };
-
         match self.state {
             PickerState::List => {
                 let selected_entry = self.matches.get(self.selected_index);
@@ -2003,6 +1995,7 @@ impl PickerDelegate for BranchListDelegate {
                         let button_label = format!("Create New From: {default_branch}");
 
                         Button::new("branch-from-default", button_label)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
@@ -2025,6 +2018,7 @@ impl PickerDelegate for BranchListDelegate {
                         |this| {
                             this.child(
                                 Button::new("delete-branch", "Delete")
+                                    .style(cyberpunk::Rank::Destructive.style())
                                     .key_binding(
                                         KeyBinding::for_action_in(
                                             &branch_picker::DeleteBranch,
@@ -2044,6 +2038,7 @@ impl PickerDelegate for BranchListDelegate {
                     )
                     .child(
                         Button::new("switch_branch", "Switch")
+                            .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                     .map(|kb| kb.size(rems_from_px(12.))),
@@ -2054,11 +2049,11 @@ impl PickerDelegate for BranchListDelegate {
                     );
 
                 Some(
-                    footer_container()
-                        .justify_end()
+                    cyberpunk::dialog_footer()
                         .map(|this| match branch_from_default_button {
                             Some(button) => this.child(button).child(
                                 Button::new("create", "Create")
+                                    .style(cyberpunk::Rank::Accent.style())
                                     .key_binding(
                                         KeyBinding::for_action_in(
                                             &menu::Confirm,
@@ -2082,6 +2077,7 @@ impl PickerDelegate for BranchListDelegate {
                         let button_label = format!("Create New From: {default_branch}");
 
                         Button::new("branch-from-default", button_label)
+                            .style(cyberpunk::Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
@@ -2096,14 +2092,13 @@ impl PickerDelegate for BranchListDelegate {
                     });
 
                 Some(
-                    footer_container()
-                        .gap_1()
-                        .justify_end()
+                    cyberpunk::dialog_footer()
                         .when_some(branch_from_default_button, |this, button| {
                             this.child(button)
                         })
                         .child(
                             Button::new("create-new-branch", "Create")
+                                .style(cyberpunk::Rank::Accent.style())
                                 .key_binding(
                                     KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                         .map(|kb| kb.size(rems_from_px(12.))),
@@ -2116,10 +2111,10 @@ impl PickerDelegate for BranchListDelegate {
                 )
             }
             PickerState::CreateRemote(_) => Some(
-                footer_container()
-                    .justify_end()
+                cyberpunk::dialog_footer()
                     .child(
                         Button::new("confirm-create-remote", "Confirm")
+                            .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                     .map(|kb| kb.size(rems_from_px(12.))),

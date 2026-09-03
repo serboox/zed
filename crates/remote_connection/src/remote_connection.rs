@@ -15,7 +15,11 @@ use semver::Version;
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{
-    ActiveTheme, CommonAnimationExt, Context, InteractiveElement, KeyBinding, ListItem, Tooltip,
+    ActiveTheme, CommonAnimationExt, Context, InteractiveElement, KeyBinding, Tooltip,
+    cyberpunk::{
+        Rank, border_dim, dialog_body, dialog_footer, dialog_footer_left, dialog_header_marked,
+        dialog_shell,
+    },
     prelude::*,
 };
 use ui_input::{ERASED_EDITOR_FACTORY, ErasedEditor};
@@ -139,6 +143,7 @@ impl Render for RemoteConnectionPrompt {
             ..Default::default()
         };
 
+        let field_ground = cx.theme().colors().editor_background;
         let is_password_prompt = self.is_password_prompt;
         let is_masked = self.is_masked;
         let (masked_password_icon, masked_password_tooltip) = if is_masked {
@@ -176,7 +181,20 @@ impl Render for RemoteConnectionPrompt {
                                     )
                                 }),
                         )
-                        .child(div().flex_1().child(self.editor.render(window, cx))),
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .min_h(px(34.))
+                                .px_2()
+                                .py_1()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(border_dim())
+                                .bg(field_ground)
+                                .child(self.editor.render(window, cx)),
+                        ),
                 )
                 .when(window.capslock().on, |this| {
                     this.child(
@@ -349,57 +367,73 @@ impl RenderOnce for SshConnectionHeader {
 }
 
 impl Render for RemoteConnectionModal {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
         let nickname = self.prompt.read(cx).nickname.clone();
         let connection_string = self.prompt.read(cx).connection_string.clone();
-        let is_wsl = self.prompt.read(cx).is_wsl;
-        let is_devcontainer = self.prompt.read(cx).is_devcontainer;
+        let title = nickname.unwrap_or(connection_string);
+        let paths = self
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        let theme = cx.theme().clone();
-        let body_color = theme.colors().editor_background;
+        let kind = if self.prompt.read(cx).is_wsl {
+            IconName::Linux
+        } else if self.prompt.read(cx).is_devcontainer {
+            IconName::Box
+        } else {
+            IconName::Server
+        };
 
-        v_flex()
-            .elevation_3(cx)
-            .w(rems(34.))
-            .border_1()
-            .border_color(theme.colors().border)
+        dialog_shell(cx)
             .key_context("SshConnectionModal")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::confirm))
             .child(
-                SshConnectionHeader {
-                    paths: self.paths.clone(),
-                    connection_string,
-                    nickname,
-                    is_wsl,
-                    is_devcontainer,
-                }
-                .render(window, cx),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .bg(body_color)
-                    .border_y_1()
-                    .border_color(theme.colors().border_variant)
-                    .child(self.prompt.clone()),
-            )
-            .child(
-                div().w_full().py_1().child(
-                    ListItem::new("li-devcontainer-go-back")
-                        .inset(true)
-                        .spacing(ui::ListItemSpacing::Sparse)
-                        .start_slot(Icon::new(IconName::Close).color(Color::Muted))
-                        .child(Label::new("Cancel"))
-                        .end_slot(
-                            KeyBinding::for_action_in(&menu::Cancel, &self.focus_handle(cx), cx)
-                                .size(rems_from_px(12.)),
-                        )
+                dialog_header_marked(
+                    Icon::new(kind).size(IconSize::Small).color(Color::Muted),
+                    title,
+                    cx,
+                )
+                .child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.dismiss(&menu::Cancel, window, cx);
                         })),
                 ),
+            )
+            .child(dialog_body().child(self.prompt.clone()))
+            .child(
+                dialog_footer()
+                    .when(!paths.is_empty(), |footer| {
+                        footer.child(
+                            dialog_footer_left().child(
+                                Label::new(paths)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                        )
+                    })
+                    .child(
+                        Button::new("cancel", "Cancel")
+                            .style(Rank::Neutral.style())
+                            .key_binding(
+                                KeyBinding::for_action_in(
+                                    &menu::Cancel,
+                                    &self.focus_handle(cx),
+                                    cx,
+                                )
+                                .size(rems_from_px(12.)),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss(&menu::Cancel, window, cx);
+                            })),
+                    ),
             )
     }
 }

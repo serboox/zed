@@ -1,5 +1,3 @@
-mod profile_modal_header;
-
 use std::sync::Arc;
 
 use agent::ContextServerRegistry;
@@ -13,11 +11,12 @@ use settings::{
     LanguageModelProviderSetting, LanguageModelSelection, Settings as _, update_settings_file,
 };
 use ui::{
-    KeyBinding, ListItem, ListItemSpacing, ListSeparator, Navigable, NavigableEntry, prelude::*,
+    KeyBinding, ListItem, ListItemSpacing, ListSeparator, Navigable, NavigableEntry,
+    cyberpunk::{Rank, dialog_body, dialog_field, dialog_footer, dialog_header, dialog_shell},
+    prelude::*,
 };
 use workspace::{ModalView, Workspace};
 
-use crate::agent_configuration::manage_profiles_modal::profile_modal_header::ProfileModalHeader;
 use crate::agent_configuration::tool_picker::{ToolPicker, ToolPickerDelegate};
 use crate::language_model_selector::{LanguageModelSelector, language_model_selector};
 use crate::{AgentPanel, ManageProfiles};
@@ -96,7 +95,6 @@ pub struct ViewProfileMode {
     configure_tools: NavigableEntry,
     configure_mcps: NavigableEntry,
     delete_profile: NavigableEntry,
-    cancel_item: NavigableEntry,
 }
 
 #[derive(Clone)]
@@ -207,7 +205,6 @@ impl ManageProfilesModal {
             configure_tools: NavigableEntry::focusable(cx),
             configure_mcps: NavigableEntry::focusable(cx),
             delete_profile: NavigableEntry::focusable(cx),
-            cancel_item: NavigableEntry::focusable(cx),
         });
         self.focus_handle(cx).focus(window, cx);
     }
@@ -574,12 +571,10 @@ impl ManageProfilesModal {
         Navigable::new(
             div()
                 .track_focus(&self.focus_handle(cx))
-                .size_full()
-                .child(ProfileModalHeader::new("Agent Profiles", None))
+                .w_full()
                 .child(
                     v_flex()
                         .pb_1()
-                        .child(ListSeparator)
                         .children(
                             mode.builtin_profiles
                                 .iter()
@@ -648,31 +643,12 @@ impl ManageProfilesModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
-
-        let base_profile_name = mode.base_profile_id.as_ref().map(|base_profile_id| {
-            settings
-                .profiles
-                .get(base_profile_id)
-                .map(|profile| profile.name.clone())
-                .unwrap_or_else(|| "Unknown".into())
-        });
-
         v_flex()
             .id("new-profile")
             .track_focus(&self.focus_handle(cx))
-            .child(ProfileModalHeader::new(
-                match &base_profile_name {
-                    Some(base_profile) => format!("Fork {base_profile}"),
-                    None => "New Profile".into(),
-                },
-                match base_profile_name {
-                    Some(_) => Some(IconName::Scissors),
-                    None => Some(IconName::Plus),
-                },
-            ))
-            .child(ListSeparator)
-            .child(h_flex().p_2().child(mode.name_editor))
+            .w_full()
+            .p_3()
+            .child(dialog_field("Name", false, cx, mode.name_editor))
     }
 
     fn render_view_profile(
@@ -681,29 +657,13 @@ impl ManageProfilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
-
-        let profile_name = settings
-            .profiles
-            .get(&mode.profile_id)
-            .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| "Unknown".into());
-
-        let icon = match mode.profile_id.as_str() {
-            "write" => IconName::Pencil,
-            "ask" => IconName::Chat,
-            _ => IconName::UserRoundPen,
-        };
-
         Navigable::new(
             div()
                 .track_focus(&self.focus_handle(cx))
-                .size_full()
-                .child(ProfileModalHeader::new(profile_name, Some(icon)))
+                .w_full()
                 .child(
                     v_flex()
                         .pb_1()
-                        .child(ListSeparator)
                         .child(
                             div()
                                 .id("fork-profile")
@@ -893,48 +853,6 @@ impl ManageProfilesModal {
                                             })
                                         }),
                                 ),
-                        )
-                        .child(ListSeparator)
-                        .child(
-                            div()
-                                .id("cancel-item")
-                                .track_focus(&mode.cancel_item.focus_handle)
-                                .on_action({
-                                    cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                                        this.cancel(window, cx);
-                                    })
-                                })
-                                .child(
-                                    ListItem::new("cancel-item")
-                                        .toggle_state(
-                                            mode.cancel_item
-                                                .focus_handle
-                                                .contains_focused(window, cx),
-                                        )
-                                        .inset(true)
-                                        .spacing(ListItemSpacing::Sparse)
-                                        .start_slot(
-                                            Icon::new(IconName::ArrowLeft)
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .child(Label::new("Go Back"))
-                                        .end_slot(
-                                            div().child(
-                                                KeyBinding::for_action_in(
-                                                    &menu::Cancel,
-                                                    &self.focus_handle,
-                                                    cx,
-                                                )
-                                                .size(rems_from_px(12.)),
-                                            ),
-                                        )
-                                        .on_click({
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.cancel(window, cx);
-                                            })
-                                        }),
-                                ),
                         ),
                 )
                 .into_any_element(),
@@ -944,49 +862,97 @@ impl ManageProfilesModal {
         .entry(mode.configure_tools)
         .entry(mode.configure_mcps)
         .entry(mode.delete_profile)
-        .entry(mode.cancel_item)
+    }
+}
+
+impl ManageProfilesModal {
+    fn profile_name(profile_id: &AgentProfileId, cx: &App) -> SharedString {
+        AgentSettings::get_global(cx)
+            .profiles
+            .get(profile_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "Unknown".into())
+    }
+
+    fn render_go_back_footer(&self, cx: &mut Context<Self>) -> Div {
+        dialog_footer().child(
+            Button::new("go-back", "Go Back")
+                .style(Rank::Neutral.style())
+                .start_icon(Icon::new(IconName::ArrowLeft))
+                .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+        )
     }
 }
 
 impl Render for ManageProfilesModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
+        let title: SharedString = match &self.mode {
+            Mode::ChooseProfile(_) => "Agent Profiles".into(),
+            Mode::NewProfile(mode) => match &mode.base_profile_id {
+                Some(base_profile_id) => {
+                    format!("Fork {}", Self::profile_name(base_profile_id, cx)).into()
+                }
+                None => "New Profile".into(),
+            },
+            Mode::ViewProfile(mode) => Self::profile_name(&mode.profile_id, cx),
+            Mode::ConfigureTools { profile_id, .. } => format!(
+                "{} — Configure Built-in Tools",
+                Self::profile_name(profile_id, cx)
+            )
+            .into(),
+            Mode::ConfigureMcps { profile_id, .. } => format!(
+                "{} — Configure MCP Tools",
+                Self::profile_name(profile_id, cx)
+            )
+            .into(),
+            Mode::ConfigureDefaultModel { profile_id, .. } => format!(
+                "{} — Configure Default Model",
+                Self::profile_name(profile_id, cx)
+            )
+            .into(),
+        };
 
-        let go_back_item = div()
-            .id("cancel-item")
-            .track_focus(&self.focus_handle)
-            .on_action({
-                cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                    this.cancel(window, cx);
-                })
-            })
-            .child(
-                ListItem::new("cancel-item")
-                    .toggle_state(self.focus_handle.contains_focused(window, cx))
-                    .inset(true)
-                    .spacing(ListItemSpacing::Sparse)
-                    .start_slot(
-                        Icon::new(IconName::ArrowLeft)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+        let (body, footer) = match &self.mode {
+            Mode::ChooseProfile(mode) => (
+                self.render_choose_profile(mode.clone(), window, cx)
+                    .into_any_element(),
+                dialog_footer().child(
+                    Button::new("close", "Close")
+                        .style(Rank::Neutral.style())
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                ),
+            ),
+            Mode::NewProfile(mode) => (
+                self.render_new_profile(mode.clone(), window, cx)
+                    .into_any_element(),
+                dialog_footer()
+                    .child(
+                        Button::new("cancel", "Cancel")
+                            .style(Rank::Neutral.style())
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     )
-                    .child(Label::new("Go Back"))
-                    .end_slot(
-                        div().child(
-                            KeyBinding::for_action_in(&menu::Cancel, &self.focus_handle, cx)
-                                .size(rems_from_px(12.)),
-                        ),
-                    )
-                    .on_click({
-                        cx.listener(move |this, _, window, cx| {
-                            this.cancel(window, cx);
-                        })
-                    }),
-            );
+                    .child(
+                        Button::new("create-profile", "Create Profile")
+                            .style(Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
+                    ),
+            ),
+            Mode::ViewProfile(mode) => (
+                self.render_view_profile(mode.clone(), window, cx)
+                    .into_any_element(),
+                self.render_go_back_footer(cx),
+            ),
+            Mode::ConfigureTools { tool_picker, .. } | Mode::ConfigureMcps { tool_picker, .. } => (
+                tool_picker.clone().into_any_element(),
+                self.render_go_back_footer(cx),
+            ),
+            Mode::ConfigureDefaultModel { model_picker, .. } => (
+                model_picker.clone().into_any_element(),
+                self.render_go_back_footer(cx),
+            ),
+        };
 
-        div()
-            .elevation_3(cx)
-            .w(rems(34.))
+        dialog_shell(cx)
             .key_context("ManageProfilesModal")
             .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
@@ -994,85 +960,23 @@ impl Render for ManageProfilesModal {
                 this.focus_handle(cx).focus(window, cx);
             }))
             .on_mouse_down_out(cx.listener(|_this, _, _, cx| cx.emit(DismissEvent)))
-            .child(match &self.mode {
-                Mode::ChooseProfile(mode) => self
-                    .render_choose_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::NewProfile(mode) => self
-                    .render_new_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::ViewProfile(mode) => self
-                    .render_view_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::ConfigureTools {
-                    profile_id,
-                    tool_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
-
+            .child(
+                dialog_header(title, cx).child(
+                    IconButton::new("dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(Rank::Quiet.style())
+                        .on_click(cx.listener(|_this, _, _window, cx| cx.emit(DismissEvent))),
+                ),
+            )
+            .child(
+                dialog_body().child(
                     v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Built-in Tools"),
-                            Some(IconName::Settings),
-                        ))
-                        .child(ListSeparator)
-                        .child(tool_picker.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureDefaultModel {
-                    profile_id,
-                    model_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
-
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Default Model"),
-                            Some(IconName::ZedAgent),
-                        ))
-                        .child(ListSeparator)
-                        .child(v_flex().w(rems(34.)).child(model_picker.clone()))
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureMcps {
-                    profile_id,
-                    tool_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
-
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure MCP Tools"),
-                            Some(IconName::ToolHammer),
-                        ))
-                        .child(ListSeparator)
-                        .child(tool_picker.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-            })
+                        .id("manage-profiles-content")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .child(body),
+                ),
+            )
+            .child(footer)
     }
 }
