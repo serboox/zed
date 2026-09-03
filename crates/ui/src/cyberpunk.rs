@@ -224,14 +224,20 @@ pub fn dialog_title(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div
 /// the caller: a child that paints past a rounded corner is what makes the
 /// radius look like a mistake.
 pub fn dialog_shell(cx: &App) -> gpui::Div {
+    use crate::StyledExt as _;
     gpui::div()
         .flex()
         .flex_col()
         .w(DIALOG_WIDTH)
         .max_h(DIALOG_MAX_HEIGHT)
         .overflow_hidden()
-        .cyberpunk_surface()
-        .shadow(crate::ElevationIndex::ModalSurface.shadow(cx))
+        // The same step of the elevation ramp the pickers float at, rather
+        // than the surface and shadow written out again here: that ramp
+        // already decides the near-black fill, the raised border a modal gets
+        // instead of a menu's dim one, the corner radius and the shadow. Two
+        // places deciding it is how a window comes to have a dim border
+        // beside a picker's raised one.
+        .elevation_3(cx)
         .debug_selector(|| "DIALOG-SHELL".to_string())
 }
 
@@ -425,13 +431,19 @@ pub fn focal_glow(accent: Accent) -> Vec<BoxShadow> {
 /// every dialog surface is built from the same handful of calls.
 pub trait CyberpunkSurface: Styled + Sized {
     /// The base near-black dialog box: fixed surface color, a thin resting
-    /// border, and the one corner radius this fork owns.
+    /// border, and the corner radius a floating surface gets.
     ///
-    /// The radius is [`RADIUS`], the same token the segmented frames and the
-    /// fields use, so a window is made of one shape rather than three.
+    /// The radius is read from the elevation ramp rather than written here as
+    /// a number, because the ramp is what the pickers already round by -- 53
+    /// of them, through `elevation_3`. A second number in this file is how a
+    /// window ends up with 6px corners beside a picker's 12px ones, which is
+    /// the kind of difference nobody can name and everybody sees.
+    ///
+    /// [`RADIUS`] is the smaller step, for what sits *inside* a surface: the
+    /// segmented frames and the fields.
     fn cyberpunk_surface(self) -> Self {
         self.bg(surface())
-            .rounded(RADIUS)
+            .rounded(crate::ElevationIndex::ModalSurface.radius())
             .border_1()
             .border_color(border_dim())
     }
