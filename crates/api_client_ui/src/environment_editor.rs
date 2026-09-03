@@ -6,27 +6,14 @@ use gpui::{
     ScrollHandle, Subscription, Window,
 };
 use ui::{
-    Checkbox, ElevationIndex, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars,
-    ToggleState, Tooltip, WithScrollbar, cyberpunk, prelude::*,
+    Checkbox, IconName, IconSize, Label, LabelSize, ScrollAxes, Scrollbars, ToggleState, Tooltip,
+    WithScrollbar, cyberpunk, prelude::*,
 };
 use workspace::ModalView;
-
-/// Two columns side by side, so wider than a one-question dialog, and short
-/// enough that the modal layer's own top offset leaves it on screen. Both
-/// columns scroll inside this, which is why the height is a ceiling rather
-/// than something the content is allowed to push past.
-///
-/// The right half carries five columns -- an on/off box, three values and the
-/// row's own actions -- and only the three values may stretch. Narrower than
-/// this and each value box comes out shorter than the words heading it, which
-/// is the difference between a table that is tight and one that cannot be
-/// read.
-const DIALOG_WIDTH: f32 = 760.;
 
 /// What a newly added environment is called until it is named. Selected for
 /// editing the moment it appears, so the reader types over it.
 const NEW_ENVIRONMENT_NAME: &str = "New environment";
-const DIALOG_MAX_HEIGHT: f32 = 480.;
 
 /// How wide the column of environments stands.
 const LIST_WIDTH: Pixels = px(200.);
@@ -986,20 +973,21 @@ impl Render for EnvironmentEditorModal {
         };
 
         // The way out sits where every window in this editor keeps it -- top
-        // right, on the row the window names itself.
-        let title_bar = h_flex()
-            .id("environment-editor-title-bar")
+        // right, on the row the window names itself. The row and the spacer
+        // before the corner both come from the shared header, so the close
+        // control lands in the same place here as in every other dialog.
+        let title_bar = cyberpunk::dialog_header(title, cx)
             .debug_selector(|| "environment-editor-title-bar".to_string())
-            .w_full()
-            .items_center()
-            .child(cyberpunk::dialog_title(title, cx))
-            .child(div().flex_1())
             .child(
-                IconButton::new("environment-editor-dismiss", IconName::Close)
-                    .icon_size(IconSize::Small)
-                    .style(cyberpunk::Rank::Quiet.style())
-                    .tooltip(Tooltip::text("Close"))
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                div()
+                    .debug_selector(|| "environment-editor-dismiss".to_string())
+                    .child(
+                        IconButton::new("environment-editor-dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(cyberpunk::Rank::Quiet.style())
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
             );
 
         // Adding, copying and removing live on one frame above the list, the
@@ -1050,58 +1038,60 @@ impl Render for EnvironmentEditorModal {
                 .into_any_element(),
         ]);
 
-        v_flex()
+        cyberpunk::dialog_shell(cx)
             .id("environment-editor-modal-root")
             .debug_selector(|| "environment-editor-modal-root".to_string())
             .key_context("EnvironmentEditorModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel(cx)))
-            // Placed and sized like every other dialog in the editor: the modal
-            // layer centres it. Placing itself was what put it against the left
-            // edge with its second column hanging off the right.
-            .w(px(DIALOG_WIDTH))
-            .max_h(px(DIALOG_MAX_HEIGHT))
-            .overflow_hidden()
-            .p_3()
-            .gap_3()
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .child(title_bar)
-            .when(self.show_scope_list, |dialog| dialog.child(toolbar))
             .child(
-                h_flex()
-                    .flex_1()
-                    // Stretched, not centred. A row centres its children by
-                    // default here, and a centred child is given the height of
-                    // its own contents rather than the height of the row -- so
-                    // the column of environments stood 773px tall in a 480px
-                    // window, centred on it, with its top above the window's
-                    // own edge and nothing to scroll. Being allowed to shrink
-                    // means nothing until it is first told how tall it may be.
-                    .items_stretch()
-                    // The two halves may each be shorter and narrower than what
-                    // is in them; each scrolls its own contents instead.
-                    .min_h_0()
-                    .min_w_0()
-                    .gap_3()
-                    .when(self.show_scope_list, |el| {
-                        el.child(self.render_scope_list(window, cx))
-                    })
-                    .child(self.render_variable_panel(window, cx)),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .flex_1()
+                        // The two halves may each be shorter and narrower than
+                        // what is in them; each scrolls its own contents
+                        // instead.
+                        .min_h_0()
+                        .min_w_0()
+                        .px_3()
+                        .pb_2()
+                        .gap_3()
+                        .when(self.show_scope_list, |dialog| dialog.child(toolbar))
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                // Stretched, not centred. A row centres its
+                                // children by default here, and a centred child
+                                // is given the height of its own contents rather
+                                // than the height of the row -- so the column of
+                                // environments stood 773px tall in a 480px
+                                // window, centred on it, with its top above the
+                                // window's own edge and nothing to scroll. Being
+                                // allowed to shrink means nothing until it is
+                                // first told how tall it may be.
+                                .items_stretch()
+                                .min_h_0()
+                                .min_w_0()
+                                .gap_3()
+                                .when(self.show_scope_list, |el| {
+                                    el.child(self.render_scope_list(window, cx))
+                                })
+                                .child(self.render_variable_panel(window, cx)),
+                        ),
+                ),
             )
-            // Outside the padded body on purpose: the rule above it has to
-            // reach both edges of the window, the way it does in every other
-            // dialog here.
             .child(
                 cyberpunk::dialog_footer()
-                    .mx_neg_3()
-                    .mb_neg_3()
                     .child(
-                        Label::new("Write one as {{name}} in a URL, a header or a body.")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        cyberpunk::dialog_footer_left().child(
+                            Label::new("Write one as {{name}} in a URL, a header or a body.")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
                     )
-                    .child(div().flex_1())
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("environment-editor-close", "Close")
                             .label_size(LabelSize::Small)
@@ -1401,14 +1391,16 @@ mod tests {
             .debug_bounds("environment-editor-modal-root")
             .expect("the dialog is painted");
         assert!(
-            dialog.size.width <= px(DIALOG_WIDTH) + px(1.),
-            "the dialog is {:?} wide; it asks for {DIALOG_WIDTH}px",
-            dialog.size.width
+            dialog.size.width <= cyberpunk::DIALOG_WIDTH + px(1.),
+            "the dialog is {:?} wide; it asks for {:?}",
+            dialog.size.width,
+            cyberpunk::DIALOG_WIDTH
         );
         assert!(
-            dialog.size.height <= px(DIALOG_MAX_HEIGHT) + px(1.),
-            "the dialog is {:?} tall; {DIALOG_MAX_HEIGHT}px is its ceiling",
-            dialog.size.height
+            dialog.size.height <= cyberpunk::DIALOG_MAX_HEIGHT + px(1.),
+            "the dialog is {:?} tall; {:?} is its ceiling",
+            dialog.size.height,
+            cyberpunk::DIALOG_MAX_HEIGHT
         );
 
         for name in [
@@ -1449,10 +1441,11 @@ mod tests {
             .debug_bounds("environment-editor-modal-root")
             .expect("the window is painted");
         assert!(
-            modal.size.height <= px(DIALOG_MAX_HEIGHT) + px(1.),
-            "the window is {:?} tall against a ceiling of {DIALOG_MAX_HEIGHT}px: its contents \
+            modal.size.height <= cyberpunk::DIALOG_MAX_HEIGHT + px(1.),
+            "the window is {:?} tall against a ceiling of {:?}: its contents \
              made it grow",
-            modal.size.height
+            modal.size.height,
+            cyberpunk::DIALOG_MAX_HEIGHT
         );
 
         let reach = view.read_with(&cx, |view, _| view.list_scroll_handle.max_offset());
@@ -1741,6 +1734,91 @@ mod tests {
         assert!(
             cx.debug_bounds("DIALOG-FIELD-name").is_some(),
             "an environment is renamed here"
+        );
+    }
+    /// Where the way out is painted, not where the element tree says it was
+    /// put. It belongs in the corner the reader reaches for, on the row the
+    /// window names itself -- which is what the shared header is for.
+    #[gpui::test]
+    async fn the_way_out_is_painted_in_the_top_right_corner_of_the_header(cx: &mut TestAppContext) {
+        let (_store, _view, mut cx) = build_environments_modal(cx).await;
+        draw(&mut cx);
+
+        let header = cx
+            .debug_bounds("environment-editor-title-bar")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("environment-editor-dismiss")
+            .expect("the way out is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85,
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the \
+             corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        assert!(
+            close.top() >= header.top() - px(1.) && close.bottom() <= header.bottom() + px(1.),
+            "the way out is painted {:?}..{:?} vertically, outside the header's own \
+             {:?}..{:?}, so it is not on the naming row at all",
+            close.top(),
+            close.bottom(),
+            header.top(),
+            header.bottom()
+        );
+    }
+
+    /// This window saves as the reader types, so its footer carries one
+    /// action and that action is the way out. What is asserted is where the
+    /// last action on the bar is painted: in the bottom-right corner of the
+    /// surface, with the incidental note beside it held to the left.
+    #[gpui::test]
+    async fn the_last_footer_action_is_painted_in_the_bottom_right_corner(cx: &mut TestAppContext) {
+        let (_store, _view, mut cx) = build_environments_modal(cx).await;
+        draw(&mut cx);
+
+        let shell = cx
+            .debug_bounds("environment-editor-modal-root")
+            .expect("the dialog is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the bar is painted");
+        let action = cx
+            .debug_bounds("BUTTON-Close")
+            .expect("the action is painted");
+        let beside = cx
+            .debug_bounds("DIALOG-FOOTER-LEFT")
+            .expect("what sits beside it is painted");
+
+        assert!(
+            action.right() > footer.left() + footer.size.width * 0.85,
+            "the action ends at {:?} in a bar spanning {:?}..{:?}, left of the corner it \
+             belongs in",
+            action.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            action.bottom() <= shell.bottom() + px(1.)
+                && action.bottom() > shell.bottom() - footer.size.height - px(1.),
+            "the action ends at {:?} in a window ending at {:?}: it is not on the bottom bar",
+            action.bottom(),
+            shell.bottom()
+        );
+        assert!(
+            beside.right() <= action.left() + px(1.),
+            "the note reaches {:?} and the action starts at {:?}, so the note has been \
+             dragged into the corner with it",
+            beside.right(),
+            action.left()
+        );
+        assert!(
+            beside.size.width <= footer.size.width * 0.5 + px(1.),
+            "the note took {:?} of a {:?} bar, past the half it is allowed",
+            beside.size.width,
+            footer.size.width
         );
     }
 }

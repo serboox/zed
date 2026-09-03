@@ -3,7 +3,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
 };
 use std::sync::Arc;
-use ui::{ElevationIndex, Tooltip, cyberpunk, prelude::*};
+use ui::{Tooltip, cyberpunk, prelude::*};
 use workspace::ModalView;
 
 /// A single-field text-input modal shared by every "give this a name" flow in
@@ -20,6 +20,10 @@ pub struct TextPromptModal {
     /// to be given one or the reader gets a sliver to paste a whole document
     /// into.
     multiline: bool,
+    /// The word over the field. Taken from the placeholder for a short name,
+    /// so the reader can still see what is being asked once they have typed
+    /// over it.
+    field_label: SharedString,
     on_confirm: Arc<dyn Fn(String, &mut Window, &mut App)>,
 }
 
@@ -97,12 +101,17 @@ impl TextPromptModal {
             editor
         });
         window.focus(&editor.focus_handle(cx), cx);
+        let field_label: SharedString = match multiline {
+            true => "text".into(),
+            false => placeholder.into(),
+        };
         Self {
             focus_handle: cx.focus_handle(),
             title: title.into(),
             confirm_label: confirm_label.into(),
             editor,
             multiline,
+            field_label,
             on_confirm,
         }
     }
@@ -134,46 +143,54 @@ impl Focusable for TextPromptModal {
 
 impl Render for TextPromptModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        // A multi-line editor reports no height of its own, so the definite
+        // height goes on the element that holds it rather than on the box
+        // around it -- a `min_h` alone leaves a sliver of an editor at the top
+        // of a tall empty box.
+        let inside = match self.multiline {
+            true => div()
+                .w_full()
+                .h(px(MULTILINE_HEIGHT))
+                .child(self.editor.clone())
+                .into_any_element(),
+            false => self.editor.clone().into_any_element(),
+        };
+
+        cyberpunk::dialog_shell(cx)
+            // Narrower than a form. The shared width is for a window with two
+            // columns of fields; this one asks for a single name, and stretching
+            // it to a form's width leaves the field marooned in the middle.
+            .w(px(if self.multiline { 640. } else { 420. }))
             .key_context("TextPromptModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel(cx)))
-            .w(px(if self.multiline { 640. } else { 420. }))
-            .p_3()
-            .gap_3()
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
             .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .child(cyberpunk::dialog_title(self.title.clone(), cx))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("text-prompt-dismiss", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .style(cyberpunk::Rank::Quiet.style())
-                            .tooltip(Tooltip::text("Close"))
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                cyberpunk::dialog_header(self.title.clone(), cx).child(
+                    IconButton::new("text-prompt-dismiss", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .style(cyberpunk::Rank::Quiet.style())
+                        .tooltip(Tooltip::text("Close"))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_body().child(
+                    v_flex().w_full().min_w_0().px_3().pb_2().child(
+                        cyberpunk::dialog_field(
+                            self.field_label.clone(),
+                            self.multiline,
+                            cx,
+                            inside,
+                        )
+                        .debug_selector(|| "text-prompt-editor-box".to_string()),
                     ),
+                ),
             )
             .child(
-                div()
-                    .p_2()
-                    .when(self.multiline, |this| this.h(px(MULTILINE_HEIGHT)))
-                    .debug_selector(|| "text-prompt-editor-box".to_string())
-                    .rounded_none()
-                    .border_1()
-                    .border_color(cyberpunk::border_dim())
-                    .bg(cyberpunk::surface())
-                    .child(self.editor.clone()),
-            )
-            .child(
-                h_flex().justify_end().gap_2().child(
+                cyberpunk::dialog_footer().child(
                     Button::new("text-prompt-confirm", self.confirm_label.clone())
-                        .style(ButtonStyle::OutlinedCustom(
-                            cyberpunk::Accent::Cyan.border(),
-                        ))
+                        .label_size(LabelSize::Small)
+                        .style(cyberpunk::Rank::Accent.style())
                         .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                 ),
             )
