@@ -4524,13 +4524,9 @@ impl Focusable for MasterPasswordView {
 
 impl Render for MasterPasswordView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        crate::widgets::dialog_surface(cx)
             .key_context("MasterPassword")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(440.))
-            .p_3()
-            .gap_2()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
             .child(crate::widgets::dialog_header(
@@ -4540,16 +4536,29 @@ impl Render for MasterPasswordView {
                 cx,
             ))
             .child(
-                Label::new(self.subtitle.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("master-password-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(
+                            Label::new(self.subtitle.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(cyberpunk::dialog_field(
+                            "Master password",
+                            false,
+                            cx,
+                            self.editor.clone(),
+                        )),
+                ),
             )
-            .child(div().child(self.editor.clone()))
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
+                cyberpunk::dialog_footer()
                     .when(self.allow_skip, |row| {
                         row.child(
                             Button::new("master-password-skip", "Skip passwords")
@@ -4634,29 +4643,17 @@ impl Focusable for QueryParamsView {
 
 impl Render for QueryParamsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let field_ground = cx.theme().colors().editor_background;
         let rows: Vec<_> = self
             .inputs
             .iter()
             .map(|(name, editor)| {
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(120.))
-                            .child(Label::new(name.clone()).size(LabelSize::Small)),
-                    )
-                    .child(div().flex_1().child(editor.clone()))
+                cyberpunk::dialog_field_on(name.clone(), false, field_ground, editor.clone())
             })
             .collect();
-        v_flex()
+        crate::widgets::dialog_surface(cx)
             .key_context("QueryParams")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(420.))
-            .p_3()
-            .gap_2()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(crate::widgets::dialog_header(
                 "Query Parameters",
@@ -4664,12 +4661,20 @@ impl Render for QueryParamsView {
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
                 cx,
             ))
-            .child(v_flex().gap_1().children(rows))
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("query-params-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_footer()
                     .child(
                         Button::new("params-cancel", "Cancel")
                             .style(cyberpunk::Rank::Neutral.style())
@@ -4781,13 +4786,10 @@ impl Render for RenameTableView {
                     )
             })
             .collect();
-        v_flex()
+        let usage_count = self.usages.len();
+        crate::widgets::dialog_surface(cx)
             .key_context("RenameTable")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(460.))
-            .p_3()
-            .gap_2()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(crate::widgets::dialog_header(
                 "Rename Table",
@@ -4796,57 +4798,59 @@ impl Render for RenameTableView {
                 cx,
             ))
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(Label::new("New name").size(LabelSize::Small))
-                    .child(
-                        div()
-                            .w_full()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .px_2()
-                            .py_1()
-                            .child(self.new_name_editor.clone()),
-                    ),
-            )
-            .when(!self.usages.is_empty(), |el| {
-                el.child(
+                cyberpunk::dialog_body().child(
                     v_flex()
-                        .gap_1()
-                        .child(
-                            Label::new(format!(
-                                "{} usage{} found",
-                                self.usages.len(),
-                                if self.usages.len() == 1 { "" } else { "s" }
-                            ))
-                            .size(LabelSize::Small),
-                        )
-                        .child(
-                            v_flex()
-                                .id("rename-table-usages")
-                                .gap_1()
-                                .max_h(px(180.))
-                                .overflow_y_scroll()
-                                .children(usage_rows),
-                        ),
-                )
-            })
-            .when(self.has_db_side_usages, |el| {
-                el.child(
-                    Label::new(
-                        "Some routines, triggers, or events also reference this table -- \
-                         their source is not rewritten automatically and needs a manual update.",
-                    )
-                    .size(LabelSize::XSmall)
-                    .color(Color::Warning),
-                )
-            })
+                        .id("rename-table-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(cyberpunk::dialog_field(
+                            "New name",
+                            false,
+                            cx,
+                            self.new_name_editor.clone(),
+                        ))
+                        .when(usage_count > 0, |el| {
+                            el.child(cyberpunk::dialog_section("Usages")).child(
+                                v_flex()
+                                    .id("rename-table-usages")
+                                    .gap_1()
+                                    .max_h(px(180.))
+                                    .overflow_y_scroll()
+                                    .children(usage_rows),
+                            )
+                        })
+                        .when(self.has_db_side_usages, |el| {
+                            el.child(
+                                Label::new(
+                                    "Some routines, triggers, or events also reference this \
+                                     table -- their source is not rewritten automatically and \
+                                     needs a manual update.",
+                                )
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                            )
+                        }),
+                ),
+            )
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
+                cyberpunk::dialog_footer()
+                    .child(
+                        cyberpunk::dialog_footer_left().when(usage_count > 0, |left| {
+                            left.child(
+                                Label::new(format!(
+                                    "{usage_count} usage{} found",
+                                    if usage_count == 1 { "" } else { "s" }
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                            )
+                        }),
+                    )
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("rename-table-cancel", "Cancel")
                             .style(cyberpunk::Rank::Neutral.style())
@@ -4915,7 +4919,7 @@ impl Render for ComparePickerView {
                     SharedString::from(format!("cmp-{candidate}")),
                     candidate.clone(),
                 )
-                .style(ButtonStyle::Subtle)
+                .style(cyberpunk::Rank::Quiet.style())
                 .full_width()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     (this.on_pick.clone())(candidate.clone(), window, cx);
@@ -4923,14 +4927,10 @@ impl Render for ComparePickerView {
                 }))
             })
             .collect();
-        v_flex()
+        let is_empty = rows.is_empty();
+        crate::widgets::dialog_surface(cx)
             .key_context("ComparePicker")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(420.))
-            .max_h(px(480.))
-            .p_3()
-            .gap_2()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(crate::widgets::dialog_header(
                 SharedString::from(format!("Compare {} with", self.left_table)),
@@ -4938,20 +4938,31 @@ impl Render for ComparePickerView {
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
                 cx,
             ))
-            .when(rows.is_empty(), |column| {
-                column.child(
-                    Label::new("No other tables to compare")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
             .child(
-                v_flex()
-                    .id("compare-candidates")
-                    .gap_0p5()
-                    .max_h(px(360.))
-                    .overflow_y_scroll()
-                    .children(rows),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("compare-candidates")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_0p5()
+                        .overflow_y_scroll()
+                        .when(is_empty, |column| {
+                            column.child(
+                                Label::new("No other tables to compare")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .children(rows),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_footer().child(
+                    Button::new("compare-pick-cancel", "Cancel")
+                        .style(cyberpunk::Rank::Neutral.style())
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                ),
             )
     }
 }
@@ -5009,13 +5020,10 @@ impl Render for QuickDocView {
                         }))
                 })
                 .collect();
-        v_flex()
+        let column_count = self.columns.len();
+        crate::widgets::dialog_surface(cx)
             .key_context("QuickDoc")
             .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(px(360.))
-            .max_h(px(480.))
-            .overflow_hidden()
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(crate::widgets::dialog_header(
                 self.title.clone(),
@@ -5024,13 +5032,38 @@ impl Render for QuickDocView {
                 cx,
             ))
             .child(
-                div()
-                    .id("quick-doc-body")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .py_1()
-                    .child(v_flex().children(rows)),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("quick-doc-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+            )
+            .child(
+                cyberpunk::dialog_footer()
+                    .child(
+                        cyberpunk::dialog_footer_left().child(
+                            Label::new(format!(
+                                "{column_count} column{}",
+                                if column_count == 1 { "" } else { "s" }
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                        ),
+                    )
+                    .child(cyberpunk::dialog_footer_spacer())
+                    .child(
+                        // Neutral, not the accent: this window shows what is
+                        // already there and has nothing to confirm, so the
+                        // accent would be worn by the way out.
+                        Button::new("quick-doc-done", "Close")
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
             )
     }
 }
@@ -8084,9 +8117,7 @@ impl DatabasePanel {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let Some(id) = id else { return };
                                     this.store.update(cx, |store, cx| {
-                                        store
-                                            .refresh_schema_cache(id, cx)
-                                            .detach_and_log_err(cx);
+                                        store.refresh_schema_cache(id, cx).detach_and_log_err(cx);
                                     });
                                 })),
                         )
@@ -8103,8 +8134,7 @@ impl DatabasePanel {
                                     driver.map_or("SQL Queries", new_query_button_label),
                                 ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    let (Some(id), Some(label)) =
-                                        (id, label_for_new_query.clone())
+                                    let (Some(id), Some(label)) = (id, label_for_new_query.clone())
                                     else {
                                         return;
                                     };
@@ -8120,9 +8150,7 @@ impl DatabasePanel {
                                     }
                                     this.workspace
                                         .update(cx, |workspace, cx| {
-                                            open_new_sql_query(
-                                                workspace, id, label, window, cx,
-                                            );
+                                            open_new_sql_query(workspace, id, label, window, cx);
                                         })
                                         .log_err();
                                 })),

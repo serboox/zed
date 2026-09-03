@@ -10,12 +10,10 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
     Window, prelude::*,
 };
-use ui::{
-    Button, ButtonStyle, Checkbox, Divider, Icon, IconName, Label, LabelSize, cyberpunk, prelude::*,
-};
+use ui::{Button, Checkbox, Icon, IconName, Label, LabelSize, cyberpunk, prelude::*};
 use workspace::ModalView;
 
-use crate::widgets::{dialog_header, dialog_surface, text_field};
+use crate::widgets::{dialog_header, dialog_surface};
 
 /// Invoked when the dump dialog is confirmed, so the owning panel can spawn the
 /// run without this dialog depending on the panel type.
@@ -514,24 +512,6 @@ impl NativeDumpDialog {
             cx.notify();
         }
     }
-
-    fn field_row(
-        &self,
-        label: &'static str,
-        editor: &Entity<Editor>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        h_flex()
-            .w_full()
-            .gap_2()
-            .items_center()
-            .child(
-                div()
-                    .w(px(150.))
-                    .child(Label::new(label).size(LabelSize::Small)),
-            )
-            .child(text_field(editor, cx).flex_1())
-    }
 }
 
 impl EventEmitter<NativeDumpEvent> for NativeDumpDialog {}
@@ -582,12 +562,6 @@ impl Render for NativeDumpDialog {
         dialog_surface(cx)
             .track_focus(&self.focus_handle)
             .key_context("NativeDumpDialog")
-            .w(px(720.))
-            .max_h(px(640.))
-            .p_4()
-            .gap_3()
-            .flex()
-            .flex_col()
             .child(dialog_header(
                 title,
                 "dump-close",
@@ -597,43 +571,88 @@ impl Render for NativeDumpDialog {
                 }),
                 cx,
             ))
-            .child(self.field_row("Path to executable:", &self.executable_editor.clone(), cx))
-            .child(self.field_row("Output result to:", &self.output_editor.clone(), cx))
             .child(
-                Label::new("Allowed substitution patterns: {timestamp}, {data_source}, {database}")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("dump-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_start()
+                                .child(div().flex_1().child(cyberpunk::dialog_field(
+                                    "Path to executable",
+                                    false,
+                                    cx,
+                                    self.executable_editor.clone(),
+                                )))
+                                .child(div().flex_1().child(cyberpunk::dialog_field(
+                                    "Output result to",
+                                    false,
+                                    cx,
+                                    self.output_editor.clone(),
+                                ))),
+                        )
+                        .child(
+                            Label::new(
+                                "Allowed substitution patterns: {timestamp}, {data_source}, \
+                                 {database}",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(cyberpunk::dialog_section("Scope"))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_start()
+                                .child(div().flex_1().child(cyberpunk::dialog_field(
+                                    "Databases to dump",
+                                    false,
+                                    cx,
+                                    self.databases_editor.clone(),
+                                )))
+                                .child(div().flex_1().child(cyberpunk::dialog_field(
+                                    "Tables to dump",
+                                    false,
+                                    cx,
+                                    self.tables_editor.clone(),
+                                ))),
+                        )
+                        .child(cyberpunk::dialog_section("Options"))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_4()
+                                .items_start()
+                                .child(left_column)
+                                .child(right_column),
+                        )
+                        .child(cyberpunk::dialog_section("Command"))
+                        .child(
+                            div()
+                                .debug_selector(|| "DUMP_COMMAND_PREVIEW".to_string())
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .rounded_lg()
+                                .bg(cyberpunk::surface())
+                                .border_1()
+                                .border_color(cyberpunk::border_dim())
+                                .child(
+                                    Label::new(SharedString::from(preview)).size(LabelSize::Small),
+                                ),
+                        ),
+                ),
             )
-            .child(Divider::horizontal())
-            .child(self.field_row("Databases to dump:", &self.databases_editor.clone(), cx))
-            .child(self.field_row("Tables to dump:", &self.tables_editor.clone(), cx))
-            .child(Divider::horizontal())
             .child(
-                h_flex()
-                    .w_full()
-                    .gap_4()
-                    .items_start()
-                    .child(left_column)
-                    .child(right_column),
-            )
-            .child(Divider::horizontal())
-            .child(
-                div()
-                    .debug_selector(|| "DUMP_COMMAND_PREVIEW".to_string())
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded_none()
-                    .bg(cyberpunk::surface())
-                    .border_1()
-                    .border_color(cyberpunk::border_dim())
-                    .child(Label::new(SharedString::from(preview)).size(LabelSize::Small)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
+                cyberpunk::dialog_footer()
                     .child(
                         div()
                             .debug_selector(|| "DUMP_CANCEL_BTN".to_string())
@@ -649,9 +668,7 @@ impl Render for NativeDumpDialog {
                     .child(
                         div().debug_selector(|| "DUMP_RUN_BTN".to_string()).child(
                             Button::new("dump-run", "Run")
-                                .style(ButtonStyle::OutlinedCustom(
-                                    cyberpunk::Accent::Cyan.border(),
-                                ))
+                                .style(cyberpunk::Rank::Accent.style())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     let request = this.build_request(cx);
                                     if let Some(callback) = this.on_run.clone() {
@@ -668,6 +685,10 @@ impl Render for NativeDumpDialog {
 
 #[cfg(test)]
 mod tests {
+    /// The shell's own border, plus rounding slack: a row inside it
+    /// cannot be flush with its outer edge.
+    const BORDER_AND_A_LITTLE: gpui::Pixels = px(1.5);
+
     use super::*;
     use gpui::TestAppContext;
     use settings::SettingsStore;
@@ -999,6 +1020,81 @@ mod tests {
             "the primary Run button must sit to the right of Cancel: cancel_left={:?} run_left={:?}",
             cancel.left(),
             run.left()
+        );
+    }
+
+    // The reference shape, measured rather than eyeballed: the window's name at
+    // the left of its own row with the way out in the corner opposite, and the
+    // actions ending in the bottom-right of the bar beneath.
+    #[gpui::test]
+    async fn the_way_out_and_the_confirming_action_end_in_opposite_corners(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| {
+            NativeDumpDialog::new(
+                DatabaseDriver::MySQL,
+                sample_config(),
+                Vec::new(),
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let shell = cx
+            .debug_bounds("DIALOG-SHELL")
+            .expect("the dialog shell is painted");
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("DIALOG-CLOSE")
+            .expect("the way out is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let run = cx
+            .debug_bounds("DUMP_RUN_BTN")
+            .expect("the confirming action is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85
+                && close.right() <= header.right() + px(0.5),
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        // Inside the shell's border, not flush with its outer edge: the shell
+        // draws a 1px border, so its first row starts a pixel in. Measured, not
+        // assumed -- the first form of this assertion asked for equality and
+        // failed on exactly that pixel.
+        assert!(
+            header.top() <= shell.top() + BORDER_AND_A_LITTLE,
+            "the header starts at {:?} in a shell starting at {:?}, so it is not the top row",
+            header.top(),
+            shell.top()
+        );
+        assert!(
+            run.right() > footer.left() + footer.size.width * 0.85
+                && run.right() <= footer.right() + px(0.5),
+            "the confirming action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in \
+             the corner",
+            run.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            footer.bottom() <= shell.bottom() + px(0.5)
+                && run.bottom() <= shell.bottom() + px(0.5)
+                && run.size.height > px(8.),
+            "the bar ends at {:?} and the action at {:?}, in a shell ending at {:?} -- the \
+             actions have been squeezed or pushed past the edge",
+            footer.bottom(),
+            run.bottom(),
+            shell.bottom()
         );
     }
 }

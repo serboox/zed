@@ -7,8 +7,7 @@ use gpui::{
     prelude::*, px,
 };
 use ui::{
-    Button, ButtonStyle, Icon, IconName, Label, LabelSize, PopoverMenu, PopoverMenuHandle,
-    cyberpunk, prelude::*,
+    Button, Icon, IconName, Label, LabelSize, PopoverMenu, PopoverMenuHandle, cyberpunk, prelude::*,
 };
 use util::ResultExt;
 use workspace::{ModalView, StatusItemView, item::ItemHandle};
@@ -272,12 +271,6 @@ impl Render for ExecDialog {
         crate::widgets::dialog_surface(cx)
             .track_focus(&self.focus_handle)
             .key_context("ExecDialog")
-            .w(px(720.))
-            .max_h(px(560.))
-            .p_4()
-            .gap_3()
-            .flex()
-            .flex_col()
             .child(crate::widgets::dialog_header(
                 format!("Exec on {}…", self.connection_label),
                 "exec-dialog-close",
@@ -288,29 +281,34 @@ impl Render for ExecDialog {
                 cx,
             ))
             .child(
-                Label::new(
-                    "Runs a script of one or more statements sequentially, separately from \
-                     this connection's SQL Queries console.",
-                )
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("exec-dialog-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(
+                            Label::new(
+                                "Runs a script of one or more statements sequentially, \
+                                 separately from this connection's SQL Queries console.",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(cyberpunk::dialog_field(
+                            "Script",
+                            true,
+                            cx,
+                            // A definite height, because a multi-line editor has
+                            // none of its own and would otherwise paint a sliver.
+                            div().w_full().h(px(220.)).child(self.sql_editor.clone()),
+                        )),
+                ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h(px(240.))
-                    .rounded_none()
-                    .border_1()
-                    .border_color(cyberpunk::border_dim())
-                    .bg(cyberpunk::surface())
-                    .p_2()
-                    .child(self.sql_editor.clone()),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .gap_2()
+                cyberpunk::dialog_footer()
                     .child(
                         Button::new("exec-load-file", "Load from file…")
                             .style(cyberpunk::Rank::Quiet.style())
@@ -319,29 +317,23 @@ impl Render for ExecDialog {
                             })),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("exec-cancel", "Cancel")
-                                    .style(cyberpunk::Rank::Neutral.style())
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExecDialogEvent::Dismissed);
-                                        cx.emit(DismissEvent);
-                                    })),
-                            )
-                            .child(
-                                Button::new("exec-run", "Run")
-                                    .style(ButtonStyle::OutlinedCustom(
-                                        cyberpunk::Accent::Cyan.border(),
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let text = this.sql_editor.read(cx).text(cx);
-                                        if let Some(callback) = this.on_run.clone() {
-                                            callback(text, window, cx);
-                                        }
-                                        cx.emit(DismissEvent);
-                                    })),
-                            ),
+                        Button::new("exec-cancel", "Cancel")
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(ExecDialogEvent::Dismissed);
+                                cx.emit(DismissEvent);
+                            })),
+                    )
+                    .child(
+                        Button::new("exec-run", "Run")
+                            .style(cyberpunk::Rank::Accent.style())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let text = this.sql_editor.read(cx).text(cx);
+                                if let Some(callback) = this.on_run.clone() {
+                                    callback(text, window, cx);
+                                }
+                                cx.emit(DismissEvent);
+                            })),
                     ),
             )
     }
@@ -482,6 +474,10 @@ impl StatusItemView for ExecStatusIndicator {
 
 #[cfg(test)]
 mod tests {
+    /// The shell's own border, plus rounding slack: a row inside it
+    /// cannot be flush with its outer edge.
+    const BORDER_AND_A_LITTLE: gpui::Pixels = px(1.5);
+
     use super::*;
 
     #[test]
@@ -716,5 +712,76 @@ mod tests {
                 "cancelling before the loop starts must stop it short of completion"
             );
         });
+    }
+    // The same reference shape as every other dialog in this crate, measured on
+    // this one: the way out in the header's far corner, the confirming action in
+    // the footer's, and nothing hanging past the window's edge.
+    #[gpui::test]
+    async fn the_way_out_and_the_confirming_action_end_in_opposite_corners(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| ExecDialog::new("qa".into(), window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        let shell = cx
+            .debug_bounds("DIALOG-SHELL")
+            .expect("the dialog shell is painted");
+        let header = cx
+            .debug_bounds("DIALOG-HEADER")
+            .expect("the header is painted");
+        let close = cx
+            .debug_bounds("DIALOG-CLOSE")
+            .expect("the way out is painted");
+        let footer = cx
+            .debug_bounds("DIALOG-FOOTER")
+            .expect("the footer is painted");
+        let run = cx
+            .debug_bounds("BUTTON-Run")
+            .expect("the confirming action is painted");
+
+        assert!(
+            close.right() > header.left() + header.size.width * 0.85
+                && close.right() <= header.right() + px(0.5),
+            "the way out ends at {:?} in a header spanning {:?}..{:?}, so it is not in the corner",
+            close.right(),
+            header.left(),
+            header.right()
+        );
+        // Inside the shell's border, not flush with its outer edge: the shell
+        // draws a 1px border, so its first row starts a pixel in. Measured, not
+        // assumed -- the first form of this assertion asked for equality and
+        // failed on exactly that pixel.
+        assert!(
+            header.top() <= shell.top() + BORDER_AND_A_LITTLE,
+            "the header starts at {:?} in a shell starting at {:?}, so it is not the top row",
+            header.top(),
+            shell.top()
+        );
+        assert!(
+            run.right() > footer.left() + footer.size.width * 0.85
+                && run.right() <= footer.right() + px(0.5),
+            "the confirming action ends at {:?} in a bar spanning {:?}..{:?}, so it is not in \
+             the corner",
+            run.right(),
+            footer.left(),
+            footer.right()
+        );
+        assert!(
+            footer.top() > header.bottom()
+                && footer.bottom() <= shell.bottom() + px(0.5)
+                && run.size.height > px(8.),
+            "the bar spans {:?}..{:?} under a header ending at {:?}, in a shell ending at {:?} \
+             -- the actions have been squeezed or pushed past the edge",
+            footer.top(),
+            footer.bottom(),
+            header.bottom(),
+            shell.bottom()
+        );
     }
 }

@@ -5,7 +5,7 @@ use gpui::{
     Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Window,
     prelude::*,
 };
-use ui::{Checkbox, Divider, ElevationIndex, Tooltip, cyberpunk, prelude::*};
+use ui::{Checkbox, Tooltip, cyberpunk, prelude::*};
 use util::ResultExt;
 use workspace::ModalView;
 
@@ -1255,124 +1255,123 @@ impl Render for ModifyTableView {
         let title = format!("Modify {}.{}", self.database, self.table);
         let busy = self.busy;
 
-        v_flex()
+        crate::widgets::dialog_surface(cx)
             .key_context("ModifyTable")
             .track_focus(&self.focus_handle)
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
-            .w(px(640.))
-            .max_h(px(560.))
-            .p_3()
-            .gap_2()
             .child(crate::widgets::dialog_header(
                 title,
                 "close-modify",
                 cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
                 cx,
             ))
-            .child(Divider::horizontal())
             .child(
-                v_flex()
-                    .id("modify-columns")
-                    .gap_0p5()
-                    .max_h(px(280.))
-                    .overflow_y_scroll()
-                    .children(rows),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("modify-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(
+                            cyberpunk::dialog_section("Columns").child(
+                                Button::new("add-column", "Add Column")
+                                    .style(cyberpunk::Rank::Quiet.style())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_blank_column(window, cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            v_flex()
+                                .id("modify-columns")
+                                .gap_0p5()
+                                .max_h(px(280.))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        )
+                        .child(
+                            cyberpunk::dialog_section("Indexes").child(
+                                Button::new("add-index", "Add Index")
+                                    .style(cyberpunk::Rank::Quiet.style())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_blank_index(window, cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            v_flex()
+                                .id("modify-indexes")
+                                .gap_0p5()
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .children(index_rows),
+                        )
+                        .child(
+                            cyberpunk::dialog_section("Foreign keys").child(
+                                Button::new("add-fk", "Add Foreign Key")
+                                    .style(cyberpunk::Rank::Quiet.style())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_blank_fk(window, cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            v_flex()
+                                .id("modify-fks")
+                                .gap_0p5()
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .children(fk_rows),
+                        )
+                        .child(
+                            cyberpunk::dialog_section("Check constraints").child(
+                                Button::new("add-check", "Add Check Constraint")
+                                    .style(cyberpunk::Rank::Quiet.style())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_blank_check(window, cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            v_flex()
+                                .id("modify-checks")
+                                .gap_0p5()
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .children(check_rows),
+                        )
+                        .child(cyberpunk::dialog_section("SQL preview"))
+                        .child(
+                            div()
+                                .id("modify-sql-preview")
+                                .w_full()
+                                .max_h(px(120.))
+                                .overflow_y_scroll()
+                                .p_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cyberpunk::border_dim())
+                                .bg(cyberpunk::surface())
+                                .cyberpunk_monospace(cx)
+                                .child(Label::new(preview_text).size(LabelSize::Small)),
+                        ),
+                ),
             )
             .child(
-                Button::new("add-column", "Add Column")
-                    .style(cyberpunk::Rank::Quiet.style())
-                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_column(window, cx))),
-            )
-            .child(Divider::horizontal())
-            .child(
-                Label::new("Indexes")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                v_flex()
-                    .id("modify-indexes")
-                    .gap_0p5()
-                    .max_h(px(140.))
-                    .overflow_y_scroll()
-                    .children(index_rows),
-            )
-            .child(
-                Button::new("add-index", "Add Index")
-                    .style(cyberpunk::Rank::Quiet.style())
-                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_index(window, cx))),
-            )
-            .child(Divider::horizontal())
-            .child(
-                Label::new("Foreign Keys")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                v_flex()
-                    .id("modify-fks")
-                    .gap_0p5()
-                    .max_h(px(140.))
-                    .overflow_y_scroll()
-                    .children(fk_rows),
-            )
-            .child(
-                Button::new("add-fk", "Add Foreign Key")
-                    .style(cyberpunk::Rank::Quiet.style())
-                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_fk(window, cx))),
-            )
-            .child(Divider::horizontal())
-            .child(
-                Label::new("Check Constraints")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                v_flex()
-                    .id("modify-checks")
-                    .gap_0p5()
-                    .max_h(px(140.))
-                    .overflow_y_scroll()
-                    .children(check_rows),
-            )
-            .child(
-                Button::new("add-check", "Add Check Constraint")
-                    .style(cyberpunk::Rank::Quiet.style())
-                    .on_click(cx.listener(|this, _, window, cx| this.add_blank_check(window, cx))),
-            )
-            .child(Divider::horizontal())
-            .child(
-                Label::new("SQL Preview")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .id("modify-sql-preview")
-                    .w_full()
-                    .max_h(px(120.))
-                    .overflow_y_scroll()
-                    .p_2()
-                    .rounded_none()
-                    .border_1()
-                    .border_color(cyberpunk::border_dim())
-                    .bg(cyberpunk::surface())
-                    .font_family("monospace")
-                    .child(Label::new(preview_text).size(LabelSize::Small)),
-            )
-            .when_some(self.status.clone(), |column, status| {
-                column.child(
-                    Label::new(status)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap_2()
+                cyberpunk::dialog_footer()
+                    .child(cyberpunk::dialog_footer_left().when_some(
+                        self.status.clone(),
+                        |left, status| {
+                            left.child(
+                                Label::new(status)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        },
+                    ))
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("cancel", "Cancel")
                             .style(cyberpunk::Rank::Neutral.style())
@@ -1382,9 +1381,7 @@ impl Render for ModifyTableView {
                     )
                     .child(
                         Button::new("execute", "Execute")
-                            .style(ButtonStyle::OutlinedCustom(
-                                cyberpunk::Accent::Cyan.border(),
-                            ))
+                            .style(cyberpunk::Rank::Accent.style())
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| this.execute(window, cx))),
                     ),

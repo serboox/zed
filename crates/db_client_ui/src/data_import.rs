@@ -5,10 +5,7 @@ use gpui::{
     px,
 };
 use ui::prelude::*;
-use ui::{
-    Button, ButtonStyle, Checkbox, ContextMenu, Divider, ElevationIndex, Label, PopoverMenu,
-    cyberpunk,
-};
+use ui::{Button, ButtonStyle, Checkbox, ContextMenu, Label, PopoverMenu, cyberpunk};
 use util::ResultExt;
 use workspace::ModalView;
 
@@ -573,15 +570,9 @@ impl Render for ImportDataView {
         let importing = self.importing;
         let charset_picker = self.render_charset_picker(cx).into_any_element();
 
-        v_flex()
+        crate::widgets::dialog_surface(cx)
             .key_context("DataImport")
             .track_focus(&self.focus_handle)
-            .cyberpunk_surface()
-            .shadow(ElevationIndex::ModalSurface.shadow(cx))
-            .w(px(640.0))
-            .max_h(px(560.0))
-            .p_4()
-            .gap_3()
             .child(crate::widgets::dialog_header(
                 format!("Import data into {}", self.table),
                 "close-import",
@@ -589,101 +580,120 @@ impl Render for ImportDataView {
                 cx,
             ))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        crate::widgets::text_field(&self.path_editor, cx)
-                            .flex_1()
-                            .debug_selector(|| "IMPORT_PATH_FIELD".to_string()),
-                    )
-                    .child(
-                        ui::Button::new("load-file", "Load")
-                            .style(cyberpunk::Rank::Quiet.style())
-                            .on_click(cx.listener(|view, _, window, cx| view.load_file(window, cx))),
-                    ),
+                cyberpunk::dialog_body().child(
+                    v_flex()
+                        .id("import-body")
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_end()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .debug_selector(|| "IMPORT_PATH_FIELD".to_string())
+                                        .child(cyberpunk::dialog_field(
+                                            "File",
+                                            false,
+                                            cx,
+                                            self.path_editor.clone(),
+                                        )),
+                                )
+                                .child(
+                                    ui::Button::new("load-file", "Load")
+                                        .style(cyberpunk::Rank::Quiet.style())
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.load_file(window, cx)
+                                        })),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .child(
+                                    Checkbox::new("has-header", has_header.into())
+                                        .label("First row is header")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.has_header = !view.has_header;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("null-empty", null_on_empty.into())
+                                        .label("Insert empty as NULL")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.null_on_empty = !view.null_on_empty;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Label::new("Charset")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(charset_picker),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .child(
+                                    Checkbox::new("continue-on-error", continue_on_error.into())
+                                        .label("Continue on error, write failures to file")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.continue_on_error = !view.continue_on_error;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("disable-indexes", disable_indexes.into())
+                                        .label("Disable indexes/triggers during load")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.disable_indexes = !view.disable_indexes;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(cyberpunk::dialog_section("Column mapping"))
+                        .child(
+                            div()
+                                .id("mapping-scroll")
+                                .max_h(px(200.0))
+                                .overflow_y_scroll()
+                                .child(v_flex().gap_1().children(mapping_rows)),
+                        ),
+                ),
             )
             .child(
-                h_flex()
-                    .gap_4()
+                cyberpunk::dialog_footer()
                     .child(
-                        Checkbox::new("has-header", has_header.into())
-                            .label("First row is header")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.has_header = !view.has_header;
-                                cx.notify();
-                            })),
+                        cyberpunk::dialog_footer_left()
+                            .when_some(preview, |left, parsed| {
+                                left.child(
+                                    Label::new(format!(
+                                        "{} columns, {} rows ({} previewed)",
+                                        parsed.headers.len(),
+                                        parsed.rows.len(),
+                                        parsed.rows.len().min(PREVIEW_ROW_LIMIT)
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                                )
+                            })
+                            .when_some(self.status.clone(), |left, status| {
+                                left.child(Label::new(status).size(LabelSize::Small).truncate())
+                            }),
                     )
-                    .child(
-                        Checkbox::new("null-empty", null_on_empty.into())
-                            .label("Insert empty as NULL")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.null_on_empty = !view.null_on_empty;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Label::new("Charset")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(charset_picker),
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .child(
-                        Checkbox::new("continue-on-error", continue_on_error.into())
-                            .label("Continue on error, write failures to file")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.continue_on_error = !view.continue_on_error;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("disable-indexes", disable_indexes.into())
-                            .label("Disable indexes/triggers during load")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.disable_indexes = !view.disable_indexes;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(Divider::horizontal())
-            .child(
-                Label::new("Column mapping")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .id("mapping-scroll")
-                    .max_h(px(200.0))
-                    .overflow_y_scroll()
-                    .child(v_flex().gap_1().children(mapping_rows)),
-            )
-            .when_some(preview, |el, parsed| {
-                el.child(
-                    Label::new(format!(
-                        "{} columns, {} rows ({} previewed)",
-                        parsed.headers.len(),
-                        parsed.rows.len(),
-                        parsed.rows.len().min(PREVIEW_ROW_LIMIT)
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-            })
-            .when_some(self.status.clone(), |el, status| {
-                el.child(Label::new(status).size(LabelSize::Small))
-            })
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
+                    .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         ui::Button::new("cancel-import", "Cancel")
                             .style(cyberpunk::Rank::Neutral.style())
@@ -691,9 +701,7 @@ impl Render for ImportDataView {
                     )
                     .child(
                         ui::Button::new("run-import", "Import")
-                            .style(ButtonStyle::OutlinedCustom(
-                                cyberpunk::Accent::Cyan.border(),
-                            ))
+                            .style(cyberpunk::Rank::Accent.style())
                             .disabled(importing)
                             .on_click(
                                 cx.listener(|view, _, window, cx| view.run_import(window, cx)),

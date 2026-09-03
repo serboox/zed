@@ -17,14 +17,13 @@ pub(crate) fn popup_surface(cx: &App) -> Div {
         .occlude()
 }
 
-/// Surface for the database client's dialogs -- the ones that take over and wait
-/// for an answer. Those carry the editor's dialog styling rather than the
-/// editor's panel styling.
+/// Surface for the database client's dialogs -- the ones that take over and
+/// wait for an answer. The shape itself is [`cyberpunk::dialog_shell`], shared
+/// with every other dialog in the fork; the only thing added here is
+/// `occlude`, which a modal needs so a click does not fall through it onto the
+/// workspace behind.
 pub(crate) fn dialog_surface(cx: &App) -> Div {
-    div()
-        .cyberpunk_surface()
-        .shadow(ElevationIndex::ElevatedSurface.shadow(cx))
-        .occlude()
+    cyberpunk::dialog_shell(cx).occlude()
 }
 
 /// Wraps a single-line editor in the bordered field chrome shared by the
@@ -48,27 +47,31 @@ pub(crate) fn dialog_close_button_style() -> ButtonStyle {
     cyberpunk::Rank::Neutral.style()
 }
 
-/// Title row shared by the database client's centered dialogs: a large title on
-/// the left and a close button with a tooltip on the right.
+/// Title row shared by the database client's centered dialogs: the window's own
+/// name at the left of the row, and the way out in the corner opposite.
+///
+/// The row is [`cyberpunk::dialog_header`], which already carries the spacer
+/// after the title, so the close control lands in the corner without this
+/// having to push it there. What is added is the control itself, wired to
+/// `on_close` -- the one thing every dialog in this crate does the same way and
+/// would otherwise write out a dozen times.
 pub(crate) fn dialog_header(
     title: impl Into<SharedString>,
     close_id: impl Into<ElementId>,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .justify_between()
-        .items_center()
-        // The shared voice, so a dialog in this crate names itself exactly the
-        // way a dialog anywhere else in the editor does.
-        .child(cyberpunk::dialog_title(title, cx))
-        .child(
-            IconButton::new(close_id, IconName::Close)
-                .style(dialog_close_button_style())
-                .tooltip(Tooltip::text("Close"))
-                .on_click(on_close),
-        )
+    cyberpunk::dialog_header(title, cx).child(
+        div()
+            .flex_none()
+            .debug_selector(|| "DIALOG-CLOSE".to_string())
+            .child(
+                IconButton::new(close_id, IconName::Close)
+                    .style(dialog_close_button_style())
+                    .tooltip(Tooltip::text("Close"))
+                    .on_click(on_close),
+            ),
+    )
 }
 
 #[cfg(test)]
