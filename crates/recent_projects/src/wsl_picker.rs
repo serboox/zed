@@ -284,8 +284,8 @@ impl Focusable for WslOpenModal {
 impl EventEmitter<DismissEvent> for WslOpenModal {}
 
 impl Render for WslOpenModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
-        dialog_shell(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
+        dialog_shell("Open WSL Distro", window, cx)
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(Self::cancel))
             .child(

@@ -4523,8 +4523,8 @@ impl Focusable for MasterPasswordView {
 }
 
 impl Render for MasterPasswordView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::widgets::dialog_surface(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::widgets::dialog_surface("Master Password", window, cx)
             .key_context("MasterPassword")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
@@ -4642,7 +4642,7 @@ impl Focusable for QueryParamsView {
 }
 
 impl Render for QueryParamsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let field_ground = cx.theme().colors().editor_background;
         let rows: Vec<_> = self
             .inputs
@@ -4651,7 +4651,7 @@ impl Render for QueryParamsView {
                 cyberpunk::dialog_field_on(name.clone(), false, field_ground, editor.clone())
             })
             .collect();
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Query Parameters", window, cx)
             .key_context("QueryParams")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
@@ -4771,7 +4771,7 @@ impl Focusable for RenameTableView {
 }
 
 impl Render for RenameTableView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let usage_rows: Vec<_> = self
             .usages
             .iter()
@@ -4787,7 +4787,7 @@ impl Render for RenameTableView {
             })
             .collect();
         let usage_count = self.usages.len();
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Rename Table", window, cx)
             .key_context("RenameTable")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
@@ -4909,7 +4909,7 @@ impl Focusable for ComparePickerView {
 }
 
 impl Render for ComparePickerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> = self
             .candidates
             .iter()
@@ -4928,7 +4928,7 @@ impl Render for ComparePickerView {
             })
             .collect();
         let is_empty = rows.is_empty();
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Compare Tables", window, cx)
             .key_context("ComparePicker")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
@@ -4999,7 +4999,7 @@ impl Focusable for QuickDocView {
 }
 
 impl Render for QuickDocView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> =
             self.columns
                 .iter()
@@ -5021,7 +5021,7 @@ impl Render for QuickDocView {
                 })
                 .collect();
         let column_count = self.columns.len();
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Quick Documentation", window, cx)
             .key_context("QuickDoc")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))

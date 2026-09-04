@@ -527,7 +527,7 @@ impl Focusable for NativeDumpDialog {
 }
 
 impl Render for NativeDumpDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = format!("Export with {}…", default_executable(self.driver));
         let preview = self.command_preview(cx);
 
@@ -559,7 +559,7 @@ impl Render for NativeDumpDialog {
             }
         }
 
-        dialog_surface(cx)
+        dialog_surface("Dump", window, cx)
             .track_focus(&self.focus_handle)
             .key_context("NativeDumpDialog")
             .child(dialog_header(

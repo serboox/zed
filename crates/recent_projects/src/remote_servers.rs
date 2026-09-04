@@ -3072,7 +3072,7 @@ impl Render for RemoteServerProjects {
             Mode::AddWslDistro(_) => "Add WSL Distro",
         };
 
-        dialog_shell(cx)
+        dialog_shell("Remote Projects", window, cx)
             .key_context("RemoteServerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))

@@ -146,7 +146,7 @@ impl DisconnectedOverlay {
 }
 
 impl Render for DisconnectedOverlay {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_reconnect = matches!(self.host, Host::RemoteServerProject(..));
 
         let message = match &self.host {
@@ -174,7 +174,7 @@ impl Render for DisconnectedOverlay {
             }
         };
 
-        dialog_shell(cx)
+        dialog_shell("Disconnected", window, cx)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::cancel))
             .occlude()

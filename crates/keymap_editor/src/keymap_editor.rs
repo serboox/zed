@@ -3080,7 +3080,7 @@ impl Render for KeybindingEditorModal {
             .then_some(())
             .and_then(|_| self.action_editor.clone());
 
-        dialog_shell(cx)
+        dialog_shell("Edit Keystroke", window, cx)
             .key_context(key_context)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))

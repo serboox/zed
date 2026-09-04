@@ -267,8 +267,8 @@ impl Focusable for ExecDialog {
 }
 
 impl Render for ExecDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::widgets::dialog_surface(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::widgets::dialog_surface("Exec SQL", window, cx)
             .track_focus(&self.focus_handle)
             .key_context("ExecDialog")
             .child(crate::widgets::dialog_header(

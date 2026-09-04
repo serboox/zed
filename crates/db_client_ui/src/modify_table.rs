@@ -1221,7 +1221,7 @@ impl Focusable for ModifyTableView {
 }
 
 impl Render for ModifyTableView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview = self.pending_statements(cx);
         let preview_text: SharedString = if preview.is_empty() {
             "-- No pending changes".into()
@@ -1255,7 +1255,7 @@ impl Render for ModifyTableView {
         let title = format!("Modify {}.{}", self.database, self.table);
         let busy = self.busy;
 
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Modify Table", window, cx)
             .key_context("ModifyTable")
             .track_focus(&self.focus_handle)
             .child(crate::widgets::dialog_header(

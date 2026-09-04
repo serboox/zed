@@ -523,7 +523,7 @@ impl Render for WaysToRunModal {
             );
         }
 
-        cyberpunk::dialog_shell(cx)
+        cyberpunk::dialog_shell("How to run this", window, cx)
             .key_context("WaysToRun")
             .track_focus(&self.focus)
             .debug_selector(|| "ways-to-run".to_string())

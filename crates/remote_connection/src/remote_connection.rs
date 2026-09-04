@@ -367,7 +367,7 @@ impl RenderOnce for SshConnectionHeader {
 }
 
 impl Render for RemoteConnectionModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
         let nickname = self.prompt.read(cx).nickname.clone();
         let connection_string = self.prompt.read(cx).connection_string.clone();
         let title = nickname.unwrap_or(connection_string);
@@ -386,7 +386,7 @@ impl Render for RemoteConnectionModal {
             IconName::Server
         };
 
-        dialog_shell(cx)
+        dialog_shell("Connection", window, cx)
             .key_context("SshConnectionModal")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::dismiss))

@@ -78,17 +78,34 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .preview_layout_rendered(window)
             .unwrap_or(Layout::Hidden);
 
-        div()
+        let picker = div()
             .relative()
             .child(content)
             .when(self.is_resizable(), |this| {
-                this.left(self.shape.horizontal_offset(window))
-                    .child(self.render_resize(Left, window, cx))
+                this.child(self.render_resize(Left, window, cx))
                     .child(self.render_resize(Right(layout), window, cx))
                     .child(self.render_resize(Bottom(layout), window, cx))
                     .child(self.render_resize(LeftCorner(layout), window, cx))
                     .child(self.render_resize(RightCorner(layout), window, cx))
-            })
+            });
+
+        if !self.is_carriable() {
+            return picker;
+        }
+
+        // A picker keeps its own size and the edges it is resized by; what it
+        // takes from the shared window shape is only being carried somewhere
+        // else, which nothing here could do before. The offset it already
+        // recentres itself by while being resized is handed over rather than
+        // set here, since two `left` calls on one element mean the first is
+        // silently dropped.
+        ui::cyberpunk::carriable(
+            Self::carried_as(),
+            gpui::point(self.shape.horizontal_offset(window), gpui::px(0.)),
+            picker,
+            window,
+            cx,
+        )
     }
 }
 

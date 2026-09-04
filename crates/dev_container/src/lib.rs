@@ -1382,7 +1382,7 @@ trait StatefulModal: ModalView + EventEmitter<DismissEvent> + Render {
 
     fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let element = self.render_for_state(self.state(), window, cx);
-        dialog_shell(cx)
+        dialog_shell("Dev Container", window, cx)
             .key_context("ContainerModal")
             .on_action(cx.listener(Self::dismiss))
             .child(element)

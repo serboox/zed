@@ -557,7 +557,7 @@ impl Focusable for ImportDataView {
 }
 
 impl Render for ImportDataView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview = self.parsed.clone();
         let mut mapping_rows = Vec::with_capacity(self.target_columns.len());
         for index in 0..self.target_columns.len() {
@@ -570,7 +570,7 @@ impl Render for ImportDataView {
         let importing = self.importing;
         let charset_picker = self.render_charset_picker(cx).into_any_element();
 
-        crate::widgets::dialog_surface(cx)
+        crate::widgets::dialog_surface("Import Data", window, cx)
             .key_context("DataImport")
             .track_focus(&self.focus_handle)
             .child(crate::widgets::dialog_header(

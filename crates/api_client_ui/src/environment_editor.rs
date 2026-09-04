@@ -1038,7 +1038,13 @@ impl Render for EnvironmentEditorModal {
                 .into_any_element(),
         ]);
 
-        cyberpunk::dialog_shell(cx)
+        // The heading doubles as what this window's size and place are
+        // remembered under, which is right here and not a bug waiting to
+        // happen: `show_scope_list` is decided when the window is built and
+        // never moves, so the heading is fixed for the life of the window --
+        // and the two entry points are two windows the reader sizes
+        // separately, not one window under two names.
+        cyberpunk::dialog_shell(title, window, cx)
             .id("environment-editor-modal-root")
             .debug_selector(|| "environment-editor-modal-root".to_string())
             .key_context("EnvironmentEditorModal")
@@ -1390,17 +1396,24 @@ mod tests {
         let dialog = cx
             .debug_bounds("environment-editor-modal-root")
             .expect("the dialog is painted");
+        let (widest, tallest) = cx.update(|window, _| {
+            let viewport = window.viewport_size();
+            (
+                cyberpunk::dialog_default_width(viewport),
+                cyberpunk::dialog_default_max_height(viewport),
+            )
+        });
         assert!(
-            dialog.size.width <= cyberpunk::DIALOG_WIDTH + px(1.),
+            dialog.size.width <= widest + px(1.),
             "the dialog is {:?} wide; it asks for {:?}",
             dialog.size.width,
-            cyberpunk::DIALOG_WIDTH
+            widest
         );
         assert!(
-            dialog.size.height <= cyberpunk::DIALOG_MAX_HEIGHT + px(1.),
+            dialog.size.height <= tallest + px(1.),
             "the dialog is {:?} tall; {:?} is its ceiling",
             dialog.size.height,
-            cyberpunk::DIALOG_MAX_HEIGHT
+            tallest
         );
 
         for name in [
@@ -1440,12 +1453,14 @@ mod tests {
         let modal = cx
             .debug_bounds("environment-editor-modal-root")
             .expect("the window is painted");
+        let tallest =
+            cx.update(|window, _| cyberpunk::dialog_default_max_height(window.viewport_size()));
         assert!(
-            modal.size.height <= cyberpunk::DIALOG_MAX_HEIGHT + px(1.),
+            modal.size.height <= tallest + px(1.),
             "the window is {:?} tall against a ceiling of {:?}: its contents \
              made it grow",
             modal.size.height,
-            cyberpunk::DIALOG_MAX_HEIGHT
+            tallest
         );
 
         let reach = view.read_with(&cx, |view, _| view.list_scroll_handle.max_offset());

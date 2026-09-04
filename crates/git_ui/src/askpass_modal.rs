@@ -109,9 +109,9 @@ impl AskPassModal {
 }
 
 impl Render for AskPassModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let hint = self.render_hint();
-        cyberpunk::dialog_shell(cx)
+        cyberpunk::dialog_shell("Credentials", window, cx)
             .key_context("PasswordPrompt")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))

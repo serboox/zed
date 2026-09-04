@@ -472,8 +472,8 @@ impl Focusable for RenameBranchModal {
 }
 
 impl Render for RenameBranchModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        cyberpunk::dialog_shell(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cyberpunk::dialog_shell("Rename Branch", window, cx)
             .key_context("RenameBranchModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
@@ -715,7 +715,7 @@ impl Focusable for RefPickerModal {
 }
 
 impl Render for RefPickerModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let commit_preview = self.commit_details.as_ref().map(|details| {
             let commit_time = OffsetDateTime::from_unix_timestamp(details.commit_timestamp)
                 .unwrap_or_else(|_| OffsetDateTime::now_utc());
@@ -751,7 +751,7 @@ impl Render for RefPickerModal {
                 )
         });
 
-        cyberpunk::dialog_shell(cx)
+        cyberpunk::dialog_shell("View Commit", window, cx)
             .key_context("RefPickerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
@@ -1318,8 +1318,8 @@ impl Focusable for GitCloneModal {
 }
 
 impl Render for GitCloneModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        cyberpunk::dialog_shell(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cyberpunk::dialog_shell("Clone Repository", window, cx)
             .key_context("GitCloneModal")
             .child(
                 cyberpunk::dialog_header("Clone Repository", cx).child(

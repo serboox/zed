@@ -17,7 +17,8 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, BoxShadow, Hsla, InteractiveElement, ParentElement, Pixels, PromptLevel, Styled, px, rgb,
+    App, BoxShadow, Hsla, InteractiveElement, IntoElement as _, MouseButton, ParentElement, Pixels,
+    PromptLevel, Styled, Window, px, rgb,
 };
 use theme::ActiveTheme as _;
 
@@ -216,20 +217,55 @@ pub fn dialog_title(name: impl Into<crate::SharedString>, cx: &App) -> gpui::Div
 }
 
 /// The whole outer box of a dialog: the surface, the shadow that lifts it off
-/// the workspace, and the size every dialog in this fork shares.
+/// the workspace, the size it opens at, and the grips that let the reader
+/// change that size or carry the window somewhere else.
 ///
 /// One call rather than the eight lines each window used to carry, because
 /// eight lines repeated sixty-eight times is how sixty-eight windows end up
 /// eight different shapes. `overflow_hidden` belongs to the shell and not to
 /// the caller: a child that paints past a rounded corner is what makes the
 /// radius look like a mistake.
-pub fn dialog_shell(cx: &App) -> gpui::Div {
+///
+/// `name` is what the window is called, and doubles as what its size and place
+/// are remembered under -- so a window reopened in the same session comes back
+/// the way it was left. It only has to be stable, not the visible title: a
+/// window whose heading changes with its state (the dev container's does)
+/// passes one name for the whole run of states.
+pub fn dialog_shell(name: impl Into<crate::SharedString>, window: &Window, cx: &App) -> gpui::Div {
     use crate::StyledExt as _;
+    let name = name.into();
+    let viewport = window.viewport_size();
+    let this = placed(&name, window);
+    let held_size = placement_of(&this, cx);
+    // A size the reader chose in a larger editor is still held to the editor
+    // there is now. Without this, shrinking the editor window leaves the
+    // dialog's footer -- and the action it is waiting for -- outside it.
+    let chosen = held_size.size.map(|size| {
+        gpui::size(
+            held(size.width, DIALOG_MIN_WIDTH, viewport.width),
+            held(size.height, DIALOG_MIN_HEIGHT, viewport.height - DROPPED_BY),
+        )
+    });
+    let width = chosen.map_or_else(|| dialog_default_width(viewport), |size| size.width);
+
     gpui::div()
         .flex()
         .flex_col()
-        .w(DIALOG_WIDTH)
-        .max_h(DIALOG_MAX_HEIGHT)
+        .w(width)
+        // A height only once the reader has asked for one. Until then the
+        // window is as tall as what is in it and no taller, which is what keeps
+        // a two-line confirmation from opening as tall as a form.
+        .when_some(chosen, |shell, size| shell.h(size.height))
+        .when(chosen.is_none(), |shell| {
+            shell.max_h(dialog_default_max_height(viewport))
+        })
+        // Where the window has been carried to, as an offset from where the
+        // layout would have put it. An offset rather than an absolute place, so
+        // a window that has never been moved still lands wherever whatever
+        // opened it decides -- the modal layer centres it -- and a window that
+        // has been moved keeps that relationship when the editor is resized.
+        .left(held_size.moved_by.x)
+        .top(held_size.moved_by.y)
         .overflow_hidden()
         // The same step of the elevation ramp the pickers float at, rather
         // than the surface and shadow written out again here: that ramp
@@ -238,14 +274,537 @@ pub fn dialog_shell(cx: &App) -> gpui::Div {
         // places deciding it is how a window comes to have a dim border
         // beside a picker's raised one.
         .elevation_3(cx)
+        // Carrying the window by its naming row is decided here rather than in
+        // [`dialog_header`], because a dialog is free to build its own heading
+        // and several do. What the row is, from here, is the top
+        // [`HEADER_BAND`] of the surface.
+        .on_mouse_down(MouseButton::Left, {
+            let name = name.clone();
+            move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                let this = placed(&name, window);
+                let Some(was) = painted_bounds(&this, cx) else {
+                    return;
+                };
+                if event.position.y - was.top() > HEADER_BAND {
+                    return;
+                }
+                if event.click_count >= 2 {
+                    forget_placement(&this, cx);
+                } else {
+                    start_drag(this, Grip::Move, event.position, was, cx);
+                }
+                window.refresh();
+            }
+        })
+        .child(dialog_drag_watcher(name.clone()))
+        .children(dialog_grips(&name))
         .debug_selector(|| "DIALOG-SHELL".to_string())
 }
 
-/// How wide every dialog is, and how tall it may grow before its middle
-/// scrolls instead. Shared so that two windows opened one after the other do
-/// not jump size between them.
+/// Lets a floating surface that decides its own size -- a picker does, and
+/// persists it -- be carried somewhere else all the same.
+///
+/// The picker's own resizing is not replaced by this: it keeps its edges and
+/// its saved size, and gains only the one thing it had no way to do. What it
+/// gains it from is a strip along its top edge rather than the whole top band a
+/// dialog is picked up by, because the top of a picker is its query field, and
+/// an editor's own mouse handling does not stop the press from reaching an
+/// ancestor -- a band there would carry the window off every time the reader
+/// dragged across the query to select it.
+///
+/// `already_offset_by` is whatever the caller already displaces the surface by
+/// on its own (a picker recentres itself as it is resized), added to rather
+/// than overwritten -- two `left` calls on one element mean the second wins and
+/// the first silently does nothing.
+pub fn carriable(
+    name: impl Into<crate::SharedString>,
+    already_offset_by: gpui::Point<Pixels>,
+    surface: gpui::Div,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
+    let name = name.into();
+    let carried = carried_by(&name, window, cx);
+    surface
+        .relative()
+        .left(already_offset_by.x + carried.x)
+        .top(already_offset_by.y + carried.y)
+        .child(dialog_drag_watcher(name.clone()))
+        .child(
+            gpui::deferred(
+                gpui::div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(CARRY_STRIP)
+                    .occlude()
+                    .cursor_grab()
+                    .debug_selector(|| "CARRY-STRIP".to_string())
+                    .on_mouse_down(MouseButton::Left, {
+                        move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                            let this = placed(&name, window);
+                            let Some(was) = painted_bounds(&this, cx) else {
+                                return;
+                            };
+                            if event.click_count >= 2 {
+                                forget_placement(&this, cx);
+                            } else {
+                                start_drag(this, Grip::Move, event.position, was, cx);
+                            }
+                            cx.stop_propagation();
+                            window.refresh();
+                        }
+                    }),
+            )
+            .with_priority(1),
+        )
+}
+
+/// Where a surface has been carried to, as an offset from where its own layout
+/// would put it.
+pub fn carried_by(name: &crate::SharedString, window: &Window, cx: &App) -> gpui::Point<Pixels> {
+    placement_of(&placed(name, window), cx).moved_by
+}
+
+/// How tall the strip along the top edge that carries a picker is. Thin, since
+/// it sits over the surface's own top padding, but no thinner than the edges
+/// the same surface is already resized by.
+const CARRY_STRIP: Pixels = px(10.);
+
+/// The width a dialog opens at: most of the editor's width rather than a fixed
+/// box, because the fixed box was 760px whether the editor was 1280px wide or
+/// 3840px, and a form with two columns in it had to scroll in both directions
+/// while three quarters of the screen stood empty.
+///
+/// Held between a floor and a ceiling all the same. The floor is what the
+/// widest dialog's own contents need; the ceiling is there because a line of
+/// text 3000px long is unreadable, and a dialog is mostly lines of text.
+pub fn dialog_default_width(viewport: gpui::Size<Pixels>) -> Pixels {
+    let room = (viewport.width - MARGIN * 2.).max(DIALOG_MIN_WIDTH);
+    (viewport.width * 0.66)
+        .clamp(DIALOG_WIDTH, DIALOG_WIDEST)
+        .min(room)
+}
+
+/// How tall a dialog may grow before its middle scrolls instead.
+///
+/// Most of the editor's height, less the room the modal layer drops a window by
+/// from the top: a dialog that asks for the whole height is one whose footer --
+/// and with it the button the dialog is waiting to be pressed -- is below the
+/// bottom edge of the window.
+pub fn dialog_default_max_height(viewport: gpui::Size<Pixels>) -> Pixels {
+    let room = (viewport.height - DROPPED_BY - MARGIN).max(DIALOG_MIN_HEIGHT);
+    (viewport.height * 0.72).min(room)
+}
+
+/// The width a dialog opens no narrower than, and no wider than.
 pub const DIALOG_WIDTH: Pixels = px(760.);
-pub const DIALOG_MAX_HEIGHT: Pixels = px(480.);
+pub const DIALOG_WIDEST: Pixels = px(1180.);
+
+/// The floor a resize is held to. Small enough to tuck a window out of the way,
+/// large enough that the naming row and the way out of it are still there.
+pub const DIALOG_MIN_WIDTH: Pixels = px(360.);
+pub const DIALOG_MIN_HEIGHT: Pixels = px(180.);
+
+/// Room kept between a dialog and the edge of the editor when it opens.
+const MARGIN: Pixels = px(24.);
+
+/// How far down the workspace the modal layer drops a window it opens.
+const DROPPED_BY: Pixels = px(80.);
+
+/// How much of a window that has been carried away must still be on screen.
+/// Enough that its naming row can be grabbed and it can be carried back.
+const KEPT_ON_SCREEN: Pixels = px(120.);
+
+/// How much of the top of the surface counts as the naming row for the purpose
+/// of picking the window up. A little more than the row is tall, since the row
+/// above a divider is what the reader is aiming at.
+const HEADER_BAND: Pixels = px(40.);
+
+/// How wide the strip along each edge is that resizes the window, and how far
+/// into the window a corner reaches.
+const GRIP: Pixels = px(6.);
+const CORNER: Pixels = px(16.);
+
+/// Which edges of a window a drag moves. `Move` moves all four, which is what
+/// carrying the window somewhere else is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grip {
+    Move,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Grip {
+    fn moves_left(self) -> bool {
+        matches!(
+            self,
+            Grip::Move | Grip::Left | Grip::TopLeft | Grip::BottomLeft
+        )
+    }
+
+    fn moves_right(self) -> bool {
+        matches!(
+            self,
+            Grip::Move | Grip::Right | Grip::TopRight | Grip::BottomRight
+        )
+    }
+
+    fn moves_top(self) -> bool {
+        matches!(
+            self,
+            Grip::Move | Grip::Top | Grip::TopLeft | Grip::TopRight
+        )
+    }
+
+    fn moves_bottom(self) -> bool {
+        matches!(
+            self,
+            Grip::Move | Grip::Bottom | Grip::BottomLeft | Grip::BottomRight
+        )
+    }
+}
+
+/// Where a window stands and how big it is, once the reader has said. `None`
+/// for the size means nobody has said yet, and the window is as big as
+/// [`dialog_default_width`] and its own contents make it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Placement {
+    moved_by: gpui::Point<Pixels>,
+    size: Option<gpui::Size<Pixels>>,
+}
+
+/// Which dialog, in which editor window. The editor window is part of it
+/// because two editor windows can each have a dialog of the same name open --
+/// two commit windows, say -- and they are two windows the reader places
+/// separately, not one window remembered twice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Placed {
+    in_window: gpui::WindowId,
+    name: crate::SharedString,
+}
+
+fn placed(name: &crate::SharedString, window: &Window) -> Placed {
+    Placed {
+        in_window: window.window_handle().window_id(),
+        name: name.clone(),
+    }
+}
+
+/// A drag in progress: which dialog, which of its edges, where the pointer
+/// started, and what the window was when it started. Measured from the start
+/// rather than accumulated per event, so a drag that outruns the frame rate
+/// does not drift.
+struct Dragged {
+    of: Placed,
+    grip: Grip,
+    from_pointer: gpui::Point<Pixels>,
+    from: Placement,
+    was: gpui::Bounds<Pixels>,
+}
+
+#[derive(Default)]
+struct Dialogs {
+    placements: std::collections::HashMap<Placed, Placement>,
+    /// Where each window was last painted. A resize has to start from the size
+    /// the window actually is, which for a window nobody has resized yet is
+    /// whatever its contents came to -- a number only the frame knows.
+    painted: std::collections::HashMap<Placed, gpui::Bounds<Pixels>>,
+    dragged: Option<Dragged>,
+}
+
+/// Holds a number between two bounds without assuming which of them is the
+/// larger. `clamp` panics when the low bound is above the high one, and in an
+/// editor window narrower than a dialog's own floor -- which the reader is free
+/// to drag it to -- that is exactly what these two are.
+fn held(value: Pixels, at_least: Pixels, at_most: Pixels) -> Pixels {
+    value.max(at_least).min(at_most.max(at_least))
+}
+
+impl gpui::Global for Dialogs {}
+
+/// Whether the reader has given this window a size of its own by dragging one
+/// of its edges.
+///
+/// A dialog that opens narrower or wider than the shared default has to stop
+/// imposing that width once this is true, or the width it sets undoes the drag
+/// on the very next frame.
+pub fn dialog_was_resized(name: &crate::SharedString, window: &Window, cx: &App) -> bool {
+    placement_of(&placed(name, window), cx).size.is_some()
+}
+
+fn placement_of(of: &Placed, cx: &App) -> Placement {
+    cx.try_global::<Dialogs>()
+        .and_then(|dialogs| dialogs.placements.get(of).copied())
+        .unwrap_or_default()
+}
+
+fn painted_bounds(of: &Placed, cx: &App) -> Option<gpui::Bounds<Pixels>> {
+    cx.try_global::<Dialogs>()
+        .and_then(|dialogs| dialogs.painted.get(of).copied())
+}
+
+fn forget_placement(of: &Placed, cx: &mut App) {
+    cx.default_global::<Dialogs>().placements.remove(of);
+}
+
+fn start_drag(
+    of: Placed,
+    grip: Grip,
+    from_pointer: gpui::Point<Pixels>,
+    was: gpui::Bounds<Pixels>,
+    cx: &mut App,
+) {
+    let from = placement_of(&of, cx);
+    cx.default_global::<Dialogs>().dragged = Some(Dragged {
+        of,
+        grip,
+        from_pointer,
+        from,
+        was,
+    });
+}
+
+/// Answers where the drag in progress has taken the window, and reports whether
+/// anything about it changed -- which is what decides whether the frame is
+/// redrawn.
+fn drag_to(
+    of: &Placed,
+    pointer: gpui::Point<Pixels>,
+    viewport: gpui::Size<Pixels>,
+    cx: &mut App,
+) -> bool {
+    let Some((grip, from, was, from_pointer)) = cx
+        .try_global::<Dialogs>()
+        .and_then(|dialogs| dialogs.dragged.as_ref())
+        .filter(|dragged| &dragged.of == of)
+        .map(|dragged| {
+            (
+                dragged.grip,
+                dragged.from,
+                dragged.was,
+                dragged.from_pointer,
+            )
+        })
+    else {
+        return false;
+    };
+
+    let moved = pointer - from_pointer;
+    let mut offset = from.moved_by;
+    let mut width = was.size.width;
+    let mut height = was.size.height;
+
+    // The modal layer centres a window across the workspace, so a window that
+    // grows by ten pixels has each of its edges move out by five on its own.
+    // Holding the edge that was *not* grabbed still therefore means moving the
+    // window by half of what it grew -- which is also why dragging one edge
+    // does not appear to move the other.
+    if grip.moves_left() && grip.moves_right() {
+        offset.x += moved.x;
+    } else if grip.moves_right() {
+        width = held(was.size.width + moved.x, DIALOG_MIN_WIDTH, viewport.width);
+        offset.x += (width - was.size.width) / 2.;
+    } else if grip.moves_left() {
+        width = held(was.size.width - moved.x, DIALOG_MIN_WIDTH, viewport.width);
+        offset.x -= (width - was.size.width) / 2.;
+    }
+
+    // Vertically the layer does not centre -- it drops the window a fixed way
+    // down -- so the top edge is the anchored one and only a drag on the top
+    // edge itself has to compensate.
+    if grip.moves_top() && grip.moves_bottom() {
+        offset.y += moved.y;
+    } else if grip.moves_bottom() {
+        height = held(
+            was.size.height + moved.y,
+            DIALOG_MIN_HEIGHT,
+            viewport.height,
+        );
+    } else if grip.moves_top() {
+        height = held(
+            was.size.height - moved.y,
+            DIALOG_MIN_HEIGHT,
+            viewport.height,
+        );
+        offset.y += was.size.height - height;
+    }
+
+    // Where the layout puts this window with no offset at all, worked back from
+    // where it was painted. Needed to keep a window that is being carried from
+    // being carried off the screen, where it could not be reached to be carried
+    // back.
+    let natural = was.origin - from.moved_by;
+    let left = held(
+        natural.x + offset.x,
+        KEPT_ON_SCREEN - width,
+        viewport.width - KEPT_ON_SCREEN,
+    );
+    let top = held(
+        natural.y + offset.y,
+        px(0.),
+        viewport.height - KEPT_ON_SCREEN,
+    );
+    offset.x = left - natural.x;
+    offset.y = top - natural.y;
+
+    let placement = Placement {
+        moved_by: offset,
+        // Carrying a window does not decide its height: a dialog only moved
+        // stays as tall as its contents.
+        size: if grip == Grip::Move {
+            from.size
+        } else {
+            Some(gpui::size(width, height))
+        },
+    };
+
+    let dialogs = cx.default_global::<Dialogs>();
+    if dialogs.placements.get(of) == Some(&placement) {
+        return false;
+    }
+    dialogs.placements.insert(of.clone(), placement);
+    true
+}
+
+fn end_drag(of: &Placed, cx: &mut App) -> bool {
+    let dialogs = cx.default_global::<Dialogs>();
+    if dialogs
+        .dragged
+        .as_ref()
+        .is_some_and(|dragged| &dragged.of == of)
+    {
+        dialogs.dragged = None;
+        return true;
+    }
+    false
+}
+
+/// Records where the window was painted, and listens for the rest of a drag.
+///
+/// The listeners are the window's rather than the shell's own, because a drag
+/// that makes a window bigger is a drag whose pointer is outside the window --
+/// and a move heard by the element the drag started on is not heard once the
+/// pointer has left it. Registered while drawing, which is how a frame-scoped
+/// listener is registered.
+fn dialog_drag_watcher(name: crate::SharedString) -> impl gpui::IntoElement {
+    gpui::canvas(
+        {
+            let name = name.clone();
+            move |bounds, window: &mut Window, cx: &mut App| {
+                cx.default_global::<Dialogs>()
+                    .painted
+                    .insert(placed(&name, window), bounds);
+            }
+        },
+        move |_bounds, _, window, _cx| {
+            let dragged = name.clone();
+            window.on_mouse_event(
+                move |event: &gpui::MouseMoveEvent, phase, window: &mut Window, cx: &mut App| {
+                    if phase != gpui::DispatchPhase::Bubble || !event.dragging() {
+                        return;
+                    }
+                    let this = placed(&dragged, window);
+                    if drag_to(&this, event.position, window.viewport_size(), cx) {
+                        window.refresh();
+                    }
+                },
+            );
+            let released = name;
+            window.on_mouse_event(
+                move |_: &gpui::MouseUpEvent, phase, window: &mut Window, cx: &mut App| {
+                    if phase == gpui::DispatchPhase::Bubble {
+                        let this = placed(&released, window);
+                        if end_drag(&this, cx) {
+                            window.refresh();
+                        }
+                    }
+                },
+            );
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// The strips along the edges and the squares in the corners that resize the
+/// window.
+///
+/// Drawn after everything the caller puts in the window -- `deferred` -- because
+/// a grip a form is painted over is a grip the pointer never reaches. They are
+/// inside the surface rather than straddling its edge, so that a press on one
+/// is a press on the window: the modal layer reads a press outside the window
+/// as "the reader is done with this" and closes it.
+fn dialog_grips(name: &crate::SharedString) -> Vec<gpui::AnyElement> {
+    let edges: [(Grip, fn(gpui::Div) -> gpui::Div); 8] = [
+        (Grip::Top, |grip| {
+            grip.top_0().left_0().right_0().h(GRIP).cursor_row_resize()
+        }),
+        (Grip::Bottom, |grip| {
+            grip.bottom_0()
+                .left_0()
+                .right_0()
+                .h(GRIP)
+                .cursor_row_resize()
+        }),
+        (Grip::Left, |grip| {
+            grip.left_0().top_0().bottom_0().w(GRIP).cursor_col_resize()
+        }),
+        (Grip::Right, |grip| {
+            grip.right_0()
+                .top_0()
+                .bottom_0()
+                .w(GRIP)
+                .cursor_col_resize()
+        }),
+        (Grip::TopLeft, |grip| {
+            grip.top_0().left_0().size(CORNER).cursor_nwse_resize()
+        }),
+        (Grip::TopRight, |grip| {
+            grip.top_0().right_0().size(CORNER).cursor_nesw_resize()
+        }),
+        (Grip::BottomLeft, |grip| {
+            grip.bottom_0().left_0().size(CORNER).cursor_nesw_resize()
+        }),
+        (Grip::BottomRight, |grip| {
+            grip.bottom_0().right_0().size(CORNER).cursor_nwse_resize()
+        }),
+    ];
+
+    edges
+        .into_iter()
+        .map(|(grip, place)| {
+            let name = name.clone();
+            gpui::deferred(
+                place(gpui::div().absolute())
+                    .occlude()
+                    .debug_selector(move || format!("DIALOG-GRIP-{grip:?}"))
+                    .on_mouse_down(MouseButton::Left, {
+                        move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                            let this = placed(&name, window);
+                            let Some(was) = painted_bounds(&this, cx) else {
+                                return;
+                            };
+                            start_drag(this, grip, event.position, was, cx);
+                            cx.stop_propagation();
+                            window.refresh();
+                        }
+                    }),
+            )
+            // Above the corners of the window's own contents, and above the
+            // edge grips where a corner overlaps one.
+            .with_priority(1)
+            .into_any_element()
+        })
+        .collect()
+}
 
 /// The row a dialog names itself on: the title at the left, and room after it
 /// for whatever the window keeps at the right -- which is the way out.
@@ -657,6 +1216,11 @@ mod tests {
         );
     }
 
+    /// The one window every test below draws. Named here because it is also the
+    /// key its size and place are remembered under, and a test that resizes it
+    /// has to be able to ask about the same window afterwards.
+    const TEST_DIALOG: crate::SharedString = crate::SharedString::new_static("Edit Connection");
+
     struct DialogHost {
         body_is_taller_than_the_window: bool,
     }
@@ -664,7 +1228,7 @@ mod tests {
     impl Render for DialogHost {
         fn render(
             &mut self,
-            _window: &mut Window,
+            window: &mut Window,
             cx: &mut Context<Self>,
         ) -> impl gpui::IntoElement {
             let tall = if self.body_is_taller_than_the_window {
@@ -672,7 +1236,7 @@ mod tests {
             } else {
                 gpui::px(80.0)
             };
-            dialog_shell(cx)
+            let shell = dialog_shell(TEST_DIALOG, window, cx)
                 .child(
                     dialog_header("Edit Connection", cx).child(
                         gpui::div()
@@ -688,7 +1252,26 @@ mod tests {
                         )))
                         .child(crate::Button::new("cancel", "Cancel"))
                         .child(crate::Button::new("save", "Save")),
-                )
+                );
+
+            // Stood where the workspace's modal layer stands a window it
+            // opens: dropped `DROPPED_BY` down the workspace, centred across
+            // it, in a column of no height of its own. The placement is not
+            // incidental to what these tests measure -- a window centred by
+            // its parent moves both its edges when it grows, which is the
+            // whole reason a drag on one edge has to compensate -- and the
+            // shell cannot be the window's own root here, because the root
+            // element's offsets are the window's own and are not applied.
+            gpui::div().absolute().size_full().child(
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .h(gpui::px(0.))
+                    .top(DROPPED_BY)
+                    .items_center()
+                    .child(gpui::div().flex().flex_row().child(shell)),
+            )
         }
     }
 
@@ -704,6 +1287,12 @@ mod tests {
         let (_host, cx) = cx.add_window_view(|_window, _cx| DialogHost {
             body_is_taller_than_the_window,
         });
+        // A known editor size, so what the window opens at is a number these
+        // tests can name rather than whatever the test platform defaults to.
+        // Wide enough that the shared default is not the floor: a test run in
+        // a 1024px editor cannot tell "most of the width" from the fixed 760px
+        // box it replaced.
+        cx.simulate_resize(gpui::size(gpui::px(1920.), gpui::px(1200.)));
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.refresh();
@@ -766,11 +1355,12 @@ mod tests {
             .debug_bounds("BUTTON-Save")
             .expect("the confirming action is painted");
 
+        let ceiling = cx.update(|window, _| dialog_default_max_height(window.viewport_size()));
         assert!(
-            shell.size.height <= DIALOG_MAX_HEIGHT + gpui::px(0.5),
+            shell.size.height <= ceiling + gpui::px(0.5),
             "a body of 2000px grew the window to {:?}, past the {:?} it may reach",
             shell.size.height,
-            DIALOG_MAX_HEIGHT
+            ceiling
         );
         assert!(
             footer.bottom() <= shell.bottom() + gpui::px(0.5),
@@ -819,6 +1409,377 @@ mod tests {
             save.right(),
             footer.left(),
             footer.right()
+        );
+    }
+
+    fn redraw(cx: &mut gpui::VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn shell_bounds(cx: &mut gpui::VisualTestContext) -> gpui::Bounds<Pixels> {
+        cx.debug_bounds("DIALOG-SHELL")
+            .expect("the shell is painted")
+    }
+
+    fn drag(cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>) {
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        redraw(cx);
+        // Two steps rather than one, because a drag the reader makes is many
+        // moves and each is answered from where the drag started -- a window
+        // that drifted would arrive somewhere else.
+        let midway = gpui::point((from.x + to.x) / 2., (from.y + to.y) / 2.);
+        cx.simulate_mouse_move(midway, MouseButton::Left, gpui::Modifiers::default());
+        redraw(cx);
+        cx.simulate_mouse_move(to, MouseButton::Left, gpui::Modifiers::default());
+        redraw(cx);
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        redraw(cx);
+    }
+
+    // A window opens at most of the editor's width rather than at a fixed box.
+    // The complaint this answers: a form with two columns of variables in it
+    // opened 760px wide with three quarters of the screen left empty.
+    #[gpui::test]
+    async fn a_window_opens_at_most_of_the_editors_width(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_dialog(cx, false);
+
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let shell = shell_bounds(cx);
+
+        assert!(
+            (shell.size.width - dialog_default_width(viewport)).abs() <= gpui::px(1.),
+            "a window in a {:?} editor opened {:?} wide, not the {:?} the shared default asks \
+             for",
+            viewport,
+            shell.size.width,
+            dialog_default_width(viewport)
+        );
+        assert!(
+            shell.size.width > DIALOG_WIDTH + gpui::px(100.),
+            "a window in a {:?} editor opened {:?} wide, which is still the fixed {:?} box it \
+             replaced",
+            viewport,
+            shell.size.width,
+            DIALOG_WIDTH
+        );
+    }
+
+    // The window is carried by its naming row, and arrives where it was taken.
+    #[gpui::test]
+    async fn the_window_is_carried_by_its_naming_row(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.center().x, before.top() + gpui::px(12.));
+        let carried = gpui::point(grab.x - gpui::px(90.), grab.y + gpui::px(70.));
+        drag(cx, grab, carried);
+
+        let after = shell_bounds(cx);
+        assert!(
+            (after.left() - (before.left() - gpui::px(90.))).abs() <= gpui::px(1.)
+                && (after.top() - (before.top() + gpui::px(70.))).abs() <= gpui::px(1.),
+            "the window was carried 90px left and 70px down from {:?} and arrived at {:?}",
+            before.origin,
+            after.origin
+        );
+        assert!(
+            (after.size.width - before.size.width).abs() <= gpui::px(1.)
+                && (after.size.height - before.size.height).abs() <= gpui::px(1.),
+            "carrying the window also changed its size, from {:?} to {:?}",
+            before.size,
+            after.size
+        );
+    }
+
+    // Dragging an edge resizes the window and holds the opposite edge still.
+    // The opposite edge is the half of this that is easy to get wrong: the
+    // modal layer centres the window, so a window that grows moves both its
+    // edges outward unless the drag compensates for it.
+    #[gpui::test]
+    async fn dragging_the_right_edge_widens_the_window_and_holds_its_left_edge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.right() - gpui::px(2.), before.center().y);
+        drag(cx, grab, gpui::point(grab.x + gpui::px(120.), grab.y));
+
+        let after = shell_bounds(cx);
+        assert!(
+            (after.size.width - (before.size.width + gpui::px(120.))).abs() <= gpui::px(2.),
+            "dragging the right edge 120px out took the width from {:?} to {:?}",
+            before.size.width,
+            after.size.width
+        );
+        assert!(
+            (after.left() - before.left()).abs() <= gpui::px(2.),
+            "the left edge moved from {:?} to {:?} while the right edge was being dragged",
+            before.left(),
+            after.left()
+        );
+    }
+
+    #[gpui::test]
+    async fn dragging_the_left_edge_widens_the_window_and_holds_its_right_edge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.left() + gpui::px(2.), before.center().y);
+        drag(cx, grab, gpui::point(grab.x - gpui::px(100.), grab.y));
+
+        let after = shell_bounds(cx);
+        assert!(
+            (after.size.width - (before.size.width + gpui::px(100.))).abs() <= gpui::px(2.),
+            "dragging the left edge 100px out took the width from {:?} to {:?}",
+            before.size.width,
+            after.size.width
+        );
+        assert!(
+            (after.right() - before.right()).abs() <= gpui::px(2.),
+            "the right edge moved from {:?} to {:?} while the left edge was being dragged",
+            before.right(),
+            after.right()
+        );
+    }
+
+    // A window made taller keeps its footer inside it: the height the drag
+    // asks for is the height of the whole window, not of its middle.
+    #[gpui::test]
+    async fn dragging_the_bottom_edge_makes_the_window_taller_and_keeps_the_actions_inside(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, true);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.center().x, before.bottom() - gpui::px(2.));
+        drag(cx, grab, gpui::point(grab.x, grab.y + gpui::px(150.)));
+
+        let after = shell_bounds(cx);
+        let save = cx
+            .debug_bounds("BUTTON-Save")
+            .expect("the confirming action is painted");
+        assert!(
+            (after.size.height - (before.size.height + gpui::px(150.))).abs() <= gpui::px(2.),
+            "dragging the bottom edge 150px down took the height from {:?} to {:?}, which is \
+             not the height the drag asked for",
+            before.size.height,
+            after.size.height
+        );
+        assert!(
+            save.bottom() <= after.bottom() + gpui::px(0.5),
+            "the confirming action ends at {:?}, below a window ending at {:?}",
+            save.bottom(),
+            after.bottom()
+        );
+    }
+
+    // The floor a resize is held to. Without it a window can be dragged down to
+    // nothing, and a window with no naming row left cannot be grabbed to be
+    // dragged back.
+    #[gpui::test]
+    async fn a_window_cannot_be_dragged_narrower_than_the_floor(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.right() - gpui::px(2.), before.center().y);
+        drag(
+            cx,
+            grab,
+            gpui::point(before.left() - gpui::px(200.), grab.y),
+        );
+
+        let after = shell_bounds(cx);
+        assert!(
+            (after.size.width - DIALOG_MIN_WIDTH).abs() <= gpui::px(2.),
+            "dragged past its own left edge, the window came to {:?} rather than stopping at \
+             the {:?} floor",
+            after.size.width,
+            DIALOG_MIN_WIDTH
+        );
+    }
+
+    // The way back: a window whose size has been dragged into a corner is
+    // given its own size back by double-clicking the row it is carried by.
+    #[gpui::test]
+    async fn double_clicking_the_naming_row_gives_the_window_its_size_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.right() - gpui::px(2.), before.center().y);
+        drag(cx, grab, gpui::point(grab.x - gpui::px(250.), grab.y));
+        let narrowed = shell_bounds(cx);
+        assert!(
+            narrowed.size.width < before.size.width - gpui::px(200.),
+            "the window was not narrowed first, so this test proves nothing: {:?} to {:?}",
+            before.size.width,
+            narrowed.size.width
+        );
+
+        let row = gpui::point(narrowed.center().x, narrowed.top() + gpui::px(12.));
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: row,
+            modifiers: gpui::Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        redraw(cx);
+        cx.simulate_mouse_up(row, MouseButton::Left, gpui::Modifiers::default());
+        redraw(cx);
+
+        let after = shell_bounds(cx);
+        assert!(
+            (after.size.width - before.size.width).abs() <= gpui::px(1.),
+            "the window came back {:?} wide rather than the {:?} it opened at",
+            after.size.width,
+            before.size.width
+        );
+    }
+
+    // A size chosen in a large editor is not kept when the editor becomes
+    // small: the window has to fit the editor it is in, or its footer -- and
+    // the action the dialog is waiting for -- is outside the window.
+    #[gpui::test]
+    async fn a_remembered_size_does_not_outgrow_a_shrunken_editor(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_dialog(cx, false);
+
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.right() - gpui::px(2.), before.center().y);
+        drag(cx, grab, gpui::point(grab.x + gpui::px(300.), grab.y));
+        let widened = shell_bounds(cx);
+        assert!(
+            widened.size.width > before.size.width + gpui::px(200.),
+            "the window was not widened first, so this test proves nothing: {:?} to {:?}",
+            before.size.width,
+            widened.size.width
+        );
+
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        redraw(cx);
+
+        let after = shell_bounds(cx);
+        assert!(
+            after.size.width <= gpui::px(900.) + gpui::px(1.),
+            "the window kept the {:?} it was given in a wider editor, in an editor now 900px \
+             wide",
+            after.size.width
+        );
+    }
+
+    // Two editor windows each have their own copy of a window of the same name
+    // -- two commit windows are two windows -- and placing one does not place
+    // the other.
+    #[gpui::test]
+    async fn two_editor_windows_place_their_own_copy_of_a_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let first = cx.add_window(|_window, _cx| DialogHost {
+            body_is_taller_than_the_window: false,
+        });
+        let second = cx.add_window(|_window, _cx| DialogHost {
+            body_is_taller_than_the_window: false,
+        });
+
+        let before = {
+            let mut one = gpui::VisualTestContext::from_window(first.into(), cx);
+            one.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+            redraw(&mut one);
+            let before = shell_bounds(&mut one);
+            let grab = gpui::point(before.center().x, before.top() + gpui::px(12.));
+            drag(
+                &mut one,
+                grab,
+                gpui::point(grab.x - gpui::px(200.), grab.y + gpui::px(100.)),
+            );
+            let moved = shell_bounds(&mut one);
+            assert!(
+                (moved.left() - (before.left() - gpui::px(200.))).abs() <= gpui::px(1.),
+                "the first window was not carried, so this test proves nothing: {:?} to {:?}",
+                before.origin,
+                moved.origin
+            );
+            before
+        };
+
+        let mut other = gpui::VisualTestContext::from_window(second.into(), cx);
+        other.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1000.)));
+        redraw(&mut other);
+        let untouched = shell_bounds(&mut other);
+        assert!(
+            (untouched.left() - before.left()).abs() <= gpui::px(1.)
+                && (untouched.top() - before.top()).abs() <= gpui::px(1.),
+            "carrying the window in one editor also carried the one in the other: {:?} against \
+             the {:?} it opened at",
+            untouched.origin,
+            before.origin
+        );
+    }
+
+    // An editor window smaller than a dialog's own floor is a shape the reader
+    // is free to drag it to, and every bound in the resize has to survive it:
+    // the floor above the ceiling is what `clamp` panics on, which is a crash
+    // rather than a window of an awkward size.
+    #[gpui::test]
+    async fn an_editor_smaller_than_the_floor_does_not_bring_the_drag_down(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_dialog(cx, false);
+
+        cx.simulate_resize(gpui::size(gpui::px(320.), gpui::px(140.)));
+        redraw(cx);
+
+        // The top edge, because it is the only one of the four still inside an
+        // editor this small: a window held to a 360px floor in a 320px editor
+        // hangs off both sides, and its bottom is below the last row.
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.center().x, before.top() + gpui::px(2.));
+        drag(cx, grab, gpui::point(grab.x, grab.y - gpui::px(400.)));
+
+        let after = shell_bounds(cx);
+        assert!(
+            after.size.height >= DIALOG_MIN_HEIGHT - gpui::px(1.),
+            "in a 140px editor the window came to {:?} tall, under the {:?} floor",
+            after.size.height,
+            DIALOG_MIN_HEIGHT
+        );
+    }
+
+    // A window carried at the edge of the editor keeps enough of itself on
+    // screen to be grabbed and carried back.
+    #[gpui::test]
+    async fn a_window_cannot_be_carried_off_the_screen(cx: &mut gpui::TestAppContext) {
+        let cx = draw_a_dialog(cx, false);
+
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let before = shell_bounds(cx);
+        let grab = gpui::point(before.center().x, before.top() + gpui::px(12.));
+        drag(
+            cx,
+            grab,
+            gpui::point(grab.x + viewport.width * 3., grab.y + viewport.height * 3.),
+        );
+
+        let after = shell_bounds(cx);
+        assert!(
+            after.left() < viewport.width - KEPT_ON_SCREEN + gpui::px(2.)
+                && after.top() < viewport.height - KEPT_ON_SCREEN + gpui::px(2.),
+            "carried far past the corner, the window came to rest at {:?} in a {:?} editor, \
+             where there is nothing left of it to grab",
+            after.origin,
+            viewport
         );
     }
 }

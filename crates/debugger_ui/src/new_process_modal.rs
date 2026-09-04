@@ -571,7 +571,7 @@ impl Render for NewProcessModal {
         let attach_focus_handle = focus_handle.clone();
         let launch_focus_handle = focus_handle;
 
-        dialog_shell(cx)
+        dialog_shell("New Process", window, cx)
             .key_context({
                 let mut key_context = KeyContext::new_with_defaults();
                 key_context.add("Pane");

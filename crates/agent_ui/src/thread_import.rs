@@ -436,7 +436,7 @@ impl Focusable for ThreadImportModal {
 impl ModalView for ThreadImportModal {}
 
 impl Render for ThreadImportModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_agents = !self.agent_entries.is_empty();
         let disabled_import_thread =
             self.is_importing || !has_agents || !self.has_checked_selectable_agent();
@@ -555,7 +555,7 @@ impl Render for ThreadImportModal {
             })
             .collect::<Vec<_>>();
 
-        dialog_shell(cx)
+        dialog_shell("Import External Agent Threads", window, cx)
             .id("thread-import-modal")
             .key_context("ThreadImportModal")
             .track_focus(&self.focus_handle)

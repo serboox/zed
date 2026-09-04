@@ -22,8 +22,12 @@ pub(crate) fn popup_surface(cx: &App) -> Div {
 /// with every other dialog in the fork; the only thing added here is
 /// `occlude`, which a modal needs so a click does not fall through it onto the
 /// workspace behind.
-pub(crate) fn dialog_surface(cx: &App) -> Div {
-    cyberpunk::dialog_shell(cx).occlude()
+///
+/// `name` is what the window's size and place are remembered under, so it has
+/// to be the same string every time this dialog is opened -- not a heading that
+/// names the table or connection it happens to be about.
+pub(crate) fn dialog_surface(name: impl Into<SharedString>, window: &Window, cx: &App) -> Div {
+    cyberpunk::dialog_shell(name, window, cx).occlude()
 }
 
 /// Wraps a single-line editor in the bordered field chrome shared by the

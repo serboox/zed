@@ -93,13 +93,17 @@ impl AlertModal {
 }
 
 impl RenderOnce for AlertModal {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let width = self.width.unwrap_or_else(|| px(440.).into());
+        let name: SharedString = self
+            .title
+            .clone()
+            .unwrap_or_else(|| SharedString::new_static("Alert"));
         let has_default_footer = self.primary_action.is_some() || self.dismiss_label.is_some();
 
         // The shell every window in this fork is built from, narrowed: an
         // alert asks one question and does not need a form's width.
-        let mut modal = cyberpunk::dialog_shell(cx)
+        let mut modal = cyberpunk::dialog_shell(name.clone(), window, cx)
             .when_some(self.key_context, |this, key_context| {
                 this.key_context(key_context.as_str())
             })
@@ -107,7 +111,12 @@ impl RenderOnce for AlertModal {
                 this.track_focus(&focus_handle)
             })
             .id(self.id)
-            .w(width);
+            // The narrower width is what an alert opens at, not what it is held
+            // to: once the reader has dragged the window to a size of their
+            // own, imposing this again would undo the drag on the next frame.
+            .when(!cyberpunk::dialog_was_resized(&name, window, cx), |modal| {
+                modal.w(width)
+            });
 
         for handler in self.action_handlers {
             modal = handler(modal);

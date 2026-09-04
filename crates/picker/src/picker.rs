@@ -583,9 +583,12 @@ impl<D: PickerDelegate> Picker<D> {
             }),
             default_shape,
             show_scrollbar: false,
-            presentation: Presentation::Modal {
-                resizable: has_preview,
-            },
+            // Every window in this fork can be resized, and a picker is a
+            // window: the reader who wants a longer list of files or a wider
+            // command palette has the same claim on it as the reader of a
+            // form. The machinery was already here and only the pickers with a
+            // preview were let near it.
+            presentation: Presentation::Modal { resizable: true },
             picker_bounds: Rc::new(Cell::new(None)),
             item_bounds: Rc::new(RefCell::new(HashMap::default())),
             size_bounds,
@@ -736,6 +739,22 @@ impl<D: PickerDelegate> Picker<D> {
     /// Whether the picker can be resized (only ever true for modals).
     fn is_resizable(&self) -> bool {
         matches!(self.presentation, Presentation::Modal { resizable: true })
+    }
+
+    /// Whether this picker can be carried somewhere else: every modal one can,
+    /// including those that open at a size they cannot be resized narrower
+    /// than.
+    fn is_carriable(&self) -> bool {
+        matches!(self.presentation, Presentation::Modal { .. })
+    }
+
+    /// What this picker's place on screen is remembered under while the editor
+    /// is open. The same name the delegate's size is persisted under, because
+    /// every picker in the app is a `Picker<D>` and only the delegate says
+    /// which one -- the file finder and the command palette are two windows,
+    /// not one window opened twice.
+    pub(crate) fn carried_as() -> SharedString {
+        SharedString::new_static(D::name())
     }
 
     pub fn list_measure_all(mut self) -> Self {
@@ -1542,7 +1561,7 @@ impl<D: PickerDelegate> Picker<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{Entity, Point, TestAppContext, point, px};
     use std::cell::Cell;
 
     struct TestDelegate {
@@ -1691,6 +1710,112 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    /// A picker stood where the workspace's modal layer stands it: dropped a
+    /// fixed way down, centred across the window, in a column of no height of
+    /// its own. Not decoration -- the offsets a carried window is placed by are
+    /// the window's own when the picker is the root element, and are dropped.
+    struct PickerHost {
+        picker: Entity<Picker<TestDelegate>>,
+    }
+
+    impl Render for PickerHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().absolute().size_full().child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .h(px(0.))
+                    .top(px(80.))
+                    .items_center()
+                    .child(div().flex().flex_row().child(self.picker.clone())),
+            )
+        }
+    }
+
+    fn draw_a_picker(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        init_test(cx);
+        let (_host, cx) = cx.add_window_view(|window, cx| PickerHost {
+            picker: cx.new(|cx| {
+                Picker::uniform_list(TestDelegate::new(vec![true, true, true]), window, cx)
+            }),
+        });
+        cx.simulate_resize(gpui::size(px(1600.), px(1000.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    fn carry(cx: &mut gpui::VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(to, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    // A picker is a window too, and can be carried out of the way of what the
+    // reader is looking at behind it.
+    #[gpui::test]
+    async fn a_picker_is_carried_by_the_strip_along_its_top_edge(cx: &mut TestAppContext) {
+        let cx = draw_a_picker(cx);
+
+        let before = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip that carries the picker is painted");
+        let grab = point(before.center().x, before.center().y);
+        carry(cx, grab, point(grab.x - px(120.), grab.y + px(60.)));
+
+        let after = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip is still painted");
+        assert!(
+            (after.left() - (before.left() - px(120.))).abs() <= px(1.)
+                && (after.top() - (before.top() + px(60.))).abs() <= px(1.),
+            "the picker was carried 120px left and 60px down from {:?} and arrived at {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    // Why the strip is a strip and not the whole top of the picker: the top of
+    // a picker is the field the query is typed into, and dragging across a
+    // query to select it must not carry the window off.
+    #[gpui::test]
+    async fn dragging_across_the_query_does_not_carry_the_picker(cx: &mut TestAppContext) {
+        let cx = draw_a_picker(cx);
+
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip that carries the picker is painted");
+        let in_the_query = point(strip.center().x, strip.bottom() + px(14.));
+        carry(
+            cx,
+            in_the_query,
+            point(in_the_query.x - px(120.), in_the_query.y),
+        );
+
+        let after = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip is still painted");
+        assert!(
+            (after.left() - strip.left()).abs() <= px(1.),
+            "a drag across the query row carried the picker from {:?} to {:?}",
+            strip.origin,
+            after.origin
+        );
     }
 
     #[gpui::test]

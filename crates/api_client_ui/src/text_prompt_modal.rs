@@ -142,7 +142,7 @@ impl Focusable for TextPromptModal {
 }
 
 impl Render for TextPromptModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A multi-line editor reports no height of its own, so the definite
         // height goes on the element that holds it rather than on the box
         // around it -- a `min_h` alone leaves a sliver of an editor at the top
@@ -156,7 +156,7 @@ impl Render for TextPromptModal {
             false => self.editor.clone().into_any_element(),
         };
 
-        cyberpunk::dialog_shell(cx)
+        cyberpunk::dialog_shell(self.title.clone(), window, cx)
             // Narrower than a form. The shared width is for a window with two
             // columns of fields; this one asks for a single name, and stretching
             // it to a form's width leaves the field marooned in the middle.

@@ -538,7 +538,7 @@ impl Render for CommitModal {
             false
         };
 
-        cyberpunk::dialog_shell(cx)
+        cyberpunk::dialog_shell("Commit", window, cx)
             .id("commit-modal")
             .key_context("GitCommit")
             .on_action(cx.listener(Self::dismiss))
