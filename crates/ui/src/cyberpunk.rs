@@ -291,45 +291,166 @@ pub fn dialog_shell(name: impl Into<crate::SharedString>, window: &Window, cx: &
                 if event.click_count >= 2 {
                     forget_placement(&this, cx);
                 } else {
-                    start_drag(this, Grip::Move, event.position, was, cx);
+                    start_drag(
+                        this,
+                        Pinned::InTheMiddle,
+                        Grip::Move,
+                        event.position,
+                        was,
+                        cx,
+                    );
                 }
                 window.refresh();
             }
         })
         .child(dialog_drag_watcher(name.clone()))
-        .children(dialog_grips(&name))
+        .children(dialog_grips(&name, Pinned::InTheMiddle))
         .debug_selector(|| "DIALOG-SHELL".to_string())
 }
 
-/// Lets a floating surface that decides its own size -- a picker does, and
-/// persists it -- be carried somewhere else all the same.
+/// How a floating surface takes part in being carried and resized.
 ///
-/// The picker's own resizing is not replaced by this: it keeps its edges and
-/// its saved size, and gains only the one thing it had no way to do. What it
-/// gains it from is a strip along its top edge rather than the whole top band a
-/// dialog is picked up by, because the top of a picker is its query field, and
-/// an editor's own mouse handling does not stop the press from reaching an
-/// ancestor -- a band there would carry the window off every time the reader
-/// dragged across the query to select it.
+/// A container rather than four arguments, because every call site sets a
+/// different two of them and a four-argument call says nothing about which.
+#[derive(Debug, Clone)]
+pub struct Floating {
+    name: crate::SharedString,
+    pinned: Pinned,
+    top_at: Pixels,
+    own: gpui::Point<Pixels>,
+    edges_resize_it: bool,
+}
+
+/// Which side of the workspace holds the surface in place, and how far in.
 ///
-/// `already_offset_by` is whatever the caller already displaces the surface by
-/// on its own (a picker recentres itself as it is resized), added to rather
-/// than overwritten -- two `left` calls on one element mean the second wins and
-/// the first silently does nothing.
-pub fn carriable(
-    name: impl Into<crate::SharedString>,
-    already_offset_by: gpui::Point<Pixels>,
-    surface: gpui::Div,
-    window: &Window,
-    cx: &App,
-) -> gpui::Div {
-    let name = name.into();
-    let carried = carried_by(&name, window, cx);
+/// It decides two things at once: which inset the offset is applied to, and
+/// where the edge that was *not* grabbed ends up. A centred window that grows
+/// by ten pixels has each of its edges move out by five on its own; a surface
+/// pinned by one edge keeps that edge exactly where it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pinned {
+    /// Centred, the way the modal layer places a dialog or a picker.
+    InTheMiddle,
+    /// Its left edge held this far from the left of what contains it.
+    ByItsLeft(Pixels),
+    /// Its right edge held this far from the right.
+    ByItsRight(Pixels),
+}
+
+impl Pinned {
+    /// How much of what the surface grew is given back to the offset when the
+    /// right edge is dragged. The left edge takes the remainder, so one number
+    /// says both.
+    fn given_back(self) -> f32 {
+        match self {
+            Pinned::InTheMiddle => 0.5,
+            Pinned::ByItsLeft(_) => 0.,
+            Pinned::ByItsRight(_) => 1.,
+        }
+    }
+}
+
+impl Floating {
+    /// A surface pinned by its left edge at the very left, whose own edges
+    /// resize it.
+    ///
+    /// `name` is what its size and place are remembered under, so it has to be
+    /// the same string every time this surface is opened -- not a heading that
+    /// names the row or column it happens to be about.
+    pub fn named(name: impl Into<crate::SharedString>) -> Self {
+        Self {
+            name: name.into(),
+            pinned: Pinned::ByItsLeft(px(0.)),
+            top_at: px(0.),
+            own: gpui::Point::default(),
+            edges_resize_it: true,
+        }
+    }
+
+    /// Which side already holds the surface, and how far in. Passed rather than
+    /// overwritten, because two `left` calls on one element mean the second
+    /// wins and the first silently does nothing -- and a surface pinned by its
+    /// right edge that is given a `left` jumps across the pane.
+    pub fn pinned(mut self, pinned: Pinned) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
+    /// How far down its container the surface already starts.
+    pub fn top_at(mut self, top_at: Pixels) -> Self {
+        self.top_at = top_at;
+        self
+    }
+
+    /// A displacement the caller works out for itself and still wants -- a
+    /// picker recentres itself as it is resized. Added to what the reader
+    /// carried the surface by rather than replaced by it.
+    pub fn carried_from(mut self, own: gpui::Point<Pixels>) -> Self {
+        self.own = own;
+        self
+    }
+
+    /// For a surface that decides its own size and keeps its own edges -- a
+    /// picker resizes itself and persists the result. It takes the carrying and
+    /// nothing else.
+    pub fn keeping_its_own_size(mut self) -> Self {
+        self.edges_resize_it = false;
+        self
+    }
+}
+
+/// Lets a floating surface -- a popup, a menu, a picker -- be carried somewhere
+/// else, and unless it keeps its own size, resized by its edges.
+///
+/// What it is carried by is a strip along its top edge rather than the whole
+/// top band a dialog is picked up by, because a floating surface has no naming
+/// row to spare: the top of a picker is its query field, and an editor's own
+/// mouse handling does not stop a press from reaching an ancestor -- a band
+/// there would carry the surface off every time the reader dragged across the
+/// query to select it.
+///
+/// Call it last, around the finished surface: the size the reader chose has to
+/// be set after whatever size the caller sets, or the caller's own size wins on
+/// every frame and the drag appears to do nothing.
+pub fn floating<E>(how: Floating, surface: E, window: &Window, cx: &App) -> E
+where
+    E: Styled + ParentElement + InteractiveElement + gpui::IntoElement,
+{
+    let Floating {
+        name,
+        pinned,
+        top_at,
+        own,
+        edges_resize_it,
+    } = how;
+    let this = placed(&name, window);
+    let placement = placement_of(&this, cx);
+    let carried = placement.moved_by;
+    let viewport = window.viewport_size();
+    let size = placement.size.filter(|_| edges_resize_it).map(|size| {
+        gpui::size(
+            held(size.width, DIALOG_MIN_WIDTH, viewport.width),
+            held(size.height, DIALOG_MIN_HEIGHT, viewport.height),
+        )
+    });
+
     surface
-        .relative()
-        .left(already_offset_by.x + carried.x)
-        .top(already_offset_by.y + carried.y)
+        // Room for the strip that carries it, so the strip covers a margin of
+        // the surface's own rather than the first row of what is in it. Without
+        // it, a press meant for the search field at the top of a popup grabs
+        // the surface instead -- the strip is drawn last and answers first.
+        .pt(CARRY_STRIP)
+        .map(|surface| match pinned {
+            Pinned::InTheMiddle => surface.left(own.x + carried.x),
+            Pinned::ByItsLeft(inset) => surface.left(inset + own.x + carried.x),
+            Pinned::ByItsRight(inset) => surface.right(inset + own.x - carried.x),
+        })
+        .top(top_at + own.y + carried.y)
+        .when_some(size, |surface, size| surface.w(size.width).h(size.height))
         .child(dialog_drag_watcher(name.clone()))
+        .when(edges_resize_it, |surface| {
+            surface.children(dialog_grips(&name, pinned))
+        })
         .child(
             gpui::deferred(
                 gpui::div()
@@ -350,7 +471,7 @@ pub fn carriable(
                             if event.click_count >= 2 {
                                 forget_placement(&this, cx);
                             } else {
-                                start_drag(this, Grip::Move, event.position, was, cx);
+                                start_drag(this, pinned, Grip::Move, event.position, was, cx);
                             }
                             cx.stop_propagation();
                             window.refresh();
@@ -361,18 +482,7 @@ pub fn carriable(
         )
 }
 
-/// Where a surface has been carried to, as an offset from where its own layout
-/// would put it.
-pub fn carried_by(name: &crate::SharedString, window: &Window, cx: &App) -> gpui::Point<Pixels> {
-    placement_of(&placed(name, window), cx).moved_by
-}
-
-/// How tall the strip along the top edge that carries a picker is. Thin, since
-/// it sits over the surface's own top padding, but no thinner than the edges
-/// the same surface is already resized by.
-const CARRY_STRIP: Pixels = px(10.);
-
-/// The width a dialog opens at: most of the editor's width rather than a fixed
+/// The width a dialog opens at:/// The width a dialog opens at: most of the editor's width rather than a fixed
 /// box, because the fixed box was 760px whether the editor was 1280px wide or
 /// 3840px, and a form with two columns in it had to scroll in both directions
 /// while three quarters of the screen stood empty.
@@ -421,6 +531,11 @@ const KEPT_ON_SCREEN: Pixels = px(120.);
 /// of picking the window up. A little more than the row is tall, since the row
 /// above a divider is what the reader is aiming at.
 const HEADER_BAND: Pixels = px(40.);
+
+/// How tall the strip along the top edge that carries a floating surface is.
+/// Thin, since it sits over the surface's own top padding, but no thinner than
+/// the edges the same surface is resized by.
+const CARRY_STRIP: Pixels = px(10.);
 
 /// How wide the strip along each edge is that resizes the window, and how far
 /// into the window a corner reaches.
@@ -504,6 +619,7 @@ fn placed(name: &crate::SharedString, window: &Window) -> Placed {
 /// does not drift.
 struct Dragged {
     of: Placed,
+    pinned: Pinned,
     grip: Grip,
     from_pointer: gpui::Point<Pixels>,
     from: Placement,
@@ -557,6 +673,7 @@ fn forget_placement(of: &Placed, cx: &mut App) {
 
 fn start_drag(
     of: Placed,
+    pinned: Pinned,
     grip: Grip,
     from_pointer: gpui::Point<Pixels>,
     was: gpui::Bounds<Pixels>,
@@ -565,6 +682,7 @@ fn start_drag(
     let from = placement_of(&of, cx);
     cx.default_global::<Dialogs>().dragged = Some(Dragged {
         of,
+        pinned,
         grip,
         from_pointer,
         from,
@@ -581,12 +699,13 @@ fn drag_to(
     viewport: gpui::Size<Pixels>,
     cx: &mut App,
 ) -> bool {
-    let Some((grip, from, was, from_pointer)) = cx
+    let Some((pinned, grip, from, was, from_pointer)) = cx
         .try_global::<Dialogs>()
         .and_then(|dialogs| dialogs.dragged.as_ref())
         .filter(|dragged| &dragged.of == of)
         .map(|dragged| {
             (
+                dragged.pinned,
                 dragged.grip,
                 dragged.from,
                 dragged.was,
@@ -602,19 +721,39 @@ fn drag_to(
     let mut width = was.size.width;
     let mut height = was.size.height;
 
-    // The modal layer centres a window across the workspace, so a window that
-    // grows by ten pixels has each of its edges move out by five on its own.
-    // Holding the edge that was *not* grabbed still therefore means moving the
-    // window by half of what it grew -- which is also why dragging one edge
-    // does not appear to move the other.
+    // Holding the edge that was not grabbed is what the pinning decides.
+    let given_back = pinned.given_back();
+
+    // How large the surface may grow before the edge being dragged leaves the
+    // screen. The edge that is *not* being dragged stays where it was painted,
+    // so it is that edge the room is measured from -- and measuring it from the
+    // start of the drag is what makes it hold: `was` is the one set of bounds in
+    // this function that the drag is not changing.
+    let room_across = if grip.moves_right() && !grip.moves_left() {
+        viewport.width - was.left().max(px(0.))
+    } else if grip.moves_left() && !grip.moves_right() {
+        was.right().min(viewport.width)
+    } else {
+        viewport.width
+    };
+    let room_down = if grip.moves_bottom() && !grip.moves_top() {
+        viewport.height - was.top().max(px(0.))
+    } else if grip.moves_top() && !grip.moves_bottom() {
+        was.bottom().min(viewport.height)
+    } else {
+        viewport.height
+    };
     if grip.moves_left() && grip.moves_right() {
         offset.x += moved.x;
     } else if grip.moves_right() {
-        width = held(was.size.width + moved.x, DIALOG_MIN_WIDTH, viewport.width);
-        offset.x += (width - was.size.width) / 2.;
+        width = held(was.size.width + moved.x, DIALOG_MIN_WIDTH, room_across);
+        offset.x += (width - was.size.width) * given_back;
     } else if grip.moves_left() {
-        width = held(was.size.width - moved.x, DIALOG_MIN_WIDTH, viewport.width);
-        offset.x -= (width - was.size.width) / 2.;
+        width = held(was.size.width - moved.x, DIALOG_MIN_WIDTH, room_across);
+        // The left edge is the one being dragged, so it moves by the whole of
+        // what the surface grew when nothing recentres it, and by half when the
+        // layout moves the other edge out as well.
+        offset.x -= (width - was.size.width) * (1. - given_back);
     }
 
     // Vertically the layer does not centre -- it drops the window a fixed way
@@ -623,37 +762,32 @@ fn drag_to(
     if grip.moves_top() && grip.moves_bottom() {
         offset.y += moved.y;
     } else if grip.moves_bottom() {
-        height = held(
-            was.size.height + moved.y,
-            DIALOG_MIN_HEIGHT,
-            viewport.height,
-        );
+        height = held(was.size.height + moved.y, DIALOG_MIN_HEIGHT, room_down);
     } else if grip.moves_top() {
-        height = held(
-            was.size.height - moved.y,
-            DIALOG_MIN_HEIGHT,
-            viewport.height,
-        );
+        height = held(was.size.height - moved.y, DIALOG_MIN_HEIGHT, room_down);
         offset.y += was.size.height - height;
     }
 
-    // Where the layout puts this window with no offset at all, worked back from
-    // where it was painted. Needed to keep a window that is being carried from
-    // being carried off the screen, where it could not be reached to be carried
-    // back.
-    let natural = was.origin - from.moved_by;
-    let left = held(
-        natural.x + offset.x,
-        KEPT_ON_SCREEN - width,
-        viewport.width - KEPT_ON_SCREEN,
-    );
-    let top = held(
-        natural.y + offset.y,
-        px(0.),
-        viewport.height - KEPT_ON_SCREEN,
-    );
-    offset.x = left - natural.x;
-    offset.y = top - natural.y;
+    // Carrying is held to the screen, so a surface cannot be carried where it
+    // could not be reached to be carried back. Resizing is not: what a resize
+    // is held to is the size floor and the viewport, and working back the
+    // untouched place from painted bounds does not hold while the size those
+    // bounds were painted at is the thing changing.
+    if grip == Grip::Move {
+        let natural = was.origin - from.moved_by;
+        let left = held(
+            natural.x + offset.x,
+            KEPT_ON_SCREEN - width,
+            viewport.width - KEPT_ON_SCREEN,
+        );
+        let top = held(
+            natural.y + offset.y,
+            px(0.),
+            viewport.height - KEPT_ON_SCREEN,
+        );
+        offset.x = left - natural.x;
+        offset.y = top - natural.y;
+    }
 
     let placement = Placement {
         moved_by: offset,
@@ -742,7 +876,7 @@ fn dialog_drag_watcher(name: crate::SharedString) -> impl gpui::IntoElement {
 /// inside the surface rather than straddling its edge, so that a press on one
 /// is a press on the window: the modal layer reads a press outside the window
 /// as "the reader is done with this" and closes it.
-fn dialog_grips(name: &crate::SharedString) -> Vec<gpui::AnyElement> {
+fn dialog_grips(name: &crate::SharedString, pinned: Pinned) -> Vec<gpui::AnyElement> {
     let edges: [(Grip, fn(gpui::Div) -> gpui::Div); 8] = [
         (Grip::Top, |grip| {
             grip.top_0().left_0().right_0().h(GRIP).cursor_row_resize()
@@ -792,7 +926,7 @@ fn dialog_grips(name: &crate::SharedString) -> Vec<gpui::AnyElement> {
                             let Some(was) = painted_bounds(&this, cx) else {
                                 return;
                             };
-                            start_drag(this, grip, event.position, was, cx);
+                            start_drag(this, pinned, grip, event.position, was, cx);
                             cx.stop_propagation();
                             window.refresh();
                         }
@@ -1412,6 +1546,52 @@ mod tests {
         );
     }
 
+    struct FloatingHost;
+
+    impl Render for FloatingHost {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let surface = gpui::div()
+                .id("floating-surface")
+                .debug_selector(|| "FLOATING-SURFACE".to_string())
+                .absolute()
+                .w(gpui::px(300.0))
+                .child(
+                    gpui::div()
+                        .debug_selector(|| "FLOATING-FIRST-ROW".to_string())
+                        .w_full()
+                        .h(gpui::px(24.0))
+                        .child("a field at the very top"),
+                );
+            gpui::div().absolute().size_full().child(floating(
+                Floating::named("Test Popup").top_at(gpui::px(40.)),
+                surface,
+                window,
+                cx,
+            ))
+        }
+    }
+
+    fn draw_a_floating_surface(cx: &mut gpui::TestAppContext) -> &mut gpui::VisualTestContext {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| FloatingHost);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx
+    }
+
     fn redraw(cx: &mut gpui::VisualTestContext) {
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -1725,6 +1905,74 @@ mod tests {
              the {:?} it opened at",
             untouched.origin,
             before.origin
+        );
+    }
+
+    // A resize is held to the screen the same way carrying is, and the case
+    // that shows it is a surface already carried down the pane: the edge being
+    // dragged is the one that can leave the screen, and the room it has is
+    // measured from the edge that is staying put -- not from the whole editor,
+    // which is what a surface still at the top of the pane cannot tell apart.
+    #[gpui::test]
+    async fn a_resize_cannot_push_a_carried_surface_past_the_last_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_floating_surface(cx);
+
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip is painted");
+        let grab = strip.center();
+        drag(cx, grab, gpui::point(grab.x, grab.y + gpui::px(360.)));
+
+        let carried = cx
+            .debug_bounds("FLOATING-SURFACE")
+            .expect("the surface is painted");
+        assert!(
+            carried.top() > gpui::px(300.),
+            "the surface was not carried down first, so this test proves nothing: it is at {:?}",
+            carried.origin
+        );
+
+        let edge = gpui::point(carried.center().x, carried.bottom() - gpui::px(2.));
+        drag(cx, edge, gpui::point(edge.x, edge.y + viewport.height * 2.));
+
+        let after = cx
+            .debug_bounds("FLOATING-SURFACE")
+            .expect("the surface is still painted");
+        assert!(
+            after.bottom() <= viewport.height + gpui::px(2.),
+            "dragged far past the last row, a surface whose top is at {:?} ends at {:?} in an \
+             editor {:?} tall",
+            carried.top(),
+            after.bottom(),
+            viewport.height
+        );
+    }
+
+    // The strip that carries a floating surface covers a margin of the
+    // surface's own, not the first row of what is in it: a press meant for the
+    // field at the top of a popup must reach the field.
+    #[gpui::test]
+    async fn the_carry_strip_does_not_cover_the_first_row_of_content(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = draw_a_floating_surface(cx);
+
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip is painted");
+        let first = cx
+            .debug_bounds("FLOATING-FIRST-ROW")
+            .expect("the first row of content is painted");
+
+        assert!(
+            first.top() >= strip.bottom() - gpui::px(0.5),
+            "the strip covers {:?}..{:?} and the first row starts at {:?}, under it",
+            strip.top(),
+            strip.bottom(),
+            first.top()
         );
     }
 

@@ -2876,7 +2876,7 @@ impl ResultView {
         self.special_built_for = Some(self.result_generation);
     }
 
-    fn render_special_view(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_special_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let special = self.active_special();
         let (title, body) = match special {
             SpecialResult::Ddl => {
@@ -2908,7 +2908,7 @@ impl ResultView {
                 });
                 ("Query plan", body)
             }
-            SpecialResult::None => return self.render_result(cx),
+            SpecialResult::None => return self.render_result(window, cx),
         };
         let body = body.unwrap_or_else(|| div().flex_1().into_any_element());
 
@@ -6045,7 +6045,11 @@ impl ResultView {
         )
     }
 
-    fn render_query_history_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_query_history_popup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.history_open || self.query_history.is_empty() {
             return None;
         }
@@ -6104,26 +6108,32 @@ impl ResultView {
                 .child(div().flex_1().child(editor))
         });
 
+        let popup = popup_surface(cx)
+            .id("query-history-popup")
+            .debug_selector(|| "QUERY_HISTORY_POPUP".to_string())
+            .absolute()
+            .flex()
+            .flex_col()
+            .min_w(px(360.0))
+            .max_h(px(360.0))
+            .when_some(search_box, |el, box_| el.child(box_))
+            .child(
+                div()
+                    .id("query-history-list")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(items),
+            );
         Some(
-            popup_surface(cx)
-                .id("query-history-popup")
-                .debug_selector(|| "QUERY_HISTORY_POPUP".to_string())
-                .absolute()
-                .top_8()
-                .left_0()
-                .flex()
-                .flex_col()
-                .min_w(px(360.0))
-                .max_h(px(360.0))
-                .when_some(search_box, |el, box_| el.child(box_))
-                .child(
-                    div()
-                        .id("query-history-list")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .children(items),
-                )
-                .into_any_element(),
+            cyberpunk::floating(
+                cyberpunk::Floating::named("Query History")
+                    .pinned(cyberpunk::Pinned::ByItsLeft(px(0.)))
+                    .top_at(rems(2.).to_pixels(window.rem_size())),
+                popup,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -7209,7 +7219,7 @@ impl ResultView {
         row_el.into_any_element()
     }
 
-    fn render_result(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_result(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(result) = self.result.as_ref() else {
             return div().into_any_element();
         };
@@ -8471,9 +8481,9 @@ impl ResultView {
                         el.child(overlay)
                     })
                     .when_some(self.render_enum_popup(cx), |el, popup| el.child(popup))
-                    .when_some(self.render_date_popup(cx), |el, popup| el.child(popup))
-                    .when_some(self.render_column_list_popup(cx), |el, popup| el.child(popup))
-                    .when_some(self.render_query_history_popup(cx), |el, popup| el.child(popup))
+                    .when_some(self.render_date_popup(window, cx), |el, popup| el.child(popup))
+                    .when_some(self.render_column_list_popup(window, cx), |el, popup| el.child(popup))
+                    .when_some(self.render_query_history_popup(window, cx), |el, popup| el.child(popup))
                     .into_any_element()
             })
             .into_any_element()
@@ -9726,7 +9736,11 @@ impl ResultView {
 
     // Renders the pending-changes preview: the SQL that Submit (or Commit) would
     // run, shown read-only so the user can review before writing.
-    fn render_pending_preview_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_pending_preview_popup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.preview_open {
             return None;
         }
@@ -9749,63 +9763,69 @@ impl ResultView {
             })
             .collect();
 
+        let popup = popup_surface(cx)
+            .id("pending-preview-popup")
+            .absolute()
+            .w(px(520.0))
+            .max_h(px(400.0))
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .justify_between()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new("Pending changes")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("preview-submit", "Submit")
+                                    .style(cyberpunk::Rank::Accent.style())
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text("Write pending changes to the database"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.preview_open = false;
+                                        this.submit_pending_edits(window, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("preview-close", IconName::Close)
+                                    .style(cyberpunk::Rank::Neutral.style())
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Close"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.preview_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("pending-preview-scroll")
+                    .p_2()
+                    .max_h(px(340.0))
+                    .overflow_y_scroll()
+                    .child(v_flex().children(lines)),
+            );
         Some(
-            popup_surface(cx)
-                .id("pending-preview-popup")
-                .absolute()
-                .top_8()
-                .right_2()
-                .w(px(520.0))
-                .max_h(px(400.0))
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .justify_between()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            Label::new("Pending changes")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new("preview-submit", "Submit")
-                                        .style(cyberpunk::Rank::Accent.style())
-                                        .label_size(LabelSize::Small)
-                                        .tooltip(Tooltip::text(
-                                            "Write pending changes to the database",
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.preview_open = false;
-                                            this.submit_pending_edits(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("preview-close", IconName::Close)
-                                        .style(cyberpunk::Rank::Neutral.style())
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(Tooltip::text("Close"))
-                                        .on_click(cx.listener(|this, _, _window, cx| {
-                                            this.preview_open = false;
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("pending-preview-scroll")
-                        .p_2()
-                        .max_h(px(340.0))
-                        .overflow_y_scroll()
-                        .child(v_flex().children(lines)),
-                )
-                .into_any_element(),
+            cyberpunk::floating(
+                cyberpunk::Floating::named("Value Preview")
+                    .pinned(cyberpunk::Pinned::ByItsRight(
+                        rems(0.5).to_pixels(window.rem_size()),
+                    ))
+                    .top_at(rems(2.).to_pixels(window.rem_size())),
+                popup,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -9922,7 +9942,11 @@ impl ResultView {
         cx.notify();
     }
 
-    fn render_column_list_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_column_list_popup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.column_list_visible {
             return None;
         }
@@ -9950,21 +9974,31 @@ impl ResultView {
             );
         }
 
+        let popup = popup_surface(cx)
+            .id("column-list-popup")
+            .absolute()
+            .min_w(px(160.0))
+            .max_h(px(400.0))
+            .overflow_y_scroll()
+            .children(items);
         Some(
-            popup_surface(cx)
-                .id("column-list-popup")
-                .absolute()
-                .top_8()
-                .right_0()
-                .min_w(px(160.0))
-                .max_h(px(400.0))
-                .overflow_y_scroll()
-                .children(items)
-                .into_any_element(),
+            cyberpunk::floating(
+                cyberpunk::Floating::named("Columns")
+                    .pinned(cyberpunk::Pinned::ByItsRight(px(0.)))
+                    .top_at(rems(2.).to_pixels(window.rem_size())),
+                popup,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
-    fn render_export_dialog_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_export_dialog_popup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.export_dialog_open {
             return None;
         }
@@ -10001,96 +10035,106 @@ impl ResultView {
         let headers_on = self.export_headers;
         let transpose_on = self.export_transpose;
 
+        let popup = popup_surface(cx)
+            .id("export-dialog-popup")
+            .debug_selector(|| "EXPORT_DIALOG_POPUP".to_string())
+            .absolute()
+            .w(px(320.0))
+            .p_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .mb_2()
+                    .child(Label::new("Export Data").size(LabelSize::Default))
+                    .child(
+                        IconButton::new("export-dialog-close", IconName::Close)
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_dialog_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Label::new("Format")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(h_flex().flex_wrap().gap_1().mb_2().children(format_chips))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .mb_2()
+                    .child(
+                        Checkbox::new("export-opt-ddl", add_ddl.into())
+                            .label("Add DDL (CREATE TABLE)")
+                            .disabled(!has_table)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_add_ddl = !this.export_add_ddl;
+                                if this.export_add_ddl {
+                                    this.fetch_export_ddl(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("export-opt-headers", headers_on.into())
+                            .label("Column headers")
+                            .disabled(!headers_enabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_headers = !this.export_headers;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("export-opt-transpose", transpose_on.into())
+                            .label("Transpose")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_transpose = !this.export_transpose;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("export-clipboard", "Copy to Clipboard")
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_to_clipboard(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("export-file", "Save to File…")
+                            .style(cyberpunk::Rank::Neutral.style())
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_to_file(cx);
+                            })),
+                    ),
+            );
         Some(
-            popup_surface(cx)
-                .id("export-dialog-popup")
-                .debug_selector(|| "EXPORT_DIALOG_POPUP".to_string())
-                .absolute()
-                .top_8()
-                .right_0()
-                .w(px(320.0))
-                .p_3()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .items_center()
-                        .mb_2()
-                        .child(Label::new("Export Data").size(LabelSize::Default))
-                        .child(
-                            IconButton::new("export-dialog-close", IconName::Close)
-                                .style(cyberpunk::Rank::Neutral.style())
-                                .icon_size(IconSize::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_dialog_open = false;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    Label::new("Format")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(h_flex().flex_wrap().gap_1().mb_2().children(format_chips))
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .mb_2()
-                        .child(
-                            Checkbox::new("export-opt-ddl", add_ddl.into())
-                                .label("Add DDL (CREATE TABLE)")
-                                .disabled(!has_table)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_add_ddl = !this.export_add_ddl;
-                                    if this.export_add_ddl {
-                                        this.fetch_export_ddl(cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Checkbox::new("export-opt-headers", headers_on.into())
-                                .label("Column headers")
-                                .disabled(!headers_enabled)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_headers = !this.export_headers;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Checkbox::new("export-opt-transpose", transpose_on.into())
-                                .label("Transpose")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_transpose = !this.export_transpose;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("export-clipboard", "Copy to Clipboard")
-                                .style(cyberpunk::Rank::Neutral.style())
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_to_clipboard(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("export-file", "Save to File…")
-                                .style(cyberpunk::Rank::Neutral.style())
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_to_file(cx);
-                                })),
-                        ),
-                )
-                .into_any_element(),
+            cyberpunk::floating(
+                cyberpunk::Floating::named("Export")
+                    .pinned(cyberpunk::Pinned::ByItsRight(px(0.)))
+                    .top_at(rems(2.).to_pixels(window.rem_size())),
+                popup,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
-    fn render_chart_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_chart_popup(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.chart_open {
             return None;
         }
@@ -10165,21 +10209,31 @@ impl ResultView {
                 .into_any_element()
         };
 
+        let popup = popup_surface(cx)
+            .id("chart-popup")
+            .debug_selector(|| "CHART_POPUP".to_string())
+            .absolute()
+            // Stretched across the pane and down to the last row until the
+            // reader gives it a size of its own, which is how the chart was
+            // always drawn. A size from a drag is set after these, and an
+            // explicit width and height are what win over the far insets.
+            .right_0()
+            .bottom_8()
+            .p_3()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body);
         Some(
-            popup_surface(cx)
-                .id("chart-popup")
-                .debug_selector(|| "CHART_POPUP".to_string())
-                .absolute()
-                .top_8()
-                .left_0()
-                .right_0()
-                .bottom_8()
-                .p_3()
-                .flex()
-                .flex_col()
-                .child(header)
-                .child(body)
-                .into_any_element(),
+            cyberpunk::floating(
+                cyberpunk::Floating::named("Chart")
+                    .pinned(cyberpunk::Pinned::ByItsLeft(px(0.)))
+                    .top_at(rems(2.).to_pixels(window.rem_size())),
+                popup,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -10522,7 +10576,7 @@ impl ResultView {
     // same absolute-positioning technique as `render_enum_popup` (anchored to the
     // edited cell's column/row via `column_edges` and the current scroll offset)
     // so both popups sit consistently next to the cell they edit.
-    fn render_date_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_date_popup(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let popup = self.date_popup.as_ref()?;
         let (_, _, _, scroll_y) = axis_metrics(&self.scroll_handle, true);
 
@@ -10652,18 +10706,19 @@ impl ResultView {
                 .left(gpui::px(screen_x))
                 .top(gpui::px(screen_y))
                 .child(backdrop)
-                .child(
+                .child(cyberpunk::floating(
+                    cyberpunk::Floating::named("Date"),
                     popup_surface(cx)
                         .id("date-popup")
                         .debug_selector(|| "DATE_POPUP".to_string())
                         .absolute()
-                        .left(gpui::px(0.0))
-                        .top(gpui::px(0.0))
                         .p_2()
                         .child(header)
                         .child(weekday_row)
                         .children(week_rows),
-                )
+                    window,
+                    cx,
+                ))
                 .into_any_element(),
         )
     }
@@ -11186,14 +11241,14 @@ impl Render for ResultView {
             self.render_statement_outcome(cx)
         } else if self.result.is_some() {
             if self.active_special() != SpecialResult::None {
-                self.render_special_view(cx).into_any_element()
+                self.render_special_view(window, cx).into_any_element()
             } else if self.active_mongo_view() == Some(MongoResultView::Documents) {
                 self.render_mongo_documents_view(cx).into_any_element()
             } else {
                 // Borrow the result (do NOT clone it): cloning the whole result
                 // set on every scroll frame is a large per-frame cost on big
                 // results.
-                self.render_result(cx).into_any_element()
+                self.render_result(window, cx).into_any_element()
             }
         } else {
             self.render_empty_state().into_any_element()
@@ -11498,15 +11553,18 @@ impl Render for ResultView {
                 el.child(panel)
             })
             .when_some(self.render_quick_doc_panel(cx), |el, panel| el.child(panel))
-            .when_some(self.render_pending_preview_popup(cx), |el, popup| {
-                el.child(popup)
-            })
+            .when_some(
+                self.render_pending_preview_popup(window, cx),
+                |el, popup| el.child(popup),
+            )
             .when_some(self.render_goto_row_bar(cx), |el, bar| el.child(bar))
             .when_some(self.render_find_bar(cx), |el, bar| el.child(bar))
-            .when_some(self.render_export_dialog_popup(cx), |el, popup| {
+            .when_some(self.render_export_dialog_popup(window, cx), |el, popup| {
                 el.child(popup)
             })
-            .when_some(self.render_chart_popup(cx), |el, popup| el.child(popup))
+            .when_some(self.render_chart_popup(window, cx), |el, popup| {
+                el.child(popup)
+            })
             .when_some(self.render_status_bar(cx), |el, bar| el.child(bar))
     }
 }
@@ -13119,6 +13177,27 @@ mod tests {
                 "{ \"_id\": 1, \"extra\": \"yes\" }".to_string(),
                 "{ \"_id\": 2 }".to_string(),
             ]),
+        }
+    }
+
+    /// A result the chart can actually draw: one label column and one numeric
+    /// column, since the chart popup says "no numeric column to chart" without
+    /// one and the popup under test would be an empty box.
+    fn chartable_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["name".to_string(), "amount".to_string()],
+            rows: (0..6)
+                .map(|row| {
+                    vec![
+                        Some(format!("row_{row}")),
+                        Some(((row + 1) * 10).to_string()),
+                    ]
+                })
+                .collect(),
+            rows_affected: 0,
+            execution_time_ms: 0,
+            timing: None,
+            raw_documents: None,
         }
     }
 
@@ -15922,6 +16001,96 @@ mod tests {
             );
             assert!(view.scroll_drag.is_none());
         });
+    }
+
+    // A popup the reader looks at for a while -- the chart is the clearest of
+    // them -- is a window: it can be carried out of the way of the rows behind
+    // it, and its edges resize it. Both from the shared shape, so the six
+    // popups in this view answer the same way.
+    #[gpui::test]
+    fn visual_chart_popup_is_carried_by_its_top_strip(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, chartable_result());
+        view.update(&mut cx, |view, cx| view.toggle_chart(cx));
+        draw_result_view_frame(window, &mut cx);
+
+        let before = cx
+            .debug_bounds("CHART_POPUP")
+            .expect("the chart popup is painted");
+        // Stretched across the pane until the reader gives it a size: the far
+        // insets are what do that, and they are easy to lose when the near ones
+        // move into the shared shape. The threshold is measured rather than
+        // guessed -- the pane in this frame is 700px, and the same popup with
+        // its far insets dropped comes to 178px, the width of its own contents.
+        assert!(
+            before.size.width >= px(500.),
+            "the chart opened {:?} wide, which is its contents' width rather than the pane's",
+            before.size.width
+        );
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip that carries it is painted");
+        let grab = strip.center();
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_mouse_move(
+            gpui::point(grab.x + px(60.), grab.y + px(40.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_mouse_up(
+            gpui::point(grab.x + px(60.), grab.y + px(40.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        draw_result_view_frame(window, &mut cx);
+
+        let after = cx
+            .debug_bounds("CHART_POPUP")
+            .expect("the chart popup is still painted");
+        assert!(
+            (after.left() - (before.left() + px(60.))).abs() <= px(1.)
+                && (after.top() - (before.top() + px(40.))).abs() <= px(1.),
+            "the chart popup was carried 60px right and 40px down from {:?} and arrived at {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    #[gpui::test]
+    fn visual_chart_popup_is_resized_by_its_bottom_edge(cx: &mut gpui::TestAppContext) {
+        let (window, view, mut cx) = framed_plain_result_window(cx, chartable_result());
+        view.update(&mut cx, |view, cx| view.toggle_chart(cx));
+        draw_result_view_frame(window, &mut cx);
+
+        let before = cx
+            .debug_bounds("CHART_POPUP")
+            .expect("the chart popup is painted");
+        let grab = gpui::point(before.center().x, before.bottom() - px(2.));
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_mouse_move(
+            gpui::point(grab.x, grab.y - px(80.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        draw_result_view_frame(window, &mut cx);
+        cx.simulate_mouse_up(
+            gpui::point(grab.x, grab.y - px(80.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        draw_result_view_frame(window, &mut cx);
+
+        let after = cx
+            .debug_bounds("CHART_POPUP")
+            .expect("the chart popup is still painted");
+        assert!(
+            (after.size.height - (before.size.height - px(80.))).abs() <= px(2.),
+            "dragging the bottom edge 80px up took the height from {:?} to {:?}",
+            before.size.height,
+            after.size.height
+        );
     }
 
     #[gpui::test]

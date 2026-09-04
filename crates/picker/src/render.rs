@@ -99,9 +99,14 @@ impl<D: PickerDelegate> Render for Picker<D> {
         // recentres itself by while being resized is handed over rather than
         // set here, since two `left` calls on one element mean the first is
         // silently dropped.
-        ui::cyberpunk::carriable(
-            Self::carried_as(),
-            gpui::point(self.shape.horizontal_offset(window), gpui::px(0.)),
+        ui::cyberpunk::floating(
+            ui::cyberpunk::Floating::named(Self::carried_as())
+                .pinned(ui::cyberpunk::Pinned::InTheMiddle)
+                .carried_from(gpui::point(
+                    self.shape.horizontal_offset(window),
+                    gpui::px(0.),
+                ))
+                .keeping_its_own_size(),
             picker,
             window,
             cx,
