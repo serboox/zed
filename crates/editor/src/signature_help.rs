@@ -371,6 +371,10 @@ pub struct SignatureHelpPopover {
     scroll_handle: ScrollHandle,
 }
 
+/// What this popover's place is remembered under.
+pub(crate) const SIGNATURE_HELP_CARRIED_AS: gpui::SharedString =
+    gpui::SharedString::new_static("Signature");
+
 impl SignatureHelpPopover {
     pub fn render(
         &mut self,
@@ -505,7 +509,8 @@ impl SignatureHelpPopover {
         } else {
             None
         };
-        div()
+        let surface = div()
+            .debug_selector(|| "SIGNATURE-POPOVER".to_string())
             .elevation_2(cx)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_move(|_, _, cx| cx.stop_propagation())
@@ -517,7 +522,19 @@ impl SignatureHelpPopover {
                     div().w_px().bg(cx.theme().colors().border_variant),
                 ])
             })
-            .child(main_content)
-            .into_any_element()
+            .child(main_content);
+        // Carried like every other window in this fork. Where it is carried *to*
+        // is applied by the editor when it places the popover, because a popover
+        // is laid out as a root element and the offsets a root asks for itself
+        // are dropped.
+        ui::cyberpunk::floating(
+            ui::cyberpunk::Floating::named(SIGNATURE_HELP_CARRIED_AS)
+                .keeping_its_own_size()
+                .placed_by_its_host(),
+            surface,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 }

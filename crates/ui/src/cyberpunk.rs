@@ -319,6 +319,7 @@ pub struct Floating {
     top_at: Pixels,
     own: gpui::Point<Pixels>,
     edges_resize_it: bool,
+    placed_by_its_host: bool,
 }
 
 /// Which side of the workspace holds the surface in place, and how far in.
@@ -364,6 +365,7 @@ impl Floating {
             top_at: px(0.),
             own: gpui::Point::default(),
             edges_resize_it: true,
+            placed_by_its_host: false,
         }
     }
 
@@ -387,6 +389,16 @@ impl Floating {
     /// carried the surface by rather than replaced by it.
     pub fn carried_from(mut self, own: gpui::Point<Pixels>) -> Self {
         self.own = own;
+        self
+    }
+
+    /// For a surface whose place its host applies rather than the surface
+    /// itself: the editor lays its popovers out as root elements, and the
+    /// offsets a root element asks for are dropped by whatever draws it. Such a
+    /// host reads [`carried_by`] and adds it to the origin it draws at, so this
+    /// says "add the strip and remember the place, but do not set the insets".
+    pub fn placed_by_its_host(mut self) -> Self {
+        self.placed_by_its_host = true;
         self
     }
 
@@ -422,6 +434,7 @@ where
         top_at,
         own,
         edges_resize_it,
+        placed_by_its_host,
     } = how;
     let this = placed(&name, window);
     let placement = placement_of(&this, cx);
@@ -435,51 +448,33 @@ where
     });
 
     surface
+        .when(!placed_by_its_host, |surface| {
+            surface
+                .map(|surface| match pinned {
+                    Pinned::InTheMiddle => surface.left(own.x + carried.x),
+                    Pinned::ByItsLeft(inset) => surface.left(inset + own.x + carried.x),
+                    Pinned::ByItsRight(inset) => surface.right(inset + own.x - carried.x),
+                })
+                .top(top_at + own.y + carried.y)
+                .when_some(size, |surface, size| surface.w(size.width).h(size.height))
+        })
         // Room for the strip that carries it, so the strip covers a margin of
         // the surface's own rather than the first row of what is in it. Without
         // it, a press meant for the search field at the top of a popup grabs
         // the surface instead -- the strip is drawn last and answers first.
-        .pt(CARRY_STRIP)
-        .map(|surface| match pinned {
-            Pinned::InTheMiddle => surface.left(own.x + carried.x),
-            Pinned::ByItsLeft(inset) => surface.left(inset + own.x + carried.x),
-            Pinned::ByItsRight(inset) => surface.right(inset + own.x - carried.x),
-        })
-        .top(top_at + own.y + carried.y)
-        .when_some(size, |surface, size| surface.w(size.width).h(size.height))
+        //
+        // Not for a surface its host places: the host measures such a surface
+        // as a root element, and padding added here is padding it measures --
+        // a one-line popover would come out `CARRY_STRIP` taller with its text
+        // pushed down, and the height it reports decides whether it is placed
+        // above or below the caret. The strip lies over the first row there
+        // instead, which is prose in both surfaces that are placed this way.
+        .when(!placed_by_its_host, |surface| surface.pt(CARRY_STRIP))
         .child(dialog_drag_watcher(name.clone()))
         .when(edges_resize_it, |surface| {
             surface.children(dialog_grips(&name, pinned))
         })
-        .child(
-            gpui::deferred(
-                gpui::div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(CARRY_STRIP)
-                    .occlude()
-                    .cursor_grab()
-                    .debug_selector(|| "CARRY-STRIP".to_string())
-                    .on_mouse_down(MouseButton::Left, {
-                        move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
-                            let this = placed(&name, window);
-                            let Some(was) = painted_bounds(&this, cx) else {
-                                return;
-                            };
-                            if event.click_count >= 2 {
-                                forget_placement(&this, cx);
-                            } else {
-                                start_drag(this, pinned, Grip::Move, event.position, was, cx);
-                            }
-                            cx.stop_propagation();
-                            window.refresh();
-                        }
-                    }),
-            )
-            .with_priority(1),
-        )
+        .child(gpui::deferred(carry_strip(name, pinned)).with_priority(1))
 }
 
 /// The width a dialog opens at:/// The width a dialog opens at: most of the editor's width rather than a fixed
@@ -645,6 +640,14 @@ fn held(value: Pixels, at_least: Pixels, at_most: Pixels) -> Pixels {
 }
 
 impl gpui::Global for Dialogs {}
+
+/// Where a surface has been carried to, as an offset from where its own layout
+/// would put it. Exposed so a test can tell a drag that never started from one
+/// that started and had its offset measured away by whatever places the
+/// surface.
+pub fn carried_by(name: &crate::SharedString, window: &Window, cx: &App) -> gpui::Point<Pixels> {
+    placement_of(&placed(name, window), cx).moved_by
+}
 
 /// Whether the reader has given this window a size of its own by dragging one
 /// of its edges.
@@ -866,6 +869,53 @@ fn dialog_drag_watcher(name: crate::SharedString) -> impl gpui::IntoElement {
     )
     .absolute()
     .size_full()
+}
+
+/// The strip along the top edge that carries a floating surface.
+///
+/// It records its own bounds rather than reading the ones the surface recorded,
+/// because two surfaces can share one name on purpose -- the hover stack is a
+/// diagnostic above a docs popover, carried together -- and the one that
+/// painted last would otherwise hand its bounds to the other one's drag. The
+/// strip spans the surface, so its own bounds answer everything a carry asks:
+/// where the surface starts and how wide it is.
+fn carry_strip(name: crate::SharedString, pinned: Pinned) -> impl gpui::IntoElement {
+    let mine: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>> = Default::default();
+    gpui::div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(CARRY_STRIP)
+        .occlude()
+        .cursor_grab()
+        .debug_selector(|| "CARRY-STRIP".to_string())
+        .child(
+            gpui::canvas(
+                {
+                    let mine = mine.clone();
+                    move |bounds, _window, _cx| mine.set(Some(bounds))
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .on_mouse_down(MouseButton::Left, {
+            move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                let this = placed(&name, window);
+                let Some(was) = mine.get() else {
+                    return;
+                };
+                if event.click_count >= 2 {
+                    forget_placement(&this, cx);
+                } else {
+                    start_drag(this, pinned, Grip::Move, event.position, was, cx);
+                }
+                cx.stop_propagation();
+                window.refresh();
+            }
+        })
 }
 
 /// The strips along the edges and the squares in the corners that resize the

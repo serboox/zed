@@ -19142,6 +19142,144 @@ async fn test_signature_help(cx: &mut TestAppContext) {
         .await;
 }
 
+// A one-line signature popover must not grow taller for carrying to be
+// possible. The strip lies over its first row rather than on a margin of its
+// own here, because the editor measures this popover as a root element and
+// height it reports is what decides whether it is placed above or below the
+// caret.
+#[gpui::test]
+async fn test_signature_help_popover_keeps_its_height(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            signature_help_provider: Some(lsp::SignatureHelpOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    cx.update_editor(|editor, window, cx| {
+        editor.show_signature_help(&ShowSignatureHelp, window, cx);
+    });
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![lsp::ParameterInformation {
+                label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                documentation: None,
+            }]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+    handle_signature_help_request(&mut cx, mocked_response).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let popover = cx
+        .debug_bounds("SIGNATURE-POPOVER")
+        .expect("the signature popover is painted");
+    let line_height = cx.update_editor(|_, window, _| window.line_height());
+    assert!(
+        popover.size.height <= line_height * 2.,
+        "a one-line signature popover is {:?} tall against a {:?} line, so something has \
+         padded it",
+        popover.size.height,
+        line_height
+    );
+}
+
+// The signature popover is a window like the rest of them: it can be carried
+// off the code it is covering. Where it is carried to is applied by the editor
+// when it places the popover -- a popover is laid out as a root element, and
+// the offsets a root element asks for itself are dropped by whatever draws it,
+// so a test is the only thing that tells the two apart.
+#[gpui::test]
+async fn test_signature_help_popover_is_carried_by_its_top_strip(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            signature_help_provider: Some(lsp::SignatureHelpOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    cx.update_editor(|editor, window, cx| {
+        editor.show_signature_help(&ShowSignatureHelp, window, cx);
+    });
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![lsp::ParameterInformation {
+                label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                documentation: None,
+            }]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+    handle_signature_help_request(&mut cx, mocked_response).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let before = cx
+        .debug_bounds("SIGNATURE-POPOVER")
+        .expect("the signature popover is painted");
+    let strip = cx
+        .debug_bounds("CARRY-STRIP")
+        .expect("the strip that carries it is painted");
+    let grab = strip.center();
+    let to = gpui::point(grab.x + px(40.), grab.y + px(25.));
+
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let after = cx
+        .debug_bounds("SIGNATURE-POPOVER")
+        .expect("the signature popover is still painted");
+    assert!(
+        (after.left() - (before.left() + px(40.))).abs() <= px(1.)
+            && (after.top() - (before.top() + px(25.))).abs() <= px(1.),
+        "the popover was carried 40px right and 25px down from {:?} and arrived at {:?}",
+        before.origin,
+        after.origin
+    );
+}
+
 #[gpui::test]
 async fn test_signature_help_multiple_signatures(cx: &mut TestAppContext) {
     init_test(cx, |_| {});

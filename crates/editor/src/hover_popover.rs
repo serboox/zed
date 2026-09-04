@@ -1041,6 +1041,12 @@ impl HoverState {
     }
 }
 
+/// What the hover stack's place is remembered under. One name for the whole
+/// stack: the docs popover and the diagnostic popover above it are carried
+/// together, which is what the reader is doing when they move either of them.
+pub(crate) const HOVER_POPOVER_CARRIED_AS: gpui::SharedString =
+    gpui::SharedString::new_static("Hover");
+
 pub struct InfoPopover {
     pub symbol_range: RangeInEditor,
     pub parsed_content: Option<Entity<Markdown>>,
@@ -1062,8 +1068,9 @@ impl InfoPopover {
         let this = cx.entity().downgrade();
         let this2 = this.clone();
         let bounds_cell = self.last_bounds.clone();
-        div()
+        let surface = div()
             .id("info_popover")
+            .debug_selector(|| "HOVER-POPOVER".to_string())
             .occlude()
             .elevation_2(cx)
             .child(
@@ -1131,8 +1138,20 @@ impl InfoPopover {
                     window,
                     cx,
                 )
-            })
-            .into_any_element()
+            });
+        // Carried like every other window in this fork. Where it is carried *to* is
+        // applied by the editor when it places the popover, because a popover is
+        // laid out as a root element and the offsets a root asks for itself are
+        // dropped.
+        ui::cyberpunk::floating(
+            ui::cyberpunk::Floating::named(HOVER_POPOVER_CARRIED_AS)
+                .keeping_its_own_size()
+                .placed_by_its_host(),
+            surface,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 
     pub fn scroll(&self, amount: ScrollAmount, window: &mut Window, cx: &mut Context<Editor>) {
@@ -1168,7 +1187,7 @@ impl DiagnosticPopover {
         let keyboard_grace = Rc::clone(&self.keyboard_grace);
         let this = cx.entity().downgrade();
         let bounds_cell = self.last_bounds.clone();
-        div()
+        let surface = div()
             .id("diagnostic")
             .occlude()
             .elevation_2_borderless(cx)
@@ -1259,8 +1278,21 @@ impl DiagnosticPopover {
                         window,
                         cx,
                     ),
-            )
-            .into_any_element()
+            );
+        // Carried and resized like every other window in this fork.
+        // Carried like every other window in this fork. Where it is carried *to* is
+        // applied by the editor when it places the popover, because a popover is
+        // laid out as a root element and the offsets a root asks for itself are
+        // dropped.
+        ui::cyberpunk::floating(
+            ui::cyberpunk::Floating::named(HOVER_POPOVER_CARRIED_AS)
+                .keeping_its_own_size()
+                .placed_by_its_host(),
+            surface,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 }
 
@@ -2412,6 +2444,211 @@ mod tests {
                 "Popover should be hidden after the hiding delay expires"
             );
         });
+    }
+
+    // A hover popover is a window like the rest of them: it can be carried out
+    // of the way of the code it is covering. What makes this worth a test
+    // rather than a reading of the code is where the offset is applied -- the
+    // popover is placed by an `anchored` element, which works out its position
+    // from its child's own laid-out bounds, and an offset the child asks for
+    // could just as easily have been measured away again.
+    #[gpui::test]
+    async fn test_hover_popover_is_carried_by_its_top_strip(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.hover_popover_sticky = Some(true);
+                });
+            });
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            fn ˇtest() { println!(); }
+        "});
+        let hover_point = cx.display_point(indoc! {"
+            fn test() { printˇln!(); }
+        "});
+        let symbol_range = cx.lsp_range(indoc! {"
+            fn test() { «println!»(); }
+        "});
+        let mut requests =
+            cx.set_request_handler::<lsp::request::HoverRequest, _, _>(move |_, _, _| async move {
+                Ok(Some(lsp::Hover {
+                    contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: "some basic docs".to_string(),
+                    }),
+                    range: Some(symbol_range),
+                }))
+            });
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(&cx) + 100));
+        requests.next().await;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("HOVER-POPOVER")
+            .expect("the hover popover is painted");
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip that carries it is painted");
+        let grab = strip.center();
+        let to = gpui::point(grab.x + px(50.), grab.y + px(30.));
+
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let carried =
+            cx.update(|window, cx| ui::cyberpunk::carried_by(&"Hover".into(), window, cx));
+        let after = cx
+            .debug_bounds("HOVER-POPOVER")
+            .expect("the hover popover is still painted");
+        assert!(
+            carried.x.abs() > px(1.),
+            "the drag never started: the popover's own offset is still {carried:?}"
+        );
+        assert!(
+            (after.left() - (before.left() + px(50.))).abs() <= px(1.)
+                && (after.top() - (before.top() + px(30.))).abs() <= px(1.),
+            "the popover was carried 50px right and 30px down from {:?} and arrived at {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    // Carried at the far edge of the editor, the popover stays inside it. The
+    // placement asks whether the popover fits in the editor and falls back on
+    // another place when it does not, so a point carried past the editor's own
+    // edge does not read as "a little way off" -- it reads as somewhere else,
+    // and the popover snaps back to where the reader never put it.
+    #[gpui::test]
+    async fn test_a_hover_popover_carried_past_the_edge_stays_inside_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.hover_popover_sticky = Some(true);
+                });
+            });
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            fn ˇtest() { println!(); }
+        "});
+        let hover_point = cx.display_point(indoc! {"
+            fn test() { printˇln!(); }
+        "});
+        let symbol_range = cx.lsp_range(indoc! {"
+            fn test() { «println!»(); }
+        "});
+        let mut requests =
+            cx.set_request_handler::<lsp::request::HoverRequest, _, _>(move |_, _, _| async move {
+                Ok(Some(lsp::Hover {
+                    contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: "some basic docs".to_string(),
+                    }),
+                    range: Some(symbol_range),
+                }))
+            });
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(&cx) + 100));
+        requests.next().await;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("HOVER-POPOVER")
+            .expect("the hover popover is painted");
+        let strip = cx
+            .debug_bounds("CARRY-STRIP")
+            .expect("the strip that carries it is painted");
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let grab = strip.center();
+        let far = gpui::point(grab.x + viewport.width, grab.y + viewport.height);
+
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(far, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_up(far, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("HOVER-POPOVER")
+            .expect("the hover popover is still painted");
+        assert!(
+            after.left() > before.left(),
+            "carried to the far corner, the popover went back to {:?} from {:?}",
+            after.origin,
+            before.origin
+        );
+        assert!(
+            after.left() < viewport.width && after.top() < viewport.height,
+            "carried to the far corner, the popover came to rest at {:?}, outside a {:?} editor",
+            after.origin,
+            viewport
+        );
     }
 
     #[gpui::test]

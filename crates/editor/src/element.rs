@@ -4356,6 +4356,29 @@ impl EditorElement {
         }
     }
 
+    /// Holds a point the reader carried a popover to inside the editor it belongs
+    /// to, leaving room for the popover itself to be seen.
+    ///
+    /// The placement that follows asks whether a popover fits in the editor and
+    /// falls back on other places when it does not, so a point outside the editor
+    /// is not "a popover a little way off" -- it is a popover somewhere else
+    /// entirely.
+    fn held_inside(point: gpui::Point<Pixels>, hitbox: &Hitbox) -> gpui::Point<Pixels> {
+        const KEPT_INSIDE: Pixels = px(48.);
+        let across = hitbox.size.width - KEPT_INSIDE;
+        let down = hitbox.size.height - KEPT_INSIDE;
+        gpui::point(
+            point
+                .x
+                .max(hitbox.left())
+                .min(hitbox.left() + across.max(Pixels::ZERO)),
+            point
+                .y
+                .max(hitbox.top())
+                .min(hitbox.top() + down.max(Pixels::ZERO)),
+        )
+    }
+
     fn layout_hover_popovers(
         &self,
         snapshot: &EditorSnapshot,
@@ -4418,7 +4441,26 @@ impl EditorElement {
             popover_position.row().as_f64() * ScrollPixelOffset::from(line_height)
                 - scroll_pixel_position.y,
         );
-        let hovered_point = content_origin + point(x, y);
+        // Where the reader has carried the hover stack to, if they have. Added
+        // here rather than inside the popover because a popover is laid out as
+        // a root element: the offsets a root asks for itself are dropped by
+        // whatever draws it, and this is what draws it.
+        //
+        // Held inside the editor rather than only inside the window, because
+        // the placement below asks whether the popover fits in the editor and
+        // falls back on other places when it does not -- a point carried past
+        // the editor's own edge is a popover that snaps somewhere the reader
+        // did not put it.
+        let hovered_point = Self::held_inside(
+            content_origin
+                + point(x, y)
+                + ui::cyberpunk::carried_by(
+                    &crate::hover_popover::HOVER_POPOVER_CARRIED_AS,
+                    window,
+                    cx,
+                ),
+            hitbox,
+        );
 
         let mut overall_height = Pixels::ZERO;
 
@@ -4856,7 +4898,20 @@ impl EditorElement {
         let target_y = Pixels::from(
             selection_row.as_f64() * ScrollPixelOffset::from(line_height) - scroll_pixel_position.y,
         );
-        let target_point = content_origin + point(target_x, target_y);
+        // Where the reader has carried it to, added here for the same reason the
+        // hover stack's offset is: the popover is laid out as a root element and
+        // the offsets a root asks for itself are dropped. Held inside the
+        // editor for the same reason too.
+        let target_point = Self::held_inside(
+            content_origin
+                + point(target_x, target_y)
+                + ui::cyberpunk::carried_by(
+                    &crate::signature_help::SIGNATURE_HELP_CARRIED_AS,
+                    window,
+                    cx,
+                ),
+            hitbox,
+        );
 
         let actual_size = element.layout_as_root(Size::<AvailableSpace>::default(), window, cx);
 
