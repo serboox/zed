@@ -415,6 +415,7 @@ mod tests {
             tree_sitter_bash::LANGUAGE.into(),
             r#"
             GREETING="hello"
+            export SHOUTED="HELLO"
 
             greet() {
                 local who="$1"
@@ -428,7 +429,7 @@ mod tests {
         )
         .await;
         let names = named(&items);
-        for wanted in ["GREETING", "greet", "shout"] {
+        for wanted in ["GREETING", "SHOUTED", "greet", "shout"] {
             assert!(
                 names.iter().any(|text| text.contains(wanted)),
                 "{wanted} is missing from {names:?}"
