@@ -1,0 +1,7 @@
+{"ImportPath":"example.com/m/sub","Action":"build-output","Output":"# example.com/m/sub\n"}
+{"ImportPath":"example.com/m/sub","Action":"build-output","Output":"sub/sub.go:4:9: cannot use \"a string\" (untyped string constant) as int value in return statement\n"}
+{"ImportPath":"example.com/m/sub","Action":"build-fail"}
+{"ImportPath":"example.com/m","Action":"build-output","Output":"# example.com/m\n"}
+{"ImportPath":"example.com/m","Action":"build-output","Output":"./main.go:7:6: declared and not used: unusedValue\n"}
+{"ImportPath":"example.com/m","Action":"build-output","Output":"./main.go:9:44: undefined: missingHelper\n"}
+{"ImportPath":"example.com/m","Action":"build-fail"}
