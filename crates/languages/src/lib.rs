@@ -191,6 +191,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             ..Default::default()
         },
         LanguageInfo {
+            name: "cobol",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
             name: "json",
             adapters: vec![json_lsp_adapter.clone(), node_version_lsp_adapter],
             context: Some(json_context_provider.clone()),

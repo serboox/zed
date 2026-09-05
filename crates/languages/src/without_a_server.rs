@@ -358,6 +358,49 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn cobol_reads_its_program_paragraphs_and_data(cx: &mut TestAppContext) {
+        // Written in fixed format with a sequence number in columns 1-6: the
+        // grammar only parses fixed format, code has to start in column 8, and
+        // the sequence numbers are what survives `unindent` stripping the
+        // literal's own indentation.
+        let items = outline_of(
+            cx,
+            "cobol",
+            arborium_cobol::language().into(),
+            r#"
+            000100 IDENTIFICATION DIVISION.
+            000200 PROGRAM-ID. GREETER.
+            000300
+            000400 DATA DIVISION.
+            000500 WORKING-STORAGE SECTION.
+            000600 01 WS-GREETING          PIC X(20) VALUE "Hello, ".
+            000700 01 WS-NAME              PIC X(30) VALUE SPACES.
+            000800
+            000900 PROCEDURE DIVISION.
+            001000 MAIN-SECTION SECTION.
+            001100 GREET-THE-WORLD.
+            001200     MOVE "World" TO WS-NAME
+            001300     DISPLAY WS-GREETING WS-NAME
+            001400     STOP RUN.
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in [
+            "GREETER",
+            "MAIN-SECTION",
+            "GREET-THE-WORLD",
+            "WS-GREETING",
+            "WS-NAME",
+        ] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn sql_reads_the_objects_it_defines(cx: &mut TestAppContext) {
         let items = outline_of(
             cx,
