@@ -96,6 +96,64 @@ impl IndexFirst {
         Some(highlights)
     }
 
+    /// Where the project declares the name under the cursor, as the link the
+    /// editor navigates by.
+    ///
+    /// The same gate as everywhere else here: nothing for a name the index will
+    /// not resolve, and nothing for a name it declares more than once. Landing
+    /// a reader in the wrong file is worse than not moving them.
+    fn declaration_link(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+        let index = self.index.upgrade()?;
+        let project = self.project.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (range, name) = word_at(&snapshot, offset)?;
+
+        let (path, declared) = {
+            let index = index.read(cx);
+            let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
+                return None;
+            };
+            index.where_declared(&name)?
+        };
+        let origin = language::Location {
+            buffer: buffer.clone(),
+            range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+        };
+
+        Some(cx.spawn(async move |cx| {
+            let opened = project
+                .update(cx, |project, cx| project.open_local_buffer(&path, cx))?
+                .await?;
+            let target = opened.read_with(cx, |opened, _| {
+                let snapshot = opened.snapshot();
+                // `Definition::line` is one-based, as a reader counts lines.
+                let row = declared.line.saturating_sub(1);
+                let at = name_on_line(&snapshot, row, &declared.name)
+                    .or_else(|| point_of(&snapshot, row, 0).map(|start| start..start));
+                at.map(|at| language::Location {
+                    buffer: opened.clone(),
+                    range: snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end),
+                })
+            })?;
+            let Some(target) = target else {
+                // The file has moved under the index and no longer has that
+                // line. Answering nothing sends the reader nowhere, which is
+                // the right place.
+                return Ok(None);
+            };
+            Ok(Some(vec![LocationLink {
+                origin: Some(origin),
+                target,
+            }]))
+        }))
+    }
+
     /// What the index can say about the name under the cursor: the line that
     /// declares it, the comment written above that line, and where it lives.
     ///
@@ -327,6 +385,25 @@ fn point_of(snapshot: &language::BufferSnapshot, row: u32, column: u32) -> Optio
     Some(snapshot.point_to_offset(point))
 }
 
+/// Where `name` sits on `row`, so that going to a definition lands on the name
+/// rather than on the indentation in front of it.
+///
+/// Bounded: a generated file can hold a line of any length, and reading one to
+/// find a name that a caller already has another place to put is not worth it.
+fn name_on_line(snapshot: &language::BufferSnapshot, row: u32, name: &str) -> Option<Range<usize>> {
+    const A_LINE_WORTH_SEARCHING: usize = 2000;
+    let start = point_of(snapshot, row, 0)?;
+    let mut line = String::new();
+    for character in snapshot.chars_at(start) {
+        if character == '\n' || line.len() >= A_LINE_WORTH_SEARCHING {
+            break;
+        }
+        line.push(character);
+    }
+    let at = line.find(name)?;
+    Some(start + at..start + at + name.len())
+}
+
 /// The word the cursor is in, and where it starts and ends.
 fn word_at(snapshot: &language::BufferSnapshot, offset: usize) -> Option<(Range<usize>, String)> {
     let mut start = offset;
@@ -493,7 +570,23 @@ impl SemanticsProvider for IndexFirst {
         kind: editor::GotoDefinitionKind,
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
-        self.project.definitions(buffer, position, kind, cx)
+        let from_the_server = self.project.definitions(buffer, position, kind, cx);
+        // Only "where is this declared". A type's definition, an
+        // implementation, and a declaration held apart from its definition are
+        // all questions about types, and the index knows none of them.
+        if kind != editor::GotoDefinitionKind::Symbol {
+            return from_the_server;
+        }
+        let Some(from_the_index) = self.declaration_link(buffer, position, cx) else {
+            return from_the_server;
+        };
+        let Some(from_the_server) = from_the_server else {
+            return Some(from_the_index);
+        };
+        Some(cx.spawn(async move |_| match from_the_server.await {
+            Ok(Some(found)) if !found.is_empty() => Ok(Some(found)),
+            _ => from_the_index.await,
+        }))
     }
 
     fn range_for_rename(
@@ -549,6 +642,31 @@ mod tests {
             line,
             language: language.to_string(),
         }
+    }
+
+    #[gpui::test]
+    fn the_name_on_a_line_is_found_where_it_actually_sits(cx: &mut gpui::TestAppContext) {
+        let buffer = cx.new(|cx| language::Buffer::local("mod one;\n\n    pub fn work() {}\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+
+        let at = name_on_line(&snapshot, 2, "work").expect("the name is on that line");
+        assert_eq!(
+            snapshot.text_for_range(at.clone()).collect::<String>(),
+            "work"
+        );
+        // The name's own column, not the start of the line it is indented on --
+        // which is what a reader would be sent to otherwise.
+        let line_starts_at = point_of(&snapshot, 2, 0).expect("the row is in the file");
+        assert!(at.start > line_starts_at, "{at:?} against {line_starts_at}");
+
+        assert!(
+            name_on_line(&snapshot, 99, "work").is_none(),
+            "a row the file no longer has"
+        );
+        assert!(
+            name_on_line(&snapshot, 0, "work").is_none(),
+            "a name that is not on that line"
+        );
     }
 
     #[test]
