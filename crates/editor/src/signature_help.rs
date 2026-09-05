@@ -201,6 +201,12 @@ impl Editor {
         let lsp_task = lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.signature_help(&buffer, buffer_position, cx)
         });
+        // Asked alongside the server, not instead of it: the server knows the
+        // parameter the cursor is on and the index does not, so it answers
+        // wherever it is running. This fills the silence where none is.
+        let without_a_server = self
+            .semantics_provider()
+            .and_then(|provider| provider.signature_help(&buffer, buffer_position, cx));
         let language = self.language_at(position, cx);
 
         let signature_help_delay_ms = if use_delay {
@@ -217,7 +223,13 @@ impl Editor {
                         .await;
                 }
 
-                let signature_help = lsp_task.await;
+                let signature_help = match lsp_task.await {
+                    Some(answered) if !answered.is_empty() => Some(answered),
+                    _ => match without_a_server {
+                        Some(task) => task.await,
+                        None => None,
+                    },
+                };
 
                 editor
                     .update(cx, |editor, cx| {

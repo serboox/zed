@@ -6,12 +6,13 @@ use anyhow::Result;
 use collections::{HashMap, HashSet};
 use editor::{Editor, SemanticsProvider};
 use futures::future::Shared;
-use gpui::{App, Entity, Task, WeakEntity, Window};
+use gpui::{App, AppContext as _, Entity, Task, WeakEntity, Window};
 use language::{Buffer, BufferId, BufferRow};
 use project::{
     DocumentHighlight, InlayHint, InvalidationStrategy, LocationLink, Project, ProjectTransaction,
     lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
 };
+use semantic_index::definitions::Definition;
 use semantic_index::resolution::WhatItMeans;
 use text::ToOffset as _;
 
@@ -94,6 +95,223 @@ impl IndexFirst {
         }
         Some(highlights)
     }
+
+    /// What the index can say about the name under the cursor: the line that
+    /// declares it, the comment written above that line, and where it lives.
+    ///
+    /// Not a type -- nothing here infers one, and section 05 of the plan says
+    /// why that is not coming for every language. It is the rest of what a
+    /// reader hovers a name to find out, and today a reader with no language
+    /// server running gets none of it.
+    fn declaration_card(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<Vec<project::Hover>>>> {
+        let index = self.index.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (range, name) = word_at(&snapshot, offset)?;
+
+        let (path, declared) = {
+            let index = index.read(cx);
+            // The same gate the underlining goes through, and for the same
+            // reason: the index declines a name that is also bound locally
+            // somewhere, or is a member of a type, because it cannot tell this
+            // occurrence of it from one of those. A card for the project's
+            // `run` shown over a local named `run` is a confident wrong answer,
+            // which is the only kind worth refusing outright.
+            let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
+                return None;
+            };
+            index.where_declared(&name)?
+        };
+
+        // The store holds what the file said when it was last read from disk.
+        // Where the declaration is in the very buffer being edited, its line
+        // number has moved and the card would quote the wrong line.
+        let open_path = buffer
+            .read(cx)
+            .file()
+            .map(|file| file.path().to_string().replace('\\', "/"));
+        if buffer.read(cx).is_dirty() && open_path.as_deref() == Some(declared.path.as_str()) {
+            return None;
+        }
+
+        let at = snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+        Some(cx.background_spawn(async move {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let card = card_for(&contents, &declared)?;
+            Some(vec![project::Hover {
+                contents: card,
+                range: Some(at),
+                language: None,
+            }])
+        }))
+    }
+}
+
+/// The blocks a declaration card is made of: the declaration as it is written,
+/// the comment above it if there is one, and a last line saying what kind of
+/// thing it is and where.
+fn card_for(contents: &str, declared: &Definition) -> Option<Vec<project::HoverBlock>> {
+    let lines: Vec<&str> = contents.lines().collect();
+    // `Definition::line` is one-based, as a reader counts lines.
+    let at = declared.line.checked_sub(1)? as usize;
+    let declaration = lines.get(at)?.trim();
+    if declaration.is_empty() {
+        return None;
+    }
+
+    // Loaded once: `load_config` parses the language's config file, and the card
+    // asks it two questions.
+    let config = config_of(&declared.language);
+    let mut blocks = vec![project::HoverBlock {
+        text: declaration.to_string(),
+        kind: match &config {
+            // The name the language is registered under, which is what the
+            // markdown fence this block becomes has to say for it to be
+            // highlighted: `C#`, not `csharp`, and `Visual Basic`, not `vb6`.
+            // The index records the directory name, which is neither.
+            Some(config) => project::HoverBlockKind::Code {
+                language: config.name.to_string(),
+            },
+            None => project::HoverBlockKind::PlainText,
+        },
+    }];
+    if let Some(comment) = config
+        .as_ref()
+        .and_then(|config| comment_above(&lines, at, &config.line_comments))
+    {
+        blocks.push(project::HoverBlock {
+            text: comment,
+            kind: project::HoverBlockKind::Markdown,
+        });
+    }
+    blocks.push(project::HoverBlock {
+        text: format!("{} · {}:{}", declared.kind, declared.path, declared.line),
+        kind: project::HoverBlockKind::PlainText,
+    });
+    Some(blocks)
+}
+
+/// The name of the call the cursor is inside, read backwards from it: past the
+/// arguments already typed, to the `(` that opened the call, to the word before
+/// that.
+///
+/// `chars` is the file's text ending at the cursor, in reverse -- which is the
+/// only direction this can be answered in without parsing, and the only one a
+/// buffer gives cheaply.
+fn callee_before(chars: impl Iterator<Item = char>) -> Option<String> {
+    // Far enough to cross a long argument list written over several lines, and
+    // short enough that a cursor outside any call does not walk the whole file
+    // on every keystroke.
+    const AS_FAR_BACK_AS_A_CALL_IS_WORTH_LOOKING: usize = 2000;
+
+    let mut depth = 0usize;
+    let mut walked = 0usize;
+    let mut chars = chars.peekable();
+    loop {
+        walked += 1;
+        if walked > AS_FAR_BACK_AS_A_CALL_IS_WORTH_LOOKING {
+            return None;
+        }
+        match chars.next()? {
+            ')' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            // A statement cannot be half of a call: a `;` or a `}` before any
+            // unclosed `(` means the cursor is not inside one at all.
+            ';' | '}' | '{' => return None,
+            _ => {}
+        }
+    }
+
+    // Whitespace between the name and its `(` is allowed in most languages.
+    while chars
+        .peek()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        chars.next();
+    }
+    let mut backwards: Vec<char> = Vec::new();
+    while chars
+        .peek()
+        .is_some_and(|character| character.is_alphanumeric() || *character == '_')
+    {
+        backwards.push(chars.next()?);
+    }
+    if backwards.is_empty() {
+        return None;
+    }
+    Some(backwards.into_iter().rev().collect())
+}
+
+/// The label a signature popover shows for a declaration, and the comment
+/// above it as its documentation.
+fn signature_of(contents: &str, declared: &Definition) -> Option<(String, Option<String>)> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let at = declared.line.checked_sub(1)? as usize;
+    let declaration = lines.get(at)?.trim();
+    if declaration.is_empty() {
+        return None;
+    }
+    let documentation = config_of(&declared.language)
+        .and_then(|config| comment_above(&lines, at, &config.line_comments));
+    Some((declaration.to_string(), documentation))
+}
+
+/// A language's own config, or nothing for a name this binary has no directory
+/// for -- which is what a row written by an older build of the index can hold,
+/// and what would otherwise panic, since `load_config` does.
+fn config_of(language: &str) -> Option<language::LanguageConfig> {
+    grammars::embedded_languages()
+        .iter()
+        .any(|known| known.as_str() == language)
+        .then(|| grammars::load_config(language))
+}
+
+/// The run of comment lines written directly above `at`, with their markers
+/// taken off, or nothing where there is no comment there.
+///
+/// Which markers count comes from the language's own config -- the same one the
+/// editor toggles comments with -- rather than from a list written here, so a
+/// language whose comments start with `--` or `*>` is read as correctly as one
+/// whose comments start with `//`.
+fn comment_above(lines: &[&str], at: usize, markers: &[Arc<str>]) -> Option<String> {
+    if markers.is_empty() {
+        return None;
+    }
+    let strip = |line: &str| -> Option<String> {
+        let trimmed = line.trim_start();
+        markers.iter().find_map(|marker| {
+            let marker = marker.trim_end();
+            trimmed
+                .strip_prefix(marker)
+                .map(|rest| rest.trim_start().to_string())
+        })
+    };
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut above = at;
+    while above > 0 {
+        above -= 1;
+        match strip(lines.get(above)?) {
+            Some(text) => collected.push(text),
+            None => break,
+        }
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse();
+    let joined = collected.join("\n").trim().to_string();
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// The offset a row and column stand for, or nothing where the file has moved
@@ -149,7 +367,70 @@ impl SemanticsProvider for IndexFirst {
         position: text::Anchor,
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>> {
-        self.project.hover(buffer, position, cx)
+        let from_the_server = self.project.hover(buffer, position, cx);
+        let Some(card) = self.declaration_card(buffer, position, cx) else {
+            return from_the_server;
+        };
+        let Some(from_the_server) = from_the_server else {
+            return Some(card);
+        };
+        // The server first, always: it knows the type, and the index does not.
+        // The card is what fills the silence where no server was started, which
+        // in this fork is the ordinary case rather than the exception.
+        Some(cx.background_spawn(async move {
+            match from_the_server.await {
+                Some(answered) if !answered.iter().all(project::Hover::is_empty) => Some(answered),
+                _ => card.await,
+            }
+        }))
+    }
+
+    fn signature_help(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<Vec<project::lsp_command::SignatureHelp>>>> {
+        let index = self.index.upgrade()?;
+        let project = self.project.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let name = callee_before(snapshot.reversed_chars_at(offset))?;
+
+        let (path, declared) = {
+            let index = index.read(cx);
+            let WhatItMeans::TheseAre(_) = index.what_a_name_means(&name)? else {
+                return None;
+            };
+            index.where_declared(&name)?
+        };
+        let languages = project.read(cx).languages().clone();
+
+        Some(cx.spawn(async move |cx| {
+            let contents = cx
+                .background_spawn(async move { std::fs::read_to_string(&path).ok() })
+                .await?;
+            let (label, documentation) = signature_of(&contents, &declared)?;
+            cx.update(|cx| {
+                project::lsp_command::SignatureHelp::new(
+                    lsp::SignatureHelp {
+                        signatures: vec![lsp::SignatureInformation {
+                            label,
+                            documentation: documentation.map(lsp::Documentation::String),
+                            parameters: None,
+                            active_parameter: None,
+                        }],
+                        active_signature: Some(0),
+                        active_parameter: None,
+                    },
+                    Some(languages),
+                    None,
+                    cx,
+                )
+                .map(|help| vec![help])
+            })
+            .ok()?
+        }))
     }
 
     fn inline_values(
@@ -252,4 +533,153 @@ pub fn init(cx: &mut App) {
         })));
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declared(line: u32, language: &str) -> Definition {
+        Definition {
+            path: "src/one.rs".to_string(),
+            name: "work".to_string(),
+            kind: "function_item".to_string(),
+            line,
+            language: language.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_card_quotes_the_declaration_its_comment_and_where_it_lives() {
+        let file = "\
+use std::io;
+
+/// Does the work.
+/// Twice, if asked.
+pub fn work(times: u32) -> io::Result<()> {
+    Ok(())
+}
+";
+        let card = card_for(file, &declared(5, "rust")).expect("a card");
+        assert_eq!(card[0].text, "pub fn work(times: u32) -> io::Result<()> {");
+        assert_eq!(
+            card[0].kind,
+            project::HoverBlockKind::Code {
+                language: "Rust".to_string()
+            }
+        );
+        assert_eq!(card[1].text, "Does the work.\nTwice, if asked.");
+        assert_eq!(card[1].kind, project::HoverBlockKind::Markdown);
+        assert_eq!(card[2].text, "function_item · src/one.rs:5");
+    }
+
+    #[test]
+    fn a_declaration_with_no_comment_above_it_is_still_a_card() {
+        let file = "pub fn work() {}\n";
+        let card = card_for(file, &declared(1, "rust")).expect("a card");
+        assert_eq!(
+            card.len(),
+            2,
+            "the declaration and where it lives: {card:?}"
+        );
+        assert_eq!(card[0].text, "pub fn work() {}");
+    }
+
+    #[test]
+    fn a_line_the_file_no_longer_has_is_no_card_rather_than_a_panic() {
+        let file = "pub fn work() {}\n";
+        assert!(card_for(file, &declared(9, "rust")).is_none());
+        assert!(card_for(file, &declared(0, "rust")).is_none());
+    }
+
+    fn markers_of(language: &str) -> Vec<Arc<str>> {
+        config_of(language)
+            .expect("a language this binary ships")
+            .line_comments
+    }
+
+    #[test]
+    fn the_comment_marker_comes_from_the_language_and_not_from_a_list_here() {
+        // Two languages whose comments start with neither `//` nor `#`.
+        let sql = vec!["-- Every customer we bill.", "CREATE TABLE customers ("];
+        assert_eq!(
+            comment_above(&sql, 1, &markers_of("sql")).as_deref(),
+            Some("Every customer we bill.")
+        );
+        let bash = vec!["# Prepares the tree.", "prepare() {"];
+        assert_eq!(
+            comment_above(&bash, 1, &markers_of("bash")).as_deref(),
+            Some("Prepares the tree.")
+        );
+        // The same lines read as a language whose comments start with `//`.
+        assert_eq!(comment_above(&sql, 1, &markers_of("rust")), None);
+    }
+
+    #[test]
+    fn only_the_run_directly_above_the_declaration_counts() {
+        let lines = vec![
+            "// About something else entirely.",
+            "",
+            "// The one that belongs to it.",
+            "pub fn work() {}",
+        ];
+        assert_eq!(
+            comment_above(&lines, 3, &markers_of("rust")).as_deref(),
+            Some("The one that belongs to it.")
+        );
+    }
+
+    #[test]
+    fn a_language_this_binary_no_longer_ships_is_a_plain_card_rather_than_a_panic() {
+        assert!(config_of("a-language-that-was-removed").is_none());
+        let card = card_for(
+            "pub fn work() {}\n",
+            &declared(1, "a-language-that-was-removed"),
+        )
+        .expect("a card");
+        assert_eq!(card[0].kind, project::HoverBlockKind::PlainText);
+    }
+
+    fn callee_in(text: &str) -> Option<String> {
+        callee_before(text.chars().rev())
+    }
+
+    #[test]
+    fn the_call_the_cursor_is_inside_is_named_by_reading_backwards() {
+        assert_eq!(callee_in("let x = work(").as_deref(), Some("work"));
+        assert_eq!(callee_in("let x = work(1, ").as_deref(), Some("work"));
+        // Whitespace between the name and its bracket, and a call written over
+        // several lines.
+        assert_eq!(
+            callee_in("let x = work (\n    1,\n    ").as_deref(),
+            Some("work")
+        );
+        // An argument that is itself a finished call does not become the answer.
+        assert_eq!(
+            callee_in("let x = work(other(1), ").as_deref(),
+            Some("work")
+        );
+        // The innermost unclosed call wins.
+        assert_eq!(callee_in("let x = work(other(").as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn a_cursor_that_is_not_inside_a_call_names_nothing() {
+        assert_eq!(callee_in("let x = 1 + 2"), None);
+        // A finished statement before any unclosed bracket.
+        assert_eq!(callee_in("work(1);\nlet x = "), None);
+        // A bracket with no name in front of it is not a call.
+        assert_eq!(callee_in("let x = ("), None);
+    }
+
+    #[test]
+    fn a_signature_is_the_declaration_and_the_comment_above_it() {
+        let file = "\
+/// Does the work.
+pub fn work(times: u32) {}
+";
+        let (label, documentation) = signature_of(file, &declared(2, "rust")).expect("a signature");
+        assert_eq!(label, "pub fn work(times: u32) {}");
+        assert_eq!(documentation.as_deref(), Some("Does the work."));
+    }
 }

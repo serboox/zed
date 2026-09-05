@@ -86,6 +86,12 @@ pub struct SymbolIndex {
     _subscription: Subscription,
 }
 
+/// How many of the catalogue's fuzzy matches a hover looks through for an
+/// exact one. The catalogue answers by fuzzy score, so an exact match can sit
+/// below better-scoring longer names; a handful is enough to find it and
+/// cheap enough to ask for on every hover.
+const CANDIDATES_A_HOVER_LOOKS_AT: usize = 32;
+
 impl SymbolIndex {
     /// Opens (or creates) `project`'s symbol index and starts the first
     /// build in the background. `project` must already have its worktrees;
@@ -171,6 +177,28 @@ impl SymbolIndex {
             .as_ref()
             .map(|catalogue| catalogue.candidates(query, most))
             .unwrap_or_default()
+    }
+
+    /// Where the project declares `name`, when it declares it in exactly one
+    /// place, as an absolute path and the definition itself.
+    ///
+    /// One place or none, on purpose. A name the project declares twice cannot
+    /// be resolved by the name alone, and showing a reader the wrong one of the
+    /// two is worse than showing nothing -- the same rule the rest of this
+    /// index answers by.
+    pub fn where_declared(&self, name: &str) -> Option<(PathBuf, Definition)> {
+        let catalogue = self.catalogue.as_ref()?;
+        // Asked for more than one so that a second declaration of the same name
+        // is seen and refused, rather than silently taken for the only one.
+        let mut exact = catalogue
+            .candidates(name, CANDIDATES_A_HOVER_LOOKS_AT)
+            .into_iter()
+            .filter(|found| found.name == name);
+        let only = exact.next()?;
+        if exact.next().is_some() {
+            return None;
+        }
+        Some((self.root.join(&only.path), only))
     }
 
     /// What the index says a name means, with no language server asked.
