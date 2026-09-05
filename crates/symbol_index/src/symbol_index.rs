@@ -10,9 +10,12 @@ use project::{Event as ProjectEvent, PathChange, Project, WorktreeId};
 pub use semantic_index::definitions::Definition;
 use semantic_index::inventory::Inventory;
 use semantic_index::refresh;
+use semantic_index::resolution::WhatItMeans;
 use semantic_index::symbols::{Catalogue, Symbols};
 use util::ResultExt as _;
 use workspace::Workspace;
+
+pub mod index_semantics;
 
 /// Which of four states the index is in, so a caller can tell "nothing
 /// matched" from "there is nothing to search yet" apart.
@@ -168,6 +171,27 @@ impl SymbolIndex {
             .as_ref()
             .map(|catalogue| catalogue.candidates(query, most))
             .unwrap_or_default()
+    }
+
+    /// What the index says a name means, with no language server asked.
+    ///
+    /// `None` while a background pass holds the stores: the question needs the
+    /// store, and a pass has it. A caller that cannot be told is in the same
+    /// position as one asking about a name the index declines -- it asks the
+    /// server -- so the two are not worth telling apart here.
+    pub fn what_a_name_means(&self, name: &str) -> Option<WhatItMeans> {
+        self.what_a_symbol_means(None, name)
+    }
+
+    /// The same, for a caller that knows which declaration it means -- which is
+    /// what makes a name declared more than once answerable at all.
+    pub fn what_a_symbol_means(
+        &self,
+        declared_in: Option<&str>,
+        name: &str,
+    ) -> Option<WhatItMeans> {
+        let (symbols, _) = self.stores.as_ref()?;
+        semantic_index::resolution::what_a_symbol_means(symbols, declared_in, name).log_err()
     }
 
     /// Reacts to what the project already emits, rather than polling.

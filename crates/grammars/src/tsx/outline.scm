@@ -31,6 +31,20 @@
   "interface" @context
   name: (_) @name) @item
 
+; An interface's own members, for the reason written out in the TypeScript
+; query beside this one: a name declared on an interface is a name the project
+; declares, and leaving them out is what read `console.warn` as a reference to
+; a project function called `warn`.
+(interface_declaration
+  body: (_
+    (property_signature
+      name: (_) @name) @item))
+
+(interface_declaration
+  body: (_
+    (method_signature
+      name: (_) @name) @item))
+
 (export_statement
   (lexical_declaration
     [

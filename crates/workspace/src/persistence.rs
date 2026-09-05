@@ -1704,6 +1704,20 @@ impl WorkspaceDb {
                 host = Some(format!("mock-{}", id));
                 user = Some(format!("mock-user-{}", id));
             }
+            // The mock identity exists whenever the *remote* crate is built
+            // with its test support, which cargo can switch on for the whole
+            // build because some other crate asked for it -- while this crate's
+            // own feature stays off. The arm above is written under this
+            // crate's feature, so in that arrangement it is compiled out and
+            // the match stops being exhaustive: a build that has nothing to do
+            // with tests fails to compile. This arm is the same answer for the
+            // same identity, written where the compiler can always see it.
+            #[allow(unreachable_patterns)]
+            _ => {
+                kind = RemoteConnectionKind::Ssh;
+                host = Some("mock".to_string());
+                user = None;
+            }
         }
 
         if let RemoteConnectionOptions::Docker(options) = options {

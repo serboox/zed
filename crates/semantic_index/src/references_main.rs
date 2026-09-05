@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use semantic_index::measure::as_time;
-use semantic_index::references::{Certainty, Queries, REQUIRED_PRECISION, Report, measure};
+use semantic_index::references::{
+    Answering, Certainty, Queries, REQUIRED_PRECISION, Report, Source, measure,
+};
 
 /// The plan's own sample size for this check.
 const SYMBOL_COUNT: usize = 100;
@@ -46,6 +48,14 @@ async fn run() -> Result<()> {
     // guess. `--answer-everything` restores the old behaviour, so the two can
     // be compared on the same sample.
     let mut certainty = Certainty::OnlyWhenTheNameMeansOneThing;
+    // Where the truth comes from: the server, a recording being taken, or one
+    // taken before. Recording is what makes a 600-symbol sample possible on a
+    // machine the server does not fit in twice.
+    // Which side of the index answers. The editor's own path by request, so
+    // that the number can be about what a reader gets.
+    let mut answering = Answering::TheStandsOwnReading;
+    let mut record: Option<PathBuf> = None;
+    let mut against: Option<PathBuf> = None;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -71,6 +81,21 @@ async fn run() -> Result<()> {
                     .context("--query-timeout wants a number of seconds")?;
                 query_timeout = Duration::from_secs(seconds);
             }
+            "--record" => {
+                record = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .context("--record wants a path to write the answers to")?,
+                ));
+            }
+            "--against" => {
+                against = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .context("--against wants the path of a recording")?,
+                ));
+            }
+            "--through-the-store" => answering = Answering::TheStoreTheEditorAsks,
             "--answer-everything" => certainty = Certainty::Always,
             // What a language nobody has written a query for actually gets,
             // so the difference can be measured rather than guessed at.
@@ -93,7 +118,17 @@ async fn run() -> Result<()> {
                      --indexing-timeout <secs>   how long to wait for the server to finish indexing\n\
                      --query-timeout <secs>      how long one request may take ({})\n\
                      --answer-everything         answer about ambiguous names too, as the first\n\
-                     \x20                           measurement did",
+                     \x20                           measurement did\n\
+                     --record <path>             ask the server about every sampled symbol and\n\
+                     \x20                           write the answers there; answers already in the\n\
+                     \x20                           file are not asked again, so a sample too large\n\
+                     \x20                           for one run is taken over several\n\
+                     --against <path>            compare against answers recorded earlier, with no\n\
+                     \x20                           server started at all\n\
+                     --through-the-store         answer through the store the editor reads, rather\n\
+                     \x20                           than through the stand's own reading of the\n\
+                     \x20                           project -- the two are only the same when this\n\
+                     \x20                           says they are",
                     semantic_index::per_language::LANGUAGES_WITH_A_REFERENCES_QUERY.join(", "),
                     QUERY_TIMEOUT.as_secs()
                 );
@@ -111,13 +146,38 @@ async fn run() -> Result<()> {
         symbol_count >= 1,
         "there is nothing to compare over zero symbols"
     );
-
-    println!(
-        "comparing {language} references under {} over {symbol_count} symbols",
-        root.display()
+    anyhow::ensure!(
+        !(record.is_some() && against.is_some()),
+        "--record takes answers from the server and --against reads answers already taken; ask \
+         for one or the other"
     );
-    if semantic_index::per_language::language_server(&language)
-        .is_some_and(|spoken| spoken.options == semantic_index::per_language::Options::RustAnalyzer)
+    let source = match (record.as_deref(), against.as_deref()) {
+        (Some(at), _) => Source::Record(at),
+        (None, Some(at)) => Source::Against(at),
+        (None, None) => Source::Live,
+    };
+
+    match &against {
+        // The sample of a run measured against a recording is the recording's
+        // own, so saying how many symbols were asked for would name a number
+        // this run does not use.
+        Some(at) => println!(
+            "comparing {language} references under {} against the answers recorded in {}",
+            root.display(),
+            at.display()
+        ),
+        None => println!(
+            "comparing {language} references under {} over {symbol_count} symbols",
+            root.display()
+        ),
+    }
+    // Only where a server is actually started: a run measured against a
+    // recording starts none, and a line about its cache would describe
+    // something that is not happening.
+    if against.is_none()
+        && semantic_index::per_language::language_server(&language).is_some_and(|spoken| {
+            spoken.options == semantic_index::per_language::Options::RustAnalyzer
+        })
     {
         println!(
             "rust-analyzer's query cache is capped at {} entries (RA_LRU_CAP); its own default \
@@ -133,6 +193,8 @@ async fn run() -> Result<()> {
         indexing_timeout,
         query_timeout,
         certainty,
+        source,
+        answering,
     )
     .await?;
     // Printed before anything is judged: the divergences are the point of this

@@ -31,6 +31,25 @@
   "interface" @context
   name: (_) @name) @item
 
+; An interface's own members. Written without naming the body's node -- `(_)`
+; matches whatever the grammar calls it -- so the query does not have to be
+; rewritten when the grammar renames that node, which it has done before.
+;
+; Recorded because a name declared on an interface is a name the project
+; declares: measured, leaving them out is what put TypeScript's pooled
+; precision at 51.6 per cent. `console.warn` was read as a reference to a
+; project function called `warn`, because nothing said `warn` is also declared
+; as a member somewhere.
+(interface_declaration
+  body: (_
+    (property_signature
+      name: (_) @name) @item))
+
+(interface_declaration
+  body: (_
+    (method_signature
+      name: (_) @name) @item))
+
 (export_statement
   (lexical_declaration
     [

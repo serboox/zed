@@ -48,6 +48,92 @@ pub struct Built {
     pub the_most_memory: Option<u64>,
 }
 
+/// What one file says, beyond the definitions in it: everything the index needs
+/// to decide what an occurrence of a name refers to.
+///
+/// Held together because it is read together and replaced together -- one file
+/// changing invalidates all of it at once -- and because a resolution that had
+/// to gather these from five places at query time would be doing project-wide
+/// work per keystroke, which is the appetite this whole store exists to avoid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileFacts {
+    pub occurrences: Vec<Occurrence>,
+    pub locals: Vec<Local>,
+    /// Row ranges the language's build switches off, zero-based and inclusive
+    /// like every other row here.
+    pub gated: Vec<(u32, u32)>,
+    /// Where the file sits in the language's own arrangement of code: for Rust,
+    /// the crate and the module path. `None` for a file nothing reaches, which
+    /// is not the same as one at the root.
+    pub placement: Option<Placement>,
+    pub imports: Vec<Import>,
+    /// Names this file declares as a member of a type.
+    ///
+    /// Part of the same record as the rest, and replaced with it: a file whose
+    /// occurrences were replaced while its members were not is a file the index
+    /// answers about wrongly -- it would offer a member's name as a plain one.
+    pub members: Vec<String>,
+}
+
+/// One place a name is written, and what the index resolved it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub name: String,
+    /// Zero-based, as tree-sitter and the LSP protocol both count.
+    pub row: u32,
+    pub column: u32,
+    /// The file holding the declaration this occurrence refers to, where the
+    /// index could tell. `None` means nothing resolved it -- which is not
+    /// "it refers to nothing", and the difference is what keeps an unresolved
+    /// occurrence from being counted as a reference to whatever was asked
+    /// about.
+    pub resolves_to: Option<String>,
+}
+
+/// A name bound locally, over the rows it is bound across.
+///
+/// Rows are zero-based and inclusive, as tree-sitter counts them and as
+/// [`Occurrence`] carries them. Every row in this store is counted that way, on
+/// purpose: an occurrence is compared against a local's range on every
+/// question, and two conventions meeting there would be a silent off-by-one
+/// that reads as a resolution bug rather than as a units bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Local {
+    pub name: String,
+    pub from_row: u32,
+    pub to_row: u32,
+}
+
+/// Where a file sits in the language's arrangement of code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    /// The crate, package or module group the file belongs to.
+    pub unit: String,
+    /// The path within it, as the language spells it.
+    pub path: String,
+}
+
+/// A name a file brings into scope, what it means there, and where the line
+/// that brings it in is written.
+///
+/// The position is not decoration: a rename that changed every use of a name
+/// and left the `use` line spelling the old one does not compile, and the
+/// references query deliberately does not capture an imported name -- it is a
+/// plain identifier there, and capturing it would have widened the query to
+/// every identifier in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    pub name: String,
+    pub means: String,
+    pub row: u32,
+    pub column: u32,
+}
+
+/// Which arrangement of tables this version reads. Raised whenever a column
+/// changes meaning or leaves, so a store written before the change is rebuilt
+/// from the files rather than read as though it agreed.
+pub const SCHEMA_VERSION: u32 = 1;
+
 impl Symbols {
     /// Opens the symbols kept at `path`, creating them if there are none.
     pub fn open(path: &Path) -> Result<Self> {
@@ -61,6 +147,17 @@ impl Symbols {
     }
 
     fn of(connection: Connection) -> Result<Self> {
+        let store = Self { connection };
+        // Before the tables are made, not after: a migration that throws away
+        // what an older version wrote has to run while those tables are still
+        // the old ones, or it drops the ones just created and leaves the store
+        // without them until the next open.
+        store.migrate()?;
+        store.prepare_tables()?;
+        Ok(store)
+    }
+
+    fn prepare_tables(&self) -> Result<()> {
         // One statement per call: sqlez prepares every statement of a call
         // before running any of them, so an index prepared alongside the table
         // it is on would be prepared before that table exists.
@@ -95,10 +192,153 @@ impl Symbols {
                  line INTEGER NOT NULL,
                  PRIMARY KEY (file, place)
              ) STRICT, WITHOUT ROWID;",
+            // What a file's reference query recognised, and what each
+            // occurrence resolves to when the store knows. Clustered by file
+            // for the same reason `symbols` is: replacing one file's rows is a
+            // walk over a range rather than a lookup through a second index.
+            //
+            // `resolves_to` is the file a name was resolved to and is null
+            // where nothing resolved it -- which is not the same as "resolved
+            // to nothing", and a store that could not tell the two apart would
+            // read every unresolved occurrence as a reference to whatever the
+            // reader asked about.
+            "CREATE TABLE IF NOT EXISTS occurrences (
+                 file INTEGER NOT NULL,
+                 place INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 row INTEGER NOT NULL,
+                 column INTEGER NOT NULL,
+                 resolves_to INTEGER,
+                 PRIMARY KEY (file, place)
+             ) STRICT, WITHOUT ROWID;",
+            // A name bound locally, with the rows it is bound over. Ranges
+            // rather than a bare set of names, because a set can only say "this
+            // name is somebody's local somewhere" and make the index decline
+            // the name everywhere -- which is what it does today and what
+            // costs it two names in three.
+            "CREATE TABLE IF NOT EXISTS locals (
+                 file INTEGER NOT NULL,
+                 place INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 from_row INTEGER NOT NULL,
+                 to_row INTEGER NOT NULL,
+                 PRIMARY KEY (file, place)
+             ) STRICT, WITHOUT ROWID;",
+            // Row ranges the language's build switches off. Kept per file
+            // because that is the unit everything else here is replaced by.
+            "CREATE TABLE IF NOT EXISTS gated (
+                 file INTEGER NOT NULL,
+                 place INTEGER NOT NULL,
+                 from_row INTEGER NOT NULL,
+                 to_row INTEGER NOT NULL,
+                 PRIMARY KEY (file, place)
+             ) STRICT, WITHOUT ROWID;",
+            // Where a file sits in the language's own arrangement of code --
+            // for Rust, which crate and which module path -- and what it
+            // brings into scope. One row per file for the placement, many for
+            // the imports.
+            "CREATE TABLE IF NOT EXISTS placement (
+                 file INTEGER PRIMARY KEY,
+                 unit TEXT NOT NULL,
+                 path TEXT NOT NULL
+             ) STRICT, WITHOUT ROWID;",
+            // Names the project declares as a member of a type -- a method, a
+            // field, an associated item. Names rather than positions, because
+            // the question asked of this table is whether a *name* is a member
+            // anywhere: two module-level items of one name are told apart by
+            // which module each is in, two members of one name only by the type
+            // they are written on, and types are what this knows nothing about.
+            "CREATE TABLE IF NOT EXISTS members (
+                 file INTEGER NOT NULL,
+                 place INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 PRIMARY KEY (file, place)
+             ) STRICT, WITHOUT ROWID;",
+            "CREATE TABLE IF NOT EXISTS imports (
+                 file INTEGER NOT NULL,
+                 place INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 means TEXT NOT NULL,
+                 row INTEGER NOT NULL,
+                 column INTEGER NOT NULL,
+                 PRIMARY KEY (file, place)
+             ) STRICT, WITHOUT ROWID;",
         ] {
-            run(&connection, statement).context("preparing the symbol tables")?;
+            run(&self.connection, statement).context("preparing the symbol tables")?;
         }
-        Ok(Self { connection })
+
+        // Every question resolution asks is asked by name, and none of these
+        // tables is keyed by one. Measured before these existed: a single
+        // question took 192 ms, because each of the five lookups walked the
+        // whole table -- 182,171 symbols in this project. The store is 99 MB
+        // without them; what they buy is the difference between a question
+        // answered while the reader is still moving the cursor and one that
+        // arrives after.
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS symbols_by_name ON symbols (name)",
+            "CREATE INDEX IF NOT EXISTS occurrences_by_name ON occurrences (name)",
+            "CREATE INDEX IF NOT EXISTS locals_by_name ON locals (name)",
+            "CREATE INDEX IF NOT EXISTS members_by_name ON members (name)",
+            "CREATE INDEX IF NOT EXISTS imports_by_name ON imports (name)",
+        ] {
+            run(&self.connection, statement).context("indexing what is asked for by name")?;
+        }
+        Ok(())
+    }
+
+    /// Brings an older store up to what this version reads, or throws it away
+    /// when it cannot.
+    ///
+    /// A store is a cache of what the files say, so the cheapest honest answer
+    /// to "this file was written by a version that arranged things differently"
+    /// is to build it again from the files. What must not happen is reading it
+    /// as though it were current: a table missing a column that a query names
+    /// fails the query, and a table whose rows mean something else answers
+    /// wrongly and silently.
+    fn migrate(&self) -> Result<()> {
+        let held = self.version()?;
+        if held == SCHEMA_VERSION {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            held <= SCHEMA_VERSION,
+            "this store was written by a newer version of the index (schema {held}, this reads \
+             {SCHEMA_VERSION}); it is not read rather than read wrongly"
+        );
+        // Unconditionally, and not only for a store that already carried a
+        // version: a store written before versions were recorded reads as
+        // version zero, which is exactly the store whose tables may mean
+        // something else. A store being made for the first time reads as zero
+        // too, and dropping tables it does not have yet costs nothing --
+        // migration runs before they are made.
+        //
+        // Only the tables resolution added. The symbol tables a version-zero
+        // store already has are compatible by construction: nothing has
+        // changed a column of theirs, and throwing them away would mean
+        // reading every file again to learn what the store already knew.
+        for statement in [
+            "DROP TABLE IF EXISTS occurrences",
+            "DROP TABLE IF EXISTS locals",
+            "DROP TABLE IF EXISTS gated",
+            "DROP TABLE IF EXISTS placement",
+            "DROP TABLE IF EXISTS imports",
+            "DROP TABLE IF EXISTS members",
+        ] {
+            run(&self.connection, statement).context("clearing what an older store held")?;
+        }
+        run(
+            &self.connection,
+            &format!("PRAGMA user_version = {SCHEMA_VERSION}"),
+        )
+        .context("recording which version wrote this store")
+    }
+
+    /// What version wrote this store. Zero for a store written before versions
+    /// were recorded, which is also what SQLite answers for a new file.
+    pub fn version(&self) -> Result<u32> {
+        let mut statement = Statement::prepare(&self.connection, "PRAGMA user_version")?;
+        let held = statement.maybe(|row| row.column_int64(0))?;
+        Ok(held.unwrap_or_default() as u32)
     }
 
     /// Replaces everything recorded for one file.
@@ -196,6 +436,292 @@ impl Symbols {
         )?;
         statement.bind_text(1, path)?;
         statement.map(read_definition)
+    }
+
+    /// Says what each of a file's occurrences resolves to, in the order the
+    /// occurrences were recorded.
+    ///
+    /// Written in a pass of its own because what an occurrence resolves to
+    /// needs the whole project: which module every file belongs to is not
+    /// knowable while the files are still being read one at a time.
+    pub fn record_resolutions(&self, path: &str, targets: &[Option<String>]) -> Result<()> {
+        self.in_one_transaction(|store| {
+            let mut files = Dictionary::on(&store.connection, "files", "path")?;
+            let file = files.of(path)?;
+            let mut write = Statement::prepare(
+                &store.connection,
+                "UPDATE occurrences SET resolves_to = ? WHERE file = ? AND place = ?",
+            )?;
+            for (place, target) in targets.iter().enumerate() {
+                let target = match target {
+                    Some(target) => Some(files.of(target)?),
+                    None => None,
+                };
+                write.reset();
+                match target {
+                    Some(target) => write.bind_int64(1, target)?,
+                    None => write.bind_null(1)?,
+                }
+                write.bind_int64(2, file)?;
+                write.bind_int64(3, place as i64)?;
+                write.exec()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Where a file sits in the language's arrangement of code, as a module
+    /// tree worked it out.
+    pub fn record_placement(&self, path: &str, placement: Option<&Placement>) -> Result<()> {
+        self.in_one_transaction(|store| {
+            let mut files = Dictionary::on(&store.connection, "files", "path")?;
+            let file = files.of(path)?;
+            let mut clear =
+                Statement::prepare(&store.connection, "DELETE FROM placement WHERE file = ?")?;
+            clear.bind_int64(1, file)?;
+            clear.exec()?;
+            if let Some(placement) = placement {
+                let mut write = Statement::prepare(
+                    &store.connection,
+                    "INSERT INTO placement (file, unit, path) VALUES (?, ?, ?)",
+                )?;
+                write.bind_int64(1, file)?;
+                write.bind_text(2, &placement.unit)?;
+                write.bind_text(3, &placement.path)?;
+                write.exec()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Marks which of a file's definitions are members of a type. Replaces what
+    /// the file had marked before, the way every other per-file record does.
+    pub fn record_members(&self, path: &str, names: &[String]) -> Result<()> {
+        self.in_one_transaction(|store| {
+            let mut writing = FactWriting::on(&store.connection)?;
+            writing.replace_members(path, names)
+        })
+    }
+
+    /// Replaces everything the store holds about how one file's names resolve.
+    ///
+    /// Separate from [`Symbols::record`] rather than folded into it, because a
+    /// definitions pass and a resolution pass cost very different amounts and
+    /// are not always both wanted: the outline pass runs over every file at
+    /// startup, while resolution is asked for where a question is being
+    /// answered.
+    pub fn record_facts(&self, path: &str, facts: &FileFacts) -> Result<()> {
+        self.in_one_transaction(|store| {
+            let mut writing = FactWriting::on(&store.connection)?;
+            writing.replace(path, facts)?;
+            writing.replace_members(path, &facts.members)
+        })
+    }
+
+    pub fn occurrences_in(&self, path: &str) -> Result<Vec<Occurrence>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            // Whether the target is null is asked for as its own column, because
+            // sqlite hands a null text column back as an empty string: read
+            // without this, every occurrence nothing resolved would come back
+            // as one resolved to a file with no name, which is the difference
+            // this table exists to keep.
+            "SELECT occurrences.name, occurrences.row, occurrences.column, resolved.path,
+                    occurrences.resolves_to IS NULL
+             FROM occurrences
+             JOIN files ON files.id = occurrences.file
+             LEFT JOIN files AS resolved ON resolved.id = occurrences.resolves_to
+             WHERE files.path = ?
+             ORDER BY occurrences.place",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.map(|row| {
+            Ok(Occurrence {
+                name: row.column_text(0)?.to_string(),
+                row: row.column_int64(1)? as u32,
+                column: row.column_int64(2)? as u32,
+                resolves_to: if row.column_int64(4)? == 1 {
+                    None
+                } else {
+                    Some(row.column_text(3)?.to_string())
+                },
+            })
+        })
+    }
+
+    pub fn locals_in(&self, path: &str) -> Result<Vec<Local>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT locals.name, locals.from_row, locals.to_row
+             FROM locals
+             JOIN files ON files.id = locals.file
+             WHERE files.path = ?
+             ORDER BY locals.place",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.map(|row| {
+            Ok(Local {
+                name: row.column_text(0)?.to_string(),
+                from_row: row.column_int64(1)? as u32,
+                to_row: row.column_int64(2)? as u32,
+            })
+        })
+    }
+
+    pub fn gated_in(&self, path: &str) -> Result<Vec<(u32, u32)>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT gated.from_row, gated.to_row
+             FROM gated
+             JOIN files ON files.id = gated.file
+             WHERE files.path = ?
+             ORDER BY gated.place",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.map(|row| Ok((row.column_int64(0)? as u32, row.column_int64(1)? as u32)))
+    }
+
+    pub fn placement_of(&self, path: &str) -> Result<Option<Placement>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT placement.unit, placement.path
+             FROM placement
+             JOIN files ON files.id = placement.file
+             WHERE files.path = ?",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.maybe(|row| {
+            Ok(Placement {
+                unit: row.column_text(0)?.to_string(),
+                path: row.column_text(1)?.to_string(),
+            })
+        })
+    }
+
+    pub fn imports_in(&self, path: &str) -> Result<Vec<Import>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT imports.name, imports.means, imports.row, imports.column
+             FROM imports
+             JOIN files ON files.id = imports.file
+             WHERE files.path = ?
+             ORDER BY imports.place",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.map(|row| {
+            Ok(Import {
+                name: row.column_text(0)?.to_string(),
+                means: row.column_text(1)?.to_string(),
+                row: row.column_int64(2)? as u32,
+                column: row.column_int64(3)? as u32,
+            })
+        })
+    }
+
+    /// How many definitions in the project carry this name.
+    ///
+    /// The first question any resolution asks: a name declared once means one
+    /// thing, and a name declared twice means the index has to say which -- or
+    /// say nothing.
+    pub fn declarations_named(&self, name: &str) -> Result<usize> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT COUNT(*) FROM symbols WHERE name = ?",
+        )?;
+        statement.bind_text(1, name)?;
+        let counted = statement.maybe(|row| row.column_int64(0))?;
+        Ok(counted.unwrap_or_default() as usize)
+    }
+
+    /// Whether the project declares this name as a member of a type anywhere.
+    pub fn is_a_member_name(&self, name: &str) -> Result<bool> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT COUNT(*) FROM members WHERE name = ?",
+        )?;
+        statement.bind_text(1, name)?;
+        let counted = statement.maybe(|row| row.column_int64(0))?;
+        Ok(counted.unwrap_or_default() as usize > 0)
+    }
+
+    /// Every place this name is written, across the project, with the file it
+    /// is written in.
+    pub fn occurrences_named(&self, name: &str) -> Result<Vec<(String, Occurrence)>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT files.path, occurrences.name, occurrences.row, occurrences.column,
+                    resolved.path, occurrences.resolves_to IS NULL
+             FROM occurrences
+             JOIN files ON files.id = occurrences.file
+             LEFT JOIN files AS resolved ON resolved.id = occurrences.resolves_to
+             WHERE occurrences.name = ?
+             ORDER BY files.path, occurrences.place",
+        )?;
+        statement.bind_text(1, name)?;
+        statement.map(|row| {
+            Ok((
+                row.column_text(0)?.to_string(),
+                Occurrence {
+                    name: row.column_text(1)?.to_string(),
+                    row: row.column_int64(2)? as u32,
+                    column: row.column_int64(3)? as u32,
+                    resolves_to: if row.column_int64(5)? == 1 {
+                        None
+                    } else {
+                        Some(row.column_text(4)?.to_string())
+                    },
+                },
+            ))
+        })
+    }
+
+    /// Every file that brings this name in, and where the line that does it is
+    /// written.
+    pub fn imports_named(&self, name: &str) -> Result<Vec<(String, Import)>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT files.path, imports.name, imports.means, imports.row, imports.column
+             FROM imports
+             JOIN files ON files.id = imports.file
+             WHERE imports.name = ?
+             ORDER BY files.path, imports.place",
+        )?;
+        statement.bind_text(1, name)?;
+        statement.map(|row| {
+            Ok((
+                row.column_text(0)?.to_string(),
+                Import {
+                    name: row.column_text(1)?.to_string(),
+                    means: row.column_text(2)?.to_string(),
+                    row: row.column_int64(3)? as u32,
+                    column: row.column_int64(4)? as u32,
+                },
+            ))
+        })
+    }
+
+    /// Every place this name is bound locally, with the file and the rows it is
+    /// bound across.
+    pub fn locals_named(&self, name: &str) -> Result<Vec<(String, Local)>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT files.path, locals.name, locals.from_row, locals.to_row
+             FROM locals
+             JOIN files ON files.id = locals.file
+             WHERE locals.name = ?
+             ORDER BY files.path, locals.place",
+        )?;
+        statement.bind_text(1, name)?;
+        statement.map(|row| {
+            Ok((
+                row.column_text(0)?.to_string(),
+                Local {
+                    name: row.column_text(1)?.to_string(),
+                    from_row: row.column_int64(2)? as u32,
+                    to_row: row.column_int64(3)? as u32,
+                },
+            ))
+        })
     }
 
     /// Gives back the room that deleted rows left behind, so the size on disk is
@@ -306,6 +832,160 @@ impl<'a> Writing<'a> {
     }
 }
 
+/// Writes what one file's names resolve to, in one place so the five tables are
+/// always replaced together: a file whose occurrences were replaced but whose
+/// locals were not is a file the index would answer about wrongly.
+struct FactWriting<'a> {
+    files: Dictionary<'a>,
+    clear_occurrences: Statement<'a>,
+    clear_locals: Statement<'a>,
+    clear_gated: Statement<'a>,
+    clear_placement: Statement<'a>,
+    clear_imports: Statement<'a>,
+    write_occurrence: Statement<'a>,
+    write_local: Statement<'a>,
+    write_gated: Statement<'a>,
+    write_placement: Statement<'a>,
+    write_import: Statement<'a>,
+    clear_members: Statement<'a>,
+    write_member: Statement<'a>,
+}
+
+impl<'a> FactWriting<'a> {
+    fn on(connection: &'a Connection) -> Result<Self> {
+        Ok(Self {
+            files: Dictionary::on(connection, "files", "path")?,
+            clear_occurrences: Statement::prepare(
+                connection,
+                "DELETE FROM occurrences WHERE file = ?",
+            )?,
+            clear_locals: Statement::prepare(connection, "DELETE FROM locals WHERE file = ?")?,
+            clear_gated: Statement::prepare(connection, "DELETE FROM gated WHERE file = ?")?,
+            clear_placement: Statement::prepare(
+                connection,
+                "DELETE FROM placement WHERE file = ?",
+            )?,
+            clear_imports: Statement::prepare(connection, "DELETE FROM imports WHERE file = ?")?,
+            write_occurrence: Statement::prepare(
+                connection,
+                "INSERT INTO occurrences (file, place, name, row, column, resolves_to)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )?,
+            write_local: Statement::prepare(
+                connection,
+                "INSERT INTO locals (file, place, name, from_row, to_row) VALUES (?, ?, ?, ?, ?)",
+            )?,
+            write_gated: Statement::prepare(
+                connection,
+                "INSERT INTO gated (file, place, from_row, to_row) VALUES (?, ?, ?, ?)",
+            )?,
+            write_placement: Statement::prepare(
+                connection,
+                "INSERT INTO placement (file, unit, path) VALUES (?, ?, ?)",
+            )?,
+            write_import: Statement::prepare(
+                connection,
+                "INSERT INTO imports (file, place, name, means, row, column)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )?,
+            clear_members: Statement::prepare(connection, "DELETE FROM members WHERE file = ?")?,
+            write_member: Statement::prepare(
+                connection,
+                "INSERT INTO members (file, place, name) VALUES (?, ?, ?)",
+            )?,
+        })
+    }
+
+    fn replace_members(&mut self, path: &str, names: &[String]) -> Result<()> {
+        let file = self.files.of(path)?;
+        self.clear_members.reset();
+        self.clear_members.bind_int64(1, file)?;
+        self.clear_members.exec()?;
+        for (place, name) in names.iter().enumerate() {
+            self.write_member.reset();
+            self.write_member.bind_int64(1, file)?;
+            self.write_member.bind_int64(2, place as i64)?;
+            self.write_member.bind_text(3, name)?;
+            self.write_member.exec()?;
+        }
+        Ok(())
+    }
+
+    fn replace(&mut self, path: &str, facts: &FileFacts) -> Result<()> {
+        let file = self.files.of(path)?;
+        for clearing in [
+            &mut self.clear_occurrences,
+            &mut self.clear_locals,
+            &mut self.clear_gated,
+            &mut self.clear_placement,
+            &mut self.clear_imports,
+        ] {
+            clearing.reset();
+            clearing.bind_int64(1, file)?;
+            clearing.exec()?;
+        }
+
+        for (place, one) in facts.occurrences.iter().enumerate() {
+            // A file named as the target has to be in `files` before it can be
+            // pointed at, and it may be a file nothing has read yet.
+            let resolved = match &one.resolves_to {
+                Some(target) => Some(self.files.of(target)?),
+                None => None,
+            };
+            self.write_occurrence.reset();
+            self.write_occurrence.bind_int64(1, file)?;
+            self.write_occurrence.bind_int64(2, place as i64)?;
+            self.write_occurrence.bind_text(3, &one.name)?;
+            self.write_occurrence.bind_int64(4, one.row as i64)?;
+            self.write_occurrence.bind_int64(5, one.column as i64)?;
+            match resolved {
+                Some(target) => self.write_occurrence.bind_int64(6, target)?,
+                None => self.write_occurrence.bind_null(6)?,
+            };
+            self.write_occurrence.exec()?;
+        }
+
+        for (place, one) in facts.locals.iter().enumerate() {
+            self.write_local.reset();
+            self.write_local.bind_int64(1, file)?;
+            self.write_local.bind_int64(2, place as i64)?;
+            self.write_local.bind_text(3, &one.name)?;
+            self.write_local.bind_int64(4, one.from_row as i64)?;
+            self.write_local.bind_int64(5, one.to_row as i64)?;
+            self.write_local.exec()?;
+        }
+
+        for (place, (from_row, to_row)) in facts.gated.iter().enumerate() {
+            self.write_gated.reset();
+            self.write_gated.bind_int64(1, file)?;
+            self.write_gated.bind_int64(2, place as i64)?;
+            self.write_gated.bind_int64(3, *from_row as i64)?;
+            self.write_gated.bind_int64(4, *to_row as i64)?;
+            self.write_gated.exec()?;
+        }
+
+        if let Some(placement) = &facts.placement {
+            self.write_placement.reset();
+            self.write_placement.bind_int64(1, file)?;
+            self.write_placement.bind_text(2, &placement.unit)?;
+            self.write_placement.bind_text(3, &placement.path)?;
+            self.write_placement.exec()?;
+        }
+
+        for (place, one) in facts.imports.iter().enumerate() {
+            self.write_import.reset();
+            self.write_import.bind_int64(1, file)?;
+            self.write_import.bind_int64(2, place as i64)?;
+            self.write_import.bind_text(3, &one.name)?;
+            self.write_import.bind_text(4, &one.means)?;
+            self.write_import.bind_int64(5, one.row as i64)?;
+            self.write_import.bind_int64(6, one.column as i64)?;
+            self.write_import.exec()?;
+        }
+        Ok(())
+    }
+}
+
 /// One of the tables that hold a name once and hand out a number for it.
 struct Dictionary<'a> {
     find: Statement<'a>,
@@ -402,8 +1082,14 @@ pub fn build(root: &Path, cores: usize, into: &Symbols) -> Result<Built> {
         cores,
         ..Built::default()
     };
+    // What every file declares, with positions, kept for the pass that follows:
+    // which module a declaration is in is not knowable while the files are
+    // still being read one at a time, and reading them again to find out would
+    // double the most expensive part of the build.
+    let mut declared: Vec<(String, Vec<crate::references::Declared>)> = Vec::new();
     into.in_one_transaction(|store| {
         let mut writing = Writing::on(&store.connection)?;
+        let mut facts = FactWriting::on(&store.connection)?;
         for round in readings.chunks(A_ROUND) {
             let reading_started = Instant::now();
             let read: Vec<Read> = pool.install(|| {
@@ -417,6 +1103,37 @@ pub fn build(root: &Path, cores: usize, into: &Symbols) -> Result<Built> {
             let writing_started = Instant::now();
             for one in &read {
                 writing.replace(&one.path, &one.found)?;
+                if let Some(resolution) = &one.resolution {
+                    facts.replace(
+                        &one.path,
+                        &FileFacts {
+                            occurrences: resolution
+                                .occurrences
+                                .iter()
+                                .map(|found| Occurrence {
+                                    name: found.name.clone(),
+                                    row: found.row,
+                                    column: found.column,
+                                    // What each occurrence resolves to is not
+                                    // worked out yet: that is imports and the
+                                    // module tree, and until they are here an
+                                    // unresolved occurrence must stay
+                                    // unresolved rather than be filed as
+                                    // resolved to nothing.
+                                    resolves_to: None,
+                                })
+                                .collect(),
+                            locals: resolution.locals.clone(),
+                            imports: resolution.imports.clone(),
+                            gated: resolution.gated.clone(),
+                            members: resolution.members.clone(),
+                            ..Default::default()
+                        },
+                    )?;
+                    facts.replace_members(&one.path, &resolution.members)?;
+
+                    declared.push((one.path.clone(), resolution.declares.clone()));
+                }
                 built.files += 1;
                 built.symbols += one.found.len();
                 built.bytes += one.bytes;
@@ -426,9 +1143,73 @@ pub fn build(root: &Path, cores: usize, into: &Symbols) -> Result<Built> {
         Ok(())
     })?;
 
+    // Now that every file has been read, what each name in it refers to can be
+    // worked out -- and only now. Kept out of the transaction above because
+    // each of these writes opens its own, and a transaction inside a
+    // transaction is not one.
+    resolve_what_was_read(root, &readable, into, &declared)?;
+
     built.took = started.elapsed();
     built.the_most_memory = measure::the_most_memory_so_far();
     Ok(built)
+}
+
+/// Works out what each occurrence refers to, once the whole project has been
+/// read, and records it beside the occurrence.
+///
+/// Measured on this fork: of 350 names declined for being declared more than
+/// once, 264 have their declarations in different crates -- which this tells
+/// apart without any type inference. The other 86 stay declined.
+fn resolve_what_was_read(
+    root: &Path,
+    readable: &[Readable],
+    into: &Symbols,
+    declared: &[(String, Vec<crate::references::Declared>)],
+) -> Result<()> {
+    let Some(rust) = readable.iter().find(|language| language.name == "rust") else {
+        return Ok(());
+    };
+    let flattened: Vec<(&str, &str, u32, u32)> = declared
+        .iter()
+        .flat_map(|(path, declares)| {
+            declares
+                .iter()
+                .map(move |one| (path.as_str(), one.name.as_str(), one.row, one.column))
+        })
+        .collect();
+    let tree = match crate::modules::read_with(root, rust, flattened.into_iter()) {
+        Ok(tree) => tree,
+        Err(trouble) => {
+            // Without a tree every name declared more than once is declined,
+            // which is where this index started -- worse, not broken. Said out
+            // loud, because a silent one would read as the index simply
+            // knowing less than it does.
+            log::warn!(
+                "the module tree could not be read, so shared names stay declined: {trouble:#}"
+            );
+            return Ok(());
+        }
+    };
+
+    for (path, _) in declared {
+        let occurrences = into.occurrences_in(path)?;
+        if !occurrences.is_empty() {
+            let targets: Vec<Option<String>> = occurrences
+                .iter()
+                .map(|occurrence| {
+                    tree.what_a_name_means(path, &occurrence.name)
+                        .map(|declared| declared.path.clone())
+                })
+                .collect();
+            into.record_resolutions(path, &targets)?;
+        }
+        let placement = tree.placed(path).map(|placed| Placement {
+            unit: placed.crate_name.clone(),
+            path: placed.module_path.clone(),
+        });
+        into.record_placement(path, placement.as_ref())?;
+    }
+    Ok(())
 }
 
 /// One file, read.
@@ -436,19 +1217,33 @@ struct Read {
     path: String,
     bytes: u64,
     found: Vec<Definition>,
+    /// `None` for a language with no references query written for it, which is
+    /// a different thing from a file whose names resolve to nothing.
+    resolution: Option<crate::references::FileResolution>,
 }
 
 /// Reads one file and finds its definitions. `None` for a file that cannot be
 /// read or parsed at all: one file fewer, not a reason to abandon the pass.
 fn read_one(root: &Path, path: &Path, language: &Readable) -> Option<Read> {
     let bytes = std::fs::metadata(path).ok()?.len();
-    let mut parser = tree_sitter::Parser::new();
-    let found = definitions::in_file_on_disk(root, path, language, &mut parser)?;
+    let contents = std::fs::read(path).ok()?;
     let named = path.strip_prefix(root).ok()?;
+    let named = named.to_string_lossy().replace('\\', "/");
+    let mut parser = tree_sitter::Parser::new();
+    let found = definitions::in_file(&named, &contents, language, &mut parser).ok()?;
+    // Read in the same pass rather than in one of its own: a second walk over
+    // the project to work out what its names resolve to would be a second walk
+    // over the project. The parse is still this file's second -- sharing one
+    // between the outline query and the references query is the next saving,
+    // and one the cost gate will say whether to take.
+    let resolution = crate::references::resolution_in_file(&named, &contents)
+        .ok()
+        .flatten();
     Some(Read {
-        path: named.to_string_lossy().replace('\\', "/"),
+        path: named,
         bytes,
         found,
+        resolution,
     })
 }
 
@@ -623,6 +1418,203 @@ fn folded(letter: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn facts() -> FileFacts {
+        FileFacts {
+            occurrences: vec![
+                Occurrence {
+                    name: "thing".to_string(),
+                    row: 4,
+                    column: 8,
+                    resolves_to: Some("src/lib.rs".to_string()),
+                },
+                Occurrence {
+                    name: "thing".to_string(),
+                    row: 9,
+                    column: 2,
+                    resolves_to: None,
+                },
+            ],
+            locals: vec![Local {
+                name: "thing".to_string(),
+                from_row: 20,
+                to_row: 28,
+            }],
+            gated: vec![(40, 52)],
+            placement: Some(Placement {
+                unit: "semantic_index".to_string(),
+                path: "symbols".to_string(),
+            }),
+            imports: vec![Import {
+                name: "Definition".to_string(),
+                means: "crate::definitions::Definition".to_string(),
+                row: 6,
+                column: 4,
+            }],
+            members: vec!["read".to_string()],
+        }
+    }
+
+    #[test]
+    fn what_a_file_resolves_survives_the_round_trip() {
+        let store = Symbols::open_in_memory().expect("a store");
+        store
+            .record_facts("src/other.rs", &facts())
+            .expect("recording");
+
+        let read = store.occurrences_in("src/other.rs").expect("occurrences");
+        assert_eq!(read, facts().occurrences);
+        assert_eq!(
+            store.locals_in("src/other.rs").expect("locals"),
+            facts().locals
+        );
+        assert_eq!(
+            store.gated_in("src/other.rs").expect("gated"),
+            facts().gated
+        );
+        assert_eq!(
+            store.placement_of("src/other.rs").expect("placement"),
+            facts().placement
+        );
+        assert_eq!(
+            store.imports_in("src/other.rs").expect("imports"),
+            facts().imports
+        );
+        assert!(
+            store.is_a_member_name("read").expect("members"),
+            "a file's members are recorded with the rest of what it says"
+        );
+    }
+
+    // An occurrence nothing resolved is not an occurrence resolved to nothing.
+    // A store that could not tell the two apart would let every unresolved
+    // name count as a reference to whatever was asked about, which is the
+    // failure that measured 0.9% precision.
+    #[test]
+    fn an_unresolved_occurrence_stays_unresolved_rather_than_becoming_a_reference() {
+        let store = Symbols::open_in_memory().expect("a store");
+        store
+            .record_facts("src/other.rs", &facts())
+            .expect("recording");
+        let read = store.occurrences_in("src/other.rs").expect("occurrences");
+        assert_eq!(read[0].resolves_to.as_deref(), Some("src/lib.rs"));
+        assert_eq!(read[1].resolves_to, None);
+    }
+
+    // One file changing invalidates everything the store knew about how its
+    // names resolve, so all five tables are replaced together. A file whose
+    // occurrences were replaced but whose locals were not is a file the index
+    // answers about wrongly.
+    #[test]
+    fn recording_a_file_again_replaces_everything_it_held() {
+        let store = Symbols::open_in_memory().expect("a store");
+        store
+            .record_facts("src/other.rs", &facts())
+            .expect("recording");
+        store
+            .record_facts("src/other.rs", &FileFacts::default())
+            .expect("recording an empty pass");
+
+        assert!(
+            store
+                .occurrences_in("src/other.rs")
+                .expect("occurrences")
+                .is_empty()
+        );
+        assert!(store.locals_in("src/other.rs").expect("locals").is_empty());
+        assert!(store.gated_in("src/other.rs").expect("gated").is_empty());
+        assert_eq!(store.placement_of("src/other.rs").expect("placement"), None);
+        assert!(
+            store
+                .imports_in("src/other.rs")
+                .expect("imports")
+                .is_empty()
+        );
+        assert!(
+            !store.is_a_member_name("read").expect("members"),
+            "recording a file again replaces its members too, not only its occurrences"
+        );
+    }
+
+    // A store this version opened says so, so the next version can tell what it
+    // is looking at rather than guess from which columns happen to be there.
+    #[test]
+    fn a_new_store_records_which_version_wrote_it() {
+        let store = Symbols::open_in_memory().expect("a store");
+        assert_eq!(store.version().expect("the version"), SCHEMA_VERSION);
+    }
+
+    // The tables resolution needs are there from the first open, so nothing
+    // has to check for them before writing.
+    #[test]
+    fn the_tables_resolution_needs_are_there() {
+        let store = Symbols::open_in_memory().expect("a store");
+        for table in ["occurrences", "locals", "gated", "placement", "imports"] {
+            let mut statement = Statement::prepare(
+                &store.connection,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .expect("asking sqlite what it has");
+            statement.bind_text(1, table).expect("binding the name");
+            let found = statement
+                .maybe(|row| row.column_int64(0))
+                .expect("a count")
+                .unwrap_or_default();
+            assert_eq!(found, 1, "{table} is not in a store this version opened");
+        }
+    }
+
+    // A store written by a version that arranged things differently is rebuilt
+    // from the files, not read as though it agreed. Read as current, a table
+    // whose rows mean something else answers wrongly and silently -- which is
+    // the one outcome a cache must never have.
+    #[test]
+    fn a_store_from_an_older_version_is_cleared_rather_than_believed() {
+        let store = Symbols::open_in_memory().expect("a store");
+        store
+            .record(
+                "src/lib.rs",
+                &[symbol("src/lib.rs", "thing", "function", 1)],
+            )
+            .expect("recording a definition");
+        run(&store.connection, "PRAGMA user_version = 0").expect("pretending to be older");
+        run(
+            &store.connection,
+            "INSERT INTO occurrences (file, place, name, row, column, resolves_to)
+             VALUES (1, 0, 'thing', 4, 2, NULL)",
+        )
+        .expect("what the older version had recorded");
+
+        // The two steps an open does, in the order it does them.
+        store.migrate().expect("migrating");
+        store.prepare_tables().expect("preparing the tables again");
+
+        assert_eq!(store.version().expect("the version"), SCHEMA_VERSION);
+        assert!(
+            store
+                .occurrences_in("src/lib.rs")
+                .expect("the table is there to be read")
+                .is_empty(),
+            "an older store's resolution is thrown away and rebuilt, not read as though it agreed"
+        );
+    }
+
+    // The other direction is refused rather than mangled: a store from a newer
+    // version may hold columns this one would misread.
+    #[test]
+    fn a_store_from_a_newer_version_is_refused() {
+        let store = Symbols::open_in_memory().expect("a store");
+        run(
+            &store.connection,
+            &format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1),
+        )
+        .expect("pretending to be newer");
+        let refused = store.migrate();
+        assert!(
+            refused.is_err(),
+            "a store from a newer version has to be refused, not read"
+        );
+    }
 
     fn symbol(path: &str, name: &str, kind: &str, line: u32) -> Definition {
         Definition {

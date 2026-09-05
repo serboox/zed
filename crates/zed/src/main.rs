@@ -761,6 +761,10 @@ fn main() {
         outline::init(cx);
         project_symbols::init(cx);
         symbol_index::init(cx);
+        // The index answers in front of the language server where it can, which
+        // for now is the highlight under the cursor -- a request the server was
+        // asked for on every cursor move.
+        symbol_index::index_semantics::init(cx);
         search_everywhere::init(cx);
         project_panel::init(cx);
         outline_panel::init(cx);

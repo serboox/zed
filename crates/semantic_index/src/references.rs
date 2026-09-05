@@ -14,7 +14,237 @@ use crate::definitions::Definition;
 use crate::languages::{self, Readable};
 use crate::measure::{Spread, as_time, spread_of};
 use crate::per_language;
+use crate::recorded::{Answer, Asked, Provenance, Recording, Seen};
 use crate::walk;
+
+/// Which side of the index answers: the stand's own reading of the project, or
+/// the store the editor actually asks.
+///
+/// The two were the same thing only in intention. Everything measured at 97.7%
+/// precision was the stand's; the editor's path had none of the rules that
+/// bought that number, and nothing in the measurement said so. This is what
+/// says so -- and what stops the two drifting apart again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answering {
+    /// The stand's own pass over the project, held in memory.
+    TheStandsOwnReading,
+    /// The store the editor reads, built the way the editor builds it and
+    /// asked the way the editor asks it.
+    TheStoreTheEditorAsks,
+}
+
+/// Where the truth this measurement compares itself against comes from.
+///
+/// The measurement costs 16.2 GiB of rust-analyzer on this project and the
+/// machine that takes it dies at 600 symbols. [`Source::Record`] takes the
+/// server's answers once into a file, and [`Source::Against`] reads them back
+/// without starting a server at all -- which is what makes the number cheap
+/// enough to take after every change to the index, and therefore worth
+/// trusting.
+#[derive(Debug, Clone, Copy)]
+pub enum Source<'a> {
+    /// Ask the server as the comparison goes, the way this stand always has.
+    Live,
+    /// Ask the server about every sampled symbol, write the answers to this
+    /// file, and compare against them. Answers already in the file are not
+    /// asked again, so a sample too large for one run is taken over several.
+    Record(&'a Path),
+    /// Compare against answers recorded earlier. No server is started, and the
+    /// sample is the recording's own -- not re-drawn from the corpus, so the
+    /// number does not move with the order a directory walk happened to take.
+    Against(&'a Path),
+}
+
+/// What the source of truth says about one symbol.
+///
+/// The three ways of not knowing are kept apart because they cost the sample
+/// differently, and a measurement that collapsed them would report a suspect
+/// run as a clean one.
+enum Told {
+    Answered(Vec<Definition>),
+    /// The server knows the file and resolves nothing at that position.
+    NothingResolvedThere,
+    /// The server has no such file: outside the project it was started on.
+    OutsideTheProject,
+    /// The question itself failed.
+    AskingFailed,
+}
+
+/// What a recording holds about one symbol, in the shape the loop reads.
+fn recorded_about(recording: &Recording, symbol: &NamedAt) -> Told {
+    let asked = Asked {
+        path: symbol.path.clone(),
+        row: symbol.row,
+        column: symbol.column,
+        name: symbol.name.clone(),
+    };
+    let Some(answer) = recording.answer(&asked) else {
+        // A recording that does not hold a symbol the run is asking about is a
+        // recording out of step with the corpus. Said out loud rather than read
+        // as "the server had nothing to say".
+        log::warn!(
+            "the recording holds no answer about {} at {}:{}:{}",
+            symbol.name,
+            symbol.path,
+            symbol.row,
+            symbol.column
+        );
+        return Told::AskingFailed;
+    };
+    match answer.seen {
+        Seen::Yes => Told::Answered(answer.references.iter().map(Definition::from).collect()),
+        Seen::No => Told::NothingResolvedThere,
+        Seen::Refused => Told::OutsideTheProject,
+        Seen::Failed => Told::AskingFailed,
+    }
+}
+
+/// Whether the source of truth resolves the name at that position at all.
+///
+/// Asked before the index is consulted and separately from the references
+/// themselves, because that is the order the comparison has always run in: a
+/// symbol the server cannot see is counted whether or not the index would have
+/// answered about it, while the references are asked for only where the index
+/// has something to compare. Answering both from one call would have made the
+/// live run ask the server three times as often -- the sample where it declines
+/// two names in three -- and that run is already killed for memory at 600
+/// symbols.
+async fn probe(
+    server: Option<&mut Server>,
+    recording: Option<&Recording>,
+    symbol: &NamedAt,
+    language: &str,
+    query_timeout: Duration,
+) -> Told {
+    if let Some(recording) = recording {
+        return match recorded_about(recording, symbol) {
+            // The probe's question is only whether the name resolves there;
+            // what it resolves to is the next question.
+            Told::Answered(_) => Told::Answered(Vec::new()),
+            otherwise => otherwise,
+        };
+    }
+
+    let Some(server) = server else {
+        return Told::AskingFailed;
+    };
+
+    // A symbol the server does not know is a question neither side can be
+    // held to: `clear_globals` carries `#[cfg(any(test, feature =
+    // "test-support"))]`, so the server knows of no such function and
+    // answers nothing, while the index answers with every real call in
+    // the project. The server is asked rather than the `#[cfg]` text
+    // read: a gate that reads shut in the source can be open here --
+    // `crates/gpui_linux` is gated on Linux, and this runs on Linux.
+    // Told the file is open first, the way an editor would: a server
+    // that answers only about what something has opened -- `tsserver`
+    // does -- otherwise reports every file as one it does not have.
+    if let Err(error) = server.open(&symbol.path, language, query_timeout).await {
+        log::warn!("{error:#}");
+    }
+    match server
+        .resolves_at(&symbol.path, symbol.row, symbol.column, query_timeout)
+        .await
+    {
+        Ok(true) => Told::Answered(Vec::new()),
+        Ok(false) => Told::NothingResolvedThere,
+        Err(error) => {
+            let refused = error
+                .downcast_ref::<ServerRefused>()
+                .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+            if refused {
+                return Told::OutsideTheProject;
+            }
+            // The probe asks one thing -- does the server resolve this
+            // name here -- and an error is that question answered no.
+            // Counted and printed rather than swallowed: a run where the
+            // server failed on half the probes has to read as suspect,
+            // not as clean.
+            log::warn!(
+                "the language server could not say whether it resolves {} at {}:{}:{}: {error:#}",
+                symbol.name,
+                symbol.path,
+                symbol.row,
+                symbol.column
+            );
+            Told::AskingFailed
+        }
+    }
+}
+
+/// What the source of truth says the references are. Asked only where the index
+/// has an answer to compare against.
+async fn references_told(
+    server: Option<&mut Server>,
+    recording: Option<&Recording>,
+    symbol: &NamedAt,
+    query_timeout: Duration,
+) -> Result<Told> {
+    if let Some(recording) = recording {
+        return Ok(recorded_about(recording, symbol));
+    }
+
+    let Some(server) = server else {
+        return Ok(Told::AskingFailed);
+    };
+
+    match server
+        .references(
+            &symbol.path,
+            symbol.row,
+            symbol.column,
+            &symbol.name,
+            query_timeout,
+        )
+        .await
+    {
+        Ok(found) => Ok(Told::Answered(found)),
+        Err(error) => {
+            // A file the server has never heard of is outside the cargo graph,
+            // so neither side can be held to it. That is a smaller sample,
+            // counted and printed -- not a failed run, and not a reason to keep
+            // going after a request that failed for any other reason: a run
+            // that carried on past those would report a measurement over
+            // whatever happened to succeed.
+            let refused = error
+                .downcast_ref::<ServerRefused>()
+                .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
+            if refused {
+                return Ok(Told::OutsideTheProject);
+            }
+            Err(error).with_context(|| {
+                format!(
+                    "asking the language server for references to {} at {}:{}:{}",
+                    symbol.name, symbol.path, symbol.row, symbol.column
+                )
+            })
+        }
+    }
+}
+
+impl Told {
+    /// The recorded form of what was told, so a run that asked can hand the
+    /// answer to a run that will not.
+    fn into_answer(self, symbol: &NamedAt) -> Answer {
+        let (seen, references) = match self {
+            Told::Answered(found) => (
+                Seen::Yes,
+                found.iter().map(crate::recorded::Reference::from).collect(),
+            ),
+            Told::NothingResolvedThere => (Seen::No, Vec::new()),
+            Told::OutsideTheProject => (Seen::Refused, Vec::new()),
+            Told::AskingFailed => (Seen::Failed, Vec::new()),
+        };
+        Answer {
+            path: symbol.path.clone(),
+            row: symbol.row,
+            column: symbol.column,
+            name: symbol.name.clone(),
+            seen,
+            references,
+        }
+    }
+}
 
 /// A name found at an exact position: row and column both zero-based, as
 /// tree-sitter and the LSP protocol both count them.
@@ -305,6 +535,366 @@ fn prepare(language: &str, queries: Queries) -> Result<Ready> {
     })
 }
 
+/// Everything one file says about how the names in it resolve, in one parse.
+///
+/// The editor's own path used to have only the first of these -- the positions
+/// a references query recognises -- and none of what decides whether answering
+/// about a name is honest. Those decisions lived in the measuring stand, which
+/// is why the stand measured 97.7% precision and the editor could not use any
+/// of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileResolution {
+    pub occurrences: Vec<FoundInText>,
+    /// Names bound locally, with the rows each is bound across. Ranges rather
+    /// than bare names: a name that is somebody's local *somewhere* is a name
+    /// the index declines everywhere, which is what costs it two names in
+    /// three.
+    pub locals: Vec<crate::symbols::Local>,
+    /// Names this file declares as a member of a type.
+    pub members: Vec<String>,
+    /// Names this file brings into scope, and where each is written.
+    pub imports: Vec<crate::symbols::Import>,
+    /// Row ranges of items the build may switch off. Recorded rather than
+    /// filtered out: an occurrence inside a `#[cfg]` branch this build does not
+    /// compile is still written in the file, and a rename that skipped it would
+    /// leave the other branch spelling the old name. What this is for is
+    /// explaining a divergence from a language server -- the server never read
+    /// that branch -- not deciding what to answer.
+    pub gated: Vec<(u32, u32)>,
+    /// What this file declares, with positions -- what a module tree is built
+    /// from. Carried out of the same parse rather than found again: reading
+    /// the file twice to learn the same thing is the cost this whole store
+    /// exists to avoid.
+    pub declares: Vec<Declared>,
+}
+
+/// One declaration, with the position a module tree needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub name: String,
+    pub row: u32,
+    pub column: u32,
+}
+
+/// Reads one file into what the store keeps about it.
+///
+/// One parse for all three, because parsing is the expensive part and the
+/// editor calls this on save.
+pub fn resolution_in_file(file_name: &str, contents: &[u8]) -> Result<Option<FileResolution>> {
+    static CLAIMED: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let claimed = CLAIMED.get_or_init(languages::by_suffix);
+    let Some(language) = languages::of_file(file_name, claimed) else {
+        return Ok(None);
+    };
+    let prepared = ready_for(language, Queries::Written)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&prepared.readable.grammar)
+        .with_context(|| format!("loading the {language} grammar"))?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(None);
+    };
+    let (occurrences, declares) = references_in_tree(language, contents, &prepared, &tree);
+    let declares = declares
+        .into_iter()
+        .map(|symbol| Declared {
+            name: symbol.name,
+            row: symbol.row,
+            column: symbol.column,
+        })
+        .collect();
+
+    let mut locals = Vec::new();
+    let mut members = Vec::new();
+    let mut imports = Vec::new();
+    let mut gated = Vec::new();
+    walk_for_resolution(
+        language,
+        tree.root_node(),
+        contents,
+        false,
+        &mut locals,
+        &mut members,
+        &mut imports,
+        &mut gated,
+    );
+    Ok(Some(FileResolution {
+        occurrences,
+        locals,
+        members,
+        imports,
+        gated,
+        declares,
+    }))
+}
+
+/// Walks a file for the two things a references query cannot say: which names
+/// are bound locally and over what rows, and which are declared as members of a
+/// type.
+///
+/// `inside_a_type` carries down whether the walk is under an `impl` or a
+/// `trait`, because that -- and not the node's own kind -- is what makes a
+/// function a method: the grammar spells a method and a free function the same
+/// way.
+fn walk_for_resolution(
+    language: &str,
+    node: tree_sitter::Node,
+    contents: &[u8],
+    inside_a_type: bool,
+    locals: &mut Vec<crate::symbols::Local>,
+    members: &mut Vec<String>,
+    imports: &mut Vec<crate::symbols::Import>,
+    gated: &mut Vec<(u32, u32)>,
+) {
+    // Only Rust for now, and said out loud rather than left to look general:
+    // what a language binds in a scope has nothing in common between languages
+    // beyond being names whose meaning is their scope's, and the shapes are
+    // described beside each language when its turn comes.
+    if language != "rust" {
+        return;
+    }
+
+    // Once the walk is under an `impl` or a `trait`, everything below it is.
+    let under_a_type = inside_a_type || matches!(node.kind(), "impl_item" | "trait_item");
+
+    if under_a_type
+        && matches!(
+            node.kind(),
+            "function_item" | "function_signature_item" | "const_item" | "type_item"
+        )
+        && let Some(name) = node.child_by_field_name("name")
+        && let Ok(text) = name.utf8_text(contents)
+    {
+        members.push(text.to_string());
+    }
+    if node.kind() == "field_declaration"
+        && let Some(name) = node.child_by_field_name("name")
+        && let Ok(text) = name.utf8_text(contents)
+    {
+        members.push(text.to_string());
+    }
+
+    // A binding's rows run from where it is written to the end of what
+    // encloses it. Starting at the enclosing node instead would cover the rows
+    // *above* the binding, where the name still means whatever it meant before
+    // -- and an occurrence there would be dropped from an answer it belongs in.
+    // A `let` shadows from its own line onwards, which is the shape all of
+    // these have.
+    if let Some(pattern) = node.child_by_field_name("pattern") {
+        let scope = node.parent().unwrap_or(node);
+        let from_row = node.start_position().row as u32;
+        let to_row = scope.end_position().row as u32;
+        let mut names = Vec::new();
+        names_bound_by(pattern, contents, &mut names);
+        for name in names {
+            locals.push(crate::symbols::Local {
+                name,
+                from_row,
+                to_row,
+            });
+        }
+    }
+    if matches!(node.kind(), "parameter" | "closure_parameters")
+        && let Some(scope) = node.parent()
+    {
+        let from_row = scope.start_position().row as u32;
+        let to_row = scope.end_position().row as u32;
+        let mut names = Vec::new();
+        names_bound_by(node, contents, &mut names);
+        for name in names {
+            locals.push(crate::symbols::Local {
+                name,
+                from_row,
+                to_row,
+            });
+        }
+    }
+    if matches!(node.kind(), "type_parameters" | "const_parameter")
+        && let Some(scope) = node.parent()
+    {
+        let from_row = scope.start_position().row as u32;
+        let to_row = scope.end_position().row as u32;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(
+                child.kind(),
+                "type_identifier" | "constrained_type_parameter" | "const_parameter"
+            ) && let Ok(text) = child.utf8_text(contents)
+            {
+                // A bound is written after the name, and only the name is what
+                // the parameter binds.
+                let name = text
+                    .split(|character: char| character == ':' || character.is_whitespace())
+                    .next()
+                    .unwrap_or(text);
+                if !name.is_empty() {
+                    locals.push(crate::symbols::Local {
+                        name: name.to_string(),
+                        from_row,
+                        to_row,
+                    });
+                }
+            }
+        }
+    }
+
+    if node.kind() == "use_declaration"
+        && let Some(argument) = node.child_by_field_name("argument")
+    {
+        names_a_use_brings_in(argument, contents, "", imports);
+    }
+
+    // The attribute and the item it is written above are two siblings, so the
+    // range recorded runs from the attribute to the end of what follows it.
+    if node.kind() == "attribute_item"
+        && let Ok(text) = node.utf8_text(contents)
+        && text.starts_with("#[cfg")
+    {
+        let ends_at = node.next_named_sibling().unwrap_or(node).end_position().row as u32;
+        gated.push((node.start_position().row as u32, ends_at));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_for_resolution(
+            language,
+            child,
+            contents,
+            under_a_type,
+            locals,
+            members,
+            imports,
+            gated,
+        );
+    }
+}
+
+/// What one `use` brings into scope: the name as this file spells it, the path
+/// it stands for, and where the name is written.
+///
+/// A `use` can bring in many names at once -- `use a::{b, c as d}` -- so the
+/// tree is walked rather than the text taken whole, and a rename that has to
+/// touch the line needs to know which of those names it is touching.
+fn names_a_use_brings_in(
+    node: tree_sitter::Node,
+    contents: &[u8],
+    prefix: &str,
+    into: &mut Vec<crate::symbols::Import>,
+) {
+    let joined = |left: &str, right: &str| -> String {
+        if left.is_empty() {
+            right.to_string()
+        } else {
+            format!("{left}::{right}")
+        }
+    };
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            if let Ok(text) = node.utf8_text(contents) {
+                into.push(crate::symbols::Import {
+                    name: text.to_string(),
+                    means: joined(prefix, text),
+                    row: node.start_position().row as u32,
+                    column: node.start_position().column as u32,
+                });
+            }
+        }
+        "scoped_identifier" | "scoped_use_list" => {
+            let path = node
+                .child_by_field_name("path")
+                .and_then(|path| path.utf8_text(contents).ok())
+                .unwrap_or("");
+            let under = joined(prefix, path);
+            match node.child_by_field_name("name") {
+                Some(name) => names_a_use_brings_in(name, contents, &under, into),
+                None => {
+                    if let Some(list) = node.child_by_field_name("list") {
+                        names_a_use_brings_in(list, contents, &under, into);
+                    }
+                }
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names_a_use_brings_in(child, contents, prefix, into);
+            }
+        }
+        "use_as_clause" => {
+            // The name this file uses is the alias; what it stands for is the
+            // path. A rename of the original touches the path, not the alias --
+            // which is why both are kept rather than one.
+            let path = node
+                .child_by_field_name("path")
+                .and_then(|path| path.utf8_text(contents).ok())
+                .unwrap_or("");
+            if let Some(alias) = node.child_by_field_name("alias")
+                && let Ok(text) = alias.utf8_text(contents)
+            {
+                into.push(crate::symbols::Import {
+                    name: text.to_string(),
+                    means: joined(prefix, path),
+                    row: alias.start_position().row as u32,
+                    column: alias.start_position().column as u32,
+                });
+            }
+            // The original name is written on this line too, and a rename of
+            // *it* has to change it. Recorded under its own name rather than
+            // the alias: `use thing as other` is a place `thing` appears, and
+            // leaving it out renames every use and not the import.
+            if let Some(original) = node.child_by_field_name("path")
+                && let Ok(text) = original.utf8_text(contents)
+            {
+                let last = text.rsplit("::").next().unwrap_or(text);
+                into.push(crate::symbols::Import {
+                    name: last.to_string(),
+                    means: joined(prefix, text),
+                    row: original.end_position().row as u32,
+                    column: original.end_position().column.saturating_sub(last.len()) as u32,
+                });
+            }
+        }
+        // `use a::*` brings in names nothing here can enumerate, and a wildcard
+        // recorded as a name would be a name nothing ever refers to.
+        "use_wildcard" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names_a_use_brings_in(child, contents, prefix, into);
+            }
+        }
+    }
+}
+
+/// The names a pattern binds, unpacked down to identifiers.
+///
+/// The path a `match` compares against and a guard's condition are not
+/// bindings, and taking them would call every matched variant a local.
+fn names_bound_by(pattern: tree_sitter::Node, contents: &[u8], into: &mut Vec<String>) {
+    match pattern.kind() {
+        "identifier" | "shorthand_field_identifier" => {
+            if let Ok(text) = pattern.utf8_text(contents) {
+                into.push(text.to_string());
+            }
+        }
+        _ => {
+            // The thing a pattern is matched *against* is not a binding:
+            // `Some(x)` binds `x`, not `Some`. The grammar names that child
+            // `type`, so it is skipped by which field it fills rather than by
+            // what kind of node it happens to be -- a path written as a plain
+            // identifier looks exactly like a name being bound.
+            let matched_against = pattern.child_by_field_name("type").map(|node| node.id());
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                if Some(child.id()) == matched_against {
+                    continue;
+                }
+                names_bound_by(child, contents, into);
+            }
+        }
+    }
+}
+
 /// The same as [`references_in_text`], for a caller that has a file name
 /// rather than a language name. The two are not the same word: a file is
 /// `Rust` to the editor and `rust` to the grammar directory the queries live
@@ -342,36 +932,39 @@ pub fn references_in_text(language: &str, contents: &[u8]) -> Result<Option<Vec<
 /// The same, saying which query to use. The editor always wants the written
 /// one where there is one; the measuring stand wants to be able to ask for
 /// the built one, to say what it costs.
+/// The grammar and queries for one language, compiled once and kept.
+///
+/// Reading a language costs compiling the outline query of every language the
+/// editor ships, and doing that per file put a fifth of a second on a preview
+/// of two hundred occurrences.
+fn ready_for(language: &str, queries: Queries) -> Result<Arc<Ready>> {
+    static READY: OnceLock<Mutex<HashMap<(String, Queries), Arc<Ready>>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashMap::new()));
+    let asked_for = (language.to_string(), queries);
+    // A poisoned lock is recovered rather than propagated: the cache holds
+    // nothing a panic could have left half-written, and refusing forever
+    // after one panic would turn this into a feature that silently stops
+    // working for the rest of the session.
+    let mut kept = ready
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match kept.get(&asked_for) {
+        Some(prepared) => Ok(prepared.clone()),
+        None => {
+            let prepared = Arc::new(prepare(language, queries)?);
+            kept.insert(asked_for, prepared.clone());
+            Ok(prepared)
+        }
+    }
+}
+
 pub fn references_in_text_with(
     language: &str,
     contents: &[u8],
     queries: Queries,
 ) -> Result<Option<Vec<FoundInText>>> {
-    // Compiled once and kept. Reading a language costs compiling the outline
-    // query of every language the editor ships, and doing that per file put a
-    // fifth of a second on a preview of two hundred occurrences.
-    static READY: OnceLock<Mutex<HashMap<(String, Queries), Arc<Ready>>>> = OnceLock::new();
-    let ready = READY.get_or_init(|| Mutex::new(HashMap::new()));
-    let asked_for = (language.to_string(), queries);
-    let prepared = {
-        // A poisoned lock is recovered rather than propagated: the cache holds
-        // nothing a panic could have left half-written, and refusing forever
-        // after one panic would turn this into a feature that silently stops
-        // working for the rest of the session.
-        let mut kept = ready
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match kept.get(&asked_for) {
-            Some(prepared) => prepared.clone(),
-            None => {
-                let prepared = Arc::new(prepare(language, queries)?);
-                kept.insert(asked_for, prepared.clone());
-                prepared
-            }
-        }
-    };
+    let prepared = ready_for(language, queries)?;
     let readable = &prepared.readable;
-    let references_query = &prepared.references;
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&readable.grammar)
@@ -380,24 +973,38 @@ pub fn references_in_text_with(
         .parse(contents, None)
         .with_context(|| format!("parsing this {language} text"))?;
 
+    let (found, _declared) = references_in_tree(language, contents, &prepared, &tree);
+    Ok(Some(found))
+}
+
+/// The references in a file already parsed, so a caller that needs the tree for
+/// something else does not parse it twice. Parsing is the expensive half of
+/// reading a file, and this is called on every save.
+fn references_in_tree(
+    language: &str,
+    contents: &[u8],
+    prepared: &Ready,
+    tree: &tree_sitter::Tree,
+) -> (Vec<FoundInText>, Vec<NamedAt>) {
     let mut recovered = Vec::new();
     recovered_rows(tree.root_node(), &mut recovered);
 
     // Where the file's own declarations are, so that a declaring position is
-    // not offered as a place that refers to itself.
-    let declared: HashSet<(u32, u32)> =
-        defined_symbols_in("", language, contents, &readable.outline, &tree)
-            .at
-            .into_iter()
-            .map(|symbol| (symbol.row, symbol.column))
-            .collect();
+    // not offered as a place that refers to itself. Handed back as well as
+    // used: the module tree is built from declarations with positions, and
+    // finding them again would mean parsing the file a second time.
+    let declares = defined_symbols_in("", language, contents, &prepared.readable.outline, tree).at;
+    let declared: HashSet<(u32, u32)> = declares
+        .iter()
+        .map(|symbol| (symbol.row, symbol.column))
+        .collect();
 
     // A file on its own says nothing about which of its imports leave the
     // project, so nothing is treated as foreign here. The measurement, which
     // reads the whole project, does know and does use it.
     let foreign = HashSet::new();
     let mut found: Vec<FoundInText> =
-        occurrences_in("", language, contents, references_query, &tree, &foreign)
+        occurrences_in("", language, contents, &prepared.references, tree, &foreign)
             .into_iter()
             .filter(|named| !row_falls_in(&recovered, named.row))
             .filter(|named| !declared.contains(&(named.row, named.column)))
@@ -409,7 +1016,7 @@ pub fn references_in_text_with(
             .collect();
     found.sort_unstable();
     found.dedup();
-    Ok(Some(found))
+    (found, declares)
 }
 
 /// Every symbol the outline query defines under `root`. A pass distinct from
@@ -1802,6 +2409,15 @@ fn duration_ratio(numerator: Duration, denominator: Duration) -> f64 {
 /// Everything this measurement produces.
 pub struct Report {
     pub symbols_sampled: usize,
+    /// Where the answers came from, when they came from a recording rather than
+    /// a running server. Printed with every number read off it: a figure that
+    /// does not say which server and which corpus it is about invites being
+    /// compared with one taken against something else.
+    pub measured_against: Option<Provenance>,
+    /// Extra findings nobody could adjudicate, because there was no server to
+    /// ask at their own positions. Counted against precision, so the figure can
+    /// only understate the index -- and printed, so that is visible.
+    pub unadjudicated_extras: usize,
     /// Sampled symbols the server refused because it has no such file. Counted
     /// on neither side, and printed, so a shrinking sample is visible rather
     /// than silent.
@@ -1894,6 +2510,27 @@ impl fmt::Display for Report {
             self.precision * 100.0,
             self.comparison.recall * 100.0
         )?;
+        if let Some(taken_from) = &self.measured_against {
+            writeln!(
+                out,
+                "measured against answers recorded from {} on {} at {}, over {} run(s)",
+                taken_from.server,
+                taken_from.corpus,
+                taken_from
+                    .corpus_commit
+                    .as_deref()
+                    .unwrap_or("an unrecorded commit"),
+                taken_from.runs
+            )?;
+        }
+        if self.unadjudicated_extras > 0 {
+            writeln!(
+                out,
+                "{} extra findings could not be adjudicated without a server and are counted \
+                 as wrong; precision here can only understate the index",
+                self.unadjudicated_extras
+            )?;
+        }
         writeln!(
             out,
             "read one symbol at a time: precision is {:.1}% on average and {:.1}% at the median; \
@@ -2077,6 +2714,8 @@ pub async fn measure(
     indexing_timeout: Duration,
     query_timeout: Duration,
     certainty: Certainty,
+    source: Source<'_>,
+    answering: Answering,
 ) -> Result<Report> {
     let rust = language_named(language)?;
     let prepared_query = match (queries, per_language::references_query(language)) {
@@ -2135,7 +2774,53 @@ pub async fn measure(
             }
         };
 
-    let sampled = sample_symbols(&scan.defined, symbol_count);
+    // Read once, before anything is sampled: in one mode the recording *is* the
+    // sample, and in the other it is what the run is about to fill.
+    let mut recording = match source {
+        Source::Live => None,
+        Source::Record(at) => {
+            let provenance = Provenance {
+                language: language.to_string(),
+                server: crate::recorded::version_of(
+                    per_language::language_server(language)
+                        .map(|spoken| spoken.binary)
+                        .unwrap_or(language),
+                )
+                .await,
+                corpus: root.display().to_string(),
+                corpus_commit: crate::recorded::commit_of(root).await,
+                runs: 1,
+            };
+            Some(Recording::read_or_start(at, provenance)?)
+        }
+        Source::Against(at) => {
+            let read = Recording::read(at)?;
+            anyhow::ensure!(
+                !read.is_empty(),
+                "{} holds no answers to compare against",
+                at.display()
+            );
+            Some(read)
+        }
+    };
+
+    // A recording is the definition of its own sample. Re-drawing one from the
+    // corpus would make the number move with the order the walk took, and with
+    // every definition added to the project since the recording was made --
+    // which is exactly what a recording exists to hold still.
+    let sampled: Vec<NamedAt> = match (&recording, source) {
+        (Some(recording), Source::Against(_)) => recording
+            .asked()
+            .into_iter()
+            .map(|asked| NamedAt {
+                path: asked.path,
+                name: asked.name,
+                row: asked.row,
+                column: asked.column,
+            })
+            .collect(),
+        _ => sample_symbols(&scan.defined, symbol_count),
+    };
     anyhow::ensure!(
         !sampled.is_empty(),
         "there is nothing to compare over zero symbols"
@@ -2144,13 +2829,113 @@ pub async fn measure(
     // Lazily: finding every reference needs whole-graph inference, and
     // priming that ahead does not fit in the machine this runs on -- the
     // server is killed before it answers anything at all.
-    let mut server = Server::start(root, language, Priming::Lazily)
-        .await
-        .context("starting the language server")?;
-    server
-        .wait_until_indexed(indexing_timeout)
-        .await
-        .context("waiting for the language server to finish indexing")?;
+    let mut server = match source {
+        Source::Against(_) => None,
+        Source::Live | Source::Record(_) => {
+            let mut started = Server::start(root, language, Priming::Lazily)
+                .await
+                .context("starting the language server")?;
+            started
+                .wait_until_indexed(indexing_timeout)
+                .await
+                .context("waiting for the language server to finish indexing")?;
+            Some(started)
+        }
+    };
+
+    // Taking a recording asks about every sampled symbol, including the ones
+    // the index declines today. That is the whole point: a later index that
+    // answers where this one is silent has to be measurable against what the
+    // server said, and a recording of only today's answers could never show it.
+    //
+    // Written after each answer rather than at the end, because this is the
+    // run that gets killed: at 600 symbols the container went over 18 GiB and
+    // was OOM-killed, and a recording that only exists at the end of a run
+    // that never ends is no recording at all.
+    if let (Some(recording), Source::Record(at)) = (recording.as_mut(), source) {
+        let mut taken = 0usize;
+        let mut unanswered = 0usize;
+        for symbol in &sampled {
+            let asked = Asked {
+                path: symbol.path.clone(),
+                row: symbol.row,
+                column: symbol.column,
+                name: symbol.name.clone(),
+            };
+            if recording.holds(&asked) {
+                continue;
+            }
+            // Bound before the match rather than matched on directly: the
+            // scrutinee's borrow of the server lives across the arms, and
+            // this arm needs the server again.
+            let probed = probe(server.as_mut(), None, symbol, language, query_timeout).await;
+            let told = match probed {
+                Told::Answered(_) => {
+                    match references_told(server.as_mut(), None, symbol, query_timeout).await {
+                        Ok(told) => told,
+                        // A question the server could not answer is recorded as
+                        // one it could not answer, and the recording goes on.
+                        // A live measurement stops at this -- one number must
+                        // not be taken over whatever happened to succeed -- but
+                        // a recording is a long job whose whole purpose is to
+                        // survive, and the names it cannot get an answer for
+                        // are the ones the index declines anyway: `from` in
+                        // this project has so many references that
+                        // rust-analyzer does not finish inside three minutes.
+                        Err(trouble) => {
+                            log::warn!("{trouble:#}");
+                            unanswered += 1;
+                            Told::AskingFailed
+                        }
+                    }
+                }
+                otherwise => otherwise,
+            };
+            recording.remember(told.into_answer(symbol));
+            recording.write(at)?;
+            taken += 1;
+        }
+        println!(
+            "recorded {taken} new answers into {} -- {} in the file now, {unanswered} of them \
+             questions the server could not answer",
+            at.display(),
+            recording.len()
+        );
+    }
+    let measured_against = recording
+        .as_ref()
+        .filter(|_| !matches!(source, Source::Live))
+        .map(|recording| recording.taken_from.clone());
+
+    // Built once, and only for the run that asks through it: this is the
+    // editor's own path -- the same build, the same tables, the same question
+    // -- so that what is measured is what a reader gets, not what the stand
+    // could work out if asked nicely.
+    let the_store_and_where_it_lives = match answering {
+        Answering::TheStandsOwnReading => None,
+        Answering::TheStoreTheEditorAsks => {
+            let kept = tempfile::tempdir().context("somewhere to keep the store")?;
+            let store = crate::symbols::Symbols::open(&kept.path().join("symbols.sqlite"))
+                .context("opening a store to answer through")?;
+            let cores = std::thread::available_parallelism()
+                .map(|cores| cores.get())
+                .unwrap_or(1);
+            let built = crate::symbols::build(root, cores, &store)
+                .context("building the store the editor reads")?;
+            println!(
+                "built the store the editor reads: {} symbols in {} files, {:?}",
+                built.symbols, built.files, built.took
+            );
+            // The directory is kept alive as long as the store is read.
+            // Held together: the store reads the file for the whole run, so
+            // the directory has to outlive it -- and be taken away with it,
+            // rather than left behind as a hundred megabytes per run.
+            Some((store, kept))
+        }
+    };
+    let the_store = the_store_and_where_it_lives
+        .as_ref()
+        .map(|(store, _)| store);
 
     let mut answers = Vec::with_capacity(sampled.len());
     let mut index_timings = Vec::with_capacity(sampled.len());
@@ -2182,49 +2967,25 @@ pub async fn measure(
         *declarations_named.entry(symbol.name.as_str()).or_default() += 1;
     }
     for symbol in &sampled {
-        // A symbol the server does not know is a question neither side can be
-        // held to: `clear_globals` carries `#[cfg(any(test, feature =
-        // "test-support"))]`, so the server knows of no such function and
-        // answers nothing, while the index answers with every real call in
-        // the project. The server is asked rather than the `#[cfg]` text
-        // read: a gate that reads shut in the source can be open here --
-        // `crates/gpui_linux` is gated on Linux, and this runs on Linux.
-        // Told the file is open first, the way an editor would: a server
-        // that answers only about what something has opened -- `tsserver`
-        // does -- otherwise reports every file as one it does not have.
-        if let Err(error) = server.open(&symbol.path, language, query_timeout).await {
-            log::warn!("{error:#}");
-        }
-        let known = server
-            .resolves_at(&symbol.path, symbol.row, symbol.column, query_timeout)
-            .await;
-        match known {
-            Ok(true) => {}
-            Ok(false) => {
+        match probe(
+            server.as_mut(),
+            recording.as_ref(),
+            symbol,
+            language,
+            query_timeout,
+        )
+        .await
+        {
+            Told::Answered(_) => {}
+            Told::NothingResolvedThere => {
                 declaration_the_server_cannot_see += 1;
                 continue;
             }
-            Err(error) => {
-                let refused = error
-                    .downcast_ref::<ServerRefused>()
-                    .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
-                if refused {
-                    outside_the_servers_project += 1;
-                    continue;
-                }
-                // The probe asks one thing -- does the server resolve this
-                // name here -- and an error is that question answered no.
-                // Counted and printed rather than swallowed: a run where the
-                // server failed on half the probes has to read as suspect,
-                // not as clean.
-                log::warn!(
-                    "the language server could not say whether it resolves {} at {}:{}:{}: \
-                     {error:#}",
-                    symbol.name,
-                    symbol.path,
-                    symbol.row,
-                    symbol.column
-                );
+            Told::OutsideTheProject => {
+                outside_the_servers_project += 1;
+                continue;
+            }
+            Told::AskingFailed => {
                 probes_the_server_failed += 1;
                 declaration_the_server_cannot_see += 1;
                 continue;
@@ -2304,14 +3065,40 @@ pub async fn measure(
             answered_because_the_tree_resolves_it += 1;
         }
         let index_started = Instant::now();
-        let found_by_text = scan.index.references_to(&symbol.name);
-        let complete = occurrences_of(
-            found_by_text,
-            &symbol.name,
-            (symbol.path.as_str(), symbol.row),
-            shared,
-            &module_tree,
-        );
+        let complete = match answering {
+            Answering::TheStandsOwnReading => {
+                let found_by_text = scan.index.references_to(&symbol.name);
+                occurrences_of(
+                    found_by_text,
+                    &symbol.name,
+                    (symbol.path.as_str(), symbol.row),
+                    shared,
+                    &module_tree,
+                )
+            }
+            Answering::TheStoreTheEditorAsks => {
+                let store = the_store.expect("the store was built above");
+                match crate::resolution::what_a_symbol_means(
+                    store,
+                    Some(symbol.path.as_str()),
+                    &symbol.name,
+                )? {
+                    crate::resolution::WhatItMeans::TheseAre(places) => Some(
+                        places
+                            .into_iter()
+                            .map(|place| Definition {
+                                path: place.path,
+                                name: symbol.name.clone(),
+                                kind: String::new(),
+                                line: place.row + 1,
+                                language: language.to_string(),
+                            })
+                            .collect(),
+                    ),
+                    crate::resolution::WhatItMeans::AskTheServer(_) => None,
+                }
+            }
+        };
         index_timings.push(index_started.elapsed());
         let Some(the_index_found) = complete else {
             // A shared name with an occurrence the tree cannot place. The
@@ -2330,39 +3117,25 @@ pub async fn measure(
         }
 
         let server_started = Instant::now();
-        let answered = server
-            .references(
-                &symbol.path,
-                symbol.row,
-                symbol.column,
-                &symbol.name,
-                query_timeout,
-            )
-            .await;
-        let the_server_found = match answered {
-            Ok(found) => found,
-            Err(error) => {
-                // A file the server has never heard of is outside the cargo
-                // graph, so neither side can be held to it. That is a smaller
-                // sample, counted and printed -- not a failed run, and not a
-                // reason to keep going after a request that failed for any
-                // other reason.
-                let refused = error
-                    .downcast_ref::<ServerRefused>()
-                    .is_some_and(ServerRefused::is_a_file_the_server_does_not_have);
-                if refused {
+        let the_server_found =
+            match references_told(server.as_mut(), recording.as_ref(), symbol, query_timeout)
+                .await?
+            {
+                Told::Answered(found) => found,
+                Told::OutsideTheProject => {
                     outside_the_servers_project += 1;
                     index_timings.pop();
                     continue;
                 }
-                return Err(error).with_context(|| {
-                    format!(
-                        "asking the language server for references to {} at {}:{}:{}",
-                        symbol.name, symbol.path, symbol.row, symbol.column
-                    )
-                });
-            }
-        };
+                // Only a recording can say this here: the live path either
+                // answers or fails the run, and a recording that has no answer
+                // for a symbol has already said so out loud.
+                Told::NothingResolvedThere | Told::AskingFailed => {
+                    probes_the_server_failed += 1;
+                    index_timings.pop();
+                    continue;
+                }
+            };
         server_timings.push(server_started.elapsed());
 
         // What the server found under a different spelling is the same symbol
@@ -2415,10 +3188,22 @@ pub async fn measure(
         }
         !refused
     };
+    // Every extra finding is asked about at its own position, and a recording
+    // cannot answer that: the positions depend on what the index found, and a
+    // later index finds places the recording was never asked about. So a run
+    // measured against a recording adjudicates nothing and counts every extra
+    // against precision, which can only understate the index -- and says how
+    // many were read that way, so the direction of the bias is on the page
+    // rather than in somebody's memory.
+    let mut unadjudicated_extras = 0usize;
     for extra in &catalogue.extra {
         if seen_by_the_server.contains_key(&extra.identity) {
             continue;
         }
+        let Some(server) = server.as_mut() else {
+            unadjudicated_extras += 1;
+            continue;
+        };
         if let Err(error) = server
             .open(&extra.identity.path, language, query_timeout)
             .await
@@ -2465,7 +3250,11 @@ pub async fn measure(
         seen_by_the_server.insert(extra.identity.clone(), seen);
     }
 
-    if let Err(error) = server.shut_down().await {
+    // Taken rather than borrowed: shutting a server down consumes it, which is
+    // the honest shape -- there is nothing to ask it afterwards.
+    if let Some(server) = server.take()
+        && let Err(error) = server.shut_down().await
+    {
         log::warn!("the language server did not shut down cleanly: {error:#}");
     }
 
@@ -2486,6 +3275,8 @@ pub async fn measure(
 
     Ok(Report {
         symbols_sampled: answers.len(),
+        measured_against,
+        unadjudicated_extras,
         outside_the_servers_project,
         declaration_the_server_cannot_see,
         probes_the_server_failed,
@@ -2517,6 +3308,88 @@ pub async fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_recording_of(seen: crate::recorded::Seen, references: usize) -> Recording {
+        let mut recording = Recording::new(Provenance {
+            language: "rust".to_string(),
+            server: "rust-analyzer under test".to_string(),
+            corpus: "/nowhere".to_string(),
+            corpus_commit: None,
+            runs: 1,
+        });
+        recording.remember(Answer {
+            path: "src/lib.rs".to_string(),
+            row: 3,
+            column: 7,
+            name: "thing".to_string(),
+            seen,
+            references: (0..references)
+                .map(|at| crate::recorded::Reference {
+                    path: "src/other.rs".to_string(),
+                    name: "thing".to_string(),
+                    kind: "identifier".to_string(),
+                    line: at as u32 + 1,
+                    language: "rust".to_string(),
+                })
+                .collect(),
+        });
+        recording
+    }
+
+    fn the_symbol() -> NamedAt {
+        NamedAt {
+            path: "src/lib.rs".to_string(),
+            name: "thing".to_string(),
+            row: 3,
+            column: 7,
+        }
+    }
+
+    // Each way of not knowing has to survive the round trip through a
+    // recording, because they cost the sample differently: a run that read a
+    // refused file as "the server saw nothing there" would report a shrinking
+    // sample as a failing index.
+    #[test]
+    fn a_recording_says_the_same_thing_the_server_did() {
+        use crate::recorded::Seen;
+
+        let answered = a_recording_of(Seen::Yes, 2);
+        match recorded_about(&answered, &the_symbol()) {
+            Told::Answered(found) => assert_eq!(found.len(), 2),
+            _ => panic!("an answer recorded as answered has to read back as one"),
+        }
+
+        assert!(matches!(
+            recorded_about(&a_recording_of(Seen::No, 0), &the_symbol()),
+            Told::NothingResolvedThere
+        ));
+        assert!(matches!(
+            recorded_about(&a_recording_of(Seen::Refused, 0), &the_symbol()),
+            Told::OutsideTheProject
+        ));
+        assert!(matches!(
+            recorded_about(&a_recording_of(Seen::Failed, 0), &the_symbol()),
+            Told::AskingFailed
+        ));
+    }
+
+    // A recording out of step with the corpus must be loud. Read as "nothing
+    // to say", it would quietly turn every missing answer into a smaller
+    // sample and a better-looking number.
+    #[test]
+    fn a_symbol_the_recording_never_heard_of_is_a_failure_not_a_silence() {
+        let recording = a_recording_of(crate::recorded::Seen::Yes, 1);
+        let elsewhere = NamedAt {
+            path: "src/lib.rs".to_string(),
+            name: "thing".to_string(),
+            row: 99,
+            column: 0,
+        };
+        assert!(matches!(
+            recorded_about(&recording, &elsewhere),
+            Told::AskingFailed
+        ));
+    }
 
     fn definition(path: &str, name: &str, line: u32) -> Definition {
         Definition {

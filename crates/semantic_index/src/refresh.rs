@@ -11,6 +11,7 @@ use crate::inventory::Inventory;
 use crate::languages::{self, Readable};
 use crate::measure;
 use crate::symbols::{self, Symbols};
+use util::ResultExt as _;
 
 /// What one refresh did.
 ///
@@ -161,15 +162,47 @@ pub fn refresh_one_file(root: &Path, path: &Path, symbols: &Symbols) -> Result<R
         return Ok(unrefreshed());
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    let Some(found) = definitions::in_file_on_disk(root, path, language, &mut parser) else {
+    let Ok(contents) = std::fs::read(path) else {
         // Could not even be read: nothing was parsed, so nothing already
         // recorded for it is disturbed.
+        return Ok(unrefreshed());
+    };
+    let mut parser = tree_sitter::Parser::new();
+    let Ok(found) = definitions::in_file(&relative, &contents, language, &mut parser) else {
         return Ok(unrefreshed());
     };
     // `found` can be empty -- see the doc on `refresh` for why an empty
     // result still replaces what was recorded.
     symbols.record(&relative, &found)?;
+
+    // What the file's names resolve to is replaced with the file, not left to
+    // go stale beside it: a save that updated the definitions and not the
+    // occurrences would leave the index answering about a line that has moved.
+    if let Some(resolution) = crate::references::resolution_in_file(&relative, &contents)
+        .log_err()
+        .flatten()
+    {
+        symbols.record_facts(
+            &relative,
+            &crate::symbols::FileFacts {
+                occurrences: resolution
+                    .occurrences
+                    .iter()
+                    .map(|found| crate::symbols::Occurrence {
+                        name: found.name.clone(),
+                        row: found.row,
+                        column: found.column,
+                        resolves_to: None,
+                    })
+                    .collect(),
+                locals: resolution.locals.clone(),
+                imports: resolution.imports.clone(),
+                gated: resolution.gated.clone(),
+                members: resolution.members.clone(),
+                ..Default::default()
+            },
+        )?;
+    }
 
     Ok(Refreshed {
         files_parsed: 1,

@@ -645,17 +645,23 @@ async fn server_occurrences(
         .collect())
 }
 
-/// Whether the project holds exactly one definition under this name, read from
-/// the index the editor already keeps. `None` where there is no index to ask.
+/// Whether the index is prepared to say what this name means, with no language
+/// server asked. `None` where there is no index to ask, or where a background
+/// pass is holding it.
+///
+/// It used to be counted here -- one definition under the name and the ticks
+/// were safe -- which missed the two rules that cost the most: a name that is
+/// also somebody's local variable, and a name the project declares as a member
+/// of a type. Both were already worked out and measured in the index; they were
+/// simply not reachable from the editor. Now the index answers, and this asks
+/// it.
 fn name_means_one_thing(project: &Entity<Project>, name: &str, cx: &App) -> Option<bool> {
     let index = symbol_index::of_project(project, cx)?;
-    let carrying_the_name = index
-        .read(cx)
-        .candidates(name, 64)
-        .into_iter()
-        .filter(|found| found.name == name)
-        .count();
-    Some(carrying_the_name <= 1)
+    let answer = index.read(cx).what_a_name_means(name)?;
+    Some(matches!(
+        answer,
+        semantic_index::resolution::WhatItMeans::TheseAre(_)
+    ))
 }
 
 impl EventEmitter<ItemEvent> for RenamePreview {}
