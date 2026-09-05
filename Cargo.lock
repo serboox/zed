@@ -18398,6 +18398,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad8388ea1a9e0ea807e442e8263a699e7edcb320ecbcd21b4fa8ff859acce3ba"
 
 [[package]]
+name = "ruff_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "run_configurations"
 version = "0.1.0"
 dependencies = [
@@ -28467,6 +28486,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "ruff_diagnostics",
  "run_configurations",
  "sandbox",
  "search",
