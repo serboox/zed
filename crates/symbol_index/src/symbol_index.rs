@@ -16,6 +16,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 pub mod index_semantics;
+pub mod symbol_completions;
 
 /// Which of four states the index is in, so a caller can tell "nothing
 /// matched" from "there is nothing to search yet" apart.

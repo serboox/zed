@@ -765,6 +765,7 @@ fn main() {
         // for now is the highlight under the cursor -- a request the server was
         // asked for on every cursor move.
         symbol_index::index_semantics::init(cx);
+        symbol_index::symbol_completions::init(cx);
         search_everywhere::init(cx);
         project_panel::init(cx);
         outline_panel::init(cx);
