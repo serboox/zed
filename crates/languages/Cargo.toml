@@ -82,6 +82,7 @@ tree-sitter-php.workspace = true
 tree-sitter-r.workspace = true
 tree-sitter-ruby.workspace = true
 tree-sitter-swift.workspace = true
+tree-sitter-vb6.workspace = true
 tree-sitter-cpp.workspace = true
 tree-sitter-css.workspace = true
 tree-sitter-go.workspace = true

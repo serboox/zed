@@ -329,4 +329,30 @@ mod tests {
             );
         }
     }
+
+    #[gpui::test]
+    async fn visual_basic_reads_its_subs_and_functions(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "vb6",
+            tree_sitter_vb6::language(),
+            r#"
+            Public Sub Greet(name As String)
+                MsgBox name
+            End Sub
+
+            Public Function Shout(name As String) As String
+                Shout = UCase(name)
+            End Function
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in ["Greet", "Shout"] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+    }
 }

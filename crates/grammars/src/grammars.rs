@@ -34,6 +34,7 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
         ("fortran", tree_sitter_fortran::LANGUAGE.into()),
         ("pascal", tree_sitter_pascal::LANGUAGE.into()),
         ("asm", tree_sitter_asm::LANGUAGE.into()),
+        ("vb6", tree_sitter_vb6::language()),
         ("jsdoc", tree_sitter_jsdoc::LANGUAGE.into()),
         ("json", tree_sitter_json::LANGUAGE.into()),
         ("jsonc", tree_sitter_json::LANGUAGE.into()),

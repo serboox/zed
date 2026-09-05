@@ -36,6 +36,7 @@ tree-sitter-perl = { workspace = true, optional = true }
 tree-sitter-fortran = { workspace = true, optional = true }
 tree-sitter-pascal = { workspace = true, optional = true }
 tree-sitter-asm = { workspace = true, optional = true }
+tree-sitter-vb6 = { workspace = true, optional = true }
 tree-sitter-jsdoc = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }
@@ -68,6 +69,7 @@ load-grammars = [
     "tree-sitter-fortran",
     "tree-sitter-pascal",
     "tree-sitter-asm",
+    "tree-sitter-vb6",
     "tree-sitter-jsdoc",
     "tree-sitter-json",
     "tree-sitter-md",

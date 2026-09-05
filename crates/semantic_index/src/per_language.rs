@@ -332,6 +332,10 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "c" => Some(include_str!("c_references.scm")),
         "java" => Some(include_str!("java_references.scm")),
         "cpp" => Some(include_str!("cpp_references.scm")),
+        "csharp" => Some(include_str!("csharp_references.scm")),
+        "php" => Some(include_str!("php_references.scm")),
+        "ruby" => Some(include_str!("ruby_references.scm")),
+        "swift" => Some(include_str!("swift_references.scm")),
         _ => None,
     }
 }
@@ -396,6 +400,10 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "c",
     "cpp",
     "java",
+    "csharp",
+    "php",
+    "ruby",
+    "swift",
 ];
 
 /// The language server to measure a language against, and the environment it
@@ -1244,6 +1252,26 @@ mod tests {
             .into_iter()
             .find(|language| language.name == "typescript")
             .expect("TypeScript is one of the languages the editor ships")
+    }
+
+    /// Every references query this fork has written compiles against the
+    /// grammar it was written for. A query naming a node kind its grammar
+    /// does not have fails at load, not at build, so without this nothing
+    /// says so until the language is first indexed.
+    #[test]
+    fn every_written_references_query_compiles_against_its_own_grammar() {
+        let (readable, _) = languages::readable();
+        for name in LANGUAGES_WITH_A_REFERENCES_QUERY {
+            let language = readable
+                .iter()
+                .find(|language| language.name == *name)
+                .unwrap_or_else(|| panic!("{name} is one of the languages the editor ships"));
+            let written = references_query(name)
+                .unwrap_or_else(|| panic!("{name} is listed as having a written query"));
+            if let Err(trouble) = tree_sitter::Query::new(&language.grammar, written) {
+                panic!("the {name} references query does not compile: {trouble}");
+            }
+        }
     }
 
     /// The index of a capture by name, the same small lookup

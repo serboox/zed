@@ -17,8 +17,10 @@ use gpui::{Action as _, Anchor, App, Entity, Subscription, Task, TaskExt, WeakEn
 use language::{BinaryStatus, BufferId, ServerHealth};
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use project::{
-    LspStore, LspStoreEvent, Worktree, lsp_store::log_store::GlobalLogStore,
-    project_settings::ProjectSettings, trusted_worktrees::TrustedWorktrees,
+    LspStore, LspStoreEvent, Worktree,
+    lsp_store::log_store::GlobalLogStore,
+    project_settings::{LanguageServerStart, ProjectSettings},
+    trusted_worktrees::TrustedWorktrees,
 };
 use settings::{Settings as _, SettingsStore};
 use ui::{
@@ -212,7 +214,38 @@ impl LanguageServerHealthStatus {
     }
 }
 
+/// Whether this editor waits to be asked before starting a language server.
+fn servers_start_by_hand(cx: &App) -> bool {
+    ProjectSettings::get_global(cx).global_lsp_settings.start == LanguageServerStart::ByHand
+}
+
 impl LanguageServerState {
+    /// Asks for the servers that serve the file being looked at. Restarting a
+    /// buffer's servers is what "ask for one" means to the store, so this is
+    /// the same call the command palette makes.
+    fn start_servers_for_this_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .active_editor
+            .as_ref()
+            .and_then(|active| active.editor.upgrade())
+        else {
+            return;
+        };
+        let buffers = editor.update(cx, |editor, cx| {
+            editor.buffer().read(cx).all_buffers().into_iter().collect()
+        });
+        self.lsp_store
+            .update(cx, |lsp_store, cx| {
+                lsp_store.restart_language_servers_for_buffers(
+                    buffers,
+                    HashSet::default(),
+                    true,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
     fn fill_menu(&self, mut menu: ContextMenu, cx: &mut Context<Self>) -> ContextMenu {
         let lsp_logs = cx
             .try_global::<GlobalLogStore>()
@@ -313,6 +346,17 @@ impl LanguageServerState {
                     first_button_encountered = true;
                 }
 
+                menu = menu.item(button);
+                continue;
+            } else if matches!(item, LspMenuItem::StartForThisFile) {
+                let button = ContextMenuEntry::new("Start Servers for This File").handler({
+                    let state = cx.entity();
+                    move |window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.start_servers_for_this_file(window, cx)
+                        });
+                    }
+                });
                 menu = menu.item(button);
                 continue;
             } else if let LspMenuItem::Header { header, separator } = item {
@@ -768,6 +812,10 @@ enum LspMenuItem {
     ToggleServersButton {
         restart: bool,
     },
+    /// The only entry offered when servers wait to be asked for and none is
+    /// running: without it the button hides itself and there is nothing left
+    /// to click.
+    StartForThisFile,
     Header {
         header: Option<SharedString>,
         separator: bool,
@@ -803,6 +851,7 @@ impl LspMenuItem {
                 binary_status: Some(binary_status.clone()),
                 message: binary_status.message.clone(),
             }),
+            Self::StartForThisFile => None,
         }
     }
 }
@@ -1187,6 +1236,8 @@ impl LspButton {
                 } else if can_restart_all {
                     new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: true });
                 }
+            } else if servers_start_by_hand(cx) {
+                new_lsp_items.push(LspMenuItem::StartForThisFile);
             }
 
             state.items = new_lsp_items;
@@ -1333,7 +1384,10 @@ impl Render for LspButton {
             })
             .unwrap_or(false);
 
+        // With servers started by hand this button is the only way to ask for
+        // one, so an empty server list is exactly when it must stay visible.
         if !is_restricted
+            && !servers_start_by_hand(cx)
             && (self.server_state.read(cx).language_servers.is_empty() || self.lsp_menu.is_none())
         {
             return div().hidden();
