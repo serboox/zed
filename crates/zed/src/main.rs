@@ -766,15 +766,22 @@ fn main() {
         // asked for on every cursor move.
         symbol_index::index_semantics::init(cx);
         symbol_index::symbol_completions::init(cx);
-        // The sources of diagnostics that are not language servers. Registered
-        // here rather than beside the rest of the fork's wiring in `zed.rs`,
-        // because everything in that file below its `#[cfg(test)]` boundary is
-        // compiled out of the shipped binary -- which is where these had been
-        // sitting, running in tests and nowhere else.
+        // Everything this fork adds, registered here rather than in `zed.rs`,
+        // where these calls had been sitting below that file's `#[cfg(test)]`
+        // boundary -- that is, compiled out of the shipped binary and running
+        // in tests and nowhere else. Each of them registers a workspace action
+        // or an observer, so without this the compiler diagnostics never ran,
+        // and structural search, rename preview, the call hierarchy, the API
+        // client panel and the database panel's own actions were unreachable.
         cargo_diagnostics::init(cx);
         go_diagnostics::init(cx);
         ruff_diagnostics::init(cx);
         json_diagnostics::init(cx);
+        db_client_ui::init(cx);
+        api_client_ui::init(cx);
+        hierarchy_view::init(cx);
+        structural_search::init(cx);
+        rename_preview::init(cx);
         search_everywhere::init(cx);
         project_panel::init(cx);
         outline_panel::init(cx);
