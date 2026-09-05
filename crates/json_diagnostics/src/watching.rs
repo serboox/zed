@@ -135,9 +135,6 @@ fn watch_one(
     watching: &Rc<RefCell<Watching>>,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
-    if !is_json(buffer, cx) {
-        return;
-    }
     cx.subscribe(buffer, {
         let project = project.clone();
         let watching = watching.clone();
@@ -146,6 +143,14 @@ fn watch_one(
                 event,
                 language::BufferEvent::Edited { .. } | language::BufferEvent::LanguageChanged(_)
             ) {
+                return;
+            }
+            // Asked here rather than before subscribing: a buffer's language
+            // is often settled after the store reports it added, so a check
+            // made once at subscription time misses the first file of a
+            // session entirely -- which is exactly what the
+            // `LanguageChanged` arm above is for.
+            if !is_json(&buffer, cx) {
                 return;
             }
             check_soon(&project, &buffer, &watching, cx);
@@ -163,8 +168,10 @@ fn watch_one(
 
     // A buffer that is already open has not been edited, and would otherwise
     // wait for its first keystroke to say anything about a file that is
-    // wrong now.
-    check_soon(project, buffer, watching, cx);
+    // wrong now. One that is not JSON yet is caught by `LanguageChanged`.
+    if is_json(buffer, cx) {
+        check_soon(project, buffer, watching, cx);
+    }
 }
 
 fn is_json(buffer: &Entity<Buffer>, cx: &App) -> bool {

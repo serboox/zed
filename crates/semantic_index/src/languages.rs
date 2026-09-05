@@ -76,16 +76,16 @@ pub fn suffixes_of(languages: &[Readable]) -> HashMap<&str, usize> {
 ///
 /// The name is asked first everywhere this is used, so a first line can only
 /// ever settle a file nothing else claimed.
-/// The longest match wins, because these patterns overlap in ways that matter:
-/// Bash claims any `#!` line containing `sh`, with no word boundary, so
-/// `#!/usr/local/share/bin/python3` matches it on the `sh` inside `share`.
-/// Python matches the same line further along, and is right about it.
+/// The longest match wins, and the earlier language wins a tie. These patterns
+/// do overlap: `#!/usr/bin/env node` is claimed by both JavaScript and
+/// TypeScript, at the same length, and the languages come back in a stable
+/// order, so which one that is does not change between runs.
 ///
-/// This is the one place the index does not copy the editor, which scores every
-/// first-line match the same and takes whichever language it reaches first. It
-/// can afford to: a wrong answer there shows the wrong colours until the reader
-/// says otherwise. Here a wrong answer parses the file with the wrong grammar
-/// and records whatever that produces as the project's symbols.
+/// The editor scores every first-line match the same and takes whichever
+/// language it reaches first. Matching on length as well costs nothing and
+/// cannot pick a worse answer than that, and here a wrong answer is worth more
+/// than the wrong colours it costs the editor: it parses the file with the
+/// wrong grammar and records whatever that produces as the project's symbols.
 pub fn claimant_by_first_line(first_line: &str, languages: &[Readable]) -> Option<usize> {
     languages
         .iter()
@@ -94,7 +94,9 @@ pub fn claimant_by_first_line(first_line: &str, languages: &[Readable]) -> Optio
             let found = language.first_line.as_ref()?.find(first_line)?;
             Some((at, found.len()))
         })
-        .max_by_key(|(_, length)| *length)
+        // `max_by_key` keeps the last of equal keys, so the position is part of
+        // the key, reversed, to keep the first instead.
+        .max_by_key(|(at, length)| (*length, std::cmp::Reverse(*at)))
         .map(|(at, _)| at)
 }
 
@@ -216,9 +218,11 @@ mod tests {
         assert_eq!(named("#!/bin/sh"), Some("bash"));
         assert_eq!(named("#!/usr/bin/env python3"), Some("python"));
         assert_eq!(named("#!/usr/bin/env ruby"), Some("ruby"));
-        // Bash claims any `#!` line with `sh` anywhere in it, and `share` has
-        // one. The longest match is what keeps the file Python's.
         assert_eq!(named("#!/usr/local/share/bin/python3"), Some("python"));
+        // Claimed by JavaScript and TypeScript at the same length, and the tie
+        // has to fall the same way every run rather than on whichever the
+        // maximum happened to keep.
+        assert_eq!(named("#!/usr/bin/env node"), Some("javascript"));
         assert_eq!(named("just a note, not a script"), None);
     }
 

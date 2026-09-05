@@ -40,7 +40,11 @@ impl Document {
     /// of the files a schema applies to; calling their comments a syntax
     /// error would mark almost every file this checks.
     pub fn read(text: &str) -> Option<Result<Document, Unreadable>> {
-        let mut reader = Reader { text, at: 0 };
+        let mut reader = Reader {
+            text,
+            at: 0,
+            depth: 0,
+        };
         if let Err(unreadable) = reader.skip_trivia() {
             return Some(Err(unreadable));
         }
@@ -93,7 +97,15 @@ pub fn pointer_to(parent: &str, name: &str) -> String {
 struct Reader<'a> {
     text: &'a str,
     at: usize,
+    /// How many values deep the reader presently is. A recursive descent over
+    /// text nobody vouched for runs out of stack rather than out of patience,
+    /// and a stack overflow aborts the process instead of unwinding.
+    depth: usize,
 }
+
+/// As deep as a document may nest. `serde_json` stops at 128 for the same
+/// reason, and nothing a reader edits by hand comes close.
+const DEEPEST_NESTING: usize = 128;
 
 impl<'a> Reader<'a> {
     fn whole_document(&mut self) -> Result<Document, Unreadable> {
@@ -168,6 +180,10 @@ impl<'a> Reader<'a> {
         names: &mut HashMap<String, Range<usize>>,
     ) -> Result<Value, Unreadable> {
         self.skip_trivia()?;
+        self.depth += 1;
+        if self.depth > DEEPEST_NESTING {
+            return Err(self.wrong_here("nested deeper than this can read"));
+        }
         let start = self.at;
         let value = match self.peek() {
             Some(b'{') => self.object(pointer, values, names)?,
@@ -181,6 +197,7 @@ impl<'a> Reader<'a> {
             None => return Err(self.wrong_here("expected a value")),
         };
         values.insert(pointer.to_string(), start..self.at);
+        self.depth -= 1;
         Ok(value)
     }
 
@@ -197,7 +214,10 @@ impl<'a> Reader<'a> {
         if self.peek() == Some(b'-') {
             self.at += 1;
         }
-        while matches!(self.peek(), Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')) {
+        while matches!(
+            self.peek(),
+            Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        ) {
             self.at += 1;
         }
         serde_json::from_str::<serde_json::Number>(&self.text[start..self.at])
@@ -373,6 +393,26 @@ mod tests {
         Document::read(text)
             .expect("the text holds a document")
             .expect("the document reads")
+    }
+
+    #[test]
+    fn nesting_deeper_than_the_reader_takes_is_refused_rather_than_overflowing() {
+        let deep = format!(
+            "{}1{}",
+            "[".repeat(DEEPEST_NESTING + 8),
+            "]".repeat(DEEPEST_NESTING + 8)
+        );
+        let read = Document::read(&deep).expect("the text holds a document");
+        assert!(read.is_err(), "a document this deep is refused");
+
+        // And one just inside the limit still reads, so the cap is not simply
+        // refusing everything nested at all.
+        let shallow = format!("{}1{}", "[".repeat(8), "]".repeat(8));
+        assert!(
+            Document::read(&shallow)
+                .expect("the text holds a document")
+                .is_ok()
+        );
     }
 
     #[test]

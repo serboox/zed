@@ -5,7 +5,7 @@ use gpui::{App, Entity, Task};
 use language::{Buffer, BufferSnapshot, CodeLabel};
 use project::{
     Completion, CompletionContext, CompletionDocumentation, CompletionSource, InProcessCompletions,
-    Project,
+    InProcessProject,
 };
 use text::{PointUtf16, ToOffset as _};
 
@@ -29,14 +29,14 @@ const MOST_THE_INDEX_IS_ASKED_FOR: usize = 100;
 impl InProcessCompletions for ProjectSymbols {
     fn completions(
         &self,
-        project: &Entity<Project>,
+        project: &InProcessProject,
         buffer: &Entity<Buffer>,
         position: PointUtf16,
         _context: &CompletionContext,
         cx: &mut App,
     ) -> Task<Result<Vec<Completion>>> {
         let nothing = || Task::ready(Ok(Vec::new()));
-        let Some(index) = crate::of_project(project, cx) else {
+        let Some(index) = crate::of_project(&project.project, cx) else {
             return nothing();
         };
         let snapshot = buffer.read(cx).snapshot();

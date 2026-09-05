@@ -766,6 +766,15 @@ fn main() {
         // asked for on every cursor move.
         symbol_index::index_semantics::init(cx);
         symbol_index::symbol_completions::init(cx);
+        // The sources of diagnostics that are not language servers. Registered
+        // here rather than beside the rest of the fork's wiring in `zed.rs`,
+        // because everything in that file below its `#[cfg(test)]` boundary is
+        // compiled out of the shipped binary -- which is where these had been
+        // sitting, running in tests and nowhere else.
+        cargo_diagnostics::init(cx);
+        go_diagnostics::init(cx);
+        ruff_diagnostics::init(cx);
+        json_diagnostics::init(cx);
         search_everywhere::init(cx);
         project_panel::init(cx);
         outline_panel::init(cx);

@@ -105,14 +105,18 @@ fn watch_one(
     watching: &Rc<RefCell<Watching>>,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
-    if !is_go(buffer, cx) {
-        return;
-    }
     cx.subscribe(buffer, {
         let project = project.clone();
         let watching = watching.clone();
         move |_: &mut workspace::Workspace, buffer, event, cx| {
             if !matches!(event, language::BufferEvent::Saved) {
+                return;
+            }
+            // Asked here rather than before subscribing: a buffer's language
+            // is often settled after the store reports it added, so a check
+            // made once at subscription time misses the first file of a
+            // session entirely.
+            if !is_go(&buffer, cx) {
                 return;
             }
             let lsp_store = project.read(cx).lsp_store();

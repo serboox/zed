@@ -9,7 +9,7 @@ use language::{Buffer, CodeLabel, LanguageRegistry, PointUtf16, ToOffset as _};
 use lsp::CompletionContext;
 use parking_lot::RwLock;
 use project::lsp_store::CompletionDocumentation;
-use project::{Completion, CompletionSource, InProcessCompletions, LspStore, Project};
+use project::{Completion, CompletionSource, InProcessCompletions, InProcessProject, LspStore};
 use serde_json::Value;
 
 use crate::{all_schema_file_associations, handle_schema_request};
@@ -31,7 +31,7 @@ struct SchemaCompletions;
 impl InProcessCompletions for SchemaCompletions {
     fn completions(
         &self,
-        project: &Entity<Project>,
+        project: &InProcessProject,
         buffer: &Entity<Buffer>,
         position: PointUtf16,
         _context: &CompletionContext,
@@ -51,11 +51,11 @@ impl InProcessCompletions for SchemaCompletions {
             return nothing();
         }
 
-        let languages = project.read(cx).languages().clone();
+        let languages = project.languages.clone();
         let Some(uri) = schema_uri_for_path(&languages, &path, cx) else {
             return nothing();
         };
-        let lsp_store = project.read(cx).lsp_store();
+        let lsp_store = project.lsp_store.clone();
         let offset = position.to_offset(&snapshot);
 
         cx.spawn(async move |cx| {
@@ -396,7 +396,26 @@ fn scan_bare_token(bytes: &[u8], start: usize) -> usize {
     {
         index += 1;
     }
-    index.max(start + 1)
+    if index > start {
+        return index;
+    }
+    // Nothing matched, and the scan still has to move. One byte past a
+    // multi-byte character's lead byte is inside that character, and an offset
+    // inside a character is what `anchor_before` asserts against; the whole
+    // character is the smallest honest step.
+    start + width_of_character_at(bytes, start)
+}
+
+/// How many bytes the UTF-8 character beginning at `start` takes, read from its
+/// lead byte. One for anything that is not a lead byte, so a scan over text
+/// that is not valid UTF-8 still moves.
+fn width_of_character_at(bytes: &[u8], start: usize) -> usize {
+    match bytes.get(start) {
+        Some(byte) if *byte >= 0xf0 => 4,
+        Some(byte) if *byte >= 0xe0 => 3,
+        Some(byte) if *byte >= 0xc0 => 2,
+        _ => 1,
+    }
 }
 
 fn unescape(content: &str) -> String {

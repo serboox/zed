@@ -287,14 +287,17 @@ fn comment_above(lines: &[&str], at: usize, markers: &[Arc<str>]) -> Option<Stri
     if markers.is_empty() {
         return None;
     }
+    // The longest marker that fits, not the first: Rust's markers are `//`,
+    // `///` and `//!` in that order, and stripping `///` with `//` leaves a
+    // stray slash at the front of every doc comment a card shows.
     let strip = |line: &str| -> Option<String> {
         let trimmed = line.trim_start();
-        markers.iter().find_map(|marker| {
-            let marker = marker.trim_end();
-            trimmed
-                .strip_prefix(marker)
-                .map(|rest| rest.trim_start().to_string())
-        })
+        markers
+            .iter()
+            .map(|marker| marker.trim_end())
+            .filter(|marker| trimmed.starts_with(marker))
+            .max_by_key(|marker| marker.len())
+            .map(|marker| trimmed[marker.len()..].trim_start().to_string())
     };
 
     let mut collected: Vec<String> = Vec::new();
@@ -429,7 +432,6 @@ impl SemanticsProvider for IndexFirst {
                 )
                 .map(|help| vec![help])
             })
-            .ok()?
         }))
     }
 

@@ -723,6 +723,18 @@ impl CompletionDisplayOptions {
     }
 }
 
+/// The parts of the project a completion source may use, taken out before the
+/// project was leased.
+///
+/// A source is asked from inside `Project::completions`, which runs while the
+/// project entity is being updated, so reading that entity again there panics.
+/// Everything reachable only through such a read is handed over here instead.
+pub struct InProcessProject {
+    pub project: Entity<Project>,
+    pub languages: Arc<LanguageRegistry>,
+    pub lsp_store: Entity<LspStore>,
+}
+
 /// A source of completions that runs inside this process, with no language
 /// server behind it.
 ///
@@ -732,7 +744,7 @@ impl CompletionDisplayOptions {
 pub trait InProcessCompletions: Send + Sync {
     fn completions(
         &self,
-        project: &Entity<Project>,
+        project: &InProcessProject,
         buffer: &Entity<Buffer>,
         position: PointUtf16,
         context: &CompletionContext,
@@ -4564,14 +4576,21 @@ impl Project {
             return from_language_servers;
         }
 
-        let project = cx.entity();
+        let project = InProcessProject {
+            project: cx.entity(),
+            languages: self.languages.clone(),
+            lsp_store: self.lsp_store.clone(),
+        };
         let in_process = sources
             .iter()
             .map(|source| source.completions(&project, buffer, position, &context, cx))
             .collect::<Vec<_>>();
 
         cx.background_spawn(async move {
-            let mut responses = from_language_servers.await?;
+            // A language server that failed or was cancelled must not cost the
+            // reader what the in-process sources answered: with no server
+            // running at all this is the only answer there is.
+            let mut responses = from_language_servers.await.log_err().unwrap_or_default();
             for task in in_process {
                 // A broken in-process source must not cost the reader whatever
                 // the language servers already answered.
