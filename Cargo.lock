@@ -22579,15 +22579,22 @@ name = "symbol_index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clock",
+ "collections",
+ "editor",
  "fs",
+ "futures 0.3.32",
  "gpui",
+ "language",
  "log",
+ "lsp",
  "paths",
  "project",
  "semantic_index",
  "serde_json",
  "settings",
  "tempfile",
+ "text",
  "util",
  "workspace",
 ]
