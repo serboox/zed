@@ -15014,6 +15014,173 @@ async fn test_initial_scan_complete(cx: &mut gpui::TestAppContext) {
     });
 }
 
+struct FixedCompletions {
+    new_texts: Vec<String>,
+    asked_at: Arc<Mutex<Option<language::PointUtf16>>>,
+}
+
+impl InProcessCompletions for FixedCompletions {
+    fn completions(
+        &self,
+        _project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        position: language::PointUtf16,
+        _context: &lsp::CompletionContext,
+        cx: &mut App,
+    ) -> Task<Result<Vec<Completion>>> {
+        *self.asked_at.lock() = Some(position);
+        let snapshot = buffer.read(cx).snapshot();
+        let anchor = snapshot.anchor_before(snapshot.len());
+        Task::ready(Ok(self
+            .new_texts
+            .iter()
+            .map(|new_text| Completion {
+                replace_range: anchor..anchor,
+                new_text: new_text.clone(),
+                label: language::CodeLabel::plain(new_text.clone(), None),
+                documentation: None,
+                source: CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect()))
+    }
+}
+
+fn completion_texts(responses: &[CompletionResponse]) -> Vec<&str> {
+    responses
+        .iter()
+        .flat_map(|response| &response.completions)
+        .map(|completion| completion.new_text.as_str())
+        .collect()
+}
+
+#[gpui::test]
+async fn test_in_process_completions_without_a_language_server(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.json": "{}" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let asked_at = Arc::new(Mutex::new(None));
+    cx.update(|cx| {
+        register_in_process_completions(
+            Arc::new(FixedCompletions {
+                new_texts: vec!["without_a_server".to_string()],
+                asked_at: asked_at.clone(),
+            }),
+            cx,
+        )
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/a.json"), cx)
+        })
+        .await
+        .unwrap();
+    let text = "{\"already\": 1}";
+    buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+    cx.executor().run_until_parked();
+
+    let responses = project
+        .update(cx, |project, cx| {
+            project.completions(&buffer, text.len(), DEFAULT_COMPLETION_CONTEXT, cx)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(completion_texts(&responses), vec!["without_a_server"]);
+    assert_eq!(
+        *asked_at.lock(),
+        Some(language::PointUtf16::new(0, text.len() as u32)),
+        "the source is asked at the cursor even with no language server running"
+    );
+}
+
+#[gpui::test]
+async fn test_in_process_completions_are_added_to_server_completions(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "TypeScript",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    cx.update(|cx| {
+        register_in_process_completions(
+            Arc::new(FixedCompletions {
+                new_texts: vec!["from_the_index".to_string()],
+                asked_at: Arc::new(Mutex::new(None)),
+            }),
+            cx,
+        )
+    });
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_language_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+
+    let text = "let a = b";
+    buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+    let responses = project.update(cx, |project, cx| {
+        project.completions(&buffer, text.len(), DEFAULT_COMPLETION_CONTEXT, cx)
+    });
+
+    fake_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async {
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                lsp::CompletionItem {
+                    label: "from_the_server_first".into(),
+                    ..Default::default()
+                },
+                lsp::CompletionItem {
+                    label: "from_the_server_second".into(),
+                    ..Default::default()
+                },
+            ])))
+        })
+        .next()
+        .await;
+
+    let responses = responses.await.unwrap();
+    assert_eq!(
+        completion_texts(&responses),
+        vec![
+            "from_the_server_first",
+            "from_the_server_second",
+            "from_the_index"
+        ],
+        "the server\'s answers keep their order and the in-process source is added after them"
+    );
+}
+
 pub fn init_test(cx: &mut gpui::TestAppContext) {
     zlog::init_test();
 
