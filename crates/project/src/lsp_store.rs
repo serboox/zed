@@ -47,7 +47,7 @@ use crate::{
         ManifestTree,
     },
     prettier_store::{self, PrettierStore, PrettierStoreEvent},
-    project_settings::{BinarySettings, LspSettings, ProjectSettings},
+    project_settings::{BinarySettings, LanguageServerStart, LspSettings, ProjectSettings},
     toolchain_store::{LocalToolchainStore, ToolchainStoreEvent},
     trusted_worktrees::{PathTrust, TrustedWorktrees, TrustedWorktreesEvent},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
@@ -340,6 +340,11 @@ pub struct LocalLspStore {
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     all_language_servers_stopped: bool,
     stopped_language_servers: HashSet<LanguageServerName>,
+    /// Languages a server has been started for by hand. Empty is the resting
+    /// state under `LanguageServerStart::ByHand`: opening a file starts
+    /// nothing, and the editor answers from its own index until someone asks
+    /// for a server.
+    languages_started_by_hand: HashSet<LanguageName>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -2877,6 +2882,20 @@ impl LocalLspStore {
             });
     }
 
+    /// Whether a server for this language is allowed to start right now.
+    ///
+    /// Under `LanguageServerStart::ByHand` -- this fork's resting state -- the
+    /// answer is no until someone starts one for the language, because a
+    /// server that nobody asked for is the single largest thing the editor
+    /// pays for: measured here, one held twenty-three times the editor's own
+    /// memory while every question asked of it was one the index answers.
+    fn may_start_a_server(&self, language: &LanguageName, cx: &App) -> bool {
+        match ProjectSettings::get_global(cx).global_lsp_settings.start {
+            LanguageServerStart::Automatically => true,
+            LanguageServerStart::ByHand => self.languages_started_by_hand.contains(language),
+        }
+    }
+
     fn register_buffer_with_language_servers(
         &mut self,
         buffer_handle: &Entity<Buffer>,
@@ -2961,6 +2980,14 @@ impl LocalLspStore {
                     {
                         return None;
                     }
+                }
+
+                // A server that has not been asked for does not get started by
+                // the mere act of opening a file. One already running is past
+                // this gate, and so is a language someone started a server for.
+                if server_node.server_id().is_none() && !self.may_start_a_server(&language_name, cx)
+                {
+                    return None;
                 }
 
                 let server_id = server_node.server_id_or_init(|disposition| {
@@ -4465,6 +4492,7 @@ impl LspStore {
                 restricted_worktrees_tasks: HashMap::default(),
                 all_language_servers_stopped: false,
                 stopped_language_servers: HashSet::default(),
+                languages_started_by_hand: HashSet::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -11636,6 +11664,7 @@ impl LspStore {
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
             local.all_language_servers_stopped = true;
+            local.languages_started_by_hand.clear();
         }
         self.shutdown_all_language_servers(cx).detach();
     }
@@ -11728,7 +11757,15 @@ impl LspStore {
                 stop_task.await;
                 lsp_store.update(cx, |lsp_store, cx| {
                     if clear_stopped {
+                        // Restarting a buffer's servers is how a server is asked
+                        // for by hand, so it is also what lifts the resting "start
+                        // nothing" state for that buffer's language.
+                        let languages = buffers
+                            .iter()
+                            .filter_map(|buffer| buffer.read(cx).language().map(|l| l.name()))
+                            .collect::<Vec<_>>();
                         if let Some(local) = lsp_store.as_local_mut() {
+                            local.languages_started_by_hand.extend(languages);
                             if only_restart_servers.is_empty() {
                                 // A full restart of these buffers un-suppresses every
                                 // manually-stopped server, even ones that are no longer
@@ -11800,10 +11837,20 @@ impl LspStore {
                 Ok(())
             })
         } else {
+            // Stopping is the other half of starting by hand: the language goes
+            // back to being served by the index alone, and opening another of
+            // its files does not quietly bring the server back.
+            let languages = buffers
+                .iter()
+                .filter_map(|buffer| buffer.read(cx).language().map(|language| language.name()))
+                .collect::<Vec<_>>();
             let (stopped_names, task) =
                 self.stop_local_language_servers_for_buffers(&buffers, also_stop_servers, cx);
             if let Some(local) = self.as_local_mut() {
                 local.stopped_language_servers.extend(stopped_names);
+                for language in languages {
+                    local.languages_started_by_hand.remove(&language);
+                }
             }
             cx.background_spawn(async move {
                 task.await;

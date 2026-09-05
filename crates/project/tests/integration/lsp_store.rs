@@ -5,7 +5,7 @@ use std::{
 
 use fs::FakeFs;
 use futures::StreamExt;
-use gpui::TestAppContext;
+use gpui::{TestAppContext, UpdateGlobal as _};
 use language::{CodeLabel, FakeLspAdapter, HighlightId, rust_lang};
 use lsp::Uri;
 use project::{
@@ -13,6 +13,8 @@ use project::{
     lsp_store::{log_store::TestRpcRequestTracker, *},
 };
 use serde_json::json;
+use settings::SettingsStore;
+use std::collections::HashSet;
 use util::path;
 
 use crate::init_test;
@@ -93,6 +95,83 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
                 .any(|(status_server_id, _)| status_server_id == server_id)
         );
         assert!(!lsp_store.has_language_server_seed_for_worktree(invisible_worktree_id));
+    });
+}
+
+// The whole point of the fork's resting state: opening a file it serves does
+// not bring a language server up. Measured on this machine, one such server
+// held twenty-three times the editor's own memory, so a server nobody asked
+// for is the single largest thing an idle editor pays for.
+#[gpui::test]
+async fn a_server_does_not_start_until_it_is_asked_for(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .project
+                    .all_languages
+                    .defaults
+                    .enable_language_server = Some(true);
+                content.global_lsp_settings = Some(settings::GlobalLspSettingsContent {
+                    start: Some(settings::LanguageServerStart::ByHand),
+                    ..Default::default()
+                });
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/the-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/the-root").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project
+                .lsp_store()
+                .read(cx)
+                .language_server_statuses()
+                .count(),
+            0,
+            "opening a file must not start a server that nobody asked for"
+        );
+    });
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![buffer.clone()],
+            HashSet::default(),
+            true,
+            cx,
+        );
+    });
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project
+                .lsp_store()
+                .read(cx)
+                .language_server_statuses()
+                .count(),
+            1,
+            "asking for a server by hand must start exactly one"
+        );
     });
 }
 

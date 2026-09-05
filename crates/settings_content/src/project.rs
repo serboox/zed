@@ -238,6 +238,24 @@ pub struct GlobalLspSettingsContent {
     pub notifications: Option<LspNotificationSettingsContent>,
     /// Rules for rendering LSP semantic tokens.
     pub semantic_token_rules: Option<SemanticTokenRules>,
+    /// When a language server may start.
+    ///
+    /// Default: `by_hand`
+    pub start: Option<LanguageServerStart>,
+}
+
+/// What has to happen before a language server is allowed to run.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageServerStart {
+    /// As soon as a file the server serves is opened.
+    Automatically,
+    /// Never on its own. The editor answers from its own index, and a server
+    /// runs only for a language it has been started for by hand.
+    #[default]
+    ByHand,
 }
 
 #[with_fallible_options]

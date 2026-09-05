@@ -20,6 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 pub use settings::BinarySettings;
 pub use settings::DirenvSettings;
+pub use settings::LanguageServerStart;
 pub use settings::LspSettings;
 use settings::{
     DapSettingsContent, EditorconfigEvent, InvalidSettingsError, LocalSettingsKind,
@@ -137,6 +138,9 @@ pub struct GlobalLspSettings {
 
     /// Rules for highlighting semantic tokens.
     pub semantic_token_rules: SemanticTokenRules,
+
+    /// What has to happen before a language server is allowed to run.
+    pub start: LanguageServerStart,
 }
 
 impl Default for GlobalLspSettings {
@@ -146,6 +150,7 @@ impl Default for GlobalLspSettings {
             request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
+            start: LanguageServerStart::default(),
         }
     }
 }
@@ -755,6 +760,12 @@ impl Settings for ProjectSettings {
                     .as_ref()
                     .unwrap()
                     .clone(),
+                start: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .unwrap()
+                    .start
+                    .unwrap_or_default(),
             },
             dap: project
                 .dap

@@ -162,6 +162,13 @@ pub fn test_settings() -> &'static str {
             }),
             &mut value,
         );
+        // The shipped editor starts no language server until asked; the suite
+        // was written against a server that starts itself, so it keeps that
+        // behaviour and the by-hand rule is tested where it is the subject.
+        util::merge_non_null_json_value_into(
+            serde_json::json!({ "global_lsp_settings": { "start": "automatically" } }),
+            &mut value,
+        );
         value.as_object_mut().unwrap().remove("languages");
         serde_json::to_string(&value).unwrap()
     });

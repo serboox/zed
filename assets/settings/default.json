@@ -2621,6 +2621,15 @@
   },
   // Common language server settings.
   "global_lsp_settings": {
+    // When a language server may start.
+    //
+    // "by_hand"        never on its own; the editor answers from its own index,
+    //                  and a server runs only for a language you start one for
+    //                  ("editor: restart language server" on one of its files).
+    // "automatically"  as soon as a file it serves is opened.
+    //
+    // Default: "by_hand"
+    "start": "by_hand",
     // Whether to show the LSP servers button in the status bar.
     "button": true,
     // The maximum amount of time to wait for responses from language servers, in seconds.
