@@ -189,6 +189,7 @@ impl Render for TextPromptModal {
             .child(
                 cyberpunk::dialog_footer().child(
                     Button::new("text-prompt-confirm", self.confirm_label.clone())
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .label_size(LabelSize::Small)
                         .style(cyberpunk::Rank::Accent.style())
                         .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),

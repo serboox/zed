@@ -42,7 +42,9 @@ use std::{
 use ui::{
     CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, ListSeparator,
     Navigable, NavigableEntry, Tooltip,
-    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_header, dialog_shell,
+    },
     prelude::*,
 };
 use util::{
@@ -324,6 +326,7 @@ impl PickerDelegate for DevContainerPickerDelegate {
             dialog_footer()
                 .child(
                     Button::new("run-action-secondary", "Open devcontainer.json")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)
@@ -335,6 +338,7 @@ impl PickerDelegate for DevContainerPickerDelegate {
                 )
                 .child(
                     Button::new("run-action", "Start Dev Container")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
@@ -1358,6 +1362,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                 .when(is_project_selected, |footer| {
                     footer.child(
                         Button::new("open_new_window", "New Window")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
                             .on_click(|_, window, cx| {
@@ -1367,6 +1372,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                 })
                 .child(
                     Button::new("select", confirm_label)
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Accent.style())
                         .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
                         .on_click(|_, window, cx| {

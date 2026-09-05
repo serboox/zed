@@ -35,7 +35,9 @@ use ui::{
     AnyElement, App, Color, CommonAnimationExt, Context, Icon, IconButton, IconName, IconSize,
     InteractiveElement, IntoElement, Label, ListItem, ListSeparator, Navigable, NavigableEntry,
     ParentElement, Render, SharedString, Styled, Toggleable, Window,
-    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_header, dialog_shell,
+    },
     div,
 };
 use util::ResultExt;
@@ -425,6 +427,7 @@ impl PickerDelegate for TemplatePickerDelegate {
             dialog_footer()
                 .child(
                     Button::new("run-action", "Continue")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
@@ -617,6 +620,7 @@ impl PickerDelegate for FeaturePickerDelegate {
             dialog_footer()
                 .child(
                     Button::new("run-action", "Select Feature")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
@@ -628,6 +632,7 @@ impl PickerDelegate for FeaturePickerDelegate {
                 )
                 .child(
                     Button::new("run-action-secondary", "Confirm Selections")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)

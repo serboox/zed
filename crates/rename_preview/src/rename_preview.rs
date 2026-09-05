@@ -901,6 +901,7 @@ impl Render for RenamePreview {
                     .when(applied, |footer| {
                         footer.child(
                             Button::new("rename-undo", "Undo")
+                                .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                 .label_size(LabelSize::Small)
                                 .style(ui::cyberpunk::Rank::Neutral.style())
                                 .tooltip(Tooltip::text("Put every file back as it was"))
@@ -910,6 +911,7 @@ impl Render for RenamePreview {
                     .when(!applied, |footer| {
                         footer.child(
                             Button::new("rename-apply", "Rename")
+                                .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                 .label_size(LabelSize::Small)
                                 .style(ui::cyberpunk::Rank::Accent.style())
                                 .disabled(ticked == 0)

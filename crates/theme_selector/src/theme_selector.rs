@@ -15,7 +15,7 @@ use theme_settings::{
 };
 use ui::{
     ListItem, ListItemSpacing,
-    cyberpunk::{Rank, dialog_footer},
+    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
     prelude::*,
     v_flex,
 };
@@ -543,6 +543,7 @@ impl PickerDelegate for ThemeSelectorDelegate {
             dialog_footer()
                 .child(
                     Button::new("docs", "View Theme Docs")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Quiet.style())
                         .end_icon(
                             Icon::new(IconName::ArrowUpRight)
@@ -555,6 +556,7 @@ impl PickerDelegate for ThemeSelectorDelegate {
                 )
                 .child(
                     Button::new("more-themes", "Install Themes")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .on_click(cx.listener({
                             move |_, _, window, cx| {

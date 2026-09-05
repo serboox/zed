@@ -11,7 +11,7 @@ use theme::{Appearance, SystemAppearance, ThemeMeta, ThemeRegistry};
 use theme_settings::{IconThemeName, IconThemeSelection, ThemeSettings};
 use ui::{
     ListItem, ListItemSpacing,
-    cyberpunk::{Rank, dialog_footer},
+    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
     prelude::*,
     v_flex,
 };
@@ -334,6 +334,7 @@ impl PickerDelegate for IconThemeSelectorDelegate {
             dialog_footer()
                 .child(
                     Button::new("docs", "View Icon Theme Docs")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Quiet.style())
                         .end_icon(
                             Icon::new(IconName::ArrowUpRight)
@@ -346,6 +347,7 @@ impl PickerDelegate for IconThemeSelectorDelegate {
                 )
                 .child(
                     Button::new("more-icon-themes", "Install Icon Themes")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .on_click(move |_event, window, cx| {
                             window.dispatch_action(

@@ -15,7 +15,7 @@ use task::{DebugScenario, ResolvedTask, RevealTarget, TaskContext, TaskTemplate}
 use ui::{
     ActiveTheme, Clickable, FluentBuilder as _, IconButtonShape, IconWithIndicator, Indicator,
     IntoElement, KeyBinding, ListItem, ListItemSpacing, RenderOnce, Toggleable, Tooltip,
-    cyberpunk::{Rank, dialog_footer},
+    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
     div,
     prelude::*,
 };
@@ -658,6 +658,7 @@ impl PickerDelegate for TasksModalDelegate {
                     let keybind = KeyBinding::for_action(&*action, cx);
 
                     Button::new("edit-current-task", label)
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .key_binding(keybind)
                         .on_click(move |_, window, cx| {
@@ -679,6 +680,7 @@ impl PickerDelegate for TasksModalDelegate {
                             };
 
                             Button::new("spawn-onehshot", spawn_oneshot_label)
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&*action, cx))
                                 .on_click(move |_, window, cx| {
@@ -693,6 +695,7 @@ impl PickerDelegate for TasksModalDelegate {
                                 "Spawn Without History"
                             };
                             Button::new("spawn", label)
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
                                 .on_click(move |_, window, cx| {
@@ -705,6 +708,7 @@ impl PickerDelegate for TasksModalDelegate {
                                 if is_recent_selected { "Rerun" } else { "Spawn" };
 
                             Button::new("spawn", run_entry_label)
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
                                 .on_click(|_, window, cx| {

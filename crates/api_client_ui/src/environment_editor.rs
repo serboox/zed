@@ -1100,6 +1100,7 @@ impl Render for EnvironmentEditorModal {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("environment-editor-close", "Close")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),

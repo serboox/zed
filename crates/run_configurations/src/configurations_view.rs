@@ -2201,6 +2201,7 @@ impl RunConfigurationsView {
                             "configuration-open-file-button",
                             format!(".zed/{}", kind_being_edited.file_name()),
                         )
+                        .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .label_size(LabelSize::XSmall)
                         .color(Color::Muted)
                         .style(ui::cyberpunk::Rank::Quiet.style())
@@ -2223,6 +2224,7 @@ impl RunConfigurationsView {
             .child(ui::cyberpunk::dialog_footer_spacer())
             .child(
                 Button::new("configuration-cancel", "Close")
+                    .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                     .label_size(LabelSize::Small)
                     .style(ui::cyberpunk::Rank::Neutral.style())
                     .on_click(cx.listener(|view, _, window, cx| view.close(window, cx))),
@@ -2233,6 +2235,7 @@ impl RunConfigurationsView {
             // hold two ideas at once for no gain.
             .child(
                 Button::new("configuration-save", "Save")
+                    .min_width(ui::cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                     .label_size(LabelSize::Small)
                     .style(ui::cyberpunk::Rank::Accent.style())
                     .disabled(!has_one)

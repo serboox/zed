@@ -696,11 +696,13 @@ impl Render for ImportDataView {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         ui::Button::new("cancel-import", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         ui::Button::new("run-import", "Import")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .disabled(importing)
                             .on_click(

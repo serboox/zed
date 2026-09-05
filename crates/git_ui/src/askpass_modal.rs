@@ -151,12 +151,14 @@ impl Render for AskPassModal {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("askpass-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("askpass-confirm", "Continue")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| {

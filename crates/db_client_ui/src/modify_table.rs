@@ -1374,6 +1374,7 @@ impl Render for ModifyTableView {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(DismissEvent);
@@ -1381,6 +1382,7 @@ impl Render for ModifyTableView {
                     )
                     .child(
                         Button::new("execute", "Execute")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| this.execute(window, cx))),

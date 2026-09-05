@@ -147,8 +147,15 @@ impl RenderOnce for AlertModal {
 
             modal = modal.child(
                 cyberpunk::dialog_footer()
-                    .child(Button::new(dismiss_label.clone(), dismiss_label).color(Color::Muted))
-                    .child(Button::new(primary_action.clone(), primary_action)),
+                    .child(
+                        Button::new(dismiss_label.clone(), dismiss_label)
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new(primary_action.clone(), primary_action)
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH),
+                    ),
             );
         }
 

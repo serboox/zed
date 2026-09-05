@@ -493,6 +493,7 @@ pub struct ButtonLike {
     pub(super) selected: bool,
     pub(super) selected_style: Option<ButtonStyle>,
     pub(super) width: Option<DefiniteLength>,
+    pub(super) min_width: Option<DefiniteLength>,
     pub(super) height: Option<DefiniteLength>,
     pub(super) layer: Option<ElevationIndex>,
     tab_index: Option<isize>,
@@ -528,6 +529,7 @@ impl ButtonLike {
             selected: false,
             selected_style: None,
             width: None,
+            min_width: None,
             height: None,
             size: ButtonSize::Default,
             rounding: Some(ButtonLikeRounding::ALL),
@@ -695,6 +697,18 @@ impl Clickable for ButtonLike {
     }
 }
 
+impl ButtonLike {
+    /// A floor for the button's own frame, with the label centred inside it.
+    ///
+    /// Unlike [`FixedWidth::width`] this never truncates: a label wider than
+    /// the floor keeps its natural width. It is what makes a row of actions
+    /// read as one row -- see `cyberpunk::DIALOG_ACTION_MIN_WIDTH`.
+    pub fn min_width(mut self, min_width: impl Into<DefiniteLength>) -> Self {
+        self.min_width = Some(min_width.into());
+        self
+    }
+}
+
 impl FixedWidth for ButtonLike {
     fn width(mut self, width: impl Into<DefiniteLength>) -> Self {
         self.width = Some(width.into());
@@ -800,6 +814,9 @@ impl RenderOnce for ButtonLike {
             .h(self.height.unwrap_or(self.size.rems().into()))
             .when_some(self.width, |this, width| {
                 this.w(width).justify_center().text_center()
+            })
+            .when_some(self.min_width, |this, min_width| {
+                this.min_w(min_width).justify_center().text_center()
             })
             .when(is_outlined, |this| this.border_1())
             // 4px on a 28px-tall control reads as "almost square, but not quite";

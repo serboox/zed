@@ -336,6 +336,15 @@ impl Clickable for Button {
     }
 }
 
+impl Button {
+    /// A floor for the button's own frame, with the label centred inside it.
+    /// See [`ButtonLike::min_width`].
+    pub fn min_width(mut self, min_width: impl Into<DefiniteLength>) -> Self {
+        self.base = self.base.min_width(min_width);
+        self
+    }
+}
+
 impl FixedWidth for Button {
     /// Sets a fixed width for the button.
     ///

@@ -36,8 +36,8 @@ use ui::{
     RedistributableColumnsState, Render, SharedString, Styled as _, Table, TableInteractionState,
     TableResizeBehavior, Tooltip, Window,
     cyberpunk::{
-        Rank, dialog_body, dialog_footer, dialog_footer_left, dialog_footer_spacer, dialog_header,
-        dialog_shell,
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_footer_left,
+        dialog_footer_spacer, dialog_header, dialog_shell,
     },
     prelude::*,
 };
@@ -3161,6 +3161,7 @@ impl Render for KeybindingEditorModal {
                         .child(dialog_footer_spacer())
                         .child(
                             Button::new("show_matching", "View")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .label_size(LabelSize::Small)
                                 .style(Rank::Quiet.style())
                                 .end_icon(
@@ -3175,11 +3176,13 @@ impl Render for KeybindingEditorModal {
                     })
                     .child(
                         Button::new("cancel", "Cancel")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("save-btn", "Save")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Accent.style())
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.save_or_display_error(cx);

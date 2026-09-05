@@ -4562,17 +4562,20 @@ impl Render for MasterPasswordView {
                     .when(self.allow_skip, |row| {
                         row.child(
                             Button::new("master-password-skip", "Skip passwords")
+                                .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                 .style(cyberpunk::Rank::Quiet.style())
                                 .on_click(cx.listener(|this, _, window, cx| this.skip(window, cx))),
                         )
                     })
                     .child(
                         Button::new("master-password-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("master-password-confirm", self.confirm_label.clone())
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
@@ -4677,11 +4680,13 @@ impl Render for QueryParamsView {
                 cyberpunk::dialog_footer()
                     .child(
                         Button::new("params-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("params-strip", "Run as-is")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Quiet.style())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.run(true, window, cx)),
@@ -4689,6 +4694,7 @@ impl Render for QueryParamsView {
                     )
                     .child(
                         Button::new("params-run", "Run")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.run(false, window, cx)),
@@ -4853,6 +4859,7 @@ impl Render for RenameTableView {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("rename-table-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
@@ -4861,6 +4868,7 @@ impl Render for RenameTableView {
                             .debug_selector(|| "rename-table-confirm".into())
                             .child(
                                 Button::new("rename-table-confirm", "Rename")
+                                    .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                     .style(cyberpunk::Rank::Accent.style())
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.confirm(window, cx)),
@@ -4960,6 +4968,7 @@ impl Render for ComparePickerView {
             .child(
                 cyberpunk::dialog_footer().child(
                     Button::new("compare-pick-cancel", "Cancel")
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .style(cyberpunk::Rank::Neutral.style())
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                 ),
@@ -5061,6 +5070,7 @@ impl Render for QuickDocView {
                         // already there and has nothing to confirm, so the
                         // accent would be worn by the way out.
                         Button::new("quick-doc-done", "Close")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     ),

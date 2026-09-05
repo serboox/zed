@@ -1419,6 +1419,7 @@ impl PickerDelegate for WorktreePickerDelegate {
         let footer = cyberpunk::dialog_footer().child(
             cyberpunk::dialog_footer_left().child(
                 Button::new("configure-worktree-tasks", "Automate Setup")
+                    .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                     .style(cyberpunk::Rank::Quiet.style())
                     .key_binding(
                         KeyBinding::for_action_in(&OpenWorktreeSetupTasks, &focus_handle, cx)
@@ -1435,6 +1436,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                 footer
                     .child(
                         Button::new("create-worktree", "Create")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
@@ -1455,6 +1457,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .when(is_deleting, |this| {
                                 this.child(
                                     Button::new("delete-worktree", "Deleting…")
+                                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                         .style(cyberpunk::Rank::Destructive.style())
                                         .loading(true)
                                         .disabled(true),
@@ -1464,6 +1467,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 let focus_handle = focus_handle.clone();
                                 this.child(
                                     Button::new("delete-worktree", "Delete")
+                                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                         .style(cyberpunk::Rank::Destructive.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(
@@ -1482,6 +1486,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 let focus_handle = focus_handle.clone();
                                 this.child(
                                     Button::new("open-in-new-window", "Open in New Window")
+                                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                         .style(cyberpunk::Rank::Neutral.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(
@@ -1502,6 +1507,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .when(!is_deleting, |this| {
                                 this.child(
                                     Button::new("open-worktree", "Open")
+                                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                         .style(cyberpunk::Rank::Accent.style())
                                         .key_binding(
                                             KeyBinding::for_action_in(

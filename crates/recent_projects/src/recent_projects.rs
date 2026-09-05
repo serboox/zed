@@ -42,7 +42,7 @@ use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
     ListSubHeader, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip,
-    cyberpunk::{Rank, dialog_footer},
+    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
     prelude::*,
 };
 use util::{ResultExt, paths::PathExt};
@@ -1774,6 +1774,7 @@ impl PickerDelegate for RecentProjectsDelegate {
         let secondary_footer_actions: Option<AnyElement> = match selected_entry {
             Some(ProjectPickerEntry::OpenFolder { .. }) => Some(
                 Button::new("remove_selected", "Remove Folder")
+                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                     .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
@@ -1787,6 +1788,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             ),
             Some(ProjectPickerEntry::ProjectGroup(_)) if !is_current_workspace_entry => Some(
                 Button::new("remove_selected", "Remove from Window")
+                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                     .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
@@ -1800,6 +1802,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             ),
             Some(ProjectPickerEntry::RecentProject(_)) => Some(
                 Button::new("delete_recent", "Remove")
+                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                     .style(Rank::Destructive.style())
                     .key_binding(KeyBinding::for_action_in(
                         &RemoveSelected,
@@ -1823,6 +1826,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             })
             .trigger(
                 Button::new("actions-trigger", "Actions")
+                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                     .style(Rank::Quiet.style())
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .key_binding(KeyBinding::for_action_in(
@@ -1902,6 +1906,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let selected_index = self.selected_index;
                                 let filtered_entries = self.filtered_entries.clone();
                                 Button::new("move_to_new_window", "New Window")
+                                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                                     .style(Rank::Neutral.style())
                                     .key_binding(KeyBinding::for_action_in(
                                         &menu::SecondaryConfirm,
@@ -1923,6 +1928,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         })
                         .child(
                             Button::new("activate", "Activate")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
@@ -1936,6 +1942,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     } else if self.create_new_window {
                         this.child(
                             Button::new("open_here", "This Window")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Neutral.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
@@ -1948,6 +1955,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                         .child(
                             Button::new("open_new_window", "Open")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
@@ -1961,6 +1969,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     } else {
                         this.child(
                             Button::new("open_new_window", "New Window")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Neutral.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::SecondaryConfirm,
@@ -1973,6 +1982,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                         .child(
                             Button::new("open_here", "Open")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,

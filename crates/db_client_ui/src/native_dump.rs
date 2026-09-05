@@ -658,6 +658,7 @@ impl Render for NativeDumpDialog {
                             .debug_selector(|| "DUMP_CANCEL_BTN".to_string())
                             .child(
                                 Button::new("dump-cancel", "Cancel")
+                                    .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                     .style(cyberpunk::Rank::Neutral.style())
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(NativeDumpEvent::Dismissed);
@@ -668,6 +669,7 @@ impl Render for NativeDumpDialog {
                     .child(
                         div().debug_selector(|| "DUMP_RUN_BTN".to_string()).child(
                             Button::new("dump-run", "Run")
+                                .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                 .style(cyberpunk::Rank::Accent.style())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     let request = this.build_request(cx);

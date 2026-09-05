@@ -505,12 +505,14 @@ impl Render for RenameBranchModal {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("rename-branch-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("rename-branch-confirm", "Rename")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -785,12 +787,14 @@ impl Render for RefPickerModal {
                 cyberpunk::dialog_footer()
                     .child(
                         Button::new("ref-picker-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
                         Button::new("ref-picker-confirm", "View")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1349,6 +1353,7 @@ impl Render for GitCloneModal {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("learn-more", "Learn More")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Quiet.style())
                             .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
@@ -1358,6 +1363,7 @@ impl Render for GitCloneModal {
                     )
                     .child(
                         Button::new("git-clone-confirm", "Clone")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .label_size(LabelSize::Small)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| {

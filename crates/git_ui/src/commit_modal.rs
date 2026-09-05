@@ -239,6 +239,7 @@ impl CommitModal {
                     "modal-commit-split-button-right",
                     menu_open,
                 )
+                .height(cyberpunk::SEGMENT_HEIGHT.into())
                 .disabled(disabled),
             )
             .menu({
@@ -397,7 +398,7 @@ impl CommitModal {
                     .child(SplitButton::new(
                         ButtonLike::new_rounded_left(format!("split-button-left-{}", commit_label))
                             .style(cyberpunk::Rank::Accent.style())
-                            .size(ButtonSize::Compact)
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .disabled(!can_commit)
                             .child(Label::new(commit_label).size(LabelSize::Small).mr_0p5())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {

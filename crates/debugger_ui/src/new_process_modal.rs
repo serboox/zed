@@ -26,7 +26,8 @@ use ui::{
     ContextMenu, DropdownMenu, IconWithIndicator, Indicator, KeyBinding, ListItem, ListItemSpacing,
     Switch, SwitchLabelPosition, ToggleButtonGroup, ToggleButtonSimple, ToggleState, Tooltip,
     cyberpunk::{
-        Rank, dialog_body, dialog_footer, dialog_footer_left, dialog_header, dialog_shell,
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_footer_left,
+        dialog_header, dialog_shell,
     },
     prelude::*,
 };
@@ -735,6 +736,7 @@ impl Render for NewProcessModal {
                         container
                             .child(
                                 Button::new("edit-custom-debug", "Edit in debug.json")
+                                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                                     .style(Rank::Neutral.style())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.save_debug_scenario(window, cx);
@@ -752,6 +754,7 @@ impl Render for NewProcessModal {
                             )
                             .child(
                                 Button::new("debugger-spawn", "Start")
+                                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                                     .style(Rank::Accent.style())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.start_new_session(window, cx)
@@ -786,6 +789,7 @@ impl Render for NewProcessModal {
                             )
                             .child({
                                 Button::new("edit-attach-task", "Edit in debug.json")
+                                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                                     .style(Rank::Neutral.style())
                                     .key_binding(KeyBinding::for_action(&*secondary_action, cx))
                                     .on_click(move |_, window, cx| {
@@ -1488,6 +1492,7 @@ impl PickerDelegate for DebugDelegate {
                 let action = menu::SecondaryConfirm.boxed_clone();
                 if self.matches.is_empty() {
                     Button::new("edit-debug-json", "Edit debug.json")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .on_click(cx.listener(|_picker, _, window, cx| {
                             window.dispatch_action(
@@ -1498,6 +1503,7 @@ impl PickerDelegate for DebugDelegate {
                         }))
                 } else {
                     Button::new("edit-debug-task", "Edit in debug.json")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .key_binding(KeyBinding::for_action(&*action, cx))
                         .on_click(move |_, window, cx| {
@@ -1510,6 +1516,7 @@ impl PickerDelegate for DebugDelegate {
                     let action = picker::ConfirmInput { secondary: false }.boxed_clone();
                     this.child({
                         Button::new("launch-custom", "Launch Custom")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Accent.style())
                             .key_binding(KeyBinding::for_action(&*action, cx))
                             .on_click(move |_, window, cx| {
@@ -1522,6 +1529,7 @@ impl PickerDelegate for DebugDelegate {
                         let run_entry_label = if is_recent_selected { "Rerun" } else { "Spawn" };
 
                         Button::new("spawn", run_entry_label)
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Accent.style())
                             .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(|_, window, cx| {

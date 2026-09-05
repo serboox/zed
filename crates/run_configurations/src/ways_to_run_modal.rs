@@ -581,6 +581,7 @@ impl Render for WaysToRunModal {
                     .child(cyberpunk::dialog_footer_spacer())
                     .child(
                         Button::new("ways-new", "New configuration...")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|modal, _, window, cx| {
                                 modal.write_a_new_one(window, cx)
@@ -588,6 +589,7 @@ impl Render for WaysToRunModal {
                     )
                     .child(
                         Button::new("ways-all", "All configurations")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(
                                 cx.listener(|modal, _, window, cx| modal.open_them_all(window, cx)),

@@ -17,8 +17,8 @@ use theme_settings::ThemeSettings;
 use ui::{
     ActiveTheme, CommonAnimationExt, Context, InteractiveElement, KeyBinding, Tooltip,
     cyberpunk::{
-        Rank, border_dim, dialog_body, dialog_footer, dialog_footer_left, dialog_header_marked,
-        dialog_shell,
+        DIALOG_ACTION_MIN_WIDTH, Rank, border_dim, dialog_body, dialog_footer, dialog_footer_left,
+        dialog_header_marked, dialog_shell,
     },
     prelude::*,
 };
@@ -421,6 +421,7 @@ impl Render for RemoteConnectionModal {
                     })
                     .child(
                         Button::new("cancel", "Cancel")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action_in(

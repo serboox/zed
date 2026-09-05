@@ -637,6 +637,7 @@ impl PickerDelegate for StashListDelegate {
             cyberpunk::dialog_footer()
                 .child(
                     Button::new("drop-stash", "Drop")
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .style(cyberpunk::Rank::Destructive.style())
                         .key_binding(
                             KeyBinding::for_action_in(
@@ -652,6 +653,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("view-stash", "View")
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .style(cyberpunk::Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action_in(
@@ -669,6 +671,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("pop-stash", "Pop")
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .style(cyberpunk::Rank::Neutral.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::SecondaryConfirm, &focus_handle, cx)
@@ -680,6 +683,7 @@ impl PickerDelegate for StashListDelegate {
                 )
                 .child(
                     Button::new("apply-stash", "Apply")
+                        .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                         .style(cyberpunk::Rank::Accent.style())
                         .key_binding(
                             KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)

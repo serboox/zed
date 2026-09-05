@@ -34,7 +34,7 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, ScrollAxes,
     Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar,
-    cyberpunk::{Rank, dialog_footer},
+    cyberpunk::{DIALOG_ACTION_MIN_WIDTH, Rank, dialog_footer},
     prelude::*,
     utils::platform_title_bar_height,
 };
@@ -1606,6 +1606,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             dialog_footer()
                 .child(
                     Button::new("open_local_folder", "Choose from Local Folders")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Quiet.style())
                         .key_binding(KeyBinding::for_action_in(
                             &workspace::Open::default(),
@@ -1618,6 +1619,7 @@ impl PickerDelegate for ProjectPickerDelegate {
                 )
                 .child(
                     Button::new("select_project", "Select")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Accent.style())
                         .disabled(!has_selection)
                         .key_binding(KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx))

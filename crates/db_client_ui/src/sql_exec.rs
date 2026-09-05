@@ -311,6 +311,7 @@ impl Render for ExecDialog {
                 cyberpunk::dialog_footer()
                     .child(
                         Button::new("exec-load-file", "Load from file…")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Quiet.style())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.load_from_file(window, cx);
@@ -318,6 +319,7 @@ impl Render for ExecDialog {
                     )
                     .child(
                         Button::new("exec-cancel", "Cancel")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(ExecDialogEvent::Dismissed);
@@ -326,6 +328,7 @@ impl Render for ExecDialog {
                     )
                     .child(
                         Button::new("exec-run", "Run")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let text = this.sql_editor.read(cx).text(cx);

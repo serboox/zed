@@ -1995,6 +1995,7 @@ impl PickerDelegate for BranchListDelegate {
                         let button_label = format!("Create New From: {default_branch}");
 
                         Button::new("branch-from-default", button_label)
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action_in(
@@ -2018,6 +2019,7 @@ impl PickerDelegate for BranchListDelegate {
                         |this| {
                             this.child(
                                 Button::new("delete-branch", "Delete")
+                                    .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                     .style(cyberpunk::Rank::Destructive.style())
                                     .key_binding(
                                         KeyBinding::for_action_in(
@@ -2038,6 +2040,7 @@ impl PickerDelegate for BranchListDelegate {
                     )
                     .child(
                         Button::new("switch_branch", "Switch")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
@@ -2053,6 +2056,7 @@ impl PickerDelegate for BranchListDelegate {
                         .map(|this| match branch_from_default_button {
                             Some(button) => this.child(button).child(
                                 Button::new("create", "Create")
+                                    .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                     .style(cyberpunk::Rank::Accent.style())
                                     .key_binding(
                                         KeyBinding::for_action_in(
@@ -2077,6 +2081,7 @@ impl PickerDelegate for BranchListDelegate {
                         let button_label = format!("Create New From: {default_branch}");
 
                         Button::new("branch-from-default", button_label)
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Neutral.style())
                             .key_binding(
                                 KeyBinding::for_action_in(
@@ -2098,6 +2103,7 @@ impl PickerDelegate for BranchListDelegate {
                         })
                         .child(
                             Button::new("create-new-branch", "Create")
+                                .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                                 .style(cyberpunk::Rank::Accent.style())
                                 .key_binding(
                                     KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
@@ -2114,6 +2120,7 @@ impl PickerDelegate for BranchListDelegate {
                 cyberpunk::dialog_footer()
                     .child(
                         Button::new("confirm-create-remote", "Confirm")
+                            .min_width(cyberpunk::DIALOG_ACTION_MIN_WIDTH)
                             .style(cyberpunk::Rank::Accent.style())
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)

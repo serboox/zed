@@ -22,8 +22,8 @@ use remote::RemoteConnectionOptions;
 use ui::{
     Checkbox, CommonAnimationExt, KeyBinding, ListItem, ListItemSpacing, Tooltip,
     cyberpunk::{
-        Rank, dialog_body, dialog_footer, dialog_footer_left, dialog_footer_spacer, dialog_header,
-        dialog_shell,
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_footer_left,
+        dialog_footer_spacer, dialog_header, dialog_shell,
     },
     prelude::*,
 };
@@ -637,14 +637,14 @@ impl Render for ThreadImportModal {
                     )
                     .child(dialog_footer_spacer())
                     .child(
-                        Button::new("cancel", "Cancel")
+                        Button::new("cancel", "Cancel").min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.cancel(&menu::Cancel, window, cx)
                             })),
                     )
                     .child(
-                        Button::new("import-threads", "Import Threads")
+                        Button::new("import-threads", "Import Threads").min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Accent.style())
                             .loading(self.is_importing)
                             .disabled(disabled_import_thread)

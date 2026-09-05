@@ -12,7 +12,10 @@ use settings::{
 };
 use ui::{
     KeyBinding, ListItem, ListItemSpacing, ListSeparator, Navigable, NavigableEntry,
-    cyberpunk::{Rank, dialog_body, dialog_field, dialog_footer, dialog_header, dialog_shell},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_field, dialog_footer, dialog_header,
+        dialog_shell,
+    },
     prelude::*,
 };
 use workspace::{ModalView, Workspace};
@@ -877,6 +880,7 @@ impl ManageProfilesModal {
     fn render_go_back_footer(&self, cx: &mut Context<Self>) -> Div {
         dialog_footer().child(
             Button::new("go-back", "Go Back")
+                .min_width(DIALOG_ACTION_MIN_WIDTH)
                 .style(Rank::Neutral.style())
                 .start_icon(Icon::new(IconName::ArrowLeft))
                 .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
@@ -918,6 +922,7 @@ impl Render for ManageProfilesModal {
                     .into_any_element(),
                 dialog_footer().child(
                     Button::new("close", "Close")
+                        .min_width(DIALOG_ACTION_MIN_WIDTH)
                         .style(Rank::Neutral.style())
                         .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                 ),
@@ -928,11 +933,13 @@ impl Render for ManageProfilesModal {
                 dialog_footer()
                     .child(
                         Button::new("cancel", "Cancel")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     )
                     .child(
                         Button::new("create-profile", "Create Profile")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Accent.style())
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),

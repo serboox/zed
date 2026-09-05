@@ -26,7 +26,10 @@ use std::sync::Arc;
 use theme_settings::ThemeSettings;
 use ui::{
     CommonAnimationExt, KeyBinding, Tooltip, WithScrollbar,
-    cyberpunk::{Rank, dialog_body, dialog_field, dialog_footer, dialog_header, dialog_shell},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_field, dialog_footer, dialog_header,
+        dialog_shell,
+    },
     prelude::*,
 };
 use util::ResultExt as _;
@@ -903,6 +906,7 @@ impl ConfigureContextServerModal {
                         "Dismiss"
                     },
                 )
+                .min_width(DIALOG_ACTION_MIN_WIDTH)
                 .style(Rank::Neutral.style())
                 .key_binding(
                     KeyBinding::for_action_in(&menu::Cancel, &focus_handle, cx)
@@ -912,6 +916,7 @@ impl ConfigureContextServerModal {
             )
             .children(self.source.has_configuration_options().then(|| {
                 Button::new("configure-server", "Configure Server")
+                    .min_width(DIALOG_ACTION_MIN_WIDTH)
                     .style(Rank::Accent.style())
                     .disabled(is_busy)
                     .key_binding(

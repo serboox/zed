@@ -3,7 +3,9 @@ use project::project_settings::ProjectSettings;
 use remote::RemoteConnectionOptions;
 use settings::Settings;
 use ui::{
-    cyberpunk::{Rank, dialog_body, dialog_footer, dialog_header, dialog_shell},
+    cyberpunk::{
+        DIALOG_ACTION_MIN_WIDTH, Rank, dialog_body, dialog_footer, dialog_header, dialog_shell,
+    },
     prelude::*,
 };
 use workspace::{
@@ -193,6 +195,7 @@ impl Render for DisconnectedOverlay {
                 dialog_footer()
                     .child(
                         Button::new("close-window", "Close Window")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH)
                             .style(Rank::Neutral.style())
                             .on_click(cx.listener(move |_, _, window, _| {
                                 window.remove_window();
@@ -201,6 +204,7 @@ impl Render for DisconnectedOverlay {
                     .when(can_reconnect, |el| {
                         el.child(
                             Button::new("reconnect", "Reconnect")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH)
                                 .style(Rank::Accent.style())
                                 .start_icon(Icon::new(IconName::ArrowCircle))
                                 .on_click(cx.listener(Self::handle_reconnect)),

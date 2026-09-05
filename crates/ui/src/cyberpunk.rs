@@ -1157,6 +1157,14 @@ pub fn dialog_field_on(
         )
 }
 
+/// The floor every labelled action in a dialog footer is sized to, so a row of
+/// answers reads as one row. Button height is already fixed at
+/// [`SEGMENT_HEIGHT`]; width is what varies, and a "OK" half the width of the
+/// "Cancel" beside it reads as two kinds of control rather than two answers to
+/// the same question. Three times the control height is the width Fluent, the
+/// GNOME HIG and Qt all land near.
+pub const DIALOG_ACTION_MIN_WIDTH: Pixels = px(84.);
+
 /// The bar a dialog ends with: a rule above it, and the actions on it. What goes
 /// on it is the caller's, but where it sits and how it is spaced is not.
 ///
@@ -1296,10 +1304,83 @@ mod tests {
                         this.child(crate::Label::new("path/to/file"))
                             .child(dialog_footer_spacer())
                     })
-                    .child(crate::Button::new("close", "Close"))
-                    .child(crate::Button::new("save", "Save")),
+                    .child(crate::Button::new("close", "Close").min_width(DIALOG_ACTION_MIN_WIDTH))
+                    .child(crate::Button::new("save", "Save").min_width(DIALOG_ACTION_MIN_WIDTH)),
             )
         }
+    }
+
+    struct ActionWidthHost;
+
+    impl Render for ActionWidthHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div().w(gpui::px(600.0)).h(gpui::px(120.0)).child(
+                dialog_footer()
+                    .child(crate::Button::new("ok", "OK").min_width(DIALOG_ACTION_MIN_WIDTH))
+                    .child(
+                        crate::Button::new("cancel", "Cancel").min_width(DIALOG_ACTION_MIN_WIDTH),
+                    )
+                    .child(
+                        crate::Button::new("replace", "Replace every occurrence")
+                            .min_width(DIALOG_ACTION_MIN_WIDTH),
+                    ),
+            )
+        }
+    }
+
+    // Labels differ in length; the actions they name must not. Measured on the
+    // painted boxes, because a row where one answer is half the width of the
+    // one beside it reads as two kinds of control rather than one row of
+    // answers. The long label is here so the floor cannot be mistaken for a
+    // fixed width that truncates.
+    #[gpui::test]
+    async fn dialog_actions_are_painted_the_same_width(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| ActionWidthHost);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let short = cx
+            .debug_bounds("BUTTON-OK")
+            .expect("the short action is painted");
+        let medium = cx
+            .debug_bounds("BUTTON-Cancel")
+            .expect("the second action is painted");
+        let long = cx
+            .debug_bounds("BUTTON-Replace every occurrence")
+            .expect("the long action is painted");
+
+        assert_eq!(
+            short.size.width, medium.size.width,
+            "two short labels must give two actions of one width, not {:?} beside {:?}",
+            short.size.width, medium.size.width
+        );
+        assert_eq!(
+            short.size.width, DIALOG_ACTION_MIN_WIDTH,
+            "a short label is widened to the floor, not left at its own {:?}",
+            short.size.width
+        );
+        assert!(
+            long.size.width > DIALOG_ACTION_MIN_WIDTH,
+            "the floor is a minimum, not a fixed width: a long label was cut to {:?}",
+            long.size.width
+        );
+        assert_eq!(
+            short.size.height, long.size.height,
+            "actions keep one height as well as one width"
+        );
     }
 
     fn draw_a_footer(
@@ -1434,8 +1515,13 @@ mod tests {
                         .child(dialog_footer_left().child(crate::Label::new(
                             "a left-hand label long enough to want the whole bar for itself",
                         )))
-                        .child(crate::Button::new("cancel", "Cancel"))
-                        .child(crate::Button::new("save", "Save")),
+                        .child(
+                            crate::Button::new("cancel", "Cancel")
+                                .min_width(DIALOG_ACTION_MIN_WIDTH),
+                        )
+                        .child(
+                            crate::Button::new("save", "Save").min_width(DIALOG_ACTION_MIN_WIDTH),
+                        ),
                 );
 
             // Stood where the workspace's modal layer stands a window it
