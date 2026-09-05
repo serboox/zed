@@ -1,0 +1,300 @@
+use std::path::Path;
+
+use jsonschema::Validator;
+use serde::Deserialize;
+
+mod checking;
+mod reading;
+mod watching;
+
+pub use checking::validator_for;
+pub use watching::{Validate, init};
+
+/// One rule saying which schema covers which files, as
+/// [`json_schema_store::all_schema_file_associations`] writes them. It writes
+/// what the language server expects, and this reads the same thing rather
+/// than a second list that could disagree with it.
+#[derive(Debug, Deserialize)]
+pub struct Association {
+    #[serde(rename = "fileMatch", default)]
+    file_match: Vec<String>,
+    url: String,
+}
+
+/// The schema that covers this file, or nothing where none does.
+///
+/// The first rule that matches wins, because the list is written specific
+/// first: `tsconfig.json` is also a JSONC file, and the rule naming its own
+/// schema stands ahead of the one covering JSONC in general.
+pub fn schema_covering(associations: &[Association], path: &Path) -> Option<String> {
+    associations
+        .iter()
+        .find(|association| {
+            association
+                .file_match
+                .iter()
+                .any(|pattern| covers(pattern, path))
+        })
+        .map(|association| association.url.clone())
+}
+
+/// Whether one `fileMatch` pattern covers a path, read the way the language
+/// server this replaces reads it: a pattern with no separator is about the
+/// file's name alone, and one with a separator is about the tail of the path.
+/// So `package.json` covers it anywhere, and `zed/settings.json` covers it
+/// only under a `zed` directory.
+fn covers(pattern: &str, path: &Path) -> bool {
+    if !pattern.contains('/') {
+        return path
+            .file_name()
+            .is_some_and(|name| same(pattern, &name.to_string_lossy()));
+    }
+    let whole = path.to_string_lossy().replace('\\', "/");
+    std::iter::once(whole.as_str())
+        .chain(whole.match_indices('/').map(|(at, _)| &whole[at + 1..]))
+        .any(|tail| same(pattern, tail))
+}
+
+/// Whether a pattern is this text exactly, or a glob covering it. A `*` stops
+/// at a path separator, so `zed/snippets/*.json` is about that directory and
+/// not about a tree below it.
+fn same(pattern: &str, subject: &str) -> bool {
+    if !pattern.contains(['*', '?', '[', '{']) {
+        return pattern == subject;
+    }
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher().is_match(subject))
+        .unwrap_or(false)
+}
+
+/// Everything the schema has to say about this text, as diagnostics the
+/// editor can show.
+pub fn diagnostics_for(text: &str, validator: &Validator) -> Vec<lsp::Diagnostic> {
+    let lines = Lines::of(text);
+    checking::what_the_schema_said(text, validator)
+        .into_iter()
+        .map(|(range, complaint)| lsp::Diagnostic {
+            range: lsp::Range {
+                start: lines.position_of(text, range.start),
+                end: lines.position_of(text, range.end),
+            },
+            severity: Some(if complaint.is_a_fault {
+                lsp::DiagnosticSeverity::ERROR
+            } else {
+                lsp::DiagnosticSeverity::WARNING
+            }),
+            source: Some(checking::SOURCE.to_string()),
+            message: complaint.message,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Where each line of a text starts, so that a byte offset can be turned into
+/// the line and column the protocol wants without walking the text again for
+/// every one of them.
+struct Lines(Vec<usize>);
+
+impl Lines {
+    fn of(text: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+        Self(starts)
+    }
+
+    /// The protocol counts lines from zero and columns in UTF-16 code units,
+    /// which is neither the byte offset the reader works in nor the character
+    /// count either of them looks like. On the line `  "caf\u{e9} \u{1f980}": 1`
+    /// the colon sits at byte 14, at character 10, and at UTF-16 unit 11.
+    fn position_of(&self, text: &str, offset: usize) -> lsp::Position {
+        let line = self.0.partition_point(|start| *start <= offset).max(1) - 1;
+        let start = self.0.get(line).copied().unwrap_or(0);
+        let character = text
+            .get(start..offset)
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        lsp::Position {
+            line: line as u32,
+            character: character as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    fn associations(value: serde_json::Value) -> Vec<Association> {
+        serde_json::from_value(value).expect("the rules parse")
+    }
+
+    /// The real list, in the order the store writes it. `tsconfig.json` is
+    /// covered twice -- by its own rule and by the JSONC one, which claims it
+    /// as a path suffix -- and the specific rule stands first, so first match
+    /// wins is what puts the right schema on it.
+    #[test]
+    fn the_first_rule_that_covers_a_file_is_the_one_that_wins() {
+        let rules = associations(json!([
+            {"fileMatch": ["tsconfig.json"], "url": "zed://schemas/tsconfig"},
+            {"fileMatch": ["*.jsonc", "tsconfig.json"], "url": "zed://schemas/jsonc"},
+        ]));
+        assert_eq!(
+            schema_covering(&rules, Path::new("/project/tsconfig.json")).as_deref(),
+            Some("zed://schemas/tsconfig")
+        );
+        assert_eq!(
+            schema_covering(&rules, Path::new("/project/a.jsonc")).as_deref(),
+            Some("zed://schemas/jsonc")
+        );
+    }
+
+    /// A pattern with no separator is about the file's name, so it covers the
+    /// file wherever it is. One with a separator is about the tail of the
+    /// path, so it does not cover a file that merely shares the name.
+    #[test]
+    fn a_named_path_covers_only_that_path_and_a_bare_name_covers_it_anywhere() {
+        let rules = associations(json!([
+            {"fileMatch": ["zed/settings.json"], "url": "zed://schemas/settings"},
+            {"fileMatch": ["package.json"], "url": "zed://schemas/package_json"},
+        ]));
+
+        for path in [
+            "/home/reader/.config/zed/settings.json",
+            "/somewhere/else/zed/settings.json",
+        ] {
+            assert_eq!(
+                schema_covering(&rules, Path::new(path)).as_deref(),
+                Some("zed://schemas/settings"),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            schema_covering(&rules, Path::new("/project/settings.json")),
+            None,
+            "not under a `zed` directory, so not this schema"
+        );
+        assert_eq!(
+            schema_covering(&rules, Path::new("/deep/inside/a/tree/package.json")).as_deref(),
+            Some("zed://schemas/package_json")
+        );
+    }
+
+    /// A file no rule covers gets nothing at all. Most JSON is like this --
+    /// fixtures, lockfiles, data -- and inventing a schema for it would put
+    /// warnings on files nobody ever described.
+    #[test]
+    fn a_file_no_rule_covers_gets_no_schema_rather_than_a_guess() {
+        let rules = associations(json!([
+            {"fileMatch": ["package.json"], "url": "zed://schemas/package_json"},
+        ]));
+        for path in ["/project/data.json", "/project/fixtures/a.json", "/a"] {
+            assert_eq!(schema_covering(&rules, Path::new(path)), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_glob_covers_what_it_should_and_a_directory_of_them_too() {
+        let rules = associations(json!([
+            {"fileMatch": ["*.jsonc", "zed/snippets/*.json"], "url": "zed://schemas/jsonc"},
+        ]));
+        for path in [
+            "/project/a.jsonc",
+            "/home/reader/.config/zed/snippets/rust.json",
+        ] {
+            assert!(
+                schema_covering(&rules, Path::new(path)).is_some(),
+                "{path}"
+            );
+        }
+        assert_eq!(schema_covering(&rules, Path::new("/project/a.json")), None);
+    }
+
+    /// The protocol wants UTF-16 code units, and a file with an emoji in it
+    /// disagrees with every other way of counting. Reading one as another
+    /// puts every diagnostic on that line into the wrong column.
+    #[test]
+    fn a_byte_offset_becomes_a_line_and_a_utf16_column() {
+        let text = "{\n  \"caf\u{e9} \u{1f980}\": 1\n}\n";
+        let colon = text.find(':').expect("the colon");
+
+        let before = &text[2..colon];
+        assert_eq!(before.len(), 14, "bytes");
+        assert_eq!(before.chars().count(), 10, "characters");
+        assert_eq!(before.encode_utf16().count(), 11, "UTF-16 units");
+
+        let lines = Lines::of(text);
+        assert_eq!(lines.position_of(text, 0), lsp::Position::new(0, 0));
+        assert_eq!(
+            lines.position_of(text, colon),
+            lsp::Position::new(1, 11),
+            "the protocol's own unit -- not 14, and not 10 either"
+        );
+    }
+
+    /// An offset at or past the end of the text lands at the end of it. The
+    /// buffer can change under a check that is already running.
+    #[test]
+    fn an_offset_past_the_end_lands_at_the_end() {
+        let text = "{}\n";
+        let lines = Lines::of(text);
+        assert_eq!(lines.position_of(text, 3), lsp::Position::new(1, 0));
+        assert_eq!(lines.position_of(text, 9_000), lsp::Position::new(1, 0));
+        assert_eq!(
+            Lines::of("").position_of("", 0),
+            lsp::Position::new(0, 0),
+            "and an empty text has a first line like any other"
+        );
+    }
+
+    /// End to end over the shape of schema this editor actually serves, with
+    /// the range asserted rather than the count: this is the whole promise,
+    /// and a diagnostic in the wrong place keeps it in name only.
+    #[test]
+    fn a_wrong_value_becomes_a_diagnostic_on_the_bytes_it_is_about() {
+        let validator = validator_for(&json!({
+            "type": "object",
+            "properties": { "tab_size": { "type": "integer" } },
+        }))
+        .expect("the schema builds");
+
+        let text = "{\n  \"tab_size\": \"two\"\n}\n";
+        let diagnostics = diagnostics_for(text, &validator);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].range,
+            lsp::Range {
+                start: lsp::Position::new(1, 14),
+                end: lsp::Position::new(1, 19),
+            },
+            "`\"two\"` on the second line and nothing around it"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(lsp::DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(diagnostics[0].source.as_deref(), Some("json-schema"));
+    }
+
+    #[test]
+    fn a_document_that_will_not_read_becomes_one_error_where_the_reading_stopped() {
+        let validator = validator_for(&json!({"type": "object"})).expect("the schema builds");
+        let diagnostics = diagnostics_for("{\n  \"a\": ,\n}\n", &validator);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(lsp::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            diagnostics[0].range,
+            lsp::Range {
+                start: lsp::Position::new(1, 7),
+                end: lsp::Position::new(1, 8),
+            }
+        );
+    }
+}

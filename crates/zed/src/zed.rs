@@ -6369,6 +6369,7 @@ mod tests {
             cargo_diagnostics::init(cx);
             go_diagnostics::init(cx);
             ruff_diagnostics::init(cx);
+            json_diagnostics::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

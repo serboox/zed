@@ -11184,6 +11184,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "json_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "globset",
+ "gpui",
+ "json_schema_store",
+ "jsonschema",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "workspace",
+]
+
+[[package]]
 name = "json_schema_store"
 version = "0.1.0"
 dependencies = [
@@ -28461,6 +28482,7 @@ dependencies = [
  "install_cli",
  "itertools 0.14.0",
  "journal",
+ "json_diagnostics",
  "json_schema_store",
  "keymap_editor",
  "language",
