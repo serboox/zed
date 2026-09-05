@@ -15,8 +15,11 @@ path = "src/json_schema_store.rs"
 default = []
 
 [dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
 
 [dependencies]
 anyhow.workspace = true
@@ -27,6 +30,7 @@ extension.workspace = true
 feature_flags.workspace = true
 gpui.workspace = true
 language.workspace = true
+lsp.workspace = true
 paths.workspace = true
 project.workspace = true
 schemars.workspace = true

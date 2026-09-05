@@ -87,8 +87,8 @@ use image_store::{ImageItemEvent, ImageStoreEvent};
 
 use ::git::{blame::Blame, status::FileStatus};
 use gpui::{
-    App, AppContext, AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Hsla, SharedString,
-    Task, TaskExt, WeakEntity, Window,
+    App, AppContext, AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Global, Hsla,
+    SharedString, Task, TaskExt, WeakEntity, Window,
 };
 use language::{
     Buffer, BufferEditSource, BufferEvent, Capability, CodeLabel, CursorShape, DiskState, Language,
@@ -721,6 +721,37 @@ impl CompletionDisplayOptions {
     pub fn merge(&mut self, other: &CompletionDisplayOptions) {
         self.dynamic_width = self.dynamic_width && other.dynamic_width;
     }
+}
+
+/// A source of completions that runs inside this process, with no language
+/// server behind it.
+///
+/// What a source returns is added to what the language servers said; it never
+/// replaces or reorders their answers, and it is asked even when the buffer has
+/// no server at all.
+pub trait InProcessCompletions: Send + Sync {
+    fn completions(
+        &self,
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        context: &CompletionContext,
+        cx: &mut App,
+    ) -> Task<Result<Vec<Completion>>>;
+}
+
+#[derive(Default)]
+struct InProcessCompletionSources(Vec<Arc<dyn InProcessCompletions>>);
+
+impl Global for InProcessCompletionSources {}
+
+/// Registers a completion source contributed by a crate that `project` does not
+/// depend on (e.g. JSON Schema hints defined in `json_schema_store`). Every
+/// registered source is asked alongside the language servers.
+pub fn register_in_process_completions(source: Arc<dyn InProcessCompletions>, cx: &mut App) {
+    cx.default_global::<InProcessCompletionSources>()
+        .0
+        .push(source);
 }
 
 /// Response from language server completion request.
@@ -4522,8 +4553,41 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<CompletionResponse>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.completions(buffer, position, context, cx)
+        let from_language_servers = self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.completions(buffer, position, context.clone(), cx)
+        });
+
+        let sources = cx
+            .try_global::<InProcessCompletionSources>()
+            .map_or_else(Vec::new, |sources| sources.0.clone());
+        if sources.is_empty() {
+            return from_language_servers;
+        }
+
+        let project = cx.entity();
+        let in_process = sources
+            .iter()
+            .map(|source| source.completions(&project, buffer, position, &context, cx))
+            .collect::<Vec<_>>();
+
+        cx.background_spawn(async move {
+            let mut responses = from_language_servers.await?;
+            for task in in_process {
+                // A broken in-process source must not cost the reader whatever
+                // the language servers already answered.
+                let Some(completions) = task.await.log_err() else {
+                    continue;
+                };
+                if completions.is_empty() {
+                    continue;
+                }
+                responses.push(CompletionResponse {
+                    completions,
+                    display_options: CompletionDisplayOptions::default(),
+                    is_incomplete: false,
+                });
+            }
+            Ok(responses)
         })
     }
 

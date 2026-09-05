@@ -12,6 +12,8 @@ use project::{LspStore, lsp_store::LocalLspAdapterDelegate};
 use settings::{LSP_SETTINGS_SCHEMA_URL_PREFIX, Settings as _, SettingsLocation};
 use util::schemars::{AllowTrailingCommas, DefaultDenyUnknownFields};
 
+pub mod schema_completions;
+
 const SCHEMA_URI_PREFIX: &str = "zed://schemas/";
 
 const TSCONFIG_SCHEMA: &str = include_str!("schemas/tsconfig.json");
@@ -55,6 +57,7 @@ static DYNAMIC_SCHEMA_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
 
 pub fn init(cx: &mut App) {
     cx.set_global(SchemaStore::default());
+    schema_completions::init(cx);
     project::lsp_store::json_language_server_ext::register_schema_handler(
         handle_schema_request,
         cx,
@@ -122,6 +125,13 @@ impl SchemaStore {
 
         if uris_to_invalidate.is_empty() {
             return;
+        }
+
+        {
+            let mut parsed_schemas = schema_completions::PARSED_SCHEMAS.write();
+            for uri in &uris_to_invalidate {
+                parsed_schemas.remove(uri);
+            }
         }
 
         self.lsp_stores.retain(|lsp_store| {
