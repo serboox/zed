@@ -76,13 +76,26 @@ pub fn suffixes_of(languages: &[Readable]) -> HashMap<&str, usize> {
 ///
 /// The name is asked first everywhere this is used, so a first line can only
 /// ever settle a file nothing else claimed.
+/// The longest match wins, because these patterns overlap in ways that matter:
+/// Bash claims any `#!` line containing `sh`, with no word boundary, so
+/// `#!/usr/local/share/bin/python3` matches it on the `sh` inside `share`.
+/// Python matches the same line further along, and is right about it.
+///
+/// This is the one place the index does not copy the editor, which scores every
+/// first-line match the same and takes whichever language it reaches first. It
+/// can afford to: a wrong answer there shows the wrong colours until the reader
+/// says otherwise. Here a wrong answer parses the file with the wrong grammar
+/// and records whatever that produces as the project's symbols.
 pub fn claimant_by_first_line(first_line: &str, languages: &[Readable]) -> Option<usize> {
-    languages.iter().position(|language| {
-        language
-            .first_line
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_match(first_line))
-    })
+    languages
+        .iter()
+        .enumerate()
+        .filter_map(|(at, language)| {
+            let found = language.first_line.as_ref()?.find(first_line)?;
+            Some((at, found.len()))
+        })
+        .max_by_key(|(_, length)| *length)
+        .map(|(at, _)| at)
 }
 
 /// The first line of a file, for the first-line rule -- and nothing more of it.
@@ -191,6 +204,22 @@ mod tests {
             readable.iter().any(|language| language.name == "rust"),
             "Rust is the language the plan starts from"
         );
+    }
+
+    #[test]
+    fn a_file_with_no_suffix_belongs_to_the_language_its_first_line_names() {
+        let (readable, _) = readable();
+        let named = |first_line: &str| {
+            claimant_by_first_line(first_line, &readable).map(|at| readable[at].name.as_str())
+        };
+        assert_eq!(named("#!/usr/bin/env bash"), Some("bash"));
+        assert_eq!(named("#!/bin/sh"), Some("bash"));
+        assert_eq!(named("#!/usr/bin/env python3"), Some("python"));
+        assert_eq!(named("#!/usr/bin/env ruby"), Some("ruby"));
+        // Bash claims any `#!` line with `sh` anywhere in it, and `share` has
+        // one. The longest match is what keeps the file Python's.
+        assert_eq!(named("#!/usr/local/share/bin/python3"), Some("python"));
+        assert_eq!(named("just a note, not a script"), None);
     }
 
     #[test]
