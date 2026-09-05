@@ -12,6 +12,7 @@ mod tests {
         let language = crate::language(name, grammar);
         let text = text.unindent();
         let buffer = cx.new(|cx| language::Buffer::local(text, cx).with_language(language, cx));
+        cx.executor().run_until_parked();
         let outline = buffer.read_with(cx, |buffer, _| buffer.snapshot().outline(None));
         outline
             .items
