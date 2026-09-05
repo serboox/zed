@@ -26,12 +26,22 @@ pub fn by_suffix() -> HashMap<String, String> {
     claimed
 }
 
+/// Whether a suffix claims a file name.
+///
+/// The dot is part of the test, not decoration: matching a bare suffix makes
+/// every `.txt` a Perl file, because Perl claims `t` for its test scripts and
+/// `notes.txt` ends with a `t`. A whole file name may also be the suffix --
+/// `go.mod` is claimed that way.
+fn claims(name: &str, suffix: &str) -> bool {
+    name == suffix || name.ends_with(&format!(".{suffix}"))
+}
+
 /// The language a file name belongs to, by the longest suffix that fits -- so
 /// `.d.ts` wins over `.ts` where two languages claim both.
 pub fn of_file<'a>(name: &str, by_suffix: &'a HashMap<String, String>) -> Option<&'a str> {
     by_suffix
         .iter()
-        .filter(|(suffix, _)| name.ends_with(suffix.as_str()))
+        .filter(|(suffix, _)| claims(name, suffix))
         .max_by_key(|(suffix, _)| suffix.len())
         .map(|(_, language)| language.as_str())
 }
@@ -56,7 +66,7 @@ pub fn suffixes_of(languages: &[Readable]) -> HashMap<&str, usize> {
 pub fn claimant(name: &str, claimed: &HashMap<&str, usize>) -> Option<usize> {
     claimed
         .iter()
-        .filter(|(suffix, _)| name.ends_with(**suffix))
+        .filter(|(suffix, _)| claims(name, suffix))
         .max_by_key(|(suffix, _)| suffix.len())
         .map(|(_, at)| *at)
 }
@@ -119,12 +129,12 @@ mod tests {
             refused.is_empty(),
             "an outline query the editor ships does not compile: {refused:?}"
         );
-        // Thirteen directories ship an outline query, and every one of them has
+        // Twenty-three directories ship an outline query, and every one of them has
         // to be readable -- including JavaScript, which is parsed by the TSX
         // grammar and would be dropped by anything walking the grammars.
         assert_eq!(
             readable.len(),
-            13,
+            23,
             "readable: {:?}",
             readable
                 .iter()

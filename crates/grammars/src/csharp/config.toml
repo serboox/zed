@@ -1,0 +1,13 @@
+name = "C#"
+grammar = "csharp"
+path_suffixes = ["cs", "csx"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/", prefix = "* ", tab_size = 1 }
+autoclose_before = ";:.,=}])>"
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+    { start = "'", end = "'", close = true, newline = false, not_in = ["string", "comment"] },
+]

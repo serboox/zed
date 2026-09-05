@@ -29,6 +29,7 @@ mod tailwind;
 mod tailwindcss;
 mod typescript;
 mod vtsls;
+mod without_a_server;
 mod yaml;
 
 pub(crate) use package_json::{PackageJson, PackageJsonData};
@@ -132,6 +133,56 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             name: "gowork",
             adapters: vec![go_lsp_adapter],
             context: Some(go_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "java",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "csharp",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "php",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "ruby",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "swift",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "r",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "perl",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "fortran",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "pascal",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "asm",
+            adapters: vec![],
             ..Default::default()
         },
         LanguageInfo {

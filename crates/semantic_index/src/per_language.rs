@@ -330,6 +330,7 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "typescript" | "tsx" => Some(include_str!("typescript_references.scm")),
         "javascript" => Some(include_str!("javascript_references.scm")),
         "c" => Some(include_str!("c_references.scm")),
+        "java" => Some(include_str!("java_references.scm")),
         "cpp" => Some(include_str!("cpp_references.scm")),
         _ => None,
     }
@@ -394,6 +395,7 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "javascript",
     "c",
     "cpp",
+    "java",
 ];
 
 /// The language server to measure a language against, and the environment it

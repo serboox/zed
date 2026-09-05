@@ -26,6 +26,16 @@ tree-sitter-gitcommit = { workspace = true, optional = true }
 tree-sitter-go = { workspace = true, optional = true }
 tree-sitter-go-mod = { workspace = true, optional = true }
 tree-sitter-gowork = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-php = { workspace = true, optional = true }
+tree-sitter-ruby = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-r = { workspace = true, optional = true }
+tree-sitter-perl = { workspace = true, optional = true }
+tree-sitter-fortran = { workspace = true, optional = true }
+tree-sitter-pascal = { workspace = true, optional = true }
+tree-sitter-asm = { workspace = true, optional = true }
 tree-sitter-jsdoc = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }
@@ -48,6 +58,16 @@ load-grammars = [
     "tree-sitter-go",
     "tree-sitter-go-mod",
     "tree-sitter-gowork",
+    "tree-sitter-java",
+    "tree-sitter-c-sharp",
+    "tree-sitter-php",
+    "tree-sitter-ruby",
+    "tree-sitter-swift",
+    "tree-sitter-r",
+    "tree-sitter-perl",
+    "tree-sitter-fortran",
+    "tree-sitter-pascal",
+    "tree-sitter-asm",
     "tree-sitter-jsdoc",
     "tree-sitter-json",
     "tree-sitter-md",
