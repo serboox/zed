@@ -71,8 +71,14 @@ pub fn refresh(
         .cloned()
         .filter_map(|relative| {
             let name = Path::new(&relative).file_name()?.to_str()?;
-            let language = languages::claimant(name, &claimed)?;
             let full = root.join(&relative);
+            let language = match languages::claimant(name, &claimed) {
+                Some(language) => language,
+                None => languages::claimant_by_first_line(
+                    &languages::first_line_of(&full)?,
+                    &readable,
+                )?,
+            };
             Some((relative, full, language))
         })
         .collect();

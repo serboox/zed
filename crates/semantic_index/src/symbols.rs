@@ -1068,7 +1068,17 @@ pub fn build(root: &Path, cores: usize, into: &Symbols) -> Result<Built> {
         .into_iter()
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?;
-            let language = languages::claimant(name, &claimed)?;
+            let language = match languages::claimant(name, &claimed) {
+                Some(language) => language,
+                // A file no suffix claims may still say what it is on its first
+                // line, and most of a repository's shell scripts do exactly
+                // that. Reading that line is only paid for by the files nothing
+                // else claimed.
+                None => languages::claimant_by_first_line(
+                    &languages::first_line_of(&path)?,
+                    &readable,
+                )?,
+            };
             Some((path, language))
         })
         .collect();
@@ -1933,6 +1943,38 @@ mod tests {
         // not to read it again.
         assert_eq!(store.files().expect("the files"), 3);
         assert!(store.in_file("src/three.rs").expect("the file").is_empty());
+    }
+
+    #[test]
+    fn a_script_with_no_suffix_is_read_by_what_its_first_line_says() {
+        let root = tempfile::tempdir().expect("a directory to put a project in");
+        let at = root.path();
+        std::fs::create_dir_all(at.join("script")).expect("a directory in it");
+        // How a repository's shell scripts are actually named: no suffix, and
+        // the line the kernel reads saying what they are.
+        std::fs::write(
+            at.join("script/bootstrap"),
+            "#!/usr/bin/env bash\nset -eu\n\nCACHE_DIR=/tmp/cache\n\nprepare() {\n    echo prepare\n}\n",
+        )
+        .expect("the script");
+        // No suffix either, and nothing on its first line that claims it.
+        std::fs::write(at.join("NOTES"), "just a note, not a script\n").expect("the note");
+
+        let store = Symbols::open_in_memory().expect("a store");
+        let built = build(at, 2, &store).expect("the build");
+        assert_eq!(
+            built.files, 1,
+            "the script is read and the note is not, in {built:?}"
+        );
+
+        let names: Vec<String> = store
+            .everything()
+            .expect("everything")
+            .into_iter()
+            .map(|one| one.name)
+            .collect();
+        assert!(names.contains(&"prepare".to_string()), "{names:?}");
+        assert!(names.contains(&"CACHE_DIR".to_string()), "{names:?}");
     }
 
     #[test]

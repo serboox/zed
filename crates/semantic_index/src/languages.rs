@@ -7,6 +7,10 @@ pub struct Readable {
     pub grammar: tree_sitter::Language,
     pub outline: tree_sitter::Query,
     pub suffixes: Vec<String>,
+    /// What the language claims by a file's first line rather than by its name.
+    /// A shell script is usually called `bootstrap`, not `bootstrap.sh`, and
+    /// says what it is on the line the kernel reads.
+    pub first_line: Option<regex::Regex>,
 }
 
 /// Which language claims each file suffix the editor ships a grammar for.
@@ -61,6 +65,41 @@ pub fn suffixes_of(languages: &[Readable]) -> HashMap<&str, usize> {
     claimed
 }
 
+/// Which of them claims a file by what its first line says, for a file whose
+/// name claims nothing.
+///
+/// This repository holds seventy-two shell scripts with no suffix at all --
+/// five times as many as the ones ending in `.sh` -- and every one of them
+/// opens with the line the kernel reads. The editor already decides what such
+/// a file is this way; the index asking the same question of the same pattern
+/// is what keeps the two from disagreeing about what a file is.
+///
+/// The name is asked first everywhere this is used, so a first line can only
+/// ever settle a file nothing else claimed.
+pub fn claimant_by_first_line(first_line: &str, languages: &[Readable]) -> Option<usize> {
+    languages.iter().position(|language| {
+        language
+            .first_line
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(first_line))
+    })
+}
+
+/// The first line of a file, for the first-line rule -- and nothing more of it.
+///
+/// Bounded on purpose: this runs for every file in the tree that no suffix
+/// claimed, and a file with no newline in it may be a gigabyte of one line.
+/// A file that is not text simply does not match, which is the right answer.
+pub fn first_line_of(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    const ENOUGH_FOR_A_SHEBANG: usize = 256;
+    let mut opened = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; ENOUGH_FOR_A_SHEBANG];
+    let read = opened.read(&mut head).ok()?;
+    let text = std::str::from_utf8(&head[..read]).ok()?;
+    Some(text.lines().next()?.to_string())
+}
+
 /// Which of them claims a file name, by the longest suffix that fits -- so
 /// `.d.ts` wins over `.ts` where two languages claim both.
 pub fn claimant(name: &str, claimed: &HashMap<&str, usize>) -> Option<usize> {
@@ -111,6 +150,7 @@ pub fn readable() -> (Vec<Readable>, Vec<String>) {
                 grammar: grammar.clone(),
                 outline,
                 suffixes: config.matcher.path_suffixes,
+                first_line: config.matcher.first_line_pattern,
             }),
             Err(trouble) => refused.push(format!("{name}: {trouble}")),
         }
