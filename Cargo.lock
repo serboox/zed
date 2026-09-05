@@ -8560,6 +8560,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "go_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "go_to_line"
 version = "0.1.0"
 dependencies = [
@@ -28407,6 +28426,7 @@ dependencies = [
  "git",
  "git_hosting_providers",
  "git_ui",
+ "go_diagnostics",
  "go_to_line",
  "gpui",
  "gpui_platform",

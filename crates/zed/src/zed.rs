@@ -6367,6 +6367,7 @@ mod tests {
             structural_search::init(cx);
             rename_preview::init(cx);
             cargo_diagnostics::init(cx);
+            go_diagnostics::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

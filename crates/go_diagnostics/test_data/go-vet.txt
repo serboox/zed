@@ -1,0 +1,14 @@
+# example.com/m/sub
+{}
+# example.com/m
+# [example.com/m]
+{
+	"example.com/m": {
+		"printf": [
+			{
+				"posn": "/src/main.go:7:57",
+				"message": "fmt.Printf format %d has arg описание of wrong type string"
+			}
+		]
+	}
+}
