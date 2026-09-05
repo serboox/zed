@@ -147,6 +147,7 @@ input_latency_ui.workspace = true
 inspector_ui.workspace = true
 install_cli.workspace = true
 journal.workspace = true
+json_diagnostics.workspace = true
 json_schema_store.workspace = true
 keymap_editor.workspace = true
 language.workspace = true
