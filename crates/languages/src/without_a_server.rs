@@ -356,4 +356,128 @@ mod tests {
             );
         }
     }
+
+    #[gpui::test]
+    async fn sql_reads_the_objects_it_defines(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "sql",
+            tree_sitter_sequel::LANGUAGE.into(),
+            r#"
+            CREATE SCHEMA shop;
+
+            CREATE TABLE shop.customers (
+                customer_id INT PRIMARY KEY,
+                display_name TEXT NOT NULL
+            );
+
+            CREATE INDEX customers_by_name ON shop.customers (display_name);
+
+            CREATE VIEW loud_customers AS
+                SELECT display_name FROM shop.customers;
+
+            CREATE FUNCTION greet(who TEXT) RETURNS TEXT AS $$
+                SELECT 'hello ' || who;
+            $$ LANGUAGE sql;
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in [
+            "shop",
+            "customers",
+            "customer_id",
+            "display_name",
+            "customers_by_name",
+            "loud_customers",
+            "greet",
+        ] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+        let columns_sit_under_their_table = items
+            .iter()
+            .filter(|(text, depth)| text.contains("customer_id") && *depth > 0)
+            .count();
+        assert_eq!(
+            columns_sit_under_their_table, 1,
+            "a column has to nest under its table in {items:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn bash_reads_its_functions_and_top_level_names(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "bash",
+            tree_sitter_bash::LANGUAGE.into(),
+            r#"
+            GREETING="hello"
+
+            greet() {
+                local who="$1"
+                echo "$GREETING $who"
+            }
+
+            function shout {
+                greet "$1" | tr a-z A-Z
+            }
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in ["GREETING", "greet", "shout"] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|text| text.contains("who")),
+            "a local is not a name the project declares, but {names:?} has one"
+        );
+    }
+
+
+    #[gpui::test]
+    async fn sql_names_a_trigger_once_and_after_itself(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "sql",
+            tree_sitter_sequel::LANGUAGE.into(),
+            r#"
+            CREATE TABLE shop.customers (
+                customer_id INT
+            );
+
+            CREATE TRIGGER stamp_customers
+                BEFORE INSERT ON shop.customers
+                FOR EACH ROW EXECUTE FUNCTION stamp();
+
+            CREATE TRIGGER IF NOT EXISTS audit_customers
+                AFTER UPDATE ON shop.customers
+                FOR EACH ROW EXECUTE FUNCTION audit();
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in ["stamp_customers", "audit_customers"] {
+            assert_eq!(
+                names.iter().filter(|text| text.contains(wanted)).count(),
+                1,
+                "{wanted} has to be named once in {names:?}"
+            );
+        }
+        assert_eq!(
+            names.iter().filter(|text| text.contains("customers")).count(),
+            3,
+            "the table is named once and each trigger once, in {names:?}"
+        );
+        assert!(
+            !names.iter().any(|text| text.contains("shop")),
+            "a schema qualifier is not a definition, but {names:?} has one"
+        );
+    }
 }

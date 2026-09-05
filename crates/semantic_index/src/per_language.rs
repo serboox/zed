@@ -336,6 +336,8 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "php" => Some(include_str!("php_references.scm")),
         "ruby" => Some(include_str!("ruby_references.scm")),
         "swift" => Some(include_str!("swift_references.scm")),
+        "bash" => Some(include_str!("bash_references.scm")),
+        "sql" => Some(include_str!("sql_references.scm")),
         _ => None,
     }
 }
@@ -404,6 +406,8 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "php",
     "ruby",
     "swift",
+    "bash",
+    "sql",
 ];
 
 /// The language server to measure a language against, and the environment it

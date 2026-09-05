@@ -81,6 +81,7 @@ tree-sitter-perl.workspace = true
 tree-sitter-php.workspace = true
 tree-sitter-r.workspace = true
 tree-sitter-ruby.workspace = true
+tree-sitter-sequel.workspace = true
 tree-sitter-swift.workspace = true
 tree-sitter-vb6.workspace = true
 tree-sitter-cpp.workspace = true
