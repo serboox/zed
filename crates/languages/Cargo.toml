@@ -70,6 +70,7 @@ pretty_assertions.workspace = true
 tempfile = { workspace = true}
 settings = { workspace = true, features = ["test-support"] }
 theme = { workspace = true, features = ["test-support"] }
+arborium-cobol.workspace = true
 tree-sitter-asm.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-c-sharp.workspace = true

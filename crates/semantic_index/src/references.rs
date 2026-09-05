@@ -4194,7 +4194,7 @@ mod tests {
         assert!(yaml.is_empty(), "found {yaml:?}");
         // A language the editor ships no grammar for is the only `None`.
         assert!(
-            references_in_text("cobol", b"MOVE X TO Y.\n").is_err(),
+            references_in_text("haskell", b"main = pure ()\n").is_err(),
             "a language the editor does not have is an error, not an empty answer"
         );
     }
