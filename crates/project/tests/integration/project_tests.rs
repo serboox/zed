@@ -16641,3 +16641,188 @@ async fn test_language_server_hover_wins_over_the_in_process_one(cx: &mut gpui::
         "an answering server keeps the in-process source out of the way"
     );
 }
+
+struct FixedCodeAction {
+    title: String,
+    inserts: String,
+}
+
+impl FixedCodeAction {
+    const ID: LanguageServerId = LanguageServerId(usize::MAX - 9000);
+}
+
+impl InProcessCodeActions for FixedCodeAction {
+    fn server_id(&self) -> LanguageServerId {
+        Self::ID
+    }
+
+    fn code_actions(
+        &self,
+        _context: &InProcessCodeActionContext,
+        buffer: &Entity<Buffer>,
+        _range: Range<language::PointUtf16>,
+        cx: &mut App,
+    ) -> Task<Vec<CodeAction>> {
+        let read = buffer.read(cx);
+        let Some(path) = read
+            .file()
+            .and_then(|file| file.as_local())
+            .map(|file| file.abs_path(cx))
+        else {
+            return Task::ready(Vec::new());
+        };
+        let Ok(uri) = Uri::from_file_path(path) else {
+            return Task::ready(Vec::new());
+        };
+        let snapshot = read.snapshot();
+        let at_the_top = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(
+            uri,
+            vec![lsp::TextEdit {
+                range: at_the_top,
+                new_text: self.inserts.clone(),
+            }],
+        );
+        Task::ready(vec![CodeAction {
+            server_id: Self::ID,
+            range: snapshot.anchor_before(0)..snapshot.anchor_before(0),
+            lsp_action: LspAction::Action(Box::new(lsp::CodeAction {
+                title: self.title.clone(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(lsp::WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            resolved: true,
+        }])
+    }
+}
+
+fn action_titles(actions: &[CodeAction]) -> Vec<String> {
+    actions
+        .iter()
+        .map(|action| action.lsp_action.title().to_string())
+        .collect()
+}
+
+#[gpui::test]
+async fn test_in_process_code_actions_without_a_language_server(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "fn main() {}\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    cx.update(|cx| {
+        register_in_process_code_actions(
+            Arc::new(FixedCodeAction {
+                title: "without_a_server".to_string(),
+                inserts: "// added\n".to_string(),
+            }),
+            cx,
+        )
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    let offered = project
+        .update(cx, |project, cx| project.code_actions(&buffer, 0..0, None, cx))
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(action_titles(&offered), vec!["without_a_server".to_string()]);
+
+    // An in-process action has no server to send its edit to, so applying it
+    // has to go through the project's own edits rather than the server path,
+    // which would report an empty transaction and change nothing.
+    project
+        .update(cx, |project, cx| {
+            project.apply_code_action(
+                buffer.clone(),
+                offered.first().expect("the action").clone(),
+                true,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "// added\nfn main() {}\n"
+    );
+}
+
+#[gpui::test]
+async fn test_language_server_code_actions_win_over_the_in_process_ones(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "let a = 1;\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "TypeScript",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                code_action_provider: Some(lsp::CodeActionProviderCapability::Simple(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    cx.update(|cx| {
+        register_in_process_code_actions(
+            Arc::new(FixedCodeAction {
+                title: "in_process".to_string(),
+                inserts: "// added\n".to_string(),
+            }),
+            cx,
+        )
+    });
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    let fake_server = fake_language_servers.next().await.unwrap();
+    fake_server.set_request_handler::<lsp::request::CodeActionRequest, _, _>(|_, _| async move {
+        Ok(Some(vec![lsp::CodeActionOrCommand::CodeAction(
+            lsp::CodeAction {
+                title: "from_the_server".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                ..lsp::CodeAction::default()
+            },
+        )]))
+    });
+
+    let offered = project
+        .update(cx, |project, cx| project.code_actions(&buffer, 0..0, None, cx))
+        .await
+        .unwrap()
+        .unwrap_or_default();
+
+    assert_eq!(
+        action_titles(&offered),
+        vec!["from_the_server".to_string()],
+        "an answering server keeps the in-process source out of the way"
+    );
+}

@@ -1,0 +1,19 @@
+use std::fmt;
+use std::fmt::Debug;
+
+pub fn borrow_error(values: &Vec<i32>) {
+    values.push(1);
+}
+
+pub fn conversion() -> String {
+    "a string"
+}
+
+pub struct Displayed;
+
+impl fmt::Display for Displayed {}
+
+pub fn misspelled() -> usize {
+    let text = String::new();
+    text.lenn()
+}

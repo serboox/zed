@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod fixing;
 mod watching;
 
 pub use watching::{Check, init};
@@ -17,7 +18,48 @@ pub struct Reported {
     /// Absolute, so a caller does not have to remember where cargo ran.
     pub path: PathBuf,
     pub diagnostic: lsp::Diagnostic,
+    /// The fixes the compiler computed for this diagnostic and handed over
+    /// with it, in the order it listed them.
+    pub fixes: Vec<Fix>,
 }
+
+/// A fix the compiler wrote itself, offered word for word as it gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    /// The compiler's own words for it -- "consider borrowing here".
+    pub title: String,
+    pub replacements: Vec<Replacement>,
+}
+
+/// One piece of text the compiler asked to be put somewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// Absolute, like [`Reported::path`]: a fix may reach a file other than
+    /// the one the diagnostic is in.
+    pub path: PathBuf,
+    /// In UTF-16 code units, like [`Reported`]'s range and for the same
+    /// reason.
+    pub range: lsp::Range,
+    /// Empty where the compiler asked for the range to be deleted, which is
+    /// a fix like any other and not the absence of one.
+    pub new_text: String,
+    /// The text that was in `range` when the compiler measured it. A caller
+    /// compares it against what is there now: a file edited since the check
+    /// has moved every offset in the report, and a replacement made against
+    /// moved offsets overwrites something the compiler never looked at.
+    pub replaced: String,
+}
+
+/// The one grade of suggestion this reader offers.
+///
+/// The compiler grades every suggestion it makes, and only this grade is a
+/// fix rather than a guess. `HasPlaceholders` replacements contain literal
+/// placeholder text -- `todo!()`, `_` -- that would be written into the
+/// buffer verbatim, and `MaybeIncorrect` ones are the compiler's guess at
+/// what was meant, which it says out loud is often wrong. Applying either at
+/// one click would put something in the file that nobody asked for, and that
+/// is worse than offering nothing.
+const ONLY_GRADE_OFFERED: &str = "MachineApplicable";
 
 /// What `cargo check --message-format=json` writes: one JSON object per line,
 /// of which only some are diagnostics.
@@ -56,6 +98,16 @@ struct Span {
     byte_end: usize,
     #[serde(default)]
     label: Option<String>,
+    /// The text the compiler asked to put over `byte_start..byte_end`.
+    /// Absent where the span only points at something; present and empty
+    /// where the compiler asked for a deletion.
+    #[serde(default)]
+    suggested_replacement: Option<String>,
+    /// Read as text rather than as an enum: a grade this reader has never
+    /// heard of must leave the rest of the message readable, and an unknown
+    /// variant would fail the whole line instead.
+    #[serde(default)]
+    suggestion_applicability: Option<String>,
 }
 
 /// Reads what the compiler reported into diagnostics the editor can show,
@@ -79,6 +131,10 @@ pub fn what_the_compiler_reported(
     // so `--all-targets` reports every error in a library twice. Identical
     // twice over is once.
     let mut already: HashSet<(PathBuf, lsp::Range, String)> = HashSet::new();
+    // A file is read once however many spans land in it: one message's fix
+    // can name several places, and `--all-targets` sends every message
+    // twice.
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
     for line in output.lines() {
         let Ok(line) = serde_json::from_str::<Line>(line) else {
             continue;
@@ -98,19 +154,21 @@ pub fn what_the_compiler_reported(
             continue;
         };
         let path = ran_in.join(&span.file_name);
-        let Some(text) = read(&path) else {
+        let Some(text) = text_of(&mut texts, &path, &read) else {
             continue;
         };
         let range = lsp::Range {
-            start: utf16_position_of(&text, span.byte_start),
-            end: utf16_position_of(&text, span.byte_end),
+            start: utf16_position_of(text, span.byte_start),
+            end: utf16_position_of(text, span.byte_end),
         };
         let said = what_it_said(&message, span);
         if !already.insert((path.clone(), range, said.clone())) {
             continue;
         }
+        let fixes = fixes_in(&message, ran_in, &mut texts, &read);
         reported.push(Reported {
             path,
+            fixes,
             diagnostic: lsp::Diagnostic {
                 range,
                 severity: Some(severity),
@@ -125,6 +183,83 @@ pub fn what_the_compiler_reported(
         });
     }
     reported
+}
+
+/// A file's text, read at most once however many spans point into it.
+///
+/// A file the reader cannot supply is remembered as unreadable, so a
+/// workspace of generated files the editor has no worktree for is not read
+/// once per span.
+fn text_of<'a>(
+    texts: &'a mut HashMap<PathBuf, Option<String>>,
+    path: &Path,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<&'a str> {
+    texts
+        .entry(path.to_path_buf())
+        .or_insert_with(|| read(path))
+        .as_deref()
+}
+
+/// Every fix this message handed over, its own and its children's.
+///
+/// The fix almost always arrives in a child, whose `message` is the fix's
+/// title -- "consider borrowing here" -- and whose spans carry the text to
+/// put where. One child is one fix, however many places it touches: the
+/// compiler's suggestions to add a `&` and to remove the matching `*` are
+/// halves of the same change, and applying one without the other leaves the
+/// file worse than before.
+///
+/// Only [`ONLY_GRADE_OFFERED`] is kept; see there for why.
+fn fixes_in(
+    message: &Message,
+    ran_in: &Path,
+    texts: &mut HashMap<PathBuf, Option<String>>,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Vec<Fix> {
+    let mut fixes = Vec::new();
+    let mut replacements = Vec::new();
+    for span in &message.spans {
+        let Some(new_text) = &span.suggested_replacement else {
+            continue;
+        };
+        if span.suggestion_applicability.as_deref() != Some(ONLY_GRADE_OFFERED) {
+            continue;
+        }
+        let path = ran_in.join(&span.file_name);
+        let Some(text) = text_of(texts, &path, read) else {
+            continue;
+        };
+        // A range the text cannot be sliced by has been measured against a
+        // different file than the one being read, and an empty string here
+        // would be indistinguishable from the compiler asking for an
+        // insertion.
+        let Some(replaced) = text.get(span.byte_start..span.byte_end) else {
+            continue;
+        };
+        let replaced = replaced.to_string();
+        replacements.push(Replacement {
+            path,
+            range: lsp::Range {
+                start: utf16_position_of(text, span.byte_start),
+                end: utf16_position_of(text, span.byte_end),
+            },
+            new_text: new_text.clone(),
+            replaced,
+        });
+    }
+    // A fix with no name cannot be offered: what the reader picks from a menu
+    // is the title, and an unnamed entry says nothing about what it will do.
+    if !replacements.is_empty() && !message.message.is_empty() {
+        fixes.push(Fix {
+            title: message.message.clone(),
+            replacements,
+        });
+    }
+    for child in &message.children {
+        fixes.extend(fixes_in(child, ran_in, texts, read));
+    }
+    fixes
 }
 
 /// The whole of what one message says: its own text, the label the compiler
@@ -363,6 +498,256 @@ mod tests {
         assert_eq!(at.line, 1);
         assert_eq!(at.character, 0);
         assert_eq!(utf16_position_of("", 4), lsp::Position::new(0, 0));
+    }
+
+    /// Real output, captured the same way, over a crate written to provoke a
+    /// suggestion of every grade the compiler hands out: two
+    /// `MachineApplicable` ones -- an insertion, for a borrow through a `&`
+    /// reference, and a deletion, for an unused import -- two
+    /// `MaybeIncorrect` ones, and a `HasPlaceholders` one for an
+    /// unimplemented trait method.
+    const SUGGESTED: &str = include_str!("../test_data/cargo-check-suggestions.json");
+    /// The crate the report above was made over, byte for byte: the offsets in
+    /// it are only meaningful against this exact text.
+    const SUGGESTED_SOURCE: &str = include_str!("../test_data/cargo-check-suggestions.source");
+
+    /// Real output over a crate whose error is on a line of Cyrillic and
+    /// emoji, where a byte count, a character count and a UTF-16 count of the
+    /// same place are three different numbers.
+    const MULTIBYTE: &str = include_str!("../test_data/cargo-check-multibyte.json");
+    const MULTIBYTE_SOURCE: &str = include_str!("../test_data/cargo-check-multibyte.source");
+
+    fn reported_over(output: &str, source: &'static str) -> Vec<Reported> {
+        what_the_compiler_reported(output, Path::new("/project"), |path| {
+            (path == Path::new("/project/src/lib.rs")).then(|| source.to_string())
+        })
+    }
+
+    fn every_fix(reported: &[Reported]) -> Vec<&Fix> {
+        reported.iter().flat_map(|one| &one.fixes).collect()
+    }
+
+    /// The byte a UTF-16 position falls at, read back out of the text.
+    ///
+    /// The reader converts bytes to UTF-16 units; this converts them back,
+    /// through a separate walk of the text, so a fix placed at the wrong
+    /// column comes out of [`applying`] as the wrong text rather than as a
+    /// number that matches whatever the reader happened to write.
+    fn byte_offset_of(text: &str, at: lsp::Position) -> usize {
+        let mut offset = 0;
+        for (index, line) in text.split_inclusive('\n').enumerate() {
+            if index as u32 != at.line {
+                offset += line.len();
+                continue;
+            }
+            let mut units = 0u32;
+            for (byte, character) in line.char_indices() {
+                if units >= at.character {
+                    return offset + byte;
+                }
+                units += character.len_utf16() as u32;
+            }
+            return offset + line.len();
+        }
+        text.len()
+    }
+
+    fn applying(fix: &Fix, source: &str) -> String {
+        let mut replacements: Vec<(usize, usize, &str)> = fix
+            .replacements
+            .iter()
+            .map(|replacement| {
+                (
+                    byte_offset_of(source, replacement.range.start),
+                    byte_offset_of(source, replacement.range.end),
+                    replacement.new_text.as_str(),
+                )
+            })
+            .collect();
+        replacements.sort_by_key(|(start, _, _)| *start);
+        let mut applied = String::new();
+        let mut at = 0;
+        for (start, end, new_text) in replacements {
+            applied.push_str(source.get(at..start).unwrap_or_default());
+            applied.push_str(new_text);
+            at = end;
+        }
+        applied.push_str(source.get(at..).unwrap_or_default());
+        applied
+    }
+
+    /// The compiler computes the fix and hands it over with the error. It
+    /// arrives in a child message, whose own text is the fix's title.
+    #[test]
+    fn a_machine_applicable_suggestion_becomes_a_fix_with_the_compilers_own_title() {
+        let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
+        let borrow = reported
+            .iter()
+            .find(|one| one.diagnostic.message.starts_with("cannot borrow"))
+            .expect("the borrow error");
+
+        assert_eq!(
+            borrow
+                .fixes
+                .iter()
+                .map(|fix| fix.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["consider changing this to be a mutable reference"]
+        );
+        let fix = &borrow.fixes[0];
+        assert_eq!(fix.replacements.len(), 1, "{:?}", fix.replacements);
+        assert_eq!(fix.replacements[0].new_text, "mut ");
+        assert_eq!(
+            fix.replacements[0].path,
+            Path::new("/project/src/lib.rs"),
+            "a replacement names its own file: a fix may reach one the error is not in"
+        );
+    }
+
+    fn the_fix_titled<'a>(reported: &'a [Reported], title: &str) -> &'a Fix {
+        every_fix(reported)
+            .into_iter()
+            .find(|fix| fix.title == title)
+            .unwrap_or_else(|| panic!("no fix titled {title:?}"))
+    }
+
+    /// What the fix produces is the text the compiler asked for, character
+    /// for character.
+    #[test]
+    fn applying_a_fix_produces_the_text_the_compiler_asked_for() {
+        let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
+        let fix = the_fix_titled(&reported, "consider changing this to be a mutable reference");
+
+        assert_eq!(
+            applying(fix, SUGGESTED_SOURCE),
+            SUGGESTED_SOURCE.replace("values: &Vec<i32>", "values: &mut Vec<i32>"),
+            "the fix turns the `&` reference into a `&mut` one and changes nothing else"
+        );
+    }
+
+    /// A fix can be a deletion. The compiler asks for one by naming a range
+    /// and no text to put there, which is a fix like any other and not the
+    /// absence of one.
+    #[test]
+    fn a_fix_that_deletes_carries_the_text_it_expects_to_delete() {
+        let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
+        let fix = the_fix_titled(&reported, "remove the whole `use` item");
+
+        assert_eq!(fix.replacements[0].new_text, "");
+        assert_eq!(fix.replacements[0].replaced, "use std::fmt::Debug;\n");
+        assert_eq!(
+            applying(fix, SUGGESTED_SOURCE),
+            SUGGESTED_SOURCE.replace("use std::fmt::Debug;\n", "")
+        );
+    }
+
+    /// The compiler grades its own suggestions, and only the top grade is a
+    /// fix rather than a guess. A `HasPlaceholders` replacement would write
+    /// `todo!()` into the file; a `MaybeIncorrect` one would write the
+    /// compiler's guess at what was meant.
+    #[test]
+    fn a_suggestion_the_compiler_is_unsure_of_is_not_offered() {
+        assert!(
+            SUGGESTED.contains("MaybeIncorrect") && SUGGESTED.contains("HasPlaceholders"),
+            "the fixture is only meaningful while the compiler still grades these lower"
+        );
+
+        let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
+        let mut titles: Vec<&str> = every_fix(&reported)
+            .iter()
+            .map(|fix| fix.title.as_str())
+            .collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            vec![
+                "consider changing this to be a mutable reference",
+                "remove the whole `use` item",
+            ],
+            "only the machine-applicable suggestions are fixes"
+        );
+
+        // The errors themselves are all still reported: refusing to offer a
+        // guess as a fix is not refusing to show the error it came with.
+        let mut said: Vec<&str> = reported
+            .iter()
+            .filter_map(|one| match &one.diagnostic.code {
+                Some(lsp::NumberOrString::String(code)) => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
+        said.sort_unstable();
+        assert_eq!(
+            said,
+            vec!["E0046", "E0308", "E0596", "E0599", "unused_imports"]
+        );
+        for one in &reported {
+            assert!(
+                one.diagnostic.message.contains("help:"),
+                "the advice is still in what the error says: {}",
+                one.diagnostic.message
+            );
+        }
+    }
+
+    /// A fix on a line of Cyrillic and emoji has to land on the character the
+    /// compiler pointed at. The compiler counts characters, the file is
+    /// stored in bytes, and the protocol asks for UTF-16 code units: on this
+    /// line those are 29, 42 and 31.
+    #[test]
+    fn a_fix_on_a_line_with_an_emoji_lands_on_the_right_characters() {
+        let line = MULTIBYTE_SOURCE
+            .lines()
+            .nth(1)
+            .expect("the line the binding is on");
+        let inside = line.find("счётчик").expect("the binding");
+        assert_eq!(line[..inside].len(), 42, "bytes");
+        assert_eq!(line[..inside].chars().count(), 29, "characters");
+        assert_eq!(line[..inside].encode_utf16().count(), 31, "UTF-16 units");
+
+        let reported = reported_over(MULTIBYTE, MULTIBYTE_SOURCE);
+        let fix = the_fix_titled(&reported, "consider making this binding mutable");
+        assert_eq!(fix.replacements[0].range.start.line, 1);
+        assert_eq!(
+            fix.replacements[0].range.start.character, 31,
+            "the protocol's own unit -- not 29, which is what the compiler reports"
+        );
+        assert_eq!(
+            applying(fix, MULTIBYTE_SOURCE),
+            MULTIBYTE_SOURCE.replace("let счётчик", "let mut счётчик")
+        );
+    }
+
+    /// The error a fix belongs to is not always where the fix lands: here the
+    /// error is on the assignment and the replacement is on the line above,
+    /// where the binding is. What the reader's cursor has to be near is the
+    /// error.
+    #[test]
+    fn a_fix_can_land_on_a_different_line_than_the_error_it_belongs_to() {
+        let reported = reported_over(MULTIBYTE, MULTIBYTE_SOURCE);
+        let one = reported.first().expect("the error");
+        assert_eq!(one.diagnostic.range.start.line, 2);
+        assert_eq!(one.fixes[0].replacements[0].range.start.line, 1);
+    }
+
+    /// The report the diagnostics tests above are built on carries a fix too,
+    /// for the unused variable in it. Nothing about reading it changed: the
+    /// same two diagnostics come out, and one of them now also carries the
+    /// rename the compiler asked for.
+    #[test]
+    fn the_earlier_report_keeps_its_diagnostics_and_gains_the_fix_it_carried() {
+        let reported =
+            what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
+        assert_eq!(reported.len(), 2);
+        assert!(reported[0].fixes.is_empty(), "the type error suggests none");
+
+        let fix = the_fix_titled(&reported, "if this is intentional, prefix it with an underscore");
+        assert_eq!(fix.replacements[0].new_text, "_never_read");
+        assert_eq!(fix.replacements[0].replaced, "never_read");
+        assert_eq!(
+            applying(fix, &library()),
+            library().replace("never_read", "_never_read")
+        );
     }
 
     /// Nothing in a stream that is not a diagnostic becomes one: the artifact
