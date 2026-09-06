@@ -446,9 +446,8 @@ mod tests {
             _ => panic!("expected query"),
         }
 
-        let args =
-            DbArgs::try_parse_from(["query", "-c", "p", "-d", "shop", "--json", "SELECT 1"])
-                .unwrap();
+        let args = DbArgs::try_parse_from(["query", "-c", "p", "-d", "shop", "--json", "SELECT 1"])
+            .unwrap();
         match args.command {
             DbCommand::Query { database, json, .. } => {
                 assert_eq!(database.as_deref(), Some("shop"));
@@ -849,7 +848,11 @@ fn run() -> Result<()> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "zed db", no_binary_name = true, about = "Query saved database connections")]
+#[command(
+    name = "zed db",
+    no_binary_name = true,
+    about = "Query saved database connections"
+)]
 struct DbArgs {
     #[command(subcommand)]
     command: DbCommand,
@@ -880,10 +883,7 @@ enum DbCommand {
 /// opened in that instance (that is where the connections live).
 fn run_db_command(args: &[String]) -> Result<()> {
     let db_args = DbArgs::try_parse_from(args)?;
-    let json = matches!(
-        db_args.command,
-        DbCommand::Query { json: true, .. }
-    );
+    let json = matches!(db_args.command, DbCommand::Query { json: true, .. });
     let request = match db_args.command {
         DbCommand::Query {
             connection,
@@ -999,9 +999,7 @@ fn print_query_result(
     println!("{}", separator(&widths));
     for row in rows {
         let cells: Vec<String> = (0..columns.len())
-            .map(|index| {
-                cell_display(row.get(index).unwrap_or(&None)).to_string()
-            })
+            .map(|index| cell_display(row.get(index).unwrap_or(&None)).to_string())
             .collect();
         println!("{}", format_row(cells));
     }
@@ -1047,10 +1045,7 @@ fn print_connections(items: &[DbConnectionSummary]) {
         .chain(std::iter::once("LABEL".len()))
         .max()
         .unwrap_or(0);
-    println!(
-        "{:id_width$}  {:label_width$}  {}",
-        "ID", "LABEL", "DRIVER"
-    );
+    println!("{:id_width$}  {:label_width$}  {}", "ID", "LABEL", "DRIVER");
     for item in items {
         println!(
             "{:id_width$}  {:label_width$}  {}",

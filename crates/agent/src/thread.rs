@@ -4986,8 +4986,7 @@ impl ToolInputSender {
 
 type ExtraToolFactory = Box<dyn Fn() -> Arc<dyn AnyAgentTool> + Send + Sync>;
 
-static EXTRA_TOOLS: parking_lot::Mutex<Vec<ExtraToolFactory>> =
-    parking_lot::Mutex::new(Vec::new());
+static EXTRA_TOOLS: parking_lot::Mutex<Vec<ExtraToolFactory>> = parking_lot::Mutex::new(Vec::new());
 
 /// Registers a tool contributed by a crate that `agent` does not depend on
 /// (e.g. database query tools defined in `db_client_ui`). Each registered
