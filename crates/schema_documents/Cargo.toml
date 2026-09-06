@@ -1,5 +1,5 @@
 [package]
-name = "json_diagnostics"
+name = "schema_documents"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -9,17 +9,22 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [lib]
-path = "src/json_diagnostics.rs"
+path = "src/schema_documents.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
+collections.workspace = true
+globset.workspace = true
 gpui.workspace = true
-json_schema_store.workspace = true
 jsonschema.workspace = true
 language.workspace = true
+log.workspace = true
 lsp.workspace = true
-schema_documents.workspace = true
+project.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+settings.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]

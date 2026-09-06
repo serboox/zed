@@ -196,6 +196,7 @@ members = [
     "crates/scheduler",
     "crates/schema_generator",
     "crates/search",
+    "crates/schema_documents",
     "crates/search_everywhere",
     "crates/semantic_index",
     "crates/session",
@@ -252,6 +253,7 @@ members = [
     "crates/windows_resources",
     "crates/workspace",
     "crates/worktree",
+    "crates/yaml_diagnostics",
     "crates/worktree_benchmarks",
     "crates/x_ai",
     "crates/zed",
@@ -474,6 +476,7 @@ ruff_diagnostics = { path = "crates/ruff_diagnostics" }
 scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
+schema_documents = { path = "crates/schema_documents" }
 search_everywhere = { path = "crates/search_everywhere" }
 semantic_index = { path = "crates/semantic_index" }
 session = { path = "crates/session" }
@@ -528,6 +531,7 @@ web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
+yaml_diagnostics = { path = "crates/yaml_diagnostics" }
 x_ai = { path = "crates/x_ai" }
 zed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }

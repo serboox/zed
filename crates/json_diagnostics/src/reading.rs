@@ -1,97 +1,30 @@
 use std::ops::Range;
 
-use collections::HashMap;
+use schema_documents::{Document, Spans, Unreadable, pointer_to};
 use serde_json::Value;
 
-/// A document read from the buffer, and where each part of it came from.
+/// Reads a document, or nothing at all where the text holds no document --
+/// an empty file, or one holding only comments. That is not a fault worth
+/// marking: there is simply nothing to check yet.
 ///
-/// A validator answers in JSON pointers -- `/languages/Rust/tab_size` -- and
-/// the editor needs a byte range. Nothing but the text can convert one to the
-/// other, so the reading that produces the value records both.
-pub struct Document {
-    pub value: Value,
-    /// The whole of the value at each pointer, braces and brackets included.
-    values: HashMap<String, Range<usize>>,
-    /// The quoted name of each property, kept under that property's own
-    /// pointer. A complaint about a property the schema does not allow
-    /// belongs on the name, and the name is not part of the value.
-    names: HashMap<String, Range<usize>>,
-}
-
-/// The one thing wrong with a document that could not be read at all.
-///
-/// One, not many: past the first unbalanced brace nothing further can be
-/// said, and saying it anyway would bury the real fault under its
-/// consequences.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unreadable {
-    pub message: String,
-    pub range: Range<usize>,
-}
-
-impl Document {
-    /// Reads a document, or nothing at all where the text holds no document
-    /// -- an empty file, or one holding only comments. That is not a fault
-    /// worth marking: there is simply nothing to check yet.
-    ///
-    /// Comments and trailing commas are read wherever they appear, in `.json`
-    /// as much as in `.jsonc`. This editor's own `settings.json` and
-    /// `keymap.json` are commented files with a `.json` name, and so are most
-    /// of the files a schema applies to; calling their comments a syntax
-    /// error would mark almost every file this checks.
-    pub fn read(text: &str) -> Option<Result<Document, Unreadable>> {
-        let mut reader = Reader {
-            text,
-            at: 0,
-            depth: 0,
-        };
-        if let Err(unreadable) = reader.skip_trivia() {
-            return Some(Err(unreadable));
-        }
-        if reader.at >= text.len() {
-            return None;
-        }
-        Some(reader.whole_document())
+/// Comments and trailing commas are read wherever they appear, in `.json` as
+/// much as in `.jsonc`. This editor's own `settings.json` and `keymap.json`
+/// are commented files with a `.json` name, and so are most of the files a
+/// schema applies to; calling their comments a syntax error would mark almost
+/// every file this checks.
+pub fn read(text: &str) -> Option<Result<Document, Unreadable>> {
+    let mut reader = Reader {
+        text,
+        at: 0,
+        depth: 0,
+    };
+    if let Err(unreadable) = reader.skip_trivia() {
+        return Some(Err(unreadable));
     }
-
-    /// The bytes the value at this pointer occupies.
-    pub fn value_at(&self, pointer: &str) -> Option<Range<usize>> {
-        self.values.get(pointer).cloned()
+    if reader.at >= text.len() {
+        return None;
     }
-
-    /// The bytes this property's quoted name occupies.
-    pub fn name_at(&self, pointer: &str) -> Option<Range<usize>> {
-        self.names.get(pointer).cloned()
-    }
-
-    /// Where to put a complaint about something a value is missing. The
-    /// opening brace, rather than the whole value: an object that lacks a
-    /// required property may be the entire file, and underlining the entire
-    /// file says nothing about where to fix it.
-    ///
-    /// One byte is a whole character here: every value starts on `{`, `[`,
-    /// `"`, a digit, `-`, or a keyword letter.
-    pub fn opening_of(&self, pointer: &str) -> Option<Range<usize>> {
-        let whole = self.value_at(pointer)?;
-        Some(whole.start..whole.end.min(whole.start + 1))
-    }
-}
-
-/// The pointer of a property of the value at `parent`, escaped the way RFC
-/// 6901 asks and the way the validator's own pointers are escaped, so the two
-/// agree on a property named `a/b`.
-pub fn pointer_to(parent: &str, name: &str) -> String {
-    let mut pointer = String::with_capacity(parent.len() + name.len() + 1);
-    pointer.push_str(parent);
-    pointer.push('/');
-    for character in name.chars() {
-        match character {
-            '~' => pointer.push_str("~0"),
-            '/' => pointer.push_str("~1"),
-            character => pointer.push(character),
-        }
-    }
-    pointer
+    Some(reader.whole_document())
 }
 
 struct Reader<'a> {
@@ -109,18 +42,13 @@ const DEEPEST_NESTING: usize = 128;
 
 impl<'a> Reader<'a> {
     fn whole_document(&mut self) -> Result<Document, Unreadable> {
-        let mut values = HashMap::default();
-        let mut names = HashMap::default();
-        let value = self.value("", &mut values, &mut names)?;
+        let mut spans = Spans::default();
+        let value = self.value("", &mut spans)?;
         self.skip_trivia()?;
         if self.at < self.text.len() {
             return Err(self.wrong_here("expected the end of the document"));
         }
-        Ok(Document {
-            value,
-            values,
-            names,
-        })
+        Ok(Document::new(value, spans))
     }
 
     fn peek(&self) -> Option<u8> {
@@ -173,12 +101,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn value(
-        &mut self,
-        pointer: &str,
-        values: &mut HashMap<String, Range<usize>>,
-        names: &mut HashMap<String, Range<usize>>,
-    ) -> Result<Value, Unreadable> {
+    fn value(&mut self, pointer: &str, spans: &mut Spans) -> Result<Value, Unreadable> {
         self.skip_trivia()?;
         self.depth += 1;
         if self.depth > DEEPEST_NESTING {
@@ -190,27 +113,22 @@ impl<'a> Reader<'a> {
         // those paths too: today an error ends the whole parse, but a caller
         // that recovered and read on with the same reader would watch the
         // depth climb until valid documents were refused.
-        let value = match self.read_one(pointer, values, names) {
+        let value = match self.read_one(pointer, spans) {
             Ok(value) => value,
             Err(unreadable) => {
                 self.depth -= 1;
                 return Err(unreadable);
             }
         };
-        values.insert(pointer.to_string(), start..self.at);
+        spans.value(pointer, start..self.at);
         self.depth -= 1;
         Ok(value)
     }
 
-    fn read_one(
-        &mut self,
-        pointer: &str,
-        values: &mut HashMap<String, Range<usize>>,
-        names: &mut HashMap<String, Range<usize>>,
-    ) -> Result<Value, Unreadable> {
+    fn read_one(&mut self, pointer: &str, spans: &mut Spans) -> Result<Value, Unreadable> {
         let value = match self.peek() {
-            Some(b'{') => self.object(pointer, values, names)?,
-            Some(b'[') => self.array(pointer, values, names)?,
+            Some(b'{') => self.object(pointer, spans)?,
+            Some(b'[') => self.array(pointer, spans)?,
             Some(b'"') => Value::String(self.string()?.0),
             Some(b't') => self.keyword("true", Value::Bool(true))?,
             Some(b'f') => self.keyword("false", Value::Bool(false))?,
@@ -323,12 +241,7 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    fn object(
-        &mut self,
-        pointer: &str,
-        values: &mut HashMap<String, Range<usize>>,
-        names: &mut HashMap<String, Range<usize>>,
-    ) -> Result<Value, Unreadable> {
+    fn object(&mut self, pointer: &str, spans: &mut Spans) -> Result<Value, Unreadable> {
         let opened = self.at;
         self.at += 1;
         let mut read = serde_json::Map::new();
@@ -347,13 +260,13 @@ impl<'a> Reader<'a> {
             }
             let (name, where_named) = self.string()?;
             let inner = pointer_to(pointer, &name);
-            names.insert(inner.clone(), where_named);
+            spans.name(&inner, where_named);
             self.skip_trivia()?;
             if self.peek() != Some(b':') {
                 return Err(self.wrong_here("expected `:`"));
             }
             self.at += 1;
-            read.insert(name, self.value(&inner, values, names)?);
+            read.insert(name, self.value(&inner, spans)?);
             self.skip_trivia()?;
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -368,12 +281,7 @@ impl<'a> Reader<'a> {
         Ok(Value::Object(read))
     }
 
-    fn array(
-        &mut self,
-        pointer: &str,
-        values: &mut HashMap<String, Range<usize>>,
-        names: &mut HashMap<String, Range<usize>>,
-    ) -> Result<Value, Unreadable> {
+    fn array(&mut self, pointer: &str, spans: &mut Spans) -> Result<Value, Unreadable> {
         let opened = self.at;
         self.at += 1;
         let mut read = Vec::new();
@@ -388,7 +296,7 @@ impl<'a> Reader<'a> {
                 Some(_) => {}
             }
             let inner = format!("{pointer}/{}", read.len());
-            read.push(self.value(&inner, values, names)?);
+            read.push(self.value(&inner, spans)?);
             self.skip_trivia()?;
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -410,8 +318,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    fn read(text: &str) -> Document {
-        Document::read(text)
+    fn a_document(text: &str) -> Document {
+        read(text)
             .expect("the text holds a document")
             .expect("the document reads")
     }
@@ -423,24 +331,20 @@ mod tests {
             "[".repeat(DEEPEST_NESTING + 8),
             "]".repeat(DEEPEST_NESTING + 8)
         );
-        let read = Document::read(&deep).expect("the text holds a document");
-        assert!(read.is_err(), "a document this deep is refused");
+        let deepest = read(&deep).expect("the text holds a document");
+        assert!(deepest.is_err(), "a document this deep is refused");
 
         // And one just inside the limit still reads, so the cap is not simply
         // refusing everything nested at all.
         let shallow = format!("{}1{}", "[".repeat(8), "]".repeat(8));
-        assert!(
-            Document::read(&shallow)
-                .expect("the text holds a document")
-                .is_ok()
-        );
+        assert!(read(&shallow).expect("the text holds a document").is_ok());
     }
 
     #[test]
     fn a_document_reads_to_the_same_value_serde_would_read() {
         let text = r#"{"a": [1, 2.5, -3e2], "b": {"c": true, "d": null}, "e": "xé\n"}"#;
         assert_eq!(
-            read(text).value,
+            a_document(text).value,
             serde_json::from_str::<Value>(text).expect("serde reads it too")
         );
     }
@@ -457,7 +361,7 @@ mod tests {
                 "b": [1, 2,],
             }
         "#;
-        assert_eq!(read(commented).value, json!({"a": 1, "b": [1, 2]}));
+        assert_eq!(a_document(commented).value, json!({"a": 1, "b": [1, 2]}));
     }
 
     /// The span is the point of reading it this way. A value's range covers
@@ -466,7 +370,7 @@ mod tests {
     #[test]
     fn every_value_and_every_property_name_keeps_the_bytes_it_came_from() {
         let text = r#"{"a": {"b": [10, 20]}}"#;
-        let document = read(text);
+        let document = a_document(text);
 
         for (pointer, expected) in [
             ("", r#"{"a": {"b": [10, 20]}}"#),
@@ -494,7 +398,9 @@ mod tests {
         assert_eq!(pointer_to("/x", "a~b"), "/x/a~0b");
 
         let text = r#"{"a/b": 1}"#;
-        let range = read(text).value_at("/a~1b").expect("the escaped pointer");
+        let range = a_document(text)
+            .value_at("/a~1b")
+            .expect("the escaped pointer");
         assert_eq!(&text[range], "1");
     }
 
@@ -504,7 +410,9 @@ mod tests {
     #[test]
     fn a_missing_property_is_pointed_at_by_the_opening_brace_of_its_object() {
         let text = "{\n  \"a\": 1\n}";
-        let opening = read(text).opening_of("").expect("the root object");
+        let opening = a_document(text)
+            .opening_of(text, "")
+            .expect("the root object");
         assert_eq!(opening, 0..1);
         assert_eq!(&text[opening], "{");
     }
@@ -515,7 +423,7 @@ mod tests {
     #[test]
     fn a_document_that_is_only_whitespace_or_comments_is_nothing_rather_than_a_fault() {
         for text in ["", "   \n\t ", "// nothing yet\n", "/* nothing yet */"] {
-            assert!(Document::read(text).is_none(), "{text:?}");
+            assert!(read(text).is_none(), "{text:?}");
         }
     }
 
@@ -524,14 +432,14 @@ mod tests {
     #[test]
     fn a_document_that_will_not_read_gives_one_fault_where_it_is() {
         let text = "{\"a\": 1,";
-        let Some(Err(unreadable)) = Document::read(text) else {
+        let Some(Err(unreadable)) = read(text) else {
             panic!("this should not read");
         };
         assert_eq!(unreadable.message, "unterminated object");
         assert_eq!(unreadable.range, 0..1);
 
         let text = "{\"a\": }";
-        let Some(Err(unreadable)) = Document::read(text) else {
+        let Some(Err(unreadable)) = read(text) else {
             panic!("this should not read");
         };
         assert_eq!(unreadable.message, "expected a value");
@@ -544,7 +452,7 @@ mod tests {
     #[test]
     fn an_unterminated_comment_is_a_fault_where_it_was_opened() {
         let text = "{ /* forever\n \"a\": 1 }";
-        let Some(Err(unreadable)) = Document::read(text) else {
+        let Some(Err(unreadable)) = read(text) else {
             panic!("this should not read");
         };
         assert_eq!(unreadable.message, "unterminated comment");
@@ -556,7 +464,7 @@ mod tests {
     /// the first would silently check half of it.
     #[test]
     fn a_second_value_after_the_document_is_a_fault() {
-        let Some(Err(unreadable)) = Document::read("{} []") else {
+        let Some(Err(unreadable)) = read("{} []") else {
             panic!("this should not read");
         };
         assert_eq!(unreadable.message, "expected the end of the document");

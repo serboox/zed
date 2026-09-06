@@ -1,15 +1,15 @@
-use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use collections::{HashMap, HashSet};
+use collections::HashMap;
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{Buffer, CodeLabel, LanguageRegistry, PointUtf16, ToOffset as _};
 use lsp::CompletionContext;
 use parking_lot::RwLock;
 use project::lsp_store::CompletionDocumentation;
 use project::{Completion, CompletionSource, InProcessCompletions, InProcessProject, LspStore};
+use schema_documents::{CursorContext, Place, Segment, Style, Suggestion, Suggestions};
 use serde_json::Value;
 
 use crate::{all_schema_file_associations, handle_schema_request};
@@ -19,8 +19,6 @@ use crate::{all_schema_file_associations, handle_schema_request};
 /// depends on runtime state is re-read after that state changes.
 pub(crate) static PARSED_SCHEMAS: LazyLock<RwLock<HashMap<String, Arc<Value>>>> =
     LazyLock::new(|| RwLock::new(HashMap::default()));
-
-const MAX_SCHEMA_DEPTH: usize = 32;
 
 pub fn init(cx: &mut App) {
     project::register_in_process_completions(Arc::new(SchemaCompletions), cx);
@@ -108,7 +106,7 @@ impl InProcessCompletions for SchemaCompletions {
     }
 }
 
-async fn schema_document(
+pub async fn schema_document(
     lsp_store: Entity<LspStore>,
     uri: String,
     cx: &mut AsyncApp,
@@ -196,39 +194,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     pattern[pattern_index..].iter().all(|byte| *byte == b'*')
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Segment {
-    Key(String),
-    Item,
-}
-
-#[derive(Debug, PartialEq)]
-enum Place {
-    Key { existing: Vec<String> },
-    Value,
-}
-
-#[derive(Debug)]
-struct CursorContext {
-    path: Vec<Segment>,
-    place: Place,
-    token: Range<usize>,
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct Suggestion {
-    pub label: String,
-    pub new_text: String,
-    pub detail: Option<String>,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Suggestions {
-    pub range: Range<usize>,
-    pub items: Vec<Suggestion>,
 }
 
 struct Frame {
@@ -442,260 +407,10 @@ fn unescape(content: &str) -> String {
     out
 }
 
-pub(crate) fn suggestions(schema: &Value, text: &str, offset: usize) -> Option<Suggestions> {
+/// Everything the schema allows where the cursor is, for a JSON document.
+fn suggestions(schema: &Value, text: &str, offset: usize) -> Option<Suggestions> {
     let context = analyze(text, offset)?;
-
-    let mut schemas = Vec::new();
-    expand(
-        schema,
-        schema,
-        MAX_SCHEMA_DEPTH,
-        &mut HashSet::default(),
-        &mut schemas,
-    );
-    for segment in &context.path {
-        schemas = child_schemas(schema, &schemas, segment);
-        if schemas.is_empty() {
-            return None;
-        }
-    }
-
-    let items = match &context.place {
-        Place::Key { existing } => key_suggestions(
-            schema,
-            &schemas,
-            existing,
-            needs_colon(text, &context.token),
-        ),
-        Place::Value => value_suggestions(&schemas),
-    };
-    if items.is_empty() {
-        return None;
-    }
-    Some(Suggestions {
-        range: context.token,
-        items,
-    })
-}
-
-/// Flattens a schema into the concrete schemas that apply at the same place:
-/// the schema itself, whatever its `$ref` points at, and every branch of its
-/// `allOf` / `anyOf` / `oneOf`.
-fn expand<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    depth: usize,
-    seen_refs: &mut HashSet<String>,
-    out: &mut Vec<&'a Value>,
-) {
-    if depth == 0 {
-        return;
-    }
-    let Some(object) = schema.as_object() else {
-        return;
-    };
-    if let Some(Value::String(reference)) = object.get("$ref")
-        && seen_refs.insert(reference.clone())
-        && let Some(target) = resolve_pointer(root, reference)
-    {
-        expand(root, target, depth - 1, seen_refs, out);
-    }
-    for keyword in ["allOf", "anyOf", "oneOf"] {
-        if let Some(Value::Array(branches)) = object.get(keyword) {
-            for branch in branches {
-                expand(root, branch, depth - 1, seen_refs, out);
-            }
-        }
-    }
-    out.push(schema);
-}
-
-fn resolve_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
-    let pointer = reference.strip_prefix('#')?;
-    if pointer.is_empty() {
-        return Some(root);
-    }
-    root.pointer(pointer)
-}
-
-fn child_schemas<'a>(root: &'a Value, schemas: &[&'a Value], segment: &Segment) -> Vec<&'a Value> {
-    let mut children = Vec::new();
-    for &schema in schemas {
-        let Some(object) = schema.as_object() else {
-            continue;
-        };
-        match segment {
-            Segment::Key(key) => {
-                if let Some(property) = object
-                    .get("properties")
-                    .and_then(|properties| properties.as_object())
-                    .and_then(|properties| properties.get(key))
-                {
-                    children.push(property);
-                } else if let Some(additional) = object
-                    .get("additionalProperties")
-                    .filter(|additional| additional.is_object())
-                {
-                    children.push(additional);
-                }
-            }
-            Segment::Item => match object.get("items") {
-                Some(Value::Array(items)) => children.extend(items.first()),
-                Some(items) if items.is_object() => children.push(items),
-                _ => {}
-            },
-        }
-    }
-
-    let mut expanded = Vec::new();
-    let mut seen_refs = HashSet::default();
-    for child in children {
-        expand(root, child, MAX_SCHEMA_DEPTH, &mut seen_refs, &mut expanded);
-    }
-    expanded
-}
-
-fn key_suggestions(
-    root: &Value,
-    schemas: &[&Value],
-    existing: &[String],
-    needs_colon: bool,
-) -> Vec<Suggestion> {
-    let mut offered = HashSet::default();
-    let mut items = Vec::new();
-    for &schema in schemas {
-        let Some(properties) = schema
-            .get("properties")
-            .and_then(|properties| properties.as_object())
-        else {
-            continue;
-        };
-        for (name, property) in properties {
-            if existing.iter().any(|key| key == name) || !offered.insert(name.clone()) {
-                continue;
-            }
-            let mut expanded = Vec::new();
-            expand(
-                root,
-                property,
-                MAX_SCHEMA_DEPTH,
-                &mut HashSet::default(),
-                &mut expanded,
-            );
-            let label = literal(&Value::String(name.clone()));
-            let new_text = if needs_colon {
-                format!("{label}: ")
-            } else {
-                label.clone()
-            };
-            items.push(Suggestion {
-                label,
-                new_text,
-                detail: type_name(&expanded),
-                documentation: description(&expanded),
-            });
-        }
-    }
-    items.sort_by(|left, right| left.label.cmp(&right.label));
-    items
-}
-
-fn value_suggestions(schemas: &[&Value]) -> Vec<Suggestion> {
-    let mut offered = HashSet::default();
-    let mut items = Vec::new();
-    let mut allows_boolean = false;
-
-    for schema in schemas {
-        let documentation = description(std::slice::from_ref(schema));
-        if let Some(Value::Array(values)) = schema.get("enum") {
-            for value in values {
-                push_value(value, documentation.clone(), &mut offered, &mut items);
-            }
-        }
-        if let Some(value) = schema.get("const") {
-            push_value(value, documentation, &mut offered, &mut items);
-        }
-        allows_boolean |= match schema.get("type") {
-            Some(Value::String(name)) => name == "boolean",
-            Some(Value::Array(names)) => names.iter().any(|name| name == "boolean"),
-            _ => false,
-        };
-    }
-
-    if allows_boolean {
-        for value in [Value::Bool(true), Value::Bool(false)] {
-            push_value(&value, None, &mut offered, &mut items);
-        }
-    }
-    items
-}
-
-fn push_value(
-    value: &Value,
-    documentation: Option<String>,
-    offered: &mut HashSet<String>,
-    items: &mut Vec<Suggestion>,
-) {
-    let text = literal(value);
-    if !offered.insert(text.clone()) {
-        return;
-    }
-    items.push(Suggestion {
-        label: text.clone(),
-        new_text: text,
-        detail: None,
-        documentation,
-    });
-}
-
-fn literal(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
-}
-
-fn type_name(schemas: &[&Value]) -> Option<String> {
-    for schema in schemas {
-        match schema.get("type") {
-            Some(Value::String(name)) => return Some(name.clone()),
-            Some(Value::Array(names)) => {
-                let names = names
-                    .iter()
-                    .filter_map(|name| name.as_str())
-                    .filter(|name| *name != "null")
-                    .collect::<Vec<_>>();
-                if !names.is_empty() {
-                    return Some(names.join(" | "));
-                }
-            }
-            _ => {}
-        }
-    }
-    schemas.iter().find_map(|schema| {
-        if schema.get("properties").is_some() {
-            Some("object".to_string())
-        } else if schema.get("items").is_some() {
-            Some("array".to_string())
-        } else if schema.get("enum").is_some() || schema.get("const").is_some() {
-            Some("enum".to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn description(schemas: &[&Value]) -> Option<String> {
-    schemas.iter().find_map(|schema| {
-        schema
-            .get("description")
-            .and_then(|text| text.as_str())
-            .filter(|text| !text.is_empty())
-            .map(|text| text.to_string())
-    })
-}
-
-fn needs_colon(text: &str, token: &Range<usize>) -> bool {
-    !text[token.end..]
-        .trim_start_matches([' ', '\t'])
-        .starts_with(':')
+    schema_documents::suggestions_for(schema, text, context, Style::Json)
 }
 
 #[cfg(test)]

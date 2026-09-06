@@ -777,6 +777,7 @@ fn main() {
         go_diagnostics::init(cx);
         ruff_diagnostics::init(cx);
         json_diagnostics::init(cx);
+        yaml_diagnostics::init(cx);
         db_client_ui::init(cx);
         api_client_ui::init(cx);
         hierarchy_view::init(cx);
