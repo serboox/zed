@@ -4175,19 +4175,28 @@ mod tests {
     #[test]
     fn assembly_answers_from_a_written_query_because_its_grammar_has_no_identifier() {
         // Its names are `word` and `ident`, neither of which the built query
-        // knows, so before this had a written one assembly found nothing at
-        // all -- and unlike YAML, that was not the truthful answer: a label is
+        // knows, so before assembly had a written one it found nothing at all
+        // -- and unlike YAML, that was not the truthful answer: a label is
         // exactly the kind of name a reader follows.
-        let found = references_in_text("asm", b"greet:\n    ret\n\n_start:\n    call greet\n")
+        const CALLING_A_LABEL: &[u8] = b"greet:\n    ret\n\n_start:\n    call greet\n";
+
+        let built = references_in_text_with("asm", CALLING_A_LABEL, Queries::BuiltFromTheGrammar)
+            .expect("assembly has a grammar")
+            .expect("and a query built from it");
+        assert!(
+            built.is_empty(),
+            "the built query names node kinds this grammar has none of: {built:?}"
+        );
+
+        let written = references_in_text("asm", CALLING_A_LABEL)
             .expect("assembly has a grammar")
             .expect("and a written query");
-        let named: Vec<&str> = found.iter().map(|one| one.name.as_str()).collect();
-        assert!(named.contains(&"greet"), "{named:?}");
-        assert!(named.contains(&"_start"), "{named:?}");
-        assert!(
-            named.iter().filter(|name| **name == "greet").count() >= 2,
-            "the label and the call that follows it, in {named:?}"
-        );
+        let named: Vec<&str> = written.iter().map(|one| one.name.as_str()).collect();
+        // Only the call. The two labels are declarations, and a declaring
+        // position is not offered as a place that refers to itself -- which is
+        // the pipeline's own rule, not this query's.
+        assert_eq!(named, vec!["greet"], "{written:?}");
+        assert_eq!(written[0].row, 4, "the `call greet` line: {written:?}");
     }
 
     /// Every language the editor has a grammar for answers, whether anybody

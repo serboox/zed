@@ -376,16 +376,19 @@ async fn open_the_declaration(
     let opened = project
         .update(cx, |project, cx| project.open_local_buffer(&path, cx))?
         .await?;
-    let target = opened.read_with(cx, |opened, _| {
+    // The closure is handed the buffer itself, not the handle to it, so the
+    // range is worked out inside and the handle is put beside it out here.
+    let at = opened.read_with(cx, |opened, _| {
         let snapshot = opened.snapshot();
         // `Definition::line` is one-based, as a reader counts lines.
         let row = declared.line.saturating_sub(1);
         let at = name_on_line(&snapshot, row, &declared.name)
-            .or_else(|| point_of(&snapshot, row, 0).map(|start| start..start));
-        at.map(|at| language::Location {
-            buffer: opened.clone(),
-            range: snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end),
-        })
+            .or_else(|| point_of(&snapshot, row, 0).map(|start| start..start))?;
+        Some(snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end))
+    });
+    let target = at.map(|range| language::Location {
+        buffer: opened.clone(),
+        range,
     });
     let Some(target) = target else {
         // The file has moved under the index and no longer has that line.

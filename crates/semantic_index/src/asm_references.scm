@@ -5,7 +5,9 @@
 ; to follow.
 
 ; A label's own name, and the name a constant is given. Both spellings of a
-; label are captured because the outline query records both.
+; label are captured because the outline query records both. A declaring
+; position is dropped again before the answer leaves -- that is the pipeline's
+; rule, not this query's.
 (label
   [(word) (ident)] @reference.value)
 (const
