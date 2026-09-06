@@ -3611,6 +3611,8 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "tempfile",
+ "text",
  "workspace",
 ]
 
@@ -18492,6 +18494,7 @@ dependencies = [
  "editor",
  "gpui",
  "language",
+ "lsp",
  "project",
  "semantic_index",
  "serde_json",
@@ -18499,6 +18502,7 @@ dependencies = [
  "symbol_index",
  "text",
  "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
