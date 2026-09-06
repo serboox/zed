@@ -42,16 +42,41 @@ pub fn init(cx: &mut App) {
             else {
                 return;
             };
-            let Some(subject) = Subject::under_the_cursor(&editor, cx) else {
-                return;
-            };
-            let project = workspace.project().clone();
-            let handle = cx.entity().downgrade();
-            let view = cx.new(|cx| RenamePreview::new(project, handle, subject, window, cx));
-            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+            open_over(workspace, &editor, window, cx);
         });
     })
     .detach();
+
+    // `editor::Rename` asks the language server first and does nothing at all
+    // when no server answers, which is every rename in a project with no
+    // server running. That silence is what this fills.
+    editor::when_nothing_offers_a_rename(
+        |editor, window, cx| {
+            let Some(workspace) = editor.read(cx).workspace() else {
+                return;
+            };
+            let editor = editor.clone();
+            workspace.update(cx, |workspace, cx| {
+                open_over(workspace, &editor, window, cx);
+            });
+        },
+        cx,
+    );
+}
+
+fn open_over(
+    workspace: &mut Workspace,
+    editor: &Entity<Editor>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(subject) = Subject::under_the_cursor(editor, cx) else {
+        return;
+    };
+    let project = workspace.project().clone();
+    let handle = cx.entity().downgrade();
+    let view = cx.new(|cx| RenamePreview::new(project, handle, subject, window, cx));
+    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
 }
 
 /// What is being renamed: where the reader's cursor was, and the word it was
@@ -929,6 +954,7 @@ mod tests {
     use project::FakeFs;
     use serde_json::json;
     use std::time::Instant;
+    use workspace::MultiWorkspace;
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1223,6 +1249,149 @@ mod tests {
         eprintln!(
             "the first preview in a process took {cold:?}, the second {warm:?}; \
              the difference is the one-time cost of compiling the outline queries"
+        );
+    }
+
+    /// A workspace with `/project/one.rs` open in an editor, the cursor inside
+    /// the first `helper`, and either no language server at all or one that
+    /// says it renames.
+    ///
+    /// The fake server is registered before any buffer is opened: a buffer
+    /// only picks up a server that is already registered by the time it opens.
+    async fn one_file_open_at_helper(
+        a_server_renames: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<Editor>,
+        project::lsp_store::OpenLspBufferHandle,
+        VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/project"),
+            json!({ "one.rs": "fn helper() {}\nfn call() { helper(); }\n" }),
+        )
+        .await;
+        let project = Project::test(fs, [util::path!("/project").as_ref()], cx).await;
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        languages.add(language::rust_lang());
+        let _servers = a_server_renames.then(|| {
+            languages.register_fake_lsp(
+                "Rust",
+                language::FakeLspAdapter {
+                    capabilities: lsp::ServerCapabilities {
+                        rename_provider: Some(lsp::OneOf::Left(true)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        });
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("the test window holds a workspace");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        let (buffer, lsp_handle) = project
+            .update(&mut cx, |project, cx| {
+                project.open_local_buffer_with_lsp(util::path!("/project/one.rs"), cx)
+            })
+            .await
+            .expect("the file opens");
+
+        let editor = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let pane = workspace.active_pane().clone();
+            let editor = workspace
+                .open_project_item::<Editor>(pane, buffer, true, true, true, true, window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        // Column four lands inside `helper` on the first line.
+                        selections.select_ranges([
+                            language::Point::new(0, 4)..language::Point::new(0, 4),
+                        ]);
+                    },
+                );
+            });
+            editor
+        });
+        cx.run_until_parked();
+
+        (workspace, editor, lsp_handle, cx)
+    }
+
+    fn preview_in(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Entity<RenamePreview>> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<RenamePreview>())
+        })
+    }
+
+    /// The one rename gesture, with no language server running: nothing offers
+    /// a rename range, and the preview answers instead of nothing happening.
+    #[gpui::test]
+    async fn the_rename_action_with_no_server_opens_the_preview_on_the_name_under_the_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, editor, _lsp_handle, mut cx) = one_file_open_at_helper(false, cx).await;
+
+        cx.dispatch_action(editor::actions::Rename);
+        cx.run_until_parked();
+
+        let preview = preview_in(&workspace, &mut cx)
+            .expect("the rename action opened the preview as the active item");
+        preview.read_with(&cx, |preview, _| {
+            assert_eq!(preview.subject.name, "helper");
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert!(
+                editor.pending_rename().is_none(),
+                "no server answered, so there is no inline rename"
+            );
+        });
+    }
+
+    /// And with a server that renames, the gesture still reaches the server's
+    /// inline rename and the preview stays out of the way.
+    #[gpui::test]
+    async fn the_rename_action_with_a_server_still_gets_the_inline_rename(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, editor, _lsp_handle, mut cx) = one_file_open_at_helper(true, cx).await;
+
+        cx.dispatch_action(editor::actions::Rename);
+        cx.run_until_parked();
+
+        editor.read_with(&cx, |editor, _| {
+            let pending = editor
+                .pending_rename()
+                .expect("the server answered, so the inline rename is open");
+            assert_eq!(pending.old_name.as_ref(), "helper");
+        });
+        assert!(
+            preview_in(&workspace, &mut cx).is_none(),
+            "the preview does not open when the server answers"
         );
     }
 }

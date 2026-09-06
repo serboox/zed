@@ -349,6 +349,23 @@ impl Navigated {
     }
 }
 
+struct WhenNothingOffersARename(Rc<dyn Fn(&Entity<Editor>, &mut Window, &mut App)>);
+
+impl Global for WhenNothingOffersARename {}
+
+/// Registers what `editor::Rename` reaches for when it has nowhere to go,
+/// because no language server offered a rename range for the position under
+/// the cursor. Without this the action does nothing at all.
+///
+/// Handed in rather than called directly: the in-process answer lives in a
+/// crate that depends on this one.
+pub fn when_nothing_offers_a_rename(
+    fallback: impl Fn(&Entity<Editor>, &mut Window, &mut App) + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(WhenNothingOffersARename(Rc::new(fallback)));
+}
+
 pub fn init(cx: &mut App) {
     cx.set_global(GlobalBlameRenderer(Arc::new(())));
     cx.set_global(breadcrumbs::RenderBreadcrumbText(render_breadcrumb_text));
@@ -7982,6 +7999,16 @@ impl Editor {
                         editor: rename_editor,
                         block_id,
                     });
+                })?;
+            } else if let Some(editor) = this.upgrade() {
+                cx.update(|window, cx| {
+                    let Some(fallback) = cx
+                        .try_global::<WhenNothingOffersARename>()
+                        .map(|global| global.0.clone())
+                    else {
+                        return;
+                    };
+                    fallback(&editor, window, cx);
                 })?;
             }
 
