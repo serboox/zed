@@ -72,6 +72,8 @@ extend-exclude = [
     "crates/edit_prediction_cli/evals/",
     # Tests contain `baˇr` that cause `"ba" should be "by" or "be".`-like false-positives
     "crates/editor/src/document_symbols.rs",
+    # The misspelling check's own tests are written out of deliberate misspellings.
+    "crates/typo_diagnostics/",
 ]
 
 [default]

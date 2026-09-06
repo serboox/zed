@@ -182,6 +182,9 @@ pub struct SettingsContent {
     /// Configuration of the run configurations.
     pub run_configurations: Option<RunConfigurationsSettingsContent>,
 
+    /// Configuration of the misspelling check over names and comments.
+    pub typo_diagnostics: Option<TypoDiagnosticsSettingsContent>,
+
     /// Whether a file that has a rendered view -- a page, a document, a drawing
     /// -- opens showing that view rather than its source. The source is one
     /// keystroke away either way.
@@ -509,6 +512,18 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// Configuration of the misspelling check over names and comments.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct TypoDiagnosticsSettingsContent {
+    /// Whether a misspelling in a name or a comment is reported, as advice
+    /// rather than as a fault. Off means nothing is read and nothing is
+    /// shown.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Configuration of the run configurations.
