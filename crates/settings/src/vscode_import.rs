@@ -179,6 +179,7 @@ impl VsCodeSettings {
             auto_update: None,
             open_in_preview: None,
             run_configurations: None,
+            prose_diagnostics: None,
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,
             collaboration_panel: None,

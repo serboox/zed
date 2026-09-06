@@ -182,6 +182,9 @@ pub struct SettingsContent {
     /// Configuration of the run configurations.
     pub run_configurations: Option<RunConfigurationsSettingsContent>,
 
+    /// Configuration of the prose and grammar advice.
+    pub prose_diagnostics: Option<ProseDiagnosticsSettingsContent>,
+
     /// Whether a file that has a rendered view -- a page, a document, a drawing
     /// -- opens showing that view rather than its source. The source is one
     /// keystroke away either way.
@@ -509,6 +512,22 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// Configuration of the prose and grammar advice.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ProseDiagnosticsSettingsContent {
+    /// Whether documents and comments are read for grammar and spelling.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+
+    /// Whether the comments of source files are read as well as Markdown
+    /// documents. Only whole-line comments are read, and only English ones.
+    ///
+    /// Default: true
+    pub check_comments: Option<bool>,
 }
 
 /// Configuration of the run configurations.
