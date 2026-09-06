@@ -1,0 +1,9 @@
+{ "diagnostics": [{"message": "Identifier 'readFile' is imported but never used.","code": "eslint(no-unused-vars)","severity": "warning","url": "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html","help": "Consider removing this import.","filename": "lint_me.ts","labels": [{"label": "'readFile' is imported here","span": {"offset": 9,"length": 8,"line": 1,"column": 10}}]},
+{"message": "Variable 'café' is declared but never used. Unused variables should start with a '_'.","code": "eslint(no-unused-vars)","severity": "warning","url": "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html","help": "Consider removing this declaration.","filename": "lint_me.ts","labels": [{"label": "'café' is declared here","span": {"offset": 108,"length": 5,"line": 4,"column": 11}}]},
+{"message": "`debugger` statement is not allowed","code": "eslint(no-debugger)","severity": "warning","url": "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-debugger.html","help": "Remove the debugger statement","filename": "lint_me.ts","labels": [{"span": {"offset": 128,"length": 9,"line": 4,"column": 31}}]}],
+              "number_of_files": 1,
+              "number_of_rules": 96,
+              "threads_count": 8,
+              "start_time": 0.016489818
+            }
+            
