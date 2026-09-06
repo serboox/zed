@@ -18,6 +18,7 @@ editor.workspace = true
 gpui.workspace = true
 language.workspace = true
 project.workspace = true
+symbol_index.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
@@ -34,6 +35,7 @@ release_channel.workspace = true
 semver.workspace = true
 serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 theme = { workspace = true, features = ["test-support"] }
 theme_settings.workspace = true
 util.workspace = true

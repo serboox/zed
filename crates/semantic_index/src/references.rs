@@ -901,12 +901,17 @@ fn names_bound_by(pattern: tree_sitter::Node, contents: &[u8], into: &mut Vec<St
 /// in, and passing the editor's name straight through returns `None` for
 /// every file there is.
 pub fn references_in_file(file_name: &str, contents: &[u8]) -> Result<Option<Vec<FoundInText>>> {
-    static CLAIMED: OnceLock<HashMap<String, String>> = OnceLock::new();
-    let claimed = CLAIMED.get_or_init(languages::by_suffix);
-    let Some(language) = languages::of_file(file_name, claimed) else {
+    let Some(language) = language_claiming(file_name) else {
         return Ok(None);
     };
     references_in_text(language, contents)
+}
+
+/// Which language claims a file name, over the map of every suffix the editor
+/// ships, built once.
+fn language_claiming(file_name: &str) -> Option<&'static str> {
+    static CLAIMED: OnceLock<HashMap<String, String>> = OnceLock::new();
+    languages::of_file(file_name, CLAIMED.get_or_init(languages::by_suffix))
 }
 
 /// Every reference the language's own query recognises in one file's text,
@@ -1017,6 +1022,177 @@ fn references_in_tree(
     found.sort_unstable();
     found.dedup();
     (found, declares)
+}
+
+/// One declaration the language's own outline query found.
+///
+/// [`crate::definitions::Definition`] holds only the line a declaration starts
+/// on, and nothing that says where it ends -- so "the last declaration at or
+/// before this line" hands everything written after a function, a trailing
+/// constant or a file-level macro call, to that function. This is what the
+/// grammar itself says instead, and the walk that finds it climbs the tree
+/// rather than comparing lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// An `impl` block has two names and carries both, in the order the query
+    /// captured them, the same way a [`crate::definitions::Definition`] does.
+    pub name: String,
+    /// The grammar's own name for the node, `function_item` or
+    /// `method_definition` and so on.
+    pub kind: String,
+    /// Zero-based row the declaration starts on -- the same row a
+    /// [`crate::definitions::Definition`] records one-based.
+    pub row: u32,
+    /// Zero-based row its own name is written on, which is where a reader is
+    /// pointed. Not always `row`: a language may write a name below the
+    /// keyword that opens the declaration.
+    pub name_row: u32,
+}
+
+/// One occurrence a file's references query recognised, and what encloses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attributed {
+    pub at: FoundInText,
+    /// `None` where nothing in the file's grammar encloses the occurrence -- a
+    /// name written at file scope. Reported as that rather than attributed to
+    /// the declaration above it, which would be a confident wrong answer.
+    pub inside: Option<Declaration>,
+    /// Whether an opening bracket follows the name, which is what separates a
+    /// call from a mention in the languages the index reads. A language that
+    /// calls without brackets says nothing here, so a caller that filters on
+    /// this trades recall for never naming a mention a call.
+    pub called: bool,
+}
+
+/// Every occurrence in one file, each with the declaration it is written
+/// inside, in a single parse.
+///
+/// `Ok(None)` where no language claims the file name, which is a different
+/// thing from a file with no occurrences in it.
+pub fn references_and_what_encloses_them(
+    file_name: &str,
+    contents: &[u8],
+) -> Result<Option<Vec<Attributed>>> {
+    let Some(language) = language_claiming(file_name) else {
+        return Ok(None);
+    };
+    let prepared = ready_for(language, Queries::Written)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&prepared.readable.grammar)
+        .with_context(|| format!("loading the {language} grammar"))?;
+    let tree = parser
+        .parse(contents, None)
+        .with_context(|| format!("parsing this {language} text"))?;
+
+    let (found, _declared) = references_in_tree(language, contents, &prepared, &tree);
+    let declarations = declarations_by_node(language, contents, &prepared.readable.outline, &tree);
+    let root = tree.root_node();
+    Ok(Some(
+        found
+            .into_iter()
+            .map(|at| {
+                let from = tree_sitter::Point::new(at.row as usize, at.column as usize);
+                let to =
+                    tree_sitter::Point::new(at.row as usize, at.column as usize + at.name.len());
+                let node = root.descendant_for_point_range(from, to);
+                Attributed {
+                    called: node.is_some_and(|node| a_bracket_follows(contents, node.end_byte())),
+                    inside: node.and_then(|node| enclosing_declaration(node, &declarations)),
+                    at,
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// Every declaration in the tree, by the id of the node the outline query
+/// captured as the item -- so a walk up from an occurrence can ask each
+/// ancestor whether it is one.
+fn declarations_by_node(
+    language: &str,
+    contents: &[u8],
+    outline: &tree_sitter::Query,
+    tree: &tree_sitter::Tree,
+) -> HashMap<usize, Declaration> {
+    let (Some(name_index), Some(item_index)) = (
+        capture_index(outline, "name"),
+        capture_index(outline, "item"),
+    ) else {
+        return HashMap::new();
+    };
+    let mut declarations = HashMap::new();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(outline, tree.root_node(), contents);
+    while let Some(matched) = matches.next() {
+        let Some(item) = matched
+            .captures
+            .iter()
+            .find(|capture| capture.index == item_index)
+            .map(|capture| capture.node)
+        else {
+            continue;
+        };
+        // The same filter the index itself applies: some languages' outline
+        // queries yield what the editor wants to draw -- an object literal's
+        // entries, a `let` nested in a function -- and attributing a call to
+        // the local variable it happens to sit under is not an answer.
+        if !per_language::is_declaration(language, item) {
+            continue;
+        }
+        let names: Vec<&str> = matched
+            .captures
+            .iter()
+            .filter(|capture| capture.index == name_index)
+            .filter_map(|capture| capture.node.utf8_text(contents).ok())
+            .collect();
+        let Some(first) = matched
+            .captures
+            .iter()
+            .find(|capture| capture.index == name_index)
+        else {
+            continue;
+        };
+        if names.is_empty() {
+            continue;
+        }
+        declarations.insert(
+            item.id(),
+            Declaration {
+                name: names.join(" "),
+                kind: item.kind().to_string(),
+                row: item.start_position().row as u32,
+                name_row: first.node.start_position().row as u32,
+            },
+        );
+    }
+    declarations
+}
+
+/// The nearest declaration at or above `node` in the tree. Climbing rather
+/// than comparing lines is the whole point: a declaration ends where the
+/// grammar says it ends, and an occurrence outside every declaration has no
+/// enclosing one at all.
+fn enclosing_declaration(
+    node: tree_sitter::Node,
+    declarations: &HashMap<usize, Declaration>,
+) -> Option<Declaration> {
+    let mut climbing = Some(node);
+    while let Some(current) = climbing {
+        if let Some(declaration) = declarations.get(&current.id()) {
+            return Some(declaration.clone());
+        }
+        climbing = current.parent();
+    }
+    None
+}
+
+/// Whether the next thing written after `from` is an opening bracket.
+fn a_bracket_follows(contents: &[u8], from: usize) -> bool {
+    contents
+        .get(from..)
+        .and_then(|rest| rest.iter().find(|byte| !byte.is_ascii_whitespace()))
+        == Some(&b'(')
 }
 
 /// Every symbol the outline query defines under `root`. A pass distinct from
@@ -4889,5 +5065,128 @@ mod tests {
         let scan = scan_references(project.path(), "rust", &rust, &query(), defined);
         assert!(scan.index.references_to("Half").is_empty());
         assert!(scan.index.references_to("work").is_empty());
+    }
+
+    fn attributed_in(file_name: &str, source: &str) -> Vec<Attributed> {
+        references_and_what_encloses_them(file_name, source.as_bytes())
+            .expect("the file parses")
+            .expect("a language claims this file name")
+    }
+
+    /// What the declaration is called where a name is written, by name and by
+    /// row, so a test can say what it expected in the words a reader would.
+    fn enclosing_of(attributed: &[Attributed], name: &str) -> Vec<(String, String)> {
+        attributed
+            .iter()
+            .filter(|one| one.at.name == name)
+            .map(|one| match &one.inside {
+                Some(declaration) => (declaration.name.clone(), declaration.kind.clone()),
+                None => ("<file scope>".to_string(), String::new()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_occurrence_is_attributed_to_the_declaration_the_grammar_encloses_it_with() {
+        let attributed = attributed_in("src/one.rs", "pub fn caller() {\n    take_stock();\n}\n");
+        assert_eq!(
+            enclosing_of(&attributed, "take_stock"),
+            vec![("caller".to_string(), "function_item".to_string())]
+        );
+    }
+
+    /// The nearest declaration, not the outermost: a call inside a method
+    /// belongs to the method, and saying it belongs to the `impl` block would
+    /// lose the only part a reader wanted.
+    #[test]
+    fn a_call_inside_a_method_belongs_to_the_method_and_not_to_the_impl_block() {
+        let attributed = attributed_in(
+            "src/one.rs",
+            "pub struct Shop;\n\
+             impl Shop {\n\
+             \x20   pub fn open(&self) {\n\
+             \x20       take_stock();\n\
+             \x20   }\n\
+             }\n",
+        );
+        assert_eq!(
+            enclosing_of(&attributed, "take_stock"),
+            vec![("open".to_string(), "function_item".to_string())]
+        );
+    }
+
+    /// The case a starting line alone cannot get right. "The last declaration
+    /// at or before this line" hands both of the names written after the
+    /// function to the function, because a `Definition` says where a
+    /// declaration starts and never where it ends.
+    #[test]
+    fn a_name_written_after_the_last_function_is_not_attributed_to_it() {
+        let attributed = attributed_in(
+            "src/one.rs",
+            "pub fn caller() {\n\
+             \x20   take_stock();\n\
+             }\n\
+             \n\
+             seed!(take_stock);\n\
+             use crate::shop::take_stock as counted_again;\n",
+        );
+        let enclosing = enclosing_of(&attributed, "take_stock");
+        assert_eq!(
+            enclosing
+                .iter()
+                .filter(|(name, _)| name == "caller")
+                .count(),
+            1,
+            "only the call written inside the function belongs to it: {enclosing:?}"
+        );
+        assert!(
+            enclosing.iter().any(|(name, _)| name == "<file scope>"),
+            "a name written outside every declaration belongs to none: {enclosing:?}"
+        );
+    }
+
+    /// A declaration that follows a function encloses what is written in it,
+    /// and the function above does not.
+    #[test]
+    fn a_trailing_declaration_encloses_its_own_initialiser() {
+        let attributed = attributed_in(
+            "src/one.rs",
+            "pub fn caller() {\n    take_stock();\n}\n\npub const LIMIT: u32 = take_stock;\n",
+        );
+        let enclosing = enclosing_of(&attributed, "take_stock");
+        assert_eq!(enclosing.len(), 2, "{enclosing:?}");
+        assert_eq!(enclosing[0].0, "caller");
+        assert_eq!(
+            enclosing[1],
+            ("LIMIT".to_string(), "const_item".to_string()),
+            "the constant declares itself; the function above it does not enclose it"
+        );
+    }
+
+    #[test]
+    fn a_name_written_with_a_bracket_after_it_is_a_call_and_one_without_is_not() {
+        let attributed = attributed_in(
+            "src/one.rs",
+            "pub fn caller() {\n    take_stock();\n    hand_over(take_stock);\n}\n",
+        );
+        let calls: Vec<(&str, bool)> = attributed
+            .iter()
+            .map(|one| (one.at.name.as_str(), one.called))
+            .collect();
+        assert!(calls.contains(&("take_stock", true)), "the call: {calls:?}");
+        assert!(
+            calls.contains(&("take_stock", false)),
+            "the same name handed over as a value: {calls:?}"
+        );
+        assert!(calls.contains(&("hand_over", true)), "{calls:?}");
+    }
+
+    #[test]
+    fn a_file_no_language_claims_is_no_answer_rather_than_an_empty_one() {
+        assert!(
+            references_and_what_encloses_them("notes.unclaimed", b"take_stock();\n")
+                .expect("no language is not a failure")
+                .is_none()
+        );
     }
 }
