@@ -1,0 +1,6 @@
+[sqlfluff]
+dialect = mysql
+rules = CP01
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper
