@@ -258,6 +258,7 @@ members = [
     "crates/which_key",
     "crates/windows_resources",
     "crates/workspace",
+    "crates/toml_diagnostics",
     "crates/worktree",
     "crates/yaml_diagnostics",
     "crates/worktree_benchmarks",
@@ -542,6 +543,7 @@ watch = { path = "crates/watch" }
 web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
+toml_diagnostics = { path = "crates/toml_diagnostics" }
 worktree = { path = "crates/worktree" }
 yaml_diagnostics = { path = "crates/yaml_diagnostics" }
 x_ai = { path = "crates/x_ai" }
@@ -918,6 +920,7 @@ tokio-socks = { version = "0.5.2", default-features = false, features = [
     "futures-io",
     "tokio",
 ] }
+taplo = "0.14.0"
 toml = "0.8"
 toml_edit = { version = "0.22", default-features = false, features = [
     "display",

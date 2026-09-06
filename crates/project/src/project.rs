@@ -848,6 +848,56 @@ pub fn register_in_process_code_actions(source: Arc<dyn InProcessCodeActions>, c
         .push(source);
 }
 
+/// Everything an in-process formatter is told about the buffer it is asked
+/// to format.
+pub struct InProcessFormattingRequest {
+    pub text: String,
+    pub tab_size: u32,
+    pub hard_tabs: bool,
+}
+
+/// A formatter that runs inside this process, with no language server and no
+/// external command behind it.
+///
+/// Like hover and unlike completions, it is asked only into the servers'
+/// silence: a buffer whose language server formats it keeps that answer
+/// whole.
+pub trait InProcessFormatting: Send + Sync {
+    /// Whether this source formats that buffer at all.
+    fn formats(&self, buffer: &Buffer) -> bool;
+
+    /// The whole text formatted, or nothing where there is nothing to
+    /// change or the text cannot be read. Nothing means the buffer is left
+    /// exactly as it is.
+    fn format(&self, request: InProcessFormattingRequest) -> Option<String>;
+}
+
+#[derive(Default)]
+struct InProcessFormattingSources(Vec<Arc<dyn InProcessFormatting>>);
+
+impl Global for InProcessFormattingSources {}
+
+/// Registers a formatter contributed by a crate that `project` does not
+/// depend on (e.g. TOML formatted in `toml_diagnostics`).
+pub fn register_in_process_formatting(source: Arc<dyn InProcessFormatting>, cx: &mut App) {
+    cx.default_global::<InProcessFormattingSources>()
+        .0
+        .push(source);
+}
+
+/// The in-process formatter for a buffer, where one claims it. The first
+/// that does wins, as with every other list of these sources.
+pub fn in_process_formatting_for(
+    buffer: &Buffer,
+    cx: &App,
+) -> Option<Arc<dyn InProcessFormatting>> {
+    cx.try_global::<InProcessFormattingSources>()?
+        .0
+        .iter()
+        .find(|source| source.formats(buffer))
+        .cloned()
+}
+
 /// Response from language server completion request.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreCompletionResponse {

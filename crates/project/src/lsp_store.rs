@@ -1639,6 +1639,9 @@ impl LocalLspStore {
                     (adapters_and_servers, settings, request_timeout)
                 })
             })?;
+        let in_process_formatter = buffer.handle.read_with(cx, |buffer, cx| {
+            crate::in_process_formatting_for(buffer, cx)
+        });
         let had_existing_line_endings = buffer
             .handle
             .read_with(cx, |buffer, _| buffer.max_point().row > 0);
@@ -1762,7 +1765,13 @@ impl LocalLspStore {
         for formatter in formatters {
             let is_auto = formatter == &Formatter::Auto;
             let formatter = if is_auto {
-                if settings.prettier.allowed {
+                if in_process_formatter.is_some() {
+                    // Prettier has no parser for a language whose formatter
+                    // runs in this process, so `auto` would otherwise reach
+                    // prettier, find nothing, and leave the file unformatted.
+                    zlog::trace!(logger => "Formatter set to auto: defaulting to the in-process formatter");
+                    &Formatter::LanguageServer(settings::LanguageServerFormatterSpecifier::Current)
+                } else if settings.prettier.allowed {
                     zlog::trace!(logger => "Formatter set to auto: defaulting to prettier");
                     &Formatter::Prettier
                 } else {
@@ -1778,6 +1787,7 @@ impl LocalLspStore {
                 buffer,
                 formatting_transaction_id,
                 &adapters_and_servers,
+                in_process_formatter.as_ref(),
                 &settings,
                 request_timeout,
                 trigger,
@@ -1805,6 +1815,7 @@ impl LocalLspStore {
         buffer: &FormattableBuffer,
         formatting_transaction_id: clock::Lamport,
         adapters_and_servers: &[(Arc<CachedLspAdapter>, Arc<LanguageServer>)],
+        in_process_formatter: Option<&Arc<dyn crate::InProcessFormatting>>,
         settings: &LanguageSettings,
         request_timeout: Duration,
         trigger: FormatTrigger,
@@ -1929,6 +1940,17 @@ impl LocalLspStore {
                 let _timer = zlog::time!(logger => "Formatting buffer using language server");
 
                 let Some(buffer_path_abs) = buffer.abs_path.as_ref() else {
+                    if let Some(source) = in_process_formatter {
+                        return Self::format_in_process(
+                            source,
+                            buffer,
+                            formatting_transaction_id,
+                            settings,
+                            logger,
+                            cx,
+                        )
+                        .await;
+                    }
                     zlog::warn!(logger => "Cannot format buffer that is not backed by a file on disk using language servers. Skipping");
                     return Ok(());
                 };
@@ -1950,6 +1972,17 @@ impl LocalLspStore {
                 };
 
                 let Some(language_server) = language_server else {
+                    if let Some(source) = in_process_formatter {
+                        return Self::format_in_process(
+                            source,
+                            buffer,
+                            formatting_transaction_id,
+                            settings,
+                            logger,
+                            cx,
+                        )
+                        .await;
+                    }
                     zlog::debug!(
                         logger =>
                         "No language server found to format buffer {buffer_path_abs:?}. Skipping",
@@ -2554,6 +2587,46 @@ impl LocalLspStore {
         } else {
             Ok(Vec::with_capacity(0))
         }
+    }
+
+    /// Formats a buffer with a source that runs in this process, where no
+    /// language server would have formatted it.
+    ///
+    /// A selection is not offered to it: it rewrites the whole document, and
+    /// applying that to a file the reader selected three lines of would
+    /// reformat everything they did not select.
+    async fn format_in_process(
+        source: &Arc<dyn crate::InProcessFormatting>,
+        buffer: &FormattableBuffer,
+        formatting_transaction_id: clock::Lamport,
+        settings: &LanguageSettings,
+        logger: zlog::Logger,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        if buffer.ranges.is_some() {
+            zlog::debug!(logger => "In-process formatter does not format ranges; skipping");
+            return Ok(());
+        }
+        let request = crate::InProcessFormattingRequest {
+            text: buffer.handle.read_with(cx, |buffer, _| buffer.text()),
+            tab_size: settings.tab_size.get(),
+            hard_tabs: settings.hard_tabs,
+        };
+        let source = source.clone();
+        let formatted = cx
+            .background_spawn(async move { source.format(request) })
+            .await;
+        let Some(formatted) = formatted else {
+            zlog::trace!(logger => "No changes");
+            return Ok(());
+        };
+        let diff = buffer
+            .handle
+            .update(cx, |buffer, cx| buffer.diff(formatted, cx))
+            .await;
+        extend_formatting_transaction(buffer, formatting_transaction_id, cx, |buffer, cx| {
+            buffer.apply_diff(diff, cx);
+        })
     }
 
     async fn format_via_external_command(

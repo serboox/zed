@@ -40,6 +40,12 @@ pub struct Reads {
     pub server_id: language::LanguageServerId,
     /// Everything the schema has to say about a text of this language.
     pub diagnostics: fn(&str, &Validator) -> Vec<lsp::Diagnostic>,
+    /// Everything wrong with a text of this language that needs no schema to
+    /// see -- a fault the grammar itself finds. A language whose whole
+    /// report comes from a schema leaves this empty, and its files are then
+    /// looked at only where a schema covers them, which is what JSON and
+    /// YAML do.
+    pub faults: Option<fn(&str) -> Vec<lsp::Diagnostic>>,
     /// The rules saying which schema covers which files.
     pub associations: for<'registry, 'at, 'app> fn(
         &'registry Arc<LanguageRegistry>,
@@ -225,8 +231,9 @@ fn check_soon(
 struct About {
     path: PathBuf,
     text: String,
-    /// The schema covering this file, already resolved to a URI.
-    covered_by: String,
+    /// The schema covering this file, already resolved to a URI, or nothing
+    /// where none covers it -- which is most files, and every TOML one.
+    covered_by: Option<String>,
 }
 
 fn about(
@@ -249,15 +256,7 @@ fn about(
             read.text(),
         )
     };
-    let lsp_store = project.read(cx).lsp_store();
-    let served_by_a_language_server = buffer.update(cx, |buffer, cx| {
-        lsp_store.update(cx, |lsp_store, cx| {
-            !lsp_store
-                .language_servers_for_local_buffer(buffer, cx)
-                .is_empty()
-        })
-    });
-    if served_by_a_language_server {
+    if served_by_a_language_server(project, buffer, cx) {
         return None;
     }
     let covered_by = covering(
@@ -270,11 +269,35 @@ fn about(
         project,
         watching,
         cx,
-    )?;
+    );
+    if covered_by.is_none() && reads.faults.is_none() {
+        return None;
+    }
     Some(About {
         path,
         text,
         covered_by,
+    })
+}
+
+/// Whether a language server already answers for this buffer.
+///
+/// This is the whole of the condition that keeps an in-process source quiet:
+/// a project with the language's server running already has these
+/// diagnostics, and saying them again would show the reader every problem
+/// twice.
+pub fn served_by_a_language_server(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    cx: &mut App,
+) -> bool {
+    let lsp_store = project.read(cx).lsp_store();
+    buffer.update(cx, |buffer, cx| {
+        lsp_store.update(cx, |lsp_store, cx| {
+            !lsp_store
+                .language_servers_for_local_buffer(buffer, cx)
+                .is_empty()
+        })
     })
 }
 
@@ -317,9 +340,10 @@ async fn check(
     watching: &Rc<RefCell<Watching>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    // A buffer a language server already covers, and a file no schema covers,
-    // both end here: nothing is published, so nothing any other source put on
-    // that file is disturbed either.
+    // A buffer a language server already covers ends here, and so does a
+    // file that neither a schema nor a fault of its own has anything to say
+    // about: nothing is published, so nothing any other source put on that
+    // file is disturbed either.
     let about = cx.update(|cx| {
         let project = project.upgrade()?;
         let buffer = buffer.upgrade()?;
@@ -328,15 +352,29 @@ async fn check(
     let Some(about) = about else {
         return Ok(());
     };
-    let Some(validator) = validator(reads, &about.covered_by, project, watching, cx).await else {
-        return Ok(());
-    };
 
-    let text = about.text;
-    let say = reads.diagnostics;
-    let diagnostics = cx
-        .background_spawn(async move { say(&text, &validator) })
-        .await;
+    let mut diagnostics = Vec::new();
+    if let Some(faults) = reads.faults {
+        let text = about.text.clone();
+        diagnostics.extend(cx.background_spawn(async move { faults(&text) }).await);
+    }
+    if let Some(uri) = about.covered_by {
+        match validator(reads, &uri, project, watching, cx).await {
+            Some(validator) => {
+                let text = about.text;
+                let say = reads.diagnostics;
+                diagnostics.extend(
+                    cx.background_spawn(async move { say(&text, &validator) })
+                        .await,
+                );
+            }
+            // A schema that would not resolve or would not build means
+            // silence for a language that has nothing else to say, so that
+            // what was shown last is left where it is rather than cleared.
+            None if reads.faults.is_none() => return Ok(()),
+            None => {}
+        }
+    }
     show(reads, project, about.path, diagnostics, cx)
 }
 

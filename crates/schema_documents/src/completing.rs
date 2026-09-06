@@ -42,6 +42,7 @@ pub struct CursorContext {
 pub enum Style {
     Json,
     Yaml,
+    Toml,
 }
 
 impl Style {
@@ -50,6 +51,16 @@ impl Style {
         match self {
             Style::Json => literal(&Value::String(name.to_string())),
             Style::Yaml => self.value(&Value::String(name.to_string())),
+            Style::Toml if is_a_bare_toml_key(name) => name.to_string(),
+            Style::Toml => literal(&Value::String(name.to_string())),
+        }
+    }
+
+    /// What stands between a key and its value in this language.
+    fn separator(self) -> &'static str {
+        match self {
+            Style::Json | Style::Yaml => ": ",
+            Style::Toml => " = ",
         }
     }
 
@@ -64,8 +75,23 @@ impl Style {
                 // and is what anything unsafe to write plainly falls back to.
                 value => literal(value),
             },
+            // Every TOML scalar is written the JSON way: a quoted string, a
+            // bare number, `true` or `false`. What differs is only the
+            // brackets around collections, and a schema offers a collection
+            // as a value only where it names one as an `enum` member.
+            Style::Toml => literal(value),
         }
     }
+}
+
+/// Whether a key can be written in TOML with no quotes. Anything else --
+/// a dot, a space, a bracket -- would be read as structure rather than as
+/// part of the name.
+fn is_a_bare_toml_key(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
 }
 
 /// Whether a string can be written in YAML with no quotes and read back as
@@ -137,12 +163,14 @@ pub fn suggestions_for(
         }
     }
 
-    let needs_colon = needs_colon(text, &context.token);
+    let separator_needed = needs_a_separator(text, &context.token, style);
     let items = match &context.place {
-        Place::Key { existing } => key_suggestions(schema, &schemas, existing, needs_colon, style),
+        Place::Key { existing } => {
+            key_suggestions(schema, &schemas, existing, separator_needed, style)
+        }
         Place::Value => value_suggestions(&schemas, style),
         Place::KeyOrValue => {
-            let keys = key_suggestions(schema, &schemas, &[], needs_colon, style);
+            let keys = key_suggestions(schema, &schemas, &[], separator_needed, style);
             if keys.is_empty() {
                 value_suggestions(&schemas, style)
             } else {
@@ -240,7 +268,7 @@ fn key_suggestions(
     root: &Value,
     schemas: &[&Value],
     existing: &[String],
-    needs_colon: bool,
+    separator_needed: bool,
     style: Style,
 ) -> Vec<Suggestion> {
     let mut offered = HashSet::default();
@@ -265,8 +293,8 @@ fn key_suggestions(
                 &mut expanded,
             );
             let label = style.key(name);
-            let new_text = if needs_colon {
-                format!("{label}: ")
+            let new_text = if separator_needed {
+                format!("{label}{}", style.separator())
             } else {
                 label.clone()
             };
@@ -381,10 +409,15 @@ fn description(schemas: &[&Value]) -> Option<String> {
     })
 }
 
-fn needs_colon(text: &str, token: &Range<usize>) -> bool {
-    !text[token.end..]
-        .trim_start_matches([' ', '\t'])
-        .starts_with(':')
+fn needs_a_separator(text: &str, token: &Range<usize>, style: Style) -> bool {
+    let after = text
+        .get(token.end..)
+        .unwrap_or("")
+        .trim_start_matches([' ', '\t']);
+    match style {
+        Style::Json | Style::Yaml => !after.starts_with(':'),
+        Style::Toml => !after.starts_with('='),
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +472,36 @@ mod tests {
             "a plain word stays plain -- YAML 1.2 has no `on` boolean"
         );
         assert_eq!(Style::Yaml.key("true"), "\"true\"");
+    }
+
+    /// A TOML key is written bare where TOML would read it back as the same
+    /// name, and quoted otherwise -- a dot or a space in a bare key would be
+    /// read as structure. The value goes after `=` rather than after `:`.
+    #[test]
+    fn a_toml_key_is_bare_only_where_toml_reads_it_back_as_itself() {
+        assert_eq!(Style::Toml.key("tab-size"), "tab-size");
+        assert_eq!(Style::Toml.key("rust-version"), "rust-version");
+        assert_eq!(Style::Toml.key("a.b"), "\"a.b\"");
+        assert_eq!(Style::Toml.key("a b"), "\"a b\"");
+        assert_eq!(Style::Toml.key(""), "\"\"");
+        assert_eq!(Style::Toml.separator(), " = ");
+        assert_eq!(
+            Style::Toml.value(&Value::String("2024".to_string())),
+            "\"2024\""
+        );
+        assert_eq!(Style::Toml.value(&Value::Bool(true)), "true");
+    }
+
+    /// A key that already has its separator is completed without a second
+    /// one, and TOML's separator is not a colon.
+    #[test]
+    fn a_key_that_already_has_its_separator_does_not_get_another() {
+        assert!(needs_a_separator("name", &(0..4), Style::Toml));
+        assert!(!needs_a_separator("name = 1", &(0..4), Style::Toml));
+        assert!(
+            needs_a_separator("name: 1", &(0..4), Style::Toml),
+            "a colon is not TOML's"
+        );
+        assert!(!needs_a_separator("name: 1", &(0..4), Style::Yaml));
     }
 }

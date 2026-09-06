@@ -27,6 +27,7 @@ static YAML: Reads = Reads {
     languages: &["YAML"],
     server_id: YAML_SERVER_ID,
     diagnostics: diagnostics_for,
+    faults: None,
     associations: json_schema_store::all_schema_file_associations,
     fetch: json_schema_store::handle_schema_request,
 };
