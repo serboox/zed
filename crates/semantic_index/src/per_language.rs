@@ -341,6 +341,7 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "asm" => Some(include_str!("asm_references.scm")),
         "cobol" => Some(include_str!("cobol_references.scm")),
         "xml" => Some(include_str!("xml_references.scm")),
+        "proto" => Some(include_str!("proto_references.scm")),
         _ => None,
     }
 }
@@ -414,6 +415,7 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "cobol",
     "asm",
     "xml",
+    "proto",
 ];
 
 /// The language server to measure a language against, and the environment it
@@ -1282,6 +1284,106 @@ mod tests {
                 panic!("the {name} references query does not compile: {trouble}");
             }
         }
+    }
+
+    /// Every text the given query captures over `source`, in the order the
+    /// cursor yields them, so a test can say what a references query actually
+    /// finds rather than only how many patterns it holds.
+    fn referenced_in(source: &str, grammar: &tree_sitter::Language, written: &str) -> Vec<String> {
+        let query = tree_sitter::Query::new(grammar, written).expect("the query compiles");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(grammar).expect("the grammar loads");
+        let tree = parser.parse(source, None).expect("the fixture parses");
+
+        let mut found = Vec::new();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        while let Some(matched) = matches.next() {
+            for capture in matched.captures {
+                if let Ok(text) = capture.node.utf8_text(source.as_bytes()) {
+                    found.push(text.to_string());
+                }
+            }
+        }
+        found
+    }
+
+    const A_PROTO_FILE: &str = r#"syntax = "proto3";
+
+package shop.v1;
+
+option java_package = "com.shop";
+
+message Order {
+  string order_id = 1;
+  Currency currency = 2;
+}
+
+service Orders {
+  rpc PlaceOrder(Order) returns (Order);
+}
+"#;
+
+    fn proto_grammar() -> tree_sitter::Language {
+        let (readable, _) = languages::readable();
+        readable
+            .into_iter()
+            .find(|language| language.name == "proto")
+            .expect("Proto is one of the languages the editor ships")
+            .grammar
+    }
+
+    /// The written Proto query finds a message used as a field's type and as
+    /// an rpc's request, which is the whole point of having one: a rename of
+    /// `Order` has to reach all of them.
+    #[test]
+    fn the_proto_query_finds_a_message_where_it_is_used_and_not_the_values_around_it() {
+        let grammar = proto_grammar();
+        let written = references_query("proto").expect("Proto has a written query");
+        let found = referenced_in(A_PROTO_FILE, &grammar, written);
+
+        assert_eq!(
+            found.iter().filter(|text| *text == "Order").count(),
+            3,
+            "the message declares itself once and is used twice, in {found:?}"
+        );
+        assert!(
+            found.iter().any(|text| text == "order_id"),
+            "a field's own name is a reference, but {found:?}"
+        );
+        assert!(
+            found.iter().any(|text| text == "PlaceOrder"),
+            "an rpc's own name is a reference, but {found:?}"
+        );
+        assert!(
+            !found.iter().any(|text| text.contains('"')),
+            "a string literal is a value, not a name, but {found:?} holds one"
+        );
+    }
+
+    /// What the query built from Proto's own node kinds does. Asserted rather
+    /// than assumed, because it decides whether writing one by hand was
+    /// needed at all: for assembly, COBOL and XML that query compiles to no
+    /// patterns and finds nothing, and Proto is the opposite case -- it
+    /// spells every name `identifier`, so the fallback finds them, and it
+    /// also spells every *value* `constant`, so the fallback puts the file's
+    /// literals in the index beside its names.
+    #[test]
+    fn the_generic_proto_query_finds_the_names_and_the_literals_with_them() {
+        let grammar = proto_grammar();
+        let generic = generic_references_query(&grammar);
+        assert!(generic.contains("(identifier) @reference.value"), "{generic}");
+        assert!(generic.contains("(constant) @reference.value"), "{generic}");
+
+        let found = referenced_in(A_PROTO_FILE, &grammar, &generic);
+        assert!(
+            found.iter().any(|text| text == "Order"),
+            "the fallback does find the names, unlike XML's, in {found:?}"
+        );
+        assert!(
+            found.iter().any(|text| text == r#""com.shop""#),
+            "and it also finds the option's value, which is the cost of it, in {found:?}"
+        );
     }
 
     /// The index of a capture by name, the same small lookup

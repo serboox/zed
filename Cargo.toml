@@ -180,6 +180,7 @@ members = [
     "crates/project_symbols",
     "crates/prompt_store",
     "crates/proto",
+    "crates/proto_diagnostics",
     "crates/python_types",
     "crates/recent_projects",
     "crates/refineable",
@@ -464,6 +465,7 @@ project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
+proto_diagnostics = { path = "crates/proto_diagnostics" }
 python_types = { path = "crates/python_types" }
 recent_projects = { path = "crates/recent_projects" }
 rename_preview = { path = "crates/rename_preview" }
@@ -732,6 +734,7 @@ lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "f4dfa8
 mach2 = "0.5"
 markup5ever_rcdom = "0.3.0"
 metal = "0.33"
+miette = "7.2"
 minidumper = "0.9"
 moka = { version = "0.12.10", features = ["sync"] }
 nanoid = "0.4"
@@ -807,6 +810,7 @@ proxyvars = "0.2"
 prost = "0.9"
 prost-build = "0.9"
 prost-types = "0.9"
+protox = "0.9.1"
 pollster = "0.4.0"
 pulldown-cmark = { version = "0.13.0", default-features = false }
 quick-xml = "0.38"
@@ -947,6 +951,7 @@ tree-sitter-vb6 = "0.0.2"
 tree-sitter-jsdoc = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-md = { git = "https://github.com/zed-industries/tree-sitter-markdown", rev = "b596e737286780d7bfa9fcddceaeeb754574b352" } # fork of 9a23c1a with serialize() buffer-overflow fix; https://github.com/tree-sitter-grammars/tree-sitter-markdown/issues/243
+tree-sitter-proto = "0.6"
 tree-sitter-python = "0.25"
 tree-sitter-regex = "0.24"
 tree-sitter-ruby = "0.23"
