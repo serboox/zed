@@ -29,11 +29,59 @@ pub struct Request {
     pub file: PathBuf,
     pub text: String,
     pub arguments: Vec<String>,
+    pub asked: Asked,
+}
+
+/// What a request wants out of the parse.
+///
+/// Only what was asked for is read back, and both kinds are answered from the
+/// same held translation unit, which is what keeps the bound above a bound over
+/// the whole feature.
+///
+/// There is deliberately no third kind asking what could follow the cursor.
+/// `clang_codeCompleteAt` answers a null pointer, and prints `crash detected in
+/// code completion`, for a unit parsed without
+/// `CXTranslationUnit_PrecompiledPreamble` -- and that flag is the front end
+/// writing out every header the file reaches, expanded, so that completion can
+/// run again without re-reading them. That is a second copy of the translation
+/// unit, which is the one thing the bound exists to refuse.
+pub enum Asked {
+    /// What the front end thinks is wrong with the file.
+    WhatIsWrong,
+    /// What the entity at this byte offset into the text is.
+    WhatIsAt(usize),
+}
+
+/// What the front end knows about one place in the file.
+///
+/// The type is the point of it. A name index can quote the declaration a name
+/// was written with; only the front end can say that
+/// `Registry<Key, Value>::keys` returns a `std::vector<std::string>` in the one
+/// instantiation the reader is looking at, and templated C++ is where a name on
+/// its own says least.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Described {
+    /// The name, with the type it has here in front of it, as one line of C++.
+    pub declaration: String,
+    /// That type on its own: for a call, what it returns; for anything else,
+    /// what it is. Every template parameter is already substituted for what it
+    /// was instantiated with.
+    pub type_of: Option<String>,
+    /// The brief of the doc comment on the declaration, where it has one.
+    pub comment: Option<String>,
+    /// Byte offsets into the text that was parsed, spanning the name asked
+    /// about.
+    pub start: usize,
+    pub end: usize,
 }
 
 /// What one parse produced.
+///
+/// Which of the first two fields carries anything follows from what was
+/// [`Asked`]; the other stays empty.
 pub struct Parsed {
     pub findings: Vec<Finding>,
+    pub described: Option<Described>,
     /// What the front end itself says this translation unit costs, in bytes.
     /// Its own accounting, not the process's: the point of the bound above is
     /// that this number is multiplied by at most [`HELD_AT_MOST`].
@@ -136,9 +184,29 @@ fn serve(jobs: &Receiver<Job>) {
         if job.reply.is_canceled() {
             continue;
         }
-        let parsed = parse_one(index, &mut held, &job.request);
+        let parsed = without_taking_the_thread_down(index, &mut held, &job.request);
         answer(job.reply, parsed);
     }
+}
+
+/// One parse, with a panic in it turned into a failed request.
+///
+/// The bindings assert on a `libclang` entry point that answers a null pointer,
+/// and one such assert on this thread would end it -- and with it every C and
+/// C++ answer for the rest of the session, since this is the only thread the
+/// library is usable from. A wrong answer to one request is the smaller
+/// failure. The held units are handed across the boundary deliberately: a
+/// panicking parse never reached the line that adds one, so the list is either
+/// untouched or one unit shorter than it was.
+fn without_taking_the_thread_down(
+    index: &'static clang::Index<'static>,
+    held: &mut Vec<(Key, clang::TranslationUnit<'static>)>,
+    request: &Request,
+) -> Result<Parsed> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_one(index, held, request)
+    }))
+    .unwrap_or_else(|_| Err(anyhow!("libclang gave up on {}", request.file.display())))
 }
 
 /// The asker gives up by dropping its end of the channel, which is ordinary and
@@ -176,7 +244,14 @@ fn parse_one(
         None => fresh(index, request, &unsaved)?,
     };
 
-    let findings = findings_of(&unit, &request.file);
+    let mut findings = Vec::new();
+    let mut described = None;
+    match request.asked {
+        Asked::WhatIsWrong => findings = findings_of(&unit, &request.file),
+        Asked::WhatIsAt(offset) => {
+            described = description_at(&unit, &request.file, &request.text, offset);
+        }
+    }
     let memory = unit.get_memory_usage().values().sum();
 
     held.insert(0, (key, unit));
@@ -186,9 +261,147 @@ fn parse_one(
 
     Ok(Parsed {
         findings,
+        described,
         memory,
         held: held.len(),
     })
+}
+
+/// What the front end knows about the byte offset asked about.
+///
+/// The type is read off the occurrence under the cursor rather than off the
+/// declaration it refers to. Inside the template, `keys` returns
+/// `std::vector<Key>`; it is the use of it through a
+/// `Registry<std::string, ...>` that knows the answer is
+/// `std::vector<std::string>`, and that answer is the whole reason to ask a
+/// compiler rather than an index.
+fn description_at<'a>(
+    unit: &'a clang::TranslationUnit<'a>,
+    about: &Path,
+    text: &str,
+    offset: usize,
+) -> Option<Described> {
+    let file = unit.get_file(about)?;
+    let at = file.get_offset_location(u32::try_from(offset).ok()?);
+    let entity = at.get_entity()?;
+    // Everything the parse did not understand comes back as the unit itself,
+    // and the unit's name is the file's path.
+    if entity.get_kind() == clang::EntityKind::TranslationUnit {
+        return None;
+    }
+    let declared = entity.get_reference().unwrap_or(entity);
+    let name = declared
+        .get_display_name()
+        .or_else(|| declared.get_name())
+        .filter(|name| !name.is_empty())?;
+
+    // A member function named through an instance has a type the front end will
+    // only spell as `<bound member function type>`, and the same goes for a
+    // dependent or overloaded one. Where it says that, the declaration it
+    // refers to is where the real signature is -- already instantiated, because
+    // the lookup happened in the instantiated class and not in the template.
+    let here = printable(entity.get_type()).or_else(|| printable(declared.get_type()));
+    let type_of = match &here {
+        Some(here)
+            if matches!(
+                here.get_kind(),
+                clang::TypeKind::FunctionPrototype | clang::TypeKind::FunctionNoPrototype
+            ) =>
+        {
+            here.get_result_type()
+                .map(|result| result.get_display_name())
+        }
+        Some(here) => Some(here.get_display_name()),
+        None => None,
+    };
+    let declaration = match &type_of {
+        Some(type_of) => format!("{type_of} {name}"),
+        None => name,
+    };
+
+    let (start, end) =
+        name_span(&entity, about, offset).unwrap_or_else(|| word_around(text, offset));
+    Some(Described {
+        declaration,
+        type_of,
+        comment: declared
+            .get_comment_brief()
+            .map(|brief| brief.trim().to_string())
+            .filter(|brief| !brief.is_empty()),
+        start,
+        end,
+    })
+}
+
+/// A type only where the front end has a name for it.
+///
+/// Where it does not, it answers with a placeholder in angle brackets -- and a
+/// card reading `<bound member function type> keys` tells the reader less than
+/// no card at all.
+fn printable<'a>(kind: Option<clang::Type<'a>>) -> Option<clang::Type<'a>> {
+    kind.filter(|kind| !kind.get_display_name().starts_with('<'))
+}
+
+/// The span of just the name at the cursor, as the front end spells it out.
+///
+/// An expression's own range is wider than its name -- `registry.keys` for the
+/// `keys` in it -- and underlining the whole of that says the card is about
+/// something it is not.
+fn name_span<'a>(
+    entity: &clang::Entity<'a>,
+    about: &Path,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    entity
+        .get_name_ranges()
+        .iter()
+        .map(|range| {
+            (
+                range.get_start().get_file_location(),
+                range.get_end().get_file_location(),
+            )
+        })
+        .find(|(start, end)| {
+            start.file.map(|file| file.get_path()).as_deref() == Some(about)
+                && (start.offset as usize) <= offset
+                && offset <= (end.offset as usize)
+        })
+        .map(|(start, end)| (start.offset as usize, end.offset as usize))
+}
+
+/// The identifier the offset falls in, read off the text.
+///
+/// The fallback for a place the front end gives no name range for, so that the
+/// card still underlines a word rather than an empty point.
+fn word_around(text: &str, offset: usize) -> (usize, usize) {
+    let offset = at_a_boundary(text, offset);
+    let is_name = |character: char| character.is_alphanumeric() || character == '_';
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_name(*character))
+        .last()
+        .map_or(offset, |(at, _)| at);
+    let end = text[offset..]
+        .char_indices()
+        .take_while(|(_, character)| is_name(*character))
+        .last()
+        .map_or(offset, |(at, character)| offset + at + character.len_utf8());
+    (start, end)
+}
+
+/// The nearest offset at or before the given one that a `str` can be split at.
+///
+/// The text is the buffer's and the offset came from it, so this only matters
+/// where they have drifted apart -- but slicing between the bytes of one
+/// character panics, and taking the editor down over a stale offset is not an
+/// option.
+fn at_a_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn fresh(
@@ -361,29 +574,49 @@ mod tests {
             })
             .collect();
 
+        let hovered = MEASURED
+            .rfind("keys")
+            .expect("the call to measure a hover on");
+
         // Twice around, so the second lap also exercises the reparse of a unit
         // that is still held and the fresh parse of one that has been evicted.
+        // Both request kinds go through the same held units, which is what
+        // makes the bound below a bound over the whole feature and not over
+        // diagnostics alone.
         for lap in 1..=2 {
             for file in &files {
-                let parsed = futures::executor::block_on(ask_libclang(Request {
-                    file: file.clone(),
-                    text: MEASURED.to_string(),
-                    arguments: vec!["-std=c++20".to_string()],
-                }))
-                .expect("a parse");
-                assert!(
-                    parsed.held <= HELD_AT_MOST,
-                    "{} units held, bound is {HELD_AT_MOST}",
-                    parsed.held,
-                );
-                println!(
-                    "lap {lap} {}: {:.1} MB in the unit, {} held, {} findings, {}",
-                    file.file_name().unwrap_or_default().to_string_lossy(),
-                    parsed.memory as f64 / 1_048_576.0,
-                    parsed.held,
-                    parsed.findings.len(),
-                    resident(),
-                );
+                for asked in [Asked::WhatIsWrong, Asked::WhatIsAt(hovered)] {
+                    let what = match asked {
+                        Asked::WhatIsWrong => "wrong",
+                        Asked::WhatIsAt(_) => "at",
+                    };
+                    let started = std::time::Instant::now();
+                    let parsed = futures::executor::block_on(ask_libclang(Request {
+                        file: file.clone(),
+                        text: MEASURED.to_string(),
+                        arguments: vec!["-std=c++20".to_string()],
+                        asked,
+                    }))
+                    .expect("a parse");
+                    assert!(
+                        parsed.held <= HELD_AT_MOST,
+                        "{} units held, bound is {HELD_AT_MOST}",
+                        parsed.held,
+                    );
+                    println!(
+                        "lap {lap} {} {what}: {:.0} ms, {:.1} MB in the unit, {} held, \
+                         {} findings, {}, {}",
+                        file.file_name().unwrap_or_default().to_string_lossy(),
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                        parsed.memory as f64 / 1_048_576.0,
+                        parsed.held,
+                        parsed.findings.len(),
+                        parsed
+                            .described
+                            .map_or("nothing described".to_string(), |said| said.declaration),
+                        resident(),
+                    );
+                }
             }
         }
 
@@ -432,8 +665,9 @@ class Registry {
 int main() {
     Registry<std::string, std::unique_ptr<int>> registry;
     registry.add("one", std::make_unique<int>(1));
+    auto names = registry.keys();
     int missing = registry.nothing_of_the_sort();
-    return missing;
+    return missing + static_cast<int>(names.size());
 }
 "#;
 }
