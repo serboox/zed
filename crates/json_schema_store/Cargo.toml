@@ -33,6 +33,7 @@ language.workspace = true
 lsp.workspace = true
 paths.workspace = true
 project.workspace = true
+schema_documents.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
 serde.workspace = true

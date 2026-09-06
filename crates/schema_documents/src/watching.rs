@@ -6,31 +6,14 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use collections::HashMap;
-use gpui::{App, AppContext as _, AsyncApp, Entity, EntityId, Task, WeakEntity, actions};
+use gpui::{App, AppContext as _, AsyncApp, Entity, EntityId, Task, WeakEntity};
 use jsonschema::Validator;
-use language::{Buffer, DiagnosticSourceKind};
-use project::Project;
+use language::{Buffer, DiagnosticSourceKind, LanguageRegistry};
 use project::buffer_store::BufferStoreEvent;
+use project::{LspStore, Project};
 use settings::SettingsLocation;
 
-use crate::{Association, diagnostics_for, schema_covering, validator_for};
-
-actions!(
-    json_diagnostics,
-    [
-        /// Checks this JSON buffer against the schema that covers it and
-        /// shows what does not fit, without a language server.
-        Validate
-    ]
-);
-
-/// The id these diagnostics are filed under. There is no server behind it, in
-/// the way `cargo_diagnostics` has none: the editor's diagnostics are keyed
-/// by server, so a source that is not a server still needs an id. Chosen far
-/// above any a running server would be assigned, and one apart from every
-/// other source that is not a server: the SQL validator, the Rust compiler,
-/// the Go one and ruff.
-const JSON_SERVER_ID: language::LanguageServerId = language::LanguageServerId(usize::MAX - 1004);
+use crate::{Association, schema_covering, validator_for};
 
 /// Idle time after an edit before the buffer is checked.
 ///
@@ -42,6 +25,30 @@ const JSON_SERVER_ID: language::LanguageServerId = language::LanguageServerId(us
 /// gap between two keys of anyone typing, and short enough that a reader who
 /// has stopped to look at what they wrote sees the answer already there.
 const SETTLE: Duration = Duration::from_millis(150);
+
+/// Everything one language's schema checking needs that is about that
+/// language rather than about schemas. The rest of this file is the same for
+/// all of them.
+pub struct Reads {
+    /// Which languages this covers, by the name the registry gives them.
+    pub languages: &'static [&'static str],
+    /// The id these diagnostics are filed under. There is no server behind
+    /// it, in the way `cargo_diagnostics` has none: the editor's diagnostics
+    /// are keyed by server, so a source that is not a server still needs an
+    /// id. Chosen far above any a running server would be assigned, and one
+    /// apart from every other source that is not a server.
+    pub server_id: language::LanguageServerId,
+    /// Everything the schema has to say about a text of this language.
+    pub diagnostics: fn(&str, &Validator) -> Vec<lsp::Diagnostic>,
+    /// The rules saying which schema covers which files.
+    pub associations: for<'registry, 'at, 'app> fn(
+        &'registry Arc<LanguageRegistry>,
+        Option<SettingsLocation<'at>>,
+        &'app mut App,
+    ) -> serde_json::Value,
+    /// How a schema is fetched, given the URI a rule named.
+    pub fetch: fn(Entity<LspStore>, String, &mut AsyncApp) -> Task<Result<String>>,
+}
 
 /// A schema, kept as both what it arrived as and what it was built into.
 ///
@@ -57,13 +64,13 @@ struct Built {
 }
 
 #[derive(Default)]
-struct Watching {
+pub struct Watching {
     /// By schema URI. A `None` is a schema that would not build, remembered
     /// so it is not built again on every keystroke; it means silence, and
     /// silence is what a reader whose schema is broken should get.
     schemas: HashMap<String, Option<Built>>,
     /// The schema covering each file, by absolute path, worked out once. A
-    /// `None` is a file no schema covers, which is most JSON there is.
+    /// `None` is a file no schema covers, which is most of them.
     covering: HashMap<PathBuf, Option<String>>,
     /// The check in flight for each buffer. Dropped, and so cancelled, when
     /// the next edit to that buffer starts another. One per buffer rather
@@ -71,65 +78,70 @@ struct Watching {
     checking: HashMap<EntityId, Task<()>>,
 }
 
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut workspace::Workspace, _, cx| {
-        let project = workspace.project().clone();
-        let watching = Rc::new(RefCell::new(Watching::default()));
-
-        // Every buffer already open, and every one opened later. Collected
-        // first: reading the store borrows the context that watching one
-        // needs mutably.
-        let already_open: Vec<Entity<Buffer>> =
-            project.read(cx).buffer_store().read(cx).buffers().collect();
-        for buffer in already_open {
-            watch_one(&project, &buffer, &watching, cx);
-        }
-        let buffer_store = project.read(cx).buffer_store().clone();
-        cx.subscribe(&buffer_store, {
-            let project = project.clone();
-            let watching = watching.clone();
-            move |_: &mut workspace::Workspace, _, event, cx| {
-                if let BufferStoreEvent::BufferAdded(buffer) = event {
-                    watch_one(&project, buffer, &watching, cx);
-                }
-            }
-        })
-        .detach();
-
-        workspace.register_action({
-            let project = project.clone();
-            let watching = watching.clone();
-            move |_, _: &Validate, _, cx| {
-                // Everything worked out once is forgotten first, so that this
-                // is also the way to pick up a schema or a rule that changed
-                // after the files it covers were opened.
-                {
-                    let mut watching = watching.borrow_mut();
-                    watching.schemas.clear();
-                    watching.covering.clear();
-                }
-                let open: Vec<Entity<Buffer>> =
-                    project.read(cx).buffer_store().read(cx).buffers().collect();
-                for buffer in open {
-                    if is_json(&buffer, cx) {
-                        check_soon(&project, &buffer, &watching, cx);
-                    }
-                }
-            }
-        });
-    })
-    .detach();
-}
-
-/// Watches one buffer, and checks it after each edit -- but only where no
-/// language server is doing it already.
+/// Watches every buffer of these languages in one workspace, and checks each
+/// after an edit -- but only where no language server is doing it already.
 ///
-/// That condition is the whole design. A project with `json-language-server`
+/// That condition is the whole design. A project with the language's server
 /// running already has these diagnostics, and producing them here as well
 /// would show the reader every problem twice. A project without one has
 /// nothing, and this is what it gets. So the feature turns itself on exactly
 /// where it is needed, and needs no setting to say so.
+pub fn watch(
+    reads: &'static Reads,
+    workspace: &mut workspace::Workspace,
+    cx: &mut gpui::Context<workspace::Workspace>,
+) -> Rc<RefCell<Watching>> {
+    let project = workspace.project().clone();
+    let watching = Rc::new(RefCell::new(Watching::default()));
+
+    // Every buffer already open, and every one opened later. Collected
+    // first: reading the store borrows the context that watching one needs
+    // mutably.
+    let already_open: Vec<Entity<Buffer>> =
+        project.read(cx).buffer_store().read(cx).buffers().collect();
+    for buffer in already_open {
+        watch_one(reads, &project, &buffer, &watching, cx);
+    }
+    let buffer_store = project.read(cx).buffer_store().clone();
+    cx.subscribe(&buffer_store, {
+        let project = project.clone();
+        let watching = watching.clone();
+        move |_: &mut workspace::Workspace, _, event, cx| {
+            if let BufferStoreEvent::BufferAdded(buffer) = event {
+                watch_one(reads, &project, buffer, &watching, cx);
+            }
+        }
+    })
+    .detach();
+
+    watching
+}
+
+/// Forgets everything worked out once and checks every open buffer again.
+///
+/// This is the way to pick up a schema or a rule that changed after the files
+/// it covers were opened.
+pub fn recheck_everything(
+    reads: &'static Reads,
+    watching: &Rc<RefCell<Watching>>,
+    project: &Entity<Project>,
+    cx: &mut gpui::Context<workspace::Workspace>,
+) {
+    {
+        let mut watching = watching.borrow_mut();
+        watching.schemas.clear();
+        watching.covering.clear();
+    }
+    let open: Vec<Entity<Buffer>> = project.read(cx).buffer_store().read(cx).buffers().collect();
+    for buffer in open {
+        if is_covered(reads, &buffer, cx) {
+            check_soon(reads, project, &buffer, watching, cx);
+        }
+    }
+}
+
 fn watch_one(
+    reads: &'static Reads,
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
     watching: &Rc<RefCell<Watching>>,
@@ -150,10 +162,10 @@ fn watch_one(
             // made once at subscription time misses the first file of a
             // session entirely -- which is exactly what the
             // `LanguageChanged` arm above is for.
-            if !is_json(&buffer, cx) {
+            if !is_covered(reads, &buffer, cx) {
                 return;
             }
-            check_soon(&project, &buffer, &watching, cx);
+            check_soon(reads, &project, &buffer, &watching, cx);
         }
     })
     .detach();
@@ -168,20 +180,25 @@ fn watch_one(
 
     // A buffer that is already open has not been edited, and would otherwise
     // wait for its first keystroke to say anything about a file that is
-    // wrong now. One that is not JSON yet is caught by `LanguageChanged`.
-    if is_json(buffer, cx) {
-        check_soon(project, buffer, watching, cx);
+    // wrong now. One that is not of this language yet is caught by
+    // `LanguageChanged`.
+    if is_covered(reads, buffer, cx) {
+        check_soon(reads, project, buffer, watching, cx);
     }
 }
 
-fn is_json(buffer: &Entity<Buffer>, cx: &App) -> bool {
-    buffer
-        .read(cx)
-        .language()
-        .is_some_and(|language| matches!(language.name().as_ref(), "JSON" | "JSONC"))
+fn is_covered(reads: &Reads, buffer: &Entity<Buffer>, cx: &App) -> bool {
+    buffer.read(cx).language().is_some_and(|language| {
+        let name = language.name();
+        reads
+            .languages
+            .iter()
+            .any(|covered| *covered == name.as_ref())
+    })
 }
 
 fn check_soon(
+    reads: &'static Reads,
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
     watching: &Rc<RefCell<Watching>>,
@@ -193,11 +210,11 @@ fn check_soon(
     let held = watching.clone();
     let task = cx.spawn(async move |_, cx| {
         cx.background_executor().timer(SETTLE).await;
-        if let Err(error) = check(&project, &buffer, &held, cx).await {
+        if let Err(error) = check(reads, &project, &buffer, &held, cx).await {
             // Nothing here is the reader's problem: a schema that will not
             // build, a buffer closed mid-check. None of it is a reason to
             // interrupt them, and none of it clears what they were shown.
-            log::debug!("checking a JSON buffer against its schema: {error:#}");
+            log::debug!("checking a buffer against its schema: {error:#}");
         }
     });
     watching.borrow_mut().checking.insert(id, task);
@@ -213,6 +230,7 @@ struct About {
 }
 
 fn about(
+    reads: &Reads,
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
     watching: &Rc<RefCell<Watching>>,
@@ -243,6 +261,7 @@ fn about(
         return None;
     }
     let covered_by = covering(
+        reads,
         &path,
         SettingsLocation {
             worktree_id,
@@ -266,9 +285,10 @@ fn about(
 /// per file is affordable; once per keystroke, which is what this runs at,
 /// would not be. What it costs is freshness: a rule added mid-session by an
 /// extension, or by a `file_types` line in the settings, reaches files opened
-/// after it and not files already open. [`Validate`] forgets all of this, and
-/// is how a reader gets the new rule without reopening anything.
+/// after it and not files already open. [`recheck_everything`] forgets all of
+/// this, and is how a reader gets the new rule without reopening anything.
 fn covering(
+    reads: &Reads,
     path: &Path,
     at: SettingsLocation<'_>,
     project: &Entity<Project>,
@@ -279,7 +299,7 @@ fn covering(
         return known.clone();
     }
     let languages = project.read(cx).languages().clone();
-    let rules = json_schema_store::all_schema_file_associations(&languages, Some(at), cx);
+    let rules = (reads.associations)(&languages, Some(at), cx);
     let found = serde_json::from_value::<Vec<Association>>(rules)
         .ok()
         .and_then(|rules| schema_covering(&rules, path));
@@ -291,6 +311,7 @@ fn covering(
 }
 
 async fn check(
+    reads: &'static Reads,
     project: &WeakEntity<Project>,
     buffer: &WeakEntity<Buffer>,
     watching: &Rc<RefCell<Watching>>,
@@ -302,20 +323,21 @@ async fn check(
     let about = cx.update(|cx| {
         let project = project.upgrade()?;
         let buffer = buffer.upgrade()?;
-        about(&project, &buffer, watching, cx)
+        about(reads, &project, &buffer, watching, cx)
     });
     let Some(about) = about else {
         return Ok(());
     };
-    let Some(validator) = validator(&about.covered_by, project, watching, cx).await else {
+    let Some(validator) = validator(reads, &about.covered_by, project, watching, cx).await else {
         return Ok(());
     };
 
     let text = about.text;
+    let say = reads.diagnostics;
     let diagnostics = cx
-        .background_spawn(async move { diagnostics_for(&text, &validator) })
+        .background_spawn(async move { say(&text, &validator) })
         .await;
-    show(project, about.path, diagnostics, cx)
+    show(reads, project, about.path, diagnostics, cx)
 }
 
 /// The validator for a schema, built once and kept, or nothing at all where
@@ -323,6 +345,7 @@ async fn check(
 /// reader whose schema is broken is no worse off than one who has no schema,
 /// and is certainly not helped by an error about a file they did not write.
 async fn validator(
+    reads: &Reads,
     uri: &str,
     project: &WeakEntity<Project>,
     watching: &Rc<RefCell<Watching>>,
@@ -331,9 +354,7 @@ async fn validator(
     let lsp_store = project
         .read_with(cx, |project, _| project.lsp_store())
         .ok()?;
-    let came_as = json_schema_store::handle_schema_request(lsp_store, uri.to_string(), cx)
-        .await
-        .ok()?;
+    let came_as = (reads.fetch)(lsp_store, uri.to_string(), cx).await.ok()?;
 
     let known = match watching.borrow().schemas.get(uri) {
         Some(Some(built)) if built.came_as == came_as => Some(Some(built.validator.clone())),
@@ -377,6 +398,7 @@ async fn validator(
 /// reader has just fixed has to be told it is clean, or the editor keeps
 /// showing the mistake.
 fn show(
+    reads: &Reads,
     project: &WeakEntity<Project>,
     path: PathBuf,
     diagnostics: Vec<lsp::Diagnostic>,
@@ -384,6 +406,7 @@ fn show(
 ) -> Result<()> {
     let uri = lsp::Uri::from_file_path(&path)
         .map_err(|_| anyhow::anyhow!("{} is not a path with a URI", path.display()))?;
+    let server_id = reads.server_id;
     project.update(cx, |project, cx| {
         project.lsp_store().update(cx, |lsp_store, cx| {
             let merged = lsp_store.merge_lsp_diagnostics(
@@ -396,7 +419,7 @@ fn show(
                     },
                     result_id: None,
                     registration_id: None,
-                    server_id: JSON_SERVER_ID,
+                    server_id,
                     disk_based_sources: std::borrow::Cow::Borrowed(&[]),
                 }],
                 |_, _, _| false,

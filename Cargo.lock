@@ -11248,20 +11248,14 @@ dependencies = [
 name = "json_diagnostics"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "collections",
- "globset",
  "gpui",
  "json_schema_store",
  "jsonschema",
  "language",
- "log",
  "lsp",
  "pretty_assertions",
- "project",
- "serde",
+ "schema_documents",
  "serde_json",
- "settings",
  "workspace",
 ]
 
@@ -11293,6 +11287,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "project",
+ "schema_documents",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -19021,6 +19016,26 @@ dependencies = [
  "parking_lot",
  "rand 0.9.4",
  "web-time",
+]
+
+[[package]]
+name = "schema_documents"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "globset",
+ "gpui",
+ "jsonschema",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "workspace",
 ]
 
 [[package]]
@@ -28388,6 +28403,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "yaml_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "json_schema_store",
+ "jsonschema",
+ "language",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "schema_documents",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-yaml",
+ "workspace",
+]
+
+[[package]]
 name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28780,6 +28815,7 @@ dependencies = [
  "windows 0.61.3",
  "windows_resources",
  "workspace",
+ "yaml_diagnostics",
  "zed-reqwest",
  "zed_actions",
  "zed_env_vars",
