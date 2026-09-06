@@ -1236,9 +1236,15 @@ mod tests {
         let again = view.read_with(&second, |view, _| view.occurrences().len());
         assert!(again >= 200, "and again on a warm process: {again}");
 
+        // A ceiling against gathering two hundred occurrences accidentally
+        // becoming quadratic, which would cost seconds to minutes -- not a
+        // measurement of how long it takes. Wall clock cannot be one here: the
+        // suite runs its tests in parallel over every core, and a tighter
+        // bound failed at 674 ms under that load while passing alone.
         assert!(
-            warm < std::time::Duration::from_millis(500),
-            "the preview took {warm:?}; the gate is half a second"
+            warm < std::time::Duration::from_secs(5),
+            "the preview took {warm:?}, which is long enough to mean the \
+             gathering grew with the square of the occurrences"
         );
         // The first number is reported and not asserted on. What it measures
         // is the queries of thirteen languages compiling once, plus the fake
