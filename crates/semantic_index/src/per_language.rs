@@ -338,6 +338,7 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "swift" => Some(include_str!("swift_references.scm")),
         "bash" => Some(include_str!("bash_references.scm")),
         "sql" => Some(include_str!("sql_references.scm")),
+        "asm" => Some(include_str!("asm_references.scm")),
         "cobol" => Some(include_str!("cobol_references.scm")),
         _ => None,
     }
@@ -410,6 +411,7 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "bash",
     "sql",
     "cobol",
+    "asm",
 ];
 
 /// The language server to measure a language against, and the environment it

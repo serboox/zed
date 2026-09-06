@@ -4178,6 +4178,24 @@ mod tests {
     /// one thing it should -- the editor has no grammar for this file at all
     /// -- so the caller can tell "nothing better to say" from "nothing here".
     #[test]
+    fn assembly_answers_from_a_written_query_because_its_grammar_has_no_identifier() {
+        // Its names are `word` and `ident`, neither of which the built query
+        // knows, so before this had a written one assembly found nothing at
+        // all -- and unlike YAML, that was not the truthful answer: a label is
+        // exactly the kind of name a reader follows.
+        let found = references_in_text("asm", b"greet:\n    ret\n\n_start:\n    call greet\n")
+            .expect("assembly has a grammar")
+            .expect("and a written query");
+        let named: Vec<&str> = found.iter().map(|one| one.name.as_str()).collect();
+        assert!(named.contains(&"greet"), "{named:?}");
+        assert!(named.contains(&"_start"), "{named:?}");
+        assert!(
+            named.iter().filter(|name| **name == "greet").count() >= 2,
+            "the label and the call that follows it, in {named:?}"
+        );
+    }
+
+    #[test]
     fn a_language_with_no_written_query_still_answers_from_its_grammar() {
         // Go has a written query and answers from it.
         assert!(
