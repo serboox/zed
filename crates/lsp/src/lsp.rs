@@ -1099,8 +1099,8 @@ impl LanguageServer {
                     )
                 })?;
             let raw_capabilities = raw_response.get("capabilities").cloned();
-            let response: InitializeResult = serde_json::from_value(raw_response)
-                .with_context(|| {
+            let response: InitializeResult =
+                serde_json::from_value(raw_response).with_context(|| {
                     format!(
                         "deserializing initialize response from server {}, id {}",
                         self.name(),

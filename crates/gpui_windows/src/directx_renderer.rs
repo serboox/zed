@@ -793,9 +793,11 @@ impl DirectXRenderer {
             return Ok(());
         }
 
-        self.pipelines
-            .shared_frames
-            .update_buffer(&devices.device, &devices.device_context, &sprites)?;
+        self.pipelines.shared_frames.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            &sprites,
+        )?;
         // One at a time, because each frame is a texture of its own and the
         // texture is what a draw call is set up with.
         for (at, view) in views.iter().enumerate() {
