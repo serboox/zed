@@ -125,75 +125,9 @@ fn schema_uri_for_path(
     path: &Path,
     cx: &mut App,
 ) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let path = path.to_string_lossy().replace('\\', "/");
-
-    let associations = all_schema_file_associations(languages, None, cx);
-    for association in associations.as_array()? {
-        let Some(url) = association.get("url").and_then(|url| url.as_str()) else {
-            continue;
-        };
-        let Some(patterns) = association
-            .get("fileMatch")
-            .and_then(|patterns| patterns.as_array())
-        else {
-            continue;
-        };
-        for pattern in patterns.iter().filter_map(|pattern| pattern.as_str()) {
-            if matches_file_match(pattern, &path, file_name) {
-                return Some(url.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// The `fileMatch` dialect the JSON language server uses: a pattern without a
-/// slash is matched against the file name, one with a slash against a suffix of
-/// the path that starts at a component boundary, and `*` stands for any run of
-/// characters inside one component.
-fn matches_file_match(pattern: &str, path: &str, file_name: &str) -> bool {
-    if !pattern.contains('/') {
-        return glob_match(pattern, file_name);
-    }
-    let pattern = pattern.trim_start_matches('/');
-    if glob_match(pattern, path) {
-        return true;
-    }
-    path.match_indices('/')
-        .any(|(index, _)| glob_match(pattern, &path[index + 1..]))
-}
-
-/// `*` stands for any run of characters inside one path component, `**` for
-/// any run that may cross component boundaries.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-    let mut pattern_index = 0;
-    let mut text_index = 0;
-    let mut star: Option<(usize, bool)> = None;
-    let mut swallowed = 0;
-
-    while text_index < text.len() {
-        if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            let crosses_components = pattern.get(pattern_index + 1) == Some(&b'*');
-            pattern_index += if crosses_components { 2 } else { 1 };
-            star = Some((pattern_index, crosses_components));
-            swallowed = text_index;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == text[text_index] {
-            pattern_index += 1;
-            text_index += 1;
-        } else if let Some((resume, crosses_components)) = star
-            && (crosses_components || text[swallowed] != b'/')
-        {
-            swallowed += 1;
-            pattern_index = resume;
-            text_index = swallowed;
-        } else {
-            return false;
-        }
-    }
-    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
+    let rules = all_schema_file_associations(languages, None, cx);
+    let rules = serde_json::from_value::<Vec<schema_documents::Association>>(rules).ok()?;
+    schema_documents::schema_covering(&rules, path)
 }
 
 struct Frame {
@@ -565,48 +499,39 @@ mod tests {
         assert!(labels("{\n  \"tab_size\": |\n}").is_empty());
     }
 
+    /// The `fileMatch` dialect this used to read with a matcher of its own,
+    /// now read by the one `schema_documents` uses for the diagnostics side --
+    /// two answers to "which schema covers this file" could disagree, and one
+    /// of them would then be wrong.
     #[test]
-    fn matches_file_match_patterns_the_way_the_server_does() {
-        assert!(matches_file_match(
-            "tsconfig.json",
-            "/home/user/app/tsconfig.json",
-            "tsconfig.json"
-        ));
-        assert!(!matches_file_match(
-            "tsconfig.json",
-            "/home/user/app/package.json",
-            "package.json"
-        ));
-        assert!(matches_file_match(
+    fn a_file_is_covered_the_way_the_server_would_cover_it() {
+        let covered = |pattern: &str, path: &str| {
+            let rules: Vec<schema_documents::Association> = serde_json::from_value(
+                serde_json::json!([{ "fileMatch": [pattern], "url": "a-schema" }]),
+            )
+            .expect("the rule reads");
+            schema_documents::schema_covering(&rules, std::path::Path::new(path)).is_some()
+        };
+
+        assert!(covered("tsconfig.json", "/home/user/app/tsconfig.json"));
+        assert!(!covered("tsconfig.json", "/home/user/app/package.json"));
+        // A pattern with a separator is about the tail of the path.
+        assert!(covered(
             "zed/settings.json",
-            "/home/user/.config/zed/settings.json",
-            "settings.json"
+            "/home/user/.config/zed/settings.json"
         ));
-        assert!(!matches_file_match(
+        assert!(!covered(
             "zed/settings.json",
-            "/home/user/other/settings.json",
-            "settings.json"
+            "/home/user/other/settings.json"
         ));
-        assert!(matches_file_match(
-            "*.json",
-            "/home/user/app/anything.json",
-            "anything.json"
-        ));
-        assert!(!matches_file_match(
-            "*.json",
-            "/home/user/app/main.rs",
-            "main.rs"
-        ));
-        assert!(matches_file_match(
+        assert!(covered("*.json", "/home/user/app/anything.json"));
+        assert!(!covered("*.json", "/home/user/app/main.rs"));
+        // `**` crosses directories; a single `*` does not.
+        assert!(covered(
             "**/.vscode/**/*.json",
-            "app/.vscode/nested/tasks.json",
-            "tasks.json"
+            "app/.vscode/nested/tasks.json"
         ));
-        assert!(!matches_file_match(
-            "**/.vscode/**/*.json",
-            "app/other/tasks.json",
-            "tasks.json"
-        ));
+        assert!(!covered("**/.vscode/**/*.json", "app/other/tasks.json"));
     }
 }
 
