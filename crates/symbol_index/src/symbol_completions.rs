@@ -3,10 +3,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{App, Entity, Task};
 use language::{Buffer, BufferSnapshot, CodeLabel};
-use project::{
-    Completion, CompletionContext, CompletionDocumentation, CompletionSource, InProcessCompletions,
-    InProcessProject,
-};
+use lsp::CompletionContext;
+use project::lsp_store::CompletionDocumentation;
+use project::{Completion, CompletionSource, InProcessCompletions, InProcessProject};
 use text::{PointUtf16, ToOffset as _};
 
 /// Offers the names the project itself declares, out of the index, so that a

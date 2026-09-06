@@ -386,7 +386,7 @@ async fn open_the_declaration(
             buffer: opened.clone(),
             range: snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end),
         })
-    })?;
+    });
     let Some(target) = target else {
         // The file has moved under the index and no longer has that line.
         // Answering nothing sends the reader nowhere, which is the right place.
@@ -515,7 +515,10 @@ impl SemanticsProvider for IndexFirst {
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<language::Location>>>>> {
         let index = self.index.upgrade()?;
-        let project = self.project.upgrade()?;
+        // The weak handle is kept rather than upgraded: it is the one whose
+        // `update` answers with a `Result`, which is what a task running after
+        // the project may have gone needs.
+        let project = self.project.clone();
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
         let (_, name) = word_at(&snapshot, offset)?;
@@ -572,7 +575,7 @@ impl SemanticsProvider for IndexFirst {
                     // word they did not ask about.
                     (snapshot.text_for_range(from..to).collect::<String>() == name)
                         .then(|| snapshot.anchor_before(from)..snapshot.anchor_after(to))
-                })?;
+                });
                 let Some(range) = range else {
                     continue;
                 };
@@ -704,7 +707,11 @@ impl SemanticsProvider for IndexFirst {
         // the file it names is opened only if the server has nothing: opening a
         // buffer per lookup in a project that has a server is work started and
         // thrown away.
-        let where_it_is = self.where_the_index_says(buffer, position, cx)?;
+        let Some(where_it_is) = self.where_the_index_says(buffer, position, cx) else {
+            // Nothing of our own to say, and dropping the task here would drop
+            // the server's answer with it.
+            return from_the_server;
+        };
         let project = self.project.clone();
         let Some(from_the_server) = from_the_server else {
             return Some(
