@@ -27,6 +27,7 @@ project.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
 semantic_index.workspace = true
 text.workspace = true
+tree-sitter.workspace = true
 util.workspace = true
 workspace.workspace = true
 

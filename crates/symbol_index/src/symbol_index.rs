@@ -17,9 +17,12 @@ use workspace::Workspace;
 
 pub mod index_semantics;
 pub mod symbol_completions;
+mod the_import_line;
 
 #[cfg(test)]
 mod answering_without_a_server;
+#[cfg(test)]
+mod bringing_the_import_line;
 
 /// Which of four states the index is in, so a caller can tell "nothing
 /// matched" from "there is nothing to search yet" apart.

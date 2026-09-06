@@ -23460,6 +23460,7 @@ dependencies = [
  "settings",
  "tempfile",
  "text",
+ "tree-sitter",
  "util",
  "workspace",
 ]
