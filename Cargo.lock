@@ -3611,6 +3611,8 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "tempfile",
+ "text",
  "workspace",
 ]
 
