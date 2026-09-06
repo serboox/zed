@@ -1,0 +1,29 @@
+[package]
+name = "proto_diagnostics"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/proto_diagnostics.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+miette.workspace = true
+project.workspace = true
+protox.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true

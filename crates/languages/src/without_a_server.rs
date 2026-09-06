@@ -528,6 +528,96 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn proto_reads_its_messages_services_and_fields(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "proto",
+            tree_sitter_proto::LANGUAGE.into(),
+            r#"
+            syntax = "proto3";
+
+            package shop.v1;
+
+            enum Currency {
+              CURRENCY_UNSPECIFIED = 0;
+              CURRENCY_EUR = 1;
+            }
+
+            message Order {
+              message Line {
+                string sku = 1;
+                int32 quantity = 2;
+              }
+
+              string order_id = 1;
+              repeated Line lines = 2;
+              map<string, string> labels = 3;
+
+              oneof payment {
+                string card_token = 4;
+                string invoice_reference = 5;
+              }
+            }
+
+            service Orders {
+              rpc PlaceOrder(Order) returns (Order);
+              rpc ListOrders(Order) returns (stream Order) {
+                option deprecated = true;
+              }
+            }
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in [
+            "Currency",
+            "CURRENCY_EUR",
+            "Order",
+            "Line",
+            "sku",
+            "order_id",
+            "lines",
+            "labels",
+            "payment",
+            "card_token",
+            "Orders",
+            "PlaceOrder",
+            "ListOrders",
+        ] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+
+        let depth_of = |wanted: &str| {
+            items
+                .iter()
+                .find(|(text, _)| text.contains(wanted))
+                .map(|(_, depth)| *depth)
+        };
+        let message = depth_of("Order").expect("the message is in the outline");
+        let nested = depth_of("Line").expect("the nested message is in the outline");
+        let field = depth_of("sku").expect("the nested message's field is in the outline");
+        assert!(
+            nested > message && field > nested,
+            "a message inside a message, and its field inside that, in {items:?}"
+        );
+
+        let method = depth_of("PlaceOrder").expect("the method is in the outline");
+        let service = depth_of("Orders").expect("the service is in the outline");
+        assert!(
+            method > service,
+            "an rpc has to sit under its service, in {items:?}"
+        );
+
+        assert!(
+            !names.iter().any(|text| text.contains("deprecated")),
+            "an option set on an rpc is not a symbol, but {names:?} has one"
+        );
+    }
+
+    #[gpui::test]
     async fn xml_reads_its_elements_and_keeps_them_nested(cx: &mut TestAppContext) {
         let items = outline_of(
             cx,
