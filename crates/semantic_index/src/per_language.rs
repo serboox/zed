@@ -340,6 +340,7 @@ pub fn references_query(language: &str) -> Option<&'static str> {
         "sql" => Some(include_str!("sql_references.scm")),
         "asm" => Some(include_str!("asm_references.scm")),
         "cobol" => Some(include_str!("cobol_references.scm")),
+        "xml" => Some(include_str!("xml_references.scm")),
         _ => None,
     }
 }
@@ -412,6 +413,7 @@ pub const LANGUAGES_WITH_A_REFERENCES_QUERY: &[&str] = &[
     "sql",
     "cobol",
     "asm",
+    "xml",
 ];
 
 /// The language server to measure a language against, and the environment it

@@ -524,4 +524,59 @@ mod tests {
             "a schema qualifier is not a definition, but {names:?} has one"
         );
     }
+
+    #[gpui::test]
+    async fn xml_reads_its_elements_and_keeps_them_nested(cx: &mut TestAppContext) {
+        let items = outline_of(
+            cx,
+            "xml",
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            r#"
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!-- a build file, near enough -->
+            <project xmlns="http://maven.apache.org/POM/4.0.0">
+                <groupId>dev.example</groupId>
+                <dependencies>
+                    <dependency scope="test">
+                        <artifactId>junit</artifactId>
+                    </dependency>
+                    <dependency scope="runtime"/>
+                </dependencies>
+            </project>
+            "#,
+        )
+        .await;
+        let names = named(&items);
+        for wanted in ["project", "groupId", "dependencies", "artifactId"] {
+            assert!(
+                names.iter().any(|text| text.contains(wanted)),
+                "{wanted} is missing from {names:?}"
+            );
+        }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|text| text.contains("dependency"))
+                .count(),
+            2,
+            "the paired element and the empty one are both elements, in {names:?}"
+        );
+        assert!(
+            !names.iter().any(|text| text.contains("scope")),
+            "an attribute is not an element, but {names:?} has one"
+        );
+
+        let depth_of = |wanted: &str| {
+            items
+                .iter()
+                .find(|(text, _)| text.contains(wanted))
+                .map(|(_, depth)| *depth)
+        };
+        let root = depth_of("project").expect("the root element is in the outline");
+        let nested = depth_of("artifactId").expect("the nested element is in the outline");
+        assert!(
+            nested > root,
+            "an element inside three others has to sit below them, but {items:?}"
+        );
+    }
 }

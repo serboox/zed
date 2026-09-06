@@ -184,12 +184,12 @@ mod tests {
             refused.is_empty(),
             "an outline query the editor ships does not compile: {refused:?}"
         );
-        // Twenty-seven directories ship an outline query, and every one of them
+        // Twenty-eight directories ship an outline query, and every one of them
         // has to be readable -- including JavaScript, which is parsed by the TSX
         // grammar and would be dropped by anything walking the grammars.
         assert_eq!(
             readable.len(),
-            27,
+            28,
             "readable: {:?}",
             readable
                 .iter()
