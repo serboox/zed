@@ -9230,6 +9230,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-vb6",
+ "tree-sitter-xml",
  "tree-sitter-yaml",
 ]
 
@@ -12098,6 +12099,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-vb6",
+ "tree-sitter-xml",
  "unindent",
  "url",
  "util",
@@ -25458,6 +25460,16 @@ checksum = "178cfc0f2c3e9ab0fe72cea69fe30c492d76bb4f94d7a60bc2f865eb994bf655"
 dependencies = [
  "cc",
  "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-xml"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e670041f591d994f54d597ddcd8f4ebc930e282c4c76a42268743b71f0c8b6b3"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

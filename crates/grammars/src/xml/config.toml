@@ -1,0 +1,30 @@
+name = "XML"
+grammar = "xml"
+path_suffixes = [
+    "xml",
+    "xsd",
+    "xsl",
+    "xslt",
+    "svg",
+    "rss",
+    "atom",
+    "wsdl",
+    "plist",
+    "resx",
+    "xaml",
+    "csproj",
+    "vbproj",
+    "props",
+    "targets",
+]
+autoclose_before = ">})"
+block_comment = { start = "<!--", prefix = "", end = "-->", tab_size = 0 }
+wrap_characters = { start_prefix = "<", start_suffix = ">", end_prefix = "</", end_suffix = ">" }
+completion_query_characters = ["-", ":"]
+word_characters = ["-", ":"]
+brackets = [
+    { start = "<", end = ">", close = false, newline = true, not_in = ["comment", "string"] },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["comment", "string"] },
+    { start = "'", end = "'", close = true, newline = false, not_in = ["comment", "string"] },
+    { start = "!--", end = " --", close = true, newline = false, not_in = ["comment", "string"] },
+]
