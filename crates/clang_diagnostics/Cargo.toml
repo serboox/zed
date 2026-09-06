@@ -24,7 +24,9 @@ lsp.workspace = true
 project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+text.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+tempfile.workspace = true

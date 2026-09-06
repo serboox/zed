@@ -11,7 +11,7 @@ use project::Project;
 use project::buffer_store::BufferStoreEvent;
 
 use crate::compile_commands::{arguments_for, entries_in, where_the_database_is};
-use crate::parsing::{Request, ask_libclang};
+use crate::parsing::{Asked, Request, ask_libclang};
 use crate::{Finding, as_diagnostics};
 
 actions!(
@@ -151,11 +151,20 @@ fn watch_one(
     }
 }
 
+/// The name the editor registers this buffer's language under, where it is one
+/// the front end can parse. Returned rather than a flag because a hover card
+/// has to say which language its code block is in, and "C" and "C++" are not
+/// the same answer.
+pub(crate) fn c_or_cpp(buffer: &Entity<Buffer>, cx: &App) -> Option<&'static str> {
+    match buffer.read(cx).language()?.name().as_ref() {
+        "C" => Some("C"),
+        "C++" => Some("C++"),
+        _ => None,
+    }
+}
+
 fn is_c_or_cpp(buffer: &Entity<Buffer>, cx: &App) -> bool {
-    buffer
-        .read(cx)
-        .language()
-        .is_some_and(|language| matches!(language.name().as_ref(), "C" | "C++"))
+    c_or_cpp(buffer, cx).is_some()
 }
 
 fn parse_soon(
@@ -261,6 +270,7 @@ async fn parse(
         file: about.path.clone(),
         text: about.text.clone(),
         arguments,
+        asked: Asked::WhatIsWrong,
     })
     .await
     .with_context(|| format!("parsing {}", about.path.display()))?;
@@ -277,7 +287,7 @@ async fn parse(
 
 /// The arguments a file is compiled with, from the compilation database nearest
 /// it, or nothing at all where there is none.
-fn how_it_is_compiled(path: &Path, root: &Path) -> Option<Vec<String>> {
+pub(crate) fn how_it_is_compiled(path: &Path, root: &Path) -> Option<Vec<String>> {
     let database = where_the_database_is(path, root, |candidate| candidate.is_file())?;
     let text = std::fs::read_to_string(&database).ok()?;
     arguments_for(&entries_in(&text), path)

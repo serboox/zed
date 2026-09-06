@@ -1,10 +1,18 @@
 mod compile_commands;
+mod describing;
 mod parsing;
 mod watching;
 
 pub use compile_commands::{Entry, arguments_for, entries_in, where_the_database_is};
-pub use parsing::{HELD_AT_MOST, Parsed, Request, ask_libclang};
-pub use watching::{Diagnose, init};
+pub use parsing::{Asked, Described, HELD_AT_MOST, Parsed, Request, ask_libclang};
+pub use watching::Diagnose;
+
+/// Everything this crate contributes: the compiler's own findings on save, and
+/// the type under the cursor on hover.
+pub fn init(cx: &mut gpui::App) {
+    watching::init(cx);
+    describing::init(cx);
+}
 
 /// How bad the compiler front end thought a finding was.
 ///
