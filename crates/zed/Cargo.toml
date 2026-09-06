@@ -184,6 +184,7 @@ project_symbols.workspace = true
 search_everywhere.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
+python_types.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true
 remote.workspace = true

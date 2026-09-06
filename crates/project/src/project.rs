@@ -766,6 +766,40 @@ pub fn register_in_process_completions(source: Arc<dyn InProcessCompletions>, cx
         .push(source);
 }
 
+/// What a hover source may use, taken out before the project was leased, for
+/// the same reason [`InProcessProject`] exists.
+pub struct InProcessHoverContext {
+    /// The absolute path of every visible worktree, longest first, so the one
+    /// that contains a file is the first that matches it.
+    pub worktree_roots: Vec<PathBuf>,
+}
+
+/// A source of hover text that runs inside this process, with no language
+/// server behind it.
+///
+/// Unlike completions, a hover has one answer rather than a merged list, so a
+/// source is asked only where the language servers said nothing.
+pub trait InProcessHover: Send + Sync {
+    fn hover(
+        &self,
+        context: &InProcessHoverContext,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        cx: &mut App,
+    ) -> Task<Option<Vec<Hover>>>;
+}
+
+#[derive(Default)]
+struct InProcessHoverSources(Vec<Arc<dyn InProcessHover>>);
+
+impl Global for InProcessHoverSources {}
+
+/// Registers a hover source contributed by a crate that `project` does not
+/// depend on (e.g. Python types inferred in `python_types`).
+pub fn register_in_process_hover(source: Arc<dyn InProcessHover>, cx: &mut App) {
+    cx.default_global::<InProcessHoverSources>().0.push(source);
+}
+
 /// Response from language server completion request.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreCompletionResponse {
@@ -4542,8 +4576,47 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Option<Vec<Hover>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.lsp_store
-            .update(cx, |lsp_store, cx| lsp_store.hover(buffer, position, cx))
+        let from_language_servers = self
+            .lsp_store
+            .update(cx, |lsp_store, cx| lsp_store.hover(buffer, position, cx));
+
+        let sources = cx
+            .try_global::<InProcessHoverSources>()
+            .map_or_else(Vec::new, |sources| sources.0.clone());
+        if sources.is_empty() {
+            return from_language_servers;
+        }
+
+        let context = InProcessHoverContext {
+            worktree_roots: self
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .sorted_by_key(|root| std::cmp::Reverse(root.components().count()))
+                .collect(),
+        };
+        let in_process = sources
+            .iter()
+            .map(|source| source.hover(&context, buffer, position, cx))
+            .collect::<Vec<_>>();
+
+        cx.background_spawn(async move {
+            // The servers first, always: where one answered, it knows more than
+            // an in-process source can. The source fills the silence where no
+            // server was started, which in this fork is the ordinary case.
+            if let Some(answered) = from_language_servers.await
+                && !answered.iter().all(Hover::is_empty)
+            {
+                return Some(answered);
+            }
+            for task in in_process {
+                if let Some(answered) = task.await
+                    && !answered.iter().all(Hover::is_empty)
+                {
+                    return Some(answered);
+                }
+            }
+            None
+        })
     }
 
     pub fn linked_edits(

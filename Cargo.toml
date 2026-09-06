@@ -179,6 +179,7 @@ members = [
     "crates/project_symbols",
     "crates/prompt_store",
     "crates/proto",
+    "crates/python_types",
     "crates/recent_projects",
     "crates/refineable",
     "crates/refineable/derive_refineable",
@@ -461,6 +462,7 @@ project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
+python_types = { path = "crates/python_types" }
 recent_projects = { path = "crates/recent_projects" }
 rename_preview = { path = "crates/rename_preview" }
 refineable = { path = "crates/refineable" }
@@ -832,6 +834,17 @@ runtimelib = { version = "1.4.0", default-features = false, features = [
     "async-dispatcher-runtime", "aws-lc-rs"
 ] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
+
+# `ty`, the Python type checker, used in process rather than as a language
+# server. `ty_ide` is `publish = false`, so every one of these comes from the
+# same pinned commit: ruff v0.16.4, the last release whose MSRV is 1.95 and so
+# the last that builds with this fork's pinned toolchain.
+ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77", features = ["os"] }
+ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
+ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
+
 rustc-hash = "2.1.0"
 rustls = { version = "0.23.26" }
 rustls-platform-verifier = "0.5.0"

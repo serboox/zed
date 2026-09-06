@@ -16504,3 +16504,140 @@ async fn test_staging_hunks_with_ambiguous_placement(cx: &mut gpui::TestAppConte
         ]
     );
 }
+
+struct FixedHover {
+    text: String,
+    roots: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl InProcessHover for FixedHover {
+    fn hover(
+        &self,
+        context: &InProcessHoverContext,
+        _buffer: &Entity<Buffer>,
+        _position: PointUtf16,
+        _cx: &mut App,
+    ) -> Task<Option<Vec<Hover>>> {
+        *self.roots.lock() = context.worktree_roots.clone();
+        Task::ready(Some(vec![Hover {
+            contents: vec![HoverBlock {
+                text: self.text.clone(),
+                kind: HoverBlockKind::PlainText,
+            }],
+            range: None,
+            language: None,
+        }]))
+    }
+}
+
+fn hover_texts(hovers: Option<Vec<Hover>>) -> Vec<String> {
+    hovers
+        .into_iter()
+        .flatten()
+        .map(|hover| hover.contents.iter().map(|block| &block.text).join("|"))
+        .collect()
+}
+
+#[gpui::test]
+async fn test_in_process_hover_without_a_language_server(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.py": "answer = 1\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let roots = Arc::new(Mutex::new(Vec::new()));
+    cx.update(|cx| {
+        register_in_process_hover(
+            Arc::new(FixedHover {
+                text: "without_a_server".to_string(),
+                roots: roots.clone(),
+            }),
+            cx,
+        )
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/a.py"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    let hovers = project
+        .update(cx, |project, cx| {
+            project.hover(&buffer, Point::new(0, 0), cx)
+        })
+        .await;
+
+    assert_eq!(hover_texts(hovers), vec!["without_a_server".to_string()]);
+    assert_eq!(
+        *roots.lock(),
+        vec![PathBuf::from(path!("/dir"))],
+        "the source is told which worktree the file is in"
+    );
+}
+
+#[gpui::test]
+async fn test_language_server_hover_wins_over_the_in_process_one(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "let a = 1;\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "TypeScript",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    cx.update(|cx| {
+        register_in_process_hover(
+            Arc::new(FixedHover {
+                text: "in_process".to_string(),
+                roots: Arc::new(Mutex::new(Vec::new())),
+            }),
+            cx,
+        )
+    });
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    let fake_server = fake_language_servers.next().await.unwrap();
+    fake_server.set_request_handler::<lsp::request::HoverRequest, _, _>(|_, _| async move {
+        Ok(Some(lsp::Hover {
+            contents: lsp::HoverContents::Scalar(lsp::MarkedString::String(
+                "from_the_server".to_string(),
+            )),
+            range: None,
+        }))
+    });
+
+    let hovers = project
+        .update(cx, |project, cx| {
+            project.hover(&buffer, Point::new(0, 4), cx)
+        })
+        .await;
+
+    assert_eq!(
+        hover_texts(hovers),
+        vec!["from_the_server".to_string()],
+        "an answering server keeps the in-process source out of the way"
+    );
+}
