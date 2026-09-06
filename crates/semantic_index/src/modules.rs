@@ -404,6 +404,62 @@ impl Brought {
     }
 }
 
+/// What one file's `use` declarations bring into scope, read from text held in
+/// memory rather than from the file the tree walks.
+///
+/// The names come back as the local name each stands for and the path it
+/// names, and the globs as the paths they cover -- the same two halves
+/// [`ModuleTree`] keeps, for a caller that has a buffer in hand and no tree to
+/// build.
+pub fn imports_of(
+    contents: &[u8],
+    grammar: &tree_sitter::Language,
+) -> Option<(HashMap<String, String>, Vec<String>)> {
+    let tree = parsed(contents, grammar)?;
+    Some(imports_in(tree.root_node(), contents, "").settled())
+}
+
+/// The names a file offers to other crates: the local names of the `pub use`
+/// declarations at its top level.
+///
+/// A `use` without `pub` is not one of them, and neither is a `pub(crate)`
+/// one. That is the whole difference between a name another crate may write
+/// and one it may not, so a caller that cannot tell them apart cannot tell
+/// whether the import it would write compiles.
+pub fn re_exports_of(
+    contents: &[u8],
+    grammar: &tree_sitter::Language,
+) -> Option<HashMap<String, String>> {
+    let tree = parsed(contents, grammar)?;
+    let root = tree.root_node();
+    let mut brought = Brought::default();
+    let mut walking = root.walk();
+    for child in root.named_children(&mut walking) {
+        if child.kind() != "use_declaration" || !reaches_other_crates(child, contents) {
+            continue;
+        }
+        if let Some(argument) = child.child_by_field_name("argument") {
+            brought.absorb(one_use(argument, contents, ""));
+        }
+    }
+    let (named, _) = brought.settled();
+    Some(named)
+}
+
+fn parsed(contents: &[u8], grammar: &tree_sitter::Language) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(grammar).ok()?;
+    parser.parse(contents, None)
+}
+
+fn reaches_other_crates(node: tree_sitter::Node, contents: &[u8]) -> bool {
+    let mut walking = node.walk();
+    node.named_children(&mut walking).any(|child| {
+        child.kind() == "visibility_modifier"
+            && child.utf8_text(contents).map(str::trim) == Ok("pub")
+    })
+}
+
 fn imports_in(node: tree_sitter::Node, contents: &[u8], prefix: &str) -> Brought {
     let mut brought = Brought::default();
     let mut walking = node.walk();
@@ -631,7 +687,9 @@ fn crate_roots(root: &Path) -> Vec<(String, String)> {
     roots
 }
 
-fn package_name(manifest: &str) -> Option<String> {
+/// The name a manifest gives its package, with `-` turned into `_` the way
+/// code writes it.
+pub fn package_name(manifest: &str) -> Option<String> {
     let mut inside_the_package = false;
     for line in manifest.lines() {
         let line = line.trim();
@@ -649,7 +707,8 @@ fn package_name(manifest: &str) -> Option<String> {
     None
 }
 
-fn library_path(manifest: &str) -> Option<String> {
+/// The file a manifest names as its library root, where it names one.
+pub fn library_path(manifest: &str) -> Option<String> {
     let mut inside_the_library = false;
     for line in manifest.lines() {
         let line = line.trim();
