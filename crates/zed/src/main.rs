@@ -778,7 +778,7 @@ fn main() {
         // client panel and the database panel's own actions were unreachable.
         cargo_diagnostics::init(cx);
         go_diagnostics::init(cx);
-        ruff_diagnostics::init(cx);
+        python_diagnostics::init(cx);
         json_diagnostics::init(cx);
         clang_diagnostics::init(cx);
         yaml_diagnostics::init(cx);

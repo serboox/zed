@@ -1,5 +1,5 @@
 [package]
-name = "ruff_diagnostics"
+name = "python_diagnostics"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [lib]
-path = "src/ruff_diagnostics.rs"
+path = "src/python_diagnostics.rs"
 doctest = false
 
 [dependencies]

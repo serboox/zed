@@ -18952,7 +18952,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruff_diagnostics"
+name = "python_diagnostics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -29759,6 +29759,7 @@ dependencies = [
  "project_symbols",
  "prompt_store",
  "proto",
+ "python_diagnostics",
  "python_types",
  "rayon",
  "recent_projects",
@@ -29768,7 +29769,6 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
- "ruff_diagnostics 0.1.0",
  "run_configurations",
  "sandbox",
  "search",

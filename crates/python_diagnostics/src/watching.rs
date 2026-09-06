@@ -14,7 +14,7 @@ use project::buffer_store::BufferStoreEvent;
 use crate::what_ruff_reported;
 
 actions!(
-    ruff_diagnostics,
+    python_diagnostics,
     [
         /// Asks ruff what is wrong with this project's Python and shows the
         /// answer, without a language server.

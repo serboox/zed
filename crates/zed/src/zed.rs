@@ -6368,7 +6368,7 @@ mod tests {
             rename_preview::init(cx);
             cargo_diagnostics::init(cx);
             go_diagnostics::init(cx);
-            ruff_diagnostics::init(cx);
+            python_diagnostics::init(cx);
             json_diagnostics::init(cx);
             yaml_diagnostics::init(cx);
             initialize_workspace(app_state.clone(), cx);
