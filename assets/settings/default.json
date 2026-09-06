@@ -2598,6 +2598,14 @@
   },
   // LSP Specific settings.
   "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // Priming analyses the whole project before a single question is
+        // asked, and the questions that do not need it are answered from
+        // this editor's own index instead.
+        "cachePriming": { "enable": false },
+      },
+    },
     // Specify the LSP name as a key here.
     // "rust-analyzer": {
     //     // A special flag for rust-analyzer integration, to use server-provided tasks
