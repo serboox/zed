@@ -35,6 +35,18 @@ pub struct IndexFirst {
 }
 
 impl IndexFirst {
+    /// The provider as `init` installs it, for a test that wants to ask it the
+    /// questions an editor asks without standing up an editor to do it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn over(project: &Entity<Project>, index: &Entity<crate::SymbolIndex>) -> Self {
+        Self {
+            project: project.downgrade(),
+            index: index.downgrade(),
+        }
+    }
+}
+
+impl IndexFirst {
     /// The occurrences the index calls this name's, in the file that is open.
     ///
     /// `None` where the index will not say -- an ambiguous name, a member of a
