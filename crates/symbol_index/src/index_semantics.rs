@@ -96,20 +96,19 @@ impl IndexFirst {
         Some(highlights)
     }
 
-    /// Where the project declares the name under the cursor, as the link the
-    /// editor navigates by.
+    /// Where the index says the name under the cursor is declared, worked out
+    /// while the buffer and the index are both in hand.
     ///
     /// The same gate as everywhere else here: nothing for a name the index will
     /// not resolve, and nothing for a name it declares more than once. Landing
     /// a reader in the wrong file is worse than not moving them.
-    fn declaration_link(
+    fn where_the_index_says(
         &self,
         buffer: &Entity<Buffer>,
         position: text::Anchor,
         cx: &mut App,
-    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+    ) -> Option<Declared> {
         let index = self.index.upgrade()?;
-        let project = self.project.upgrade()?;
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
         let (range, name) = word_at(&snapshot, offset)?;
@@ -121,37 +120,14 @@ impl IndexFirst {
             };
             index.where_declared(&name)?
         };
-        let origin = language::Location {
-            buffer: buffer.clone(),
-            range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
-        };
-
-        Some(cx.spawn(async move |cx| {
-            let opened = project
-                .update(cx, |project, cx| project.open_local_buffer(&path, cx))?
-                .await?;
-            let target = opened.read_with(cx, |opened, _| {
-                let snapshot = opened.snapshot();
-                // `Definition::line` is one-based, as a reader counts lines.
-                let row = declared.line.saturating_sub(1);
-                let at = name_on_line(&snapshot, row, &declared.name)
-                    .or_else(|| point_of(&snapshot, row, 0).map(|start| start..start));
-                at.map(|at| language::Location {
-                    buffer: opened.clone(),
-                    range: snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end),
-                })
-            })?;
-            let Some(target) = target else {
-                // The file has moved under the index and no longer has that
-                // line. Answering nothing sends the reader nowhere, which is
-                // the right place.
-                return Ok(None);
-            };
-            Ok(Some(vec![LocationLink {
-                origin: Some(origin),
-                target,
-            }]))
-        }))
+        Some(Declared {
+            path,
+            declared,
+            origin: language::Location {
+                buffer: buffer.clone(),
+                range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+            },
+        })
     }
 
     /// What the index can say about the name under the cursor: the line that
@@ -375,6 +351,53 @@ fn comment_above(lines: &[&str], at: usize, markers: &[Arc<str>]) -> Option<Stri
     (!joined.is_empty()).then_some(joined)
 }
 
+/// Where the index says the name under the cursor is declared, and the place
+/// the reader asked from, kept together until it is known whether the file has
+/// to be opened at all.
+struct Declared {
+    path: std::path::PathBuf,
+    declared: Definition,
+    origin: language::Location,
+}
+
+/// Opens the file the index named and points at the name on the line it
+/// recorded, falling back to the start of that line where the name is no
+/// longer written there.
+async fn open_the_declaration(
+    project: WeakEntity<Project>,
+    where_it_is: Declared,
+    cx: &mut gpui::AsyncApp,
+) -> Result<Option<Vec<LocationLink>>> {
+    let Declared {
+        path,
+        declared,
+        origin,
+    } = where_it_is;
+    let opened = project
+        .update(cx, |project, cx| project.open_local_buffer(&path, cx))?
+        .await?;
+    let target = opened.read_with(cx, |opened, _| {
+        let snapshot = opened.snapshot();
+        // `Definition::line` is one-based, as a reader counts lines.
+        let row = declared.line.saturating_sub(1);
+        let at = name_on_line(&snapshot, row, &declared.name)
+            .or_else(|| point_of(&snapshot, row, 0).map(|start| start..start));
+        at.map(|at| language::Location {
+            buffer: opened.clone(),
+            range: snapshot.anchor_before(at.start)..snapshot.anchor_after(at.end),
+        })
+    })?;
+    let Some(target) = target else {
+        // The file has moved under the index and no longer has that line.
+        // Answering nothing sends the reader nowhere, which is the right place.
+        return Ok(None);
+    };
+    Ok(Some(vec![LocationLink {
+        origin: Some(origin),
+        target,
+    }]))
+}
+
 /// How many places the index may be asked to open buffers for. A name written
 /// ten thousand times is not a list anybody reads, and opening a buffer per
 /// file to build it is the expensive part.
@@ -405,8 +428,23 @@ fn name_on_line(snapshot: &language::BufferSnapshot, row: u32, name: &str) -> Op
         }
         line.push(character);
     }
-    let at = line.find(name)?;
-    Some(start + at..start + at + name.len())
+    // Not the first substring: on `func (s *Server) Serve() {`, the name
+    // `Serve` first appears inside `Server`, and a reader sent there lands in
+    // the receiver type rather than on the method.
+    let is_word = |character: char| character.is_alphanumeric() || character == '_';
+    let mut from = 0;
+    while let Some(at) = line[from..].find(name) {
+        let at = from + at;
+        let before = line[..at].chars().next_back();
+        let after = line[at + name.len()..].chars().next();
+        if !before.is_some_and(is_word) && !after.is_some_and(is_word) {
+            return Some(start + at..start + at + name.len());
+        }
+        // Past the whole name: `at + 1` is not always a character boundary,
+        // and slicing there panics.
+        from = at + name.len();
+    }
+    None
 }
 
 /// The word the cursor is in, and where it starts and ends.
@@ -481,6 +519,13 @@ impl SemanticsProvider for IndexFirst {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
         let (_, name) = word_at(&snapshot, offset)?;
+        // The same refusal the underlining makes, and for the same reason: an
+        // unsaved edit has moved every row below it, and a stale row that lands
+        // on another occurrence of the same name passes the text check below
+        // and is reported as a place the reader never asked about.
+        if buffer.read(cx).is_dirty() {
+            return None;
+        }
 
         let places = {
             let index = index.read(cx);
@@ -502,9 +547,17 @@ impl SemanticsProvider for IndexFirst {
                     Some(buffer) => buffer.clone(),
                     None => {
                         let full = root.join(&place.path);
-                        let buffer = project
-                            .update(cx, |project, cx| project.open_local_buffer(&full, cx))?
-                            .await?;
+                        // A file the index recorded and the tree no longer has
+                        // is one place lost, not the whole answer: the rest are
+                        // still where they were said to be.
+                        let Ok(opening) =
+                            project.update(cx, |project, cx| project.open_local_buffer(&full, cx))
+                        else {
+                            continue;
+                        };
+                        let Ok(buffer) = opening.await else {
+                            continue;
+                        };
                         opened.insert(place.path.clone(), buffer.clone());
                         buffer
                     }
@@ -647,15 +700,20 @@ impl SemanticsProvider for IndexFirst {
         if kind != editor::GotoDefinitionKind::Symbol {
             return from_the_server;
         }
-        let Some(from_the_index) = self.declaration_link(buffer, position, cx) else {
-            return from_the_server;
-        };
+        // Worked out now, while the buffer and the index are both in hand, but
+        // the file it names is opened only if the server has nothing: opening a
+        // buffer per lookup in a project that has a server is work started and
+        // thrown away.
+        let where_it_is = self.where_the_index_says(buffer, position, cx)?;
+        let project = self.project.clone();
         let Some(from_the_server) = from_the_server else {
-            return Some(from_the_index);
+            return Some(
+                cx.spawn(async move |cx| open_the_declaration(project, where_it_is, cx).await),
+            );
         };
-        Some(cx.spawn(async move |_| match from_the_server.await {
+        Some(cx.spawn(async move |cx| match from_the_server.await {
             Ok(Some(found)) if !found.is_empty() => Ok(Some(found)),
-            _ => from_the_index.await,
+            _ => open_the_declaration(project, where_it_is, cx).await,
         }))
     }
 
@@ -736,6 +794,27 @@ mod tests {
         assert!(
             name_on_line(&snapshot, 0, "work").is_none(),
             "a name that is not on that line"
+        );
+    }
+
+    #[gpui::test]
+    fn a_name_inside_a_longer_word_is_not_the_name(cx: &mut gpui::TestAppContext) {
+        // The receiver type holds `Serve` inside `Server`, before the method
+        // of that name -- a reader sent to the first substring lands in the
+        // wrong token on the right line.
+        let buffer = cx.new(|cx| language::Buffer::local("func (s *Server) Serve() {\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+
+        let at = name_on_line(&snapshot, 0, "Serve").expect("the method is on that line");
+        assert_eq!(
+            snapshot.text_for_range(at.clone()).collect::<String>(),
+            "Serve"
+        );
+        let text = snapshot.text();
+        assert_eq!(
+            at.start,
+            text.rfind("Serve").expect("the method"),
+            "the method, not the receiver type it is spelled inside"
         );
     }
 

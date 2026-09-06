@@ -15022,7 +15022,7 @@ struct FixedCompletions {
 impl InProcessCompletions for FixedCompletions {
     fn completions(
         &self,
-        _project: &Entity<Project>,
+        _project: &project::InProcessProject,
         buffer: &Entity<Buffer>,
         position: language::PointUtf16,
         _context: &lsp::CompletionContext,

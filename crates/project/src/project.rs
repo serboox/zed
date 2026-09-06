@@ -4590,7 +4590,16 @@ impl Project {
             // A language server that failed or was cancelled must not cost the
             // reader what the in-process sources answered: with no server
             // running at all this is the only answer there is.
-            let mut responses = from_language_servers.await.log_err().unwrap_or_default();
+            // A failure is held rather than returned at once: a server that
+            // failed or was cancelled has said nothing, and an in-process
+            // source may still have something. Only if none does is the
+            // failure handed back -- "the servers did not answer" is not "there
+            // are no completions", and a reader can tell the two apart.
+            let (mut responses, trouble) = match from_language_servers.await {
+                Ok(responses) => (responses, None),
+                Err(trouble) => (Vec::new(), Some(trouble)),
+            };
+            let mut anything_in_process = false;
             for task in in_process {
                 // A broken in-process source must not cost the reader whatever
                 // the language servers already answered.
@@ -4600,11 +4609,17 @@ impl Project {
                 if completions.is_empty() {
                     continue;
                 }
+                anything_in_process = true;
                 responses.push(CompletionResponse {
                     completions,
                     display_options: CompletionDisplayOptions::default(),
                     is_incomplete: false,
                 });
+            }
+            if let Some(trouble) = trouble
+                && !anything_in_process
+            {
+                return Err(trouble);
             }
             Ok(responses)
         })

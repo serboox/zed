@@ -182,9 +182,32 @@ impl<'a> Reader<'a> {
         self.skip_trivia()?;
         self.depth += 1;
         if self.depth > DEEPEST_NESTING {
+            self.depth -= 1;
             return Err(self.wrong_here("nested deeper than this can read"));
         }
         let start = self.at;
+        // Every arm below can fail, and the counter has to come back down on
+        // those paths too: today an error ends the whole parse, but a caller
+        // that recovered and read on with the same reader would watch the
+        // depth climb until valid documents were refused.
+        let value = match self.read_one(pointer, values, names) {
+            Ok(value) => value,
+            Err(unreadable) => {
+                self.depth -= 1;
+                return Err(unreadable);
+            }
+        };
+        values.insert(pointer.to_string(), start..self.at);
+        self.depth -= 1;
+        Ok(value)
+    }
+
+    fn read_one(
+        &mut self,
+        pointer: &str,
+        values: &mut HashMap<String, Range<usize>>,
+        names: &mut HashMap<String, Range<usize>>,
+    ) -> Result<Value, Unreadable> {
         let value = match self.peek() {
             Some(b'{') => self.object(pointer, values, names)?,
             Some(b'[') => self.array(pointer, values, names)?,
@@ -196,8 +219,6 @@ impl<'a> Reader<'a> {
             Some(_) => return Err(self.wrong_here("expected a value")),
             None => return Err(self.wrong_here("expected a value")),
         };
-        values.insert(pointer.to_string(), start..self.at);
-        self.depth -= 1;
         Ok(value)
     }
 

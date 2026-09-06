@@ -4172,11 +4172,6 @@ mod tests {
         );
     }
 
-    /// Every language the editor has a grammar for answers, whether anybody
-    /// wrote a query for it or not: where there is no written query, one is
-    /// built from the grammar's own node kinds. `None` is left to mean the
-    /// one thing it should -- the editor has no grammar for this file at all
-    /// -- so the caller can tell "nothing better to say" from "nothing here".
     #[test]
     fn assembly_answers_from_a_written_query_because_its_grammar_has_no_identifier() {
         // Its names are `word` and `ident`, neither of which the built query
@@ -4195,6 +4190,11 @@ mod tests {
         );
     }
 
+    /// Every language the editor has a grammar for answers, whether anybody
+    /// wrote a query for it or not: where there is no written query, one is
+    /// built from the grammar's own node kinds. `None` is left to mean the
+    /// one thing it should -- the editor has no grammar for this file at all
+    /// -- so the caller can tell "nothing better to say" from "nothing here".
     #[test]
     fn a_language_with_no_written_query_still_answers_from_its_grammar() {
         // Go has a written query and answers from it.

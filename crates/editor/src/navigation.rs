@@ -1396,12 +1396,7 @@ impl Editor {
         let workspace = self.workspace()?;
         let project = workspace.read(cx).project().clone();
         let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
-        // Asked alongside the server, never instead of it. With no server
-        // running this is the only answer there is, and it is the question the
-        // index was built to answer.
-        let without_a_server = self
-            .semantics_provider()
-            .and_then(|provider| provider.references(&buffer, head, cx));
+        let asked_at = buffer.clone();
         Some(cx.spawn_in(window, async move |editor, cx| {
             let _cleanup = cx.on_drop(&editor, move |editor, _| {
                 if let Ok(i) = editor
@@ -1412,12 +1407,27 @@ impl Editor {
                 }
             });
 
-            let locations = match references.await? {
-                Some(found) if !found.is_empty() => Some(found),
-                _ => match without_a_server {
+            // The server answers wherever it is running. Where it did not --
+            // because none is, or because the request failed or was cancelled
+            // mid-edit -- the index is asked, and only then: it opens a buffer
+            // per file holding the name, which is not work to start and throw
+            // away on every lookup in a project that has a server.
+            let answered = references.await;
+            let server_answered = matches!(&answered, Ok(Some(found)) if !found.is_empty());
+            let locations = if server_answered {
+                answered?
+            } else {
+                let from_the_index = editor.update(cx, |editor, cx| {
+                    editor
+                        .semantics_provider()
+                        .and_then(|provider| provider.references(&asked_at, head, cx))
+                })?;
+                match from_the_index {
                     Some(task) => task.await?,
-                    None => None,
-                },
+                    // Nothing of our own to say, so whatever the server said --
+                    // including its error -- is the answer.
+                    None => answered?,
+                }
             };
             let Some(locations) = locations else {
                 return anyhow::Ok(Navigated::No);
