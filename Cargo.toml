@@ -215,6 +215,7 @@ members = [
     "crates/snippet_provider",
     "crates/snippets_ui",
     "crates/split_preview",
+    "crates/sql_diagnostics",
     "crates/sql_semantic_tokens_lsp",
     "crates/sqlez",
     "crates/sqlez_macros",
@@ -497,6 +498,7 @@ snippet = { path = "crates/snippet" }
 snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
 split_preview = { path = "crates/split_preview" }
+sql_diagnostics = { path = "crates/sql_diagnostics" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }
@@ -884,6 +886,8 @@ servo = "0.4"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 smol = "2.0"
 sqlformat = "0.2"
+sqruff-lib = "0.40.0"
+sqruff-lib-core = "0.40.0"
 stacksafe = "0.1"
 streaming-iterator = "0.1"
 strsim = "0.11"

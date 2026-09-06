@@ -209,6 +209,7 @@ smol.workspace = true
 split_preview.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
+sql_diagnostics.workspace = true
 pdf_preview.workspace = true
 rename_preview.workspace = true
 structural_search.workspace = true

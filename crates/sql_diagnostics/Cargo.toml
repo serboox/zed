@@ -1,0 +1,28 @@
+[package]
+name = "sql_diagnostics"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/sql_diagnostics.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+project.workspace = true
+sqruff-lib.workspace = true
+sqruff-lib-core.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
