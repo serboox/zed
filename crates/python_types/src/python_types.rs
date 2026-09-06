@@ -1,4 +1,5 @@
 mod edited_system;
+mod type_completions;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -17,17 +18,23 @@ use ty_project::{ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
 use crate::edited_system::{EditedSystem, OpenBuffers};
 
-/// Answers hover for Python out of `ty`'s type inference, in this process.
+/// Answers hover and completion for Python out of `ty`'s type inference, in
+/// this process.
+///
+/// One source object behind both, so the two share the project databases they
+/// answer out of rather than each building its own.
 pub fn init(cx: &mut App) {
-    project::register_in_process_hover(Arc::new(TypesFromTy::default()), cx);
+    let types = Arc::new(TypesFromTy::default());
+    project::register_in_process_hover(types.clone(), cx);
+    project::register_in_process_completions(types, cx);
 }
 
 #[derive(Default)]
-struct TypesFromTy {
+pub(crate) struct TypesFromTy {
     projects: Mutex<HashMap<PathBuf, Arc<PythonProject>>>,
 }
 
-struct PythonProject {
+pub(crate) struct PythonProject {
     // One lock over the database rather than a handle per query: salsa cancels
     // every outstanding query when an input changes, and every hover changes an
     // input (the text of the buffer being read). Serialising them is what makes
@@ -49,7 +56,7 @@ impl TypesFromTy {
 }
 
 impl PythonProject {
-    fn discover(root: &Path) -> Option<Self> {
+    pub(crate) fn discover(root: &Path) -> Option<Self> {
         let root = SystemPathBuf::from_path_buf(root.to_path_buf()).ok()?;
         let open = Arc::new(OpenBuffers::default());
         let system = EditedSystem::new(&root, open.clone());
@@ -75,7 +82,7 @@ impl InProcessHover for TypesFromTy {
         position: PointUtf16,
         cx: &mut App,
     ) -> Task<Option<Vec<Hover>>> {
-        let Some(asked) = what_was_asked(context, buffer, position, cx) else {
+        let Some(asked) = what_was_asked(&context.worktree_roots, buffer, position, cx) else {
             return Task::ready(None);
         };
         let Some(project) = self.project_for(&asked.root) else {
@@ -99,12 +106,12 @@ impl InProcessHover for TypesFromTy {
     }
 }
 
-/// Everything a hover needs that can only be read on the foreground thread.
-struct Asked {
-    root: PathBuf,
-    path: SystemPathBuf,
-    text: String,
-    offset: TextSize,
+/// Everything an answer needs that can only be read on the foreground thread.
+pub(crate) struct Asked {
+    pub(crate) root: PathBuf,
+    pub(crate) path: SystemPathBuf,
+    pub(crate) text: String,
+    pub(crate) offset: TextSize,
 }
 
 /// What `ty` said, and the span of source it said it about.
@@ -113,8 +120,8 @@ struct Said {
     about: TextRange,
 }
 
-fn what_was_asked(
-    context: &InProcessHoverContext,
+pub(crate) fn what_was_asked(
+    worktree_roots: &[PathBuf],
     buffer: &Entity<Buffer>,
     position: PointUtf16,
     cx: &App,
@@ -127,8 +134,7 @@ fn what_was_asked(
     ) {
         return None;
     }
-    let root = context
-        .worktree_roots
+    let root = worktree_roots
         .iter()
         .find(|root| path.starts_with(root))
         .cloned()
@@ -257,11 +263,11 @@ mod tests {
         assert!(what_ty_says("# just a comment\n", 4).is_none());
     }
 
-    /// Reports what one project's database costs after answering across
-    /// several modules that pull the standard library in, against the 293 MB a
-    /// `pyright` server holds for the same job. Printed rather than asserted:
-    /// the number is for a person to read, and a threshold here would fail on
-    /// an unrelated allocator change.
+    /// Reports what one project's database costs after answering hovers and
+    /// completions across several modules that pull the standard library in,
+    /// against the 293 MB a `pyright` server holds for the same job. Printed
+    /// rather than asserted: the number is for a person to read, and a
+    /// threshold here would fail on an unrelated allocator change.
     #[test]
     fn resident_memory_after_reading_a_project() {
         let modules = [
@@ -288,30 +294,49 @@ mod tests {
         }
         let before = resident_bytes();
         let project = PythonProject::discover(directory.path()).expect("a project");
+        let asked_about = |name: &str, source: &str, offset: usize| Asked {
+            root: directory.path().to_path_buf(),
+            path: SystemPathBuf::from_path_buf(directory.path().join(name)).expect("a UTF-8 path"),
+            text: source.to_string(),
+            offset: TextSize::try_from(offset).expect("an offset that fits"),
+        };
         let mut answered = 0;
         for (name, source) in modules {
             for (offset, _) in source.char_indices() {
-                let said = answer(
-                    &project,
-                    &Asked {
-                        root: directory.path().to_path_buf(),
-                        path: SystemPathBuf::from_path_buf(directory.path().join(name))
-                            .expect("a UTF-8 path"),
-                        text: source.to_string(),
-                        offset: TextSize::try_from(offset).expect("an offset that fits"),
-                    },
-                );
-                if said.is_some() {
+                if answer(&project, &asked_about(name, source, offset)).is_some() {
                     answered += 1;
+                }
+            }
+        }
+        let after_hovers = resident_bytes();
+
+        // The completion side asks the same database for the members of every
+        // expression a `.` follows, which is where a menu is actually offered:
+        // once with nothing typed after the dot, and once with the whole
+        // member name typed, which is the two ends of what a reader does.
+        let mut offered = 0;
+        for (name, source) in modules {
+            for (dot, _) in source.match_indices('.') {
+                let typed = source[dot + 1..]
+                    .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+                    .unwrap_or(source.len() - dot - 1);
+                for offset in [dot + 1, dot + 1 + typed] {
+                    offered += crate::type_completions::offer(
+                        &project,
+                        &asked_about(name, source, offset),
+                    )
+                    .len();
                 }
             }
         }
         let after = resident_bytes();
         assert!(answered > 0, "the measurement needs real answers");
+        assert!(offered > 0, "the measurement needs real suggestions");
         println!(
-            "resident memory over {} modules and {answered} answers: {:.1} MB before, {:.1} MB after, {:.1} MB for the database",
+            "resident memory over {} modules, {answered} hovers and {offered} suggestions: {:.1} MB before, {:.1} MB after hovers, {:.1} MB after completions, {:.1} MB for the database",
             modules.len(),
             before as f64 / 1e6,
+            after_hovers as f64 / 1e6,
             after as f64 / 1e6,
             after.saturating_sub(before) as f64 / 1e6
         );

@@ -844,6 +844,7 @@ ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fda
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
 ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
 ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
+ty_python_semantic = { git = "https://github.com/astral-sh/ruff", rev = "11c76bf48fdac06b2f240cba502eda96da4dce77" }
 
 rustc-hash = "2.1.0"
 rustls = { version = "0.23.26" }
