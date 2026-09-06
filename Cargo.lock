@@ -17577,6 +17577,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "python_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "python_types"
 version = "0.1.0"
 dependencies = [
@@ -18917,7 +18936,7 @@ dependencies = [
  "pathdiff",
  "ruff_annotate_snippets",
  "ruff_cache",
- "ruff_diagnostics 0.0.10",
+ "ruff_diagnostics",
  "ruff_memory_usage",
  "ruff_notebook",
  "ruff_python_ast",
@@ -18949,25 +18968,6 @@ dependencies = [
  "is-macro",
  "ruff_text_size",
  "serde",
-]
-
-[[package]]
-name = "python_diagnostics"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "collections",
- "gpui",
- "language",
- "log",
- "lsp",
- "pretty_assertions",
- "project",
- "serde",
- "serde_json",
- "smol",
- "which 6.0.3",
- "workspace",
 ]
 
 [[package]]
@@ -19009,7 +19009,7 @@ source = "git+https://github.com/astral-sh/ruff?rev=11c76bf48fdac06b2f240cba502e
 dependencies = [
  "anyhow",
  "rand 0.10.2",
- "ruff_diagnostics 0.0.10",
+ "ruff_diagnostics",
  "ruff_source_file",
  "ruff_text_size",
  "serde",
@@ -19065,7 +19065,7 @@ version = "0.0.10"
 source = "git+https://github.com/astral-sh/ruff?rev=11c76bf48fdac06b2f240cba502eda96da4dce77#11c76bf48fdac06b2f240cba502eda96da4dce77"
 dependencies = [
  "anyhow",
- "ruff_diagnostics 0.0.10",
+ "ruff_diagnostics",
  "ruff_python_ast",
  "ruff_python_codegen",
  "ruff_python_trivia",
@@ -25585,7 +25585,7 @@ dependencies = [
  "rayon",
  "regex",
  "ruff_db",
- "ruff_diagnostics 0.0.10",
+ "ruff_diagnostics",
  "ruff_index",
  "ruff_memory_usage",
  "ruff_python_ast",
@@ -25726,7 +25726,7 @@ dependencies = [
  "ordermap",
  "rayon",
  "ruff_db",
- "ruff_diagnostics 0.0.10",
+ "ruff_diagnostics",
  "ruff_index",
  "ruff_macros",
  "ruff_memory_usage",
