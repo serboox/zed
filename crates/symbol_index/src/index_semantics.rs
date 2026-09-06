@@ -375,6 +375,11 @@ fn comment_above(lines: &[&str], at: usize, markers: &[Arc<str>]) -> Option<Stri
     (!joined.is_empty()).then_some(joined)
 }
 
+/// How many places the index may be asked to open buffers for. A name written
+/// ten thousand times is not a list anybody reads, and opening a buffer per
+/// file to build it is the expensive part.
+const MOST_PLACES_WORTH_OPENING: usize = 1000;
+
 /// The offset a row and column stand for, or nothing where the file has moved
 /// under the index and that place is no longer in it.
 fn point_of(snapshot: &language::BufferSnapshot, row: u32, column: u32) -> Option<usize> {
@@ -462,6 +467,71 @@ impl SemanticsProvider for IndexFirst {
                 Some(answered) if !answered.iter().all(project::Hover::is_empty) => Some(answered),
                 _ => card.await,
             }
+        }))
+    }
+
+    fn references(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<language::Location>>>>> {
+        let index = self.index.upgrade()?;
+        let project = self.project.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (_, name) = word_at(&snapshot, offset)?;
+
+        let places = {
+            let index = index.read(cx);
+            let WhatItMeans::TheseAre(places) = index.what_a_name_means(&name)? else {
+                return None;
+            };
+            places
+        };
+        if places.is_empty() || places.len() > MOST_PLACES_WORTH_OPENING {
+            return None;
+        }
+        let root = index.read(cx).root().to_path_buf();
+
+        Some(cx.spawn(async move |cx| {
+            let mut found = Vec::new();
+            let mut opened: HashMap<String, Entity<Buffer>> = HashMap::default();
+            for place in places {
+                let buffer = match opened.get(&place.path) {
+                    Some(buffer) => buffer.clone(),
+                    None => {
+                        let full = root.join(&place.path);
+                        let buffer = project
+                            .update(cx, |project, cx| project.open_local_buffer(&full, cx))?
+                            .await?;
+                        opened.insert(place.path.clone(), buffer.clone());
+                        buffer
+                    }
+                };
+                let range = buffer.read_with(cx, |buffer, _| {
+                    let snapshot = buffer.snapshot();
+                    let from = point_of(&snapshot, place.row, place.column)?;
+                    let to = point_of(&snapshot, place.row, place.column + name.len() as u32)?;
+                    // The store holds what the file said when it was last read.
+                    // A place whose text is no longer the name is a row that has
+                    // moved, and pointing a reader at it would send them to a
+                    // word they did not ask about.
+                    (snapshot.text_for_range(from..to).collect::<String>() == name)
+                        .then(|| snapshot.anchor_before(from)..snapshot.anchor_after(to))
+                })?;
+                let Some(range) = range else {
+                    continue;
+                };
+                found.push(language::Location { buffer, range });
+            }
+            // Every place having moved is a store that has fallen behind the
+            // files, and an empty answer reads as "no references" rather than
+            // "ask somebody else"; `None` is the one that says the latter.
+            if found.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(found))
         }))
     }
 

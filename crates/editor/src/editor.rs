@@ -11309,6 +11309,18 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>>;
 
+    /// Every place the project writes the name under the cursor, where
+    /// something other than a language server can say. Nothing by default, and
+    /// the server is asked as before.
+    fn references(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<language::Location>>>>> {
+        None
+    }
+
     /// The signature of the call the cursor is inside, where something other
     /// than a language server can say what it is. Nothing by default, and the
     /// server is asked as before.

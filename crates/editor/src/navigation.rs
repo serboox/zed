@@ -1396,6 +1396,12 @@ impl Editor {
         let workspace = self.workspace()?;
         let project = workspace.read(cx).project().clone();
         let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
+        // Asked alongside the server, never instead of it. With no server
+        // running this is the only answer there is, and it is the question the
+        // index was built to answer.
+        let without_a_server = self
+            .semantics_provider()
+            .and_then(|provider| provider.references(&buffer, head, cx));
         Some(cx.spawn_in(window, async move |editor, cx| {
             let _cleanup = cx.on_drop(&editor, move |editor, _| {
                 if let Ok(i) = editor
@@ -1406,7 +1412,14 @@ impl Editor {
                 }
             });
 
-            let Some(locations) = references.await? else {
+            let locations = match references.await? {
+                Some(found) if !found.is_empty() => Some(found),
+                _ => match without_a_server {
+                    Some(task) => task.await?,
+                    None => None,
+                },
+            };
+            let Some(locations) = locations else {
                 return anyhow::Ok(Navigated::No);
             };
             let mut locations = cx.update(|_, cx| {

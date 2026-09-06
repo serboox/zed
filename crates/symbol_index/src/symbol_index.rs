@@ -180,6 +180,12 @@ impl SymbolIndex {
             .unwrap_or_default()
     }
 
+    /// The directory the index was built over, which is what the relative
+    /// paths its rows hold are relative to.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Where the project declares `name`, when it declares it in exactly one
     /// place, as an absolute path and the definition itself.
     ///
