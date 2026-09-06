@@ -241,6 +241,7 @@ members = [
     "crates/time_format",
     "crates/title_bar",
     "crates/toolchain_selector",
+    "crates/typo_diagnostics",
     "crates/ui",
     "crates/ui_input",
     "crates/ui_macros",
@@ -522,6 +523,7 @@ time_format = { path = "crates/time_format" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 title_bar = { path = "crates/title_bar" }
 toolchain_selector = { path = "crates/toolchain_selector" }
+typo_diagnostics = { path = "crates/typo_diagnostics" }
 ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
@@ -956,6 +958,8 @@ tree-sitter-sequel = "0.3"
 tree-sitter-xml = "0.7"
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
 tracing = "0.1.40"
+typos = "0.10.44"
+typos-dict = "0.14"
 unicase = "2.6"
 unicode-script = "0.5.7"
 unicode-segmentation = "1.10"

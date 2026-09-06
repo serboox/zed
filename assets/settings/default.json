@@ -1629,6 +1629,13 @@
     // Whether the strip of readings for a running configuration is shown.
     "show_process_metrics": true
   },
+  // The misspelling check over names and comments, which runs with no
+  // language server.
+  "typo_diagnostics": {
+    // Whether a misspelling in a name or a comment is reported, as advice
+    // rather than as a fault.
+    "enabled": true
+  },
   "auto_update": true,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //

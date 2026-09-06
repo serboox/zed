@@ -783,6 +783,7 @@ fn main() {
         clang_diagnostics::init(cx);
         yaml_diagnostics::init(cx);
         js_diagnostics::init(cx);
+        typo_diagnostics::init(cx);
         db_client_ui::init(cx);
         api_client_ui::init(cx);
         hierarchy_view::init(cx);
