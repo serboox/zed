@@ -1306,9 +1306,7 @@ mod tests {
         let window =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = window
-            .read_with(cx, |multi_workspace, _| {
-                multi_workspace.workspace().clone()
-            })
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .expect("the test window holds a workspace");
         let mut cx = VisualTestContext::from_window(window.into(), cx);
 
@@ -1331,7 +1329,7 @@ mod tests {
                     |selections| {
                         // Column four lands inside `helper` on the first line.
                         selections.select_ranges([
-                            language::Point::new(0, 4)..language::Point::new(0, 4),
+                            language::Point::new(0, 4)..language::Point::new(0, 4)
                         ]);
                     },
                 );
@@ -1381,9 +1379,7 @@ mod tests {
     /// And with a server that renames, the gesture still reaches the server's
     /// inline rename and the preview stays out of the way.
     #[gpui::test]
-    async fn the_rename_action_with_a_server_still_gets_the_inline_rename(
-        cx: &mut TestAppContext,
-    ) {
+    async fn the_rename_action_with_a_server_still_gets_the_inline_rename(cx: &mut TestAppContext) {
         let (workspace, editor, _lsp_handle, mut cx) = one_file_open_at_helper(true, cx).await;
 
         cx.dispatch_action(editor::actions::Rename);

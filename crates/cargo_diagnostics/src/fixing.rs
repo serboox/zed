@@ -39,13 +39,10 @@ impl Fixes {
         let mut by_file: HashMap<PathBuf, Vec<Anchored>> = HashMap::new();
         for one in reported {
             for fix in &one.fixes {
-                by_file
-                    .entry(one.path.clone())
-                    .or_default()
-                    .push(Anchored {
-                        at: one.diagnostic.range,
-                        fix: fix.clone(),
-                    });
+                by_file.entry(one.path.clone()).or_default().push(Anchored {
+                    at: one.diagnostic.range,
+                    fix: fix.clone(),
+                });
             }
         }
         self.by_file = by_file;
@@ -328,7 +325,9 @@ mod tests {
             .find("pub fn")
             .expect("the first line, which no error is on");
         assert!(
-            offered_at(&project, &buffer, elsewhere, cx).await.is_empty(),
+            offered_at(&project, &buffer, elsewhere, cx)
+                .await
+                .is_empty(),
             "the error is three lines down"
         );
     }

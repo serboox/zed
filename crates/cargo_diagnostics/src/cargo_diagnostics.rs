@@ -616,7 +616,10 @@ mod tests {
     #[test]
     fn applying_a_fix_produces_the_text_the_compiler_asked_for() {
         let reported = reported_over(SUGGESTED, SUGGESTED_SOURCE);
-        let fix = the_fix_titled(&reported, "consider changing this to be a mutable reference");
+        let fix = the_fix_titled(
+            &reported,
+            "consider changing this to be a mutable reference",
+        );
 
         assert_eq!(
             applying(fix, SUGGESTED_SOURCE),
@@ -741,7 +744,10 @@ mod tests {
         assert_eq!(reported.len(), 2);
         assert!(reported[0].fixes.is_empty(), "the type error suggests none");
 
-        let fix = the_fix_titled(&reported, "if this is intentional, prefix it with an underscore");
+        let fix = the_fix_titled(
+            &reported,
+            "if this is intentional, prefix it with an underscore",
+        );
         assert_eq!(fix.replacements[0].new_text, "_never_read");
         assert_eq!(fix.replacements[0].replaced, "never_read");
         assert_eq!(

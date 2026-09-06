@@ -583,11 +583,9 @@ impl Render for GrpcView {
                     .child(
                         Button::new("grpc-connect-reflection", "Connect via Reflection")
                             .style(cyberpunk::Rank::Accent.style())
-                            .on_click(
-                            cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.connect_via_reflection(window, cx)
-                            }),
-                        ),
+                            })),
                     ),
             )
             .child(
@@ -712,11 +710,13 @@ impl Render for GrpcView {
                                 .id("grpc-send-hitbox")
                                 .debug_selector(|| "grpc-send".to_string())
                                 .when(can_send, |el| {
-                                    el.child(Button::new("grpc-send", "Send")
-                                        .style(cyberpunk::Rank::Accent.style())
-                                        .on_click(
-                                        cx.listener(|this, _, window, cx| this.send(window, cx)),
-                                    ))
+                                    el.child(
+                                        Button::new("grpc-send", "Send")
+                                            .style(cyberpunk::Rank::Accent.style())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.send(window, cx)
+                                            })),
+                                    )
                                 })
                                 .when(!can_send, |el| {
                                     el.child(

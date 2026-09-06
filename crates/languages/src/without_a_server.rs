@@ -484,7 +484,6 @@ mod tests {
         );
     }
 
-
     #[gpui::test]
     async fn sql_names_a_trigger_once_and_after_itself(cx: &mut TestAppContext) {
         let items = outline_of(
@@ -515,7 +514,10 @@ mod tests {
             );
         }
         assert_eq!(
-            names.iter().filter(|text| text.contains("customers")).count(),
+            names
+                .iter()
+                .filter(|text| text.contains("customers"))
+                .count(),
             3,
             "the table is named once and each trigger once, in {names:?}"
         );

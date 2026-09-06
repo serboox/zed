@@ -16736,11 +16736,16 @@ async fn test_in_process_code_actions_without_a_language_server(cx: &mut gpui::T
     cx.executor().run_until_parked();
 
     let offered = project
-        .update(cx, |project, cx| project.code_actions(&buffer, 0..0, None, cx))
+        .update(cx, |project, cx| {
+            project.code_actions(&buffer, 0..0, None, cx)
+        })
         .await
         .unwrap()
         .unwrap_or_default();
-    assert_eq!(action_titles(&offered), vec!["without_a_server".to_string()]);
+    assert_eq!(
+        action_titles(&offered),
+        vec!["without_a_server".to_string()]
+    );
 
     // An in-process action has no server to send its edit to, so applying it
     // has to go through the project's own edits rather than the server path,
@@ -16815,7 +16820,9 @@ async fn test_language_server_code_actions_win_over_the_in_process_ones(
     });
 
     let offered = project
-        .update(cx, |project, cx| project.code_actions(&buffer, 0..0, None, cx))
+        .update(cx, |project, cx| {
+            project.code_actions(&buffer, 0..0, None, cx)
+        })
         .await
         .unwrap()
         .unwrap_or_default();

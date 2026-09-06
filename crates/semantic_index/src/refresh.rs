@@ -74,10 +74,9 @@ pub fn refresh(
             let full = root.join(&relative);
             let language = match languages::claimant(name, &claimed) {
                 Some(language) => language,
-                None => languages::claimant_by_first_line(
-                    &languages::first_line_of(&full)?,
-                    &readable,
-                )?,
+                None => {
+                    languages::claimant_by_first_line(&languages::first_line_of(&full)?, &readable)?
+                }
             };
             Some((relative, full, language))
         })

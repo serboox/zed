@@ -1471,16 +1471,18 @@ impl BrowserToolsPanel {
                         IconButton::new("copy-selector", IconName::Copy)
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Copy this element's selector"))
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                panel.copy(selector.clone(), cx)
-                            }))
+                            .on_click(
+                                cx.listener(move |panel, _, _, cx| {
+                                    panel.copy(selector.clone(), cx)
+                                }),
+                            )
                             .into_any_element(),
                         Button::new("copy-html", "HTML")
                             .label_size(LabelSize::XSmall)
                             .tooltip(Tooltip::text("Copy this element's HTML"))
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                panel.copy(html.clone(), cx)
-                            }))
+                            .on_click(
+                                cx.listener(move |panel, _, _, cx| panel.copy(html.clone(), cx)),
+                            )
                             .into_any_element(),
                         div()
                             .id("edit-html-hitbox")
@@ -4397,8 +4399,7 @@ mod tests {
         answered(&frame, cx, &[(Ask::Selector, "#the-chosen-element")]);
 
         click(cx, "copy-selector");
-        let copied =
-            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(
             copied.as_deref(),
             Some("#the-chosen-element"),

@@ -1074,10 +1074,9 @@ pub fn build(root: &Path, cores: usize, into: &Symbols) -> Result<Built> {
                 // line, and most of a repository's shell scripts do exactly
                 // that. Reading that line is only paid for by the files nothing
                 // else claimed.
-                None => languages::claimant_by_first_line(
-                    &languages::first_line_of(&path)?,
-                    &readable,
-                )?,
+                None => {
+                    languages::claimant_by_first_line(&languages::first_line_of(&path)?, &readable)?
+                }
             };
             Some((path, language))
         })
