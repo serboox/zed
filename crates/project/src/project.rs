@@ -733,6 +733,9 @@ pub struct InProcessProject {
     pub project: Entity<Project>,
     pub languages: Arc<LanguageRegistry>,
     pub lsp_store: Entity<LspStore>,
+    /// The absolute path of every visible worktree, longest first, so the one
+    /// that contains a file is the first that matches it.
+    pub worktree_roots: Vec<PathBuf>,
 }
 
 /// A source of completions that runs inside this process, with no language
@@ -4569,6 +4572,15 @@ impl Project {
         })
     }
 
+    /// The absolute path of every visible worktree, longest first, so the one
+    /// that contains a file is the first that matches it.
+    fn sorted_visible_worktree_roots(&self, cx: &App) -> Vec<PathBuf> {
+        self.visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .sorted_by_key(|root| std::cmp::Reverse(root.components().count()))
+            .collect()
+    }
+
     pub fn hover<T: ToPointUtf16>(
         &self,
         buffer: &Entity<Buffer>,
@@ -4588,11 +4600,7 @@ impl Project {
         }
 
         let context = InProcessHoverContext {
-            worktree_roots: self
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                .sorted_by_key(|root| std::cmp::Reverse(root.components().count()))
-                .collect(),
+            worktree_roots: self.sorted_visible_worktree_roots(cx),
         };
         let in_process = sources
             .iter()
@@ -4653,6 +4661,7 @@ impl Project {
             project: cx.entity(),
             languages: self.languages.clone(),
             lsp_store: self.lsp_store.clone(),
+            worktree_roots: self.sorted_visible_worktree_roots(cx),
         };
         let in_process = sources
             .iter()

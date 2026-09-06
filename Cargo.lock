@@ -17580,17 +17580,23 @@ dependencies = [
 name = "python_types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "fs",
  "gpui",
  "language",
  "log",
+ "lsp",
  "project",
  "ruff_db",
  "ruff_notebook",
  "ruff_text_size",
+ "serde_json",
+ "settings",
  "tempfile",
  "text",
  "ty_ide",
  "ty_project",
+ "ty_python_semantic",
 ]
 
 [[package]]
