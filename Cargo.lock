@@ -406,7 +406,7 @@ dependencies = [
  "reqwest_client",
  "rust-embed",
  "sandbox",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -449,7 +449,7 @@ dependencies = [
  "futures-concurrency",
  "rustc-hash 2.1.3",
  "rustix 1.1.2",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "shell-words",
@@ -476,7 +476,7 @@ checksum = "06679e1542356341f4550ccfb16338b64f37f6af70de2105446ef6fbb078234c"
 dependencies = [
  "anyhow",
  "derive_more",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
@@ -542,7 +542,7 @@ dependencies = [
  "paths",
  "project",
  "regex",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -645,7 +645,7 @@ dependencies = [
  "reqwest_client",
  "rope",
  "sandbox",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "search",
  "semver 1.0.27",
  "serde",
@@ -911,7 +911,7 @@ dependencies = [
  "http_client",
  "language_model_core",
  "log",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -2293,7 +2293,7 @@ dependencies = [
  "aws-smithy-types",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -3644,9 +3644,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.5.59"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2348487adcd4631696ced64ccdb40d38ac4d31cae7f2eec8817fcea1b9d1c43c"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
 dependencies = [
  "clap",
 ]
@@ -4328,7 +4328,7 @@ dependencies = [
  "pollster 0.4.0",
  "postage",
  "rand 0.9.4",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -5376,7 +5376,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "proto",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -5393,7 +5393,7 @@ name = "dap-types"
 version = "0.0.1"
 source = "git+https://github.com/zed-industries/dap-types?rev=1b461b310481d01e02b2603c16d7144b926339f8#1b461b310481d01e02b2603c16d7144b926339f8"
 dependencies = [
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
 ]
@@ -5672,7 +5672,7 @@ dependencies = [
  "project",
  "regex",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -5781,7 +5781,7 @@ dependencies = [
  "pretty_assertions",
  "project",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -5820,7 +5820,7 @@ dependencies = [
  "anyhow",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
 ]
@@ -6219,7 +6219,7 @@ dependencies = [
  "jsonschema",
  "mdbook",
  "regex",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -6701,7 +6701,7 @@ dependencies = [
  "release_channel",
  "rope",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -7368,7 +7368,7 @@ dependencies = [
  "picker",
  "project",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "settings",
@@ -7406,6 +7406,17 @@ name = "fancy-regex"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata 0.4.18",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata 0.4.18",
@@ -7508,7 +7519,7 @@ dependencies = [
  "fs",
  "gpui",
  "inventory",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde_json",
  "settings",
 ]
@@ -8399,7 +8410,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "rope",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "smallvec",
@@ -8481,7 +8492,7 @@ dependencies = [
  "release_channel",
  "remote",
  "remote_connection",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "search",
  "serde",
  "serde_json",
@@ -8832,7 +8843,7 @@ dependencies = [
  "http_client",
  "language_model_core",
  "log",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -8939,7 +8950,7 @@ dependencies = [
  "reqwest_client",
  "resvg 0.46.0",
  "scheduler",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "seahash",
  "serde",
  "serde_json",
@@ -9091,7 +9102,7 @@ dependencies = [
 name = "gpui_shared_string"
 version = "0.1.0"
 dependencies = [
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "smol_str",
 ]
@@ -11478,7 +11489,7 @@ dependencies = [
  "paths",
  "project",
  "schema_documents",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -11827,7 +11838,7 @@ dependencies = [
  "parking_lot",
  "path",
  "regex",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "toml 0.8.23",
@@ -11892,7 +11903,7 @@ dependencies = [
  "log",
  "partial-json-fixer",
  "pretty_assertions",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -11953,7 +11964,7 @@ dependencies = [
  "pretty_assertions",
  "rand 0.9.4",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -11982,7 +11993,7 @@ dependencies = [
  "language_model",
  "log",
  "open_ai",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -12509,7 +12520,7 @@ dependencies = [
  "anyhow",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "url",
@@ -12533,7 +12544,7 @@ dependencies = [
  "anyhow",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
 ]
@@ -12731,7 +12742,7 @@ dependencies = [
  "parking_lot",
  "postage",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -13031,6 +13042,22 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+]
+
+[[package]]
+name = "markdown_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "rumdl",
+ "workspace",
 ]
 
 [[package]]
@@ -13596,7 +13623,7 @@ dependencies = [
  "anyhow",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -14932,7 +14959,7 @@ dependencies = [
  "anyhow",
  "futures 0.3.32",
  "http_client",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -14956,7 +14983,7 @@ dependencies = [
  "notifications",
  "picker",
  "project",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "settings",
  "telemetry",
@@ -15062,7 +15089,7 @@ dependencies = [
  "log",
  "pretty_assertions",
  "rand 0.9.4",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -15081,7 +15108,7 @@ dependencies = [
  "picker",
  "project",
  "project_panel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -15100,7 +15127,7 @@ dependencies = [
  "futures 0.3.32",
  "http_client",
  "language_model_core",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -15135,7 +15162,7 @@ dependencies = [
  "google_ai",
  "http_client",
  "language_model_core",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -16468,7 +16495,7 @@ dependencies = [
  "language",
  "menu",
  "project",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -17108,7 +17135,7 @@ dependencies = [
  "release_channel",
  "remote",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -17188,7 +17215,7 @@ dependencies = [
  "project",
  "rayon",
  "remote_connection",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "search",
  "serde",
  "serde_json",
@@ -17542,6 +17569,7 @@ checksum = "1e8bbe1a966bd2f362681a44f6edce3c2310ac21e4d5067a6e7ec396297a6ea0"
 dependencies = [
  "bitflags 2.13.1",
  "memchr",
+ "pulldown-cmark-escape 0.11.0",
  "unicase",
 ]
 
@@ -18393,7 +18421,7 @@ dependencies = [
  "prost 0.9.0",
  "release_channel",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -19197,6 +19225,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumdl"
+version = "0.2.66"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6672da0e112f1543bd7084208f78d2c24bc44f272755c51406001de116a1c282"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "dyn-clone",
+ "fancy-regex 0.17.0",
+ "globset",
+ "ignore",
+ "indexmap 2.14.0",
+ "libc",
+ "log",
+ "mimalloc",
+ "percent-encoding",
+ "pulldown-cmark 0.13.0",
+ "regex",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.20",
+ "tikv-jemallocator",
+ "toml 1.1.4+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
+ "unicode-normalization",
+ "unicode-width 0.2.2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "run_configurations"
 version = "0.1.0"
 dependencies = [
@@ -19746,7 +19806,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger 0.11.8",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -19768,9 +19828,9 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.0.4"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82d20c4491bc164fa2f6c5d44565947a52ad80b9505d8e36f8d54c27c739fcd0"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
  "indexmap 2.14.0",
@@ -19782,14 +19842,14 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.0.4"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d020396d1d138dc19f1165df7545479dcd58d93810dc5d646a16e55abefa80"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.117",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -20276,13 +20336,13 @@ dependencies = [
 
 [[package]]
 name = "serde_derive_internals"
-version = "0.29.1"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -20377,7 +20437,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.14.0",
  "schemars 0.9.0",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -21906,7 +21966,7 @@ dependencies = [
  "pretty_assertions",
  "release_channel",
  "rust-embed",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -21929,7 +21989,7 @@ dependencies = [
  "gpui",
  "language_model_core",
  "log",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -22027,7 +22087,7 @@ dependencies = [
  "regex",
  "release_channel",
  "rodio",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "search",
  "serde",
  "serde_json",
@@ -22577,7 +22637,7 @@ dependencies = [
  "indoc",
  "parking_lot",
  "paths",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -23839,7 +23899,7 @@ dependencies = [
  "menu",
  "picker",
  "project",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "settings",
@@ -23947,7 +24007,7 @@ dependencies = [
  "parking_lot",
  "pretty_assertions",
  "proto",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -24107,7 +24167,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "settings",
  "sysinfo 0.37.2",
@@ -24156,7 +24216,7 @@ dependencies = [
  "release_channel",
  "remote",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -24204,7 +24264,7 @@ dependencies = [
  "palette",
  "parking_lot",
  "refineable",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -24281,7 +24341,7 @@ dependencies = [
  "log",
  "palette",
  "refineable",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -24584,7 +24644,7 @@ dependencies = [
  "remote",
  "remote_connection",
  "rpc",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "semver 1.0.27",
  "serde",
  "serde_json",
@@ -24864,6 +24924,19 @@ dependencies = [
  "toml_datetime 0.7.3",
  "toml_parser",
  "winnow 0.7.13",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap 2.14.0",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.2",
 ]
 
 [[package]]
@@ -25919,7 +25992,7 @@ dependencies = [
  "log",
  "menu",
  "num-format",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "settings",
  "smallvec",
@@ -26333,7 +26406,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "rust-embed",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_json_lenient",
@@ -26505,7 +26578,7 @@ dependencies = [
  "project_panel",
  "regex",
  "release_channel",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "search",
  "semver 1.0.27",
  "serde",
@@ -29074,7 +29147,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "remote",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "session",
@@ -29290,7 +29363,7 @@ name = "x_ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "strum 0.27.2",
 ]
@@ -29784,6 +29857,7 @@ dependencies = [
  "log",
  "lsp_locations",
  "markdown",
+ "markdown_diagnostics",
  "markdown_preview",
  "menu",
  "migrator",
@@ -29991,7 +30065,7 @@ name = "zed_actions"
 version = "0.1.0"
 dependencies = [
  "gpui",
- "schemars 1.0.4",
+ "schemars 1.2.2",
  "serde",
  "util",
 ]
