@@ -1,6 +1,14 @@
+use collections::HashSet;
+use fs::Fs;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle,
     SharedString, Subscription, WeakEntity, Window,
+};
+use language::LanguageServerName;
+use language::language_settings::all_language_settings;
+use project::project_settings::{LanguageServerStart, ProjectSettings};
+use settings::{
+    LspSettings, SemanticTokens, Settings as _, SettingsStore, update_settings_file_with_completion,
 };
 use task::TaskTemplate;
 use ui::cyberpunk::CyberpunkSurface as _;
@@ -26,6 +34,148 @@ pub enum Pointing {
     Remembered { label: String },
 }
 
+/// The one server whose cache priming is worth a switch of its own: it is the
+/// only one this fork ships an `initialization_options` default for.
+const RUST_ANALYZER: &str = "rust-analyzer";
+
+/// How much the editor may spend on answering a question about the code.
+///
+/// Three rather than two, because the choice between no types at all and every
+/// hint repainting on each keystroke is not the one a reader wants to make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnsweringMode {
+    /// The index alone. Nothing starts on its own.
+    Index,
+    /// A server for the language being read, for the one thing an index cannot
+    /// work out.
+    Types,
+    /// Every hint a server can give, warmed before it is asked for.
+    Everything,
+}
+
+/// What a mode is, spelled out in the settings it stands for.
+///
+/// A mode is not stored anywhere: it is read back out of these four values, so
+/// editing `settings.json` by hand moves the lit segment as surely as pressing
+/// one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnsweringCost {
+    start: LanguageServerStart,
+    prime_caches: bool,
+    inlay_hints: bool,
+    semantic_tokens: SemanticTokens,
+}
+
+impl AnsweringMode {
+    const ALL: [Self; 3] = [Self::Index, Self::Types, Self::Everything];
+
+    fn costs(self) -> AnsweringCost {
+        match self {
+            Self::Index => AnsweringCost {
+                start: LanguageServerStart::ByHand,
+                prime_caches: false,
+                inlay_hints: false,
+                semantic_tokens: SemanticTokens::Off,
+            },
+            Self::Types => AnsweringCost {
+                start: LanguageServerStart::Automatically,
+                prime_caches: false,
+                inlay_hints: false,
+                semantic_tokens: SemanticTokens::Off,
+            },
+            Self::Everything => AnsweringCost {
+                start: LanguageServerStart::Automatically,
+                prime_caches: true,
+                inlay_hints: true,
+                semantic_tokens: SemanticTokens::Combined,
+            },
+        }
+    }
+
+    /// The mode these settings are, if they are one of the three at all.
+    fn matching(cost: AnsweringCost) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.costs() == cost)
+    }
+
+    /// The mode the editor is in right now. `None` when the settings are some
+    /// mixture of their own, which is a state the reader is allowed to be in.
+    fn in_effect(cx: &App) -> Option<Self> {
+        Self::matching(AnsweringCost::in_effect(cx))
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Index => IconName::ListTree,
+            Self::Types => IconName::Code,
+            // A flame rather than a sparkle: a sparkle means AI everywhere else
+            // in this chrome, and this mode honestly burns.
+            Self::Everything => IconName::Flame,
+        }
+    }
+
+    /// What it costs, rather than what it does -- the cost is the part the
+    /// reader is choosing between.
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Index => "The editor answers from its own index. No language server starts.",
+            Self::Types => {
+                "A server starts for the language you are in. Types on hover, completion by type."
+            }
+            Self::Everything => {
+                "Hints in the line, semantic colour, caches warmed before you ask. Costs the most."
+            }
+        }
+    }
+
+    /// Names the segment itself: the element it is, and the thing a test
+    /// presses.
+    fn segment_selector(self) -> &'static str {
+        match self {
+            Self::Index => "answering-mode-index",
+            Self::Types => "answering-mode-types",
+            Self::Everything => "answering-mode-everything",
+        }
+    }
+
+    /// Names whether the segment is the lit one. `IconButton` paints the same
+    /// bounds whichever colour its icon is, so this is the only place the lit
+    /// state is legible from outside the render.
+    fn state_selector(self, lit: bool) -> &'static str {
+        match (self, lit) {
+            (Self::Index, true) => "answering-mode-index-lit",
+            (Self::Index, false) => "answering-mode-index-dim",
+            (Self::Types, true) => "answering-mode-types-lit",
+            (Self::Types, false) => "answering-mode-types-dim",
+            (Self::Everything, true) => "answering-mode-everything-lit",
+            (Self::Everything, false) => "answering-mode-everything-dim",
+        }
+    }
+}
+
+impl AnsweringCost {
+    fn in_effect(cx: &App) -> Self {
+        let defaults = &all_language_settings(None, cx).defaults;
+        Self {
+            start: ProjectSettings::get_global(cx).global_lsp_settings.start,
+            prime_caches: caches_are_primed(cx),
+            inlay_hints: defaults.inlay_hints.enabled,
+            semantic_tokens: defaults.semantic_tokens,
+        }
+    }
+}
+
+/// rust-analyzer primes its caches unless it is told not to, so an absent
+/// setting reads as on.
+fn caches_are_primed(cx: &App) -> bool {
+    ProjectSettings::get_global(cx)
+        .lsp
+        .get(&LanguageServerName::new_static(RUST_ANALYZER))
+        .and_then(|settings| settings.initialization_options.as_ref())
+        .and_then(|options| options.pointer("/cachePriming/enable"))
+        .and_then(|primed| primed.as_bool())
+        .unwrap_or(true)
+}
+
 /// The switcher above the editor: what will run, and the two presses that run it.
 ///
 /// It is the one control that answers "again, the same way" without opening
@@ -44,11 +194,15 @@ impl ConfigurationsToolbar {
             toolbar.keep_pointing_at_something(cx);
             cx.notify();
         });
+        // The answering mode is read out of the settings rather than held here,
+        // so the bar has to be redrawn whenever they move -- including when they
+        // are edited by hand.
+        let settings_changed = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         let mut toolbar = Self {
             store,
             workspace: workspace.weak_handle(),
             pointing: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, settings_changed],
         };
         toolbar.keep_pointing_at_something(cx);
         toolbar
@@ -436,10 +590,111 @@ impl Render for ConfigurationsToolbar {
                         .into_any_element(),
                 ]))
             })
+            .child(self.answering_modes(cx))
     }
 }
 
 impl ConfigurationsToolbar {
+    /// The three answering modes, as one frame beside the run pair.
+    fn answering_modes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let in_effect = AnsweringMode::in_effect(cx);
+        cyberpunk::segmented(AnsweringMode::ALL.map(|mode| {
+            let lit = in_effect == Some(mode);
+            // Two frames of the same bounds: the outer one is the segment, the
+            // inner one says whether it is the lit one.
+            div()
+                .debug_selector(move || mode.segment_selector().to_string())
+                .child(
+                    div()
+                        .debug_selector(move || mode.state_selector(lit).to_string())
+                        .child(
+                            IconButton::new(mode.segment_selector(), mode.icon())
+                                .icon_size(IconSize::Small)
+                                .icon_color(if lit { Color::Accent } else { Color::Muted })
+                                .tooltip(Tooltip::text(mode.tooltip()))
+                                .on_click(cx.listener(move |toolbar, _, _window, cx| {
+                                    toolbar.switch_to(mode, cx)
+                                })),
+                        ),
+                )
+                .into_any_element()
+        }))
+    }
+
+    /// Writes the mode's settings, and only once they have landed asks the
+    /// servers to match: the store decides what may start by reading the
+    /// settings, so starting anything before the file is written starts nothing.
+    fn switch_to(&mut self, mode: AnsweringMode, cx: &mut Context<Self>) {
+        let costs = mode.costs();
+        let written =
+            update_settings_file_with_completion(<dyn Fs>::global(cx), cx, move |settings, _| {
+                settings.global_lsp_settings.get_or_insert_default().start = Some(costs.start);
+                let rust_analyzer = settings
+                    .project
+                    .lsp
+                    .0
+                    .entry(RUST_ANALYZER.into())
+                    .or_insert_with(|| LspSettings {
+                        binary: None,
+                        settings: None,
+                        initialization_options: None,
+                        enable_lsp_tasks: true,
+                        fetch: None,
+                    });
+                let options = rust_analyzer
+                    .initialization_options
+                    .get_or_insert_with(|| serde_json::json!({}));
+                if let Some(options) = options.as_object_mut() {
+                    options.insert(
+                        "cachePriming".to_string(),
+                        serde_json::json!({ "enable": costs.prime_caches }),
+                    );
+                }
+                let defaults = &mut settings.project.all_languages.defaults;
+                defaults.inlay_hints.get_or_insert_default().enabled = Some(costs.inlay_hints);
+                defaults.semantic_tokens = Some(costs.semantic_tokens);
+            });
+        cx.spawn(async move |toolbar, cx| {
+            match written.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    log::error!("could not write the answering mode: {error:#}");
+                    return;
+                }
+                Err(_) => return,
+            }
+            toolbar
+                .update(cx, |toolbar, cx| toolbar.match_the_servers_to(mode, cx))
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// The buffers already open keep whatever servers they have until they are
+    /// told otherwise, so a switch that only wrote the settings would be a lie
+    /// in both directions.
+    fn match_the_servers_to(&self, mode: AnsweringMode, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let (lsp_store, open_buffers) = {
+            let project = project.read(cx);
+            (project.lsp_store(), project.opened_buffers(cx))
+        };
+        lsp_store.update(cx, |lsp_store, cx| match mode {
+            // Not `stop_all_language_servers`: that latches the store shut until
+            // every server is restarted, and asking for one by hand afterwards
+            // would then do nothing.
+            AnsweringMode::Index => lsp_store
+                .stop_language_servers_for_buffers(open_buffers, HashSet::default(), cx)
+                .detach_and_log_err(cx),
+            AnsweringMode::Types | AnsweringMode::Everything => {
+                lsp_store.restart_all_language_servers(cx)
+            }
+        });
+    }
+
     /// The plaque itself: the glyph of what will run, its name, and the arrow
     /// that says there are others. Wide enough to read a name in, and no wider,
     /// since the bar's two ends have to fit beside it.
@@ -917,7 +1172,7 @@ impl Render for ConfigurationsList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use util::path;
@@ -1066,6 +1321,9 @@ mod tests {
             json!({ ".zed": { "tasks.json": tasks } }),
         )
         .await;
+        // Switching the answering mode writes the settings file, so the tests
+        // need a file system to write it to that is not the real one.
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
         let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
         let workspace_window =
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
@@ -1095,6 +1353,167 @@ mod tests {
       { "label": "unit tests", "command": "go test ./..." },
       { "label": "integration tests", "command": "go test -tags=integration ./..." }
     ]"#;
+
+    /// What a fresh install answers with. Read out of the settings that ship
+    /// rather than the suite's own, which deliberately start servers.
+    #[test]
+    fn a_fresh_install_answers_from_the_index_alone() {
+        use settings::RootUserSettings as _;
+
+        let shipped = settings::UserSettingsContent::parse_json_with_comments(
+            settings::default_settings().as_ref(),
+        )
+        .expect("the settings that ship parse")
+        .content;
+        let defaults = &shipped.project.all_languages.defaults;
+
+        let shipped_cost = AnsweringCost {
+            start: shipped
+                .global_lsp_settings
+                .as_ref()
+                .and_then(|lsp| lsp.start)
+                .expect("the shipped settings say when a server may start"),
+            prime_caches: shipped
+                .project
+                .lsp
+                .0
+                .get(RUST_ANALYZER)
+                .and_then(|server| server.initialization_options.as_ref())
+                .and_then(|options| options.pointer("/cachePriming/enable"))
+                .and_then(|primed| primed.as_bool())
+                .expect("the shipped settings say whether caches are primed"),
+            inlay_hints: defaults
+                .inlay_hints
+                .as_ref()
+                .and_then(|hints| hints.enabled)
+                .expect("the shipped settings say whether hints are shown"),
+            semantic_tokens: defaults
+                .semantic_tokens
+                .expect("the shipped settings say whether semantic tokens are asked for"),
+        };
+
+        assert_eq!(shipped_cost.start, LanguageServerStart::ByHand);
+        assert_eq!(
+            AnsweringMode::matching(shipped_cost),
+            Some(AnsweringMode::Index),
+            "a fresh install is in the mode that starts nothing"
+        );
+    }
+
+    /// Pressing a segment -- really pressing it, at the place it is painted --
+    /// writes the four settings that mode stands for, and moves the lit segment
+    /// to it.
+    #[gpui::test]
+    async fn pressing_a_segment_switches_the_answering_mode(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+        draw_the_bar(bar, &mut cx);
+
+        for mode in AnsweringMode::ALL {
+            let segment = cx.debug_bounds(mode.segment_selector()).unwrap_or_else(|| {
+                panic!("{} is painted beside the run pair", mode.segment_selector())
+            });
+            cx.simulate_click(segment.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            draw_the_bar(bar, &mut cx);
+
+            assert_eq!(
+                cx.update(|_window, cx| AnsweringCost::in_effect(cx)),
+                mode.costs(),
+                "pressing {} writes the settings that mode stands for",
+                mode.segment_selector()
+            );
+            assert!(
+                cx.debug_bounds(mode.state_selector(true)).is_some(),
+                "{} is the lit segment once it has been pressed",
+                mode.segment_selector()
+            );
+            for other in AnsweringMode::ALL
+                .into_iter()
+                .filter(|other| *other != mode)
+            {
+                assert!(
+                    cx.debug_bounds(other.state_selector(false)).is_some(),
+                    "{} is not lit while {} is",
+                    other.segment_selector(),
+                    mode.segment_selector()
+                );
+            }
+        }
+    }
+
+    /// The lit segment is read out of the settings, so editing them by hand
+    /// moves it -- and settings that are a mixture of their own light none.
+    #[gpui::test]
+    async fn the_lit_segment_follows_the_settings(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+        draw_the_bar(bar, &mut cx);
+
+        // The suite starts servers automatically and asks for nothing else,
+        // which is the middle mode.
+        assert!(
+            cx.debug_bounds(AnsweringMode::Types.state_selector(true))
+                .is_some(),
+            "the suite's own settings are the middle mode"
+        );
+
+        let everything = AnsweringMode::Everything.costs();
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.global_lsp_settings.get_or_insert_default().start =
+                        Some(everything.start);
+                    content.project.lsp.0.insert(
+                        RUST_ANALYZER.into(),
+                        LspSettings {
+                            binary: None,
+                            settings: None,
+                            initialization_options: Some(
+                                serde_json::json!({ "cachePriming": { "enable": true } }),
+                            ),
+                            enable_lsp_tasks: true,
+                            fetch: None,
+                        },
+                    );
+                    let defaults = &mut content.project.all_languages.defaults;
+                    defaults.inlay_hints.get_or_insert_default().enabled = Some(true);
+                    defaults.semantic_tokens = Some(everything.semantic_tokens);
+                });
+            });
+        });
+        cx.run_until_parked();
+        draw_the_bar(bar, &mut cx);
+
+        assert!(
+            cx.debug_bounds(AnsweringMode::Everything.state_selector(true))
+                .is_some(),
+            "settings written by hand move the lit segment"
+        );
+
+        // One value away from any of the three, and none of them is the truth.
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.project.all_languages.defaults.semantic_tokens =
+                        Some(SemanticTokens::Off);
+                });
+            });
+        });
+        cx.run_until_parked();
+        draw_the_bar(bar, &mut cx);
+
+        assert_eq!(
+            cx.update(|_window, cx| AnsweringMode::in_effect(cx)),
+            None,
+            "settings that are none of the three are a state of their own"
+        );
+        for mode in AnsweringMode::ALL {
+            assert!(
+                cx.debug_bounds(mode.state_selector(false)).is_some(),
+                "{} is not lit while the settings match no mode",
+                mode.segment_selector()
+            );
+        }
+    }
 
     /// The list is the panel the mockup draws: as wide as a name needs, a
     /// heading over the rows, and the two presses shown on the row they would
