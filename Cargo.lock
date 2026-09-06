@@ -11403,6 +11403,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "js_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "json5"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -29746,6 +29765,7 @@ dependencies = [
  "install_cli",
  "itertools 0.14.0",
  "journal",
+ "js_diagnostics",
  "json_diagnostics",
  "json_schema_store",
  "keymap_editor",

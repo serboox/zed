@@ -150,6 +150,7 @@ install_cli.workspace = true
 journal.workspace = true
 json_diagnostics.workspace = true
 json_schema_store.workspace = true
+js_diagnostics.workspace = true
 keymap_editor.workspace = true
 language.workspace = true
 language_extension.workspace = true

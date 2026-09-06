@@ -124,6 +124,7 @@ members = [
     "crates/clang_diagnostics",
     "crates/json_diagnostics",
     "crates/json_schema_store",
+    "crates/js_diagnostics",
     "crates/keymap_editor",
     "crates/language",
     "crates/language_core",
@@ -405,6 +406,7 @@ install_cli = { path = "crates/install_cli" }
 journal = { path = "crates/journal" }
 json_diagnostics = { path = "crates/json_diagnostics" }
 json_schema_store = { path = "crates/json_schema_store" }
+js_diagnostics = { path = "crates/js_diagnostics" }
 keymap_editor = { path = "crates/keymap_editor" }
 language = { path = "crates/language" }
 language_core = { path = "crates/language_core" }
