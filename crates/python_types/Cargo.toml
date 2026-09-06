@@ -1,0 +1,28 @@
+[package]
+name = "python_types"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/python_types.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+project.workspace = true
+ruff_db.workspace = true
+ruff_notebook.workspace = true
+ruff_text_size.workspace = true
+text.workspace = true
+ty_ide.workspace = true
+ty_project.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
