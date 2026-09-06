@@ -83,6 +83,7 @@ call.workspace = true
 cargo_diagnostics.workspace = true
 chrono.workspace = true
 channel.workspace = true
+clang_diagnostics.workspace = true
 clap.workspace = true
 cli.workspace = true
 client.workspace = true
