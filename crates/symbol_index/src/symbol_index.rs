@@ -15,6 +15,7 @@ use semantic_index::symbols::{Catalogue, Symbols};
 use util::ResultExt as _;
 use workspace::Workspace;
 
+pub mod call_hierarchy;
 pub mod index_semantics;
 pub mod symbol_completions;
 mod the_import_line;

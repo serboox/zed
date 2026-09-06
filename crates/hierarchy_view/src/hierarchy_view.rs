@@ -1,10 +1,10 @@
 use anyhow::Result;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
-    Render, SharedString, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
-    actions, div, px, uniform_list,
+    Action, AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, ElementId,
+    Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Pixels, Render, SharedString, Styled, Subscription, UniformListScrollHandle, WeakEntity,
+    Window, actions, div, px, uniform_list,
 };
 use language::{Anchor, Location, PointUtf16, SymbolKind};
 use project::{
@@ -16,6 +16,10 @@ use project::{
     lsp_store::LspStore,
 };
 use std::ops::Range;
+use symbol_index::{
+    SymbolIndex,
+    call_hierarchy::{self, Called},
+};
 use ui::{Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip, cyberpunk, prelude::*};
 use util::ResultExt as _;
 use workspace::{
@@ -133,7 +137,10 @@ impl Direction {
 #[derive(Clone)]
 struct HierarchyRow {
     name: SharedString,
-    kind: SymbolKind,
+    /// Already the word a reader sees: a server item and an index item name
+    /// what they are in different vocabularies, and nothing below here has to
+    /// know which one it is holding.
+    kind: SharedString,
     location: Location,
     selection_range: Range<Anchor>,
     source: RowSource,
@@ -146,13 +153,18 @@ struct HierarchyRow {
 enum RowSource {
     Call(CallHierarchyItem),
     Type(TypeHierarchyItem),
+    /// A row the project's own index worked out, with no server asked. The
+    /// name is all it takes to ask again, since that is how the index is
+    /// asked in the first place; `None` for a call written at file scope,
+    /// which names no declaration to ask about.
+    Indexed(Option<SharedString>),
 }
 
 impl From<&CallHierarchyItem> for HierarchyRow {
     fn from(item: &CallHierarchyItem) -> Self {
         Self {
             name: item.name.clone(),
-            kind: item.kind,
+            kind: SharedString::from(kind_label(item.kind)),
             location: item.location.clone(),
             selection_range: item.selection_range.clone(),
             source: RowSource::Call(item.clone()),
@@ -164,7 +176,7 @@ impl From<&TypeHierarchyItem> for HierarchyRow {
     fn from(item: &TypeHierarchyItem) -> Self {
         Self {
             name: item.name.clone(),
-            kind: item.kind,
+            kind: SharedString::from(kind_label(item.kind)),
             location: item.location.clone(),
             selection_range: item.selection_range.clone(),
             source: RowSource::Type(item.clone()),
@@ -302,6 +314,8 @@ impl HierarchyPanel {
         cx.notify();
 
         let lsp_store = self.project.read(cx).lsp_store();
+        let project = self.project.downgrade();
+        let index = self.index(cx);
         cx.spawn(async move |this, cx| {
             let result = if direction.is_call() {
                 prepare_call_hierarchy(&lsp_store, &buffer, position, cx)
@@ -311,6 +325,16 @@ impl HierarchyPanel {
                 prepare_type_hierarchy(&lsp_store, &buffer, position, cx)
                     .await
                     .map(root_outcome_from_type)
+            };
+            // The server first and unchanged; the index answers only into its
+            // silence, which is what `Unsupported` means -- no reachable
+            // server offers this for this file. And only about calls: nothing
+            // the index holds records an edge between two types.
+            let result = match (result, index) {
+                (Ok(HierarchyOutcome::Unsupported), Some(index)) if direction.is_call() => {
+                    Ok(root_from_the_index(&project, &index, &buffer, position, cx).await)
+                }
+                (result, _) => result,
             };
             this.update(cx, |this, cx| {
                 this.content = match result {
@@ -375,8 +399,10 @@ impl HierarchyPanel {
         cx.notify();
 
         let lsp_store = self.project.read(cx).lsp_store();
+        let project = self.project.downgrade();
+        let index = self.index(cx);
         cx.spawn(async move |this, cx| {
-            let result = fetch_children(&lsp_store, direction, &source, cx).await;
+            let result = fetch_children(&lsp_store, &project, &index, direction, &source, cx).await;
             this.update(cx, |this, cx| {
                 let Content::Ready { outcome, .. } = &mut this.content else {
                     return;
@@ -392,6 +418,14 @@ impl HierarchyPanel {
             .log_err();
         })
         .detach();
+    }
+
+    /// The project's own index, where one has been built for it. `None` in a
+    /// window over a project nothing indexes -- a remote project, or one
+    /// opened before the index had a chance to start -- and the panel is then
+    /// exactly what it was before the index answered anything.
+    fn index(&self, cx: &App) -> Option<WeakEntity<SymbolIndex>> {
+        symbol_index::of_project(&self.project, cx).map(|index| index.downgrade())
     }
 
     fn open_row(&self, row: &HierarchyRow, window: &mut Window, cx: &mut Context<Self>) {
@@ -575,7 +609,7 @@ impl HierarchyPanel {
                             )
                             .child(Label::new(row.name.clone()).size(LabelSize::Small))
                             .child(
-                                Label::new(kind_label(row.kind))
+                                Label::new(row.kind.clone())
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             )
@@ -745,11 +779,19 @@ fn node_at_mut<'a>(
 
 async fn fetch_children(
     lsp_store: &Entity<LspStore>,
+    project: &WeakEntity<Project>,
+    index: &Option<WeakEntity<SymbolIndex>>,
     direction: Direction,
     source: &RowSource,
     cx: &mut gpui::AsyncApp,
 ) -> Result<HierarchyOutcome<Node>> {
     match (direction, source) {
+        // A call written inside no declaration names none to ask about, and
+        // saying so is the whole reason it is a row of its own.
+        (_, RowSource::Indexed(None)) => Ok(HierarchyOutcome::NoResults),
+        (Direction::IncomingCalls | Direction::OutgoingCalls, RowSource::Indexed(Some(name))) => {
+            children_from_the_index(project, index, direction, name, cx).await
+        }
         (Direction::IncomingCalls, RowSource::Call(item)) => {
             let outcome = incoming_calls(lsp_store, item, cx).await?;
             Ok(match outcome {
@@ -814,6 +856,91 @@ fn root_outcome_from_call(outcome: HierarchyOutcome<CallHierarchyItem>) -> Hiera
 
 fn root_outcome_from_type(outcome: HierarchyOutcome<TypeHierarchyItem>) -> HierarchyOutcome<Node> {
     map_type_outcome(outcome)
+}
+
+/// The root the index answers with: the declaration the cursor is on.
+///
+/// `Unsupported` where the index will not say, which leaves the panel showing
+/// exactly the message it showed before any of this existed.
+async fn root_from_the_index(
+    project: &WeakEntity<Project>,
+    index: &WeakEntity<SymbolIndex>,
+    buffer: &Entity<language::Buffer>,
+    position: PointUtf16,
+    cx: &mut AsyncApp,
+) -> HierarchyOutcome<Node> {
+    let asked = cx.update(|cx| {
+        let index = index.upgrade()?;
+        call_hierarchy::declaration_under(&index, buffer, position, cx)
+    });
+    let Some(called) = asked else {
+        return HierarchyOutcome::Unsupported;
+    };
+    match node_from_the_index(project, &called, cx).await {
+        Some(node) => HierarchyOutcome::Found(vec![node]),
+        None => HierarchyOutcome::Unsupported,
+    }
+}
+
+/// One row's children, out of the index. Type directions never reach here:
+/// only a call direction ever produces an indexed row to expand.
+async fn children_from_the_index(
+    project: &WeakEntity<Project>,
+    index: &Option<WeakEntity<SymbolIndex>>,
+    direction: Direction,
+    name: &str,
+    cx: &mut AsyncApp,
+) -> Result<HierarchyOutcome<Node>> {
+    let Some(index) = index.as_ref().and_then(|index| index.upgrade()) else {
+        return Ok(HierarchyOutcome::Unsupported);
+    };
+    let asked = cx.update(|cx| match direction {
+        Direction::IncomingCalls => call_hierarchy::incoming(&index, name, cx),
+        Direction::OutgoingCalls => call_hierarchy::outgoing(&index, name, cx),
+        // The index records declarations and the places names occur, not edges
+        // between types, so it has nothing to say about a type hierarchy and
+        // says nothing rather than approximating one by name.
+        Direction::Supertypes | Direction::Subtypes => None,
+    });
+    let Some(asked) = asked else {
+        return Ok(HierarchyOutcome::Unsupported);
+    };
+
+    let mut nodes = Vec::new();
+    for called in asked.await {
+        if let Some(node) = node_from_the_index(project, &called, cx).await {
+            nodes.push(node);
+        }
+    }
+    Ok(if nodes.is_empty() {
+        HierarchyOutcome::NoResults
+    } else {
+        HierarchyOutcome::Found(nodes)
+    })
+}
+
+/// Opens the file the index named so the row has somewhere to send a reader,
+/// which is the one thing the index cannot work out on its own.
+async fn node_from_the_index(
+    project: &WeakEntity<Project>,
+    called: &Called,
+    cx: &mut AsyncApp,
+) -> Option<Node> {
+    let location = call_hierarchy::locate(project.clone(), called, cx).await?;
+    let name = SharedString::from(called.name.clone());
+    let selection_range = location.range.clone();
+    let source = if called.at_file_scope() {
+        RowSource::Indexed(None)
+    } else {
+        RowSource::Indexed(Some(name.clone()))
+    };
+    Some(Node::new(HierarchyRow {
+        name,
+        kind: SharedString::from(called.kind.clone()),
+        location,
+        selection_range,
+        source,
+    }))
 }
 
 impl Render for HierarchyPanel {
@@ -1433,6 +1560,245 @@ mod tests {
             // and the node is collapsed again rather than holding both the
             // old and a new set of children.
             assert!(matches!(nodes[0].expansion, Expansion::Collapsed));
+        });
+    }
+
+    const SHOP: &str = "pub fn take_stock() -> u32 {\n    1\n}\n";
+    const STORE: &str = "pub fn open_up() {\n    take_stock();\n}\n";
+
+    struct RealProject {
+        project_at: tempfile::TempDir,
+        _index_at: tempfile::TempDir,
+        window: WindowHandle<MultiWorkspace>,
+        workspace: Entity<Workspace>,
+        panel: Entity<HierarchyPanel>,
+        project: Entity<Project>,
+        servers: Option<futures::channel::mpsc::UnboundedReceiver<lsp::FakeLanguageServer>>,
+    }
+
+    /// A workspace with the panel loaded over a project that exists twice at
+    /// one path: the editor's own in-memory filesystem, which every test here
+    /// uses, and a real directory, because the index walks the disk with the
+    /// standard library rather than through the editor. Its index is built
+    /// over the real one, so the panel can be asked a question no server is
+    /// there to answer.
+    ///
+    /// `capable` says what the file's language server offers. `None` registers
+    /// no language server at all -- which is what this fork ships with, and the
+    /// case the index exists for.
+    async fn open_workspace_over_a_real_project(
+        capable: Option<bool>,
+        cx: &mut TestAppContext,
+    ) -> RealProject {
+        let project_at = tempfile::tempdir().expect("a directory to put a project in");
+        let mut tree = serde_json::Map::new();
+        for (name, contents) in [("shop.rs", SHOP), ("store.rs", STORE)] {
+            std::fs::write(project_at.path().join(name), contents).expect("a project file on disk");
+            tree.insert(
+                name.to_string(),
+                serde_json::Value::String(contents.to_string()),
+            );
+        }
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(project_at.path(), serde_json::Value::Object(tree))
+            .await;
+        let project = Project::test(fs, [project_at.path()], cx).await;
+
+        let servers = capable.map(|capable| {
+            let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+            language_registry.add(rust_lang());
+            language_registry.register_fake_lsp(
+                "Rust",
+                FakeLspAdapter {
+                    capabilities: lsp::ServerCapabilities {
+                        call_hierarchy_provider: capable
+                            .then_some(lsp::CallHierarchyServerCapability::Simple(true)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        });
+
+        let index_at = tempfile::tempdir().expect("a directory for the index's own files");
+        cx.update(|cx| {
+            symbol_index::ensure_index_at(
+                project.clone(),
+                index_at.path().join("symbol_index"),
+                cx,
+            );
+        });
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let workspace_weak = workspace.downgrade();
+        let panel = window
+            .update(cx, |_, window, cx| {
+                cx.spawn_in(window, async move |_this, cx| {
+                    HierarchyPanel::load(workspace_weak, cx.clone()).await
+                })
+            })
+            .unwrap()
+            .await
+            .expect("failed to load hierarchy panel");
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.add_panel(panel.clone(), window, cx);
+                });
+            })
+            .unwrap();
+
+        // The index builds in the background, and a question asked before the
+        // build has finished is asked of an empty one.
+        cx.run_until_parked();
+
+        RealProject {
+            project_at,
+            _index_at: index_at,
+            window,
+            workspace,
+            panel,
+            project,
+            servers,
+        }
+    }
+
+    /// Opens the declaring file and puts the cursor inside `take_stock`'s own
+    /// name, which is where a reader would ask a hierarchy question from.
+    async fn open_the_declaration_at_the_cursor(
+        workspace: &Entity<Workspace>,
+        project: &Entity<Project>,
+        at: &std::path::Path,
+        cx: &mut VisualTestContext,
+    ) {
+        let (buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(at.join("shop.rs"), cx)
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let pane = workspace.active_pane().clone();
+            let editor = workspace
+                .open_project_item::<Editor>(pane, buffer, true, true, true, true, window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                    // Column 9 lands inside "take_stock" on the first line.
+                    s.select_ranges([language::Point::new(0, 9)..language::Point::new(0, 9)]);
+                });
+            });
+        });
+    }
+
+    fn root_of(panel: &HierarchyPanel) -> &Node {
+        let Content::Ready { outcome, .. } = &panel.content else {
+            panic!("expected the panel to be ready");
+        };
+        let HierarchyOutcome::Found(nodes) = outcome else {
+            panic!("expected the root to be found");
+        };
+        assert_eq!(nodes.len(), 1, "one declaration under the cursor");
+        &nodes[0]
+    }
+
+    #[gpui::test]
+    async fn the_index_answers_incoming_calls_where_no_server_does(cx: &mut TestAppContext) {
+        init_test(cx);
+        let held = open_workspace_over_a_real_project(None, cx).await;
+        let (workspace, panel, project) = (
+            held.workspace.clone(),
+            held.panel.clone(),
+            held.project.clone(),
+        );
+        let root_path = held.project_at.path().to_path_buf();
+        let cx = &mut VisualTestContext::from_window(held.window.into(), cx);
+        open_the_declaration_at_the_cursor(&workspace, &project, &root_path, cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            HierarchyPanel::start(workspace, Direction::IncomingCalls, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let root = root_of(panel);
+            assert_eq!(root.row.name.as_ref(), "take_stock");
+            assert!(
+                matches!(root.row.source, RowSource::Indexed(Some(_))),
+                "with no server, the root comes from the index"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_expand(vec![0], cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let Expansion::Loaded(HierarchyOutcome::Found(children)) = &root_of(panel).expansion
+            else {
+                panic!("expected the root's incoming calls to be loaded");
+            };
+            let named: Vec<&str> = children
+                .iter()
+                .map(|child| child.row.name.as_ref())
+                .collect();
+            assert_eq!(
+                named,
+                vec!["open_up"],
+                "the calling function is named, not the line it calls from"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_server_that_answers_leaves_the_index_unasked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut held = open_workspace_over_a_real_project(Some(true), cx).await;
+        let (workspace, panel, project) = (
+            held.workspace.clone(),
+            held.panel.clone(),
+            held.project.clone(),
+        );
+        let root_path = held.project_at.path().to_path_buf();
+        let mut servers = held
+            .servers
+            .take()
+            .expect("a language server was asked for");
+        let cx = &mut VisualTestContext::from_window(held.window.into(), cx);
+        open_the_declaration_at_the_cursor(&workspace, &project, &root_path, cx).await;
+
+        let fake_server = servers.next().await.unwrap();
+        cx.run_until_parked();
+
+        let uri = lsp::Uri::from_file_path(root_path.join("shop.rs")).unwrap();
+        let prepared = call_item("what_the_server_says", uri, 0);
+        fake_server.set_request_handler::<lsp::request::CallHierarchyPrepare, _, _>({
+            move |_, _| {
+                let prepared = prepared.clone();
+                async move { Ok(Some(vec![prepared])) }
+            }
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            HierarchyPanel::start(workspace, Direction::IncomingCalls, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let root = root_of(panel);
+            assert_eq!(
+                root.row.name.as_ref(),
+                "what_the_server_says",
+                "the server's own answer, unchanged"
+            );
+            assert!(
+                matches!(root.row.source, RowSource::Call(_)),
+                "the index stays silent while the server answers"
+            );
         });
     }
 }

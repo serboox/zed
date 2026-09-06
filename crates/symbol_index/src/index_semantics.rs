@@ -416,11 +416,15 @@ async fn open_the_declaration(
 /// How many places the index may be asked to open buffers for. A name written
 /// ten thousand times is not a list anybody reads, and opening a buffer per
 /// file to build it is the expensive part.
-const MOST_PLACES_WORTH_OPENING: usize = 1000;
+pub(crate) const MOST_PLACES_WORTH_OPENING: usize = 1000;
 
 /// The offset a row and column stand for, or nothing where the file has moved
 /// under the index and that place is no longer in it.
-fn point_of(snapshot: &language::BufferSnapshot, row: u32, column: u32) -> Option<usize> {
+pub(crate) fn point_of(
+    snapshot: &language::BufferSnapshot,
+    row: u32,
+    column: u32,
+) -> Option<usize> {
     let point = language::Point::new(row, column);
     if point > snapshot.max_point() {
         return None;
@@ -433,7 +437,11 @@ fn point_of(snapshot: &language::BufferSnapshot, row: u32, column: u32) -> Optio
 ///
 /// Bounded: a generated file can hold a line of any length, and reading one to
 /// find a name that a caller already has another place to put is not worth it.
-fn name_on_line(snapshot: &language::BufferSnapshot, row: u32, name: &str) -> Option<Range<usize>> {
+pub(crate) fn name_on_line(
+    snapshot: &language::BufferSnapshot,
+    row: u32,
+    name: &str,
+) -> Option<Range<usize>> {
     const A_LINE_WORTH_SEARCHING: usize = 2000;
     let start = point_of(snapshot, row, 0)?;
     let mut line = String::new();
@@ -463,7 +471,10 @@ fn name_on_line(snapshot: &language::BufferSnapshot, row: u32, name: &str) -> Op
 }
 
 /// The word the cursor is in, and where it starts and ends.
-fn word_at(snapshot: &language::BufferSnapshot, offset: usize) -> Option<(Range<usize>, String)> {
+pub(crate) fn word_at(
+    snapshot: &language::BufferSnapshot,
+    offset: usize,
+) -> Option<(Range<usize>, String)> {
     let mut start = offset;
     let mut end = offset;
     let is_word = |character: char| character.is_alphanumeric() || character == '_';

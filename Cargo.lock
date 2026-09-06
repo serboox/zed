@@ -9716,6 +9716,8 @@ dependencies = [
  "semver 1.0.27",
  "serde_json",
  "settings",
+ "symbol_index",
+ "tempfile",
  "theme",
  "theme_settings",
  "ui",
