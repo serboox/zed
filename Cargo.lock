@@ -3501,6 +3501,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14c638459986b83c2b885179bd4ea6a2cbb05697b001501a56adb3a3d230803b"
 
 [[package]]
+name = "clang"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2ed30b30e1e17966b55ddd0b9dd2758fd824f0a6da6875c8abb17e6aba47c28"
+dependencies = [
+ "clang-sys",
+ "libc",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3509,6 +3519,25 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "clang_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clang",
+ "collections",
+ "futures 0.3.32",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "workspace",
 ]
 
 [[package]]
@@ -28593,6 +28622,7 @@ dependencies = [
  "cargo_diagnostics",
  "channel",
  "chrono",
+ "clang_diagnostics",
  "clap",
  "cli",
  "client",

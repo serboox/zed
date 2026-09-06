@@ -121,6 +121,7 @@ members = [
     "crates/inspector_ui",
     "crates/install_cli",
     "crates/journal",
+    "crates/clang_diagnostics",
     "crates/json_diagnostics",
     "crates/json_schema_store",
     "crates/keymap_editor",
@@ -312,6 +313,7 @@ buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
 cargo_diagnostics = { path = "crates/cargo_diagnostics" }
 channel = { path = "crates/channel" }
+clang_diagnostics = { path = "crates/clang_diagnostics" }
 cli = { path = "crates/cli" }
 client = { path = "crates/client" }
 clock = { path = "crates/clock" }
@@ -608,6 +610,11 @@ chardetng = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
 circular-buffer = "1.0"
+# Loaded at run time, never linked at build time: `runtime` makes the build
+# script do nothing at all, and the shared library is looked for when the editor
+# runs. A machine without LLVM builds and runs this editor and simply gets no
+# diagnostics for C.
+clang = { version = "2.1.0", features = ["runtime", "clang_9_0"] }
 clap = { version = "4.4", features = ["derive", "wrap_help"] }
 clap_complete = { version = "4.4" }
 clap_complete_nushell = { version = "4.4" }
