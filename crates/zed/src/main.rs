@@ -782,6 +782,7 @@ fn main() {
         json_diagnostics::init(cx);
         clang_diagnostics::init(cx);
         yaml_diagnostics::init(cx);
+        toml_diagnostics::init(cx);
         js_diagnostics::init(cx);
         db_client_ui::init(cx);
         api_client_ui::init(cx);

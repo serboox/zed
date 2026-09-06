@@ -15,7 +15,7 @@ pub use checking::{
 pub use completing::{
     CursorContext, Place, Segment, Style, Suggestion, Suggestions, suggestions_for,
 };
-pub use watching::{Reads, recheck_everything, watch};
+pub use watching::{Reads, recheck_everything, served_by_a_language_server, watch};
 
 /// A document read from a buffer, and where each part of it came from.
 ///
@@ -183,8 +183,19 @@ fn same(pattern: &str, subject: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// What was said about a text, as diagnostics the editor can show.
+/// What a schema said about a text, as diagnostics the editor can show.
 pub fn diagnostics_from(text: &str, said: Vec<(Range<usize>, Complaint)>) -> Vec<lsp::Diagnostic> {
+    diagnostics_from_source(text, said, SOURCE)
+}
+
+/// The same, for a source that is not a schema: a language whose own grammar
+/// finds faults attributes them to itself, so that a reader can tell a
+/// parser's verdict from a schema's opinion.
+pub fn diagnostics_from_source(
+    text: &str,
+    said: Vec<(Range<usize>, Complaint)>,
+    source: &str,
+) -> Vec<lsp::Diagnostic> {
     let lines = Lines::of(text);
     said.into_iter()
         .map(|(range, complaint)| lsp::Diagnostic {
@@ -197,7 +208,7 @@ pub fn diagnostics_from(text: &str, said: Vec<(Range<usize>, Complaint)>) -> Vec
             } else {
                 lsp::DiagnosticSeverity::WARNING
             }),
-            source: Some(SOURCE.to_string()),
+            source: Some(source.to_string()),
             message: complaint.message,
             ..Default::default()
         })
