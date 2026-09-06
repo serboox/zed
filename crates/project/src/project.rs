@@ -94,7 +94,7 @@ use language::{
     Buffer, BufferEditSource, BufferEvent, Capability, CodeLabel, CursorShape, DiskState, Language,
     LanguageName, LanguageRegistry, PointUtf16, ToOffset, ToPointUtf16, Toolchain,
     ToolchainMetadata, ToolchainScope, Transaction, Unclipped, language_settings::InlayHintKind,
-    proto::split_operations,
+    proto::split_operations, range_from_lsp,
 };
 use lsp::{
     CodeActionKind, CompletionContext, CompletionItemKind, DocumentHighlightKind, InsertTextMode,
@@ -137,7 +137,7 @@ use std::{
 
 use task_store::TaskStore;
 use terminals::Terminals;
-use text::{Anchor, BufferId, Point, Rope};
+use text::{Anchor, Bias, BufferId, Point, Rope};
 use toolchain_store::EmptyToolchainStore;
 use util::{
     ResultExt as _, maybe,
@@ -801,6 +801,51 @@ impl Global for InProcessHoverSources {}
 /// depend on (e.g. Python types inferred in `python_types`).
 pub fn register_in_process_hover(source: Arc<dyn InProcessHover>, cx: &mut App) {
     cx.default_global::<InProcessHoverSources>().0.push(source);
+}
+
+/// What a code action source may use, taken out before the project was
+/// leased, for the same reason [`InProcessProject`] exists.
+pub struct InProcessCodeActionContext {
+    /// The absolute path of every visible worktree, longest first, so the one
+    /// that contains a file is the first that matches it.
+    pub worktree_roots: Vec<PathBuf>,
+}
+
+/// A source of code actions that runs inside this process, with no language
+/// server behind it.
+///
+/// Like hover and unlike completions, the language servers' answer is taken
+/// whole where they gave one: a source is asked only into their silence.
+pub trait InProcessCodeActions: Send + Sync {
+    /// The id the source files its actions under.
+    ///
+    /// [`Project::apply_code_action`] matches it to route an action back to
+    /// the source's own edits. Without that, the action would take the server
+    /// path, find no server of that id, and report an empty transaction --
+    /// the fix would look applied and change nothing.
+    fn server_id(&self) -> LanguageServerId;
+
+    fn code_actions(
+        &self,
+        context: &InProcessCodeActionContext,
+        buffer: &Entity<Buffer>,
+        range: Range<PointUtf16>,
+        cx: &mut App,
+    ) -> Task<Vec<CodeAction>>;
+}
+
+#[derive(Default)]
+struct InProcessCodeActionSources(Vec<Arc<dyn InProcessCodeActions>>);
+
+impl Global for InProcessCodeActionSources {}
+
+/// Registers a code action source contributed by a crate that `project` does
+/// not depend on (e.g. the compiler's own suggestions read in
+/// `cargo_diagnostics`).
+pub fn register_in_process_code_actions(source: Arc<dyn InProcessCodeActions>, cx: &mut App) {
+    cx.default_global::<InProcessCodeActionSources>()
+        .0
+        .push(source);
 }
 
 /// Response from language server completion request.
@@ -4715,9 +4760,62 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<Vec<CodeAction>>>> {
         let buffer = buffer_handle.read(cx);
-        let range = buffer.anchor_before(range.start)..buffer.anchor_before(range.end);
-        self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.code_actions(buffer_handle, range, kinds, cx)
+        let asked_about = buffer.offset_to_point_utf16(range.start.to_offset(buffer))
+            ..buffer.offset_to_point_utf16(range.end.to_offset(buffer));
+        let anchors = buffer.anchor_before(range.start)..buffer.anchor_before(range.end);
+        let from_language_servers = self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.code_actions(buffer_handle, anchors, kinds.clone(), cx)
+        });
+
+        let sources = cx
+            .try_global::<InProcessCodeActionSources>()
+            .map_or_else(Vec::new, |sources| sources.0.clone());
+        if sources.is_empty() {
+            return from_language_servers;
+        }
+
+        let context = InProcessCodeActionContext {
+            worktree_roots: self.sorted_visible_worktree_roots(cx),
+        };
+        let in_process = sources
+            .iter()
+            .map(|source| source.code_actions(&context, buffer_handle, asked_about.clone(), cx))
+            .collect::<Vec<_>>();
+
+        cx.background_spawn(async move {
+            // The servers first, always: where one answered, its answer is
+            // taken whole. The sources fill the silence where no server was
+            // started, which in this fork is the ordinary case.
+            // A failure is held rather than returned at once, for the reason
+            // `completions` holds one: "the servers did not answer" is not
+            // "there is nothing to offer", and only if no source offers
+            // anything either is the failure what the reader is told.
+            let (answered, trouble) = match from_language_servers.await {
+                Ok(answered) => (answered, None),
+                Err(trouble) => (None, Some(trouble)),
+            };
+            if answered.as_ref().is_some_and(|actions| !actions.is_empty()) {
+                return Ok(answered);
+            }
+            let mut offered = Vec::new();
+            for task in in_process {
+                offered.extend(task.await);
+            }
+            if let Some(kinds) = &kinds {
+                offered.retain(|action| {
+                    action
+                        .lsp_action
+                        .action_kind()
+                        .is_some_and(|kind| kinds.contains(&kind))
+                });
+            }
+            if !offered.is_empty() {
+                return Ok(Some(offered));
+            }
+            match trouble {
+                Some(trouble) => Err(trouble),
+                None => Ok(answered),
+            }
         })
     }
 
@@ -4728,8 +4826,81 @@ impl Project {
         push_to_history: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        let from_a_source = cx
+            .try_global::<InProcessCodeActionSources>()
+            .is_some_and(|sources| {
+                sources
+                    .0
+                    .iter()
+                    .any(|source| source.server_id() == action.server_id)
+            });
+        if from_a_source {
+            return self.apply_code_action_without_a_server(action, push_to_history, cx);
+        }
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.apply_code_action(buffer_handle, action, push_to_history, cx)
+        })
+    }
+
+    /// Applies the edits an in-process source put in the action itself.
+    ///
+    /// Only `changes` is read, not `document_changes`: a source writes its own
+    /// action, so it can write the simpler of the two shapes, and reading a
+    /// shape nothing produces would be untested code in the apply path.
+    fn apply_code_action_without_a_server(
+        &self,
+        action: CodeAction,
+        push_to_history: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ProjectTransaction>> {
+        let Some(changes) = action
+            .lsp_action
+            .edit()
+            .and_then(|edit| edit.changes.clone())
+        else {
+            return Task::ready(Ok(ProjectTransaction::default()));
+        };
+        cx.spawn(async move |project, cx| {
+            let mut applied = ProjectTransaction::default();
+            for (uri, edits) in changes {
+                let Ok(path) = uri.to_file_path() else {
+                    continue;
+                };
+                let buffer = project
+                    .update(cx, |project, cx| project.open_local_buffer(&path, cx))?
+                    .await?;
+                let transaction = buffer.update(cx, |buffer, cx| {
+                    let mut edits = edits
+                        .into_iter()
+                        .map(|edit| {
+                            let range = range_from_lsp(edit.range);
+                            let start = buffer.clip_point_utf16(range.start, Bias::Left);
+                            let end = buffer.clip_point_utf16(range.end, Bias::Left);
+                            (start..end, edit.new_text)
+                        })
+                        .collect::<Vec<_>>();
+                    // `edit` resolves every range against the text as it is
+                    // now, so the whole set has to arrive in one call and in
+                    // order -- applying them one at a time would move the
+                    // ground under the ranges still to come.
+                    edits.sort_by_key(|(range, _)| (range.start, range.end));
+                    buffer.finalize_last_transaction();
+                    buffer.start_transaction();
+                    buffer.edit(edits, None, cx);
+                    buffer.end_transaction(cx).and_then(|transaction_id| {
+                        if push_to_history {
+                            buffer.finalize_last_transaction();
+                            buffer.get_transaction(transaction_id).cloned()
+                        } else {
+                            buffer.forget_transaction(transaction_id)
+                        }
+                    })
+                });
+                if let Some(transaction) = transaction {
+                    applied.0.insert(buffer, transaction);
+                }
+            }
+            Ok(applied)
         })
     }
 

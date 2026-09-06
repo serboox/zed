@@ -3240,6 +3240,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "fs",
  "gpui",
  "language",
  "log",
@@ -3248,7 +3249,9 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "settings",
  "smol",
+ "util",
  "which 6.0.3",
  "workspace",
 ]
