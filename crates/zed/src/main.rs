@@ -766,6 +766,7 @@ fn main() {
         // asked for on every cursor move.
         symbol_index::index_semantics::init(cx);
         symbol_index::symbol_completions::init(cx);
+        symbol_index::symbols_of_the_project::init(cx);
         // Python types, answered by `ty` in this process rather than by a
         // language server, where the servers said nothing.
         python_types::init(cx);

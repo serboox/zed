@@ -684,7 +684,7 @@ async fn open_every_place(
 /// How many places the index may be asked to open buffers for. A name written
 /// ten thousand times is not a list anybody reads, and opening a buffer per
 /// file to build it is the expensive part.
-pub(crate) const MOST_PLACES_WORTH_OPENING: usize = 1000;
+pub const MOST_PLACES_WORTH_OPENING: usize = 1000;
 
 /// The offset a row and column stand for, or nothing where the file has moved
 /// under the index and that place is no longer in it.

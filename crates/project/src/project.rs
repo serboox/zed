@@ -991,10 +991,97 @@ pub fn register_in_process_semantics(source: Arc<dyn InProcessSemantics>, cx: &m
         .push(source);
 }
 
+/// What a workspace symbol source may use, taken out before the project was
+/// leased, for the same reason [`InProcessProject`] exists.
+pub struct InProcessSymbolContext {
+    pub project: Entity<Project>,
+}
+
+/// What one source answered, and whether that is all it had.
+pub struct InProcessSymbolAnswer {
+    pub symbols: Vec<Symbol>,
+    /// True when the source found more matches than it was willing to list.
+    pub cut_short: bool,
+}
+
+/// A source of workspace symbols that runs inside this process, with no
+/// language server behind it.
+///
+/// Like hover and unlike completions, the language servers' answer is taken
+/// whole where they gave one: a source is asked only into their silence.
+pub trait InProcessWorkspaceSymbols: Send + Sync {
+    /// The name this source files its symbols under.
+    ///
+    /// [`Project::open_buffer_for_symbol`] matches it to open one of them
+    /// without looking for a language server. Without that, the symbol would
+    /// take the server path, find no server of that name, and report an
+    /// error -- the row would be listed and refuse to open.
+    fn language_server_name(&self) -> LanguageServerName;
+
+    fn symbols(
+        &self,
+        context: &InProcessSymbolContext,
+        query: &str,
+        cx: &mut App,
+    ) -> Task<InProcessSymbolAnswer>;
+}
+
+#[derive(Default)]
+struct InProcessWorkspaceSymbolSources(Vec<Arc<dyn InProcessWorkspaceSymbols>>);
+
+impl Global for InProcessWorkspaceSymbolSources {}
+
+/// Registers a workspace symbol source contributed by a crate that `project`
+/// does not depend on (e.g. the project's own symbols read out of the index
+/// in `symbol_index`).
+pub fn register_in_process_workspace_symbols(
+    source: Arc<dyn InProcessWorkspaceSymbols>,
+    cx: &mut App,
+) {
+    cx.default_global::<InProcessWorkspaceSymbolSources>()
+        .0
+        .push(source);
+}
+
 /// Every registered semantics source, in the order they were registered.
 pub fn in_process_semantics(cx: &App) -> Vec<Arc<dyn InProcessSemantics>> {
     cx.try_global::<InProcessSemanticsSources>()
         .map_or_else(Vec::new, |sources| sources.0.clone())
+}
+
+fn in_process_workspace_symbols_named(name: &LanguageServerName, cx: &App) -> bool {
+    cx.try_global::<InProcessWorkspaceSymbolSources>()
+        .is_some_and(|sources| {
+            sources
+                .0
+                .iter()
+                .any(|source| &source.language_server_name() == name)
+        })
+}
+
+/// A list of workspace symbols, and whether it is all there is.
+pub struct SymbolListing {
+    pub symbols: Vec<Symbol>,
+    /// True when a source found more matches than it was willing to list, so
+    /// a surface can say the list is not complete rather than showing it as
+    /// though it were.
+    pub cut_short: bool,
+}
+
+/// What decides whether two symbols are the same one: where it is and what it
+/// is called. Two sources reading the same declaration must not put it in the
+/// list twice, and neither the label nor the kind can be compared for that --
+/// one source may render the same declaration differently from another.
+fn same_symbol(symbol: &Symbol) -> (String, String, u32) {
+    let path = match &symbol.path {
+        SymbolLocation::InProject(project_path) => format!(
+            "{}:{}",
+            project_path.worktree_id.to_usize(),
+            project_path.path.as_unix_str()
+        ),
+        SymbolLocation::OutsideProject { abs_path, .. } => abs_path.to_string_lossy().into_owned(),
+    };
+    (path, symbol.name.clone(), symbol.range.start.0.row)
 }
 
 /// Response from language server completion request.
@@ -4710,8 +4797,82 @@ impl Project {
     }
 
     pub fn symbols(&self, query: &str, cx: &mut Context<Self>) -> Task<Result<Vec<Symbol>>> {
-        self.lsp_store
-            .update(cx, |lsp_store, cx| lsp_store.symbols(query, cx))
+        let listing = self.symbol_listing(query, cx);
+        cx.background_spawn(async move { Ok(listing.await?.symbols) })
+    }
+
+    /// [`Self::symbols`], with whether the list is all there is.
+    ///
+    /// An in-process source bounds what it lists, and a surface showing a
+    /// bounded list has to be able to say so rather than presenting it as
+    /// complete.
+    pub fn symbol_listing(
+        &self,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SymbolListing>> {
+        let from_language_servers = self
+            .lsp_store
+            .update(cx, |lsp_store, cx| lsp_store.symbols(query, cx));
+
+        let sources = cx
+            .try_global::<InProcessWorkspaceSymbolSources>()
+            .map_or_else(Vec::new, |sources| sources.0.clone());
+        if sources.is_empty() {
+            return cx.background_spawn(async move {
+                Ok(SymbolListing {
+                    symbols: from_language_servers.await?,
+                    cut_short: false,
+                })
+            });
+        }
+
+        let context = InProcessSymbolContext {
+            project: cx.entity(),
+        };
+        let in_process = sources
+            .iter()
+            .map(|source| source.symbols(&context, query, cx))
+            .collect::<Vec<_>>();
+
+        cx.background_spawn(async move {
+            // The servers first, always: where one answered, it knows more
+            // than an in-process source can, and what it said is handed back
+            // whole and in its own order. The source fills the silence where
+            // no server was started, which in this fork is the ordinary case.
+            // A failure is held rather than returned at once, for the same
+            // reason it is in `completions`: a server that failed has said
+            // nothing, and a source may still have something.
+            let (answered, trouble) = match from_language_servers.await {
+                Ok(answered) => (answered, None),
+                Err(trouble) => (Vec::new(), Some(trouble)),
+            };
+            if !answered.is_empty() {
+                return Ok(SymbolListing {
+                    symbols: answered,
+                    cut_short: false,
+                });
+            }
+
+            let mut symbols: Vec<Symbol> = Vec::new();
+            let mut cut_short = false;
+            let mut seen = HashSet::default();
+            for task in in_process {
+                let source_answered = task.await;
+                cut_short |= source_answered.cut_short;
+                for symbol in source_answered.symbols {
+                    if seen.insert(same_symbol(&symbol)) {
+                        symbols.push(symbol);
+                    }
+                }
+            }
+            if symbols.is_empty()
+                && let Some(trouble) = trouble
+            {
+                return Err(trouble);
+            }
+            Ok(SymbolListing { symbols, cut_short })
+        })
     }
 
     pub fn open_buffer_for_symbol(
@@ -4719,6 +4880,14 @@ impl Project {
         symbol: &Symbol,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        if in_process_workspace_symbols_named(&symbol.language_server_name, cx) {
+            let SymbolLocation::InProject(project_path) = &symbol.path else {
+                return Task::ready(Err(anyhow!(
+                    "an in-process symbol source only reports symbols inside the project"
+                )));
+            };
+            return self.open_buffer(project_path.clone(), cx);
+        }
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.open_buffer_for_symbol(symbol, cx)
         })

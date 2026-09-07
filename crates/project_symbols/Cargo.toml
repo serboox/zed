@@ -34,9 +34,12 @@ futures.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
+menu.workspace = true
 project = { workspace = true, features = ["test-support"] }
 release_channel.workspace = true
 semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+symbol_index.workspace = true
+tempfile.workspace = true
 theme = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

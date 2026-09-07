@@ -18,6 +18,7 @@ use workspace::Workspace;
 pub mod call_hierarchy;
 pub mod index_semantics;
 pub mod symbol_completions;
+pub mod symbols_of_the_project;
 mod the_import_line;
 
 #[cfg(test)]
