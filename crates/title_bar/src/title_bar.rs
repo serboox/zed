@@ -215,6 +215,28 @@ pub fn set_middle_of_the_bar(
     cx.set_global(WhatGoesInTheMiddle(Arc::new(middle)));
 }
 
+/// Makes whatever goes at the right of the title bar for one workspace.
+///
+/// Registered rather than depended on, for the same reason the middle is: what
+/// belongs there -- today, the gauge that says how much the editor may spend on
+/// answering a question -- knows about the project's settings and its language
+/// servers, which the title bar itself has no business knowing.
+type RightOfTheBar =
+    Arc<dyn Fn(&Workspace, &mut Window, &mut App) -> Option<AnyView> + Send + Sync>;
+
+struct WhatGoesAtTheRight(RightOfTheBar);
+
+impl Global for WhatGoesAtTheRight {}
+
+/// Says what the title bar puts immediately left of the account controls. Set
+/// once, before any workspace is opened.
+pub fn set_right_of_the_bar(
+    cx: &mut App,
+    right: impl Fn(&Workspace, &mut Window, &mut App) -> Option<AnyView> + Send + Sync + 'static,
+) {
+    cx.set_global(WhatGoesAtTheRight(Arc::new(right)));
+}
+
 pub struct TitleBar {
     platform_titlebar: Entity<PlatformTitleBar>,
     project: Entity<Project>,
@@ -231,6 +253,9 @@ pub struct TitleBar {
     /// What sits between the project and the account controls, if anything was
     /// registered to go there.
     middle: Option<AnyView>,
+    /// What sits immediately left of the account controls, if anything was
+    /// registered to go there.
+    right: Option<AnyView>,
 }
 
 /// How far right of the middle of the bar whatever is put in its middle sits.
@@ -257,7 +282,11 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
-        let mut children = <ArrayVec<_, 3>>::new();
+        // Four groups, in the order they are pushed: the project, the middle, the
+        // gauge at the right, and the account controls. Sized exactly, so adding
+        // a group without raising this panics on the first draw rather than
+        // dropping it silently.
+        let mut children = <ArrayVec<_, 4>>::new();
         let mut project_end = <ArrayVec<AnyElement, 3>>::new();
 
         let mut project_name = None;
@@ -414,6 +443,27 @@ impl Render for TitleBar {
             );
         }
 
+        if let Some(right) = self.right.clone() {
+            children.push(
+                h_flex()
+                    // Fixed, unlike the middle: a gauge is a row of three
+                    // segments with nothing in it that can be given up, so it
+                    // keeps its width and the shrinkable groups either side of it
+                    // pay for a narrow window instead. Anything that hung past
+                    // the bar's own edge here would simply be cut off.
+                    .flex_none()
+                    .h_full()
+                    .items_center()
+                    // The gap the bar's own controls stand apart by, so the gauge
+                    // does not sit against the account controls beside it.
+                    .mr_1()
+                    .debug_selector(|| "title-bar-right".to_string())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(right)
+                    .into_any_element(),
+            );
+        }
+
         let status = self.client.status();
         let status = &*status.borrow();
         let user = self.user_store.read(cx).current_user();
@@ -518,6 +568,10 @@ impl TitleBar {
             .try_global::<WhatGoesInTheMiddle>()
             .map(|middle| middle.0.clone())
             .and_then(|make| make(workspace, window, cx));
+        let right = cx
+            .try_global::<WhatGoesAtTheRight>()
+            .map(|right| right.0.clone())
+            .and_then(|make| make(workspace, window, cx));
         let project = workspace.project().clone();
         let git_store = project.read(cx).git_store().clone();
         let user_store = workspace.app_state().user_store.clone();
@@ -599,6 +653,7 @@ impl TitleBar {
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
             middle,
+            right,
         };
 
         this.observe_diagnostics(cx);
@@ -1627,6 +1682,77 @@ mod tests {
                 middle.size.width
             );
         }
+    }
+
+    /// The gauge at the right of the bar keeps its whole width at any window
+    /// width: it is a row of three segments with nothing in it that can be given
+    /// up, so what shrinks is the group in the middle, and nothing hangs past
+    /// the window edge where it would simply be cut off.
+    #[gpui::test]
+    async fn the_right_hand_slot_keeps_its_width_when_the_bar_narrows(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let gauge = px(120.);
+        cx.update(|cx| {
+            set_middle_of_the_bar(cx, move |_workspace, _window, cx| {
+                Some(cx.new(|_| WideThing { width: px(960.) }).into())
+            });
+            set_right_of_the_bar(cx, move |_workspace, _window, cx| {
+                Some(cx.new(|_| WideThing { width: gauge }).into())
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(util::path!("/project"), serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [util::path!("/project").as_ref()], cx).await;
+        let window = cx
+            .add_window(|window, cx| Workspace::new(None, project, app_state.clone(), window, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        let mut widths_of_the_middle = Vec::new();
+        for bar in [px(1200.), px(520.)] {
+            cx.simulate_resize(size(bar, px(600.)));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let right = cx
+                .debug_bounds("title-bar-right")
+                .expect("the gauge is painted at the right of the bar");
+            assert_eq!(
+                right.size.width, gauge,
+                "in a {bar:?} bar the gauge is {:?} wide; it has nothing to give up",
+                right.size.width
+            );
+            assert!(
+                right.right() <= bar,
+                "in a {bar:?} bar the gauge reaches to {:?}, past the window's own edge",
+                right.right()
+            );
+            let middle = cx
+                .debug_bounds("title-bar-middle")
+                .expect("the plaque is painted");
+            assert!(
+                middle.right() <= right.left(),
+                "in a {bar:?} bar the plaque reaches to {:?} and the gauge starts at {:?}; \
+                 whichever is drawn second covers the other",
+                middle.right(),
+                right.left()
+            );
+            widths_of_the_middle.push(middle.size.width);
+        }
+
+        let [wide, narrow] = widths_of_the_middle
+            .as_slice()
+            .try_into()
+            .expect("one width per bar width");
+        assert!(
+            narrow < wide,
+            "the middle shrank from {wide:?} to {narrow:?} -- it is what pays for a narrow bar"
+        );
     }
 
     /// Stands in for the plaque: something that asks for more room than the bar

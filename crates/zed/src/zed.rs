@@ -359,9 +359,11 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
 }
 
 /// Puts the plaque that says how a project is run in the middle of the title
-/// bar. Registered from here rather than from either crate: the title bar has no
-/// business knowing about projects being run, and the crate that runs them has
-/// none knowing where the bar keeps things.
+/// bar, and the gauge that says what answering a question about the code may
+/// cost at its right, beside the account controls. Registered from here rather
+/// than from either crate: the title bar has no business knowing about projects
+/// being run, and the crate that runs them has none knowing where the bar keeps
+/// things.
 pub fn put_run_configurations_in_the_title_bar(cx: &mut App) {
     title_bar::set_middle_of_the_bar(cx, |workspace, _window, cx| {
         Some(
@@ -369,6 +371,14 @@ pub fn put_run_configurations_in_the_title_bar(cx: &mut App) {
                 run_configurations::configurations_toolbar::ConfigurationsToolbar::new(
                     workspace, cx,
                 )
+            })
+            .into(),
+        )
+    });
+    title_bar::set_right_of_the_bar(cx, |workspace, _window, cx| {
+        Some(
+            cx.new(|cx| {
+                run_configurations::configurations_toolbar::AnsweringModeGauge::new(workspace, cx)
             })
             .into(),
         )
