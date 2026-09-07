@@ -43,8 +43,8 @@ pub struct Reads {
     /// Everything wrong with a text of this language that needs no schema to
     /// see -- a fault the grammar itself finds. A language whose whole
     /// report comes from a schema leaves this empty, and its files are then
-    /// looked at only where a schema covers them, which is what JSON and
-    /// YAML do.
+    /// looked at only where a schema covers them, which is most of them and
+    /// so is nearly silence.
     pub faults: Option<fn(&str) -> Vec<lsp::Diagnostic>>,
     /// The rules saying which schema covers which files.
     pub associations: for<'registry, 'at, 'app> fn(

@@ -5,23 +5,35 @@ use schema_documents::{Complaint, unreadable_is_one_complaint};
 
 use crate::reading::read;
 
+/// The one thing wrong with this text that no schema is needed to see,
+/// placed on the bytes the reading stopped at.
+///
+/// A text holding no document at all yields nothing: a file the reader has
+/// just created, or one holding only comments, has nothing wrong with it yet,
+/// and an error on it would be an error on every new file. A text that will
+/// not read yields the one fault that stopped it and not a complaint per
+/// line -- past an unbalanced brace everything further is a consequence of
+/// the first mistake rather than a second one.
+pub fn what_the_reader_said(text: &str) -> Vec<(Range<usize>, Complaint)> {
+    match read(text) {
+        Some(Err(unreadable)) => vec![unreadable_is_one_complaint(unreadable)],
+        Some(Ok(_)) | None => Vec::new(),
+    }
+}
+
 /// Everything the schema has to say about this text, placed on the bytes it
 /// is about.
 ///
-/// A text holding no document at all yields nothing: a file the reader has
-/// just created has nothing to check, and an error on it would be an error on
-/// every new file. A text that will not read yields the one fault that
-/// stopped it, not a schema complaint per line -- past an unbalanced brace
-/// the value is not the reader's value any more, and everything the schema
-/// would say about it is about a document nobody wrote.
+/// A text holding no document at all yields nothing, and so does one that
+/// will not read: [`what_the_reader_said`] has already said where the reading
+/// stopped, and past an unbalanced brace the value is not the reader's value
+/// any more, so everything the schema would say about it is about a document
+/// nobody wrote.
 pub fn what_the_schema_said(text: &str, validator: &Validator) -> Vec<(Range<usize>, Complaint)> {
-    let Some(read) = read(text) else {
+    let Some(Ok(document)) = read(text) else {
         return Vec::new();
     };
-    match read {
-        Ok(document) => schema_documents::what_the_schema_said(text, &document, validator),
-        Err(unreadable) => vec![unreadable_is_one_complaint(unreadable)],
-    }
+    schema_documents::what_the_schema_said(text, &document, validator)
 }
 
 #[cfg(test)]
@@ -115,14 +127,37 @@ mod tests {
 
     /// A file mid-edit is unreadable most of the time, and the schema has an
     /// opinion about every part of the half-document that results. One fault
-    /// where the reader is typing is the whole of what is useful.
+    /// where the reader is typing is the whole of what is useful, and it
+    /// comes from the reader rather than from the schema.
     #[test]
     fn a_document_that_will_not_read_is_one_fault_and_not_a_pile_of_schema_complaints() {
-        let mut said = checked(r#"{"name": "zed", "tab_size": }"#);
+        let text = r#"{"name": "zed", "tab_size": }"#;
+        assert!(checked(text).is_empty(), "{:?}", checked(text));
+
+        let mut said = what_the_reader_said(text);
         assert_eq!(said.len(), 1, "{said:?}");
         let (_, complaint) = said.remove(0);
         assert!(complaint.is_a_fault, "and it is the kind that stops work");
         assert_eq!(complaint.message, "expected a value");
+    }
+
+    /// The same fault, found without any schema at all. This is what nearly
+    /// every JSON file in a project gets, because nearly none of them are
+    /// covered by a schema.
+    #[test]
+    fn a_document_that_will_not_read_needs_no_schema_to_say_so() {
+        let mut said = what_the_reader_said("{\n  \"a\": ,\n}\n");
+        assert_eq!(said.len(), 1, "{said:?}");
+        let (range, complaint) = said.remove(0);
+        assert_eq!(range, 9..10, "the `,` the value should have been");
+        assert!(complaint.is_a_fault);
+    }
+
+    #[test]
+    fn a_document_that_reads_has_nothing_the_reader_objects_to() {
+        for text in ["", "  \n ", "// still thinking\n", r#"{"name": "zed"}"#] {
+            assert!(what_the_reader_said(text).is_empty(), "{text:?}");
+        }
     }
 
     /// The schema is not satisfied by any of this, and none of it is said:
@@ -167,6 +202,29 @@ mod tests {
 
         let said = what_the_schema_said(r#"{"tab_size": "two"}"#, &validator);
         assert_eq!(said.len(), 1, "the rest of the schema still applies");
+    }
+
+    /// Which references go unchecked, and which do not. Only a reference the
+    /// schema cannot resolve from its own text reaches the retriever that
+    /// answers with the schema accepting anything -- a reference into the
+    /// document's own definitions is resolved and applied like any other
+    /// keyword. Reading the limit as "no `$ref` is checked" understates what
+    /// this does; reading it as "every `$ref` is checked" overstates it.
+    #[test]
+    fn a_reference_inside_the_schema_itself_is_resolved_and_applied() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "name": { "$ref": "#/$defs/short_string" } },
+            "$defs": { "short_string": { "type": "string", "maxLength": 4 } },
+        });
+        let validator = validator_for(&schema).expect("the schema builds");
+        assert!(what_the_schema_said(r#"{"name": "zed"}"#, &validator).is_empty());
+        assert_eq!(
+            what_the_schema_said(r#"{"name": "zed the editor"}"#, &validator).len(),
+            1,
+            "the referred-to section is applied, so its `maxLength` is too"
+        );
     }
 
     /// The editor's own schemas are written for an older draft than the
