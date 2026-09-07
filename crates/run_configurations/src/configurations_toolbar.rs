@@ -636,7 +636,13 @@ impl Render for ConfigurationsToolbar {
                         .child(
                             IconButton::new("run-configurations-debug", IconName::Debug)
                                 .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
+                                // Green while it can be pressed, muted while it
+                                // cannot: a button that looks alive and does
+                                // nothing is the fault this pair already had once.
+                                .icon_color(match cannot_be_debugged {
+                                    Some(_) => Color::Muted,
+                                    None => Color::Success,
+                                })
                                 .disabled(cannot_be_debugged.is_some())
                                 .tooltip(Tooltip::text(cannot_be_debugged.unwrap_or("Debug it")))
                                 .on_click(
