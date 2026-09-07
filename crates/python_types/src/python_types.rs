@@ -1,5 +1,6 @@
 mod edited_system;
 mod type_completions;
+mod type_errors;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -18,15 +19,19 @@ use ty_project::{ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
 use crate::edited_system::{EditedSystem, OpenBuffers};
 
-/// Answers hover and completion for Python out of `ty`'s type inference, in
-/// this process.
+pub use crate::type_errors::{TypeChecker, type_checker};
+
+/// Answers hover, completion and type errors for Python out of `ty`'s type
+/// inference, in this process.
 ///
-/// One source object behind both, so the two share the project databases they
-/// answer out of rather than each building its own.
+/// One source object behind all three, so they share the project databases
+/// they answer out of rather than each building its own -- which would cost
+/// the whole of one again per source.
 pub fn init(cx: &mut App) {
     let types = Arc::new(TypesFromTy::default());
     project::register_in_process_hover(types.clone(), cx);
-    project::register_in_process_completions(types, cx);
+    project::register_in_process_completions(types.clone(), cx);
+    type_errors::register(types, cx);
 }
 
 #[derive(Default)]

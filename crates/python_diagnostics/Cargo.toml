@@ -20,6 +20,7 @@ language.workspace = true
 log.workspace = true
 lsp.workspace = true
 project.workspace = true
+python_types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
@@ -27,4 +28,18 @@ which.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+futures.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+lsp = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+semver.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
