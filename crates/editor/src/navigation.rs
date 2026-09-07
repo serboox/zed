@@ -1332,8 +1332,79 @@ impl Editor {
         }))
     }
 
-    /// Runs an LSP "find all references" query for the symbol under the cursor
-    /// and returns the raw [`Location`]s. Unlike [`Self::find_all_references`],
+    /// Where the symbol at `head` is referenced: what the language server
+    /// answers, or -- where none did, because none is running or its request
+    /// failed -- what the project's own index answers.
+    ///
+    /// Every surface that lists references asks through here, so a picker and a
+    /// multibuffer cannot disagree about the same symbol. `None` is nobody
+    /// having anything to say, which is a different answer from an empty list.
+    fn references_anywhere(
+        &mut self,
+        project: &Entity<Project>,
+        buffer: Entity<Buffer>,
+        head: text::Anchor,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Vec<Location>>>> {
+        let from_the_server =
+            project.update(cx, |project, cx| project.references(&buffer, head, cx));
+        let workspace = self.workspace();
+        // Whatever answers in a language server's silence reads the files as
+        // they are saved on disk, so it cannot place a name in a file with
+        // unsaved edits -- and a list quietly missing the file the reader is
+        // typing in would be taken for a complete one.
+        let unsaved = buffer.read(cx).is_dirty().then(|| {
+            buffer
+                .read(cx)
+                .file()
+                .map(|file| file.path().to_string())
+                .unwrap_or_else(|| "this file".to_string())
+        });
+        cx.spawn(async move |editor, cx| {
+            // The server answers wherever it is running. Where it did not --
+            // because none is, or because the request failed or was cancelled
+            // mid-edit -- the index is asked, and only then: it opens a buffer
+            // per file holding the name, which is not work to start and throw
+            // away on every lookup in a project that has a server.
+            let answered = from_the_server.await;
+            if matches!(&answered, Ok(Some(found)) if !found.is_empty()) {
+                return answered;
+            }
+            // Said before the answer is asked for rather than after: the file
+            // being edited is left out whether or not anything is found in the
+            // rest of the project, and an empty list is the reading most in
+            // need of the explanation.
+            if let (Some(unsaved), Some(workspace)) = (unsaved, workspace) {
+                workspace.update(cx, |workspace, cx| {
+                    struct ReferencesExcludeUnsavedFile;
+
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<ReferencesExcludeUnsavedFile>(),
+                            format!(
+                                "References leave out {unsaved}: with no answer from a language server, only files as they are saved on disk can be searched. Save it to have it searched too."
+                            ),
+                        ),
+                        cx,
+                    )
+                });
+            }
+            let from_the_index = editor.update(cx, |editor, cx| {
+                editor
+                    .semantics_provider()
+                    .and_then(|provider| provider.references(&buffer, head, cx))
+            })?;
+            let Some(from_the_index) = from_the_index else {
+                // Nothing of our own to say, so whatever the server said --
+                // including its error -- is the answer.
+                return answered;
+            };
+            from_the_index.await
+        })
+    }
+
+    /// Runs a "find all references" query for the symbol under the cursor and
+    /// returns the raw [`Location`]s. Unlike [`Self::find_all_references`],
     /// this does not group the results or open any UI
     pub fn find_all_references_locations(
         &mut self,
@@ -1348,7 +1419,7 @@ impl Editor {
             .head();
 
         let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
-        let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
+        let references = self.references_anywhere(project, buffer, head, cx);
         // Keep every reference, including the one under the cursor, to match the
         // default `find_all_references` multibuffer (`always_open_multibuffer`).
         Some(cx.spawn(async move |_, _| Ok(references.await?.unwrap_or_default())))
@@ -1395,8 +1466,7 @@ impl Editor {
         let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
         let workspace = self.workspace()?;
         let project = workspace.read(cx).project().clone();
-        let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
-        let asked_at = buffer.clone();
+        let references = self.references_anywhere(&project, buffer.clone(), head, cx);
         Some(cx.spawn_in(window, async move |editor, cx| {
             let _cleanup = cx.on_drop(&editor, move |editor, _| {
                 if let Ok(i) = editor
@@ -1407,29 +1477,7 @@ impl Editor {
                 }
             });
 
-            // The server answers wherever it is running. Where it did not --
-            // because none is, or because the request failed or was cancelled
-            // mid-edit -- the index is asked, and only then: it opens a buffer
-            // per file holding the name, which is not work to start and throw
-            // away on every lookup in a project that has a server.
-            let answered = references.await;
-            let server_answered = matches!(&answered, Ok(Some(found)) if !found.is_empty());
-            let locations = if server_answered {
-                answered?
-            } else {
-                let from_the_index = editor.update(cx, |editor, cx| {
-                    editor
-                        .semantics_provider()
-                        .and_then(|provider| provider.references(&asked_at, head, cx))
-                })?;
-                match from_the_index {
-                    Some(task) => task.await?,
-                    // Nothing of our own to say, so whatever the server said --
-                    // including its error -- is the answer.
-                    None => answered?,
-                }
-            };
-            let Some(locations) = locations else {
+            let Some(locations) = references.await? else {
                 return anyhow::Ok(Navigated::No);
             };
             let mut locations = cx.update(|_, cx| {
@@ -2384,6 +2432,44 @@ impl Editor {
         })
     }
 
+    /// What to tell a reader whose go-to of this kind landed nowhere, and the
+    /// key under which that message replaces its own predecessor rather than
+    /// stacking up behind it.
+    fn nothing_to_go_to(
+        &mut self,
+        kind: GotoDefinitionKind,
+        buffer: &Entity<Buffer>,
+        head: text::Anchor,
+        cx: &mut Context<Self>,
+    ) {
+        // `Symbol` is left out on purpose: `go_to_definition` falls back to
+        // find-all-references when it navigates nowhere, so that key is not
+        // dead and a message here would talk over the list that follows.
+        let what = match kind {
+            GotoDefinitionKind::Symbol => return,
+            GotoDefinitionKind::Declaration => "declaration",
+            GotoDefinitionKind::Type => "type definition",
+            GotoDefinitionKind::Implementation => "implementation",
+        };
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let said = self
+            .semantics_provider
+            .clone()
+            .and_then(|provider| provider.why_a_goto_finds_nothing(kind, buffer, head, cx))
+            .map(|said| said.to_string())
+            .unwrap_or_else(|| format!("No {what} found here."));
+        workspace.update(cx, |workspace, cx| {
+            struct NothingToGoTo;
+
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<NothingToGoTo>(), said),
+                cx,
+            )
+        });
+    }
+
     fn go_to_definition_of_kind(
         &mut self,
         kind: GotoDefinitionKind,
@@ -2391,9 +2477,6 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Navigated>> {
-        let Some(provider) = self.semantics_provider.clone() else {
-            return Task::ready(Ok(Navigated::No));
-        };
         let head = self
             .selections
             .newest::<MultiBufferOffset>(&self.display_snapshot(cx))
@@ -2402,14 +2485,23 @@ impl Editor {
         let Some((buffer, head)) = buffer.text_anchor_for_position(head, cx) else {
             return Task::ready(Ok(Navigated::No));
         };
-        let Some(definitions) = provider.definitions(&buffer, head, kind, cx) else {
+        let asked = self
+            .semantics_provider
+            .clone()
+            .and_then(|provider| provider.definitions(&buffer, head, kind, cx));
+        let Some(definitions) = asked else {
+            self.nothing_to_go_to(kind, &buffer, head, cx);
             return Task::ready(Ok(Navigated::No));
         };
 
         let nav_entry = self.navigation_entry(self.selections.newest_anchor().head(), cx);
 
         cx.spawn_in(window, async move |editor, cx| {
-            let Some(definitions) = definitions.await? else {
+            let definitions = definitions.await?.filter(|found| !found.is_empty());
+            let Some(definitions) = definitions else {
+                editor.update(cx, |editor, cx| {
+                    editor.nothing_to_go_to(kind, &buffer, head, cx)
+                })?;
                 return Ok(Navigated::No);
             };
             let navigated = editor
@@ -2430,6 +2522,11 @@ impl Editor {
                     )
                 })?
                 .await?;
+            if navigated == Navigated::No {
+                editor.update(cx, |editor, cx| {
+                    editor.nothing_to_go_to(kind, &buffer, head, cx)
+                })?;
+            }
             anyhow::Ok(navigated)
         })
     }

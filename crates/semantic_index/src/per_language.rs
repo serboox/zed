@@ -1262,6 +1262,68 @@ fn nested_inside_a_block(defined: tree_sitter::Node) -> bool {
     false
 }
 
+/// Whether a declaration of this grammar kind declares a type -- a struct, a
+/// class, an enum, an interface, a trait, an alias -- rather than a function,
+/// a constant or a module.
+///
+/// Read from the grammar's own node kinds, per language, rather than by
+/// looking for "struct" or "type" inside the kind's name: `type_parameter`,
+/// `typedef` and `prototype` all hold one of those words and none of them
+/// declares a type, and a substring rule cannot be checked against a grammar.
+///
+/// A language with no list here answers `false`, which is what keeps a reader
+/// from being sent to a function when they asked for a type: the caller then
+/// says it cannot answer instead of guessing.
+pub fn declares_a_type(language: &str, kind: &str) -> bool {
+    let kinds: &[&str] = match language {
+        "rust" => &[
+            "struct_item",
+            "enum_item",
+            "union_item",
+            "trait_item",
+            "type_item",
+        ],
+        "go" => &["type_declaration"],
+        "python" => &["class_definition"],
+        "typescript" | "tsx" | "javascript" => &[
+            "class_declaration",
+            "abstract_class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "type_alias_declaration",
+        ],
+        "c" => &[
+            "struct_specifier",
+            "union_specifier",
+            "enum_specifier",
+            "type_definition",
+        ],
+        "cpp" => &[
+            "class_specifier",
+            "struct_specifier",
+            "union_specifier",
+            "enum_specifier",
+            "type_definition",
+        ],
+        "java" => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "annotation_type_declaration",
+        ],
+        "csharp" => &[
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+        ],
+        _ => &[],
+    };
+    kinds.contains(&kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

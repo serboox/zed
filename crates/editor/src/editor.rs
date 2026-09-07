@@ -11427,6 +11427,24 @@ pub trait SemanticsProvider {
         None
     }
 
+    /// Why a go-to of `kind` has nothing to offer at `position`, in the words a
+    /// reader is shown when the gesture lands nowhere.
+    ///
+    /// `None` where the provider makes no claim, and the editor then says only
+    /// that the gesture found nothing. A provider that can never answer a kind
+    /// says so here, so that a bound key explains itself instead of appearing
+    /// broken.
+    fn why_a_goto_finds_nothing(
+        &self,
+        kind: GotoDefinitionKind,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<SharedString> {
+        let _ = (kind, buffer, position, cx);
+        None
+    }
+
     fn range_for_rename(
         &self,
         buffer: &Entity<Buffer>,
