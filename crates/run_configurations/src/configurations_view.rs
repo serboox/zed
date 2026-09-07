@@ -80,6 +80,246 @@ fn debugger_for(command: &str) -> &'static str {
         .unwrap_or("CodeLLDB")
 }
 
+/// The runners a row can show an icon for, and the type name in the theme's
+/// file-icon set that stands for each.
+///
+/// Three of these are substitutions rather than matches, because the set has no
+/// icon of the program at all: `package` stands in for `mise`, and `settings`
+/// for `make` and `just`. Neither icon depicts those programs -- they were
+/// picked as the nearest reading of "a tool that runs other tools" and "a build
+/// recipe" -- so a real icon for either should replace them rather than sit
+/// beside them.
+///
+/// `storage` and `vcs` are the type names the default icon theme gives to
+/// `database.svg` and `git.svg`; there are no `database` or `git` type names to
+/// ask for.
+const RUNNER_ICONS: [(&str, &str); 29] = [
+    ("go", "go"),
+    ("gofmt", "go"),
+    ("gotestsum", "go"),
+    ("python", "python"),
+    ("python3", "python"),
+    ("uv", "python"),
+    ("uvx", "python"),
+    ("pytest", "python"),
+    ("ruff", "python"),
+    ("cargo", "rust"),
+    ("rustc", "rust"),
+    ("rustup", "rust"),
+    ("node", "javascript"),
+    ("npm", "javascript"),
+    ("npx", "javascript"),
+    ("pnpm", "javascript"),
+    ("yarn", "javascript"),
+    ("bun", "bun"),
+    ("bunx", "bun"),
+    ("docker", "docker"),
+    ("docker-compose", "docker"),
+    ("podman", "docker"),
+    ("psql", "storage"),
+    ("mysql", "storage"),
+    ("sqlite3", "storage"),
+    ("mise", "package"),
+    ("make", "settings"),
+    ("just", "settings"),
+    ("git", "vcs"),
+];
+
+/// Shown when nothing else fits: whatever a row runs, it runs in a terminal.
+const ICON_OF_ANYTHING_ELSE: &str = "terminal";
+
+/// The debuggers whose adapter names say what language is being debugged. A
+/// debug configuration has no command to read, so the adapter is all there is.
+const ADAPTER_ICONS: [(&str, &str); 3] =
+    [("delve", "go"), ("debugpy", "python"), ("codelldb", "rust")];
+
+/// Commands that run something else rather than being the thing that runs: the
+/// shells, `env`, and `-c` as it arrives as an argument of its own.
+const WRAPPERS: [&str; 5] = ["env", "sh", "bash", "zsh", "-c"];
+
+/// How wide a row's second line is allowed to read, in characters. The column is
+/// 300px and the line is extra-small, so this is what fits without the label
+/// having to be measured.
+const MOST_CHARACTERS_OF_WHAT_IT_RUNS: usize = 46;
+
+/// A row's leading icon: 16px of glyph, centred in a 20px box. Neither number
+/// has a token in the shared palette, and the box is what keeps the first line
+/// of every row starting at the same place.
+const ROW_ICON: Pixels = px(16.);
+const ROW_ICON_BOX: Pixels = px(20.);
+
+/// Below this there is not enough of a program name left to recognise, so the
+/// whole line is elided instead of only its first word.
+const LEAST_OF_A_PROGRAM_WORTH_SHOWING: usize = 14;
+
+/// The program a command names: its first word, without the directories leading
+/// up to it, so `/usr/bin/python3` and `python3` are the same program.
+fn program_named_by(said: &str) -> String {
+    said.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// Whether a command runs something else rather than being what runs. A shell or
+/// `env` says so by its name; a script kept in a dotfile directory says so by
+/// where it lives, which is where a project's own wrapper scripts are kept.
+fn is_a_wrapper(command: &str) -> bool {
+    let program = program_named_by(command);
+    if WRAPPERS.contains(&program.as_str()) {
+        return true;
+    }
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('.') && segment != "." && segment != "..")
+}
+
+/// Whether an argument could itself be the program being run, as opposed to a
+/// flag, a variable being set for it, or another wrapper.
+fn could_be_a_program(argument: &str) -> bool {
+    let first = argument.split_whitespace().next().unwrap_or_default();
+    !first.is_empty() && !first.starts_with('-') && !first.contains('=') && !is_a_wrapper(first)
+}
+
+/// What actually runs. A wrapper must not take the icon from the program it
+/// wraps: on a project where every row goes through one script, the wrapper is
+/// the one thing every row has in common and the runner is in the arguments.
+///
+/// Not [`crate::debugging::unwrapped`], which looks for a program some debugger
+/// can derive a session from. A row shows an icon for `docker`, `mise` and
+/// `make` as well, none of which any debugger knows.
+fn runner_of(command: &str, arguments: &[String]) -> String {
+    let program = program_named_by(command);
+    if !is_a_wrapper(command) {
+        return program;
+    }
+    arguments
+        .iter()
+        .find(|argument| could_be_a_program(argument))
+        .map(|argument| program_named_by(argument))
+        .unwrap_or(program)
+}
+
+/// The icon type a runner gets.
+fn icon_type_of_runner(runner: &str) -> &'static str {
+    RUNNER_ICONS
+        .iter()
+        .find(|(named, _)| *named == runner)
+        .map(|(_, icon_type)| *icon_type)
+        .unwrap_or(ICON_OF_ANYTHING_ELSE)
+}
+
+/// The icon type a task gets, read from what it runs rather than from anything
+/// the reader configured.
+fn icon_type_of_task(task: &TaskTemplate) -> &'static str {
+    icon_type_of_runner(&runner_of(&task.command, &task.args))
+}
+
+/// The icon type a debug configuration gets, read from its adapter.
+fn icon_type_of_adapter(adapter: &str) -> &'static str {
+    let adapter = adapter.to_lowercase();
+    ADAPTER_ICONS
+        .iter()
+        .find(|(named, _)| *named == adapter)
+        .map(|(_, icon_type)| *icon_type)
+        .unwrap_or(ICON_OF_ANYTHING_ELSE)
+}
+
+/// The icon type a configuration gets, whichever of the two files it came from.
+fn icon_type_of_configuration(configuration: &Configuration) -> &'static str {
+    match (&configuration.task, &configuration.scenario) {
+        (Some(task), _) => icon_type_of_task(task),
+        (None, Some(scenario)) => icon_type_of_adapter(&scenario.adapter),
+        (None, None) => ICON_OF_ANYTHING_ELSE,
+    }
+}
+
+/// What a row says it runs: the command and the arguments given to it. The
+/// command alone does not tell one row from another on a project where every row
+/// goes through the same script, which is what the arguments are there to say.
+fn what_it_runs(task: &TaskTemplate) -> String {
+    format!("{} {}", task.command.trim(), task.args.join(" "))
+        .trim()
+        .to_string()
+}
+
+/// The same sentence for a configuration read out of a file. A debug
+/// configuration has no command, so it says which debugger it uses.
+fn what_a_configuration_runs(configuration: &Configuration) -> String {
+    match (&configuration.task, &configuration.scenario) {
+        (Some(task), _) => what_it_runs(task),
+        (None, Some(scenario)) => scenario.adapter.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Takes the middle out of `said` so it reads in `most` characters. The middle
+/// goes rather than the end because the end is what tells two runs apart: a
+/// reader separates `.../with-env go run ./cmd/api` from `.../with-env go test
+/// ./...` by its tail.
+fn elided_in_the_middle(said: &str, most: usize) -> String {
+    let characters: Vec<char> = said.chars().collect();
+    if characters.len() <= most {
+        return said.to_string();
+    }
+    if most <= 1 {
+        return "…".to_string();
+    }
+    let kept = most - 1;
+    let tail = kept.div_ceil(2);
+    let head = kept - tail;
+    let mut shorter: String = characters.iter().take(head).collect();
+    shorter.push('…');
+    shorter.extend(characters.iter().skip(characters.len() - tail));
+    shorter
+}
+
+/// What a row shows of what it runs. A long program name loses its middle so its
+/// arguments stay whole; when the arguments alone are longer than the line, the
+/// whole sentence loses its middle instead. The full text stays on the row, in a
+/// tooltip, so nothing is only elided away.
+fn what_it_runs_shortened(said: &str) -> String {
+    if said.chars().count() <= MOST_CHARACTERS_OF_WHAT_IT_RUNS {
+        return said.to_string();
+    }
+    if let Some((program, rest)) = said.split_once(' ') {
+        let room = MOST_CHARACTERS_OF_WHAT_IT_RUNS.saturating_sub(rest.chars().count() + 1);
+        if room >= LEAST_OF_A_PROGRAM_WORTH_SHOWING {
+            return format!("{} {}", elided_in_the_middle(program, room), rest);
+        }
+    }
+    elided_in_the_middle(said, MOST_CHARACTERS_OF_WHAT_IT_RUNS)
+}
+
+/// What a group heading says: its name, and how many rows are under it. A count
+/// is something the window title cannot also be saying, which is what separates
+/// the two headings without a second type size.
+fn group_heading_said(said: &str, how_many: usize) -> String {
+    format!("{said} · {how_many}")
+}
+
+/// The whole of what a row runs, shown while the row is under the pointer, so
+/// the elided line takes nothing away.
+struct WhatItRunsTooltip {
+    said: SharedString,
+}
+
+impl Render for WhatItRunsTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::tooltip_container(cx, |container, _| {
+            container
+                .debug_selector(|| "configuration-runs-tooltip".to_string())
+                .child(Label::new(self.said.clone()).size(LabelSize::Small))
+        })
+    }
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, cx| {
         // One store for the whole workspace, made when it opens: the files are read
@@ -1408,6 +1648,27 @@ impl RunConfigurationsView {
     }
 
     /// A small heading over a group in the list, as the mockup has them.
+    /// The icon that says what a row runs, in a box of its own so every row's
+    /// first line starts at the same place whether its icon resolved or not.
+    fn runner_icon(icon_type: &str, selector: String, cx: &App) -> AnyElement {
+        let icons = file_icons::FileIcons::get(cx);
+        let path = icons
+            .get_icon_for_type(icon_type, cx)
+            .or_else(|| icons.get_icon_for_type(ICON_OF_ANYTHING_ELSE, cx));
+        h_flex()
+            .flex_none()
+            .size(ROW_ICON_BOX)
+            .items_center()
+            .justify_center()
+            .debug_selector(move || selector)
+            .children(path.map(|path| {
+                Icon::from_path(path)
+                    .size(IconSize::Custom(rems_from_px(ROW_ICON)))
+                    .color(Color::Muted)
+            }))
+            .into_any_element()
+    }
+
     fn group_heading(said: impl Into<SharedString>) -> AnyElement {
         h_flex()
             .w_full()
@@ -1426,17 +1687,9 @@ impl RunConfigurationsView {
         let kind = configuration.kind;
         let at = configuration.at;
         let chosen = self.chosen == Some((kind, at));
-        let what_it_runs = configuration
-            .task
-            .as_ref()
-            .map(|task| task.command.clone())
-            .or_else(|| {
-                configuration
-                    .scenario
-                    .as_ref()
-                    .map(|scenario| scenario.adapter.to_string())
-            })
-            .unwrap_or_default();
+        let said = what_a_configuration_runs(configuration);
+        let whole_of_it: SharedString = said.clone().into();
+        let icon_type = icon_type_of_configuration(configuration);
         let shown_label = configuration.shown_label();
         let configuration = configuration.clone();
         h_flex()
@@ -1450,20 +1703,34 @@ impl RunConfigurationsView {
             .py_1()
             .gap_2()
             .items_center()
-            .when(chosen, |row| row.bg(ui::cyberpunk::row_chosen()))
+            .when(chosen, |row| {
+                row.bg(ui::cyberpunk::row_chosen())
+                    .shadow(ui::cyberpunk::row_chosen_rail())
+            })
             .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
             .cursor_pointer()
+            .when(!whole_of_it.is_empty(), |row| {
+                row.tooltip(move |_, cx| {
+                    let said = whole_of_it.clone();
+                    cx.new(|_| WhatItRunsTooltip { said }).into()
+                })
+            })
             .on_click(cx.listener(move |view, _, window, cx| {
                 let configuration = configuration.clone();
                 view.show(&configuration, window, cx);
             }))
+            .child(Self::runner_icon(
+                icon_type,
+                format!("configuration-{}-{at}-icon", kind.file_name()),
+                cx,
+            ))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .child(Label::new(shown_label).size(LabelSize::Small))
                     .child(
-                        Label::new(what_it_runs)
+                        Label::new(what_it_runs_shortened(&said))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
@@ -1483,9 +1750,8 @@ impl RunConfigurationsView {
             true => task.command.clone(),
             false => task.label.clone(),
         };
-        let what_it_runs = format!("{} {}", task.command, task.args.join(" "))
-            .trim()
-            .to_string();
+        let said = what_it_runs(task);
+        let whole_of_it: SharedString = said.clone().into();
         h_flex()
             .id(("temporary", at))
             .debug_selector(move || format!("temporary-{at}"))
@@ -1495,6 +1761,12 @@ impl RunConfigurationsView {
             .gap_2()
             .items_center()
             .hover(|row| row.bg(ui::cyberpunk::row_hovered()))
+            .when(!whole_of_it.is_empty(), |row| {
+                row.tooltip(move |_, cx| {
+                    let said = whole_of_it.clone();
+                    cx.new(|_| WhatItRunsTooltip { said }).into()
+                })
+            })
             .child(
                 Label::new("on the spot")
                     .size(LabelSize::XSmall)
@@ -1506,7 +1778,7 @@ impl RunConfigurationsView {
                     .min_w_0()
                     .child(Label::new(label).size(LabelSize::Small))
                     .child(
-                        Label::new(what_it_runs)
+                        Label::new(what_it_runs_shortened(&said))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
@@ -1543,6 +1815,7 @@ impl RunConfigurationsView {
             .enumerate()
             .map(|(at, task)| self.render_temporary(at, task, cx))
             .collect();
+        let how_many_kept = kept.len();
         let how_many_temporary = temporary.len();
         let nothing_at_all = kept.is_empty() && temporary.is_empty();
 
@@ -1569,12 +1842,16 @@ impl RunConfigurationsView {
                 )
             })
             .when(!kept.is_empty(), |list| {
-                list.child(Self::group_heading("KEPT IN THE PROJECT"))
+                list.child(Self::group_heading(group_heading_said(
+                    "KEPT IN THE PROJECT",
+                    how_many_kept,
+                )))
             })
             .children(kept)
             .when(how_many_temporary > 0, |list| {
                 list.child(Self::group_heading(format!(
-                    "RUN ON THE SPOT · {how_many_temporary} of {}",
+                    "{} of {}",
+                    group_heading_said("RUN ON THE SPOT", how_many_temporary),
                     crate::configurations_store::MOST_TEMPORARIES_KEPT
                 )))
             })
@@ -3860,5 +4137,299 @@ mod tests {
             vec!["./cmd/api".to_string()],
             "a project that never stops changing still has to be read"
         );
+    }
+
+    fn a_task(command: &str, arguments: &[&str]) -> TaskTemplate {
+        TaskTemplate {
+            command: command.to_string(),
+            args: arguments
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// On a project whose runs all go through one wrapper script, the command is
+    /// the one thing every row has in common: a second line built from it alone
+    /// says the same wrapper path on every row and tells none of them apart.
+    #[gpui::test]
+    async fn the_second_line_of_a_kept_configuration_carries_its_arguments(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(
+                r#"[
+                  { "label": "api server",
+                    "command": "/home/reader/.envs/.zed/with-env",
+                    "args": ["go", "run", "./cmd/api"] },
+                  { "label": "unit tests",
+                    "command": "/home/reader/.envs/.zed/with-env",
+                    "args": ["go", "test", "./..."] }
+                ]"#,
+            ),
+            cx,
+        )
+        .await;
+
+        let said: Vec<String> = view.read_with(&mut cx, |view, cx| {
+            view.store
+                .read(cx)
+                .all()
+                .map(what_a_configuration_runs)
+                .collect()
+        });
+
+        assert_eq!(
+            said,
+            vec![
+                "/home/reader/.envs/.zed/with-env go run ./cmd/api",
+                "/home/reader/.envs/.zed/with-env go test ./...",
+            ],
+            "two rows through the same wrapper have to read differently"
+        );
+    }
+
+    /// The same fact was written out twice in this file, in two formats. One of
+    /// them dropped the arguments; the other did not. There is one now.
+    #[gpui::test]
+    async fn a_kept_configuration_and_a_temporary_one_read_the_same(cx: &mut TestAppContext) {
+        let (view, _fs, mut cx) = a_view_of(
+            Some(r#"[{ "label": "tests", "command": "cargo", "args": ["test", "--all"] }]"#),
+            cx,
+        )
+        .await;
+        let kept = view.read_with(&mut cx, |view, cx| {
+            view.store
+                .read(cx)
+                .get(Kind::Task, 0)
+                .cloned()
+                .expect("the configuration")
+        });
+        let temporary = a_task("cargo", &["test", "--all"]);
+
+        assert_eq!(
+            what_a_configuration_runs(&kept),
+            what_it_runs(&temporary),
+            "a row kept in the project and a row run on the spot describe the same \
+             run in the same words"
+        );
+    }
+
+    /// The whole point of reading past the wrapper: on this project the wrapper
+    /// is what every row has in common, so a wrapper's own icon says nothing.
+    #[test]
+    fn a_wrapper_script_does_not_take_the_icon_from_the_program_it_wraps() {
+        assert_eq!(
+            icon_type_of_task(&a_task(
+                "/home/reader/.envs/.zed/with-env",
+                &["go", "test", "./..."]
+            )),
+            "go",
+            "a script kept in a dotfile directory runs something else"
+        );
+        assert_eq!(
+            icon_type_of_task(&a_task("env", &["FOO=bar", "cargo", "test"])),
+            "rust",
+            "a variable being set is not the program being run"
+        );
+        assert_eq!(
+            icon_type_of_task(&a_task("/bin/bash", &["-c", "pytest -q"])),
+            "python",
+            "what a shell is told to run is what runs"
+        );
+        assert_eq!(
+            icon_type_of_task(&a_task("/usr/bin/zsh", &[])),
+            ICON_OF_ANYTHING_ELSE,
+            "a wrapper wrapping nothing has nothing to say"
+        );
+    }
+
+    #[test]
+    fn each_mapped_runner_gets_its_own_icon_and_an_unknown_one_gets_the_terminal() {
+        for (runner, icon_type) in RUNNER_ICONS {
+            assert_eq!(
+                icon_type_of_task(&a_task(runner, &[])),
+                icon_type,
+                "{runner} has an icon of its own"
+            );
+            assert_eq!(
+                icon_type_of_task(&a_task(&format!("/usr/local/bin/{runner}"), &[])),
+                icon_type,
+                "and the directories leading up to {runner} make no difference"
+            );
+        }
+        assert_eq!(
+            icon_type_of_task(&a_task("frobnicate", &["--now"])),
+            ICON_OF_ANYTHING_ELSE
+        );
+        for (adapter, icon_type) in ADAPTER_ICONS {
+            assert_eq!(icon_type_of_adapter(adapter), icon_type);
+        }
+        assert_eq!(
+            icon_type_of_adapter("Delve"),
+            "go",
+            "an adapter is named as the file writes it, not in lower case"
+        );
+        assert_eq!(icon_type_of_adapter("GDB"), ICON_OF_ANYTHING_ELSE);
+    }
+
+    /// Every icon type this view asks for has to be in the theme's file-icon set,
+    /// or the row shows a gap where its icon should be.
+    #[gpui::test]
+    fn every_icon_type_a_row_asks_for_resolves(cx: &mut TestAppContext) {
+        init_test(cx);
+        let missing: Vec<&str> = cx.update(|cx| {
+            let icons = file_icons::FileIcons::get(cx);
+            RUNNER_ICONS
+                .iter()
+                .map(|(_, icon_type)| *icon_type)
+                .chain(ADAPTER_ICONS.iter().map(|(_, icon_type)| *icon_type))
+                .chain([ICON_OF_ANYTHING_ELSE])
+                .filter(|icon_type| icons.get_icon_for_type(icon_type, cx).is_none())
+                .collect()
+        });
+        assert_eq!(
+            missing,
+            Vec::<&str>::new(),
+            "every icon type a row can ask for has to resolve"
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_elided_in_the_middle() {
+        let said = "/home/reader/.envs/.zed/with-env go run ./cmd/api --verbose";
+        let shortened = what_it_runs_shortened(said);
+
+        assert!(
+            shortened.chars().count() <= MOST_CHARACTERS_OF_WHAT_IT_RUNS,
+            "{shortened:?} still does not fit the column"
+        );
+        assert!(
+            shortened.ends_with("go run ./cmd/api --verbose"),
+            "{shortened:?} has to keep the tail, which is what tells two runs apart"
+        );
+        assert!(
+            shortened.starts_with('/'),
+            "{shortened:?} has to keep the head as well, or the middle was not what went"
+        );
+        let ellipsis = shortened
+            .find('…')
+            .expect("a shortened line says where it was cut");
+        assert!(
+            ellipsis > 0 && ellipsis < shortened.len() - '…'.len_utf8(),
+            "{shortened:?} was cut at an end rather than in the middle"
+        );
+        assert_eq!(
+            what_it_runs_shortened("cargo test"),
+            "cargo test",
+            "a line that fits is left alone"
+        );
+    }
+
+    /// What the elided line leaves out is still on the row: hovering it says the
+    /// whole of what it runs.
+    #[gpui::test]
+    async fn the_whole_of_a_long_command_is_reachable_on_the_row(cx: &mut TestAppContext) {
+        let (_view, mut cx) = a_window_of(
+            r#"[{ "label": "api server",
+                  "command": "/home/reader/.envs/.zed/with-env",
+                  "args": ["go", "run", "./cmd/api", "--verbose"] }]"#,
+            cx,
+        )
+        .await;
+        draw(&mut cx);
+
+        let row = debug_center(&mut cx, "configuration-tasks.json-0");
+        cx.simulate_mouse_move(row, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        draw(&mut cx);
+
+        assert!(
+            cx.debug_bounds("configuration-runs-tooltip").is_some(),
+            "the row under the pointer has to say the whole of what it runs"
+        );
+    }
+
+    /// Selection and hover were the same signal at two strengths, which is no
+    /// signal at all. The chosen row now also carries a rail down its leading
+    /// edge -- inset, so no row moves when one of them is chosen.
+    #[gpui::test]
+    async fn the_chosen_row_is_told_apart_by_more_than_its_fill(cx: &mut TestAppContext) {
+        let rail = ui::cyberpunk::row_chosen_rail();
+        assert!(
+            !rail.is_empty() && rail.iter().all(|shadow| shadow.inset),
+            "the chosen row's second channel has to be drawn inside the row"
+        );
+
+        let (view, mut cx) = a_window_of(
+            r#"[
+                 { "label": "one", "command": "cargo", "args": ["test"] },
+                 { "label": "two", "command": "cargo", "args": ["run"] }
+               ]"#,
+            cx,
+        )
+        .await;
+        draw(&mut cx);
+        let before = cx
+            .debug_bounds("configuration-tasks.json-1")
+            .expect("the second row");
+
+        show_the_first_configuration(&view, &mut cx);
+        let chosen = cx
+            .debug_bounds("configuration-tasks.json-0")
+            .expect("the chosen row");
+        let after = cx
+            .debug_bounds("configuration-tasks.json-1")
+            .expect("the second row");
+
+        assert_eq!(
+            before, after,
+            "choosing a row must not move the rows under it"
+        );
+        assert_eq!(
+            chosen.size.width, after.size.width,
+            "and must not make the chosen row a different size than its neighbours"
+        );
+        assert!(
+            cx.debug_bounds("configuration-tasks.json-0-icon").is_some(),
+            "and the row's icon has a place of its own on it"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_group_heading_counts_the_rows_under_it(cx: &mut TestAppContext) {
+        assert_eq!(
+            group_heading_said("KEPT IN THE PROJECT", 7),
+            "KEPT IN THE PROJECT · 7"
+        );
+
+        let (view, mut cx) = a_window_of(
+            r#"[
+                 { "label": "one", "command": "cargo", "args": ["test"] },
+                 { "label": "two", "command": "cargo", "args": ["run"] },
+                 { "label": "three", "command": "cargo", "args": ["build"] }
+               ]"#,
+            cx,
+        )
+        .await;
+        draw(&mut cx);
+
+        let how_many_kept = view.read_with(&mut cx, |view, cx| view.store.read(cx).all().count());
+        assert_eq!(how_many_kept, 3, "three rows are drawn under the heading");
+        for at in 0..how_many_kept {
+            assert!(
+                cx.debug_bounds(match at {
+                    0 => "configuration-tasks.json-0",
+                    1 => "configuration-tasks.json-1",
+                    _ => "configuration-tasks.json-2",
+                })
+                .is_some(),
+                "row {at} is one of the rows the heading counts"
+            );
+        }
     }
 }

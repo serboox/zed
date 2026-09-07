@@ -137,6 +137,15 @@ pub fn row_chosen() -> Hsla {
     Accent::Cyan.border().opacity(0.16)
 }
 
+/// The second thing the chosen row says. Fill alone cannot separate "chosen"
+/// from "under the pointer", since both are the same wash at two strengths, so
+/// the chosen row also carries a rail down its leading edge. Inset, because a
+/// border would move every row's contents by its width the moment one of them
+/// was chosen.
+pub fn row_chosen_rail() -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(2.), px(0.), Accent::Cyan.border()).inset()]
+}
+
 /// How much an action matters. Four ranks and no more: the one the reader came
 /// for, the way out, the secondary one, and the one that destroys something.
 ///

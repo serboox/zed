@@ -366,6 +366,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("nix", "icons/file_icons/nix.svg"),
     ("ocaml", "icons/file_icons/ocaml.svg"),
     ("odin", "icons/file_icons/odin.svg"),
+    ("package", "icons/file_icons/package.svg"),
     ("phoenix", "icons/file_icons/phoenix.svg"),
     ("php", "icons/file_icons/php.svg"),
     ("prettier", "icons/file_icons/prettier.svg"),
