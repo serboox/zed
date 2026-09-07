@@ -1728,11 +1728,15 @@ impl RunConfigurationsView {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(shown_label).size(LabelSize::Small))
+                    .child(Label::new(shown_label).size(LabelSize::Small).truncate())
                     .child(
+                        // The character cap keeps a row's arguments whole; this is
+                        // what stops a line the cap still leaves too long from
+                        // painting over whatever the row ends with.
                         Label::new(what_it_runs_shortened(&said))
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate_middle(),
                     ),
             )
             .into_any_element()
@@ -1767,6 +1771,11 @@ impl RunConfigurationsView {
                     cx.new(|_| WhatItRunsTooltip { said }).into()
                 })
             })
+            .child(Self::runner_icon(
+                icon_type_of_task(task),
+                format!("temporary-{at}-icon"),
+                cx,
+            ))
             .child(
                 Label::new("on the spot")
                     .size(LabelSize::XSmall)
@@ -1776,11 +1785,13 @@ impl RunConfigurationsView {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(label).size(LabelSize::Small))
+                    .debug_selector(move || format!("temporary-{at}-said"))
+                    .child(Label::new(label).size(LabelSize::Small).truncate())
                     .child(
                         Label::new(what_it_runs_shortened(&said))
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate_middle(),
                     ),
             )
             .child(
@@ -4431,5 +4442,65 @@ mod tests {
                 "row {at} is one of the rows the heading counts"
             );
         }
+    }
+
+    /// A row without an icon in a column of rows with icons does not read as a
+    /// different kind of row, it reads as a row whose icon failed to load. The
+    /// icon says what runs here as well, and the same wrapper rule applies.
+    #[gpui::test]
+    async fn a_temporary_row_carries_the_icon_of_what_it_runs(cx: &mut TestAppContext) {
+        let (pane_view, _fs, mut pane_cx) = a_view_of(None, cx).await;
+        let store = pane_view.read_with(&pane_cx, |view, _| view.store.clone());
+        store.update_in(&mut pane_cx, |store, _window, cx| {
+            store.remember_temporary(
+                a_task(
+                    "/home/reader/.envs/.zed/with-env",
+                    &["go", "run", "./cmd/api"],
+                ),
+                cx,
+            );
+        });
+        pane_cx.run_until_parked();
+        let (_view, mut cx) = a_window_beside(&pane_view, &mut pane_cx);
+        draw(&mut cx);
+
+        let icon = cx
+            .debug_bounds("temporary-0-icon")
+            .expect("a row run on the spot has an icon of its own");
+        let row = cx.debug_bounds("temporary-0").expect("the row it sits on");
+        let said = cx
+            .debug_bounds("temporary-0-said")
+            .expect("what the row is called and what it runs");
+        eprintln!(
+            "row {:?} icon {:?} said {:?}",
+            row.size.width, icon.size.width, said.size.width
+        );
+
+        assert_eq!(
+            icon.size.width, ROW_ICON_BOX,
+            "the icon takes the same room on every row, whichever list it is in"
+        );
+        assert!(
+            icon.origin.x < said.origin.x,
+            "and it leads the row rather than following what it describes"
+        );
+        assert!(
+            row.origin.x + row.size.width <= px(300.),
+            "nothing on the row may hang past the column it is in"
+        );
+        assert!(
+            said.size.width >= px(96.),
+            "and the icon must not crowd out what the row says: {:?} left for it",
+            said.size.width
+        );
+
+        let kept_icon = icon_type_of_task(&a_task(
+            "/home/reader/.envs/.zed/with-env",
+            &["go", "run", "./cmd/api"],
+        ));
+        assert_eq!(
+            kept_icon, "go",
+            "a temporary row reads past its wrapper the same way a kept one does"
+        );
     }
 }
