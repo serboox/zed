@@ -28,6 +28,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+smol.workspace = true
 # `net` is what looks a host up before a request goes out, so the reader can see
 # what the lookup cost.
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }

@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::request::{ApiKeyPlacement, AuthConfig, Request, RequestBody};
+use rand::RngCore;
+
+use crate::request::{ApiKeyPlacement, AuthConfig, FormDataValue, Request, RequestBody};
 
 /// The concrete HTTP request that will be sent, after variable resolution,
 /// query-param merging, and auth have all been applied. Pure and
@@ -51,13 +55,271 @@ fn apply_auto_headers(headers: &mut Vec<(String, String)>, disabled: &[String]) 
     }
 }
 
+/// The bytes of every file one body sends, read before the build so that the
+/// build itself stays free of I/O -- it runs wherever Send was pressed, up to
+/// and including the thread that draws the window, where reading a file of
+/// upload size would stop the editor.
+#[derive(Debug, Clone, Default)]
+pub struct FilesForABody {
+    read: HashMap<PathBuf, Vec<u8>>,
+    unreadable: Vec<(PathBuf, String)>,
+}
+
+impl FilesForABody {
+    /// Reads every path [`files_a_body_needs`] named. Awaiting this is safe from
+    /// any thread -- the read runs on a blocking pool rather than here -- which
+    /// is why it is async rather than a plain call every caller would have to
+    /// remember to wrap in a background task.
+    pub async fn read_them(paths: Vec<PathBuf>) -> Self {
+        let mut files = Self::default();
+        for path in paths {
+            match smol::fs::read(&path).await {
+                Ok(bytes) => {
+                    files.read.insert(path, bytes);
+                }
+                Err(error) => files.unreadable.push((path, error.to_string())),
+            }
+        }
+        files
+    }
+
+    pub fn bytes_of(&self, path: &Path) -> Option<&[u8]> {
+        self.read.get(path).map(Vec::as_slice)
+    }
+
+    /// The paths that could not be read, each with the reason. A body needing
+    /// one of them is not built at all, so a caller that can tell the reader
+    /// something -- Send can -- has to read this to say what went wrong; the
+    /// build itself has nowhere to report it.
+    pub fn unreadable(&self) -> &[(PathBuf, String)] {
+        &self.unreadable
+    }
+}
+
+/// Every file this body sends, so they can be read before the build.
+///
+/// The paths come back as they were written, with no `resolve` applied: this has
+/// no variable context to resolve against, and resolving inside the build
+/// instead would leave it looking up a file nobody read. A path is chosen from
+/// disk rather than typed, so there is nothing in it a variable would fill.
+pub fn files_a_body_needs(body: &RequestBody) -> Vec<PathBuf> {
+    match body {
+        RequestBody::Binary { path } if !path.as_os_str().is_empty() => vec![path.clone()],
+        RequestBody::FormData(fields) => fields
+            .iter()
+            .filter(|field| field.enabled && !field.key.is_empty())
+            .filter_map(|field| match &field.value {
+                FormDataValue::File(path) if !path.as_os_str().is_empty() => Some(path.clone()),
+                FormDataValue::File(_) | FormDataValue::Text(_) => None,
+            })
+            .collect(),
+        RequestBody::None
+        | RequestBody::Raw { .. }
+        | RequestBody::UrlEncoded(_)
+        | RequestBody::GraphQl { .. }
+        | RequestBody::Binary { .. } => Vec::new(),
+    }
+}
+
+/// A content type a body requires, and how firmly.
+enum ContentTypeToSend {
+    /// A header the reader wrote by hand wins over this one.
+    UnlessWrittenByHand(String),
+    /// Replaces whatever the reader wrote. Only the build knows the multipart
+    /// boundary it has just generated, so a hand-written `multipart/form-data`
+    /// header names a different boundary or none at all, and a server reading
+    /// that header finds no parts in a body that has them.
+    EvenOverWhatWasWritten(String),
+}
+
+/// A boundary no body can hold by accident, written the way other clients write
+/// theirs so that a reader recognises it in a capture.
+fn a_multipart_boundary() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let random: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("----ZedApiClientFormBoundary{random}")
+}
+
+/// Text put between the quotes of a `Content-Disposition` parameter. A quote or
+/// a line ending left in it would end the parameter, or the header itself,
+/// early -- which is a part the reader never wrote appearing in the body.
+fn between_quotes(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .map(|character| if character == '"' { '\'' } else { character })
+        .collect()
+}
+
+/// The bytes to send for one body, and the content type they have to carry.
+///
+/// The content type comes back rather than being set here because a header the
+/// reader wrote by hand usually wins over it, and only the caller holds the
+/// headers. `None` means this body says nothing about its type -- a raw body's
+/// type is the reader's to state, and always has been.
+///
+/// The bytes of a file body -- `Binary`, or a `FormData` field holding a file --
+/// come from `files`, read before this was called; see [`FilesForABody`] for
+/// why they are not read here.
+fn body_to_send(
+    body: &RequestBody,
+    resolve: &impl Fn(&str) -> String,
+    files: &FilesForABody,
+) -> (Option<Vec<u8>>, Option<ContentTypeToSend>) {
+    match body {
+        RequestBody::Raw { text, .. } if !text.is_empty() => {
+            (Some(resolve(text).into_bytes()), None)
+        }
+        RequestBody::UrlEncoded(pairs) => {
+            let written: Vec<String> = pairs
+                .iter()
+                .filter(|(key, _)| !key.is_empty())
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(&resolve(key)),
+                        urlencoding::encode(&resolve(value))
+                    )
+                })
+                .collect();
+            if written.is_empty() {
+                return (None, None);
+            }
+            (
+                Some(written.join("&").into_bytes()),
+                Some(ContentTypeToSend::UnlessWrittenByHand(
+                    "application/x-www-form-urlencoded".to_string(),
+                )),
+            )
+        }
+        RequestBody::GraphQl { query, variables } => {
+            if query.trim().is_empty() {
+                return (None, None);
+            }
+            let mut sending = serde_json::Map::new();
+            sending.insert(
+                "query".to_string(),
+                serde_json::Value::String(resolve(query)),
+            );
+            let written = resolve(variables);
+            // Variables are written as JSON by the reader, and are sent as the
+            // object they parse to rather than as a string holding one -- a
+            // server reading `variables` expects an object there. Text that is
+            // not an object at all is left out entirely: sending it as a string
+            // would be rejected by every server, and guessing at what was meant
+            // is worse than sending the query alone.
+            if let Ok(serde_json::Value::Object(parsed)) =
+                serde_json::from_str::<serde_json::Value>(&written)
+            {
+                sending.insert("variables".to_string(), serde_json::Value::Object(parsed));
+            }
+            let Ok(text) = serde_json::to_vec(&serde_json::Value::Object(sending)) else {
+                return (None, None);
+            };
+            (
+                Some(text),
+                Some(ContentTypeToSend::UnlessWrittenByHand(
+                    "application/json".to_string(),
+                )),
+            )
+        }
+        RequestBody::Binary { path } if !path.as_os_str().is_empty() => {
+            // A file that could not be read makes this no body at all rather
+            // than an empty one: an empty PUT reads to a server as "store
+            // nothing here", which is a worse answer than a request that
+            // plainly carried nothing. What went wrong is in
+            // `FilesForABody::unreadable`, for the caller to show.
+            let Some(bytes) = files.bytes_of(path) else {
+                return (None, None);
+            };
+            (
+                Some(bytes.to_vec()),
+                Some(ContentTypeToSend::UnlessWrittenByHand(
+                    "application/octet-stream".to_string(),
+                )),
+            )
+        }
+        RequestBody::FormData(fields) => {
+            let sending: Vec<&crate::request::FormDataField> = fields
+                .iter()
+                .filter(|field| field.enabled && !field.key.is_empty())
+                .collect();
+            if sending.is_empty() {
+                return (None, None);
+            }
+            let boundary = a_multipart_boundary();
+            let mut written: Vec<u8> = Vec::new();
+            for field in sending {
+                let name = between_quotes(&resolve(&field.key));
+                written.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                match &field.value {
+                    FormDataValue::Text(text) => {
+                        written.extend_from_slice(
+                            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        written.extend_from_slice(resolve(text).as_bytes());
+                    }
+                    FormDataValue::File(path) => {
+                        // One part missing makes the whole form wrong, so none
+                        // of it is sent: a server handed a form without its file
+                        // either refuses it or stores a record with a hole in it,
+                        // and both are harder to trace back to an unreadable
+                        // file than a request that carried no body at all. The
+                        // reason is in `FilesForABody::unreadable`.
+                        let Some(bytes) = files.bytes_of(path) else {
+                            return (None, None);
+                        };
+                        let filename =
+                            between_quotes(&path.file_name().unwrap_or_default().to_string_lossy());
+                        written.extend_from_slice(
+                            format!(
+                                "Content-Disposition: form-data; name=\"{name}\"; \
+                                 filename=\"{filename}\"\r\n\
+                                 Content-Type: application/octet-stream\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                        written.extend_from_slice(bytes);
+                    }
+                }
+                written.extend_from_slice(b"\r\n");
+            }
+            written.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            (
+                Some(written),
+                Some(ContentTypeToSend::EvenOverWhatWasWritten(format!(
+                    "multipart/form-data; boundary={boundary}"
+                ))),
+            )
+        }
+        RequestBody::None | RequestBody::Raw { .. } | RequestBody::Binary { .. } => (None, None),
+    }
+}
+
 /// Applies `resolve` (a `{{token}}` substitution function, typically
-/// `variable_resolution::resolve` bound to a `VariableContext`) to every
-/// user-facing string on `request`, merges enabled query params into the
-/// URL, and layers auth on top as either a header or a query param.
+/// `variable_resolution::resolve` bound to a `VariableContext`) to the URL,
+/// the query parameters, the headers, the body and every credential, merges
+/// enabled query params into the URL, and layers auth on top as either a
+/// header or a query param.
+///
+/// For a request whose body holds no file. Anything that can hold one goes
+/// through [`build_resolved_request_with_files`], the single place a request is
+/// built, so that the file reaches the wire whether Send, the collection runner
+/// or a generated snippet asked for it.
 pub fn build_resolved_request(
     request: &Request,
     resolve: &impl Fn(&str) -> String,
+) -> ResolvedRequest {
+    build_resolved_request_with_files(request, resolve, &FilesForABody::default())
+}
+
+/// The same, for a body whose files [`FilesForABody::read_them`] has already
+/// read.
+pub fn build_resolved_request_with_files(
+    request: &Request,
+    resolve: &impl Fn(&str) -> String,
+    files: &FilesForABody,
 ) -> ResolvedRequest {
     let mut url = resolve(&request.url);
 
@@ -90,10 +352,22 @@ pub fn build_resolved_request(
         .collect();
     apply_auto_headers(&mut headers, &request.settings.disabled_auto_headers);
 
-    let body = match &request.body {
-        RequestBody::Raw { text, .. } if !text.is_empty() => Some(resolve(text).into_bytes()),
-        _ => None,
-    };
+    let (body, needs_content_type) = body_to_send(&request.body, resolve, files);
+    match needs_content_type {
+        Some(ContentTypeToSend::UnlessWrittenByHand(content_type)) => {
+            if !headers
+                .iter()
+                .any(|(key, _)| key.trim().eq_ignore_ascii_case("content-type"))
+            {
+                headers.push(("Content-Type".to_string(), content_type));
+            }
+        }
+        Some(ContentTypeToSend::EvenOverWhatWasWritten(content_type)) => {
+            headers.retain(|(key, _)| !key.trim().eq_ignore_ascii_case("content-type"));
+            headers.push(("Content-Type".to_string(), content_type));
+        }
+        None => {}
+    }
 
     match &request.auth {
         AuthConfig::Basic { username, password } => {
@@ -128,7 +402,7 @@ pub fn build_resolved_request(
             if !oauth2.access_token.is_empty() {
                 headers.push((
                     "Authorization".to_string(),
-                    format!("Bearer {}", oauth2.access_token),
+                    format!("Bearer {}", resolve(&oauth2.access_token)),
                 ));
             }
         }
@@ -1184,6 +1458,450 @@ mod tests {
                 && authorization.contains("user-agent"),
             "auto-generated headers must be part of the signed headers set \
              (added before signing), not appended afterward unsigned: {authorization}"
+        );
+    }
+
+    /// A body written as a table of pairs is sent as those pairs, which is
+    /// what the content type it now carries says it is.
+    #[test]
+    fn a_table_of_pairs_is_sent_as_a_form_body_with_the_type_that_names_it() {
+        let mut request = base_request();
+        request.body = RequestBody::UrlEncoded(vec![
+            ("grant_type".to_string(), "password".to_string()),
+            ("username".to_string(), "alice".to_string()),
+        ]);
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.body.as_deref().map(String::from_utf8_lossy),
+            Some("grant_type=password&username=alice".into())
+        );
+        assert_eq!(
+            resolved.headers,
+            vec![(
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string()
+            )]
+        );
+    }
+
+    /// A variable in a pair is resolved, and what it resolves to is escaped
+    /// afterwards rather than before: a value holding a space or an ampersand
+    /// would otherwise end the pair early and start another.
+    #[test]
+    fn a_pair_carrying_a_variable_is_resolved_and_then_escaped() {
+        let mut request = base_request();
+        request.body =
+            RequestBody::UrlEncoded(vec![("q".to_string(), "{{search-words}}".to_string())]);
+
+        let resolved = build_resolved_request(&request, &|text: &str| {
+            if text == "{{search-words}}" {
+                "one two&three".to_string()
+            } else {
+                text.to_string()
+            }
+        });
+
+        assert_eq!(
+            resolved.body.as_deref().map(String::from_utf8_lossy),
+            Some("q=one%20two%26three".into()),
+            "the ampersand inside the value cannot be allowed to separate pairs"
+        );
+    }
+
+    /// A pair with no name is not a pair, and a table holding nothing else is
+    /// not a body -- an empty form body would make a GET carry a content type
+    /// for nothing.
+    #[test]
+    fn a_table_with_nothing_named_in_it_is_not_a_body() {
+        let mut request = base_request();
+        request.body = RequestBody::UrlEncoded(vec![(String::new(), "1".to_string())]);
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(resolved.body, None);
+        assert!(resolved.headers.is_empty(), "{:?}", resolved.headers);
+    }
+
+    /// A GraphQL request is one JSON object holding the query and the
+    /// variables, and the variables are the object the reader wrote rather
+    /// than a string holding it.
+    #[test]
+    fn a_graphql_body_is_sent_as_json_with_its_variables_as_an_object() {
+        let mut request = base_request();
+        request.body = RequestBody::GraphQl {
+            query: "query Ratios($id: ID!) { ratios(id: $id) { pe } }".to_string(),
+            variables: r#"{"id": "{{instrument-id}}"}"#.to_string(),
+        };
+
+        let resolved = build_resolved_request(&request, &|text: &str| {
+            text.replace("{{instrument-id}}", "8830")
+        });
+
+        let sent: serde_json::Value =
+            serde_json::from_slice(resolved.body.as_deref().expect("a graphql body is sent"))
+                .expect("what is sent is json");
+        assert_eq!(
+            sent["query"],
+            "query Ratios($id: ID!) { ratios(id: $id) { pe } }"
+        );
+        assert_eq!(
+            sent["variables"],
+            serde_json::json!({"id": "8830"}),
+            "an object, not the text of one, and with the variable resolved"
+        );
+        assert_eq!(
+            resolved.headers,
+            vec![("Content-Type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    /// Variables that are not an object are left out rather than sent as
+    /// text: every server would refuse a string there, and the query alone
+    /// still reaches one that can answer it.
+    #[test]
+    fn graphql_variables_that_are_not_an_object_are_left_out() {
+        for written in ["", "not json at all", "[1, 2]", "\"a string\""] {
+            let mut request = base_request();
+            request.body = RequestBody::GraphQl {
+                query: "{ me }".to_string(),
+                variables: written.to_string(),
+            };
+
+            let resolved = build_resolved_request(&request, &identity);
+            let sent: serde_json::Value =
+                serde_json::from_slice(resolved.body.as_deref().expect("a graphql body is sent"))
+                    .expect("what is sent is json");
+            assert_eq!(sent["query"], "{ me }", "{written:?}");
+            assert_eq!(sent.get("variables"), None, "{written:?}");
+        }
+    }
+
+    /// A GraphQL body with no query is nothing to send.
+    #[test]
+    fn a_graphql_body_with_no_query_is_not_a_body() {
+        let mut request = base_request();
+        request.body = RequestBody::GraphQl {
+            query: "   ".to_string(),
+            variables: r#"{"id": 1}"#.to_string(),
+        };
+
+        assert_eq!(build_resolved_request(&request, &identity).body, None);
+    }
+
+    /// A content type the reader wrote by hand wins: they may be sending a
+    /// form body to a server that insists on a vendor type for it.
+    #[test]
+    fn a_content_type_written_by_hand_is_not_replaced() {
+        let mut request = base_request();
+        request.headers = vec![Header {
+            key: "content-type".to_string(),
+            value: "application/vnd.example+x-www-form-urlencoded".to_string(),
+            enabled: true,
+            description: None,
+        }];
+        request.body = RequestBody::UrlEncoded(vec![("a".to_string(), "1".to_string())]);
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(
+            resolved.headers,
+            vec![(
+                "content-type".to_string(),
+                "application/vnd.example+x-www-form-urlencoded".to_string()
+            )],
+            "one content type, and it is theirs"
+        );
+    }
+
+    /// An access token is as much a place for a variable as any other
+    /// credential -- a token kept in the environment is the ordinary way to
+    /// keep it out of a saved request.
+    #[test]
+    fn an_oauth2_access_token_written_as_a_variable_is_resolved() {
+        let mut request = base_request();
+        request.auth = AuthConfig::OAuth2(crate::oauth2::OAuth2Config {
+            access_token: "{{access-token}}".to_string(),
+            ..Default::default()
+        });
+
+        let resolved = build_resolved_request(&request, &|text: &str| {
+            text.replace("{{access-token}}", "ya29.a0")
+        });
+
+        assert_eq!(
+            resolved.headers,
+            vec![("Authorization".to_string(), "Bearer ya29.a0".to_string())],
+            "the braces must not reach the wire"
+        );
+    }
+
+    /// A file body is the file: what is on disk, byte for byte, under the type
+    /// a server reads as "bytes I am not to interpret".
+    #[test]
+    fn a_binary_body_sends_the_file_itself() {
+        let holding = tempfile::tempdir().expect("a directory to write into");
+        let path = holding.path().join("upload.bin");
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        std::fs::write(&path, &bytes).expect("the file to be written");
+
+        let mut request = base_request();
+        request.body = RequestBody::Binary { path };
+        let files = smol::block_on(FilesForABody::read_them(files_a_body_needs(&request.body)));
+
+        let resolved = build_resolved_request_with_files(&request, &identity, &files);
+
+        assert!(files.unreadable().is_empty(), "{:?}", files.unreadable());
+        assert_eq!(resolved.body.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(
+            resolved.headers,
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string()
+            )]
+        );
+    }
+
+    /// A form body is multipart: every part named, a file part carrying the
+    /// file's own name so the server can store it under something better than
+    /// the field name, and the boundary the header names separating them.
+    #[test]
+    fn a_form_body_carries_its_text_and_its_file() {
+        let holding = tempfile::tempdir().expect("a directory to write into");
+        let path = holding.path().join("portrait.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("the file to be written");
+
+        let mut request = base_request();
+        request.body = RequestBody::FormData(vec![
+            crate::request::FormDataField {
+                key: "caption".to_string(),
+                value: crate::request::FormDataValue::Text("{{who}} at work".to_string()),
+                enabled: true,
+            },
+            crate::request::FormDataField {
+                key: "avatar".to_string(),
+                value: crate::request::FormDataValue::File(path.clone()),
+                enabled: true,
+            },
+            crate::request::FormDataField {
+                key: "unwanted".to_string(),
+                value: crate::request::FormDataValue::Text("left out".to_string()),
+                enabled: false,
+            },
+        ]);
+        let files = smol::block_on(FilesForABody::read_them(files_a_body_needs(&request.body)));
+
+        let resolved = build_resolved_request_with_files(
+            &request,
+            &|text: &str| text.replace("{{who}}", "Ada"),
+            &files,
+        );
+
+        let sent = String::from_utf8_lossy(resolved.body.as_deref().expect("a form body is sent"))
+            .into_owned();
+        assert!(
+            sent.contains(
+                "Content-Disposition: form-data; name=\"caption\"\r\n\r\nAda at work\r\n"
+            ),
+            "{sent}"
+        );
+        assert!(
+            sent.contains(
+                "Content-Disposition: form-data; name=\"avatar\"; filename=\"portrait.png\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            ),
+            "{sent}"
+        );
+        let body = resolved.body.as_deref().expect("a form body is sent");
+        let on_disk = std::fs::read(&path).expect("the file to be read back");
+        assert!(
+            body.windows(on_disk.len())
+                .any(|window| window == on_disk.as_slice()),
+            "the part carries the file itself, and a file is not text"
+        );
+        assert!(
+            !sent.contains("unwanted"),
+            "a field the reader switched off is not a part: {sent}"
+        );
+    }
+
+    /// The boundary is generated during the build, so the header cannot be
+    /// written from anywhere else -- and if the two ever disagree the parts
+    /// become body text no server will look at.
+    #[test]
+    fn the_boundary_in_the_header_is_the_boundary_in_the_body() {
+        let mut request = base_request();
+        request.body = RequestBody::FormData(vec![crate::request::FormDataField {
+            key: "a".to_string(),
+            value: crate::request::FormDataValue::Text("1".to_string()),
+            enabled: true,
+        }]);
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        let (_, content_type) = resolved
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            .expect("a multipart body names its boundary in the header");
+        let named = content_type
+            .split_once("boundary=")
+            .map(|(_, boundary)| boundary.to_string())
+            .expect("the header carries a boundary");
+        let sent = String::from_utf8_lossy(resolved.body.as_deref().expect("a form body is sent"))
+            .into_owned();
+        assert!(sent.starts_with(&format!("--{named}\r\n")), "{sent}");
+        assert!(sent.ends_with(&format!("--{named}--\r\n")), "{sent}");
+    }
+
+    /// Every body kind leaves a hand-written content type alone -- except
+    /// multipart, whose header holds the boundary this build has just made up
+    /// and nobody else can know.
+    #[test]
+    fn a_hand_written_content_type_loses_only_to_multipart() {
+        let holding = tempfile::tempdir().expect("a directory to write into");
+        let path = holding.path().join("upload.bin");
+        std::fs::write(&path, b"payload").expect("the file to be written");
+        let theirs = "application/vnd.example+what-they-said";
+
+        for body in [
+            RequestBody::Raw {
+                content_type: crate::request::RawBodyContentType::Json,
+                text: "{}".to_string(),
+            },
+            RequestBody::UrlEncoded(vec![("a".to_string(), "1".to_string())]),
+            RequestBody::GraphQl {
+                query: "{ me }".to_string(),
+                variables: String::new(),
+            },
+            RequestBody::Binary { path },
+        ] {
+            let mut request = base_request();
+            request.headers = vec![Header {
+                key: "Content-Type".to_string(),
+                value: theirs.to_string(),
+                enabled: true,
+                description: None,
+            }];
+            request.body = body;
+            let files = smol::block_on(FilesForABody::read_them(files_a_body_needs(&request.body)));
+
+            let resolved = build_resolved_request_with_files(&request, &identity, &files);
+
+            assert_eq!(
+                resolved.headers,
+                vec![("Content-Type".to_string(), theirs.to_string())],
+                "{:?} has to keep the reader's own type",
+                request.body
+            );
+        }
+
+        let mut request = base_request();
+        request.headers = vec![Header {
+            key: "Content-Type".to_string(),
+            value: "multipart/form-data; boundary=whatever-they-wrote".to_string(),
+            enabled: true,
+            description: None,
+        }];
+        request.body = RequestBody::FormData(vec![crate::request::FormDataField {
+            key: "a".to_string(),
+            value: crate::request::FormDataValue::Text("1".to_string()),
+            enabled: true,
+        }]);
+
+        let resolved = build_resolved_request(&request, &identity);
+
+        assert_eq!(resolved.headers.len(), 1, "{:?}", resolved.headers);
+        let (_, content_type) = &resolved.headers[0];
+        assert!(
+            !content_type.contains("whatever-they-wrote"),
+            "the parts are separated by the boundary the build made, so the header \
+             cannot keep naming theirs: {content_type}"
+        );
+        let named = content_type
+            .split_once("boundary=")
+            .map(|(_, boundary)| boundary.to_string())
+            .expect("the header carries a boundary");
+        let sent = String::from_utf8_lossy(resolved.body.as_deref().expect("a form body is sent"))
+            .into_owned();
+        assert!(sent.starts_with(&format!("--{named}\r\n")), "{sent}");
+    }
+
+    /// A file that cannot be read stops the body it belonged to, and says so
+    /// through `unreadable` -- a form missing one part, or an empty PUT, would
+    /// reach the server as an answer the reader never gave.
+    #[test]
+    fn a_file_that_cannot_be_read_stops_the_body_and_is_reported() {
+        let holding = tempfile::tempdir().expect("a directory to write into");
+        let missing = holding.path().join("never-written.bin");
+        let there = holding.path().join("caption.txt");
+        std::fs::write(&there, b"read me").expect("the file to be written");
+
+        for body in [
+            RequestBody::Binary {
+                path: missing.clone(),
+            },
+            RequestBody::FormData(vec![
+                crate::request::FormDataField {
+                    key: "caption".to_string(),
+                    value: crate::request::FormDataValue::Text("a picture".to_string()),
+                    enabled: true,
+                },
+                crate::request::FormDataField {
+                    key: "avatar".to_string(),
+                    value: crate::request::FormDataValue::File(missing.clone()),
+                    enabled: true,
+                },
+            ]),
+        ] {
+            let mut request = base_request();
+            request.body = body;
+            let files = smol::block_on(FilesForABody::read_them(files_a_body_needs(&request.body)));
+
+            let resolved = build_resolved_request_with_files(&request, &identity, &files);
+
+            assert_eq!(resolved.body, None, "{:?}", request.body);
+            assert!(resolved.headers.is_empty(), "{:?}", resolved.headers);
+            assert_eq!(
+                files.unreadable().len(),
+                1,
+                "the caller has to be able to say which file: {:?}",
+                files.unreadable()
+            );
+            assert_eq!(files.unreadable()[0].0, missing);
+        }
+    }
+
+    /// A body with no file in it needs nothing read, so Send does not go to disk
+    /// for a request that never mentioned one.
+    #[test]
+    fn a_body_with_no_file_in_it_asks_for_nothing() {
+        assert!(files_a_body_needs(&RequestBody::None).is_empty());
+        assert!(
+            files_a_body_needs(&RequestBody::Binary {
+                path: std::path::PathBuf::new()
+            })
+            .is_empty(),
+            "no file chosen yet is not a file to read"
+        );
+        assert!(
+            files_a_body_needs(&RequestBody::FormData(vec![
+                crate::request::FormDataField {
+                    key: "caption".to_string(),
+                    value: crate::request::FormDataValue::Text("text".to_string()),
+                    enabled: true,
+                },
+                crate::request::FormDataField {
+                    key: "avatar".to_string(),
+                    value: crate::request::FormDataValue::File(std::path::PathBuf::from(
+                        "/tmp/off.bin"
+                    )),
+                    enabled: false,
+                },
+            ]))
+            .is_empty(),
+            "a field switched off is not sent, so its file is not read either"
         );
     }
 }

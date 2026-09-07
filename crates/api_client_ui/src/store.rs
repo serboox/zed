@@ -1247,13 +1247,26 @@ impl ApiClientStore {
         self.persist_collections(cx);
     }
 
+    /// The files this request's body sends, to be read before `what_to_send` is
+    /// asked for them -- reading them here would be a disk read on the thread
+    /// that draws the window.
+    pub fn files_to_send(&self, request_id: RequestId) -> Vec<std::path::PathBuf> {
+        let Some(request) = self.requests.iter().find(|r| r.id == request_id) else {
+            return Vec::new();
+        };
+        api_client::files_a_body_needs(&request.body)
+    }
+
     /// What it takes to send this request against one environment: the client
     /// and the request with every `{{token}}` in it resolved. Handed out rather
     /// than sent here, so whoever asked can await it in their own window.
+    ///
+    /// `files` is what [`Self::files_to_send`] named, already read.
     pub fn what_to_send(
         &self,
         request_id: RequestId,
         environment_id: EnvironmentId,
+        files: &api_client::FilesForABody,
     ) -> Option<(reqwest::Client, api_client::ResolvedRequest)> {
         // An environment that has been deleted is not one to send against: the
         // request would go out resolved against nothing at all and come back
@@ -1267,7 +1280,7 @@ impl ApiClientStore {
         };
         Some((
             self.http_client.clone(),
-            api_client::build_resolved_request(request, &resolve),
+            api_client::build_resolved_request_with_files(request, &resolve, files),
         ))
     }
 
@@ -2020,15 +2033,73 @@ mod tests {
 
         store.read_with(cx, |store, _| {
             assert!(
-                store.what_to_send(request_id, doomed).is_some(),
+                store
+                    .what_to_send(request_id, doomed, &Default::default())
+                    .is_some(),
                 "an environment that is there is one to send against"
             );
         });
 
         store.update(cx, |store, cx| store.delete_environment(doomed, cx));
         store.read_with(cx, |store, _| {
-            assert!(store.what_to_send(request_id, doomed).is_none());
+            assert!(
+                store
+                    .what_to_send(request_id, doomed, &Default::default())
+                    .is_none()
+            );
         });
+    }
+
+    /// The reason the files are named and read before the build: a body made of
+    /// one has to reach the wire. A caller that builds without them sends a
+    /// request with no body at all, and the reader is told nothing.
+    #[gpui::test]
+    fn what_to_send_carries_the_file_a_body_is_made_of(cx: &mut TestAppContext) {
+        let holding = tempfile::tempdir().expect("a directory to write into");
+        let path = holding.path().join("upload.bin");
+        std::fs::write(&path, b"the bytes on disk").expect("the file to be written");
+
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let environment_id = store.update(cx, |store, cx| {
+            store.create_environment("Staging".into(), cx)
+        });
+        let collection = api_client::Collection::new("Sample".into());
+        let collection_id = collection.id;
+        store.update(cx, |store, _| store.collections.push(collection));
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, "Upload".into(), None, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.update_request(request_id, cx, |request| {
+                request.url = "https://example.com/upload".into();
+                request.body = api_client::RequestBody::Binary { path: path.clone() };
+            });
+        });
+
+        let paths = store.read_with(cx, |store, _| store.files_to_send(request_id));
+        assert_eq!(paths, vec![path], "the store has to name the file to read");
+        // Read outside the app's own async machinery: the read lands on a
+        // blocking pool the test scheduler does not drive, and awaiting it in a
+        // `gpui` task is a forbidden park rather than a wait.
+        let files = smol::block_on(api_client::FilesForABody::read_them(paths));
+
+        let (_, resolved) = store
+            .read_with(cx, |store, _| {
+                store.what_to_send(request_id, environment_id, &files)
+            })
+            .expect("an environment that is there is one to send against");
+
+        assert_eq!(
+            resolved.body.as_deref(),
+            Some(b"the bytes on disk".as_ref())
+        );
+        assert!(
+            resolved.headers.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("content-type") && value == "application/octet-stream"
+            }),
+            "{:?}",
+            resolved.headers
+        );
     }
 
     #[gpui::test]

@@ -215,7 +215,19 @@ async fn run_one_request(
     let resolve = |text: &str| {
         api_client::resolve(text, &context, &dynamic, api_client::ResolveMode::ForSend)
     };
-    let resolved = api_client::build_resolved_request(request, &resolve);
+    let files =
+        api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body)).await;
+    if let Some((path, why)) = files.unreadable().first() {
+        // The body would go out without this file, which a server answers as
+        // though the row itself were wrong. The run says which file instead.
+        return OneRequestOutcome {
+            status: None,
+            passed_tests: 0,
+            failed_tests: 0,
+            error: Some(format!("Could not read {}: {why}", path.display())),
+        };
+    }
+    let resolved = api_client::build_resolved_request_with_files(request, &resolve, &files);
 
     let response = match api_client::execute(client, &resolved).await {
         Ok(summary) => summary,

@@ -2249,24 +2249,40 @@ impl RequestView {
         let store = self.store.clone();
         let shown = self.code_snippet_shape;
         let view = cx.entity().downgrade();
-        workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                let modal = CodeSnippetModal::new(request, store, languages, shown, window, cx);
-                // The shape the reader picked is remembered here, so the window
-                // opens on it rather than on cURL again. Where they left the window
-                // is remembered by the window itself, for whichever request opens
-                // it next.
-                cx.observe_release(&cx.entity(), move |_, modal: &mut CodeSnippetModal, cx| {
-                    let shown = modal.shown();
-                    view.update(cx, |view, _| {
-                        view.code_snippet_shape = shown;
-                    })
-                    .log_err();
+        let workspace = workspace.downgrade();
+        // The files first: the window shows the body Send would send, and reading
+        // them is not something the thread that draws it can do.
+        cx.spawn_in(window, async move |_, cx| {
+            let files =
+                api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body))
+                    .await;
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        let modal = CodeSnippetModal::new(
+                            request, files, store, languages, shown, window, cx,
+                        );
+                        // The shape the reader picked is remembered here, so the
+                        // window opens on it rather than on cURL again. Where they
+                        // left the window is remembered by the window itself, for
+                        // whichever request opens it next.
+                        cx.observe_release(
+                            &cx.entity(),
+                            move |_, modal: &mut CodeSnippetModal, cx| {
+                                let shown = modal.shown();
+                                view.update(cx, |view, _| {
+                                    view.code_snippet_shape = shown;
+                                })
+                                .log_err();
+                            },
+                        )
+                        .detach();
+                        modal
+                    });
                 })
-                .detach();
-                modal
-            });
-        });
+                .log_err();
+        })
+        .detach();
     }
 
     /// Looks up this request's own response tab, if one is open. `None` here is
@@ -2559,13 +2575,31 @@ impl RequestView {
                 }
             }
 
+            let files =
+                api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body))
+                    .await;
+            if let Some((path, why)) = files.unreadable().first() {
+                // Without this the request would go out with no body at all,
+                // which a server answers as though the reader had meant to send
+                // nothing. Nothing is sent, and the reason is shown instead.
+                let message = format!("Could not read {}: {why}", path.display());
+                this.update_in(cx, |this, window, cx| {
+                    this.send_state = SendState::Error(message.clone());
+                    this.route_error_to_dock(message, window, cx);
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+
             let (resolved, environment_name) = store.update(cx, |store, _| {
                 let context = store.variable_context_for(&request);
                 let dynamic = SystemDynamicVariableSource;
                 let resolve = |text: &str| {
                     api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
                 };
-                let resolved = api_client::build_resolved_request(&request, &resolve);
+                let resolved =
+                    api_client::build_resolved_request_with_files(&request, &resolve, &files);
                 let environment_name = store
                     .effective_environment_for(&request)
                     .map(|environment| environment.name.clone());
@@ -2852,13 +2886,16 @@ impl RequestView {
 
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
+            let files =
+                api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body))
+                    .await;
             let resolved = store.update(cx, |store, _| {
                 let context = store.variable_context_for_environment(&request, environment_id);
                 let dynamic = SystemDynamicVariableSource;
                 let resolve = |text: &str| {
                     api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
                 };
-                api_client::build_resolved_request(&request, &resolve)
+                api_client::build_resolved_request_with_files(&request, &resolve, &files)
             });
             let result = api_client::execute(&client, &resolved).await;
             this.update_in(cx, |this, window, cx| {
@@ -3145,6 +3182,9 @@ impl RequestView {
 
         let workspace = workspace.downgrade();
         cx.spawn_in(window, async move |this, cx| {
+            let files =
+                api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body))
+                    .await;
             let mut resolve_against = |environment_id: EnvironmentId| {
                 store.update(cx, |store, _| {
                     let context = store.variable_context_for_environment(&request, environment_id);
@@ -3152,7 +3192,7 @@ impl RequestView {
                     let resolve = |text: &str| {
                         api_client::resolve(text, &context, &dynamic, ResolveMode::ForSend)
                     };
-                    api_client::build_resolved_request(&request, &resolve)
+                    api_client::build_resolved_request_with_files(&request, &resolve, &files)
                 })
             };
             let left_request = resolve_against(left_id);
@@ -5178,6 +5218,9 @@ pub(crate) struct CodeSnippetModal {
     focus_handle: FocusHandle,
     pub(crate) code_editor: Entity<Editor>,
     request: api_client::Request,
+    /// Read before the window opened: the snippet has to show the same body Send
+    /// would send, and the window cannot go to disk while it is drawing.
+    files: api_client::FilesForABody,
     store: Entity<ApiClientStore>,
     languages: Arc<language::LanguageRegistry>,
     shown: Snippet,
@@ -5234,6 +5277,7 @@ impl gpui::Global for WhereItWasLeft {}
 impl CodeSnippetModal {
     pub(crate) fn new(
         request: api_client::Request,
+        files: api_client::FilesForABody,
         store: Entity<ApiClientStore>,
         languages: Arc<language::LanguageRegistry>,
         shown: Snippet,
@@ -5254,6 +5298,7 @@ impl CodeSnippetModal {
             focus_handle: cx.focus_handle(),
             code_editor,
             request,
+            files,
             store,
             languages,
             shown,
@@ -5457,7 +5502,7 @@ impl CodeSnippetModal {
         let code = {
             let store = self.store.read(cx);
             let context = store.variable_context_for(&self.request);
-            crate::code_generator::generate(snippet, &self.request, &context)
+            crate::code_generator::generate(snippet, &self.request, &context, &self.files)
         };
         self.code_editor.update(cx, |editor, cx| {
             editor.set_read_only(false);

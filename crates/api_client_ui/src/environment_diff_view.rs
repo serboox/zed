@@ -325,16 +325,24 @@ impl EnvironmentDiffView {
             Side::Left => self.left.environment.clone(),
             Side::Right => self.right.environment.clone(),
         };
-        let Some((client, resolved)) = self
-            .store
-            .read(cx)
-            .what_to_send(self.compared.request_id, environment)
-        else {
-            return;
-        };
+        let request_id = self.compared.request_id;
+        let paths = self.store.read(cx).files_to_send(request_id);
+        let store = self.store.clone();
         self.asking_again = Some(side);
         cx.notify();
         self.asking = cx.spawn_in(window, async move |this, cx| {
+            let files = api_client::FilesForABody::read_them(paths).await;
+            let what_to_send = store.read_with(cx, |store, _| {
+                store.what_to_send(request_id, environment, &files)
+            });
+            let Some((client, resolved)) = what_to_send else {
+                this.update(cx, |this, cx| {
+                    this.asking_again = None;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
             let result = api_client::execute(&client, &resolved).await;
             this.update_in(cx, |this, window, cx| {
                 // Not through `show`: that would drop the very task this is
