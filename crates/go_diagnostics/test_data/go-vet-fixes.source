@@ -1,0 +1,13 @@
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	описание := "🦀🔥"
+	fmt.Println(описание, "🦀", time.Now().Format("2006-02-01"))
+	var code int = 65
+	fmt.Println(string(code))
+}

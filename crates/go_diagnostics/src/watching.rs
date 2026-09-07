@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -10,6 +11,7 @@ use language::{Buffer, DiagnosticSourceKind};
 use project::Project;
 use project::buffer_store::BufferStoreEvent;
 
+use crate::fixing::Fixes;
 use crate::{what_the_compiler_reported, what_vet_reported};
 
 actions!(
@@ -26,7 +28,8 @@ actions!(
 /// server, so a source that is not a server still needs an id. Chosen far
 /// above any a running server would be assigned, and one apart from the SQL
 /// validator's and cargo's.
-const GO_SERVER_ID: language::LanguageServerId = language::LanguageServerId(usize::MAX - 1002);
+pub(crate) const GO_SERVER_ID: language::LanguageServerId =
+    language::LanguageServerId(usize::MAX - 1002);
 
 /// Idle time after a save before the toolchain is asked. A save often comes in
 /// a burst -- format-on-save writes, then a multi-file rename -- and each one
@@ -56,9 +59,15 @@ struct Watching {
 }
 
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut workspace::Workspace, _, cx| {
+    // One store for the whole application rather than one per workspace: the
+    // source that reads it is registered once, and a file belongs to
+    // whichever run last reported on it.
+    let fixes = Arc::new(Mutex::new(Fixes::default()));
+    crate::fixing::init(fixes.clone(), cx);
+    cx.observe_new(move |workspace: &mut workspace::Workspace, _, cx| {
         let project = workspace.project().clone();
         let watching = Rc::new(RefCell::new(Watching::default()));
+        let fixes = fixes.clone();
 
         // Every buffer already open, and every one opened later. Collected
         // first: reading the store borrows the context that watching one needs
@@ -66,15 +75,16 @@ pub fn init(cx: &mut App) {
         let already_open: Vec<Entity<Buffer>> =
             project.read(cx).buffer_store().read(cx).buffers().collect();
         for buffer in already_open {
-            watch_one(&project, &buffer, &watching, cx);
+            watch_one(&project, &buffer, &watching, &fixes, cx);
         }
         let buffer_store = project.read(cx).buffer_store().clone();
         cx.subscribe(&buffer_store, {
             let project = project.clone();
             let watching = watching.clone();
+            let fixes = fixes.clone();
             move |_: &mut workspace::Workspace, _, event, cx| {
                 if let BufferStoreEvent::BufferAdded(buffer) = event {
-                    watch_one(&project, buffer, &watching, cx);
+                    watch_one(&project, buffer, &watching, &fixes, cx);
                 }
             }
         })
@@ -83,8 +93,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action({
             let project = project.clone();
             let watching = watching.clone();
+            let fixes = fixes.clone();
             move |_, _: &Check, _, cx| {
-                ask_the_toolchain(&project, &watching, cx);
+                ask_the_toolchain(&project, &watching, &fixes, cx);
             }
         });
     })
@@ -103,11 +114,13 @@ fn watch_one(
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
     watching: &Rc<RefCell<Watching>>,
+    fixes: &Arc<Mutex<Fixes>>,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
     cx.subscribe(buffer, {
         let project = project.clone();
         let watching = watching.clone();
+        let fixes = fixes.clone();
         move |_: &mut workspace::Workspace, buffer, event, cx| {
             if !matches!(event, language::BufferEvent::Saved) {
                 return;
@@ -133,7 +146,7 @@ fn watch_one(
             if served {
                 return;
             }
-            ask_the_toolchain(&project, &watching, cx);
+            ask_the_toolchain(&project, &watching, &fixes, cx);
         }
     })
     .detach();
@@ -152,6 +165,7 @@ fn is_go(buffer: &Entity<Buffer>, cx: &App) -> bool {
 fn ask_the_toolchain(
     project: &Entity<Project>,
     watching: &Rc<RefCell<Watching>>,
+    fixes: &Arc<Mutex<Fixes>>,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
     let Some(root) = a_go_module_root(project, cx) else {
@@ -159,6 +173,7 @@ fn ask_the_toolchain(
     };
     let project = project.downgrade();
     let held = watching.clone();
+    let fixes = fixes.clone();
     let task = cx.spawn(async move |_, cx| {
         cx.background_executor().timer(SETTLE).await;
         let asked = run_go(&root).await;
@@ -172,7 +187,9 @@ fn ask_the_toolchain(
                 return;
             }
         };
-        if let Err(error) = show_what_it_said(&project, &root, &built, &vetted, &held, cx).await {
+        if let Err(error) =
+            show_what_it_said(&project, &root, &built, &vetted, &held, &fixes, cx).await
+        {
             log::warn!("showing what the toolchain said: {error:#}");
         }
     });
@@ -262,11 +279,18 @@ async fn show_what_it_said(
     built: &str,
     vetted: &str,
     watching: &Rc<RefCell<Watching>>,
+    fixes: &Arc<Mutex<Fixes>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let read = |path: &Path| std::fs::read_to_string(path).ok();
     let mut reported = what_the_compiler_reported(built, root, &read);
     reported.extend(what_vet_reported(vetted, root, &read));
+    match fixes.lock() {
+        Ok(mut fixes) => fixes.remember(&reported),
+        // A poisoned store means a panic while it was held. The diagnostics
+        // are still worth showing; only the fixes are lost.
+        Err(error) => log::warn!("keeping the analyzers' fixes: {error}"),
+    }
     let (telling, now_reported_in) = what_to_tell(reported, &watching.borrow().reported_in);
     watching.borrow_mut().reported_in = now_reported_in;
 
@@ -319,6 +343,7 @@ mod tests {
     fn one_at(path: &str) -> Reported {
         Reported {
             path: PathBuf::from(path),
+            fixes: Vec::new(),
             diagnostic: lsp::Diagnostic {
                 message: "undefined: missingHelper".to_string(),
                 ..Default::default()
