@@ -1,14 +1,20 @@
 mod compile_commands;
 mod describing;
 mod parsing;
+mod relating;
 mod watching;
 
 pub use compile_commands::{Entry, arguments_for, entries_in, where_the_database_is};
-pub use parsing::{Asked, Described, HELD_AT_MOST, Parsed, Request, ask_libclang};
+pub use parsing::{
+    Asked, Described, HELD_AT_MOST, NamedType, Parsed, Place, Related, Relatives, Request,
+    ask_libclang,
+};
+pub use relating::{Target, ask_about_types};
 pub use watching::Diagnose;
 
-/// Everything this crate contributes: the compiler's own findings on save, and
-/// the type under the cursor on hover.
+/// What this crate registers with the application: the compiler's own findings
+/// on save, and the type under the cursor on hover. The type hierarchy it also
+/// answers is asked for directly, by the panel that shows one.
 pub fn init(cx: &mut gpui::App) {
     watching::init(cx);
     describing::init(cx);

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clang_diagnostics::{NamedType, Place, Related, Relatives};
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, ElementId,
@@ -16,6 +17,7 @@ use project::{
     lsp_store::LspStore,
 };
 use std::ops::Range;
+use std::path::Path;
 use symbol_index::{
     SymbolIndex,
     call_hierarchy::{self, Called},
@@ -130,6 +132,19 @@ impl Direction {
     }
 }
 
+/// What the panel says above a subtype list the compiler's own front end
+/// answered.
+///
+/// The front end reads one translation unit: the file the reader is in, and
+/// every header it reaches. A class derived from in some other file of the
+/// project is not in that program and cannot be found in it, and a list that
+/// left the reader to assume otherwise would be worse than no list -- they
+/// would take a missing subclass for a subclass that does not exist.
+const WHAT_THE_FRONT_END_LOOKED_AT_FOR_SUBTYPES: &str = concat!(
+    "From the compiler front end, which read only this file and the headers ",
+    "it includes. Classes deriving from this elsewhere in the project are not listed.",
+);
+
 /// One row's worth of display data, converted from whichever of the two
 /// protocol-layer item types it came from. Kept separate from `RowSource` so
 /// the tree and rendering code never have to match on call-vs-type to read a
@@ -158,6 +173,11 @@ enum RowSource {
     /// asked in the first place; `None` for a call written at file scope,
     /// which names no declaration to ask about.
     Indexed(Option<SharedString>),
+    /// A type the compiler's own front end named, with no server asked. The
+    /// place its declaration is written at is all it takes to ask again, and
+    /// it is a place in some file the translation unit reaches rather than in
+    /// the file the reader started from.
+    Clang(Place),
 }
 
 impl From<&CallHierarchyItem> for HierarchyRow {
@@ -224,6 +244,12 @@ enum Content {
     Ready {
         direction: Direction,
         outcome: HierarchyOutcome<Node>,
+        /// The buffer whose translation unit answered this tree, where the
+        /// compiler's own front end answered it. A type question is asked
+        /// inside one translation unit, so every row in such a tree is asked
+        /// about through the same buffer -- and that is also the limit the
+        /// panel has to admit to for subtypes.
+        clang_origin: Option<Entity<language::Buffer>>,
     },
     Failed {
         direction: Direction,
@@ -317,7 +343,7 @@ impl HierarchyPanel {
         let project = self.project.downgrade();
         let index = self.index(cx);
         cx.spawn(async move |this, cx| {
-            let result = if direction.is_call() {
+            let mut result = if direction.is_call() {
                 prepare_call_hierarchy(&lsp_store, &buffer, position, cx)
                     .await
                     .map(root_outcome_from_call)
@@ -326,19 +352,35 @@ impl HierarchyPanel {
                     .await
                     .map(root_outcome_from_type)
             };
-            // The server first and unchanged; the index answers only into its
-            // silence, which is what `Unsupported` means -- no reachable
-            // server offers this for this file. And only about calls: nothing
-            // the index holds records an edge between two types.
-            let result = match (result, index) {
-                (Ok(HierarchyOutcome::Unsupported), Some(index)) if direction.is_call() => {
-                    Ok(root_from_the_index(&project, &index, &buffer, position, cx).await)
+            // The server first and unchanged. Anything else answers only into
+            // its silence, which is what `Unsupported` means -- no reachable
+            // server offers this for this file. Which source that is follows
+            // from the question: the index records declarations and the places
+            // names occur, so it answers about calls, and nothing it holds is
+            // an edge between two types; the compiler's own front end holds
+            // the class graph, and answers about types for the two languages
+            // it is a front end for.
+            let mut clang_origin = None;
+            if let Ok(HierarchyOutcome::Unsupported) = &result {
+                if direction.is_call() {
+                    if let Some(index) = index {
+                        result =
+                            Ok(root_from_the_index(&project, &index, &buffer, position, cx).await);
+                    }
+                } else if let Some(outcome) =
+                    root_from_clang(&project, &buffer, position, direction, cx).await
+                {
+                    clang_origin = Some(buffer.clone());
+                    result = Ok(outcome);
                 }
-                (result, _) => result,
-            };
+            }
             this.update(cx, |this, cx| {
                 this.content = match result {
-                    Ok(outcome) => Content::Ready { direction, outcome },
+                    Ok(outcome) => Content::Ready {
+                        direction,
+                        outcome,
+                        clang_origin,
+                    },
                     Err(error) => Content::Failed {
                         direction,
                         message: SharedString::from(format!("{error:#}")),
@@ -356,7 +398,10 @@ impl HierarchyPanel {
     /// child is discarded rather than kept alongside the new ones, since it
     /// answered the wrong question.
     fn flip_direction(&mut self, cx: &mut Context<Self>) {
-        let Content::Ready { direction, outcome } = &mut self.content else {
+        let Content::Ready {
+            direction, outcome, ..
+        } = &mut self.content
+        else {
             return;
         };
         *direction = direction.flip();
@@ -387,10 +432,16 @@ impl HierarchyPanel {
     /// path identifies one node instead of re-fetching the tree is so this
     /// request stays scoped to it.
     fn request_children(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
-        let Content::Ready { direction, outcome } = &mut self.content else {
+        let Content::Ready {
+            direction,
+            outcome,
+            clang_origin,
+        } = &mut self.content
+        else {
             return;
         };
         let direction = *direction;
+        let clang_origin = clang_origin.clone();
         let Some(node) = node_at_mut(outcome, &path) else {
             return;
         };
@@ -402,7 +453,16 @@ impl HierarchyPanel {
         let project = self.project.downgrade();
         let index = self.index(cx);
         cx.spawn(async move |this, cx| {
-            let result = fetch_children(&lsp_store, &project, &index, direction, &source, cx).await;
+            let result = fetch_children(
+                &lsp_store,
+                &project,
+                &index,
+                &clang_origin,
+                direction,
+                &source,
+                cx,
+            )
+            .await;
             this.update(cx, |this, cx| {
                 let Content::Ready { outcome, .. } = &mut this.content else {
                     return;
@@ -701,7 +761,17 @@ fn flatten_content(content: &Content) -> Vec<FlatRow> {
             depth: 0,
             text: SharedString::from(format!("Request failed: {message}")),
         }),
-        Content::Ready { direction, outcome } => {
+        Content::Ready {
+            direction,
+            outcome,
+            clang_origin,
+        } => {
+            if clang_origin.is_some() && *direction == Direction::Subtypes {
+                rows.push(FlatRow::Status {
+                    depth: 0,
+                    text: SharedString::from(WHAT_THE_FRONT_END_LOOKED_AT_FOR_SUBTYPES),
+                });
+            }
             flatten_outcome(outcome, 0, &mut Vec::new(), *direction, &mut rows);
         }
     }
@@ -781,6 +851,7 @@ async fn fetch_children(
     lsp_store: &Entity<LspStore>,
     project: &WeakEntity<Project>,
     index: &Option<WeakEntity<SymbolIndex>>,
+    clang_origin: &Option<Entity<language::Buffer>>,
     direction: Direction,
     source: &RowSource,
     cx: &mut gpui::AsyncApp,
@@ -791,6 +862,9 @@ async fn fetch_children(
         (_, RowSource::Indexed(None)) => Ok(HierarchyOutcome::NoResults),
         (Direction::IncomingCalls | Direction::OutgoingCalls, RowSource::Indexed(Some(name))) => {
             children_from_the_index(project, index, direction, name, cx).await
+        }
+        (Direction::Supertypes | Direction::Subtypes, RowSource::Clang(at)) => {
+            Ok(children_from_clang(project, clang_origin, at, direction, cx).await)
         }
         (Direction::IncomingCalls, RowSource::Call(item)) => {
             let outcome = incoming_calls(lsp_store, item, cx).await?;
@@ -912,10 +986,156 @@ async fn children_from_the_index(
             nodes.push(node);
         }
     }
-    Ok(if nodes.is_empty() {
+    Ok(found_or_nothing(nodes))
+}
+
+/// What a list of children means. An empty list is `NoResults` and never
+/// `Found(vec![])`: the first says "nothing derives from this" in words the
+/// reader can see, and the second draws an expanded row with nothing under it,
+/// which reads as a lookup that broke.
+fn found_or_nothing(nodes: Vec<Node>) -> HierarchyOutcome<Node> {
+    if nodes.is_empty() {
         HierarchyOutcome::NoResults
     } else {
         HierarchyOutcome::Found(nodes)
+    }
+}
+
+/// What the compiler's own front end says the reader is asking about: the
+/// type under the cursor, as the one root of the tree.
+///
+/// `None` where the front end has nothing to say -- a language it is not a
+/// front end for, a project with no compilation database, a cursor that is not
+/// on a type. The panel then keeps the message it already had, because an
+/// empty type hierarchy and a question that was never answered are not the
+/// same thing to a reader deciding whether to believe the panel.
+async fn root_from_clang(
+    project: &WeakEntity<Project>,
+    buffer: &Entity<language::Buffer>,
+    position: PointUtf16,
+    direction: Direction,
+    cx: &mut AsyncApp,
+) -> Option<HierarchyOutcome<Node>> {
+    let relatives = ask_clang(
+        project,
+        buffer,
+        clang_diagnostics::Target::Under(position),
+        direction,
+        cx,
+    )
+    .await?;
+    let node = node_from_clang(project, &relatives.subject, cx).await?;
+    Some(HierarchyOutcome::Found(vec![node]))
+}
+
+/// One row's children, out of the compiler's own front end.
+///
+/// Asked through the buffer the tree started from, because that is the
+/// translation unit the whole tree is read out of: a base class declared in a
+/// header is a place inside it, and asking about that place through some other
+/// file would be asking about a different program.
+async fn children_from_clang(
+    project: &WeakEntity<Project>,
+    clang_origin: &Option<Entity<language::Buffer>>,
+    at: &Place,
+    direction: Direction,
+    cx: &mut AsyncApp,
+) -> HierarchyOutcome<Node> {
+    let Some(origin) = clang_origin else {
+        return HierarchyOutcome::Unsupported;
+    };
+    let asked = ask_clang(
+        project,
+        origin,
+        clang_diagnostics::Target::Declared(at.clone()),
+        direction,
+        cx,
+    )
+    .await;
+    let Some(relatives) = asked else {
+        return HierarchyOutcome::Unsupported;
+    };
+
+    let mut nodes = Vec::new();
+    for related in &relatives.related {
+        if let Some(node) = node_from_clang(project, related, cx).await {
+            nodes.push(node);
+        }
+    }
+    found_or_nothing(nodes)
+}
+
+async fn ask_clang(
+    project: &WeakEntity<Project>,
+    buffer: &Entity<language::Buffer>,
+    target: clang_diagnostics::Target,
+    direction: Direction,
+    cx: &mut AsyncApp,
+) -> Option<Relatives> {
+    let asked = cx.update(|cx| {
+        let project = project.upgrade()?;
+        clang_diagnostics::ask_about_types(&project, buffer, target, related(direction)?, cx)
+    });
+    asked?.await
+}
+
+/// Which way the front end reads the relation for a panel direction, and
+/// nothing for a call direction: the front end is asked about types only, and
+/// calls have a source of their own.
+fn related(direction: Direction) -> Option<Related> {
+    match direction {
+        Direction::Supertypes => Some(Related::Bases),
+        Direction::Subtypes => Some(Related::Derived),
+        Direction::IncomingCalls | Direction::OutgoingCalls => None,
+    }
+}
+
+/// Opens the file the front end named so the row has somewhere to send a
+/// reader, and names the row in C++'s own vocabulary rather than the
+/// protocol's.
+async fn node_from_clang(
+    project: &WeakEntity<Project>,
+    named: &NamedType,
+    cx: &mut AsyncApp,
+) -> Option<Node> {
+    let location = locate_in_file(project, &named.at.file, named.at.offset, named.end, cx).await?;
+    let selection_range = location.range.clone();
+    Some(Node::new(HierarchyRow {
+        name: SharedString::from(named.name.clone()),
+        kind: SharedString::from(named.kind.clone()),
+        location,
+        selection_range,
+        source: RowSource::Clang(named.at.clone()),
+    }))
+}
+
+/// The span of a declaration's name, as somewhere a reader can be sent.
+///
+/// The offsets were measured against the file the front end read, which is the
+/// buffer's text for the file the reader is in and the file on disk for every
+/// header. Both are clamped: a header the reader has edited since has moved
+/// under them, and a row that lands a little short is better than one that
+/// panics.
+async fn locate_in_file(
+    project: &WeakEntity<Project>,
+    path: &Path,
+    start: usize,
+    end: usize,
+    cx: &mut AsyncApp,
+) -> Option<Location> {
+    let opened = project
+        .update(cx, |project, cx| project.open_local_buffer(path, cx))
+        .log_err()?
+        .await
+        .log_err()?;
+    let range = opened.read_with(cx, |opened, _| {
+        let snapshot = opened.snapshot();
+        let length = snapshot.len();
+        snapshot.anchor_before(start.min(length))..snapshot.anchor_after(end.min(length))
+    });
+    Some(Location {
+        buffer: opened,
+        range,
     })
 }
 
@@ -1547,7 +1767,10 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
-            let Content::Ready { direction, outcome } = &panel.content else {
+            let Content::Ready {
+                direction, outcome, ..
+            } = &panel.content
+            else {
                 unreachable!()
             };
             assert_eq!(*direction, Direction::OutgoingCalls);
@@ -1800,5 +2023,107 @@ mod tests {
                 "the index stays silent while the server answers"
             );
         });
+    }
+
+    /// The type directions reach the compiler's own front end only for the two
+    /// languages it is a front end for. In a Rust file with a server that does
+    /// not offer a type hierarchy, nothing else answers and the panel says
+    /// exactly what it said before any of this existed.
+    #[gpui::test]
+    async fn a_language_that_is_not_c_or_cpp_gets_no_type_hierarchy(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (window, workspace, panel, project, mut fake_language_servers) =
+            open_workspace_with_panel(false, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        open_editor_at_cursor(&workspace, &project, cx).await;
+
+        let _fake_server = fake_language_servers.next().await.unwrap();
+        cx.run_until_parked();
+
+        for direction in [Direction::Supertypes, Direction::Subtypes] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                HierarchyPanel::start(workspace, direction, window, cx);
+            });
+            cx.run_until_parked();
+
+            let rows = panel.read_with(cx, |panel, _| {
+                let Content::Ready {
+                    outcome,
+                    clang_origin,
+                    ..
+                } = &panel.content
+                else {
+                    panic!("expected the panel to be ready");
+                };
+                let HierarchyOutcome::Unsupported = outcome else {
+                    panic!("expected {direction:?} to be Unsupported for a Rust buffer");
+                };
+                assert!(
+                    clang_origin.is_none(),
+                    "the front end must not be asked about a language it is not a front end for",
+                );
+                flatten_content(&panel.content)
+            });
+            let FlatRow::Status { text, .. } = &rows[0] else {
+                panic!("expected a status row");
+            };
+            assert_eq!(text, &direction.unsupported_message());
+        }
+    }
+
+    /// A subtype list the front end answered says what it looked at, because
+    /// what it looked at is one translation unit and not the project. The note
+    /// belongs to that direction alone: a base clause names every base, so
+    /// supertypes need no caveat.
+    #[gpui::test]
+    async fn a_subtype_list_from_the_front_end_says_what_it_looked_at(cx: &mut TestAppContext) {
+        init_test(cx);
+        let buffer = cx.new(|cx| language::Buffer::local("class Thing {};\n", cx));
+
+        let note_shown = |direction: Direction, clang_origin: Option<Entity<language::Buffer>>| {
+            let content = Content::Ready {
+                direction,
+                outcome: HierarchyOutcome::NoResults,
+                clang_origin,
+            };
+            flatten_content(&content).into_iter().any(|row| {
+                matches!(row, FlatRow::Status { text, .. }
+                    if text.as_ref() == WHAT_THE_FRONT_END_LOOKED_AT_FOR_SUBTYPES)
+            })
+        };
+
+        assert!(
+            note_shown(Direction::Subtypes, Some(buffer.clone())),
+            "a front-end subtype list must admit what it looked at",
+        );
+        assert!(
+            !note_shown(Direction::Supertypes, Some(buffer)),
+            "a base clause names every base, so supertypes need no caveat",
+        );
+        assert!(
+            !note_shown(Direction::Subtypes, None),
+            "a language server's own subtype list is not qualified by this note",
+        );
+    }
+
+    /// An empty list of children is `NoResults` and never `Found(vec![])`. The
+    /// first is a sentence the reader can see; the second draws an expanded row
+    /// with nothing under it, which reads as a lookup that broke.
+    #[test]
+    fn no_children_is_nothing_and_not_an_empty_list() {
+        assert!(matches!(
+            found_or_nothing(Vec::new()),
+            HierarchyOutcome::NoResults
+        ));
+    }
+
+    /// The front end is asked about types and never about calls, which have a
+    /// source of their own.
+    #[test]
+    fn only_the_type_directions_reach_the_front_end() {
+        assert_eq!(related(Direction::Supertypes), Some(Related::Bases));
+        assert_eq!(related(Direction::Subtypes), Some(Related::Derived));
+        assert_eq!(related(Direction::IncomingCalls), None);
+        assert_eq!(related(Direction::OutgoingCalls), None);
     }
 }

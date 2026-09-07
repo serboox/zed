@@ -9769,6 +9769,7 @@ name = "hierarchy_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clang_diagnostics",
  "editor",
  "fs",
  "futures 0.3.32",

@@ -50,6 +50,54 @@ pub enum Asked {
     WhatIsWrong,
     /// What the entity at this byte offset into the text is.
     WhatIsAt(usize),
+    /// Which types the type at one place is related to, read one way round.
+    WhichTypesRelateTo { at: Place, direction: Related },
+}
+
+/// A place in one of the files that make up a translation unit.
+///
+/// The file is named because a class is very often not declared in the file
+/// being parsed: a base class lives in a header, and the header is part of the
+/// same translation unit. The offset is a byte offset into that file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub file: PathBuf,
+    pub offset: usize,
+}
+
+/// Which way a type hierarchy is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Related {
+    /// The classes a class derives from. Its own declaration names them, so
+    /// this answer is complete.
+    Bases,
+    /// The classes that derive from it, as far as this one translation unit
+    /// shows. A class deriving from it in a file this unit never reaches is
+    /// not here and cannot be: a translation unit is one program the compiler
+    /// saw, and it knows nothing of the rest of the project.
+    Derived,
+}
+
+/// One type the front end named, and where its declaration is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedType {
+    /// The name as C++ spells it, template arguments included.
+    pub name: String,
+    /// The word for what it is, in C++'s own vocabulary rather than the
+    /// protocol's.
+    pub kind: String,
+    /// Where its name is written, which is also all it takes to ask about it
+    /// again.
+    pub at: Place,
+    /// Byte offset in `at.file` just past that name.
+    pub end: usize,
+}
+
+/// A type and its neighbours in one direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relatives {
+    pub subject: NamedType,
+    pub related: Vec<NamedType>,
 }
 
 /// What the front end knows about one place in the file.
@@ -82,6 +130,9 @@ pub struct Described {
 pub struct Parsed {
     pub findings: Vec<Finding>,
     pub described: Option<Described>,
+    /// The type asked about and its neighbours, where the place asked about
+    /// holds a type at all.
+    pub relatives: Option<Relatives>,
     /// What the front end itself says this translation unit costs, in bytes.
     /// Its own accounting, not the process's: the point of the bound above is
     /// that this number is multiplied by at most [`HELD_AT_MOST`].
@@ -246,10 +297,14 @@ fn parse_one(
 
     let mut findings = Vec::new();
     let mut described = None;
-    match request.asked {
+    let mut relatives = None;
+    match &request.asked {
         Asked::WhatIsWrong => findings = findings_of(&unit, &request.file),
         Asked::WhatIsAt(offset) => {
-            described = description_at(&unit, &request.file, &request.text, offset);
+            described = description_at(&unit, &request.file, &request.text, *offset);
+        }
+        Asked::WhichTypesRelateTo { at, direction } => {
+            relatives = relatives_at(&unit, at, *direction);
         }
     }
     let memory = unit.get_memory_usage().values().sum();
@@ -262,6 +317,7 @@ fn parse_one(
     Ok(Parsed {
         findings,
         described,
+        relatives,
         memory,
         held: held.len(),
     })
@@ -402,6 +458,167 @@ fn at_a_boundary(text: &str, offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+/// The type at one place, and its neighbours in one direction.
+///
+/// `None` where that place holds no type at all -- a statement, a call, a
+/// keyword, a file the unit never reached. That is the difference between "no
+/// supertypes" and "not a question about a type", and the two must not read
+/// the same.
+fn relatives_at<'a>(
+    unit: &'a clang::TranslationUnit<'a>,
+    at: &Place,
+    direction: Related,
+) -> Option<Relatives> {
+    let subject = class_at(unit, at)?;
+    let related = match direction {
+        Related::Bases => bases_of(&subject),
+        Related::Derived => classes_derived_from(unit, &subject),
+    };
+    let mut named_related: Vec<NamedType> = Vec::new();
+    for one in related {
+        let Some(named) = named(&one) else {
+            continue;
+        };
+        // A class the unit reaches twice -- declared in a header, derived from
+        // in two files it includes -- is one class, and its place is what says
+        // so.
+        if !named_related.iter().any(|already| already.at == named.at) {
+            named_related.push(named);
+        }
+    }
+    Some(Relatives {
+        subject: named(&subject)?,
+        related: named_related,
+    })
+}
+
+/// The class the given place is about.
+///
+/// A cursor written on the class's own name is the easy case. A cursor on
+/// something that merely *has* that type -- a variable, a field, a base in a
+/// base clause -- answers about the type it has, which is what a reader asking
+/// for a hierarchy from a declaration line means.
+fn class_at<'a>(unit: &'a clang::TranslationUnit<'a>, at: &Place) -> Option<clang::Entity<'a>> {
+    let file = unit.get_file(&at.file)?;
+    let entity = file
+        .get_offset_location(u32::try_from(at.offset).ok()?)
+        .get_entity()?;
+    // Everything the parse did not understand comes back as the unit itself.
+    if entity.get_kind() == clang::EntityKind::TranslationUnit {
+        return None;
+    }
+    let declared = entity.get_reference().unwrap_or(entity);
+    if is_a_class(declared.get_kind()) {
+        return Some(declared.get_canonical_entity());
+    }
+    let through = declared.get_type()?.get_declaration()?;
+    is_a_class(through.get_kind()).then(|| through.get_canonical_entity())
+}
+
+/// The classes named in a class's own base clause, in the order it names them.
+///
+/// Read off the definition rather than off whichever declaration was asked
+/// about: a forward declaration names no bases, and answering "none" from one
+/// would be a wrong answer rather than a missing one.
+fn bases_of<'a>(subject: &clang::Entity<'a>) -> Vec<clang::Entity<'a>> {
+    let definition = subject.get_definition().unwrap_or(*subject);
+    definition
+        .get_children()
+        .into_iter()
+        .filter(|child| child.get_kind() == clang::EntityKind::BaseSpecifier)
+        .filter_map(|base| {
+            base.get_type()
+                .and_then(|of| of.get_declaration())
+                .or_else(|| base.get_reference())
+        })
+        .map(|base| base.get_canonical_entity())
+        .collect()
+}
+
+/// Every class in this translation unit whose base clause names the subject.
+///
+/// One direction of the same edge, walked the only way a translation unit
+/// allows: over everything it holds. What it holds is the file that was parsed
+/// and every header that file reaches, and nothing else -- so a class derived
+/// from in a file nobody included is genuinely absent, not overlooked.
+fn classes_derived_from<'a>(
+    unit: &'a clang::TranslationUnit<'a>,
+    subject: &clang::Entity<'a>,
+) -> Vec<clang::Entity<'a>> {
+    let Some(wanted) = subject.get_canonical_entity().get_usr() else {
+        return Vec::new();
+    };
+    let mut derived = Vec::new();
+    unit.get_entity().visit_children(|entity, _| {
+        if is_a_class(entity.get_kind())
+            && entity.is_definition()
+            && bases_of(&entity)
+                .iter()
+                .any(|base| base.get_usr().as_ref() == Some(&wanted))
+        {
+            derived.push(entity.get_canonical_entity());
+        }
+        clang::EntityVisitResult::Recurse
+    });
+    derived
+}
+
+fn is_a_class(kind: clang::EntityKind) -> bool {
+    matches!(
+        kind,
+        clang::EntityKind::ClassDecl
+            | clang::EntityKind::StructDecl
+            | clang::EntityKind::UnionDecl
+            | clang::EntityKind::ClassTemplate
+            | clang::EntityKind::ClassTemplatePartialSpecialization
+    )
+}
+
+/// A class as a row can show it: its name, the word for what it is, and where
+/// its name is written.
+fn named(entity: &clang::Entity<'_>) -> Option<NamedType> {
+    let declaration = entity.get_definition().unwrap_or(*entity);
+    let name = declaration
+        .get_display_name()
+        .or_else(|| declaration.get_name())
+        .filter(|name| !name.is_empty())?;
+    let at = declaration.get_location()?.get_file_location();
+    let file = at.file?.get_path();
+    let start = at.offset as usize;
+    // The name range where the front end gives one, and the identifier's own
+    // length otherwise, so a row underlines the name rather than a point.
+    let end = declaration
+        .get_name_ranges()
+        .first()
+        .map(|range| range.get_end().get_file_location().offset as usize)
+        .filter(|end| *end > start)
+        .unwrap_or_else(|| start + declaration.get_name().unwrap_or_default().len());
+    Some(NamedType {
+        name,
+        kind: word_for(declaration.get_kind()).to_string(),
+        at: Place {
+            file,
+            offset: start,
+        },
+        end,
+    })
+}
+
+/// What a reader would call it, in C++'s own words. A `struct` is not a
+/// `class` in the source even where the language treats them alike, and a row
+/// that renamed it would send the reader looking for a keyword that is not
+/// there.
+fn word_for(kind: clang::EntityKind) -> &'static str {
+    match kind {
+        clang::EntityKind::ClassDecl => "class",
+        clang::EntityKind::StructDecl => "struct",
+        clang::EntityKind::UnionDecl => "union",
+        clang::EntityKind::ClassTemplate => "class template",
+        clang::EntityKind::ClassTemplatePartialSpecialization => "class template specialization",
+        _ => "type",
+    }
 }
 
 fn fresh(
@@ -577,6 +794,9 @@ mod tests {
         let hovered = MEASURED
             .rfind("keys")
             .expect("the call to measure a hover on");
+        let declared = MEASURED
+            .find("Named {")
+            .expect("the class to measure a hierarchy question on");
 
         // Twice around, so the second lap also exercises the reparse of a unit
         // that is still held and the fresh parse of one that has been evicted.
@@ -585,10 +805,22 @@ mod tests {
         // diagnostics alone.
         for lap in 1..=2 {
             for file in &files {
-                for asked in [Asked::WhatIsWrong, Asked::WhatIsAt(hovered)] {
+                let questions = [
+                    Asked::WhatIsWrong,
+                    Asked::WhatIsAt(hovered),
+                    Asked::WhichTypesRelateTo {
+                        at: Place {
+                            file: file.clone(),
+                            offset: declared,
+                        },
+                        direction: Related::Derived,
+                    },
+                ];
+                for asked in questions {
                     let what = match asked {
                         Asked::WhatIsWrong => "wrong",
                         Asked::WhatIsAt(_) => "at",
+                        Asked::WhichTypesRelateTo { .. } => "types",
                     };
                     let started = std::time::Instant::now();
                     let parsed = futures::executor::block_on(ask_libclang(Request {
@@ -605,7 +837,7 @@ mod tests {
                     );
                     println!(
                         "lap {lap} {} {what}: {:.0} ms, {:.1} MB in the unit, {} held, \
-                         {} findings, {}, {}",
+                         {} findings, {}, {}, {}",
                         file.file_name().unwrap_or_default().to_string_lossy(),
                         started.elapsed().as_secs_f64() * 1_000.0,
                         parsed.memory as f64 / 1_048_576.0,
@@ -614,6 +846,15 @@ mod tests {
                         parsed
                             .described
                             .map_or("nothing described".to_string(), |said| said.declaration),
+                        parsed
+                            .relatives
+                            .map_or("no type asked about".to_string(), |about| {
+                                format!(
+                                    "{} with {} relative(s)",
+                                    about.subject.name,
+                                    about.related.len()
+                                )
+                            }),
                         resident(),
                     );
                 }
@@ -661,6 +902,13 @@ class Registry {
   private:
     std::map<Key, Value> entries_;
 };
+
+class Named {
+  public:
+    virtual ~Named() = default;
+};
+
+class Person : public Named {};
 
 int main() {
     Registry<std::string, std::unique_ptr<int>> registry;
