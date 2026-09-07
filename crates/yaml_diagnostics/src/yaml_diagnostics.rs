@@ -1,7 +1,10 @@
+use std::ops::Range;
+
 use gpui::{App, actions};
 use jsonschema::Validator;
 use schema_documents::{
-    Reads, diagnostics_from, unreadable_is_one_complaint, what_the_schema_said,
+    Complaint, Reads, diagnostics_from, diagnostics_from_source, unreadable_is_one_complaint,
+    what_the_schema_said,
 };
 
 mod completing;
@@ -12,8 +15,9 @@ pub use reading::read;
 actions!(
     yaml_diagnostics,
     [
-        /// Checks this YAML buffer against the schema that covers it and
-        /// shows what does not fit, without a language server.
+        /// Checks this YAML buffer for faults and against the schema that
+        /// covers it, and shows what does not fit, without a language
+        /// server.
         Validate
     ]
 );
@@ -23,11 +27,16 @@ actions!(
 /// one, ruff and JSON.
 const YAML_SERVER_ID: language::LanguageServerId = language::LanguageServerId(usize::MAX - 1005);
 
+/// What a fault found here is attributed to, shown beside each one. The
+/// grammar says these rather than a schema, so they do not carry the schema's
+/// own source.
+const SOURCE: &str = "yaml";
+
 static YAML: Reads = Reads {
     languages: &["YAML"],
     server_id: YAML_SERVER_ID,
     diagnostics: diagnostics_for,
-    faults: None,
+    faults: Some(faults),
     associations: json_schema_store::all_schema_file_associations,
     fetch: json_schema_store::handle_schema_request,
 };
@@ -44,6 +53,29 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Every fault the grammar finds in this text.
+///
+/// This is what a YAML file gets where no schema covers it, which is nearly
+/// every one of them: a `docker-compose.yml` in a project nobody registered a
+/// schema for, a Kubernetes manifest, a fixture. A file the grammar cannot
+/// follow is the mistake worth showing whether or not anything describes what
+/// it should hold.
+pub fn faults(text: &str) -> Vec<lsp::Diagnostic> {
+    diagnostics_from_source(text, what_the_grammar_said(text), SOURCE)
+}
+
+/// The one place the grammar lost the thread, placed on the bytes the reading
+/// stopped at.
+///
+/// One, not many: past the first such place everything further is a
+/// consequence of the first mistake rather than a second one.
+pub fn what_the_grammar_said(text: &str) -> Vec<(Range<usize>, Complaint)> {
+    match read(text) {
+        Err(unreadable) => vec![unreadable_is_one_complaint(unreadable)],
+        Ok(_) => Vec::new(),
+    }
+}
+
 /// Everything the schema has to say about a YAML text, as diagnostics the
 /// editor can show.
 ///
@@ -51,19 +83,21 @@ pub fn init(cx: &mut App) {
 /// one is checked on its own: the schema describes a document, so a file with
 /// three of them has three chances to disagree with it.
 ///
-/// A text that will not read yields the one fault that stopped it, not a
-/// schema complaint per line -- past the place the grammar lost the thread
-/// the value is not the reader's value any more, and everything the schema
-/// would say about it is about a document nobody wrote.
+/// A text that will not read yields nothing here: [`faults`] has already said
+/// where the reading stopped, and past that place the value is not the
+/// reader's value any more, so everything the schema would say about it is
+/// about a document nobody wrote.
 pub fn diagnostics_for(text: &str, validator: &Validator) -> Vec<lsp::Diagnostic> {
-    let said = match read(text) {
-        Ok(documents) => documents
+    let Ok(documents) = read(text) else {
+        return Vec::new();
+    };
+    diagnostics_from(
+        text,
+        documents
             .iter()
             .flat_map(|document| what_the_schema_said(text, document, validator))
             .collect(),
-        Err(unreadable) => vec![unreadable_is_one_complaint(unreadable)],
-    };
-    diagnostics_from(text, said)
+    )
 }
 
 #[cfg(test)]
@@ -167,23 +201,114 @@ mod tests {
         assert!(message.contains("One Dark"), "{message}");
     }
 
-    /// A file mid-edit is unreadable most of the time, and the schema has an
-    /// opinion about every part of the half-document that results. One fault
-    /// where the reader is typing is the whole of what is useful.
+    /// The report a file gets when nothing describes what it should hold,
+    /// which is nearly every YAML file in a project. Asked for the way the
+    /// harness asks for it, because the wiring is the thing that was missing:
+    /// the grammar has always found this fault and nobody ever asked it.
+    fn report_without_a_schema(text: &str) -> Vec<lsp::Diagnostic> {
+        let faults = YAML
+            .faults
+            .expect("YAML reports the faults its own grammar finds");
+        faults(text)
+    }
+
+    /// A file mid-edit, which is what a file is most of the time, and one no
+    /// schema covers. The fault is an error rather than a warning: nothing
+    /// the reader wrote past it is being read at all.
     #[test]
-    fn a_document_that_will_not_read_is_one_fault_and_not_a_pile_of_schema_complaints() {
-        let mut said = checked("name: zed\n  tab_size: 2\ntheme: One Dark\n");
-        assert_eq!(said.len(), 1, "{said:?}");
-        let diagnostic = said.remove(0);
+    fn a_file_the_grammar_could_not_follow_says_so_even_where_no_schema_covers_it() {
+        let mut report = report_without_a_schema("name: zed\n  tab_size: 2\ntheme: One Dark\n");
+        assert_eq!(report.len(), 1, "{report:?}");
+        let diagnostic = report.remove(0);
         assert_eq!(
             diagnostic.severity,
             Some(lsp::DiagnosticSeverity::ERROR),
             "and it is the kind that stops work"
         );
+        assert_eq!(diagnostic.source.as_deref(), Some("yaml"));
         assert_eq!(diagnostic.range.start, lsp::Position::new(0, 0));
         assert_ne!(
             diagnostic.range.start, diagnostic.range.end,
             "a visible mark"
+        );
+    }
+
+    /// The other half of the promise: a file that reads is left alone. A
+    /// warning on a working file no schema covers would be worse than saying
+    /// nothing at all.
+    #[test]
+    fn a_file_that_reads_and_no_schema_covers_gets_an_empty_report() {
+        for text in [
+            "name: zed\ntab_size: 2\n",
+            "# the name\nname: zed\n",
+            "name: zed\n---\nname: other\n",
+            "",
+            "  \n ",
+            "# still thinking\n",
+            "---\n",
+        ] {
+            let report = report_without_a_schema(text);
+            assert!(report.is_empty(), "{text:?}: {report:?}");
+        }
+    }
+
+    /// The whole promise of a report that replaces itself: a file the reader
+    /// has just fixed hands back an empty report, and an empty report is what
+    /// clears the underlining the mistake left behind. Silence would leave the
+    /// old marks on the screen.
+    #[test]
+    fn a_file_that_was_fixed_hands_back_an_empty_report_rather_than_nothing() {
+        let broken = "name: zed\n  tab_size: 2\n";
+        assert!(
+            !report_without_a_schema(broken).is_empty(),
+            "the second line is indented under a scalar"
+        );
+
+        let report = report_without_a_schema("name: zed\ntab_size: 2\n");
+        assert!(
+            report.is_empty(),
+            "an empty report, which is what replaces the last one: {report:?}"
+        );
+    }
+
+    /// A file the grammar rejected gets the grammar's fault and no schema
+    /// complaints at all: the schema would otherwise have an opinion about
+    /// every part of the half document a broken file leaves behind.
+    #[test]
+    fn a_file_the_grammar_rejected_gets_no_schema_complaints() {
+        let broken = "name: zed\n  tab_size: 2\ntheme: One Dark\n";
+        assert!(checked(broken).is_empty(), "{:?}", checked(broken));
+        assert!(
+            !report_without_a_schema(broken).is_empty(),
+            "the fault is still reported"
+        );
+    }
+
+    /// The grammar counts bytes, and the protocol is told UTF-16 code units.
+    /// On a line holding a two-byte character and an emoji, bytes, characters
+    /// and code units are three different numbers, and reading one as another
+    /// puts every mark on that line in the wrong column.
+    #[test]
+    fn the_grammar_counts_bytes_and_the_protocol_is_told_utf16_code_units() {
+        let text = "caf\u{e9}\u{1f980}: \"unterminated\nb: 2\n";
+        let stray = text
+            .find('"')
+            .expect("the quote that opens the string nothing closes");
+
+        let before = &text[..stray];
+        assert_eq!(before.len(), 11, "bytes");
+        assert_eq!(before.chars().count(), 7, "characters");
+        assert_eq!(before.encode_utf16().count(), 8, "UTF-16 units");
+
+        let said = what_the_grammar_said(text);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0.start, stray, "the grammar named the byte");
+
+        let report = report_without_a_schema(text);
+        assert_eq!(
+            report[0].range.start,
+            lsp::Position::new(0, 8),
+            "the protocol's own unit -- not 11, and not 7 either: {report:?}"
         );
     }
 
