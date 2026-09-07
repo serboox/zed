@@ -200,6 +200,18 @@ pub fn env_file_variables(text: &str) -> Vec<(String, String)> {
 }
 
 impl TaskTemplate {
+    /// Whether `id` names a run that came from this template.
+    ///
+    /// Every [`TaskId`] carries a hash of the template it was resolved from, so
+    /// this holds whatever context the run was resolved against -- a label would
+    /// not, since two templates can substitute to the same words.
+    pub fn was_resolved_into(&self, id: &TaskId) -> bool {
+        to_hex_hash(self)
+            .context("hashing task template")
+            .log_err()
+            .is_some_and(|hash| id.0.contains(&hash))
+    }
+
     /// Replaces all `VariableName` task variables in the task template string fields.
     ///
     /// Every [`ResolvedTask`] gets a [`TaskId`], based on the `id_base` (to avoid collision with various task sources),

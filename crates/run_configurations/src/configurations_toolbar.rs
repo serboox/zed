@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use collections::HashSet;
 use fs::Fs;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window,
+    SharedString, Subscription, Task, WeakEntity, Window,
 };
 use language::LanguageServerName;
 use language::language_settings::all_language_settings;
@@ -10,7 +12,8 @@ use project::project_settings::{LanguageServerStart, ProjectSettings};
 use settings::{
     LspSettings, SemanticTokens, Settings as _, SettingsStore, update_settings_file_with_completion,
 };
-use task::TaskTemplate;
+use task::{TaskId, TaskTemplate};
+use terminal::{TaskStatus, Terminal};
 use ui::cyberpunk::CyberpunkSurface as _;
 use ui::{ButtonLike, KeyBinding, PopoverMenu, Tooltip, WithScrollbar, cyberpunk, prelude::*};
 use util::ResultExt as _;
@@ -28,6 +31,11 @@ const PLAQUE_HEIGHT: f32 = 28.0;
 /// is part of that number. A gauge taller than the plaque beside it is a gauge
 /// that outgrows the bar it sits in.
 const SEGMENT_CONTENT_HEIGHT: f32 = 26.0;
+
+/// How often the pair looks to see whether the run it points at is still going.
+/// Nothing in a terminal tells the title bar that a task has ended, so the pair
+/// asks; a draw is only asked for when the answer changes.
+const HOW_OFTEN_IT_LOOKS: Duration = Duration::from_secs(1);
 
 /// Which way of running the switcher is pointing at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +252,11 @@ pub struct ConfigurationsToolbar {
     store: Entity<ConfigurationsStore>,
     workspace: WeakEntity<Workspace>,
     pointing: Option<Pointing>,
+    /// Whether a run was going on the last time the pair looked. Only the change
+    /// matters: which pair to paint is read afresh in every draw, and this is
+    /// what decides whether a draw is asked for at all.
+    a_run_was_going_on: bool,
+    _watching_the_run: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -258,9 +271,26 @@ impl ConfigurationsToolbar {
             store,
             workspace: workspace.weak_handle(),
             pointing: None,
+            a_run_was_going_on: false,
+            _watching_the_run: Task::ready(()),
             _subscriptions: vec![subscription],
         };
         toolbar.keep_pointing_at_something(cx);
+        toolbar._watching_the_run = cx.spawn(async move |toolbar, cx| {
+            loop {
+                cx.background_executor().timer(HOW_OFTEN_IT_LOOKS).await;
+                let looked = toolbar.update(cx, |toolbar, cx| {
+                    let going_on = toolbar.the_run_it_points_at(cx).is_some();
+                    if going_on != toolbar.a_run_was_going_on {
+                        toolbar.a_run_was_going_on = going_on;
+                        cx.notify();
+                    }
+                });
+                if looked.is_err() {
+                    return;
+                }
+            }
+        });
         toolbar
     }
 
@@ -495,6 +525,80 @@ impl ConfigurationsToolbar {
         );
     }
 
+    /// The run of what the plaque points at that is still going on, if one is.
+    ///
+    /// A run is matched to its configuration by the hash of the template it was
+    /// resolved from, which every `TaskId` carries: matching on the label
+    /// instead would claim a run that another configuration happens to have
+    /// substituted to the same words. When no terminal can be tied to this
+    /// configuration the answer is `None`, so the pair keeps offering Run and
+    /// Debug rather than offering to stop a run it cannot name.
+    fn the_run_it_points_at(&self, cx: &App) -> Option<(Entity<Terminal>, TaskId)> {
+        let template = self.task_it_points_at(cx)?;
+        let workspace = self.workspace.upgrade()?;
+        let panel = workspace
+            .read(cx)
+            .panel::<terminal_view::terminal_panel::TerminalPanel>(cx)?;
+        for pane in panel.read(cx).panes() {
+            for item in pane.read(cx).items() {
+                let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
+                    continue;
+                };
+                let terminal = view.read(cx).terminal();
+                let Some(task) = terminal.read(cx).task() else {
+                    continue;
+                };
+                if task.status == TaskStatus::Running
+                    && template.was_resolved_into(&task.spawned_task.id)
+                {
+                    return Some((terminal.clone(), task.spawned_task.id.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some((terminal, _)) = self.the_run_it_points_at(cx) else {
+            return;
+        };
+        terminal.update(cx, |terminal, _| terminal.kill_active_task());
+    }
+
+    /// Stops the run, waits for the process to be gone, and only then starts the
+    /// same configuration again.
+    ///
+    /// `Rerun` with `allow_concurrent_runs` off waits for a run of the same task
+    /// to finish but never ends it, so a server that runs until it is stopped
+    /// would be waited on forever. Ending it here first is also what keeps the
+    /// second process from starting while the first still holds a port, which
+    /// fails to bind rather than replacing it.
+    fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((terminal, task_id)) = self.the_run_it_points_at(cx) else {
+            return;
+        };
+        let gone = terminal.update(cx, |terminal, cx| {
+            terminal.kill_active_task();
+            terminal.wait_for_completed_task(cx)
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            gone.await;
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(zed_actions::Rerun {
+                        task_id: Some(task_id.0),
+                        allow_concurrent_runs: Some(false),
+                        use_new_terminal: Some(false),
+                        reevaluate_context: false,
+                    }),
+                    cx,
+                );
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn start_debugging(
         &mut self,
         scenario: task::DebugScenario,
@@ -568,14 +672,23 @@ impl Render for ConfigurationsToolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pointing_at = self.what_it_points_at(cx);
         let toolbar = cx.entity();
-        let running = pointing_at.is_some();
         // `None` for the reason a nonexistent pointing "cannot" be debugged
-        // reads as it being fine, which only ever shows up behind `running`
-        // being false, where the debug button is not rendered at all.
+        // reads as it being fine, which only ever shows up where the debug
+        // button is not rendered at all.
         let cannot_be_debugged = self
             .pointing
             .as_ref()
             .and_then(|pointing| self.cannot_be_debugged(pointing, cx));
+        // Both under one frame with a hairline between them: two bare icons
+        // beside the plaque give no hint that either is pressable, and a frame
+        // each reads as a fence. Two segments either way, so nothing on the bar
+        // moves when a run starts or ends.
+        let pair = pointing_at
+            .as_ref()
+            .map(|_| match self.the_run_it_points_at(cx).is_some() {
+                true => self.stop_and_restart(cx),
+                false => self.run_and_debug(cannot_be_debugged, cx),
+            });
 
         h_flex()
             .id("run-configurations-toolbar")
@@ -597,61 +710,125 @@ impl Render for ConfigurationsToolbar {
                         Some(ConfigurationsList::new(toolbar.clone(), window, cx))
                     }),
             )
-            .when(running, |plaque| {
-                // Both under one frame with a hairline between them: two bare
-                // icons beside the plaque give no hint that either is pressable,
-                // and a frame each reads as a fence. The difference between
-                // running and debugging is these two buttons and nothing else --
-                // it is one configuration either way.
-                plaque.child(ui::cyberpunk::segmented([
-                    // Wrapped in its own div, as the debug button below is:
-                    // `IconButton` paints another `IconName::PlayFilled` of its
-                    // own inside the plaque beside it, and a bare
-                    // `ICON-PlayFilled` selector would land on whichever one
-                    // painted last rather than on this button.
-                    div()
-                        .debug_selector(|| "run-configurations-run-button".to_string())
-                        .child(
-                            IconButton::new("run-configurations-run", IconName::PlayFilled)
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Accent)
-                                .tooltip(Tooltip::text("Run it"))
-                                .on_click(
-                                    cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx)),
-                                ),
-                        )
-                        .into_any_element(),
-                    // Wrapped in its own div: `IconButton` has no
-                    // `debug_selector` of its own to tell a test which of the two
-                    // states was painted, and a `disabled` button otherwise looks
-                    // identical to an enabled one on bounds alone.
-                    div()
-                        .debug_selector(move || {
-                            match cannot_be_debugged {
-                                Some(_) => "run-configurations-debug-disabled",
-                                None => "run-configurations-debug-enabled",
-                            }
-                            .to_string()
-                        })
-                        .child(
-                            IconButton::new("run-configurations-debug", IconName::Debug)
-                                .icon_size(IconSize::Small)
-                                // Green while it can be pressed, muted while it
-                                // cannot: a button that looks alive and does
-                                // nothing is the fault this pair already had once.
-                                .icon_color(match cannot_be_debugged {
-                                    Some(_) => Color::Muted,
-                                    None => Color::Success,
-                                })
-                                .disabled(cannot_be_debugged.is_some())
-                                .tooltip(Tooltip::text(cannot_be_debugged.unwrap_or("Debug it")))
-                                .on_click(
-                                    cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx)),
-                                ),
-                        )
-                        .into_any_element(),
-                ]))
+            .when_some(pair, |plaque, pair| {
+                plaque.child(ui::cyberpunk::segmented(pair))
             })
+    }
+}
+
+impl ConfigurationsToolbar {
+    /// The pair while nothing is running: the two ways of starting this one
+    /// configuration, which is the same configuration either way.
+    fn run_and_debug(
+        &self,
+        cannot_be_debugged: Option<&'static str>,
+        cx: &Context<Self>,
+    ) -> [AnyElement; 2] {
+        [
+            // Wrapped in its own div, as the debug button below is: `IconButton`
+            // paints another `IconName::PlayFilled` of its own inside the plaque
+            // beside it, and a bare `ICON-PlayFilled` selector would land on
+            // whichever one painted last rather than on this button.
+            div()
+                .debug_selector(|| "run-configurations-run-button".to_string())
+                .child(
+                    IconButton::new("run-configurations-run", IconName::PlayFilled)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Accent)
+                        .tooltip(Tooltip::text("Run it"))
+                        .on_click(cx.listener(|toolbar, _, window, cx| toolbar.run(window, cx))),
+                )
+                .into_any_element(),
+            // Wrapped in its own div: `IconButton` has no `debug_selector` of
+            // its own to tell a test which of the two states was painted, and a
+            // `disabled` button otherwise looks identical to an enabled one on
+            // bounds alone.
+            div()
+                .debug_selector(move || {
+                    match cannot_be_debugged {
+                        Some(_) => "run-configurations-debug-disabled",
+                        None => "run-configurations-debug-enabled",
+                    }
+                    .to_string()
+                })
+                .child(
+                    IconButton::new("run-configurations-debug", IconName::Debug)
+                        .icon_size(IconSize::Small)
+                        // Green while it can be pressed, muted while it cannot: a
+                        // button that looks alive and does nothing is the fault
+                        // this pair already had once.
+                        .icon_color(match cannot_be_debugged {
+                            Some(_) => Color::Muted,
+                            None => Color::Success,
+                        })
+                        .disabled(cannot_be_debugged.is_some())
+                        .tooltip(Tooltip::text(cannot_be_debugged.unwrap_or("Debug it")))
+                        .on_click(cx.listener(|toolbar, _, window, cx| toolbar.debug(window, cx))),
+                )
+                .into_any_element(),
+        ]
+    }
+
+    /// The pair while the run it points at is going on. The glyph changes along
+    /// with the colour, so which state the pair is in survives a screen that
+    /// shows no colour at all.
+    fn stop_and_restart(&self, cx: &Context<Self>) -> [AnyElement; 2] {
+        [
+            segment(
+                "run-configurations-stop",
+                IconName::Stop,
+                Color::Error,
+                "Stop the run",
+                cx.listener(|toolbar, _, _window, cx| toolbar.stop(cx)),
+            ),
+            segment(
+                "run-configurations-restart",
+                IconName::Rerun,
+                Color::Accent,
+                "Stop the run and start it again",
+                cx.listener(|toolbar, _, window, cx| toolbar.restart(window, cx)),
+            ),
+        ]
+    }
+}
+
+/// One segment of the pair, named twice: once by what it is, so a test can press
+/// it, and once by the colour it carries, so a test can read that colour back.
+/// `IconButton` paints the same bounds whichever colour its icon is, and the
+/// name is taken from the value the icon is coloured with rather than written
+/// beside it.
+fn segment(
+    selector: &'static str,
+    icon: IconName,
+    colour: Color,
+    tooltip: &'static str,
+    pressed: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .debug_selector(move || format!("{selector}-button"))
+        .child(
+            div()
+                .debug_selector(move || format!("{selector}-in-{}", named(colour)))
+                .child(
+                    IconButton::new(selector, icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(colour)
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(pressed),
+                ),
+        )
+        .into_any_element()
+}
+
+/// What a theme colour is called, for a selector that has to say which one was
+/// used.
+fn named(colour: Color) -> &'static str {
+    match colour {
+        Color::Accent => "accent",
+        Color::Error => "error",
+        Color::Success => "success",
+        Color::Muted => "muted",
+        _ => "other",
     }
 }
 
@@ -1321,6 +1498,9 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use terminal_view::terminal_panel::TerminalPanel;
     use util::path;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1333,6 +1513,10 @@ mod tests {
             // which key runs them has to be tested with those keys bound -- the
             // hints are read out of the keymap, and an empty one shows none.
             // The keys themselves are the same ones the shipped keymap carries.
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            // The terminal panel is where the runs live, and the pair reads it
+            // to answer whether the thing it points at is running.
+            terminal_view::init(cx);
             cx.bind_keys([
                 gpui::KeyBinding::new("down", menu::SelectNext, None),
                 gpui::KeyBinding::new("up", menu::SelectPrevious, None),
@@ -1441,17 +1625,44 @@ mod tests {
     struct BarWithThePlaque {
         toolbar: Entity<ConfigurationsToolbar>,
         gauge: Entity<AnsweringModeGauge>,
+        /// With nothing focused, an action dispatched into this window reaches
+        /// only the dispatch tree's own root and never the handler below, so the
+        /// bar is given something to focus.
+        focus_handle: FocusHandle,
+        /// The run a test expects Restart to end, so the handler below can say
+        /// whether it was still going on at the moment the rerun was asked for.
+        watching: Option<Entity<Terminal>>,
+        /// Every rerun the bar's window was asked for: the id, and whether
+        /// `watching` was still running when the ask arrived.
+        asked_to_rerun: Rc<RefCell<Vec<(String, bool)>>>,
     }
 
     impl Render for BarWithThePlaque {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(900.)).h(px(600.)).child(
-                h_flex()
-                    .h(px(40.))
-                    .gap_1()
-                    .child(self.toolbar.clone())
-                    .child(self.gauge.clone()),
-            )
+            let watching = self.watching.clone();
+            let asked_to_rerun = self.asked_to_rerun.clone();
+            div()
+                .track_focus(&self.focus_handle)
+                .w(px(900.))
+                .h(px(600.))
+                .on_action(move |rerun: &zed_actions::Rerun, _window, cx| {
+                    let still_running = watching.as_ref().is_some_and(|terminal| {
+                        terminal
+                            .read(cx)
+                            .task()
+                            .is_some_and(|task| task.status == TaskStatus::Running)
+                    });
+                    asked_to_rerun
+                        .borrow_mut()
+                        .push((rerun.task_id.clone().unwrap_or_default(), still_running));
+                })
+                .child(
+                    h_flex()
+                        .h(px(40.))
+                        .gap_1()
+                        .child(self.toolbar.clone())
+                        .child(self.gauge.clone()),
+                )
         }
     }
 
@@ -1485,13 +1696,159 @@ mod tests {
         let gauge = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
             cx.new(|cx| AnsweringModeGauge::new(workspace, cx))
         });
-        let bar = cx.add_window(|_window, _cx| BarWithThePlaque {
+        let bar = cx.add_window(|_window, cx| BarWithThePlaque {
             toolbar: toolbar.clone(),
             gauge,
+            focus_handle: cx.focus_handle(),
+            watching: None,
+            asked_to_rerun: Rc::default(),
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
         (toolbar, bar, cx)
+    }
+
+    /// Everything a test about a run needs: the bar with the plaque in it, the
+    /// workspace whose terminal panel the runs go into, and that panel.
+    struct APlaqueOverRuns {
+        toolbar: Entity<ConfigurationsToolbar>,
+        workspace: Entity<Workspace>,
+        panel: Entity<TerminalPanel>,
+        bar: gpui::WindowHandle<BarWithThePlaque>,
+    }
+
+    async fn a_plaque_over_runs(
+        tasks: &str,
+        cx: &mut TestAppContext,
+    ) -> (APlaqueOverRuns, VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".zed": { "tasks.json": tasks } }),
+        )
+        .await;
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let mut workspace_cx = VisualTestContext::from_window(workspace_window.into(), cx);
+        let workspace = workspace_window.root(&mut workspace_cx).unwrap();
+        let (toolbar, gauge, panel) =
+            workspace.update_in(&mut workspace_cx, |workspace, window, cx| {
+                let toolbar = cx.new(|cx| ConfigurationsToolbar::new(workspace, cx));
+                let gauge = cx.new(|cx| AnsweringModeGauge::new(workspace, cx));
+                let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                workspace.add_panel(panel.clone(), window, cx);
+                (toolbar, gauge, panel)
+            });
+        let bar = cx.add_window(|_window, cx| BarWithThePlaque {
+            toolbar: toolbar.clone(),
+            gauge,
+            focus_handle: cx.focus_handle(),
+            watching: None,
+            asked_to_rerun: Rc::default(),
+        });
+        let cx = VisualTestContext::from_window(bar.into(), cx);
+        cx.run_until_parked();
+        (
+            APlaqueOverRuns {
+                toolbar,
+                workspace,
+                panel,
+                bar,
+            },
+            cx,
+        )
+    }
+
+    /// Starts a run of `template` in the terminal panel, the way the workspace
+    /// does: the resolved task carries the id the pair matches on, while the
+    /// command is one a test can leave running and then kill.
+    async fn a_run_of(
+        template: &TaskTemplate,
+        over: &APlaqueOverRuns,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Terminal> {
+        // The run is a real process on a real PTY, and its exit arrives on that
+        // PTY's own thread rather than on the executor.
+        cx.background_executor.allow_parking();
+        let resolved = template
+            .resolve_task("run configurations", &task::TaskContext::default())
+            .expect("the template resolves against an empty context");
+        let mut spawned = resolved.resolved;
+        spawned.command = Some("sleep".to_string());
+        spawned.args = vec!["60".to_string()];
+        // The project is on a fake file system, so the run is given a directory
+        // that really exists to start in.
+        spawned.cwd = Some(std::env::temp_dir());
+        let project = over
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let terminal = project
+            .update(cx, |project, cx| project.create_terminal_task(spawned, cx))
+            .await
+            .expect("the run starts");
+        let view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                terminal_view::TerminalView::new(
+                    terminal.clone(),
+                    over.workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let pane = over
+            .panel
+            .read_with(cx, |panel, _| {
+                panel.panes().first().map(|pane| (*pane).clone())
+            })
+            .expect("the terminal panel has a pane");
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(view), false, false, None, window, cx);
+        });
+        cx.run_until_parked();
+        terminal
+    }
+
+    /// The template the plaque points at, which is what a run has to be tied to.
+    fn what_it_would_run(
+        toolbar: &Entity<ConfigurationsToolbar>,
+        cx: &VisualTestContext,
+    ) -> TaskTemplate {
+        toolbar
+            .read_with(cx, |toolbar, cx| toolbar.task_it_points_at(cx))
+            .expect("the plaque points at a task")
+    }
+
+    fn still_running(terminal: &Entity<Terminal>, cx: &VisualTestContext) -> bool {
+        terminal.read_with(cx, |terminal, _| {
+            terminal
+                .task()
+                .is_some_and(|task| task.status == TaskStatus::Running)
+        })
+    }
+
+    /// Waits, in real time, for `terminal`'s task to stop being the running one.
+    /// The process is a real one and its exit arrives on the PTY's own thread,
+    /// so there is nothing on the executor to pump instead.
+    async fn wait_until_it_is_over(
+        terminal: &Entity<Terminal>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if !still_running(terminal, cx) {
+                return true;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        false
     }
 
     fn draw_the_bar(window: gpui::WindowHandle<BarWithThePlaque>, cx: &mut VisualTestContext) {
@@ -2179,9 +2536,12 @@ mod tests {
         let gauge = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
             cx.new(|cx| AnsweringModeGauge::new(workspace, cx))
         });
-        let bar = cx.add_window(|_window, _cx| BarWithThePlaque {
+        let bar = cx.add_window(|_window, cx| BarWithThePlaque {
             toolbar: toolbar.clone(),
             gauge,
+            focus_handle: cx.focus_handle(),
+            watching: None,
+            asked_to_rerun: Rc::default(),
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
@@ -2397,6 +2757,260 @@ mod tests {
                 .is_empty(),
             "pressing Run on a command that could not be resolved has to say \
              so -- doing nothing looks exactly like the press never landed"
+        );
+    }
+
+    /// The template a configuration the project keeps would run.
+    fn the_kept_configuration(
+        toolbar: &Entity<ConfigurationsToolbar>,
+        at: usize,
+        cx: &VisualTestContext,
+    ) -> TaskTemplate {
+        toolbar
+            .read_with(cx, |toolbar, cx| {
+                toolbar
+                    .store
+                    .read(cx)
+                    .get(Kind::Task, at)
+                    .and_then(|configuration| configuration.task.clone())
+            })
+            .expect("the project keeps a configuration there")
+    }
+
+    /// Nothing is running, so the pair is the two ways of starting a run. This
+    /// is the state the bar spends most of its life in.
+    #[gpui::test]
+    async fn with_nothing_running_the_pair_is_run_and_debug(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        draw_the_bar(over.bar, &mut cx);
+
+        assert!(
+            cx.debug_bounds("run-configurations-run-button").is_some(),
+            "with nothing running, the first segment has to be Run"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-debug-enabled")
+                .is_some()
+                || cx
+                    .debug_bounds("run-configurations-debug-disabled")
+                    .is_some(),
+            "and the second has to be Debug, pressable or not"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-stop-button").is_none(),
+            "there is nothing to stop"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-button")
+                .is_none(),
+            "and nothing to restart"
+        );
+    }
+
+    /// While the run the plaque points at is going on, the same two segments are
+    /// Stop and Restart: the stop segment carries the error colour and the
+    /// restart segment does not, and the frame keeps the width it had.
+    #[gpui::test]
+    async fn while_this_configuration_runs_the_pair_is_stop_and_restart(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        draw_the_bar(over.bar, &mut cx);
+        let before = cx
+            .debug_bounds("run-configurations-toolbar")
+            .expect("the bar is painted before anything runs");
+
+        let template = what_it_would_run(&over.toolbar, &cx);
+        let run = a_run_of(&template, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+
+        assert!(
+            cx.debug_bounds("run-configurations-stop-button").is_some(),
+            "the first segment has to become Stop while the run is going on"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-button")
+                .is_some(),
+            "and the second has to become Restart"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-run-button").is_none(),
+            "Run must not be offered beside Stop"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-debug-enabled")
+                .is_none()
+                && cx
+                    .debug_bounds("run-configurations-debug-disabled")
+                    .is_none(),
+            "nor Debug"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-stop-in-error")
+                .is_some(),
+            "Stop has to read as the red square everyone expects"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-in-accent")
+                .is_some(),
+            "Restart carries the accent instead"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-restart-in-error")
+                .is_none(),
+            "so the error colour says Stop and only Stop"
+        );
+
+        let after = cx
+            .debug_bounds("run-configurations-toolbar")
+            .expect("the bar is still painted while the run is going on");
+        assert_eq!(
+            before.size.width, after.size.width,
+            "the frame keeps two segments, so nothing on the bar may move when a \
+             run starts"
+        );
+
+        over.toolbar.update(&mut cx, |toolbar, cx| toolbar.stop(cx));
+        assert!(
+            wait_until_it_is_over(&run, &mut cx).await,
+            "the run this test started has to be left dead"
+        );
+    }
+
+    /// The mistake this guards against: a run started later, of some other
+    /// configuration, is not this plaque's run, and pressing Stop here must
+    /// never be offered for it.
+    #[gpui::test]
+    async fn a_different_configurations_run_does_not_turn_this_plaque_into_stop(
+        cx: &mut TestAppContext,
+    ) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let another = the_kept_configuration(&over.toolbar, 1, &cx);
+        let run = a_run_of(&another, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+
+        assert!(
+            cx.debug_bounds("run-configurations-run-button").is_some(),
+            "the plaque points at the first configuration, which is not running"
+        );
+        assert!(
+            cx.debug_bounds("run-configurations-stop-button").is_none(),
+            "so Stop must not be offered for someone else's run"
+        );
+
+        // Pointed at the one that is running, the very same pair does flip --
+        // otherwise this test would pass on a pair that never flips at all.
+        over.toolbar.update(&mut cx, |toolbar, cx| {
+            toolbar.point_at(
+                Pointing::Kept {
+                    kind: Kind::Task,
+                    at: 1,
+                },
+                cx,
+            );
+        });
+        draw_the_bar(over.bar, &mut cx);
+        assert!(
+            cx.debug_bounds("run-configurations-stop-button").is_some(),
+            "the plaque that does point at that run offers Stop for it"
+        );
+
+        over.toolbar.update(&mut cx, |toolbar, cx| toolbar.stop(cx));
+        assert!(
+            wait_until_it_is_over(&run, &mut cx).await,
+            "the run this test started has to be left dead"
+        );
+    }
+
+    /// Pressing Stop -- really pressing it, where it is painted -- ends the run
+    /// the plaque points at, and leaves every other run alone.
+    #[gpui::test]
+    async fn pressing_stop_ends_that_run_and_no_other(cx: &mut TestAppContext) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let ours = what_it_would_run(&over.toolbar, &cx);
+        let another = the_kept_configuration(&over.toolbar, 1, &cx);
+        let our_run = a_run_of(&ours, &over, &mut cx).await;
+        let their_run = a_run_of(&another, &over, &mut cx).await;
+        draw_the_bar(over.bar, &mut cx);
+
+        let stop = cx
+            .debug_bounds("run-configurations-stop-button")
+            .expect("Stop is painted while the run is going on");
+        cx.simulate_click(stop.center(), gpui::Modifiers::none());
+
+        assert!(
+            wait_until_it_is_over(&our_run, &mut cx).await,
+            "pressing Stop has to end the run the plaque points at"
+        );
+        assert!(
+            still_running(&their_run, &cx),
+            "and must not end another configuration's run along with it"
+        );
+
+        their_run.update(&mut cx, |terminal, _| terminal.kill_active_task());
+        assert!(
+            wait_until_it_is_over(&their_run, &mut cx).await,
+            "the other run this test started has to be left dead too"
+        );
+    }
+
+    /// Restart stops the run and only then starts it again. The order is the
+    /// whole point: this project's runs bind ports, and a second process started
+    /// while the first still holds one fails to bind.
+    #[gpui::test]
+    async fn restart_does_not_start_the_new_run_before_the_old_one_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        let (over, mut cx) = a_plaque_over_runs(THREE_TASKS, cx).await;
+        let template = what_it_would_run(&over.toolbar, &cx);
+        let run = a_run_of(&template, &over, &mut cx).await;
+        let task_id = run
+            .read_with(&cx, |terminal, _| {
+                terminal.task().map(|task| task.spawned_task.id.0.clone())
+            })
+            .expect("the run carries the id it was resolved with");
+        let (asked_to_rerun, focus_handle) = over
+            .bar
+            .update(&mut cx, |bar, _window, _cx| {
+                bar.watching = Some(run.clone());
+                (bar.asked_to_rerun.clone(), bar.focus_handle.clone())
+            })
+            .expect("the bar is still open");
+        draw_the_bar(over.bar, &mut cx);
+        cx.update(|window, cx| window.focus(&focus_handle, cx));
+        draw_the_bar(over.bar, &mut cx);
+
+        let restart = cx
+            .debug_bounds("run-configurations-restart-button")
+            .expect("Restart is painted while the run is going on");
+        cx.simulate_click(restart.center(), gpui::Modifiers::none());
+
+        assert!(
+            wait_until_it_is_over(&run, &mut cx).await,
+            "Restart has to end the run it points at"
+        );
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if !asked_to_rerun.borrow().is_empty() {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+
+        let asked = asked_to_rerun.borrow().clone();
+        assert_eq!(
+            asked.len(),
+            1,
+            "one rerun, for the configuration that was stopped"
+        );
+        assert_eq!(
+            asked[0].0, task_id,
+            "and for that run's own task rather than whatever ran last"
+        );
+        assert!(
+            !asked[0].1,
+            "the rerun must not be asked for while the process it is replacing \
+             is still going"
         );
     }
 }
