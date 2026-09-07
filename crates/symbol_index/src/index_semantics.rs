@@ -9,7 +9,8 @@ use futures::future::Shared;
 use gpui::{App, AppContext as _, Entity, Task, WeakEntity, Window};
 use language::{Buffer, BufferId, BufferRow};
 use project::{
-    DocumentHighlight, InlayHint, InvalidationStrategy, LocationLink, Project, ProjectTransaction,
+    DocumentHighlight, InProcessSemantics, InProcessSemanticsContext, InProcessSpan, InlayHint,
+    InvalidationStrategy, LocationLink, Project, ProjectTransaction,
     lsp_store::{BufferSemanticTokens, CacheInlayHints, RefreshForServer},
 };
 use semantic_index::definitions::Definition;
@@ -196,6 +197,157 @@ impl IndexFirst {
             }])
         }))
     }
+
+    /// Every place the index calls a reference to the name under the cursor,
+    /// worked out while the buffer and the index are both in hand.
+    ///
+    /// The same refusal the underlining makes, and for the same reason: an
+    /// unsaved edit has moved every row below it, and a stale row that lands on
+    /// another occurrence of the same name passes the text check in
+    /// [`open_every_place`] and is reported as a place the reader never asked
+    /// about.
+    fn what_the_index_calls_references(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<NamedPlaces> {
+        let index = self.index.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (_, name) = word_at(&snapshot, offset)?;
+        if buffer.read(cx).is_dirty() {
+            return None;
+        }
+
+        let places = {
+            let index = index.read(cx);
+            let WhatItMeans::TheseAre(places) = index.what_a_name_means(&name)? else {
+                return None;
+            };
+            places
+        };
+        if places.is_empty() || places.len() > MOST_PLACES_WORTH_OPENING {
+            return None;
+        }
+        Some(NamedPlaces {
+            name,
+            root: index.read(cx).root().to_path_buf(),
+            places,
+        })
+    }
+
+    /// The first thing any registered in-process semantics source says, asked
+    /// in the order they were registered.
+    ///
+    /// Nothing at all where none is registered, which keeps the whole detour
+    /// out of the way of the languages no source knows anything about -- the
+    /// index serves 28 of them and must not lose a lookup to a layer that was
+    /// never going to answer.
+    fn from_a_source<Answer: Send + 'static>(
+        &self,
+        cx: &mut App,
+        ask: impl Fn(
+            &dyn InProcessSemantics,
+            &InProcessSemanticsContext,
+            &mut App,
+        ) -> Task<Option<Answer>>,
+    ) -> Option<Task<Option<Answer>>> {
+        let sources = project::in_process_semantics(cx);
+        if sources.is_empty() {
+            return None;
+        }
+        let worktree_roots = {
+            let project = self.project.upgrade()?;
+            project.read(cx).sorted_visible_worktree_roots(cx)
+        };
+        let context = InProcessSemanticsContext { worktree_roots };
+        let asked: Vec<_> = sources
+            .iter()
+            .map(|source| ask(source.as_ref(), &context, cx))
+            .collect();
+        Some(cx.background_spawn(async move {
+            for task in asked {
+                if let Some(answered) = task.await {
+                    return Some(answered);
+                }
+            }
+            None
+        }))
+    }
+
+    /// The word the cursor is in, as a place a lookup can be said to come from.
+    fn asked_from(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &App,
+    ) -> Option<language::Location> {
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (range, _) = word_at(&snapshot, offset)?;
+        Some(language::Location {
+            buffer: buffer.clone(),
+            range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+        })
+    }
+
+    /// The position an in-process source is asked about, in the units its
+    /// registry speaks.
+    fn position_of(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &App,
+    ) -> text::PointUtf16 {
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        snapshot.offset_to_point_utf16(offset)
+    }
+}
+
+/// Opens the files an in-process source named and turns its spans into places
+/// in buffers.
+///
+/// A span whose text the buffer no longer holds is dropped rather than
+/// reported: the source and the editor do not always read the same bytes, and
+/// a stale range points at a word the reader never asked about. Every span
+/// being stale means the source answered about a file that has since changed,
+/// and `None` says so, where an empty list would read as "there are none".
+async fn places_of(
+    project: WeakEntity<Project>,
+    spans: Vec<InProcessSpan>,
+    cx: &mut gpui::AsyncApp,
+) -> Option<Vec<language::Location>> {
+    let mut opened: HashMap<std::path::PathBuf, Entity<Buffer>> = HashMap::default();
+    let mut found = Vec::new();
+    for span in spans {
+        let buffer = match opened.get(&span.path) {
+            Some(buffer) => buffer.clone(),
+            None => {
+                let Ok(opening) =
+                    project.update(cx, |project, cx| project.open_local_buffer(&span.path, cx))
+                else {
+                    continue;
+                };
+                let Ok(buffer) = opening.await else {
+                    continue;
+                };
+                opened.insert(span.path.clone(), buffer.clone());
+                buffer
+            }
+        };
+        let range = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            span.found_in(&snapshot)
+                .map(|range| snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+        });
+        let Some(range) = range else {
+            continue;
+        };
+        found.push(language::Location { buffer, range });
+    }
+    (!found.is_empty()).then_some(found)
 }
 
 /// The blocks a declaration card is made of: the declaration as it is written,
@@ -413,6 +565,68 @@ async fn open_the_declaration(
     }]))
 }
 
+/// The places the index named, and the name it named them for.
+struct NamedPlaces {
+    name: String,
+    root: std::path::PathBuf,
+    places: Vec<semantic_index::resolution::Where>,
+}
+
+/// Opens every file the index named and points at the name on the row it
+/// recorded.
+async fn open_every_place(
+    project: WeakEntity<Project>,
+    named: NamedPlaces,
+    cx: &mut gpui::AsyncApp,
+) -> Result<Option<Vec<language::Location>>> {
+    let NamedPlaces { name, root, places } = named;
+    let mut found = Vec::new();
+    let mut opened: HashMap<String, Entity<Buffer>> = HashMap::default();
+    for place in places {
+        let buffer = match opened.get(&place.path) {
+            Some(buffer) => buffer.clone(),
+            None => {
+                let full = root.join(&place.path);
+                // A file the index recorded and the tree no longer has is one
+                // place lost, not the whole answer: the rest are still where
+                // they were said to be.
+                let Ok(opening) =
+                    project.update(cx, |project, cx| project.open_local_buffer(&full, cx))
+                else {
+                    continue;
+                };
+                let Ok(buffer) = opening.await else {
+                    continue;
+                };
+                opened.insert(place.path.clone(), buffer.clone());
+                buffer
+            }
+        };
+        let range = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            let from = point_of(&snapshot, place.row, place.column)?;
+            let to = point_of(&snapshot, place.row, place.column + name.len() as u32)?;
+            // The store holds what the file said when it was last read. A place
+            // whose text is no longer the name is a row that has moved, and
+            // pointing a reader at it would send them to a word they did not
+            // ask about.
+            (snapshot.text_for_range(from..to).collect::<String>() == name)
+                .then(|| snapshot.anchor_before(from)..snapshot.anchor_after(to))
+        });
+        let Some(range) = range else {
+            continue;
+        };
+        found.push(language::Location { buffer, range });
+    }
+    // Every place having moved is a store that has fallen behind the files, and
+    // an empty answer reads as "no references" rather than "ask somebody else";
+    // `None` is the one that says the latter.
+    if found.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(found))
+}
+
 /// How many places the index may be asked to open buffers for. A name written
 /// ten thousand times is not a list anybody reads, and opening a buffer per
 /// file to build it is the expensive part.
@@ -540,80 +754,30 @@ impl SemanticsProvider for IndexFirst {
         position: text::Anchor,
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<language::Location>>>>> {
-        let index = self.index.upgrade()?;
-        // The weak handle is kept rather than upgraded: it is the one whose
-        // `update` answers with a `Result`, which is what a task running after
-        // the project may have gone needs.
+        let point = self.position_of(buffer, position, cx);
+        let from_a_source = self.from_a_source(cx, |source, context, cx| {
+            source.references(context, buffer, point, cx)
+        });
+        let from_the_index = self.what_the_index_calls_references(buffer, position, cx);
+        if from_a_source.is_none() && from_the_index.is_none() {
+            return None;
+        }
         let project = self.project.clone();
-        let snapshot = buffer.read(cx).snapshot();
-        let offset = position.to_offset(&snapshot);
-        let (_, name) = word_at(&snapshot, offset)?;
-        // The same refusal the underlining makes, and for the same reason: an
-        // unsaved edit has moved every row below it, and a stale row that lands
-        // on another occurrence of the same name passes the text check below
-        // and is reported as a place the reader never asked about.
-        if buffer.read(cx).is_dirty() {
-            return None;
-        }
-
-        let places = {
-            let index = index.read(cx);
-            let WhatItMeans::TheseAre(places) = index.what_a_name_means(&name)? else {
-                return None;
-            };
-            places
-        };
-        if places.is_empty() || places.len() > MOST_PLACES_WORTH_OPENING {
-            return None;
-        }
-        let root = index.read(cx).root().to_path_buf();
-
         Some(cx.spawn(async move |cx| {
-            let mut found = Vec::new();
-            let mut opened: HashMap<String, Entity<Buffer>> = HashMap::default();
-            for place in places {
-                let buffer = match opened.get(&place.path) {
-                    Some(buffer) => buffer.clone(),
-                    None => {
-                        let full = root.join(&place.path);
-                        // A file the index recorded and the tree no longer has
-                        // is one place lost, not the whole answer: the rest are
-                        // still where they were said to be.
-                        let Ok(opening) =
-                            project.update(cx, |project, cx| project.open_local_buffer(&full, cx))
-                        else {
-                            continue;
-                        };
-                        let Ok(buffer) = opening.await else {
-                            continue;
-                        };
-                        opened.insert(place.path.clone(), buffer.clone());
-                        buffer
-                    }
-                };
-                let range = buffer.read_with(cx, |buffer, _| {
-                    let snapshot = buffer.snapshot();
-                    let from = point_of(&snapshot, place.row, place.column)?;
-                    let to = point_of(&snapshot, place.row, place.column + name.len() as u32)?;
-                    // The store holds what the file said when it was last read.
-                    // A place whose text is no longer the name is a row that has
-                    // moved, and pointing a reader at it would send them to a
-                    // word they did not ask about.
-                    (snapshot.text_for_range(from..to).collect::<String>() == name)
-                        .then(|| snapshot.anchor_before(from)..snapshot.anchor_after(to))
-                });
-                let Some(range) = range else {
-                    continue;
-                };
-                found.push(language::Location { buffer, range });
+            // `ty` before the index: it knows which occurrences of a Python
+            // name are the same symbol, where the index knows only which are
+            // the same word.
+            if let Some(from_a_source) = from_a_source
+                && let Some(spans) = from_a_source.await
+            {
+                if let Some(places) = places_of(project.clone(), spans, cx).await {
+                    return Ok(Some(places));
+                }
             }
-            // Every place having moved is a store that has fallen behind the
-            // files, and an empty answer reads as "no references" rather than
-            // "ask somebody else"; `None` is the one that says the latter.
-            if found.is_empty() {
-                return Ok(None);
+            match from_the_index {
+                Some(named) => open_every_place(project, named, cx).await,
+                None => Ok(None),
             }
-            Ok(Some(found))
         }))
     }
 
@@ -729,24 +893,51 @@ impl SemanticsProvider for IndexFirst {
         if kind != editor::GotoDefinitionKind::Symbol {
             return from_the_server;
         }
+        let point = self.position_of(buffer, position, cx);
+        let from_a_source = self.from_a_source(cx, |source, context, cx| {
+            source.definitions(context, buffer, point, cx)
+        });
+        let asked_from = self.asked_from(buffer, position, cx);
         // Worked out now, while the buffer and the index are both in hand, but
-        // the file it names is opened only if the server has nothing: opening a
-        // buffer per lookup in a project that has a server is work started and
-        // thrown away.
-        let Some(where_it_is) = self.where_the_index_says(buffer, position, cx) else {
+        // the file it names is opened only if nothing ahead of it answered:
+        // opening a buffer per lookup in a project that has a server is work
+        // started and thrown away.
+        let from_the_index = self.where_the_index_says(buffer, position, cx);
+        if from_a_source.is_none() && from_the_index.is_none() {
             // Nothing of our own to say, and dropping the task here would drop
             // the server's answer with it.
             return from_the_server;
-        };
+        }
         let project = self.project.clone();
-        let Some(from_the_server) = from_the_server else {
-            return Some(
-                cx.spawn(async move |cx| open_the_declaration(project, where_it_is, cx).await),
-            );
-        };
-        Some(cx.spawn(async move |cx| match from_the_server.await {
-            Ok(Some(found)) if !found.is_empty() => Ok(Some(found)),
-            _ => open_the_declaration(project, where_it_is, cx).await,
+        Some(cx.spawn(async move |cx| {
+            // The server first, always. Then `ty`, which follows a Python name
+            // through the imports and aliases it was reached by, where the
+            // index can only find a name the project declares exactly once.
+            if let Some(from_the_server) = from_the_server
+                && let Ok(Some(found)) = from_the_server.await
+                && !found.is_empty()
+            {
+                return Ok(Some(found));
+            }
+            if let Some(from_a_source) = from_a_source
+                && let Some(spans) = from_a_source.await
+            {
+                if let Some(places) = places_of(project.clone(), spans, cx).await {
+                    return Ok(Some(
+                        places
+                            .into_iter()
+                            .map(|target| LocationLink {
+                                origin: asked_from.clone(),
+                                target,
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+            match from_the_index {
+                Some(where_it_is) => open_the_declaration(project, where_it_is, cx).await,
+                None => Ok(None),
+            }
         }))
     }
 
@@ -756,7 +947,32 @@ impl SemanticsProvider for IndexFirst {
         position: text::Anchor,
         cx: &mut App,
     ) -> Task<Result<Option<Range<text::Anchor>>>> {
-        self.project.range_for_rename(buffer, position, cx)
+        let from_the_server = self.project.range_for_rename(buffer, position, cx);
+        let point = self.position_of(buffer, position, cx);
+        let Some(from_a_source) = self.from_a_source(cx, |source, context, cx| {
+            source.rename_range(context, buffer, point, cx)
+        }) else {
+            return from_the_server;
+        };
+        let buffer = buffer.clone();
+        cx.spawn(async move |cx| {
+            let answered = from_the_server.await;
+            if let Ok(Some(range)) = &answered {
+                return Ok(Some(range.clone()));
+            }
+            let Some(range) = from_a_source.await else {
+                // Whatever the server said, including its error: a source with
+                // nothing to say must not turn a failure into a silence.
+                return answered;
+            };
+            Ok(buffer.read_with(cx, |buffer, _| {
+                let snapshot = buffer.snapshot();
+                if range.start > range.end || range.end > snapshot.len() {
+                    return None;
+                }
+                Some(snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+            }))
+        })
     }
 
     fn perform_rename(
@@ -766,7 +982,35 @@ impl SemanticsProvider for IndexFirst {
         new_name: String,
         cx: &mut App,
     ) -> Option<Task<Result<ProjectTransaction>>> {
-        self.project.perform_rename(buffer, position, new_name, cx)
+        let from_the_server = self
+            .project
+            .perform_rename(buffer, position, new_name.clone(), cx);
+        let point = self.position_of(buffer, position, cx);
+        let renaming = new_name.clone();
+        let Some(from_a_source) = self.from_a_source(cx, move |source, context, cx| {
+            source.rename(context, buffer, point, renaming.clone(), cx)
+        }) else {
+            return from_the_server;
+        };
+        let project = self.project.clone();
+        Some(cx.spawn(async move |cx| {
+            // The server first, always. An empty transaction is what a project
+            // with no server running answers with, and it is not a rename.
+            if let Some(from_the_server) = from_the_server
+                && let Ok(edited) = from_the_server.await
+                && !edited.0.is_empty()
+            {
+                return Ok(edited);
+            }
+            let Some(spans) = from_a_source.await else {
+                return Ok(ProjectTransaction::default());
+            };
+            project
+                .update(cx, |project, cx| {
+                    project.apply_in_process_rename(spans, new_name, cx)
+                })?
+                .await
+        }))
     }
 }
 
