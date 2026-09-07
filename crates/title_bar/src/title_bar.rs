@@ -443,26 +443,21 @@ impl Render for TitleBar {
             );
         }
 
-        if let Some(right) = self.right.clone() {
-            children.push(
-                h_flex()
-                    // Fixed, unlike the middle: a gauge is a row of three
-                    // segments with nothing in it that can be given up, so it
-                    // keeps its width and the shrinkable groups either side of it
-                    // pay for a narrow window instead. Anything that hung past
-                    // the bar's own edge here would simply be cut off.
-                    .flex_none()
-                    .h_full()
-                    .items_center()
-                    // The gap the bar's own controls stand apart by, so the gauge
-                    // does not sit against the account controls beside it.
-                    .mr_1()
-                    .debug_selector(|| "title-bar-right".to_string())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(right)
-                    .into_any_element(),
-            );
-        }
+        let right_slot = self.right.clone().map(|right| {
+            h_flex()
+                // Fixed, unlike the middle: a gauge is a row of three segments
+                // with nothing in it that can be given up, so it keeps its width
+                // and the shrinkable groups either side of it pay for a narrow
+                // window instead. Anything that hung past the bar's own edge
+                // here would simply be cut off.
+                .flex_none()
+                .h_full()
+                .items_center()
+                .debug_selector(|| "title-bar-right".to_string())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(right)
+                .into_any_element()
+        });
 
         let status = self.client.status();
         let status = &*status.borrow();
@@ -482,39 +477,55 @@ impl Render for TitleBar {
 
         children.push(
             h_flex()
+                // The leftover width of the bar, packed against the right edge:
+                // the gauge sits in it as the last thing before the account
+                // controls, so the two stand a `gap_1` apart with nothing
+                // stranded between them.
+                //
+                // No `min_w_0`, unlike the groups that shrink: this one holds the
+                // gauge, which has nothing it can give up, and a box narrower
+                // than its own contents packed against its right edge spills
+                // those contents leftwards over whatever is beside it.
                 .flex_1()
-                .min_w_0()
                 .justify_end()
                 .pr_1()
                 .gap_1()
-                .debug_selector(|| "title-bar-account-end".to_string())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.render_call_controls(window, cx))
-                .children(self.render_connection_status(status, cx))
-                .child(self.update_version.clone())
-                .when(
-                    user.is_none()
-                        && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
-                    |this| this.child(self.render_sign_in_button(cx)),
+                .h_full()
+                .items_center()
+                .children(right_slot)
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .debug_selector(|| "title-bar-account-end".to_string())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.render_call_controls(window, cx))
+                        .children(self.render_connection_status(status, cx))
+                        .child(self.update_version.clone())
+                        .when(
+                            user.is_none()
+                                && is_signed_out_or_auth_error
+                                && TitleBarSettings::get_global(cx).show_sign_in,
+                            |this| this.child(self.render_sign_in_button(cx)),
+                        )
+                        .when(is_signing_in, |this| {
+                            this.child(
+                                Label::new("Signing in…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .with_animation(
+                                        "signing-in",
+                                        Animation::new(Duration::from_secs(2))
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.4, 0.8)),
+                                        |label, delta| label.alpha(delta),
+                                    ),
+                            )
+                        })
+                        .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
+                            this.child(self.render_user_menu_button(cx))
+                        }),
                 )
-                .when(is_signing_in, |this| {
-                    this.child(
-                        Label::new("Signing in…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .with_animation(
-                                "signing-in",
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.4, 0.8)),
-                                |label, delta| label.alpha(delta),
-                            ),
-                    )
-                })
-                .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
-                    this.child(self.render_user_menu_button(cx))
-                })
                 .into_any_element(),
         );
 
@@ -1753,6 +1764,63 @@ mod tests {
             narrow < wide,
             "the middle shrank from {wide:?} to {narrow:?} -- it is what pays for a narrow bar"
         );
+    }
+
+    /// The gap the bar's own controls stand apart by: `gap_1`, at the default
+    /// scale of one rem to sixteen pixels.
+    const THE_BARS_OWN_GAP: Pixels = px(4.);
+
+    /// The gauge was asked for at the right edge, beside the account controls.
+    /// A group that takes the leftover width and packs itself right leaves the
+    /// gauge stranded to the left of that gap, which is what a reader sees as
+    /// the gauge being in the wrong place. Measured on painted boxes, since
+    /// where a group sits in the element tree says nothing about where it lands.
+    #[gpui::test]
+    async fn the_gauge_sits_beside_the_account_controls(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            set_right_of_the_bar(cx, move |_workspace, _window, cx| {
+                Some(cx.new(|_| WideThing { width: px(120.) }).into())
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(util::path!("/project"), serde_json::json!({ "a.txt": "" }))
+            .await;
+        let project = Project::test(fs, [util::path!("/project").as_ref()], cx).await;
+        let window = cx
+            .add_window(|window, cx| Workspace::new(None, project, app_state.clone(), window, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        for bar in [px(1200.), px(700.)] {
+            cx.simulate_resize(size(bar, px(600.)));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let right = cx
+                .debug_bounds("title-bar-right")
+                .expect("the gauge is painted at the right of the bar");
+            let account = cx
+                .debug_bounds("title-bar-account-end")
+                .expect("the account controls are painted");
+            assert!(
+                right.right() <= account.left() + px(1.),
+                "in a {bar:?} bar the gauge reaches to {:?} and the account controls start at                  {:?}; whichever is drawn second covers the other",
+                right.right(),
+                account.left()
+            );
+            assert!(
+                account.left() - right.right() <= THE_BARS_OWN_GAP + px(1.),
+                "in a {bar:?} bar the gauge ends at {:?} and the account controls start at {:?},                  leaving {:?} of empty bar between them; the two stand one gap apart",
+                right.right(),
+                account.left(),
+                account.left() - right.right()
+            );
+        }
     }
 
     /// Stands in for the plaque: something that asks for more room than the bar
