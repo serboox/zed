@@ -792,6 +792,8 @@ fn main() {
         sql_diagnostics::init(cx);
         shell_diagnostics::init(cx);
         xml_diagnostics::init(cx);
+        php_diagnostics::init(cx);
+        ruby_diagnostics::init(cx);
         db_client_ui::init(cx);
         api_client_ui::init(cx);
         hierarchy_view::init(cx);

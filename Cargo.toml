@@ -173,6 +173,7 @@ members = [
     "crates/path",
     "crates/paths",
     "crates/pdf_preview",
+    "crates/php_diagnostics",
     "crates/picker",
     "crates/picker_preview",
     "crates/platform_title_bar",
@@ -197,6 +198,7 @@ members = [
     "crates/repl",
     "crates/reqwest_client",
     "crates/rope",
+    "crates/ruby_diagnostics",
     "crates/rpc",
     "crates/python_diagnostics",
     "crates/run_configurations",
@@ -443,6 +445,7 @@ markdown_diagnostics = { path = "crates/markdown_diagnostics" }
 markdown_preview = { path = "crates/markdown_preview" }
 mermaid_render = { path = "crates/mermaid_render" }
 pdf_preview = { path = "crates/pdf_preview" }
+php_diagnostics = { path = "crates/php_diagnostics" }
 svg_preview = { path = "crates/svg_preview" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
@@ -491,6 +494,7 @@ repl = { path = "crates/repl" }
 reqwest_client = { path = "crates/reqwest_client" }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", features = ["wav", "playback", "wav_output", "recording"] }
 rope = { path = "crates/rope" }
+ruby_diagnostics = { path = "crates/ruby_diagnostics" }
 run_configurations = { path = "crates/run_configurations" }
 rpc = { path = "crates/rpc" }
 python_diagnostics = { path = "crates/python_diagnostics" }

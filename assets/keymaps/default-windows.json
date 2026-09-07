@@ -1817,11 +1817,11 @@
       "ctrl-k h": "hierarchy_view::ToggleFocus",
       // Find by shape, beside the find-in-project this keymap already has.
       "ctrl-k f": "structural_search::Toggle",
-      // One key for every per-language checker rather than fifteen keys. Each
+      // One key for every per-language checker rather than seventeen keys. Each
       // checker already looks for its own language in the project and does
       // nothing when it is absent, so asking all of them is the same as asking
       // whichever one has an answer -- and a reader has one shortcut to
-      // remember instead of fifteen.
+      // remember instead of seventeen.
       "ctrl-k c": [
         "action::Sequence",
         [
@@ -1839,7 +1839,9 @@
           "toml_diagnostics::Validate",
           "yaml_diagnostics::Validate",
           "shell_diagnostics::Check",
-          "xml_diagnostics::Check"
+          "xml_diagnostics::Check",
+          "php_diagnostics::Check",
+          "ruby_diagnostics::Check"
         ]
       ]
     },
