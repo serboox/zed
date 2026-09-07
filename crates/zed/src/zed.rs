@@ -674,7 +674,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_left_item(session_restore_indicator, window, cx);
             status_bar.add_left_item(db_exec_status, window, cx);
-            status_bar.add_left_item(run_metrics_status, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
@@ -683,6 +682,12 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            // Right items are painted in reverse of the order they are added
+            // (see `render_right_tools`), so adding this last is what puts it
+            // at the near edge of the right-hand group. Every fact about the
+            // current file -- encoding, language, line ending, cursor position
+            // -- keeps the place the reader's hand already knows.
+            status_bar.add_right_item(run_metrics_status, window, cx);
         });
 
         let panels_task = initialize_panels(workspace, window, cx);
