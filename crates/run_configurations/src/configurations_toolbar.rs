@@ -23,6 +23,12 @@ use crate::configurations_store::ConfigurationsStore;
 /// the bar's row and not a button's.
 const PLAQUE_HEIGHT: f32 = 28.0;
 
+/// How tall a gauge segment's content stands: two pixels short of
+/// `cyberpunk::SEGMENT_HEIGHT`, because the frame's own hairline top and bottom
+/// is part of that number. A gauge taller than the plaque beside it is a gauge
+/// that outgrows the bar it sits in.
+const SEGMENT_CONTENT_HEIGHT: f32 = 26.0;
+
 /// Which way of running the switcher is pointing at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pointing {
@@ -127,6 +133,38 @@ impl AnsweringMode {
         }
     }
 
+    /// Which stop of the load scale this mode paints in. The gauge is the one
+    /// place in this chrome where a hue carries information rather than
+    /// decoration, which is why the scale is declared in the palette rather
+    /// than mixed here.
+    fn load(self) -> cyberpunk::Load {
+        match self {
+            Self::Index => cyberpunk::Load::Calm,
+            Self::Types => cyberpunk::Load::Warm,
+            Self::Everything => cyberpunk::Load::Hot,
+        }
+    }
+
+    /// How far along the scale this mode sits, so a segment can tell whether the
+    /// gauge is filled as far as it.
+    fn stop(self) -> u8 {
+        match self {
+            Self::Index => 0,
+            Self::Types => 1,
+            Self::Everything => 2,
+        }
+    }
+
+    /// Shown on the lit segment alone: three labels do not fit in the bar, and
+    /// one makes the state unmistakable.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Index => "Index",
+            Self::Types => "Types",
+            Self::Everything => "Everything",
+        }
+    }
+
     /// Names the segment itself: the element it is, and the thing a test
     /// presses.
     fn segment_selector(self) -> &'static str {
@@ -148,6 +186,28 @@ impl AnsweringMode {
             (Self::Types, false) => "answering-mode-types-dim",
             (Self::Everything, true) => "answering-mode-everything-lit",
             (Self::Everything, false) => "answering-mode-everything-dim",
+        }
+    }
+
+    /// Names a filled segment and the colour it is filled in -- the colour being
+    /// the stop of the mode in effect, not this segment's own. A fill is a
+    /// background, and a background paints the same bounds as no background at
+    /// all, so this is the only place the level the gauge reads at is legible
+    /// from outside the render.
+    ///
+    /// Written out rather than composed, because `debug_bounds` looks a selector
+    /// up by a `&'static str` and a formatted one could not be passed to it.
+    fn fill_selector(self, filled_in: Self) -> &'static str {
+        match (self, filled_in) {
+            (Self::Index, Self::Index) => "answering-mode-index-fill-calm",
+            (Self::Index, Self::Types) => "answering-mode-index-fill-warm",
+            (Self::Index, Self::Everything) => "answering-mode-index-fill-hot",
+            (Self::Types, Self::Index) => "answering-mode-types-fill-calm",
+            (Self::Types, Self::Types) => "answering-mode-types-fill-warm",
+            (Self::Types, Self::Everything) => "answering-mode-types-fill-hot",
+            (Self::Everything, Self::Index) => "answering-mode-everything-fill-calm",
+            (Self::Everything, Self::Types) => "answering-mode-everything-fill-warm",
+            (Self::Everything, Self::Everything) => "answering-mode-everything-fill-hot",
         }
     }
 }
@@ -194,15 +254,11 @@ impl ConfigurationsToolbar {
             toolbar.keep_pointing_at_something(cx);
             cx.notify();
         });
-        // The answering mode is read out of the settings rather than held here,
-        // so the bar has to be redrawn whenever they move -- including when they
-        // are edited by hand.
-        let settings_changed = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         let mut toolbar = Self {
             store,
             workspace: workspace.weak_handle(),
             pointing: None,
-            _subscriptions: vec![subscription, settings_changed],
+            _subscriptions: vec![subscription],
         };
         toolbar.keep_pointing_at_something(cx);
         toolbar
@@ -590,37 +646,119 @@ impl Render for ConfigurationsToolbar {
                         .into_any_element(),
                 ]))
             })
-            .child(self.answering_modes(cx))
     }
 }
 
-impl ConfigurationsToolbar {
-    /// The three answering modes, as one frame beside the run pair.
-    fn answering_modes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+/// The load gauge: the three answering modes as one framed scale at the right of
+/// the title bar, filled as far as the mode in effect and in that mode's colour.
+///
+/// A view of its own rather than a second render of [`ConfigurationsToolbar`]:
+/// the two groups sit in different slots of the bar, and the gauge needs nothing
+/// the toolbar holds -- the mode is read back out of the settings, and the only
+/// thing carried here is the workspace whose servers a switch has to be applied
+/// to.
+pub struct AnsweringModeGauge {
+    workspace: WeakEntity<Workspace>,
+    _settings_changed: Subscription,
+}
+
+impl AnsweringModeGauge {
+    pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
+        Self {
+            workspace: workspace.weak_handle(),
+            // The mode is read out of the settings rather than held here, so the
+            // gauge has to be redrawn whenever they move -- including when they
+            // are edited by hand.
+            _settings_changed: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+        }
+    }
+}
+
+impl Render for AnsweringModeGauge {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let in_effect = AnsweringMode::in_effect(cx);
         cyberpunk::segmented(AnsweringMode::ALL.map(|mode| {
             let lit = in_effect == Some(mode);
-            // Two frames of the same bounds: the outer one is the segment, the
-            // inner one says whether it is the lit one.
+            // Every stop up to the one in effect is tinted, and all of them in
+            // that stop's colour: how far the gauge is filled and what the mode
+            // costs are then one glance rather than two. Beyond it, nothing.
+            let filled_in = in_effect.filter(|active| mode.stop() <= active.stop());
+            let load = mode.load();
+            let content = match lit {
+                // A `ButtonLike` rather than an `IconButton`: the lit segment
+                // carries a label beside its icon, which an `IconButton` has no
+                // room for.
+                true => ButtonLike::new(mode.segment_selector())
+                    .style(ButtonStyle::Transparent)
+                    .size(ButtonSize::None)
+                    .height(px(SEGMENT_CONTENT_HEIGHT).into())
+                    .tooltip(Tooltip::text(mode.tooltip()))
+                    .on_click(cx.listener(move |gauge, _, _window, cx| gauge.switch_to(mode, cx)))
+                    .child(
+                        h_flex()
+                            .h(px(SEGMENT_CONTENT_HEIGHT))
+                            .px_1p5()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Icon::new(mode.icon())
+                                    .size(IconSize::Small)
+                                    .color(Color::Custom(load.border())),
+                            )
+                            .child(
+                                Label::new(mode.label())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(load.border())),
+                            ),
+                    )
+                    .into_any_element(),
+                false => IconButton::new(mode.segment_selector(), mode.icon())
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Custom(cyberpunk::text_tertiary()))
+                    .tooltip(Tooltip::text(mode.tooltip()))
+                    .on_click(cx.listener(move |gauge, _, _window, cx| gauge.switch_to(mode, cx)))
+                    .into_any_element(),
+            };
+            // Three frames of the same bounds: the outer one is the segment, the
+            // middle one says whether it is filled and in what colour, the inner
+            // one says whether it is the lit one.
             div()
                 .debug_selector(move || mode.segment_selector().to_string())
+                .relative()
+                .flex()
+                .items_center()
+                .h(px(SEGMENT_CONTENT_HEIGHT))
+                .when_some(filled_in, |segment, active| {
+                    segment.bg(active.load().fill())
+                })
                 .child(
                     div()
-                        .debug_selector(move || mode.state_selector(lit).to_string())
+                        .when_some(filled_in, |fill, active| {
+                            fill.debug_selector(move || mode.fill_selector(active).to_string())
+                        })
                         .child(
-                            IconButton::new(mode.segment_selector(), mode.icon())
-                                .icon_size(IconSize::Small)
-                                .icon_color(if lit { Color::Accent } else { Color::Muted })
-                                .tooltip(Tooltip::text(mode.tooltip()))
-                                .on_click(cx.listener(move |toolbar, _, _window, cx| {
-                                    toolbar.switch_to(mode, cx)
-                                })),
+                            div()
+                                .debug_selector(move || mode.state_selector(lit).to_string())
+                                .child(content),
                         ),
                 )
+                .when(lit, |segment| {
+                    segment.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(2.))
+                            .bg(load.border()),
+                    )
+                })
                 .into_any_element()
         }))
     }
+}
 
+impl AnsweringModeGauge {
     /// Writes the mode's settings, and only once they have landed asks the
     /// servers to match: the store decides what may start by reading the
     /// settings, so starting anything before the file is written starts nothing.
@@ -654,7 +792,7 @@ impl ConfigurationsToolbar {
                 defaults.inlay_hints.get_or_insert_default().enabled = Some(costs.inlay_hints);
                 defaults.semantic_tokens = Some(costs.semantic_tokens);
             });
-        cx.spawn(async move |toolbar, cx| {
+        cx.spawn(async move |gauge, cx| {
             match written.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -663,8 +801,8 @@ impl ConfigurationsToolbar {
                 }
                 Err(_) => return,
             }
-            toolbar
-                .update(cx, |toolbar, cx| toolbar.match_the_servers_to(mode, cx))
+            gauge
+                .update(cx, |gauge, cx| gauge.match_the_servers_to(mode, cx))
                 .log_err();
         })
         .detach();
@@ -694,7 +832,9 @@ impl ConfigurationsToolbar {
             }
         });
     }
+}
 
+impl ConfigurationsToolbar {
     /// The plaque itself: the glyph of what will run, its name, and the arrow
     /// that says there are others. Wide enough to read a name in, and no wider,
     /// since the bar's two ends have to fit beside it.
@@ -1294,14 +1434,18 @@ mod tests {
     /// title bar, so it is given a bar to sit in rather than a whole screen.
     struct BarWithThePlaque {
         toolbar: Entity<ConfigurationsToolbar>,
+        gauge: Entity<AnsweringModeGauge>,
     }
 
     impl Render for BarWithThePlaque {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .w(px(900.))
-                .h(px(600.))
-                .child(div().h(px(40.)).child(self.toolbar.clone()))
+            div().w(px(900.)).h(px(600.)).child(
+                h_flex()
+                    .h(px(40.))
+                    .gap_1()
+                    .child(self.toolbar.clone())
+                    .child(self.gauge.clone()),
+            )
         }
     }
 
@@ -1332,8 +1476,12 @@ mod tests {
         let toolbar = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
             cx.new(|cx| ConfigurationsToolbar::new(workspace, cx))
         });
+        let gauge = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
+            cx.new(|cx| AnsweringModeGauge::new(workspace, cx))
+        });
         let bar = cx.add_window(|_window, _cx| BarWithThePlaque {
             toolbar: toolbar.clone(),
+            gauge,
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();
@@ -1438,6 +1586,103 @@ mod tests {
                     mode.segment_selector()
                 );
             }
+        }
+    }
+
+    /// The gauge is filled as far as the segment in effect and no further, and
+    /// every filled segment carries the colour of that stop rather than its own.
+    /// Read off painted selectors, because a fill is a background and a
+    /// background paints the same bounds as none at all.
+    #[gpui::test]
+    async fn the_fill_reaches_as_far_as_the_lit_segment(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+        draw_the_bar(bar, &mut cx);
+
+        for active in AnsweringMode::ALL {
+            let segment = cx
+                .debug_bounds(active.segment_selector())
+                .unwrap_or_else(|| panic!("{} is painted in the gauge", active.segment_selector()));
+            cx.simulate_click(segment.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            draw_the_bar(bar, &mut cx);
+
+            for mode in AnsweringMode::ALL {
+                let reached = mode.stop() <= active.stop();
+                assert_eq!(
+                    cx.debug_bounds(mode.fill_selector(active)).is_some(),
+                    reached,
+                    "with {} in effect, {} should{} be filled in that stop's colour",
+                    active.segment_selector(),
+                    mode.segment_selector(),
+                    if reached { "" } else { " not" }
+                );
+                for other in AnsweringMode::ALL
+                    .into_iter()
+                    .filter(|other| *other != active)
+                {
+                    assert!(
+                        cx.debug_bounds(mode.fill_selector(other)).is_none(),
+                        "with {} in effect, {} must not be filled in {}'s colour",
+                        active.segment_selector(),
+                        mode.segment_selector(),
+                        other.segment_selector()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Settings that are a mixture of their own fill nothing: a gauge filled to
+    /// some stop would be claiming a mode that is not in effect.
+    #[gpui::test]
+    async fn settings_matching_no_mode_fill_nothing(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.project.all_languages.defaults.semantic_tokens =
+                        Some(SemanticTokens::Combined);
+                });
+            });
+        });
+        cx.run_until_parked();
+        draw_the_bar(bar, &mut cx);
+
+        assert_eq!(
+            cx.update(|_window, cx| AnsweringMode::in_effect(cx)),
+            None,
+            "the suite's settings with semantic tokens added are none of the three"
+        );
+        for mode in AnsweringMode::ALL {
+            for stop in AnsweringMode::ALL {
+                assert!(
+                    cx.debug_bounds(mode.fill_selector(stop)).is_none(),
+                    "{} is filled while the settings match no mode",
+                    mode.segment_selector()
+                );
+            }
+        }
+    }
+
+    /// The selector a test reads the fill off names the stop the render actually
+    /// paints, so the two cannot drift apart.
+    #[test]
+    fn each_mode_names_its_own_stop_of_the_scale() {
+        for mode in AnsweringMode::ALL {
+            let stop = match mode.load() {
+                cyberpunk::Load::Calm => "calm",
+                cyberpunk::Load::Warm => "warm",
+                cyberpunk::Load::Hot => "hot",
+            };
+            let selector = mode.fill_selector(mode);
+            assert!(
+                selector.starts_with(mode.segment_selector()),
+                "{selector} should name the segment it fills"
+            );
+            assert!(
+                selector.ends_with(&format!("-fill-{stop}")),
+                "{selector} should name the stop {mode:?} paints in"
+            );
         }
     }
 
@@ -1925,8 +2170,12 @@ mod tests {
         let toolbar = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
             cx.new(|cx| ConfigurationsToolbar::new(workspace, cx))
         });
+        let gauge = workspace.update_in(&mut workspace_cx, |workspace, _window, cx| {
+            cx.new(|cx| AnsweringModeGauge::new(workspace, cx))
+        });
         let bar = cx.add_window(|_window, _cx| BarWithThePlaque {
             toolbar: toolbar.clone(),
+            gauge,
         });
         let cx = VisualTestContext::from_window(bar.into(), cx);
         cx.run_until_parked();

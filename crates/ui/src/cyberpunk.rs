@@ -14,6 +14,10 @@
 //! Only two accents exist on purpose (cyan for the focal element, red for
 //! danger). Do not add a third without a matching argument for why every
 //! dialog that reads this module should carry it.
+//!
+//! [`Load`] is the one exception, and is written down as one: a gauge that
+//! reports a cost needs a hue that means something, so it gets a scale of its
+//! own whose hottest stop is the danger accent itself.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -96,6 +100,63 @@ impl Accent {
             Accent::Cyan => rgb(0x4df3ff).into(),
             Accent::Red => rgb(0xff415c).into(),
         }
+    }
+}
+
+/// How much the editor is being asked to spend, as a three-stop scale.
+///
+/// This is the one documented exception to the two-accent rule above, and the
+/// one place in this chrome where a hue carries information rather than
+/// decoration: the load gauge in the title bar reports a cost, and a cost read
+/// at a glance is read as a colour before it is read as a word. Use it for that
+/// gauge and nothing else -- never to tint a dialog, a row, or an icon that is
+/// not reporting a load.
+///
+/// The hottest stop is the danger accent itself rather than a fourth hue. The
+/// top of this scale is the state that costs the most, which is already what
+/// the fork's alarm colour says; a second red would only ask the reader to tell
+/// two alarms apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    /// The cheapest stop: nothing runs that was not asked for.
+    Calm,
+    /// The middle stop.
+    Warm,
+    /// The most expensive stop.
+    Hot,
+}
+
+/// How strongly a filled stop of the gauge tints its segment. Chosen against
+/// [`surface()`], the ground the title bar's segments sit on, and against the
+/// three tints already defined for rows: louder than [`row_hovered`]'s 0.10,
+/// which is deliberately barely there, quieter than [`row_pressed`]'s 0.20,
+/// which has to read as a press. It matches [`row_chosen`], because it carries
+/// the same message -- this one is the state you are in -- and because the icon
+/// painted over it has to stay the brighter thing in the segment.
+const GAUGE_FILL_ALPHA: f32 = 0.16;
+
+impl Load {
+    /// Border / stripe color for this stop.
+    pub fn border(self) -> Hsla {
+        match self {
+            Load::Calm => rgb(0x00ff9c).into(),
+            Load::Warm => rgb(0xffc400).into(),
+            Load::Hot => Accent::Red.border(),
+        }
+    }
+
+    /// Brighter variant, for an icon or a label at this stop.
+    pub fn bright(self) -> Hsla {
+        match self {
+            Load::Calm => rgb(0x4dffbd).into(),
+            Load::Warm => rgb(0xffd54d).into(),
+            Load::Hot => Accent::Red.bright(),
+        }
+    }
+
+    /// The tint a stop of the gauge is filled with.
+    pub fn fill(self) -> Hsla {
+        self.border().opacity(GAUGE_FILL_ALPHA)
     }
 }
 
@@ -1324,6 +1385,34 @@ mod tests {
             let border = accent.border();
             let bright = accent.bright();
             assert_ne!(border, bright);
+        }
+    }
+
+    #[test]
+    fn the_hottest_load_is_the_danger_accent_and_the_others_are_not() {
+        assert_eq!(Load::Hot.border(), Accent::Red.border());
+        assert_eq!(Load::Hot.bright(), Accent::Red.bright());
+        for cooler in [Load::Calm, Load::Warm] {
+            assert_ne!(
+                cooler.border(),
+                Accent::Red.border(),
+                "a cooler stop must not read as the alarm colour"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filled_stop_is_visible_but_stays_under_its_own_icon() {
+        for stop in [Load::Calm, Load::Warm, Load::Hot] {
+            let fill = stop.fill();
+            assert!(
+                fill.a > row_hovered().a,
+                "a filled stop has to be louder than a hover"
+            );
+            assert!(
+                fill.a < row_pressed().a,
+                "a filled stop must not read as loudly as a press"
+            );
         }
     }
 
