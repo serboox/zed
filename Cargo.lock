@@ -7662,6 +7662,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "file_relations"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "fs",
+ "gpui",
+ "language",
+ "project",
+ "release_channel",
+ "semantic_index",
+ "semver 1.0.27",
+ "serde_json",
+ "settings",
+ "symbol_index",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

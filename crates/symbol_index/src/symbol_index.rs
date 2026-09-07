@@ -236,6 +236,20 @@ impl SymbolIndex {
         semantic_index::resolution::what_a_symbol_means(symbols, declared_in, name).log_err()
     }
 
+    /// What the index can say about one file's place in the project: which
+    /// files bring in a name it declares, what it declares at its top level,
+    /// and what became of each of those.
+    ///
+    /// `path` is relative to [`Self::root`], with forward slashes, which is how
+    /// every row in the store is keyed. `None` while a background pass holds
+    /// the stores -- the same answer, and for the same reason, as
+    /// [`Self::what_a_name_means`]: the question needs the store, and a pass
+    /// has it.
+    pub fn relations_of(&self, path: &str) -> Option<semantic_index::relations::Relations> {
+        let (symbols, _) = self.stores.as_ref()?;
+        semantic_index::relations::relations_of(symbols, path).log_err()
+    }
+
     /// Reacts to what the project already emits, rather than polling.
     ///
     /// `WorktreeUpdatedEntries` is the event that actually fires when a

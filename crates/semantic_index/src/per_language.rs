@@ -316,6 +316,22 @@ fn bracketed_list(tokens: tree_sitter::Node) -> Option<tree_sitter::Node> {
         .find(|child| child.kind() == "token_tree" && opens_with_a_bracket(*child))
 }
 
+/// The languages a hand-written resolution walk exists for.
+///
+/// That walk is the only thing that fills the imports table: no references
+/// query captures an imported name -- there it is a plain identifier, and
+/// capturing it would widen the query to every identifier in the file. So a
+/// question answered out of that table has to say "cannot tell" for every
+/// language not named here, rather than "nothing" -- an empty list drawn from a
+/// table nothing ever wrote to is a claim about the project that nothing
+/// supports.
+pub const IMPORTS_ARE_READ_FOR: &[&str] = &["rust"];
+
+/// Whether what a file of this language brings into scope is read at all.
+pub fn imports_are_read(language: &str) -> bool {
+    IMPORTS_ARE_READ_FOR.contains(&language)
+}
+
 /// The references query for a language, or `None` where this fork has not
 /// written one. A language with an `outline.scm` and no references query is
 /// covered for definitions and not for references, which is the honest state

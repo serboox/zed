@@ -646,11 +646,13 @@ fn walk_for_resolution(
     imports: &mut Vec<crate::symbols::Import>,
     gated: &mut Vec<(u32, u32)>,
 ) {
-    // Only Rust for now, and said out loud rather than left to look general:
-    // what a language binds in a scope has nothing in common between languages
-    // beyond being names whose meaning is their scope's, and the shapes are
-    // described beside each language when its turn comes.
-    if language != "rust" {
+    // Named in one place rather than spelled here, because what this walk fills
+    // in decides what other surfaces may claim: everything answered out of the
+    // imports table has to know which languages it holds nothing for. What a
+    // language binds in a scope has nothing in common between languages beyond
+    // being names whose meaning is their scope's, so the shapes are described
+    // beside each language when its turn comes.
+    if !per_language::imports_are_read(language) {
         return;
     }
 

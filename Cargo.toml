@@ -86,6 +86,7 @@ members = [
     "crates/feedback",
     "crates/file_finder",
     "crates/file_icons",
+    "crates/file_relations",
     "crates/fs",
     "crates/fs_benchmarks",
     "crates/fuzzy",
@@ -373,6 +374,7 @@ feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
 file_finder = { path = "crates/file_finder" }
+file_relations = { path = "crates/file_relations" }
 file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
