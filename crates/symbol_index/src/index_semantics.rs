@@ -143,6 +143,41 @@ impl IndexFirst {
         })
     }
 
+    /// Where the index says a go-to of `kind` should land, or nothing where it
+    /// has no honest answer for that kind.
+    fn where_the_index_says_for(
+        &self,
+        kind: editor::GotoDefinitionKind,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Declared> {
+        match kind {
+            // The index records the line a name is declared on. Nothing here
+            // splits a declaration held apart from its definition -- no
+            // language it reads is indexed twice over -- so the declaring line
+            // is the answer to either question.
+            editor::GotoDefinitionKind::Symbol | editor::GotoDefinitionKind::Declaration => {
+                self.where_the_index_says(buffer, position, cx)
+            }
+            // Reached from the type's own name and from nowhere else. What type
+            // an expression has needs inference, which nothing here does; but
+            // where the name under the cursor is itself declared as a type, the
+            // line declaring it is that type's definition.
+            editor::GotoDefinitionKind::Type => {
+                let found = self.where_the_index_says(buffer, position, cx)?;
+                semantic_index::per_language::declares_a_type(
+                    &found.declared.language,
+                    &found.declared.kind,
+                )
+                .then_some(found)
+            }
+            // Which types implement a trait is a relation the index does not
+            // record, and nothing short of one answers this.
+            editor::GotoDefinitionKind::Implementation => None,
+        }
+    }
+
     /// What the index can say about the name under the cursor: the line that
     /// declares it, the comment written above that line, and where it lives.
     ///
@@ -216,9 +251,24 @@ impl IndexFirst {
         let snapshot = buffer.read(cx).snapshot();
         let offset = position.to_offset(&snapshot);
         let (_, name) = word_at(&snapshot, offset)?;
-        if buffer.read(cx).is_dirty() {
-            return None;
-        }
+        // What the store holds is what each file said when it was last read
+        // from disk, so an unsaved edit has moved every row below it in that
+        // one file. Its rows are dropped rather than reported -- a stale row
+        // that lands on another occurrence of the same name passes the text
+        // check later and would be given as a place the reader never asked
+        // about -- while the places in every other file are as good as they
+        // were. Which file the answer leaves out is said by the caller, which
+        // is the one with a window to say it in.
+        let being_edited = buffer
+            .read(cx)
+            .is_dirty()
+            .then(|| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .map(|file| file.path().to_string().replace('\\', "/"))
+            })
+            .flatten();
 
         let places = {
             let index = index.read(cx);
@@ -227,6 +277,10 @@ impl IndexFirst {
             };
             places
         };
+        let places: Vec<_> = places
+            .into_iter()
+            .filter(|place| Some(place.path.as_str()) != being_edited.as_deref())
+            .collect();
         if places.is_empty() || places.len() > MOST_PLACES_WORTH_OPENING {
             return None;
         }
@@ -887,12 +941,6 @@ impl SemanticsProvider for IndexFirst {
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
         let from_the_server = self.project.definitions(buffer, position, kind, cx);
-        // Only "where is this declared". A type's definition, an
-        // implementation, and a declaration held apart from its definition are
-        // all questions about types, and the index knows none of them.
-        if kind != editor::GotoDefinitionKind::Symbol {
-            return from_the_server;
-        }
         let point = self.position_of(buffer, position, cx);
         let from_a_source = self.from_a_source(cx, |source, context, cx| {
             source.definitions(context, buffer, point, cx)
@@ -902,7 +950,7 @@ impl SemanticsProvider for IndexFirst {
         // the file it names is opened only if nothing ahead of it answered:
         // opening a buffer per lookup in a project that has a server is work
         // started and thrown away.
-        let from_the_index = self.where_the_index_says(buffer, position, cx);
+        let from_the_index = self.where_the_index_says_for(kind, buffer, position, cx);
         if from_a_source.is_none() && from_the_index.is_none() {
             // Nothing of our own to say, and dropping the task here would drop
             // the server's answer with it.
@@ -939,6 +987,52 @@ impl SemanticsProvider for IndexFirst {
                 None => Ok(None),
             }
         }))
+    }
+
+    fn link_candidate_range(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Range<text::Anchor>> {
+        // The same gate the go-to goes through, so that a name is underlined
+        // exactly when clicking it would move the reader: a name the index
+        // declines -- ambiguous, local, a member of a type -- reads as
+        // non-navigable, which is what it is.
+        let found = self.where_the_index_says_for(
+            editor::GotoDefinitionKind::Symbol,
+            buffer,
+            position,
+            cx,
+        )?;
+        Some(found.origin.range)
+    }
+
+    fn why_a_goto_finds_nothing(
+        &self,
+        kind: editor::GotoDefinitionKind,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _cx: &mut App,
+    ) -> Option<gpui::SharedString> {
+        self.index.upgrade()?;
+        let said = match kind {
+            // Both are the index's own question, so silence here means the
+            // name itself was not answerable and not that the kind never is.
+            editor::GotoDefinitionKind::Symbol | editor::GotoDefinitionKind::Declaration => {
+                return None;
+            }
+            editor::GotoDefinitionKind::Type => {
+                "No type definition here. The project index records where names are declared, \
+                 not what type an expression has, so it reaches a type only from the type's own \
+                 name; anything further needs a language server."
+            }
+            editor::GotoDefinitionKind::Implementation => {
+                "No implementation here. The project index records where names are declared, \
+                 not which types implement them, so this one needs a language server."
+            }
+        };
+        Some(said.into())
     }
 
     fn range_for_rename(

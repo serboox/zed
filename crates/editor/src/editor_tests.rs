@@ -42182,3 +42182,263 @@ fn test_tab_background_color_reflects_background_tint(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// A provider that answers references out of something other than a language
+/// server -- as the project's own symbol index does -- and hands every other
+/// question to the project unchanged.
+struct ReferencesFromSomewhereOtherThanAServer {
+    project: WeakEntity<Project>,
+    places: Vec<language::Location>,
+}
+
+impl SemanticsProvider for ReferencesFromSomewhereOtherThanAServer {
+    fn references(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<language::Location>>>>> {
+        Some(Task::ready(Ok(Some(self.places.clone()))))
+    }
+
+    fn hover(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<Vec<project::Hover>>>> {
+        self.project.hover(buffer, position, cx)
+    }
+
+    fn inline_values(
+        &self,
+        buffer_handle: Entity<Buffer>,
+        range: Range<text::Anchor>,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Vec<InlayHint>>>> {
+        self.project.inline_values(buffer_handle, range, cx)
+    }
+
+    fn applicable_inlay_chunks(
+        &self,
+        buffer: &Entity<Buffer>,
+        ranges: &[Range<text::Anchor>],
+        cx: &mut App,
+    ) -> Vec<Range<BufferRow>> {
+        self.project.applicable_inlay_chunks(buffer, ranges, cx)
+    }
+
+    fn invalidate_inlay_hints(&self, for_buffers: &HashSet<BufferId>, cx: &mut App) {
+        self.project.invalidate_inlay_hints(for_buffers, cx)
+    }
+
+    fn inlay_hints(
+        &self,
+        invalidate: InvalidationStrategy,
+        buffer: Entity<Buffer>,
+        ranges: Vec<Range<text::Anchor>>,
+        known_chunks: Option<(clock::Global, HashSet<Range<BufferRow>>)>,
+        cx: &mut App,
+    ) -> Option<HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>>> {
+        self.project
+            .inlay_hints(invalidate, buffer, ranges, known_chunks, cx)
+    }
+
+    fn semantic_tokens(
+        &self,
+        buffer: Entity<Buffer>,
+        refresh: Option<RefreshForServer>,
+        cx: &mut App,
+    ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
+        self.project.semantic_tokens(buffer, refresh, cx)
+    }
+
+    fn supports_inlay_hints(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.project.supports_inlay_hints(buffer, cx)
+    }
+
+    fn supports_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.project.supports_semantic_tokens(buffer, cx)
+    }
+
+    fn document_highlights(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Vec<DocumentHighlight>>>> {
+        self.project.document_highlights(buffer, position, cx)
+    }
+
+    fn definitions(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        kind: GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+        self.project.definitions(buffer, position, kind, cx)
+    }
+
+    fn range_for_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Task<Result<Option<Range<text::Anchor>>>> {
+        self.project.range_for_rename(buffer, position, cx)
+    }
+
+    fn perform_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        new_name: String,
+        cx: &mut App,
+    ) -> Option<Task<Result<ProjectTransaction>>> {
+        self.project.perform_rename(buffer, position, new_name, cx)
+    }
+}
+
+#[gpui::test]
+async fn the_picker_and_the_multibuffer_are_given_the_same_references(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    // A server with no references to offer, which is what a file with none
+    // running looks like to the editor.
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+    cx.set_state(indoc! {"
+        fn one() {
+            let a = ˇtwo();
+        }
+
+        fn two() {}
+    "});
+
+    let buffer = cx.update_editor(|editor, _, cx| {
+        editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("the test editor holds one buffer")
+    });
+    let places = cx.update_editor(|_, _, cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        let at = snapshot
+            .text()
+            .rfind("two")
+            .expect("the declaration is in the buffer");
+        vec![language::Location {
+            buffer: buffer.clone(),
+            range: snapshot.anchor_before(at)..snapshot.anchor_after(at + "two".len()),
+        }]
+    });
+    let where_the_places_are = cx.update_editor(|_, _, cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        places
+            .iter()
+            .map(|place| {
+                (
+                    place.range.start.to_offset(&snapshot),
+                    place.range.end.to_offset(&snapshot),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    cx.update_editor(|editor, _, _| {
+        let project = editor
+            .project()
+            .expect("the test editor has a project")
+            .downgrade();
+        editor.set_semantics_provider(Some(Rc::new(ReferencesFromSomewhereOtherThanAServer {
+            project,
+            places: places.clone(),
+        })));
+    });
+
+    let project = cx.update_workspace(|workspace, _, _| workspace.project().clone());
+    let for_the_picker = cx
+        .update_editor(|editor, _, cx| editor.find_all_references_locations(&project, cx))
+        .expect("the picker asks the question")
+        .await
+        .expect("and is answered");
+    let for_the_picker = cx.update_editor(|_, _, cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        for_the_picker
+            .iter()
+            .map(|place| {
+                (
+                    place.range.start.to_offset(&snapshot),
+                    place.range.end.to_offset(&snapshot),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        for_the_picker, where_the_places_are,
+        "the picker is given what answered, not an empty list"
+    );
+
+    let navigated = cx
+        .update_editor(|editor, window, cx| {
+            editor.find_all_references(&FindAllReferences::default(), window, cx)
+        })
+        .expect("the multibuffer asks the same question")
+        .await
+        .expect("and is answered");
+    assert_eq!(
+        navigated,
+        Navigated::Yes,
+        "the same places the picker was given open here too"
+    );
+}
+
+#[gpui::test]
+async fn a_go_to_that_lands_nowhere_tells_the_reader_instead_of_doing_nothing(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    // A server that offers none of these three, which is what a file with no
+    // language server running looks like to the editor.
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+    cx.set_state(indoc! {"
+        fn one() {
+            let a = ˇtwo();
+        }
+
+        fn two() {}
+    "});
+
+    let gestures: [(
+        &str,
+        fn(&mut Editor, &mut Window, &mut Context<Editor>) -> Task<Result<Navigated>>,
+    ); 3] = [
+        ("go to declaration", |editor, window, cx| {
+            editor.go_to_declaration(&GoToDeclaration, window, cx)
+        }),
+        ("go to type definition", |editor, window, cx| {
+            editor.go_to_type_definition(&GoToTypeDefinition, window, cx)
+        }),
+        ("go to implementation", |editor, window, cx| {
+            editor.go_to_implementation(&GoToImplementation::default(), window, cx)
+        }),
+    ];
+
+    for (named, gesture) in gestures {
+        cx.update_workspace(|workspace, _, cx| workspace.clear_all_notifications(cx));
+        assert!(
+            cx.update_workspace(|workspace, _, _| workspace.notification_ids().is_empty()),
+            "{named} starts with nothing said"
+        );
+
+        let navigated = cx
+            .update_editor(|editor, window, cx| gesture(editor, window, cx))
+            .await
+            .expect("the gesture finishes");
+        assert_eq!(navigated, Navigated::No, "{named} has nowhere to land here");
+        assert_eq!(
+            cx.update_workspace(|workspace, _, _| workspace.notification_ids().len()),
+            1,
+            "{named} tells the reader it found nothing, rather than leaving a dead key"
+        );
+    }
+}
