@@ -1,0 +1,4 @@
+{"ImportPath":"example.com/m","Action":"build-output","Output":"# example.com/m\n"}
+{"ImportPath":"example.com/m","Action":"build-output","Output":"./main.go:7:7: duplicate case \"dup\" (constant of type string) in expression switch\n"}
+{"ImportPath":"example.com/m","Action":"build-output","Output":"\t./main.go:6:19: previous case\n"}
+{"ImportPath":"example.com/m","Action":"build-fail"}

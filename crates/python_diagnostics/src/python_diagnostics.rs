@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 
 use collections::HashMap;
 use serde::Deserialize;
@@ -64,6 +65,10 @@ struct Finding {
     end_location: Place,
     #[serde(default)]
     fix: Option<SuggestedFix>,
+    /// Where ruff documents the rule that fired. Absent for a parse error,
+    /// where nothing fired and there is no rule to read about.
+    #[serde(default)]
+    url: Option<String>,
 }
 
 /// A place in a file, counted from one. `column` counts Unicode characters --
@@ -160,6 +165,7 @@ pub fn what_ruff_reported(
                 },
                 severity: Some(severity_of(finding.code.as_deref())),
                 code: finding.code.clone().map(lsp::NumberOrString::String),
+                code_description: documented_at(finding.url.as_deref()),
                 source: Some("ruff".to_string()),
                 message: what_it_said(&finding),
                 ..Default::default()
@@ -168,6 +174,18 @@ pub fn what_ruff_reported(
         });
     }
     reported
+}
+
+/// Where the rule that fired is documented, as the protocol carries it.
+///
+/// ruff gives the link itself, so nothing here is constructed from a rule
+/// code: a link built by pattern would 404 for the rules whose page is named
+/// differently, and a link that goes nowhere is worse than no link.
+///
+/// A link that will not parse as a URI is dropped for the same reason.
+fn documented_at(url: Option<&str>) -> Option<lsp::CodeDescription> {
+    let href = lsp::Uri::from_str(url?).ok()?;
+    Some(lsp::CodeDescription { href: Some(href) })
 }
 
 /// The whole of what one finding says: its own text, and the fix it offers.
@@ -442,6 +460,99 @@ mod tests {
             reported[0].diagnostic.severity,
             Some(lsp::DiagnosticSeverity::ERROR)
         );
+    }
+
+    /// The findings this reader reports, and where each one points. Carrying
+    /// a link must not add, drop or move one of them.
+    #[test]
+    fn which_findings_are_reported_and_where_they_point_is_unchanged() {
+        let reported = over_the_real_file(REAL_OUTPUT);
+        let placed: Vec<(Option<&str>, lsp::Range)> = reported
+            .iter()
+            .map(|one| {
+                let code = match &one.diagnostic.code {
+                    Some(lsp::NumberOrString::String(code)) => Some(code.as_str()),
+                    _ => None,
+                };
+                (code, one.diagnostic.range)
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    Some("F401"),
+                    lsp::Range {
+                        start: lsp::Position::new(0, 7),
+                        end: lsp::Position::new(0, 9),
+                    }
+                ),
+                (
+                    Some("F841"),
+                    lsp::Range {
+                        start: lsp::Position::new(4, 4),
+                        end: lsp::Position::new(4, 8),
+                    }
+                ),
+                (
+                    Some("E702"),
+                    lsp::Range {
+                        start: lsp::Position::new(4, 17),
+                        end: lsp::Position::new(4, 18),
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A rule that fired carries the link ruff gave for it, so the reader can
+    /// read what the rule is for without leaving the editor to search. A
+    /// parse error carries none: nothing fired, and ruff says so by sending
+    /// no link rather than by sending a page that does not exist.
+    #[test]
+    fn a_rule_that_fired_carries_ruffs_own_link_and_a_parse_error_carries_none() {
+        let reported = over_the_real_file(REAL_OUTPUT);
+        assert_eq!(
+            reported[0].diagnostic.code_description,
+            Some(lsp::CodeDescription {
+                href: Some(
+                    lsp::Uri::from_str("https://docs.astral.sh/ruff/rules/unused-import")
+                        .expect("ruff's own link parses")
+                )
+            })
+        );
+        assert_eq!(
+            reported[2].diagnostic.code_description,
+            Some(lsp::CodeDescription {
+                href: Some(
+                    lsp::Uri::from_str(
+                        "https://docs.astral.sh/ruff/rules/multiple-statements-on-one-line-semicolon"
+                    )
+                    .expect("ruff's own link parses")
+                )
+            })
+        );
+
+        // Captured from ruff over `def f(:` -- it writes `"url": null` for a
+        // parse error, and nothing is built from the code to fill the gap.
+        const BROKEN: &str = r#"[
+          {
+            "cell": null,
+            "code": "invalid-syntax",
+            "end_location": { "column": 8, "row": 1 },
+            "filename": "/project/lint_me.py",
+            "fix": null,
+            "location": { "column": 7, "row": 1 },
+            "message": "Expected a parameter or the end of the parameter list",
+            "name": "invalid-syntax",
+            "noqa_row": null,
+            "severity": "error",
+            "url": null
+          }
+        ]"#;
+        let reported = over_the_real_file(BROKEN);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].diagnostic.code_description, None);
     }
 
     /// A file `read` cannot supply is skipped. The columns are only

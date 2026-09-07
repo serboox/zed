@@ -1,0 +1,10 @@
+package main
+
+func main() {
+	s := "x"
+	switch s {
+	case "🦀🔥", "dup":
+	case "dup":
+	}
+	_ = s
+}

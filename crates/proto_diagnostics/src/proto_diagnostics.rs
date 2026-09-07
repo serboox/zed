@@ -117,8 +117,48 @@ fn what_it_said(trouble: &protox::Error, file: &Path, text: &str) -> Checked {
         severity: Some(lsp::DiagnosticSeverity::ERROR),
         source: Some("protox".to_string()),
         message: what_it_says(trouble),
+        related_information: the_other_places(trouble, file, text),
         ..Default::default()
     })
+}
+
+/// Every place this fault is about except the first, each keeping its own
+/// position.
+///
+/// A name defined twice is about two places, and the second definition is
+/// half the answer. The compiler keeps them as labels on one fault; the first
+/// is the place the fault is filed under, and the rest are where the reader
+/// has to look next.
+///
+/// A label the compiler gave no words for is dropped: the editor shows a
+/// related place by its message, so one with nothing to say would draw an
+/// empty row over the reader's source. A label's offset is a byte into the
+/// same file the fault is filed under -- the compiler carries one source per
+/// fault -- so the file's own text places every one of them.
+fn the_other_places(
+    trouble: &protox::Error,
+    file: &Path,
+    text: &str,
+) -> Option<Vec<lsp::DiagnosticRelatedInformation>> {
+    let uri = lsp::Uri::from_file_path(file).ok()?;
+    let places: Vec<lsp::DiagnosticRelatedInformation> = trouble
+        .labels()?
+        .skip(1)
+        .filter_map(|label| {
+            let message = label.label().filter(|words| !words.is_empty())?.to_string();
+            Some(lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: uri.clone(),
+                    range: lsp::Range {
+                        start: utf16_position_at(text, label.offset()),
+                        end: utf16_position_at(text, label.offset().saturating_add(label.len())),
+                    },
+                },
+                message,
+            })
+        })
+        .collect();
+    (!places.is_empty()).then_some(places)
 }
 
 /// Whether a fault the compiler reported is about this file rather than about
@@ -138,6 +178,14 @@ fn is_about(reported_in: Option<&str>, file: &Path) -> bool {
 /// is counted in bytes from the start of the file it named -- not in
 /// characters, and not in the UTF-16 code units the protocol asks for. The
 /// test over a line holding an accent and an emoji is what says so.
+///
+/// Its own offsets are only right where the place has nothing multi-byte
+/// before it on its line. Where it does, the compiler adds that prefix's
+/// excess of bytes over characters a second time and reports a length that
+/// can run to the end of the file: `message Order` behind a comment holding
+/// two emoji comes back six bytes late and twenty-two long. Nothing here can
+/// correct for that -- the offset is all there is to go on -- so a
+/// multi-byte line is not the place to check this conversion on.
 fn where_it_is(trouble: &protox::Error) -> Option<Range<usize>> {
     let label = trouble.labels()?.next()?;
     Some(label.offset()..label.offset().saturating_add(label.len()))
@@ -236,6 +284,132 @@ mod tests {
         match checked {
             Checked::Faulted(diagnostic) => diagnostic,
             other => panic!("expected a fault, got {other:?}"),
+        }
+    }
+
+    /// A name defined twice is about two places, and the compiler says so
+    /// with two labels: the first definition and the second. The fault is
+    /// filed under the first, and the second is where the reader has to look
+    /// next -- as a place it can be jumped to, not as a line number in a
+    /// sentence.
+    ///
+    /// Both places are asserted, because a related place put on the wrong
+    /// line is worse than none.
+    #[test]
+    fn a_name_defined_twice_keeps_the_second_definition_as_a_place_of_its_own() {
+        const TWICE: &str = "syntax = \"proto3\";\n\nmessage Order {\n}\nmessage Order {\n}\n";
+        let project = AProject::new();
+        let file = project.holding("order.proto", TWICE);
+        let diagnostic = faulted(project.checked(&file));
+
+        assert_eq!(
+            diagnostic.message, "name 'Order' is defined twice",
+            "{diagnostic:?}"
+        );
+        assert_eq!(
+            diagnostic.range,
+            lsp::Range {
+                start: lsp::Position::new(2, 8),
+                end: lsp::Position::new(2, 13),
+            },
+            "the place the fault is filed under, unmoved"
+        );
+        assert_eq!(
+            diagnostic.related_information,
+            Some(vec![lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: lsp::Uri::from_file_path(&file)
+                        .expect("a temporary directory is an absolute path"),
+                    range: lsp::Range {
+                        start: lsp::Position::new(4, 8),
+                        end: lsp::Position::new(4, 13),
+                    },
+                },
+                message: "defined again here".to_string(),
+            }])
+        );
+    }
+
+    /// A field number used twice is the same shape of fault, and the earlier
+    /// field is the place to look at.
+    #[test]
+    fn a_field_number_used_twice_points_at_the_field_that_used_it_first() {
+        const TWICE: &str =
+            "syntax = \"proto3\";\n\nmessage Order {\n  string a = 1;\n  string b = 1;\n}\n";
+        let project = AProject::new();
+        let file = project.holding("order.proto", TWICE);
+        let diagnostic = faulted(project.checked(&file));
+
+        assert_eq!(
+            diagnostic.message, "field number '1' is already used",
+            "{diagnostic:?}"
+        );
+        assert_eq!(
+            diagnostic.range,
+            lsp::Range {
+                start: lsp::Position::new(3, 13),
+                end: lsp::Position::new(3, 14),
+            },
+            "the number on the first field"
+        );
+        assert_eq!(
+            diagnostic.related_information.as_ref().map(|places| places
+                .iter()
+                .map(|place| (place.location.range, place.message.as_str()))
+                .collect::<Vec<_>>()),
+            Some(vec![(
+                lsp::Range {
+                    start: lsp::Position::new(4, 13),
+                    end: lsp::Position::new(4, 14),
+                },
+                "defined again here"
+            )])
+        );
+    }
+
+    /// A fault about one place carries no related place at all, rather than
+    /// one pointing back at itself.
+    #[test]
+    fn a_fault_about_one_place_carries_no_related_place() {
+        let project = AProject::new();
+        let file = project.holding(
+            "order.proto",
+            "syntax = \"proto3\";\n\nmessage Order {\n  Missing thing = 1;\n}\n",
+        );
+        let diagnostic = faulted(project.checked(&file));
+        assert_eq!(diagnostic.related_information, None, "{diagnostic:?}");
+    }
+
+    /// What the compiler carries besides its labels, asked of the compiler
+    /// itself rather than assumed. It names no rule and grades nothing, so
+    /// there is no code, no link and no severity of its own to pass on.
+    #[test]
+    fn the_compiler_names_no_rule_and_grades_nothing() {
+        let project = AProject::new();
+        for source in [
+            "syntax = \"proto3\";\n\nmessage Order {\n  string a = 1;\n  string b = 1;\n}\n",
+            "syntax = \"proto3\";\n\nmessage Order {\n  Missing thing = 1;\n}\n",
+            "syntax = \"proto3\";\n\nmessage Order {\n  string order_id = ;\n}\n",
+        ] {
+            let file = project.holding("asked.proto", source);
+            let roots = import_roots(project.root.path(), &file);
+            let mut compiler = protox::Compiler::new(&roots).expect("a compiler");
+            let trouble = compiler
+                .include_source_info(false)
+                .open_file(&file)
+                .expect_err("every source here is faulty");
+            assert!(
+                trouble.code().is_none(),
+                "{source:?} named {:?}",
+                trouble.code().map(|code| code.to_string())
+            );
+            assert!(trouble.severity().is_none(), "{source:?} graded itself");
+            assert!(
+                trouble
+                    .related()
+                    .is_none_or(|mut related| related.next().is_none()),
+                "{source:?} carries related diagnostics of its own"
+            );
         }
     }
 
