@@ -12647,6 +12647,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "log_lens"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "regex",
+ "serde_json",
+ "settings",
+ "terminal",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "logos"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -24459,6 +24482,7 @@ dependencies = [
  "itertools 0.14.0",
  "language",
  "log",
+ "log_lens",
  "menu",
  "pretty_assertions",
  "project",

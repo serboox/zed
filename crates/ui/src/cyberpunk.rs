@@ -122,6 +122,38 @@ pub fn accent_for_danger(is_dangerous: bool) -> Accent {
     }
 }
 
+/// Where a log level sits on the severity scale.
+///
+/// This is a data-encoding scale, not a third and fourth accent: it colours a
+/// value the reader is scanning for, and the word it colours is always printed
+/// beside it, so the level survives desaturation and colour blindness. Amber
+/// exists here and nowhere else in this chrome, because "worth a second look"
+/// is a rank between routine and alarming that the two accents cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// Detail nobody reads unless they are hunting something.
+    Debug,
+    /// The ordinary case, and therefore not coloured at all.
+    Info,
+    /// Worth a second look.
+    Warn,
+    /// Something failed.
+    Error,
+}
+
+impl Severity {
+    /// Colour for the level word and for anything on the row that inherits its
+    /// rank.
+    pub fn text(self) -> Hsla {
+        match self {
+            Severity::Debug => text_tertiary(),
+            Severity::Info => text_primary(),
+            Severity::Warn => rgb(0xffb02e).into(),
+            Severity::Error => Accent::Red.bright(),
+        }
+    }
+}
+
 /// How a row says it is under the pointer, being pressed, or chosen. One accent
 /// at three strengths rather than three greys: a list inside this chrome has to
 /// answer in the same colour as everything else in it.

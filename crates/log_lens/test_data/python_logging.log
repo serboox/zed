@@ -1,0 +1,9 @@
+2026-09-07 11:23:53,243 INFO translations: Fetch all translation files
+2026-09-07 11:23:53,244 ERROR translations: Cache load failed
+Traceback (most recent call last):
+  File "/srv/app/translations.py", line 252, in fetch_all
+    cache = load(path)
+  File "/srv/app/cache.py", line 55, in load
+    raise ValueError("truncated cache")
+ValueError: truncated cache
+2026-09-07 11:23:53,245 INFO translations: Fetch all translation files

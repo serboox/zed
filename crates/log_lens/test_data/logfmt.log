@@ -1,0 +1,2 @@
+level=info ts=2026-09-07T11:23:53.243Z msg="Fetch all translation files" caller=translations/translations.go:252 domain_id=73
+level=error msg="cache miss" file=/tmp/translations_cache.json items=0
