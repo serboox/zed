@@ -1582,7 +1582,7 @@ mod tests {
     use unindent::Unindent;
 
     use crate::{
-        KeybindSource, KeymapFile,
+        ActionSequence, KeybindSource, KeymapFile,
         keymap_file::{KeybindUpdateOperation, KeybindUpdateTarget},
     };
 
@@ -2798,5 +2798,248 @@ mod tests {
             ]
             "#,
         );
+    }
+
+    /// The default keymaps, exactly as the reader receives them.
+    const DEFAULT_KEYMAPS: [(&str, &str); 3] = [
+        (
+            "default-linux.json",
+            include_str!("../../../assets/keymaps/default-linux.json"),
+        ),
+        (
+            "default-macos.json",
+            include_str!("../../../assets/keymaps/default-macos.json"),
+        ),
+        (
+            "default-windows.json",
+            include_str!("../../../assets/keymaps/default-windows.json"),
+        ),
+    ];
+
+    /// The actions this editor added to answer, with no language server
+    /// running, what a language server would answer.
+    const THE_FORKS_OWN_ACTIONS: [&str; 26] = [
+        "cargo_diagnostics::Check",
+        "go_diagnostics::Check",
+        "python_diagnostics::Lint",
+        "js_diagnostics::Lint",
+        "clang_diagnostics::Diagnose",
+        "sql_diagnostics::Lint",
+        "markdown_diagnostics::Lint",
+        "typo_diagnostics::Check",
+        "prose_diagnostics::Check",
+        "proto_diagnostics::Check",
+        "json_diagnostics::Validate",
+        "toml_diagnostics::Validate",
+        "yaml_diagnostics::Validate",
+        "hierarchy_view::ShowIncomingCalls",
+        "hierarchy_view::ShowOutgoingCalls",
+        "hierarchy_view::ShowSupertypes",
+        "hierarchy_view::ShowSubtypes",
+        "hierarchy_view::ToggleFocus",
+        "rename_preview::Toggle",
+        "structural_search::Toggle",
+        "file_relations::Toggle",
+        "run_configurations::RunThisConfiguration",
+        "run_configurations::DebugThisConfiguration",
+        "run_configurations::SaveThisConfiguration",
+        "log_lens::OpenLogLens",
+        "browser_tools::ToggleFocus",
+    ];
+
+    /// The per-language checkers, which all mean "ask the tools about this
+    /// project now" and all already run on save.
+    const PER_LANGUAGE_CHECKERS: [&str; 13] = [
+        "cargo_diagnostics::Check",
+        "go_diagnostics::Check",
+        "python_diagnostics::Lint",
+        "js_diagnostics::Lint",
+        "clang_diagnostics::Diagnose",
+        "sql_diagnostics::Lint",
+        "markdown_diagnostics::Lint",
+        "typo_diagnostics::Check",
+        "prose_diagnostics::Check",
+        "proto_diagnostics::Check",
+        "json_diagnostics::Validate",
+        "toml_diagnostics::Validate",
+        "yaml_diagnostics::Validate",
+    ];
+
+    /// The one keystroke each default keymap deliberately claims twice within a
+    /// single context: the database console overrides the editor's newline with
+    /// its query runner. Every other pair sharing a context and a keystroke is
+    /// a mistake, because the later binding wins silently and the earlier one
+    /// is dead.
+    const DELIBERATE_OVERRIDES: [(&str, &str, &str); 3] = [
+        ("default-linux.json", "Editor && mode == full", "ctrl-enter"),
+        ("default-macos.json", "Editor && mode == full", "cmd-enter"),
+        (
+            "default-windows.json",
+            "Editor && mode == full",
+            "ctrl-enter",
+        ),
+    ];
+
+    /// One action a keymap runs: where it is active, what triggers it, its
+    /// name, and whether it shares its keystrokes with other actions because it
+    /// is one step of an `action::Sequence`.
+    struct Runs {
+        keystrokes: String,
+        action: String,
+        one_step_of_a_sequence: bool,
+    }
+
+    fn parse_or_panic(name: &str, keymap: &str) -> KeymapFile {
+        match KeymapFile::parse(keymap) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("{name} does not parse: {error}"),
+        }
+    }
+
+    /// Every keystroke each keymap entry claims, one entry at a time, so that
+    /// two entries claiming the same keystroke in one context are visible.
+    fn keystrokes_claimed_by(name: &str, keymap: &str) -> Vec<(String, String)> {
+        let mut claimed = Vec::new();
+        for section in parse_or_panic(name, keymap).sections() {
+            for (keystrokes, _) in section.bindings() {
+                claimed.push((section.context.clone(), keystrokes.clone()));
+            }
+        }
+        claimed
+    }
+
+    /// Every action each keymap runs, with the steps of an `action::Sequence`
+    /// listed individually.
+    fn actions_run_by(name: &str, keymap: &str) -> Vec<Runs> {
+        let mut runs = Vec::new();
+        for section in parse_or_panic(name, keymap).sections() {
+            for (keystrokes, action) in section.bindings() {
+                collect_actions(keystrokes, &action.0, false, &mut runs);
+            }
+        }
+        runs
+    }
+
+    fn collect_actions(
+        keystrokes: &str,
+        action: &Value,
+        one_step_of_a_sequence: bool,
+        into: &mut Vec<Runs>,
+    ) {
+        let named = match action {
+            Value::String(name) => Some(name.as_str()),
+            Value::Array(items) => match (items.first(), items.get(1)) {
+                (Some(Value::String(name)), Some(Value::Array(steps)))
+                    if name == ActionSequence::name_for_type() =>
+                {
+                    for step in steps {
+                        collect_actions(keystrokes, step, true, into);
+                    }
+                    None
+                }
+                (Some(Value::String(name)), _) => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(name) = named {
+            into.push(Runs {
+                keystrokes: keystrokes.to_string(),
+                action: name.to_string(),
+                one_step_of_a_sequence,
+            });
+        }
+    }
+
+    #[test]
+    fn the_default_keymaps_parse() {
+        for (name, keymap) in DEFAULT_KEYMAPS {
+            let sections = parse_or_panic(name, keymap).sections().count();
+            assert!(sections > 0, "{name} parsed to no sections at all");
+        }
+    }
+
+    /// Twenty-six actions answered questions a language server would answer and
+    /// could be reached only by opening the command palette, which a reader who
+    /// never opens it cannot discover.
+    #[test]
+    fn every_action_this_fork_added_is_bound_in_all_three_default_keymaps() {
+        for (name, keymap) in DEFAULT_KEYMAPS {
+            let runs = actions_run_by(name, keymap);
+            for action in THE_FORKS_OWN_ACTIONS {
+                assert!(
+                    runs.iter().any(|runs| runs.action == action),
+                    "{name} binds no keystroke to {action}"
+                );
+            }
+        }
+    }
+
+    /// The thirteen per-language checkers share one keystroke rather than
+    /// taking thirteen of their own: each already looks for its own language
+    /// and does nothing when the project has none, so asking all of them is
+    /// asking whichever one has an answer.
+    #[test]
+    fn the_per_language_checkers_share_one_keystroke_because_a_reader_remembers_four_shortcuts_not_thirteen()
+     {
+        for (name, keymap) in DEFAULT_KEYMAPS {
+            let runs = actions_run_by(name, keymap);
+            let mut shared = Vec::new();
+            for action in PER_LANGUAGE_CHECKERS {
+                if let Some(alone) = runs
+                    .iter()
+                    .find(|runs| runs.action == action && !runs.one_step_of_a_sequence)
+                {
+                    panic!(
+                        "{name} gives {action} a keystroke of its own: {}",
+                        alone.keystrokes
+                    );
+                }
+                let together = runs
+                    .iter()
+                    .filter(|runs| runs.action == action && runs.one_step_of_a_sequence)
+                    .map(|runs| runs.keystrokes.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    together.len(),
+                    1,
+                    "{name} should run {action} from exactly one sequence, not {together:?}"
+                );
+                shared.extend(together);
+            }
+            shared.sort();
+            shared.dedup();
+            assert_eq!(
+                shared.len(),
+                1,
+                "{name} spreads the per-language checkers over {shared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_entries_in_one_context_claim_the_same_keystrokes() {
+        for (name, keymap) in DEFAULT_KEYMAPS {
+            let mut how_often: HashMap<(String, String), usize> = HashMap::default();
+            for claim in keystrokes_claimed_by(name, keymap) {
+                *how_often.entry(claim).or_default() += 1;
+            }
+            let mut shared = how_often
+                .into_iter()
+                .filter(|(_, how_often)| *how_often > 1)
+                .map(|(claim, _)| claim)
+                .collect::<Vec<_>>();
+            shared.sort();
+            let mut deliberate = DELIBERATE_OVERRIDES
+                .iter()
+                .filter(|(keymap, _, _)| *keymap == name)
+                .map(|(_, context, keystrokes)| (context.to_string(), keystrokes.to_string()))
+                .collect::<Vec<_>>();
+            deliberate.sort();
+            assert_eq!(
+                shared, deliberate,
+                "{name} claims the same keystrokes twice in one context"
+            );
+        }
     }
 }

@@ -1872,4 +1872,89 @@
       "escape": "db_ddl_source::CloseDdlSource"
     }
   },
+  // Everything below answers a question a language server would answer, in an
+  // editor that runs none. Each of these was reachable only from the command
+  // palette, so a reader who never opened it could not find any of them.
+  //
+  // The whole set hangs off `cmd-k`, the chord prefix this keymap already uses
+  // for its less-frequent commands, so it reads as one family rather than as a
+  // handful of new modifier combinations.
+  {
+    "context": "Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      // Calls in, calls out; then base types and derived types.
+      "cmd-k i": "hierarchy_view::ShowIncomingCalls",
+      "cmd-k o": "hierarchy_view::ShowOutgoingCalls",
+      "cmd-k b": "hierarchy_view::ShowSupertypes",
+      "cmd-k d": "hierarchy_view::ShowSubtypes",
+      // What links to this file, and what it links to.
+      "cmd-k l": "file_relations::Toggle",
+      // `f2` renames, and falls through to this view when no server answers.
+      // `shift-f2` asks for the view outright, so every place that would change
+      // is listed whether a server is running or not.
+      "shift-f2": "rename_preview::Toggle"
+    }
+  },
+  {
+    "context": "Workspace",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-k h": "hierarchy_view::ToggleFocus",
+      // Find by shape, beside the find-in-project this keymap already has.
+      "cmd-k f": "structural_search::Toggle",
+      // One key for every per-language checker rather than thirteen keys. Each
+      // checker already looks for its own language in the project and does
+      // nothing when it is absent, so asking all of them is the same as asking
+      // whichever one has an answer -- and a reader has one shortcut to
+      // remember instead of thirteen.
+      "cmd-k c": [
+        "action::Sequence",
+        [
+          "cargo_diagnostics::Check",
+          "go_diagnostics::Check",
+          "python_diagnostics::Lint",
+          "js_diagnostics::Lint",
+          "clang_diagnostics::Diagnose",
+          "sql_diagnostics::Lint",
+          "markdown_diagnostics::Lint",
+          "typo_diagnostics::Check",
+          "prose_diagnostics::Check",
+          "proto_diagnostics::Check",
+          "json_diagnostics::Validate",
+          "toml_diagnostics::Validate",
+          "yaml_diagnostics::Validate"
+        ]
+      ]
+    }
+  },
+  {
+    "context": "Terminal",
+    "use_key_equivalents": true,
+    "bindings": {
+      // `o` for the output the lens lays out, with `shift` because plain
+      // `cmd-o` opens a project everywhere else.
+      "cmd-shift-o": "log_lens::OpenLogLens"
+    }
+  },
+  {
+    "context": "HtmlPreview",
+    "bindings": {
+      // What `f12` does in every browser, beside the `cmd-shift-i` this page
+      // already answers with an inspection.
+      "f12": "browser_tools::ToggleFocus"
+    }
+  },
+  {
+    // A window of its own, with no editor or workspace behind it, so `f5` and
+    // `ctrl-f5` are free here and mean what they mean in every other debugger
+    // front end.
+    "context": "RunConfigurations",
+    "use_key_equivalents": true,
+    "bindings": {
+      "f5": "run_configurations::DebugThisConfiguration",
+      "ctrl-f5": "run_configurations::RunThisConfiguration",
+      "cmd-s": "run_configurations::SaveThisConfiguration"
+    }
+  },
 ]
