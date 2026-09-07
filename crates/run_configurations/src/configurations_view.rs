@@ -1776,11 +1776,10 @@ impl RunConfigurationsView {
                 format!("temporary-{at}-icon"),
                 cx,
             ))
-            .child(
-                Label::new("on the spot")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            // No "on the spot" label of its own: the heading directly above every
+            // one of these rows already says it, and at this width the sixty
+            // pixels it took were the difference between a name that fits and a
+            // name cut in half.
             .child(
                 v_flex()
                     .flex_1()
