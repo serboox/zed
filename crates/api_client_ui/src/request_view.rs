@@ -1,8 +1,8 @@
 use crate::code_generator::Snippet;
 use crate::environment_diff_view::{EnvironmentDiffView, WhatIsCompared, side_of_the_comparison};
 use crate::response_dock::{
-    DockResponseEntry, ResponseDockPanel, SendGeneration, existing_response_tab,
-    reveal_response_tab,
+    DockResponseEntry, PairedRequest, ResponseDockPanel, SendGeneration, activate_response_tab,
+    close_paired_tab, existing_response_tab, response_pane, reveal_response_tab,
 };
 use crate::response_view::{ResponseData, ResponseTab, SendState};
 use crate::store::{ApiClientStore, HistoryExchangeDetail, HistoryExchangeOutcome};
@@ -15,9 +15,9 @@ use api_client::{
 };
 use editor::{Editor, EditorEvent, HighlightKey};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, ScrollHandle, Size, Subscription, WeakEntity, Window,
-    point, px,
+    App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, HighlightStyle,
+    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, Size, Subscription,
+    WeakEntity, Window, point, px,
 };
 use std::sync::Arc;
 use ui::{
@@ -615,10 +615,16 @@ pub struct RequestView {
     /// response for the whole workspace, so this is what tells the view whether
     /// what is on screen there is still its own reply or somebody else's.
     dock_generation: Option<SendGeneration>,
-    /// Which tab the claim above was made against. A closed tab is replaced by a
-    /// fresh one that numbers its sends from scratch, so the number alone cannot
-    /// tell "my claim is stale" from "someone newer owns the tab".
-    dock_tab: Option<gpui::EntityId>,
+    /// This request's own response tab, once one has been opened. It is what
+    /// pairs the two: closing this tab closes that one and the other way round.
+    /// A closed tab is replaced by a fresh one that numbers its sends from
+    /// scratch, so the generation alone cannot tell "my claim is stale" from
+    /// "this is a different tab".
+    dock_tab: Option<EntityId>,
+    /// Watches the dock's pane for the response tab above being closed, so the
+    /// request closes with it. Replaced whenever a tab is opened for this
+    /// request, which is the only moment there is a pane to watch.
+    _response_pairing: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -954,6 +960,7 @@ impl RequestView {
             body_json_invalid: false,
             dock_generation: None,
             dock_tab: None,
+            _response_pairing: None,
             _subscriptions: Vec::new(),
         };
 
@@ -968,6 +975,11 @@ impl RequestView {
                 .update(cx, |picker, cx| picker.refresh(window, cx));
         });
         this._subscriptions.push(observer);
+
+        if let Some(workspace) = this.workspace.upgrade() {
+            let pairing = cx.subscribe_in(&workspace, window, Self::on_workspace_event);
+            this._subscriptions.push(pairing);
+        }
 
         for param in &request.params {
             this.push_param_row(
@@ -2257,31 +2269,105 @@ impl RequestView {
         });
     }
 
-    /// Looks up the workspace's shared response dock, if one is registered.
-    /// `None` here is the "dock unavailable" case every `route_*_to_dock`
-    /// caller must fall back from -- either the workspace itself is gone, or
-    /// (e.g. during startup, before `initialize_panels` finishes) the panel
-    /// simply hasn't been added yet.
+    /// Looks up this request's own response tab, if one is open. `None` here is
+    /// the "dock unavailable" case every `route_*_to_dock` caller must fall back
+    /// from -- the workspace itself is gone, the terminal panel hasn't been added
+    /// yet (e.g. during startup, before `initialize_panels` finishes), or this
+    /// request has simply never been sent.
     fn find_response_dock(&self, cx: &App) -> Option<Entity<ResponseDockPanel>> {
         let workspace = self.workspace.upgrade()?;
-        existing_response_tab(workspace.read(cx), cx)
+        existing_response_tab(workspace.read(cx), self.request_id, cx)
     }
 
-    /// The response tab, opened beside the terminals if it is not there yet.
-    /// Every reply lands in that one tab, so the answers sit with the rest of the
-    /// output instead of in a panel of their own.
+    /// This request's response tab, opened beside the terminals if it is not
+    /// there yet, so the answers sit with the rest of the output instead of in a
+    /// panel of their own. Every request has its own, and the two tabs are paired
+    /// from here on.
     fn open_response_tab(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<ResponseDockPanel>> {
         let workspace = self.workspace.upgrade()?;
-        workspace.update(cx, |workspace, cx| {
-            reveal_response_tab(workspace, window, cx)
-        })
+        let paired = PairedRequest {
+            request_id: self.request_id,
+            request_item: cx.entity_id(),
+            title: self.title.clone(),
+        };
+        let tab = workspace.update(cx, |workspace, cx| {
+            reveal_response_tab(workspace, paired, window, cx)
+        })?;
+        self.dock_tab = Some(tab.entity_id());
+        self.watch_response_tab(&workspace, window, cx);
+        Some(tab)
     }
 
-    fn reveal_response_dock(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Closing the reply closes the request it answers. Watched on the dock's
+    /// own pane rather than on the workspace: that pane belongs to the terminal
+    /// panel, and the workspace never reports what is removed from it.
+    fn watch_response_tab(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = response_pane(workspace.read(cx), cx) else {
+            return;
+        };
+        let workspace = workspace.clone();
+        let pairing = cx.subscribe_in(&pane, window, move |this, _pane, event, window, cx| {
+            if let workspace::pane::Event::RemovedItem { item } = event
+                && Some(item.item_id()) == this.dock_tab
+            {
+                this.dock_tab = None;
+                this.dock_generation = None;
+                let request_item = cx.entity_id();
+                close_paired_tab(&workspace, request_item, window, cx);
+            }
+        });
+        self._response_pairing = Some(pairing);
+    }
+
+    /// The identity a response tab needs to answer this request and to be paired
+    /// with its tab.
+    pub(crate) fn paired_request(view: &Entity<Self>, cx: &App) -> PairedRequest {
+        let this = view.read(cx);
+        PairedRequest {
+            request_id: this.request_id,
+            request_item: view.entity_id(),
+            title: this.title.clone(),
+        }
+    }
+
+    /// Records the response tab opened for this request by somebody other than a
+    /// send, so closing that tab still closes this one.
+    pub(crate) fn remember_response_tab(&mut self, item_id: EntityId) {
+        self.dock_tab = Some(item_id);
+    }
+
+    fn on_workspace_event(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        event: &workspace::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, workspace::Event::ActiveItemChanged) {
+            return;
+        }
+        let this_is_in_front = workspace
+            .read(cx)
+            .active_item(cx)
+            .is_some_and(|item| item.item_id() == cx.entity_id());
+        if this_is_in_front {
+            let request_id = self.request_id;
+            workspace.update(cx, |workspace, cx| {
+                activate_response_tab(workspace, request_id, window, cx)
+            });
+        }
+    }
+
+    fn reveal_response_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_response_tab(window, cx);
     }
 
@@ -2336,12 +2422,9 @@ impl RequestView {
         let title = self.title.clone();
         let claimed = std::cell::Cell::new(None);
         self.route_to_dock(window, cx, |dock, cx| {
-            claimed.set(Some((cx.entity_id(), dock.begin_send(title, cx))));
+            claimed.set(Some(dock.begin_send(title, cx)));
         });
-        if let Some((tab, generation)) = claimed.get() {
-            self.dock_generation = Some(generation);
-            self.dock_tab = Some(tab);
-        }
+        self.dock_generation = claimed.get();
     }
 
     /// Claims the tab again when the one this view claimed is no longer there --
@@ -5658,12 +5741,15 @@ impl Render for CodeSnippetModal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_dock::ResponseDockDisplay;
     use crate::store::ApiClientStore;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
     use terminal_view::terminal_panel::TerminalPanel;
     use workspace::ItemHandle as _;
+    use workspace::SaveIntent;
     use workspace::dock::Panel as _;
+    use workspace::item::test::{TestItem, TestProjectItem};
 
     // Before this rank was wired in, an unarmed comparison trigger fell back to
     // `ButtonStyle::Subtle`, which paints no border at rest -- the trigger read
@@ -9450,7 +9536,7 @@ mod tests {
             );
         });
 
-        // A second reply belongs in the same tab: one tab for every request.
+        // The same request sending again belongs in the tab it already owns.
         view.update_in(&mut cx, |view, window, cx| {
             view.apply_response(sample_response_data(500), window, cx);
         });
@@ -9555,5 +9641,379 @@ mod tests {
                 "the reply itself must not be lost"
             );
         });
+    }
+
+    /// Two request tabs, one terminal panel to put their replies in, and both
+    /// requests already open in the centre pane.
+    async fn build_two_requests_in_workspace(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<RequestView>,
+        Entity<RequestView>,
+        Entity<TerminalPanel>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let store = cx.new(|cx| ApiClientStore::new(cx));
+        let collection_id = store.update(cx, |store, cx| store.create_collection("A".into(), cx));
+        let first_request = new_request(&store, collection_id, "Get users", cx);
+        let second_request = new_request(&store, collection_id, "Get orders", cx);
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let (first, second, terminal_panel) = window
+            .update(cx, |workspace, window, cx| {
+                let terminal_panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                workspace.add_panel(terminal_panel.clone(), window, cx);
+                let handle = workspace.weak_handle();
+                let first = cx.new(|cx| {
+                    RequestView::new(&first_request, store.clone(), handle.clone(), window, cx)
+                });
+                workspace.add_item_to_active_pane(Box::new(first.clone()), None, true, window, cx);
+                let second = cx
+                    .new(|cx| RequestView::new(&second_request, store.clone(), handle, window, cx));
+                workspace.add_item_to_active_pane(Box::new(second.clone()), None, true, window, cx);
+                (first, second, terminal_panel)
+            })
+            .expect("the workspace window is open");
+
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let workspace = window
+            .root(&mut cx)
+            .expect("the workspace is the window root");
+        cx.run_until_parked();
+        (workspace, first, second, terminal_panel, cx)
+    }
+
+    fn new_request(
+        store: &Entity<ApiClientStore>,
+        collection_id: api_client::CollectionId,
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Request {
+        let request_id = store.update(cx, |store, cx| {
+            store.create_request(collection_id, name.into(), None, cx)
+        });
+        store
+            .read_with(cx, |store, _| {
+                store
+                    .requests
+                    .iter()
+                    .find(|request| request.id == request_id)
+                    .cloned()
+            })
+            .expect("the request was just created")
+    }
+
+    fn response_tabs(
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Entity<ResponseDockPanel>> {
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            terminal_panel
+                .pane()
+                .map(|pane| pane.read(cx).items_of_type::<ResponseDockPanel>().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    fn response_tab_of(
+        view: &Entity<RequestView>,
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<ResponseDockPanel> {
+        let request_id = view.read_with(cx, |view, _| view.request_id);
+        response_tabs(terminal_panel, cx)
+            .into_iter()
+            .find(|tab| tab.read_with(cx, |tab, _| tab.request_id) == request_id)
+            .expect("this request has a response tab of its own")
+    }
+
+    fn shown_status(tab: &Entity<ResponseDockPanel>, cx: &mut VisualTestContext) -> u16 {
+        tab.read_with(cx, |tab, _| match &tab.display {
+            ResponseDockDisplay::Success(entry) => entry.response.status,
+            _ => panic!("expected the tab to be showing a reply"),
+        })
+    }
+
+    fn front_response_tab(
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::EntityId> {
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            terminal_panel
+                .pane()?
+                .read(cx)
+                .active_item()
+                .map(|item| item.item_id())
+        })
+    }
+
+    /// Two requests sent in turn have two response tabs, each holding its own
+    /// reply. This is the whole point of the pairing: with one shared tab the
+    /// second send overwrote the first, so a reader read the wrong body under
+    /// the right request.
+    #[gpui::test]
+    async fn two_requests_sent_in_turn_have_two_response_tabs_each_holding_its_own_reply(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            response_tabs(&terminal_panel, &mut cx).len(),
+            2,
+            "each request has to keep a response tab of its own"
+        );
+        let first_tab = response_tab_of(&first, &terminal_panel, &mut cx);
+        let second_tab = response_tab_of(&second, &terminal_panel, &mut cx);
+        assert_eq!(
+            shown_status(&first_tab, &mut cx),
+            201,
+            "the first request's tab has to still hold the first request's reply"
+        );
+        assert_eq!(
+            shown_status(&second_tab, &mut cx),
+            500,
+            "the second request's tab holds the second request's reply"
+        );
+
+        // Several tabs reading "API Response" would be unusable, so each wears
+        // its own request's title.
+        let (first_label, second_label) = cx.update(|_window, cx| {
+            (
+                first_tab.read(cx).tab_content_text(0, cx),
+                second_tab.read(cx).tab_content_text(0, cx),
+            )
+        });
+        assert_eq!(first_label.as_ref(), "Get users");
+        assert_eq!(second_label.as_ref(), "Get orders");
+    }
+
+    /// Bringing a request to the front activates its own response tab and not
+    /// the other one, so the body on screen answers the request in front of it.
+    #[gpui::test]
+    async fn bringing_a_request_to_the_front_activates_its_own_response_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_tab = response_tab_of(&first, &terminal_panel, &mut cx).item_id();
+        let second_tab = response_tab_of(&second, &terminal_panel, &mut cx).item_id();
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(second_tab),
+            "the send that just finished left its own tab at the front"
+        );
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.activate_item(&first, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(first_tab),
+            "switching request tabs has to switch the reply on screen with it"
+        );
+    }
+
+    /// Activating a response tab does not move the caret out of the request:
+    /// the reader is editing the request, and a reply arriving must not steal
+    /// what they are typing into.
+    #[gpui::test]
+    async fn activating_a_response_tab_does_not_move_the_caret_out_of_the_request(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.activate_item(&first, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_tab = response_tab_of(&first, &terminal_panel, &mut cx).item_id();
+        assert_eq!(
+            front_response_tab(&terminal_panel, &mut cx),
+            Some(first_tab),
+            "the request's own reply is what the dock has to be showing"
+        );
+        let request_focus = cx.update(|_window, cx| first.read(cx).focus_handle.clone());
+        let caret_is_in_the_request =
+            cx.update(|window, cx| request_focus.contains_focused(window, cx));
+        assert!(
+            caret_is_in_the_request,
+            "the reply is activated, not focused: the caret stays in the request"
+        );
+    }
+
+    /// Closing a request closes its response, and closing a response closes its
+    /// request: the pair lives and dies together, and neither is left behind
+    /// answering a request that is no longer open.
+    #[gpui::test]
+    async fn closing_a_request_closes_its_response_and_closing_a_response_closes_its_request(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, first, second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        first.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(201), window, cx);
+        });
+        cx.run_until_parked();
+        second.update_in(&mut cx, |view, window, cx| {
+            view.apply_response(sample_response_data(500), window, cx);
+        });
+        cx.run_until_parked();
+
+        let centre = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        let first_item = first.entity_id();
+        let second_response = response_tab_of(&second, &terminal_panel, &mut cx).item_id();
+
+        centre.update_in(&mut cx, |pane, window, cx| {
+            pane.close_item_by_id(first_item, SaveIntent::Close, window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let tabs = response_tabs(&terminal_panel, &mut cx);
+        assert_eq!(
+            tabs.len(),
+            1,
+            "closing a request has to take its response tab with it"
+        );
+        assert_eq!(
+            tabs.first().map(|tab| tab.item_id()),
+            Some(second_response),
+            "the other request's reply must be the one left standing"
+        );
+        assert_eq!(
+            centre.read_with(&cx, |pane, _| pane.items_of_type::<RequestView>().count()),
+            1,
+            "the other request has to stay open"
+        );
+
+        let bottom = terminal_panel
+            .read_with(&cx, |terminal_panel, _| terminal_panel.pane())
+            .expect("the terminal panel has a pane");
+        bottom.update_in(&mut cx, |pane, window, cx| {
+            pane.close_item_by_id(second_response, SaveIntent::Close, window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            response_tabs(&terminal_panel, &mut cx).len(),
+            0,
+            "the response tab the reader closed has to be gone"
+        );
+        assert_eq!(
+            centre.read_with(&cx, |pane, _| pane.items_of_type::<RequestView>().count()),
+            0,
+            "closing a response closes the request it answered"
+        );
+    }
+
+    /// A request with unsaved edits closed by way of its response tab still gets
+    /// the chance to be saved: the pairing closes through the reader's own path,
+    /// which asks, rather than forcing a skip -- a forced skip reloads the item
+    /// and throws the edits away without a word.
+    #[gpui::test]
+    async fn a_request_closed_by_way_of_its_response_still_gets_the_chance_to_be_saved(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _first, _second, _terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        let unsaved = cx.new(|cx| {
+            let project_item = TestProjectItem::new_dirty(1, "unsent.http", cx);
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(&[project_item])
+        });
+        let unsaved_item = unsaved.entity_id();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(unsaved.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            close_paired_tab(&workspace, unsaved_item, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "the paired close has to offer to save, the way the reader's own close does"
+        );
+        assert_eq!(
+            unsaved.read_with(&cx, |item, _| item.reload_count),
+            0,
+            "a forced skip would have reloaded the item and dropped the unsaved edits"
+        );
+        let centre = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        assert!(
+            centre.read_with(&cx, |pane, _| pane
+                .items()
+                .any(|item| item.item_id() == unsaved_item)),
+            "nothing may close until the reader has answered the prompt"
+        );
+    }
+
+    /// Opening a request without sending it creates no response tab: five open
+    /// requests must not fill the dock with five blank tabs.
+    #[gpui::test]
+    async fn opening_a_request_without_sending_it_creates_no_response_tab(cx: &mut TestAppContext) {
+        let (workspace, first, _second, terminal_panel, mut cx) =
+            build_two_requests_in_workspace(cx).await;
+
+        assert_eq!(
+            response_tabs(&terminal_panel, &mut cx).len(),
+            0,
+            "two requests are open and neither was sent, so there is nothing to show"
+        );
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.activate_item(&first, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            response_tabs(&terminal_panel, &mut cx).len(),
+            0,
+            "switching to an unsent request must not open a blank tab for it"
+        );
     }
 }
