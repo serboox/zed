@@ -1,0 +1,2 @@
+2026-09-07T11:23:53.243+0300	DEBUG	cache/cache.go:55	Cache loaded from file	{"version": "dev", "name": "finbox_wrapper_api", "revision": "HEAD", "file": "/tmp/translations_cache.json", "items": 13695}
+2026-09-07T11:23:53.244+0300	INFO	translations/translations.go:252	Fetch all translation files	{"version": "dev", "name": "finbox_wrapper_api", "revision": "HEAD", "domain_id": 73}

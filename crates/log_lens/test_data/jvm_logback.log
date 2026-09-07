@@ -1,0 +1,8 @@
+11:23:53.243 [main] INFO  com.example.Translations - Fetch all translation files
+11:23:53.244 [pool-1-thread-3] ERROR com.example.Cache - Cache load failed
+java.lang.IllegalStateException: truncated cache
+	at com.example.Cache.load(Cache.java:55)
+	at com.example.Translations.fetchAll(Translations.java:252)
+Caused by: java.io.EOFException: unexpected end of stream
+	at java.base/java.io.DataInputStream.readInt(DataInputStream.java:397)
+11:23:53.245 [main] DEBUG com.example.Translations - Done

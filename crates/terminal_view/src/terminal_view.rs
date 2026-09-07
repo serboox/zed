@@ -14,6 +14,7 @@ use gpui::{
     Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
     WeakEntity, actions, anchored, deferred, div,
 };
+use log_lens::OpenLogLens;
 use menu;
 use persistence::TerminalDb;
 use project::{Project, ProjectEntryId, search::SearchQuery};
@@ -462,6 +463,20 @@ impl TerminalView {
         self.focus_handle.focus(window, cx);
     }
 
+    pub fn open_log_lens(&mut self, _: &OpenLogLens, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| self.terminal.read(cx).title(true));
+        log_lens::open(
+            self.terminal.clone(),
+            self.workspace.clone(),
+            title.into(),
+            window,
+            cx,
+        );
+    }
+
     pub fn rename_terminal(
         &mut self,
         _: &RenameTerminal,
@@ -558,6 +573,10 @@ impl TerminalView {
                             })
                     },
                 )
+                .when(self.shows_workspace_actions(), |menu| {
+                    menu.separator()
+                        .action("Open log lens", Box::new(OpenLogLens))
+                })
                 .when(self.shows_workspace_actions(), |menu| {
                     menu.separator().action(
                         "Close Terminal Tab",
@@ -1364,6 +1383,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
+            .on_action(cx.listener(TerminalView::open_log_lens))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
