@@ -568,6 +568,39 @@ impl Symbols {
         })
     }
 
+    /// The names one file declares as a member of a type.
+    ///
+    /// Read per file rather than per name -- which is how the resolution gate
+    /// asks -- because the question here is which of a file's declarations are
+    /// not the file's own to export.
+    pub fn members_in(&self, path: &str) -> Result<Vec<String>> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT members.name
+             FROM members
+             JOIN files ON files.id = members.file
+             WHERE files.path = ?
+             ORDER BY members.place",
+        )?;
+        statement.bind_text(1, path)?;
+        statement.map(|row| Ok(row.column_text(0)?.to_string()))
+    }
+
+    /// Whether the store has ever read this file.
+    ///
+    /// The one thing that tells "the index read this file and it declares
+    /// nothing" apart from "the index has never seen this file", which are the
+    /// same empty answer to every other question here.
+    pub fn knows(&self, path: &str) -> Result<bool> {
+        let mut statement = Statement::prepare(
+            &self.connection,
+            "SELECT COUNT(*) FROM files WHERE path = ?",
+        )?;
+        statement.bind_text(1, path)?;
+        let counted = statement.maybe(|row| row.column_int64(0))?;
+        Ok(counted.unwrap_or_default() > 0)
+    }
+
     pub fn gated_in(&self, path: &str) -> Result<Vec<(u32, u32)>> {
         let mut statement = Statement::prepare(
             &self.connection,

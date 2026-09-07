@@ -8,6 +8,7 @@ pub mod per_language;
 pub mod recorded;
 pub mod references;
 pub mod refresh;
+pub mod relations;
 pub mod resolution;
 pub mod structural;
 pub mod symbols;

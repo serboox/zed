@@ -793,6 +793,7 @@ fn main() {
         api_client_ui::init(cx);
         hierarchy_view::init(cx);
         structural_search::init(cx);
+        file_relations::init(cx);
         rename_preview::init(cx);
         search_everywhere::init(cx);
         project_panel::init(cx);
