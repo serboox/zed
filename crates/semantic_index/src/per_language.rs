@@ -1372,7 +1372,10 @@ service Orders {
     fn the_generic_proto_query_finds_the_names_and_the_literals_with_them() {
         let grammar = proto_grammar();
         let generic = generic_references_query(&grammar);
-        assert!(generic.contains("(identifier) @reference.value"), "{generic}");
+        assert!(
+            generic.contains("(identifier) @reference.value"),
+            "{generic}"
+        );
         assert!(generic.contains("(constant) @reference.value"), "{generic}");
 
         let found = referenced_in(A_PROTO_FILE, &grammar, &generic);

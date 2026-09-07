@@ -295,7 +295,6 @@ pub fn dictionary_word_count() -> usize {
     FstDictionary::curated().word_count()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +372,9 @@ mod tests {
         assert!(
             said.iter().all(|one| one.range.start.line == 2),
             "{:?} is not the paragraph",
-            said.iter().map(|one| one.range.start.line).collect::<Vec<_>>()
+            said.iter()
+                .map(|one| one.range.start.line)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -381,8 +382,7 @@ mod tests {
     /// must go unchecked rather than be reported word by word.
     #[test]
     fn a_comment_in_russian_is_left_alone_rather_than_reported_word_by_word() {
-        let text =
-            "// Эта функция возвращает значение по умолчанию для пустого списка.\nfn default() {}\n";
+        let text = "// Эта функция возвращает значение по умолчанию для пустого списка.\nfn default() {}\n";
         let said = in_rust_comments(text);
         assert!(said.is_empty(), "{:?}", marks(text, &said));
     }
@@ -392,8 +392,7 @@ mod tests {
     /// English.
     #[test]
     fn a_comment_in_german_is_left_alone_too() {
-        let text =
-            "// Diese Funktion gibt den vorgegebenen Wert für eine leere Liste zurück.\nfn d() {}\n";
+        let text = "// Diese Funktion gibt den vorgegebenen Wert für eine leere Liste zurück.\nfn d() {}\n";
         let said = in_rust_comments(text);
         assert!(said.is_empty(), "{:?}", marks(text, &said));
     }
@@ -413,7 +412,11 @@ mod tests {
             "struct Thing { the: usize, of: usize, is: usize }\n",
         ] {
             let said = in_rust_comments(code);
-            assert!(said.is_empty(), "{code:?} produced {:?}", marks(code, &said));
+            assert!(
+                said.is_empty(),
+                "{code:?} produced {:?}",
+                marks(code, &said)
+            );
         }
     }
 

@@ -344,7 +344,10 @@ mod tests {
     #[test]
     fn a_fault_in_an_imported_file_is_not_reported_on_the_file_that_imports_it() {
         let project = AProject::new();
-        project.holding("currency.proto", "syntax = \"proto3\";\n\nenum Currency {\n");
+        project.holding(
+            "currency.proto",
+            "syntax = \"proto3\";\n\nenum Currency {\n",
+        );
         let file = project.holding(
             "order.proto",
             "syntax = \"proto3\";\n\nimport \"currency.proto\";\n\nmessage Order {\n  Currency currency = 1;\n}\n",
@@ -365,10 +368,7 @@ mod tests {
         );
         let diagnostic = faulted(project.checked(&file));
         assert_eq!(diagnostic.severity, Some(lsp::DiagnosticSeverity::ERROR));
-        assert!(
-            diagnostic.message.contains("end of file"),
-            "{diagnostic:?}"
-        );
+        assert!(diagnostic.message.contains("end of file"), "{diagnostic:?}");
         assert!(
             diagnostic.range.start.line <= 3,
             "somewhere in the file the reader wrote: {diagnostic:?}"
