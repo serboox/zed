@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How much of a machine a run is using, as far as this platform will say.
@@ -21,14 +22,27 @@ pub struct Metrics {
     pub network: Result<u64, &'static str>,
     /// Why the video memory is not being reported.
     pub video_memory: Result<u64, &'static str>,
+    /// Every process of the tree and what it holds, the root first.
+    pub tree: Vec<ProcessMemory>,
+}
+
+/// One process of a run, for a reading that lists them rather than summing them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessMemory {
+    pub pid: u32,
+    pub name: Arc<str>,
+    /// Resident memory of this process alone, in bytes.
+    pub memory: u64,
 }
 
 /// What the machine says about one process, before any of it is turned into a
 /// rate.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     pub pid: u32,
     pub parent: u32,
+    /// What the machine calls the program, as `/proc` spells it.
+    pub name: Arc<str>,
     /// Ticks of processor time this process has had, user and system together.
     pub ticks: u64,
     pub memory: u64,
@@ -59,7 +73,9 @@ fn ticks_a_second() -> f32 {
 /// name -- so the fields after it are found from the *last* `)`, never by
 /// splitting the whole line.
 pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
+    let opens = stat.find('(')?;
     let closes = stat.rfind(')')?;
+    let name: Arc<str> = stat.get(opens + 1..closes)?.into();
     let pid: u32 = stat[..stat.find(' ')?].trim().parse().ok()?;
     let after_name: Vec<&str> = stat[closes + 1..].split_whitespace().collect();
     // After the name come: state, ppid, pgrp, ... utime is the 12th, stime the
@@ -72,6 +88,7 @@ pub fn sample_of(stat: &str, statm: &str) -> Option<Sample> {
     Some(Sample {
         pid,
         parent,
+        name,
         ticks: utime.saturating_add(stime),
         memory: pages.saturating_mul(page_size()),
         started,
@@ -96,9 +113,12 @@ fn page_size() -> u64 {
 pub fn tree_of(root: u32, everything: &[Sample]) -> Vec<Sample> {
     let mut children: HashMap<u32, Vec<Sample>> = HashMap::new();
     for sample in everything {
-        children.entry(sample.parent).or_default().push(*sample);
+        children
+            .entry(sample.parent)
+            .or_default()
+            .push(sample.clone());
     }
-    let Some(root_sample) = everything.iter().find(|sample| sample.pid == root).copied() else {
+    let Some(root_sample) = everything.iter().find(|sample| sample.pid == root).cloned() else {
         return Vec::new();
     };
     let mut tree = vec![root_sample];
@@ -111,7 +131,7 @@ pub fn tree_of(root: u32, everything: &[Sample]) -> Vec<Sample> {
         if let Some(theirs) = children.get(&pid) {
             for child in theirs {
                 if taken.insert(child.pid) {
-                    tree.push(*child);
+                    tree.push(child.clone());
                 }
             }
         }
@@ -164,7 +184,7 @@ impl Watcher {
         now: Instant,
     ) -> Option<Metrics> {
         let tree = tree_of(root, everything);
-        let Some(root_sample) = tree.first().copied() else {
+        let Some(root_sample) = tree.first().cloned() else {
             self.forget();
             return None;
         };
@@ -180,6 +200,14 @@ impl Watcher {
             .map(|sample| (who_of(sample), sample.ticks))
             .collect();
         let root_now = who_of(&root_sample);
+        let holdings: Vec<ProcessMemory> = tree
+            .iter()
+            .map(|sample| ProcessMemory {
+                pid: sample.pid,
+                name: sample.name.clone(),
+                memory: sample.memory,
+            })
+            .collect();
         let cpu = match &self.last {
             Some(last) if last.root == root_now && now > last.when => {
                 // What each process of the tree did since the last reading. One
@@ -210,6 +238,7 @@ impl Watcher {
             memory,
             network: Err("needs rights this editor does not ask for"),
             video_memory: Err("nothing is using it"),
+            tree: holdings,
         })
     }
 
@@ -284,6 +313,7 @@ mod tests {
         let statm = "1000 512 100 10 0 200 0";
         let sample = sample_of(stat, statm).expect("the line reads");
         assert_eq!(sample.pid, 4242);
+        assert_eq!(&*sample.name, "my program (2)");
         assert_eq!(sample.parent, 99);
         assert_eq!(sample.ticks, 380, "user and system time together");
         assert_eq!(sample.memory, 512 * 4096);
@@ -298,6 +328,7 @@ mod tests {
         Sample {
             pid,
             parent,
+            name: "a program".into(),
             ticks,
             memory,
             started,

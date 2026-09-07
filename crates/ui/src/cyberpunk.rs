@@ -137,6 +137,50 @@ pub fn row_chosen() -> Hsla {
     Accent::Cyan.border().opacity(0.16)
 }
 
+/// The two hues a chart's series are drawn in, and no others.
+///
+/// Not the two accents: those carry "focal" and "danger", and a line saying how
+/// much memory a build is holding is neither -- reusing them would make every
+/// chart read as an alarm. Red with green is out for the same reason it is out
+/// everywhere: roughly one man in twelve cannot separate that pair, and it is
+/// the pair everyone reaches for first. Cyan and violet stay apart for every
+/// kind of colour vision, and they are far enough apart in lightness (a light
+/// hue against a mid-dark one) that the pair still reads once the screen is
+/// desaturated -- which is the test a hue pair has to pass, since colour alone
+/// is never allowed to carry a quantity here.
+pub fn series_processor() -> Hsla {
+    rgb(0x00e5ff).into()
+}
+
+pub fn series_memory() -> Hsla {
+    rgb(0x9a5cff).into()
+}
+
+/// How many steps [`ramp`] has.
+pub const RAMP_STEPS: usize = 5;
+
+/// Where a value sits on a sequential ramp of the memory hue: `0.` for the
+/// smallest of a set of bars, `1.` for the largest.
+///
+/// One hue getting lighter, never a spread of different hues: a set of bars
+/// sorted by size is ordered data, and a rainbow over ordered data reads as
+/// categories that have nothing to do with each other. Quantised to
+/// [`RAMP_STEPS`] steps because a continuous ramp over a handful of bars gives
+/// neighbours a difference nobody can see, while five steps stay apart in
+/// lightness as well as in saturation.
+pub fn ramp(fraction: f32) -> Hsla {
+    let steps = [
+        rgb(0x2a1a45),
+        rgb(0x452a6e),
+        rgb(0x603c99),
+        rgb(0x7d4ec6),
+        rgb(0x9a5cff),
+    ];
+    let last = RAMP_STEPS - 1;
+    let step = (fraction.clamp(0., 1.) * last as f32).round() as usize;
+    steps[step.min(last)].into()
+}
+
 /// How much an action matters. Four ranks and no more: the one the reader came
 /// for, the way out, the secondary one, and the one that destroys something.
 ///
