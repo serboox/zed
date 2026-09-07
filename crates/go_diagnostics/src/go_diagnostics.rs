@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod fixing;
 mod watching;
 
 pub use watching::{Check, init};
@@ -17,6 +18,38 @@ pub struct Reported {
     /// Absolute, so a caller does not have to remember where the tool ran.
     pub path: PathBuf,
     pub diagnostic: lsp::Diagnostic,
+    /// The fixes the analyzer that found this handed over with it, in the
+    /// order it listed them. The compiler supplies none: `go build` reports
+    /// only text.
+    pub fixes: Vec<Fix>,
+}
+
+/// A fix an analyzer wrote itself, offered word for word as it gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    /// The analyzer's own words for it -- "Replace 2006-02-01 with
+    /// 2006-01-02".
+    pub title: String,
+    pub replacements: Vec<Replacement>,
+}
+
+/// One piece of text an analyzer asked to be put somewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// Absolute, like [`Reported::path`]: a fix may reach a file other than
+    /// the one the finding is in.
+    pub path: PathBuf,
+    /// In UTF-16 code units, like [`Reported`]'s range and for the same
+    /// reason.
+    pub range: lsp::Range,
+    /// Empty where the analyzer asked for the range to be deleted, which is a
+    /// fix like any other and not the absence of one.
+    pub new_text: String,
+    /// The text that was in `range` when the analyzer measured it. A caller
+    /// compares it against what is there now: a file edited since the run has
+    /// moved every offset in the report, and a replacement made against
+    /// moved offsets overwrites something the analyzer never looked at.
+    pub replaced: String,
 }
 
 /// What `go build -json` writes: one JSON object per line, of which only the
@@ -98,6 +131,7 @@ pub fn what_the_compiler_reported(
         }
         reported.push(Reported {
             path,
+            fixes: Vec::new(),
             diagnostic: lsp::Diagnostic {
                 range,
                 severity: Some(lsp::DiagnosticSeverity::ERROR),
@@ -123,6 +157,30 @@ struct Finding {
     #[serde(default)]
     end: Option<String>,
     message: String,
+    /// Alternative ways to fix this one finding, of which at most one may be
+    /// applied. Absent from the analyzers that compute none, which is most of
+    /// them.
+    #[serde(default)]
+    suggested_fixes: Vec<SuggestedFix>,
+}
+
+#[derive(Deserialize)]
+struct SuggestedFix {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    edits: Vec<SuggestedEdit>,
+}
+
+/// One piece of text an analyzer asked to put over `start..end`, which are
+/// absolute byte offsets into `filename`. `new` is empty where it asked for a
+/// deletion, and `start` equals `end` where it asked for an insertion.
+#[derive(Deserialize)]
+struct SuggestedEdit {
+    filename: String,
+    start: usize,
+    end: usize,
+    new: String,
 }
 
 /// Reads what `go vet` reported into diagnostics the editor can show.
@@ -169,8 +227,10 @@ pub fn what_vet_reported(
                     if !already.insert((path.clone(), range, finding.message.clone())) {
                         continue;
                     }
+                    let fixes = fixes_in(&finding, ran_in, &mut texts, &read);
                     reported.push(Reported {
                         path,
+                        fixes,
                         diagnostic: lsp::Diagnostic {
                             range,
                             severity: Some(lsp::DiagnosticSeverity::WARNING),
@@ -185,6 +245,128 @@ pub fn what_vet_reported(
         }
     }
     reported
+}
+
+/// Every fix this finding handed over that this reader will pass on.
+///
+/// `go vet` grades nothing: unlike the Rust compiler's suggestions, an
+/// analyzer's fix arrives with no word on how sure of it the analyzer is. So
+/// the only grade available is the contract every analyzer writes to, which
+/// says a fix's edits "must not overlap, nor contain edits for other
+/// packages" and that an edit's end must not precede its start. A fix that
+/// breaks that is malformed rather than merely uncertain, and is refused
+/// whole.
+///
+/// Refused whole, and not edit by edit, because a fix's edits are halves of
+/// one change: `stringintconv` asks for a `rune(` and its closing `)` as two
+/// edits, and applying one without the other leaves the file broken.
+///
+/// A fix with no message is refused as well -- what the reader picks from a
+/// menu is the title, and an unnamed entry says nothing about what it will
+/// do -- and so is one with no edits, which would do nothing at all.
+fn fixes_in(
+    finding: &Finding,
+    ran_in: &Path,
+    texts: &mut HashMap<PathBuf, Option<String>>,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Vec<Fix> {
+    finding
+        .suggested_fixes
+        .iter()
+        .filter_map(|suggested| one_fix(suggested, ran_in, texts, read))
+        .collect()
+}
+
+fn one_fix(
+    suggested: &SuggestedFix,
+    ran_in: &Path,
+    texts: &mut HashMap<PathBuf, Option<String>>,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<Fix> {
+    if suggested.message.is_empty() || suggested.edits.is_empty() || overlap(&suggested.edits) {
+        return None;
+    }
+    let mut replacements = Vec::with_capacity(suggested.edits.len());
+    for edit in &suggested.edits {
+        if edit.end < edit.start {
+            return None;
+        }
+        let path = beneath(ran_in, &edit.filename);
+        let text = text_of(texts, &path, read)?;
+        // A range the text cannot be sliced by has been measured against a
+        // different file than the one being read, and an empty string here
+        // would be indistinguishable from the analyzer asking for an
+        // insertion.
+        let replaced = text.get(edit.start..edit.end)?.to_string();
+        let range = lsp::Range {
+            start: utf16_position_at(text, edit.start),
+            end: utf16_position_at(text, edit.end),
+        };
+        replacements.push(Replacement {
+            path,
+            range,
+            new_text: edit.new.clone(),
+            replaced,
+        });
+    }
+    Some(Fix {
+        title: suggested.message.clone(),
+        replacements,
+    })
+}
+
+/// Whether any two of a fix's edits in the same file cover overlapping text.
+/// Two insertions at one point are not an overlap: neither replaces
+/// anything, and both can be written in the order they were given.
+fn overlap(edits: &[SuggestedEdit]) -> bool {
+    let mut by_file: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for edit in edits {
+        by_file
+            .entry(edit.filename.as_str())
+            .or_default()
+            .push((edit.start, edit.end));
+    }
+    by_file.into_values().any(|mut ranges| {
+        ranges.sort_unstable();
+        ranges
+            .windows(2)
+            .any(|pair| matches!(pair, [(_, before), (after, _)] if after < before))
+    })
+}
+
+/// A file's text, read at most once however many edits point into it.
+fn text_of<'a>(
+    texts: &'a mut HashMap<PathBuf, Option<String>>,
+    path: &Path,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<&'a str> {
+    texts
+        .entry(path.to_path_buf())
+        .or_insert_with(|| read(path))
+        .as_deref()
+}
+
+/// The position an absolute byte offset falls at, counted the way the
+/// protocol counts: lines from zero, and characters as UTF-16 code units.
+///
+/// An offset past the end of the text lands at the end of it, and one inside
+/// a character lands on the boundary before it, rather than panicking on a
+/// file the tool saw and the editor has since changed.
+fn utf16_position_at(text: &str, byte: usize) -> lsp::Position {
+    let mut at = byte.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before = text.get(..at).unwrap_or("");
+    let line_starts_at = before.rfind('\n').map_or(0, |newline| newline + 1);
+    lsp::Position {
+        line: before.matches('\n').count() as u32,
+        character: before
+            .get(line_starts_at..)
+            .unwrap_or("")
+            .encode_utf16()
+            .count() as u32,
+    }
 }
 
 /// Every JSON tree in a stream that also holds text that is not JSON.
@@ -374,6 +556,29 @@ mod tests {
     /// the tool's *standard error*, which is where `go` passes the analyzers'
     /// JSON through, mixed with the package names it prints itself.
     const REAL_VET: &str = include_str!("../test_data/go-vet.txt");
+
+    /// Real output from the same command over a module whose analyzers do
+    /// suggest fixes -- `timeformat` and `stringintconv` -- captured together
+    /// with the file itself, so that every offset in it can be checked
+    /// against the text it was measured on.
+    const WITH_FIXES: &str = include_str!("../test_data/go-vet-fixes.txt");
+    const WITH_FIXES_SOURCE: &str = include_str!("../test_data/go-vet-fixes.source");
+
+    fn over_the_fixture_with_fixes(output: &str) -> Vec<Reported> {
+        what_vet_reported(output, Path::new("/src"), |path| {
+            (path == Path::new("/src/main.go")).then(|| WITH_FIXES_SOURCE.to_string())
+        })
+    }
+
+    fn fixes_named(reported: &[Reported], analyzer: &str) -> Vec<Fix> {
+        reported
+            .iter()
+            .filter(|one| {
+                one.diagnostic.code == Some(lsp::NumberOrString::String(analyzer.to_string()))
+            })
+            .flat_map(|one| one.fixes.clone())
+            .collect()
+    }
 
     /// The file `REAL_BUILD` was captured over.
     fn built_file() -> String {
@@ -623,5 +828,144 @@ mod tests {
             reported[0].diagnostic.message,
             "cannot use x as string value\nhave (int)\nwant (string)"
         );
+    }
+
+    /// An analyzer's suggested fix is read under the analyzer's own name for
+    /// it, placed in the protocol's own unit, and carrying the text it
+    /// expects to replace. Go reports a byte offset, the protocol wants
+    /// UTF-16 code units, and the characters on the line are a third number
+    /// again.
+    #[test]
+    fn a_suggested_fix_is_read_with_its_own_words_and_placed_in_utf16_units() {
+        let line = WITH_FIXES_SOURCE
+            .lines()
+            .nth(9)
+            .expect("the line the format string is on");
+        let format = line.find("2006-02-01").expect("the format string");
+
+        // Three counts of the same place, all different.
+        assert_eq!(line[..format].len(), 58, "bytes");
+        assert_eq!(line[..format].chars().count(), 47, "characters");
+        assert_eq!(line[..format].encode_utf16().count(), 48, "UTF-16 units");
+
+        let reported = over_the_fixture_with_fixes(WITH_FIXES);
+        let fixes = fixes_named(&reported, "timeformat");
+        assert_eq!(fixes.len(), 1, "{fixes:?}");
+        assert_eq!(fixes[0].title, "Replace 2006-02-01 with 2006-01-02");
+        assert_eq!(fixes[0].replacements.len(), 1);
+        let replacement = &fixes[0].replacements[0];
+        assert_eq!(replacement.path, Path::new("/src/main.go"));
+        assert_eq!(
+            replacement.range,
+            lsp::Range {
+                start: lsp::Position::new(9, 48),
+                end: lsp::Position::new(9, 58),
+            },
+            "the protocol's own unit -- not the 58 bytes Go counts to get there"
+        );
+        assert_eq!(replacement.new_text, "2006-01-02");
+        assert_eq!(replacement.replaced, "2006-02-01");
+    }
+
+    /// One finding's alternatives are read as separate fixes, each whole. The
+    /// two edits of `stringintconv`'s second alternative are halves of one
+    /// change, and both belong to it.
+    #[test]
+    fn each_alternative_is_one_fix_however_many_places_it_touches() {
+        let fixes = fixes_named(&over_the_fixture_with_fixes(WITH_FIXES), "stringintconv");
+        let shape: Vec<(&str, usize)> = fixes
+            .iter()
+            .map(|fix| (fix.title.as_str(), fix.replacements.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Format the number as a decimal", 1),
+                ("Convert a single rune to a string", 2),
+            ]
+        );
+        // A pure insertion: it replaces nothing, and both halves are one.
+        assert_eq!(fixes[1].replacements[0].new_text, "rune(");
+        assert_eq!(fixes[1].replacements[0].replaced, "");
+        assert_eq!(fixes[1].replacements[1].new_text, ")");
+    }
+
+    /// `go vet` grades nothing, so the only grade this reader has is the
+    /// contract every analyzer writes to: a fix's edits must not overlap, an
+    /// edit's end must not precede its start, and a fix the reader cannot
+    /// name or that changes nothing is no fix. A fix that breaks any of that
+    /// is refused whole -- half of a two-part change applied alone would
+    /// leave the file broken.
+    #[test]
+    fn a_fix_that_breaks_the_analyzer_contract_is_refused_whole() {
+        const TIMEFORMAT: &str = "Replace 2006-02-01 with 2006-01-02";
+        const TWO_EDITS: &str = "Convert a single rune to a string";
+        let refused: [(&str, String, &[&str]); 4] = [
+            (
+                "an overlap",
+                WITH_FIXES.replace("\"end\": 198,", "\"end\": 205,"),
+                &[TWO_EDITS],
+            ),
+            (
+                "an end before its start",
+                WITH_FIXES.replace("\"end\": 155,", "\"end\": 5,"),
+                &[TIMEFORMAT],
+            ),
+            ("no name", WITH_FIXES.replace(TIMEFORMAT, ""), &[TIMEFORMAT]),
+            (
+                // The real arrays move to a field nothing reads, leaving
+                // every fix with nothing to apply.
+                "no edits",
+                WITH_FIXES.replace("\"edits\": [", "\"edits\": [], \"unread\": ["),
+                &[TIMEFORMAT, TWO_EDITS],
+            ),
+        ];
+        for (why, output, gone) in refused {
+            assert_ne!(output, WITH_FIXES, "{why}: the fixture shape has moved");
+            let reported = over_the_fixture_with_fixes(&output);
+            assert!(
+                !reported.is_empty(),
+                "{why}: the findings themselves must survive"
+            );
+            let named: Vec<String> = reported
+                .iter()
+                .flat_map(|one| one.fixes.iter().map(|fix| fix.title.clone()))
+                .collect();
+            for refused in gone {
+                assert!(
+                    !named.iter().any(|title| title == refused),
+                    "{why}: {named:?}"
+                );
+            }
+        }
+    }
+
+    /// A byte offset past the end of the text lands at the end of what there
+    /// is, and one inside a character on the boundary before it. The report
+    /// was measured against a file the editor may have changed since, and a
+    /// panic in a diagnostics reader would take the editor down over a stale
+    /// count.
+    #[test]
+    fn a_byte_offset_past_the_end_lands_at_the_end() {
+        assert_eq!(
+            utf16_position_at("package main\n", 9_000),
+            lsp::Position::new(1, 0)
+        );
+        assert_eq!(
+            utf16_position_at("a\n\u{1f980}b\n", 3),
+            lsp::Position::new(1, 0),
+            "the second line, before the emoji"
+        );
+        assert_eq!(
+            utf16_position_at("a\n\u{1f980}b\n", 5),
+            lsp::Position::new(1, 0),
+            "inside the emoji, so on the boundary before it"
+        );
+        assert_eq!(
+            utf16_position_at("a\n\u{1f980}b\n", 6),
+            lsp::Position::new(1, 2),
+            "past the emoji, which is two UTF-16 units and four bytes"
+        );
+        assert_eq!(utf16_position_at("", 0), lsp::Position::new(0, 0));
     }
 }

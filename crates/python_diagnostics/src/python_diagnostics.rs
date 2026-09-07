@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use collections::HashMap;
 use serde::Deserialize;
 
+mod fixing;
 mod watching;
 
 pub use watching::{Lint, init};
@@ -17,6 +18,36 @@ pub struct Reported {
     /// Absolute, so a caller does not have to remember where ruff ran.
     pub path: PathBuf,
     pub diagnostic: lsp::Diagnostic,
+    /// The fix ruff computed for this finding and called safe, or nothing
+    /// where it computed none or would not vouch for the one it computed.
+    pub fixes: Vec<Fix>,
+}
+
+/// A fix ruff wrote itself, offered word for word as it gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    /// ruff's own words for it -- "Remove unused import: `os`".
+    pub title: String,
+    pub replacements: Vec<Replacement>,
+}
+
+/// One piece of text ruff asked to be put somewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// Absolute, like [`Reported::path`]. ruff keeps every edit of a fix in
+    /// the file the finding is in, so this is always that file.
+    pub path: PathBuf,
+    /// In UTF-16 code units, like [`Reported`]'s range and for the same
+    /// reason.
+    pub range: lsp::Range,
+    /// Empty where ruff asked for the range to be deleted, which is a fix
+    /// like any other and not the absence of one.
+    pub new_text: String,
+    /// The text that was in `range` when ruff measured it. A caller compares
+    /// it against what is there now: a file edited since the run has moved
+    /// every offset in the report, and a replacement made against moved
+    /// offsets overwrites something ruff never looked at.
+    pub replaced: String,
 }
 
 /// What `ruff check --output-format json` writes: one array holding one
@@ -32,7 +63,7 @@ struct Finding {
     location: Place,
     end_location: Place,
     #[serde(default)]
-    fix: Option<Fix>,
+    fix: Option<SuggestedFix>,
 }
 
 /// A place in a file, counted from one. `column` counts Unicode characters --
@@ -45,12 +76,36 @@ struct Place {
 }
 
 #[derive(Deserialize)]
-struct Fix {
+struct SuggestedFix {
     #[serde(default)]
     message: Option<String>,
+    /// Read as text rather than as an enum: a grade this reader has never
+    /// heard of must leave the rest of the finding readable, and an unknown
+    /// variant would fail the whole entry instead.
     #[serde(default)]
     applicability: Option<String>,
+    #[serde(default)]
+    edits: Vec<Edit>,
 }
+
+/// One piece of text ruff asked to put over `location..end_location`. The
+/// content is empty where it asked for a deletion.
+#[derive(Deserialize)]
+struct Edit {
+    content: String,
+    location: Place,
+    end_location: Place,
+}
+
+/// The one grade of fix this reader offers.
+///
+/// ruff grades every fix it computes, and only this grade is one it will
+/// apply without being asked twice. An `unsafe` fix can change what the code
+/// means -- rewriting `x == None` to `x is None` alters the comparison for a
+/// type that overloads `__eq__` -- and a `display` one is written to be read
+/// rather than applied. Applying either at one click would put something in
+/// the file that nobody asked for, and that is worse than offering nothing.
+const ONLY_GRADE_OFFERED: &str = "safe";
 
 /// The code ruff gives a parse error, as opposed to a lint rule firing.
 const PARSE_ERROR: &str = "invalid-syntax";
@@ -91,7 +146,9 @@ pub fn what_ruff_reported(
         let Some(text) = text else {
             continue;
         };
+        let fixes = fix_in(&finding, &path, text).into_iter().collect();
         reported.push(Reported {
+            fixes,
             diagnostic: lsp::Diagnostic {
                 range: lsp::Range {
                     start: utf16_position_of(text, finding.location.row, finding.location.column),
@@ -128,6 +185,78 @@ fn what_it_said(finding: &Finding) -> String {
         said.push_str(fix.message.as_deref().unwrap_or("available"));
     }
     said
+}
+
+/// The fix ruff offered for this finding, where it is one this reader will
+/// pass on.
+///
+/// Only [`ONLY_GRADE_OFFERED`] is kept; see there for why. A fix with no
+/// message is dropped as well: what the reader picks from a menu is the
+/// title, and an unnamed entry says nothing about what it will do.
+///
+/// A whole fix is refused where any one of its edits cannot be placed
+/// against the text ruff measured. Its edits are halves of one change --
+/// ruff's rewrite of a comparison deletes the old expression and writes the
+/// new one -- and applying some of them leaves the file worse than before.
+fn fix_in(finding: &Finding, path: &Path, text: &str) -> Option<Fix> {
+    let fix = finding.fix.as_ref()?;
+    if fix.applicability.as_deref() != Some(ONLY_GRADE_OFFERED) {
+        return None;
+    }
+    let title = fix.message.clone()?;
+    if title.is_empty() || fix.edits.is_empty() {
+        return None;
+    }
+    let mut replacements = Vec::with_capacity(fix.edits.len());
+    for edit in &fix.edits {
+        let start = byte_offset_of(text, edit.location.row, edit.location.column)?;
+        let end = byte_offset_of(text, edit.end_location.row, edit.end_location.column)?;
+        // A range the text cannot be sliced by has been measured against a
+        // different file than the one being read, and an empty string here
+        // would be indistinguishable from ruff asking for an insertion.
+        let replaced = text.get(start..end)?.to_string();
+        replacements.push(Replacement {
+            path: path.to_path_buf(),
+            range: lsp::Range {
+                start: utf16_position_of(text, edit.location.row, edit.location.column),
+                end: utf16_position_of(text, edit.end_location.row, edit.end_location.column),
+            },
+            new_text: edit.content.clone(),
+            replaced,
+        });
+    }
+    Some(Fix {
+        title,
+        replacements,
+    })
+}
+
+/// The byte offset a row and column fall at, needed because the text has to
+/// be sliced by it to learn what a fix expects to replace.
+///
+/// ruff counts a row from one and a column in Unicode characters from one,
+/// which is a third unit again from the bytes the file is stored in and the
+/// UTF-16 code units the protocol asks for.
+///
+/// A row past the end of the text yields nothing rather than a guess: the
+/// report was measured against a file the editor may have changed since, and
+/// a fix placed by guess would overwrite text ruff never looked at. A column
+/// past the end of its line lands at the end of that line, which is where
+/// ruff itself points at a line's trailing whitespace.
+fn byte_offset_of(text: &str, row: u32, column: u32) -> Option<usize> {
+    let rows_before = row.checked_sub(1)?;
+    let mut line_starts_at = 0usize;
+    for _ in 0..rows_before {
+        line_starts_at += text.get(line_starts_at..)?.find('\n')? + 1;
+    }
+    let rest = text.get(line_starts_at..)?;
+    let line = rest.split('\n').next().unwrap_or(rest);
+    let within: usize = line
+        .chars()
+        .take(column.saturating_sub(1) as usize)
+        .map(char::len_utf8)
+        .sum();
+    Some(line_starts_at + within)
 }
 
 /// ruff calls every finding an error, which would paint a file red over a
@@ -180,6 +309,18 @@ mod tests {
     /// than written by hand: every field this reader depends on is one ruff
     /// actually emits, in the shape it actually emits it.
     const REAL_OUTPUT: &str = include_str!("../test_data/ruff-check.json");
+
+    /// Real output from the same command over a file whose safe fix lands
+    /// after an emoji, captured together with the file itself so that every
+    /// column in it can be checked against the text it was measured on.
+    const WITH_FIXES: &str = include_str!("../test_data/ruff-check-fixes.json");
+    const WITH_FIXES_SOURCE: &str = include_str!("../test_data/ruff-check-fixes.source");
+
+    fn over_the_fixture_with_fixes() -> Vec<Reported> {
+        what_ruff_reported(WITH_FIXES, Path::new("/project"), |path| {
+            (path == Path::new("/project/lint_me.py")).then(|| WITH_FIXES_SOURCE.to_string())
+        })
+    }
 
     /// The file the fixture was captured over, byte for byte.
     fn linted() -> String {
@@ -351,5 +492,99 @@ mod tests {
         );
         assert_eq!(utf16_position_of(text, 1, 9_000), lsp::Position::new(0, 5));
         assert_eq!(utf16_position_of("", 1, 1), lsp::Position::new(0, 0));
+    }
+
+    /// Only a fix ruff itself calls safe is passed on. It grades every fix it
+    /// computes, and an `unsafe` one changes what the code means -- applying
+    /// that at one click is worse than offering nothing.
+    #[test]
+    fn only_a_fix_ruff_calls_safe_is_kept() {
+        let reported = over_the_fixture_with_fixes();
+
+        let graded: Vec<(String, Vec<&str>)> = reported
+            .iter()
+            .map(|one| {
+                let code = match &one.diagnostic.code {
+                    Some(lsp::NumberOrString::String(code)) => code.clone(),
+                    _ => String::new(),
+                };
+                (
+                    code,
+                    one.fixes.iter().map(|fix| fix.title.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            graded,
+            vec![
+                ("F401".to_string(), vec!["Remove unused import: `os`"]),
+                ("E703".to_string(), vec!["Remove unnecessary semicolon"]),
+                // Graded unsafe by ruff: `x == None` and `x is None` are not
+                // the same comparison for a type that overloads `__eq__`.
+                ("E711".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    /// A fix's edit is placed in the protocol's own unit and carries the text
+    /// it expects to replace. ruff counts characters from one, the file is
+    /// bytes, and the protocol wants UTF-16 code units -- three numbers that
+    /// disagree on the line the safe fix lands on.
+    #[test]
+    fn a_fixs_edit_is_placed_in_utf16_units_and_carries_what_it_replaces() {
+        let line = WITH_FIXES_SOURCE
+            .lines()
+            .nth(5)
+            .expect("the line the semicolon is on");
+        let semicolon = line.find(';').expect("the semicolon");
+
+        // Three counts of the same place, all different.
+        assert_eq!(line[..semicolon].len(), 33, "bytes");
+        assert_eq!(line[..semicolon].chars().count(), 19, "characters");
+        assert_eq!(line[..semicolon].encode_utf16().count(), 21, "UTF-16 units");
+
+        let reported = over_the_fixture_with_fixes();
+        let fix = reported[1].fixes.first().expect("the semicolon's fix");
+        assert_eq!(fix.replacements.len(), 1);
+        let replacement = &fix.replacements[0];
+        assert_eq!(replacement.path, Path::new("/project/lint_me.py"));
+        assert_eq!(
+            replacement.range,
+            lsp::Range {
+                start: lsp::Position::new(5, 21),
+                end: lsp::Position::new(5, 22),
+            },
+            "the protocol's own unit -- not 33, and not the 19 ruff reports"
+        );
+        assert_eq!(replacement.new_text, "", "ruff asked for a deletion");
+        assert_eq!(replacement.replaced, ";");
+    }
+
+    /// A fix with no message is dropped even where ruff calls it safe: what
+    /// the reader picks from a menu is the title, and an unnamed entry says
+    /// nothing about what it will do.
+    #[test]
+    fn a_fix_with_no_name_is_not_kept() {
+        let unnamed = WITH_FIXES.replace(
+            "\"message\": \"Remove unnecessary semicolon\"",
+            "\"message\": null",
+        );
+        let reported = what_ruff_reported(&unnamed, Path::new("/project"), |path| {
+            (path == Path::new("/project/lint_me.py")).then(|| WITH_FIXES_SOURCE.to_string())
+        });
+        assert!(reported[1].fixes.is_empty(), "{:?}", reported[1].fixes);
+    }
+
+    /// A row past the end of the text yields no byte offset at all. The
+    /// report was measured against a file the editor may have changed since,
+    /// and a fix placed by guess would overwrite text ruff never looked at.
+    #[test]
+    fn a_row_past_the_end_has_no_byte_offset() {
+        let text = "x = 1\ny = 2\n";
+        assert_eq!(byte_offset_of(text, 2, 1), Some(6));
+        assert_eq!(byte_offset_of(text, 9_000, 1), None);
+        assert_eq!(byte_offset_of(text, 0, 1), None);
+        // A column past the end of its line lands at that line's end.
+        assert_eq!(byte_offset_of(text, 1, 9_000), Some(5));
     }
 }

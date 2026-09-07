@@ -1,0 +1,9 @@
+import os
+
+
+def add(first, second):
+    total = first + second
+    описание = "🦀🔥";
+    if описание == None:
+        return 0
+    return total

@@ -1,0 +1,61 @@
+# example.com/m
+# [example.com/m]
+{
+	"example.com/m": {
+		"stringintconv": [
+			{
+				"posn": "/src/main.go:12:14",
+				"message": "conversion from int to string yields a string of one rune, not a string of digits",
+				"suggested_fixes": [
+					{
+						"message": "Format the number as a decimal",
+						"edits": [
+							{
+								"filename": "/src/main.go",
+								"start": 191,
+								"end": 197,
+								"new": "fmt.Sprint"
+							}
+						]
+					},
+					{
+						"message": "Convert a single rune to a string",
+						"edits": [
+							{
+								"filename": "/src/main.go",
+								"start": 198,
+								"end": 198,
+								"new": "rune("
+							},
+							{
+								"filename": "/src/main.go",
+								"start": 202,
+								"end": 202,
+								"new": ")"
+							}
+						]
+					}
+				]
+			}
+		],
+		"timeformat": [
+			{
+				"posn": "/src/main.go:10:59",
+				"message": "2006-02-01 should be 2006-01-02",
+				"suggested_fixes": [
+					{
+						"message": "Replace 2006-02-01 with 2006-01-02",
+						"edits": [
+							{
+								"filename": "/src/main.go",
+								"start": 145,
+								"end": 155,
+								"new": "2006-01-02"
+							}
+						]
+					}
+				]
+			}
+		]
+	}
+}
