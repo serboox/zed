@@ -1,8 +1,8 @@
 use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll, styled_runs_for_code_label};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, StyledText, Task, TaskExt,
-    TextStyle, WeakEntity, Window, relative,
+    AnyElement, App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, StyledText,
+    Task, TaskExt, TextStyle, WeakEntity, Window, relative,
 };
 use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate, PreviewUpdate};
@@ -47,6 +47,9 @@ pub struct ProjectSymbolsDelegate {
     external_match_candidates: Vec<StringMatchCandidate>,
     show_worktree_root_name: bool,
     matches: Vec<StringMatch>,
+    /// True when the source that answered had more matches than it was
+    /// willing to list, so the list on screen is not all there is.
+    cut_short: bool,
 }
 
 impl ProjectSymbolsDelegate {
@@ -60,6 +63,7 @@ impl ProjectSymbolsDelegate {
             external_match_candidates: Default::default(),
             matches: Default::default(),
             show_worktree_root_name: false,
+            cut_short: false,
         }
     }
 
@@ -210,14 +214,16 @@ impl PickerDelegate for ProjectSymbolsDelegate {
             .to_owned();
         self.filter(&query_filter, window, cx);
         self.show_worktree_root_name = self.project.read(cx).visible_worktrees(cx).count() > 1;
-        let symbols = self
+        let listing = self
             .project
-            .update(cx, |project, cx| project.symbols(&query, cx));
+            .update(cx, |project, cx| project.symbol_listing(&query, cx));
         cx.spawn_in(window, async move |this, cx| {
-            let symbols = symbols.await.log_err();
-            if let Some(symbols) = symbols {
+            let listing = listing.await.log_err();
+            if let Some(listing) = listing {
+                let (symbols, cut_short) = (listing.symbols, listing.cut_short);
                 this.update_in(cx, |this, window, cx| {
                     let delegate = &mut this.delegate;
+                    delegate.cut_short = cut_short;
                     let project = delegate.project.read(cx);
                     let (visible_match_candidates, external_match_candidates) = symbols
                         .iter()
@@ -243,6 +249,33 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                 .log_err();
             }
         })
+    }
+
+    /// Says so when the list is not all there is. A reader who cannot find a
+    /// name in a list that was cut short would otherwise conclude the project
+    /// does not declare it.
+    fn render_header(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        if !self.cut_short {
+            return None;
+        }
+        Some(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .child(
+                    Label::new("Too many matches to list -- narrow the search.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_match(
@@ -334,7 +367,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use gpui::{TestAppContext, VisualContext};
+    use gpui::{TestAppContext, VisualContext, VisualTestContext};
     use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
     use lsp::OneOf;
     use project::FakeFs;
@@ -604,6 +637,259 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
+            crate::init(cx);
+            symbol_index::symbols_of_the_project::init(cx);
+            // Deliberately not `symbol_index::init`: its own `cx.observe_new`
+            // would register a project's index at the real, shared
+            // `paths::database_dir()` the moment a workspace opens. A test
+            // that needs an index calls `symbol_index::ensure_index_at`
+            // directly with a scratch directory instead.
+        });
+    }
+
+    /// A project that exists twice over at one and the same path: the editor's
+    /// side is the deterministic in-memory filesystem, and the index's side is
+    /// a real directory, because the symbol index walks and reads the disk
+    /// itself rather than going through the editor's filesystem abstraction.
+    async fn a_project_on_disk(
+        files: &[(&str, &str)],
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<Project>) {
+        let held = tempfile::tempdir().expect("a directory to put a project in");
+        let mut tree = serde_json::Map::new();
+        for (name, contents) in files {
+            std::fs::write(held.path().join(name), contents).expect("a project file on disk");
+            tree.insert(
+                (*name).to_string(),
+                serde_json::Value::String((*contents).to_string()),
+            );
+        }
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(held.path(), serde_json::Value::Object(tree))
+            .await;
+        let project = Project::test(fs, [held.path()], cx).await;
+        (held, project)
+    }
+
+    /// A project's index, kept at a scratch directory rather than the real
+    /// `paths::database_dir()`, registered so that `symbol_index::of_project`
+    /// finds it the same way it would find one `symbol_index::init` built.
+    fn an_index_for(
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<symbol_index::SymbolIndex>) {
+        let held = tempfile::tempdir().expect("a directory for the index's own files");
+        let index_dir = held.path().join("symbol_index");
+        let index = cx.update(|cx| symbol_index::ensure_index_at(project, index_dir, cx));
+        (held, index)
+    }
+
+    /// Opens a real workspace over `project` and opens the picker through the
+    /// real action `cmd-t` is bound to, rather than constructing the delegate.
+    fn open_the_picker(
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> (ProjectSymbols, Entity<Workspace>, &mut VisualTestContext) {
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.dispatch_action(workspace::ToggleProjectSymbols);
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<Picker<ProjectSymbolsDelegate>>(cx)
+                .expect("the picker did not open")
+        });
+        (picker, workspace, cx)
+    }
+
+    /// The bug this guards against: `Project::symbols` went to the language
+    /// servers and nowhere else, so with none running the most-used
+    /// navigation shortcut in the editor listed nothing at all, whatever the
+    /// project's own index held.
+    #[gpui::test]
+    async fn the_index_answers_when_no_language_server_does(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_on_disk, project) = a_project_on_disk(
+            &[(
+                "stock.rs",
+                "pub fn open_up() {}\n\npub fn take_stock() {}\n",
+            )],
+            cx,
+        )
+        .await;
+        let (_index_at, _index) = an_index_for(project.clone(), cx);
+        // The index parses in the background; reading it before that has
+        // finished reads an empty one.
+        cx.executor().run_until_parked();
+
+        let (picker, workspace, cx) = open_the_picker(project, cx);
+        cx.simulate_input("take_stock");
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            let names: Vec<&str> = picker
+                .delegate
+                .matches
+                .iter()
+                .map(|matched| matched.string.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["take_stock"],
+                "with no language server the index must answer: {names:?}"
+            );
+        });
+
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<Editor>(cx)
+                .expect("confirming a symbol should have opened an editor")
+        });
+        editor.update_in(cx, |editor, _window, cx| {
+            assert_eq!(editor.title(cx), "stock.rs");
+            let snapshot = editor.display_snapshot(cx);
+            let head = editor
+                .selections
+                .newest::<language::Point>(&snapshot)
+                .head();
+            assert_eq!(head.row, 2, "`take_stock` is declared on the third line");
+        });
+    }
+
+    /// The precedence this guards: where a language server answered, its
+    /// answer is what the reader sees, whole and unjoined by the index, so
+    /// that no symbol is listed twice.
+    #[gpui::test]
+    async fn a_language_server_that_answers_is_not_joined_by_the_index(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (on_disk, project) = a_project_on_disk(
+            &[("stock.rs", "pub fn take_stock_from_the_index() {}\n")],
+            cx,
+        )
+        .await;
+        let (_index_at, _index) = an_index_for(project.clone(), cx);
+        cx.executor().run_until_parked();
+
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(Arc::new(Language::new(
+            LanguageConfig {
+                name: "Rust".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["rs".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    workspace_symbol_provider: Some(OneOf::Left(true)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let stock = on_disk.path().join("stock.rs");
+        let _buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(&stock, cx)
+            })
+            .await
+            .expect("the project file should open");
+
+        let fake_symbols = [symbol("take_stock_from_the_server", &stock)];
+        let fake_server = fake_servers.next().await.expect("a fake server to start");
+        fake_server.set_request_handler::<lsp::WorkspaceSymbolRequest, _, _>(
+            move |params: lsp::WorkspaceSymbolParams, cx| {
+                let executor = cx.background_executor().clone();
+                let fake_symbols = fake_symbols.clone();
+                async move {
+                    let candidates = fake_symbols
+                        .iter()
+                        .enumerate()
+                        .map(|(id, symbol)| StringMatchCandidate::new(id, &symbol.name))
+                        .collect::<Vec<_>>();
+                    let matches = fuzzy::match_strings(
+                        &candidates,
+                        &params.query,
+                        true,
+                        true,
+                        100,
+                        &Default::default(),
+                        executor,
+                    )
+                    .await;
+                    Ok(Some(lsp::WorkspaceSymbolResponse::Flat(
+                        matches
+                            .into_iter()
+                            .map(|mat| fake_symbols[mat.candidate_id].clone())
+                            .collect(),
+                    )))
+                }
+            },
+        );
+
+        let (picker, _workspace, cx) = open_the_picker(project, cx);
+        cx.simulate_input("take_stock");
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            let names: Vec<&str> = picker
+                .delegate
+                .matches
+                .iter()
+                .map(|matched| matched.string.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["take_stock_from_the_server"],
+                "the server answered, so the index must stay out of the list: {names:?}"
+            );
+            assert!(
+                !picker.delegate.cut_short,
+                "the server's answer is never reported as cut short"
+            );
+        });
+    }
+
+    /// A list the index cut short must say so, rather than reading as though
+    /// the project declares nothing else by that name.
+    #[gpui::test]
+    async fn a_list_cut_short_says_so(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut declarations = String::new();
+        for at in 0..=symbol_index::index_semantics::MOST_PLACES_WORTH_OPENING {
+            declarations.push_str(&format!("pub fn cutshort{at:05}() {{}}\n"));
+        }
+        let (_on_disk, project) = a_project_on_disk(&[("many.rs", &declarations)], cx).await;
+        let (_index_at, _index) = an_index_for(project.clone(), cx);
+        cx.executor().run_until_parked();
+
+        let (picker, _workspace, cx) = open_the_picker(project, cx);
+        cx.simulate_input("cutshort");
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            assert!(
+                picker.delegate.cut_short,
+                "more matches than are worth listing must be reported as cut short"
+            );
+            assert!(
+                picker.delegate.match_count() > 0,
+                "the header only shows alongside a list"
+            );
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            assert!(
+                picker.delegate.render_header(window, cx).is_some(),
+                "a cut-short list must say so on screen, not only in the delegate"
+            );
         });
     }
 
