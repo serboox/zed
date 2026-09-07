@@ -4,6 +4,10 @@ mod parsing;
 mod relating;
 mod watching;
 
+use std::path::{Path, PathBuf};
+
+use collections::HashMap;
+
 pub use compile_commands::{Entry, arguments_for, entries_in, where_the_database_is};
 pub use parsing::{
     Asked, Described, HELD_AT_MOST, NamedType, Parsed, Place, Related, Relatives, Request,
@@ -33,21 +37,40 @@ pub enum Severity {
     Error,
 }
 
-/// One thing the front end said about the file it parsed.
+/// One thing the front end said, and where it said it.
 ///
 /// Plain data, and deliberately so: it is read on the one thread that owns
 /// `libclang` and answered on another, and nothing borrowed from a
 /// translation unit may outlive the parse that produced it.
 ///
-/// `start` and `end` are byte offsets into the text that was parsed, which is
-/// the buffer's text and not the file on disk. The front end counts columns in
-/// bytes and the protocol counts them in UTF-16 code units, so the offsets are
-/// kept as they came and converted once, against that same text, in
-/// [`as_diagnostics`].
+/// `start` and `end` are byte offsets into `file`, which is not always the file
+/// that was parsed: a header the file includes is part of the same translation
+/// unit, and an error in one belongs on the header's own line. The front end
+/// counts columns in bytes and the protocol counts them in UTF-16 code units,
+/// so the offsets are kept as they came and converted once, against the text of
+/// the file they are in, in [`as_diagnostics_by_file`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub severity: Severity,
     pub message: String,
+    /// The warning's own flag, as the compiler spells it on the command line --
+    /// `-Wunused-variable`. Absent for a hard error, which has no flag to
+    /// switch it off with and so has no name to look up.
+    pub code: Option<String>,
+    pub file: PathBuf,
+    pub start: usize,
+    pub end: usize,
+    /// The notes the front end hung off it, each still at its own place.
+    pub notes: Vec<Note>,
+}
+
+/// One note explaining a [`Finding`] -- which overload was tried, where the
+/// conflicting declaration is -- at the place it is about, which is very often
+/// not the place the finding is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub message: String,
+    pub file: PathBuf,
     pub start: usize,
     pub end: usize,
 }
@@ -56,29 +79,72 @@ pub struct Finding {
 /// sources on a file said what.
 pub const SOURCE: &str = "clang";
 
-/// What the front end said, in the shape the editor shows.
+/// What the front end said, grouped by the file each finding is in and in the
+/// shape the editor shows.
 ///
-/// `text` must be the text that was parsed. The offsets in a [`Finding`] are
-/// only meaningful against it, and placing a diagnostic on the wrong column is
-/// worse than not showing it.
-pub fn as_diagnostics(findings: &[Finding], text: &str) -> Vec<lsp::Diagnostic> {
-    findings
-        .iter()
-        .map(|finding| lsp::Diagnostic {
+/// `text_of` must answer with the text each file was parsed as -- the buffer's
+/// text for the file being edited, and what is on disk for a header. The
+/// offsets in a [`Finding`] are only meaningful against that, and placing a
+/// diagnostic on the wrong column is worse than not showing it. A file it
+/// cannot answer for is left out rather than guessed at.
+pub fn as_diagnostics_by_file(
+    findings: &[Finding],
+    text_of: impl Fn(&Path) -> Option<String>,
+) -> Vec<(PathBuf, Vec<lsp::Diagnostic>)> {
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::default();
+    let mut text_for = |file: &Path| -> Option<String> {
+        if !texts.contains_key(file) {
+            texts.insert(file.to_path_buf(), text_of(file));
+        }
+        texts.get(file).cloned().flatten()
+    };
+
+    let mut by_file: Vec<(PathBuf, Vec<lsp::Diagnostic>)> = Vec::new();
+    for finding in findings {
+        let Some(text) = text_for(&finding.file) else {
+            continue;
+        };
+        let mut related = Vec::new();
+        for note in &finding.notes {
+            let Some(note_text) = text_for(&note.file) else {
+                continue;
+            };
+            let Ok(uri) = lsp::Uri::from_file_path(&note.file) else {
+                continue;
+            };
+            related.push(lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri,
+                    range: lsp::Range {
+                        start: utf16_position_at(&note_text, note.start),
+                        end: utf16_position_at(&note_text, note.end),
+                    },
+                },
+                message: note.message.clone(),
+            });
+        }
+        let diagnostic = lsp::Diagnostic {
             range: lsp::Range {
-                start: utf16_position_at(text, finding.start),
-                end: utf16_position_at(text, finding.end),
+                start: utf16_position_at(&text, finding.start),
+                end: utf16_position_at(&text, finding.end),
             },
             severity: Some(match finding.severity {
                 Severity::Error => lsp::DiagnosticSeverity::ERROR,
                 Severity::Warning => lsp::DiagnosticSeverity::WARNING,
                 Severity::Note => lsp::DiagnosticSeverity::INFORMATION,
             }),
+            code: finding.code.clone().map(lsp::NumberOrString::String),
             source: Some(SOURCE.to_string()),
             message: finding.message.clone(),
+            related_information: (!related.is_empty()).then_some(related),
             ..Default::default()
-        })
-        .collect()
+        };
+        match by_file.iter_mut().find(|(file, _)| *file == finding.file) {
+            Some((_, diagnostics)) => diagnostics.push(diagnostic),
+            None => by_file.push((finding.file.clone(), vec![diagnostic])),
+        }
+    }
+    by_file
 }
 
 /// The position a byte offset falls at, counted the way the protocol counts:
@@ -183,13 +249,18 @@ mod tests {
             [Severity::Error, Severity::Warning, Severity::Note].map(|severity| Finding {
                 severity,
                 message: "something".to_string(),
+                code: None,
+                file: PathBuf::from("/p/a.cpp"),
                 start: 0,
                 end: 1,
+                notes: Vec::new(),
             });
-        let shown: Vec<_> = as_diagnostics(&findings, "x;\n")
-            .into_iter()
-            .map(|diagnostic| diagnostic.severity)
-            .collect();
+        let shown: Vec<_> = only_file(as_diagnostics_by_file(&findings, |_| {
+            Some("x;\n".to_string())
+        }))
+        .into_iter()
+        .map(|diagnostic| diagnostic.severity)
+        .collect();
         assert_eq!(
             shown,
             vec![
@@ -208,13 +279,130 @@ mod tests {
         let findings = [Finding {
             severity: Severity::Error,
             message: "expected ';'".to_string(),
+            code: None,
+            file: PathBuf::from("/p/a.cpp"),
             start: 3,
             end: 3,
+            notes: Vec::new(),
         }];
-        let shown = as_diagnostics(&findings, "int x\n");
+        let shown = only_file(as_diagnostics_by_file(&findings, |_| {
+            Some("int x\n".to_string())
+        }));
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].source.as_deref(), Some("clang"));
         assert_eq!(shown[0].message, "expected ';'");
         assert_eq!(shown[0].range.start, lsp::Position::new(0, 3));
+        assert_eq!(shown[0].code, None, "a hard error has no flag to name");
+    }
+
+    /// A finding in a header goes to the header. A reader told that a header's
+    /// missing semicolon is on a line of the file that included it would go
+    /// looking at code that is fine.
+    #[test]
+    fn a_finding_is_filed_against_the_file_it_is_in() {
+        let findings = [
+            Finding {
+                severity: Severity::Error,
+                message: "expected ';' after class member declaration".to_string(),
+                code: None,
+                file: PathBuf::from("/p/thing.h"),
+                start: 12,
+                end: 12,
+                notes: Vec::new(),
+            },
+            Finding {
+                severity: Severity::Warning,
+                message: "unused variable 'spare'".to_string(),
+                code: Some("-Wunused-variable".to_string()),
+                file: PathBuf::from("/p/a.cpp"),
+                start: 0,
+                end: 5,
+                notes: Vec::new(),
+            },
+        ];
+        let by_file = as_diagnostics_by_file(&findings, |file| match file.to_str() {
+            Some("/p/thing.h") => Some("class Thing {\n  int one\n};\n".to_string()),
+            _ => Some("int spare;\n".to_string()),
+        });
+
+        assert_eq!(
+            by_file
+                .iter()
+                .map(|(file, diagnostics)| (file.clone(), diagnostics.len()))
+                .collect::<Vec<_>>(),
+            vec![
+                (PathBuf::from("/p/thing.h"), 1),
+                (PathBuf::from("/p/a.cpp"), 1),
+            ]
+        );
+        assert_eq!(by_file[0].1[0].range.start, lsp::Position::new(0, 12));
+        assert_eq!(
+            by_file[1].1[0].code,
+            Some(lsp::NumberOrString::String("-Wunused-variable".to_string())),
+            "the warning carries the flag that fired it",
+        );
+    }
+
+    /// A note keeps its own file and line, so a reader can go to the
+    /// declaration it names rather than read a path out of a message.
+    #[test]
+    fn a_note_arrives_as_a_location_and_not_as_text() {
+        let findings = [Finding {
+            severity: Severity::Error,
+            message: "redefinition of 'Thing'".to_string(),
+            code: None,
+            file: PathBuf::from("/p/a.cpp"),
+            start: 0,
+            end: 5,
+            notes: vec![Note {
+                message: "previous definition is here".to_string(),
+                file: PathBuf::from("/p/thing.h"),
+                start: 6,
+                end: 11,
+            }],
+        }];
+        let shown = only_file(as_diagnostics_by_file(&findings, |file| {
+            match file.to_str() {
+                Some("/p/thing.h") => Some("class Thing {};\n".to_string()),
+                _ => Some("class Thing {};\n".to_string()),
+            }
+        }));
+        let related = shown[0]
+            .related_information
+            .as_ref()
+            .expect("the note came through");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "previous definition is here");
+        assert_eq!(related[0].location.range.start, lsp::Position::new(0, 6));
+        assert!(
+            related[0].location.uri.to_string().ends_with("/p/thing.h"),
+            "the note points at the header it is in, not at the file being read",
+        );
+    }
+
+    /// A file whose text nobody can produce is left out. Its offsets mean
+    /// nothing without it, and a diagnostic placed at a guessed position points
+    /// the reader at innocent code.
+    #[test]
+    fn a_file_with_no_text_is_left_out_rather_than_guessed_at() {
+        let findings = [Finding {
+            severity: Severity::Error,
+            message: "expected ';'".to_string(),
+            code: None,
+            file: PathBuf::from("/p/gone.h"),
+            start: 3,
+            end: 3,
+            notes: Vec::new(),
+        }];
+        assert!(as_diagnostics_by_file(&findings, |_| None).is_empty());
+    }
+
+    fn only_file(by_file: Vec<(PathBuf, Vec<lsp::Diagnostic>)>) -> Vec<lsp::Diagnostic> {
+        assert_eq!(by_file.len(), 1, "one file was expected");
+        by_file
+            .into_iter()
+            .next()
+            .map(|(_, diagnostics)| diagnostics)
+            .unwrap_or_default()
     }
 }

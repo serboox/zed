@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
 
-use crate::{Finding, Severity};
+use crate::{Finding, Note, Severity};
 
 /// How many translation units are kept parsed at once.
 ///
@@ -634,9 +634,6 @@ fn fresh(
         // reader wants the list, and a missing header at the top of a file
         // would otherwise be the only thing ever reported.
         .keep_going(true)
-        // A warning in a header is about the header, and there are thousands of
-        // them in a system one. Errors from headers still arrive.
-        .ignore_non_errors_from_included_files(true)
         .parse()
         .map_err(|error| anyhow!("parsing {}: {error}", request.file.display()))
 }
@@ -648,13 +645,23 @@ fn reuse<'k>(held: impl Iterator<Item = &'k Key>, wanted: &Key) -> Option<usize>
         .map(|(at, _)| at)
 }
 
-/// What the front end said about the file it was asked about.
+/// Everything the front end said about this translation unit, each finding
+/// carrying the file it is in.
 ///
-/// Findings in other files are dropped. This source is about the file the
-/// reader has open; a diagnostic belongs on the file it is in, and putting a
-/// header's error on the line that included it would say the wrong thing about
-/// the wrong line. A header opened on its own is parsed on its own and reports
-/// there.
+/// An error in a header is kept. A translation unit is the file and every header
+/// it reaches, so an error in the reader's own header is something the compiler
+/// told us and the reader can act on; dropping it left a broken header looking
+/// clean for as long as the reader was editing the file that includes it. Which
+/// of the files kept here the editor can carry a diagnostic for is decided
+/// further out.
+///
+/// Anything milder than an error is kept only for the file that was parsed: a
+/// system header holds thousands of warnings and none of them is about the code
+/// the reader wrote. `libclang` will do that sifting itself, given
+/// `CXTranslationUnit_IgnoreNonErrorsFromIncludedFiles`, and it is not used
+/// because it also throws away the notes hung off the errors that are kept --
+/// a note is milder than an error, and the note saying where the earlier
+/// declaration is lives in the header it declared.
 ///
 /// The lifetime is written out rather than elided: a unit is kept across
 /// requests as a `'static` one, and reading it has to borrow it for less than
@@ -662,25 +669,50 @@ fn reuse<'k>(held: impl Iterator<Item = &'k Key>, wanted: &Key) -> Option<usize>
 fn findings_of<'a>(unit: &'a clang::TranslationUnit<'a>, about: &Path) -> Vec<Finding> {
     unit.get_diagnostics()
         .iter()
-        .filter_map(|diagnostic| finding_of(diagnostic, about))
+        .filter_map(finding_of)
+        .filter(|finding| finding.severity == Severity::Error || finding.file == about)
         .collect()
 }
 
-fn finding_of<'a>(diagnostic: &clang::diagnostic::Diagnostic<'a>, about: &Path) -> Option<Finding> {
+fn finding_of(diagnostic: &clang::diagnostic::Diagnostic<'_>) -> Option<Finding> {
     let severity = match diagnostic.get_severity() {
         clang::diagnostic::Severity::Ignored => return None,
         clang::diagnostic::Severity::Note => Severity::Note,
         clang::diagnostic::Severity::Warning => Severity::Warning,
         clang::diagnostic::Severity::Error | clang::diagnostic::Severity::Fatal => Severity::Error,
     };
-    let at = diagnostic.get_location().get_file_location();
-    if at.file?.get_path() != about {
-        return None;
-    }
+    let file = where_it_is(diagnostic)?;
+    let (start, end) = span_of(diagnostic, &file);
+    Some(Finding {
+        severity,
+        message: whole_of_what_it_said(diagnostic, &file),
+        code: flag_of(diagnostic),
+        notes: notes_of(diagnostic),
+        file,
+        start,
+        end,
+    })
+}
 
-    // The point the front end blamed, widened to the range it highlighted where
-    // it gave one. A range is what marks the whole of a bad expression rather
-    // than its first character.
+/// The file a diagnostic is in, where it is in one at all. A diagnostic about
+/// the command line rather than the code -- an unknown argument, a missing
+/// include path -- has no file, and there is nowhere in the reader's code to put
+/// it.
+fn where_it_is(diagnostic: &clang::diagnostic::Diagnostic<'_>) -> Option<PathBuf> {
+    Some(
+        diagnostic
+            .get_location()
+            .get_file_location()
+            .file?
+            .get_path(),
+    )
+}
+
+/// The point the front end blamed, widened to the range it highlighted where it
+/// gave one. A range is what marks the whole of a bad expression rather than its
+/// first character.
+fn span_of(diagnostic: &clang::diagnostic::Diagnostic<'_>, in_file: &Path) -> (usize, usize) {
+    let at = diagnostic.get_location().get_file_location();
     let (start, end) = diagnostic
         .get_ranges()
         .iter()
@@ -691,31 +723,108 @@ fn finding_of<'a>(diagnostic: &clang::diagnostic::Diagnostic<'a>, about: &Path) 
             )
         })
         .find(|(start, end)| {
-            start.file.map(|file| file.get_path()).as_deref() == Some(about)
+            start.file.map(|file| file.get_path()).as_deref() == Some(in_file)
                 && end.offset >= start.offset
         })
         .map_or((at.offset, at.offset), |(start, end)| {
             (start.offset, end.offset)
         });
-
-    Some(Finding {
-        severity,
-        message: whole_of_what_it_said(diagnostic),
-        start: start as usize,
-        end: end as usize,
-    })
+    (start as usize, end as usize)
 }
 
-/// A diagnostic and the notes hung off it, as one message.
+/// The warning's own flag, as the compiler spells it -- `-Wunused-variable`.
 ///
-/// The note is often where the answer is -- which overload was tried, where the
-/// conflicting declaration is -- and a note shown on its own line miles away
-/// from the error it explains is a note nobody reads.
-fn whole_of_what_it_said(diagnostic: &clang::diagnostic::Diagnostic<'_>) -> String {
+/// `libclang` offers no accessor for it and only appends it, in brackets, to a
+/// formatted line, so it is read back off that line and only where the line is
+/// exactly the diagnostic's own text with a bracketed tail after it. Anything
+/// else is left without a code: a reader looks a code up, and a made-up one
+/// sends them somewhere that does not exist.
+fn flag_of(diagnostic: &clang::diagnostic::Diagnostic<'_>) -> Option<String> {
+    let text = diagnostic.get_text();
+    let mut formatter = diagnostic.formatter();
+    let formatted = formatter
+        .source_location(false)
+        .column(false)
+        .source_ranges(false)
+        .option(true)
+        .category_id(false)
+        .category_name(false)
+        .format();
+    // `clang_formatDiagnostic` prints the severity word too, and offers no flag
+    // to leave it out, so the line is read from its end instead: a bracketed
+    // tail with the diagnostic's own text immediately in front of it. Anything
+    // that does not look like that -- a message that itself ends in brackets --
+    // yields nothing.
+    let line = formatted.trim_end();
+    let without_the_bracket = line.strip_suffix(']')?;
+    let opened = without_the_bracket.rfind('[')?;
+    let (before, flags) = without_the_bracket.split_at(opened);
+    if !before.trim_end().ends_with(&text) {
+        return None;
+    }
+    // A warning turned into an error arrives as `-Werror,-Wunused-variable`:
+    // the promotion first, the warning that actually fired last, and the last
+    // is the one a reader looks up.
+    flags
+        .strip_prefix('[')?
+        .rsplit(',')
+        .next()
+        .map(str::trim)
+        .filter(|flag| flag.starts_with('-'))
+        .map(str::to_string)
+}
+
+/// The notes hung off a diagnostic, each still at its own place.
+///
+/// A note without a file is dropped: it explains something the reader cannot be
+/// sent to, and it has already been kept in the message below.
+fn notes_of(diagnostic: &clang::diagnostic::Diagnostic<'_>) -> Vec<Note> {
+    diagnostic
+        .get_children()
+        .iter()
+        .filter_map(|note| {
+            let file = where_it_is(note)?;
+            let (start, end) = span_of(note, &file);
+            Some(Note {
+                message: note.get_text(),
+                file,
+                start,
+                end,
+            })
+        })
+        .collect()
+}
+
+/// The diagnostic's own text, with only those notes that nothing can show in
+/// place appended to it.
+///
+/// A note in the same file as the diagnostic arrives as a related location and
+/// is painted at the line it is about, which is where it is worth most. A note
+/// in another file -- the header holding the overload that was tried, the
+/// earlier declaration -- has nowhere to be painted next to the error it
+/// explains, so its text stays here, with the file and line it names, rather
+/// than being lost.
+fn whole_of_what_it_said(diagnostic: &clang::diagnostic::Diagnostic<'_>, about: &Path) -> String {
     let mut said = diagnostic.get_text();
     for note in diagnostic.get_children() {
-        said.push_str("\nnote: ");
-        said.push_str(&note.get_text());
+        let at = note.get_location().get_file_location();
+        let Some(file) = at.file.map(|file| file.get_path()) else {
+            said.push_str(&format!("\nnote: {}", note.get_text()));
+            continue;
+        };
+        if file == about {
+            continue;
+        }
+        let named = file
+            .file_name()
+            .unwrap_or(file.as_os_str())
+            .to_string_lossy()
+            .to_string();
+        said.push_str(&format!(
+            "\nnote: {} ({named}:{})",
+            note.get_text(),
+            at.line
+        ));
     }
     said
 }
@@ -766,6 +875,205 @@ mod tests {
         );
     }
 
+    /// A source file, a header beside it, and what the front end said about the
+    /// pair. Written out rather than going through the editor so a test needs
+    /// no window, no project and no buffer.
+    struct TwoFiles {
+        _directory: tempfile::TempDir,
+        source: PathBuf,
+        header: PathBuf,
+        source_text: String,
+        header_text: String,
+    }
+
+    const HEADER_NAME: &str = "included.h";
+
+    fn two_files(source_text: &str, header_text: &str) -> TwoFiles {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("reading.cpp");
+        let header = directory.path().join(HEADER_NAME);
+        std::fs::write(&source, source_text).expect("the source on disk");
+        std::fs::write(&header, header_text).expect("the header on disk");
+        TwoFiles {
+            _directory: directory,
+            source,
+            header,
+            source_text: source_text.to_string(),
+            header_text: header_text.to_string(),
+        }
+    }
+
+    fn what_is_wrong_with(held: &TwoFiles) -> Vec<Finding> {
+        futures::executor::block_on(ask_libclang(Request {
+            file: held.source.clone(),
+            text: held.source_text.clone(),
+            arguments: vec!["-std=c++20".to_string(), "-Wall".to_string()],
+            asked: Asked::WhatIsWrong,
+        }))
+        .expect("a parse")
+        .findings
+    }
+
+    /// The claim: a mistake the reader left in their own header reaches them
+    /// while they are editing the file that includes it, filed against the
+    /// header -- and nothing is put on the file they are editing, whose lines
+    /// are all fine.
+    #[test]
+    #[ignore = "needs libclang on the machine"]
+    fn an_error_in_an_included_header_is_reported_against_the_header() {
+        let held = two_files(
+            &format!("#include \"{HEADER_NAME}\"\n\nint main() {{ return 0; }}\n"),
+            "struct Thing {\n    int one\n};\n",
+        );
+        let findings = what_is_wrong_with(&held);
+
+        let in_the_header: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.file == held.header)
+            .collect();
+        assert!(
+            in_the_header
+                .iter()
+                .any(|finding| finding.severity == Severity::Error),
+            "the header's error reached the reader, out of {findings:#?}",
+        );
+        assert!(
+            findings.iter().all(|finding| finding.file != held.source),
+            "nothing was put on the file being edited, which has no mistake in it: {findings:#?}",
+        );
+        for finding in in_the_header {
+            assert!(
+                finding.start >= held.header_text.find("int one").unwrap_or_default(),
+                "the offset is in the header's own text, at or after the member it is about",
+            );
+            assert!(
+                finding.end <= held.header_text.len(),
+                "and inside the header rather than past its end",
+            );
+        }
+    }
+
+    /// The claim: a warning arrives named by the flag that fired it, so a
+    /// reader can look it up or switch it off, and a hard error -- which has no
+    /// flag -- arrives with none rather than with an invented one.
+    #[test]
+    #[ignore = "needs libclang on the machine"]
+    fn a_warning_carries_its_own_flag_and_a_hard_error_carries_no_code() {
+        let held = two_files(
+            "int counted() {\n    int spare = 1;\n    return 0;\n}\n\
+             \n\
+             int main() { return nothing_at_all(); }\n",
+            "\n",
+        );
+        let findings = what_is_wrong_with(&held);
+
+        let warning = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Warning)
+            .unwrap_or_else(|| panic!("a warning about the unused variable: {findings:#?}"));
+        assert_eq!(
+            warning.code.as_deref(),
+            Some("-Wunused-variable"),
+            "the warning's own flag, and not a guess: {}",
+            warning.message,
+        );
+
+        let error = findings
+            .iter()
+            .find(|finding| finding.severity == Severity::Error)
+            .unwrap_or_else(|| panic!("an error about the undeclared call: {findings:#?}"));
+        assert_eq!(
+            error.code, None,
+            "no flag switches this on, so it is given no name: {}",
+            error.message,
+        );
+    }
+
+    /// The claim: a note about another file keeps that file and its own
+    /// position, so a reader can be taken to the earlier declaration -- and
+    /// because nothing can paint it next to the error it explains, its text
+    /// stays in the message with the file and line it names.
+    #[test]
+    #[ignore = "needs libclang on the machine"]
+    fn a_note_in_another_file_keeps_its_place_and_stays_in_the_message() {
+        let held = two_files(
+            &format!(
+                "#include \"{HEADER_NAME}\"\n\nstruct Thing {{}};\n\nint main() {{ return 0; }}\n"
+            ),
+            "struct Thing {};\n",
+        );
+        let findings = what_is_wrong_with(&held);
+
+        let redefinition = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("redefinition of 'Thing'"))
+            .unwrap_or_else(|| panic!("the redefinition error: {findings:#?}"));
+        assert_eq!(redefinition.file, held.source);
+        let note = redefinition
+            .notes
+            .first()
+            .unwrap_or_else(|| panic!("the note naming the earlier one: {redefinition:#?}"));
+        assert_eq!(
+            note.file, held.header,
+            "the note is about the header, and says so itself",
+        );
+        assert_eq!(
+            Some(note.start),
+            held.header_text.find("Thing"),
+            "the note's own offset is at the earlier declaration's name",
+        );
+        assert!(
+            redefinition.message.contains(HEADER_NAME),
+            "a note nothing can paint in place keeps its text and names its file: {}",
+            redefinition.message,
+        );
+    }
+
+    /// The claim: a note about the same file moves out of the message, because
+    /// it arrives as a place of its own and is shown at the line it is about --
+    /// and what is left still says what went wrong.
+    #[test]
+    #[ignore = "needs libclang on the machine"]
+    fn a_note_in_the_same_file_moves_out_of_the_message_and_keeps_its_place() {
+        let held = two_files(
+            "static void take(int one) { (void)one; }\n\
+             int main() { take(1, 2); return 0; }\n",
+            "\n",
+        );
+        let findings = what_is_wrong_with(&held);
+
+        let call = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("no matching function for call"))
+            .unwrap_or_else(|| panic!("the failed call: {findings:#?}"));
+        assert!(
+            !call.notes.is_empty(),
+            "the candidate it tried arrived as a note: {call:#?}",
+        );
+        for note in &call.notes {
+            assert_eq!(
+                note.file, held.source,
+                "the candidate is declared in this same file",
+            );
+            assert!(
+                Some(note.start) < held.source_text.find('\n'),
+                "and the note's offset is on the line the candidate is declared on, \
+                 not on the line the call is written on",
+            );
+        }
+        assert_eq!(
+            call.message.lines().count(),
+            1,
+            "a note shown at its own line is not repeated in the message: {}",
+            call.message,
+        );
+        assert!(
+            call.message.contains("take"),
+            "and what is left still names what went wrong: {}",
+            call.message,
+        );
+    }
+
     /// What translation units really cost, on this machine, with this
     /// `libclang`, and whether the bound above actually holds them down.
     ///
@@ -780,6 +1088,12 @@ mod tests {
     fn what_translation_units_cost_and_how_many_are_held() {
         let directory = std::env::temp_dir().join("clang_diagnostics_measurement");
         std::fs::create_dir_all(&directory).expect("a directory to measure in");
+        // A header with a mistake of its own, so the measurement covers the
+        // whole of what is read back: a finding filed against a file other than
+        // the one that was parsed, with the notes and the flag that come with
+        // it. Whatever is read back, the bound below is over the units held.
+        std::fs::write(directory.join(MEASURED_HEADER), MEASURED_IN_A_HEADER)
+            .expect("a header to measure");
 
         // More files than the bound, so that the bound is what stops the list
         // growing rather than there being nothing else to hold.
@@ -837,12 +1151,18 @@ mod tests {
                     );
                     println!(
                         "lap {lap} {} {what}: {:.0} ms, {:.1} MB in the unit, {} held, \
-                         {} findings, {}, {}, {}",
+                         {} findings in {} file(s), {}, {}, {}",
                         file.file_name().unwrap_or_default().to_string_lossy(),
                         started.elapsed().as_secs_f64() * 1_000.0,
                         parsed.memory as f64 / 1_048_576.0,
                         parsed.held,
                         parsed.findings.len(),
+                        parsed
+                            .findings
+                            .iter()
+                            .map(|finding| finding.file.clone())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len(),
                         parsed
                             .described
                             .map_or("nothing described".to_string(), |said| said.declaration),
@@ -874,9 +1194,20 @@ mod tests {
             .join(", ")
     }
 
+    const MEASURED_HEADER: &str = "measured.h";
+
+    /// A header the measured file includes, wrong in a way that is confined to
+    /// its own line: the rest of the file still parses, so the hover and the
+    /// hierarchy the measurement also asks for are unaffected.
+    const MEASURED_IN_A_HEADER: &str = r#"
+#pragma once
+static_assert(sizeof(int) == 99, "an error that belongs to this header");
+"#;
+
     /// A file with enough of the standard library in it to be a fair
     /// measurement, and one real mistake so the findings are not empty.
     const MEASURED: &str = r#"
+#include "measured.h"
 #include <algorithm>
 #include <map>
 #include <memory>

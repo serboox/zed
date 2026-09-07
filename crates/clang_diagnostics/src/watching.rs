@@ -12,7 +12,7 @@ use project::buffer_store::BufferStoreEvent;
 
 use crate::compile_commands::{arguments_for, entries_in, where_the_database_is};
 use crate::parsing::{Asked, Request, ask_libclang};
-use crate::{Finding, as_diagnostics};
+use crate::{Finding, as_diagnostics_by_file};
 
 actions!(
     clang_diagnostics,
@@ -51,6 +51,12 @@ struct Watching {
     /// the tree is not repeated on every save of a project that has none --
     /// which is most C projects there are.
     without_a_database: HashSet<PathBuf>,
+    /// Which files each buffer's last parse put something on, so that a header
+    /// whose error the reader has fixed can be told it is clean. Kept per
+    /// buffer rather than in one set: two open files reach many of the same
+    /// headers, and clearing a header because one of them stopped reporting it
+    /// would wipe what the other still says about it.
+    reported_in: HashMap<EntityId, HashSet<PathBuf>>,
 }
 
 pub fn init(cx: &mut App) {
@@ -139,7 +145,9 @@ fn watch_one(
         let watching = watching.clone();
         let id = buffer.entity_id();
         move |_: &mut workspace::Workspace, _: &mut Buffer, _| {
-            watching.borrow_mut().parsing.remove(&id);
+            let mut watching = watching.borrow_mut();
+            watching.parsing.remove(&id);
+            watching.reported_in.remove(&id);
         }
     })
     .detach();
@@ -288,7 +296,48 @@ async fn parse(
         parsed.held,
     );
 
-    show(project, about.path, &parsed.findings, &about.text, cx)
+    // Reading a header off disk to place a finding in it, so the work waits on
+    // the background thread rather than on the one drawing the editor.
+    let by_file = {
+        let findings = within(parsed.findings, &about.root);
+        let parsed_file = about.path.clone();
+        let parsed_text = about.text.clone();
+        cx.background_spawn(async move {
+            as_diagnostics_by_file(&findings, |file| {
+                if file == parsed_file {
+                    Some(parsed_text.clone())
+                } else {
+                    std::fs::read_to_string(file).ok()
+                }
+            })
+        })
+        .await
+    };
+
+    show(
+        project,
+        buffer.entity_id(),
+        &about.path,
+        by_file,
+        watching,
+        cx,
+    )
+}
+
+/// Findings the editor can carry, which are the ones inside the project.
+///
+/// A translation unit reaches the standard library and the SDK as well, and the
+/// front end complains about a template it instantiated in `<vector>` as
+/// readily as about the reader's own header. The editor keeps diagnostics
+/// against paths in a worktree and warns and gives up on any other, so a
+/// finding outside the project is dropped here instead. What the reader wrote
+/// is what they can fix, and the note pointing back into their code comes with
+/// the finding that is in it.
+fn within(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .filter(|finding| finding.file.starts_with(root))
+        .collect()
 }
 
 /// The arguments a file is compiled with, from the compilation database nearest
@@ -299,43 +348,73 @@ pub(crate) fn how_it_is_compiled(path: &Path, root: &Path) -> Option<Vec<String>
     arguments_for(&entries_in(&text), path)
 }
 
-/// Hands the editor what the front end said, replacing whatever this source
-/// said last. An empty list is not silence and is meant: a file whose mistake
-/// the reader has just fixed has to be told it is clean, or the editor keeps
-/// showing the mistake.
+/// Hands the editor what the front end said about each file it named,
+/// replacing whatever this source said last about that file.
+///
+/// An empty list is not silence and is meant: a file whose mistake the reader
+/// has just fixed has to be told it is clean, or the editor keeps showing the
+/// mistake. So the file that was parsed is always told something, and so is
+/// every file this buffer's last parse put something on and this one did not.
+///
+/// One call to the editor per file, and not one call carrying them all: it
+/// gives up on the whole batch at the first path it has no worktree for.
 fn show(
     project: &WeakEntity<Project>,
-    path: PathBuf,
-    findings: &[Finding],
-    text: &str,
+    buffer: EntityId,
+    parsed: &Path,
+    found: Vec<(PathBuf, Vec<lsp::Diagnostic>)>,
+    watching: &Rc<RefCell<Watching>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let uri = lsp::Uri::from_file_path(&path)
-        .map_err(|_| anyhow::anyhow!("{} is not a path with a URI", path.display()))?;
-    let diagnostics = as_diagnostics(findings, text);
+    let mut telling = found;
+    if !telling.iter().any(|(file, _)| file == parsed) {
+        telling.push((parsed.to_path_buf(), Vec::new()));
+    }
+    let now: HashSet<PathBuf> = telling.iter().map(|(file, _)| file.clone()).collect();
+    {
+        let mut watching = watching.borrow_mut();
+        let told_last_time = watching.reported_in.remove(&buffer).unwrap_or_default();
+        let cleared: Vec<PathBuf> = {
+            let still_said_elsewhere: HashSet<&PathBuf> =
+                watching.reported_in.values().flatten().collect();
+            told_last_time
+                .into_iter()
+                .filter(|file| !now.contains(file) && !still_said_elsewhere.contains(file))
+                .collect()
+        };
+        telling.extend(cleared.into_iter().map(|file| (file, Vec::new())));
+        watching.reported_in.insert(buffer, now);
+    }
+
     project.update(cx, |project, cx| {
         project.lsp_store().update(cx, |lsp_store, cx| {
-            let merged = lsp_store.merge_lsp_diagnostics(
-                DiagnosticSourceKind::Pushed,
-                vec![project::lsp_store::DocumentDiagnosticsUpdate {
-                    diagnostics: lsp::PublishDiagnosticsParams {
-                        uri,
-                        diagnostics,
-                        version: None,
-                    },
-                    result_id: None,
-                    registration_id: None,
-                    server_id: CLANG_SERVER_ID,
-                    disk_based_sources: std::borrow::Cow::Borrowed(&[]),
-                }],
-                |_, _, _| false,
-                cx,
-            );
-            if let Err(error) = merged {
-                log::warn!(
-                    "showing what libclang said about {}: {error:#}",
-                    path.display()
+            for (path, diagnostics) in telling {
+                let Ok(uri) = lsp::Uri::from_file_path(&path) else {
+                    log::warn!("{} is not a path with a URI", path.display());
+                    continue;
+                };
+                let merged = lsp_store.merge_lsp_diagnostics(
+                    DiagnosticSourceKind::Pushed,
+                    vec![project::lsp_store::DocumentDiagnosticsUpdate {
+                        diagnostics: lsp::PublishDiagnosticsParams {
+                            uri,
+                            diagnostics,
+                            version: None,
+                        },
+                        result_id: None,
+                        registration_id: None,
+                        server_id: CLANG_SERVER_ID,
+                        disk_based_sources: std::borrow::Cow::Borrowed(&[]),
+                    }],
+                    |_, _, _| false,
+                    cx,
                 );
+                if let Err(error) = merged {
+                    log::warn!(
+                        "showing what libclang said about {}: {error:#}",
+                        path.display()
+                    );
+                }
             }
         })
     })
