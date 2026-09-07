@@ -60,7 +60,7 @@ struct Watching {
     running: Option<Task<()>>,
 }
 
-pub fn init(cx: &mut App) {
+pub(crate) fn init(cx: &mut App) {
     // One store for the whole application rather than one per workspace: the
     // source that reads it is registered once, and a file belongs to
     // whichever run last reported on it.
@@ -134,18 +134,7 @@ fn watch_one(
             if !is_python(&buffer, cx) {
                 return;
             }
-            let lsp_store = project.read(cx).lsp_store();
-            // Nested this way round because asking needs the buffer and the
-            // application both, and the buffer's own update is what hands
-            // over one without holding the other.
-            let served = buffer.update(cx, |buffer, cx| {
-                lsp_store.update(cx, |lsp_store, cx| {
-                    !lsp_store
-                        .language_servers_for_local_buffer(buffer, cx)
-                        .is_empty()
-                })
-            });
-            if served {
+            if served_by_a_language_server(&project, &buffer, cx) {
                 return;
             }
             ask_ruff(&project, &watching, &fixes, cx);
@@ -154,7 +143,27 @@ fn watch_one(
     .detach();
 }
 
-fn is_python(buffer: &Entity<Buffer>, cx: &App) -> bool {
+/// Whether a language server is already answering for this buffer.
+///
+/// Nested this way round because asking needs the buffer and the application
+/// both, and the buffer's own update is what hands over one without holding
+/// the other.
+pub(crate) fn served_by_a_language_server(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    cx: &mut App,
+) -> bool {
+    let lsp_store = project.read(cx).lsp_store();
+    buffer.update(cx, |buffer, cx| {
+        lsp_store.update(cx, |lsp_store, cx| {
+            !lsp_store
+                .language_servers_for_local_buffer(buffer, cx)
+                .is_empty()
+        })
+    })
+}
+
+pub(crate) fn is_python(buffer: &Entity<Buffer>, cx: &App) -> bool {
     buffer
         .read(cx)
         .language()

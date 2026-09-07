@@ -4,9 +4,18 @@ use collections::HashMap;
 use serde::Deserialize;
 
 mod fixing;
+mod type_watching;
 mod watching;
 
-pub use watching::{Lint, init};
+pub use type_watching::CheckTypes;
+pub use watching::Lint;
+
+/// Registers both sources of Python diagnostics this editor has with no
+/// language server running: the linter, and `ty`'s type checker.
+pub fn init(cx: &mut gpui::App) {
+    watching::init(cx);
+    type_watching::init(cx);
+}
 
 /// One finding the linter reported, at a place the editor can put it.
 ///
