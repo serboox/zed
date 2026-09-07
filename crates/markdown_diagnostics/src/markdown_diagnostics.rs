@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rumdl_lib::config::{Config, RUMDL_CONFIG_FILES, SourcedConfig};
 use rumdl_lib::document_run::DocumentRun;
-use rumdl_lib::rule::{LintWarning, Rule};
+use rumdl_lib::rule::{LintWarning, Rule, Severity};
 
 mod watching;
 
@@ -144,23 +144,37 @@ pub fn diagnostics_for(
 }
 
 /// One finding, phrased the way a linter's opinion deserves.
-///
-/// Every finding is a hint, whatever rumdl calls it. rumdl grades some of its
-/// rules an error, which would paint a document red over a heading that
-/// climbed two levels at once -- and unlike a compiler's error, nothing here
-/// stops the document from being read, published or built. What is on offer
-/// is advice, and it is marked as advice.
 fn advice_about(warning: &LintWarning, lines: &[&str], byte_order_mark: u32) -> lsp::Diagnostic {
     lsp::Diagnostic {
         range: lsp::Range {
             start: place(lines, warning.line, warning.column, byte_order_mark),
             end: place(lines, warning.end_line, warning.end_column, byte_order_mark),
         },
-        severity: Some(lsp::DiagnosticSeverity::HINT),
+        severity: Some(how_much_it_matters(warning.severity)),
         code: warning.rule_name.clone().map(lsp::NumberOrString::String),
         source: Some("rumdl".to_string()),
         message: warning.message.clone(),
         ..Default::default()
+    }
+}
+
+/// How much one finding matters, keeping the distinction rumdl draws and
+/// stopping a step short of calling any of it a fault.
+///
+/// rumdl grades its own rules, and the grades are not interchangeable: a
+/// heading that skipped a level or an image with no alt text it calls an
+/// error, while an over-indented list item or a fenced block with no language
+/// it calls a warning. A reader who cannot tell those apart cannot decide
+/// what to fix first, which is the whole use of a grade.
+///
+/// Every grade still lands below `ERROR`, because nothing rumdl reports stops
+/// the document from being read, published or built. So its error becomes a
+/// warning and its milder grades stay advice: the order survives, and no
+/// finding claims to be something that stops work.
+fn how_much_it_matters(severity: Severity) -> lsp::DiagnosticSeverity {
+    match severity {
+        Severity::Error => lsp::DiagnosticSeverity::WARNING,
+        Severity::Warning | Severity::Info => lsp::DiagnosticSeverity::HINT,
     }
 }
 
@@ -265,11 +279,75 @@ mod tests {
             "Expected heading level 2, but found heading level 3"
         );
         assert_eq!(diagnostics[0].source.as_deref(), Some("rumdl"));
-        for diagnostic in &diagnostics {
-            assert_eq!(
-                diagnostic.severity,
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.severity)
+                .collect::<Vec<_>>(),
+            vec![
+                // rumdl grades a heading that skipped a level an error.
+                Some(lsp::DiagnosticSeverity::WARNING),
+                // and an over-indented list item a warning.
                 Some(lsp::DiagnosticSeverity::HINT),
-                "a linter's opinion is advice, whatever rumdl grades it"
+            ]
+        );
+    }
+
+    /// A heading that skipped a level and a fenced block with no language are
+    /// not the same size of problem, and rumdl says so: it grades the first an
+    /// error and the second a warning. The two arrive apart.
+    #[test]
+    fn the_grade_rumdl_gave_a_finding_is_kept_and_nothing_becomes_a_fault() {
+        const GRADED: &str = "# Title\n\n### Skipped\n\n```\ncode\n```\n";
+        let diagnostics = linted(GRADED);
+
+        // What rumdl itself graded these, read straight from the library so
+        // the expectation is not a guess about its rules.
+        let configured = Configured {
+            config: Config::default(),
+            adopted_rumdl: false,
+        };
+        let rules = rules_for(&configured, None);
+        let run = DocumentRun::new(GRADED, &rules, &configured.config);
+        let graded: Vec<(Option<String>, Severity)> = run
+            .analyze()
+            .expect("the document analyses")
+            .warnings
+            .iter()
+            .map(|warning| (warning.rule_name.clone(), warning.severity))
+            .collect();
+        assert!(
+            graded.contains(&(Some("MD001".to_string()), Severity::Error)),
+            "{graded:?}"
+        );
+        assert!(
+            graded.contains(&(Some("MD040".to_string()), Severity::Warning)),
+            "{graded:?}"
+        );
+
+        let severity_of = |wanted: &str| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    matches!(&diagnostic.code, Some(lsp::NumberOrString::String(code)) if code == wanted)
+                })
+                .and_then(|diagnostic| diagnostic.severity)
+        };
+        assert_eq!(
+            severity_of("MD001"),
+            Some(lsp::DiagnosticSeverity::WARNING),
+            "the one rumdl graded an error"
+        );
+        assert_eq!(
+            severity_of("MD040"),
+            Some(lsp::DiagnosticSeverity::HINT),
+            "the one rumdl graded a warning"
+        );
+        for diagnostic in &diagnostics {
+            assert_ne!(
+                diagnostic.severity,
+                Some(lsp::DiagnosticSeverity::ERROR),
+                "nothing here stops the document being read, published or built"
             );
         }
     }

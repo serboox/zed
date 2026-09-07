@@ -104,13 +104,27 @@ pub fn what_the_compiler_reported(
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
-        // The compiler indents the detail under a type error ("have (int)")
-        // rather than repeating the place, so an indented line belongs to
-        // whatever was reported last.
+        // The compiler indents the detail under an error rather than
+        // repeating the place, so an indented line belongs to whatever was
+        // reported last. Some of that detail names a place of its own -- the
+        // earlier declaration under a redeclaration, the earlier case under a
+        // duplicate one -- and that place is kept as a place. The rest,
+        // "have (int)" under a type error, has no place to be kept at and
+        // stays part of what was said.
         if line.starts_with([' ', '\t']) {
-            if let Some(last) = reported.last_mut() {
-                last.diagnostic.message.push('\n');
-                last.diagnostic.message.push_str(line.trim_start());
+            let Some(last) = reported.last_mut() else {
+                continue;
+            };
+            match a_place_of_its_own(line, ran_in, &mut texts, &read) {
+                Some(place) => last
+                    .diagnostic
+                    .related_information
+                    .get_or_insert_with(Vec::new)
+                    .push(place),
+                None => {
+                    last.diagnostic.message.push('\n');
+                    last.diagnostic.message.push_str(line.trim_start());
+                }
             }
             continue;
         }
@@ -142,6 +156,39 @@ pub fn what_the_compiler_reported(
         });
     }
     reported
+}
+
+/// The place an indented detail line points at, where it points at one.
+///
+/// `./main.go:3:6: other declaration of helper` is a second place the error is
+/// about, and the reader's next move is to go and look at it. Folded into the
+/// message it becomes a line number to find by hand; kept as a place, the
+/// editor can jump to it.
+///
+/// Nothing at all for a detail line that names no place, which is most of
+/// them, and nothing for one whose file cannot be read: only that file's text
+/// converts Go's byte column into the protocol's.
+fn a_place_of_its_own(
+    line: &str,
+    ran_in: &Path,
+    texts: &mut HashMap<PathBuf, Option<String>>,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<lsp::DiagnosticRelatedInformation> {
+    let (file, row, column, message) = a_place_and_what_was_said(line.trim_start())?;
+    if message.is_empty() {
+        return None;
+    }
+    let message = message.to_string();
+    let path = beneath(ran_in, file);
+    let uri = lsp::Uri::from_file_path(&path).ok()?;
+    let text = text_of(texts, &path, read)?;
+    Some(lsp::DiagnosticRelatedInformation {
+        location: lsp::Location {
+            uri,
+            range: a_range(text, row, column, None),
+        },
+        message,
+    })
 }
 
 /// What `go vet -json` writes: a tree of package to analyzer to either a list
@@ -557,6 +604,15 @@ mod tests {
     /// JSON through, mixed with the package names it prints itself.
     const REAL_VET: &str = include_str!("../test_data/go-vet.txt");
 
+    /// Real output, captured from `go build -json ./...` under Go 1.27 over a
+    /// module holding a duplicated switch case. The compiler indents the
+    /// earlier case under the error and gives it a place of its own, and that
+    /// place is on a line holding an emoji -- so Go's byte column, the
+    /// characters on the line and the protocol's UTF-16 units are three
+    /// different numbers.
+    const DUPLICATE_BUILD: &str = include_str!("../test_data/go-build-duplicate.json");
+    const DUPLICATE_SOURCE: &str = include_str!("../test_data/go-build-duplicate.source");
+
     /// Real output from the same command over a module whose analyzers do
     /// suggest fixes -- `timeformat` and `stringintconv` -- captured together
     /// with the file itself, so that every offset in it can be checked
@@ -808,6 +864,109 @@ mod tests {
     fn a_file_that_cannot_be_read_is_skipped_rather_than_placed_by_guess() {
         assert!(what_the_compiler_reported(REAL_BUILD, Path::new("/project"), |_| None).is_empty());
         assert!(what_vet_reported(REAL_VET, Path::new("/src"), |_| None).is_empty());
+    }
+
+    /// A detail line that names a place of its own is kept as a place. The
+    /// earlier case is where the reader has to look next, and a line number
+    /// buried in the message is one they have to find by hand.
+    #[test]
+    fn a_detail_line_that_names_a_place_is_kept_as_a_place_rather_than_as_text() {
+        let line = DUPLICATE_SOURCE
+            .lines()
+            .nth(5)
+            .expect("the case holding the emoji");
+        let inside = line.rfind("\"dup\"").expect("the value said twice");
+
+        // Three counts of the same place, all different.
+        assert_eq!(line[..inside].len(), 18, "bytes");
+        assert_eq!(line[..inside].chars().count(), 12, "characters");
+        assert_eq!(line[..inside].encode_utf16().count(), 14, "UTF-16 units");
+
+        let reported = what_the_compiler_reported(DUPLICATE_BUILD, Path::new("/project"), |path| {
+            (path == Path::new("/project/main.go")).then(|| DUPLICATE_SOURCE.to_string())
+        });
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        let duplicate = &reported[0];
+
+        assert_eq!(
+            duplicate.diagnostic.message,
+            "duplicate case \"dup\" (constant of type string) in expression switch",
+            "the earlier case is a place now, not a line of text"
+        );
+        assert_eq!(
+            duplicate.diagnostic.range,
+            lsp::Range {
+                start: lsp::Position::new(6, 6),
+                end: lsp::Position::new(6, 12),
+            },
+            "the case the compiler filed the error under, unmoved"
+        );
+        assert_eq!(
+            duplicate.diagnostic.related_information,
+            Some(vec![lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: lsp::Uri::from_file_path("/project/main.go")
+                        .expect("an absolute path is a file URI"),
+                    range: lsp::Range {
+                        start: lsp::Position::new(5, 14),
+                        end: lsp::Position::new(5, 20),
+                    },
+                },
+                message: "previous case".to_string(),
+            }]),
+            "the protocol's own unit -- not the 18 bytes Go counted from"
+        );
+    }
+
+    /// Which errors a real build reports and where each one points. Keeping a
+    /// detail line as a place must not add, drop or move one of them, and an
+    /// error with no such detail must carry no related place at all.
+    #[test]
+    fn which_errors_are_reported_and_where_they_point_is_unchanged() {
+        let reported =
+            what_the_compiler_reported(REAL_BUILD, Path::new("/project"), read_the_captured_module);
+        let placed: Vec<(&Path, lsp::Range, &str)> = reported
+            .iter()
+            .map(|one| {
+                (
+                    one.path.as_path(),
+                    one.diagnostic.range,
+                    one.diagnostic.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    Path::new("/project/sub/sub.go"),
+                    lsp::Range {
+                        start: lsp::Position::new(3, 8),
+                        end: lsp::Position::new(3, 18),
+                    },
+                    "cannot use \"a string\" (untyped string constant) as int value in return statement",
+                ),
+                (
+                    Path::new("/project/main.go"),
+                    lsp::Range {
+                        start: lsp::Position::new(6, 5),
+                        end: lsp::Position::new(6, 16),
+                    },
+                    "declared and not used: unusedValue",
+                ),
+                (
+                    Path::new("/project/main.go"),
+                    lsp::Range {
+                        start: lsp::Position::new(8, 31),
+                        end: lsp::Position::new(8, 44),
+                    },
+                    "undefined: missingHelper",
+                ),
+            ]
+        );
+        for one in &reported {
+            assert_eq!(one.diagnostic.related_information, None, "{one:?}");
+        }
     }
 
     /// The compiler indents the detail under a type error rather than

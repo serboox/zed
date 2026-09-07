@@ -1,0 +1,7 @@
+{ "diagnostics": [{"message": "Identifier `pour` has already been declared","severity": "error","filename": "dupes.ts","labels": [{"label": "`pour` has already been declared here","span": {"offset": 59,"length": 4,"line": 4,"column": 18}},{"label": "It can not be redeclared here","span": {"offset": 86,"length": 4,"line": 5,"column": 18}}]}],
+              "number_of_files": 1,
+              "number_of_rules": 96,
+              "threads_count": 8,
+              "start_time": 0.026004971
+            }
+            

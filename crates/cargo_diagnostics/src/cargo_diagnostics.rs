@@ -165,6 +165,7 @@ pub fn what_the_compiler_reported(
         if !already.insert((path.clone(), range, said.clone())) {
             continue;
         }
+        let related_information = the_other_places(&message, ran_in, &mut texts, &read);
         let fixes = fixes_in(&message, ran_in, &mut texts, &read);
         reported.push(Reported {
             path,
@@ -178,6 +179,7 @@ pub fn what_the_compiler_reported(
                     .map(|code| lsp::NumberOrString::String(code.code.clone())),
                 source: Some("cargo".to_string()),
                 message: said,
+                related_information,
                 ..Default::default()
             },
         });
@@ -199,6 +201,57 @@ fn text_of<'a>(
         .entry(path.to_path_buf())
         .or_insert_with(|| read(path))
         .as_deref()
+}
+
+/// Every place this message points at except the one it is filed under, each
+/// keeping its own position.
+///
+/// A type error is about two places -- the expression and the return type it
+/// has to match -- and a reassignment is about two more, the second write and
+/// the first. The message names only one of them; the other spans are where
+/// the rest of the answer is, and gluing their labels into the text would
+/// leave the reader looking for a line the editor could have jumped to.
+///
+/// A span the compiler gave no label for is dropped: the editor shows a
+/// related place by its message, so one with nothing to say would draw an
+/// empty row over the reader's code. So is a span in a file that cannot be
+/// read, because only that file's text can place it.
+///
+/// Only this message's own spans, and not its children's: a child's spans are
+/// where its suggestion goes, and those are already offered as fixes.
+fn the_other_places(
+    message: &Message,
+    ran_in: &Path,
+    texts: &mut HashMap<PathBuf, Option<String>>,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<Vec<lsp::DiagnosticRelatedInformation>> {
+    let mut places = Vec::new();
+    for span in &message.spans {
+        if span.is_primary {
+            continue;
+        }
+        let Some(label) = span.label.as_deref().filter(|label| !label.is_empty()) else {
+            continue;
+        };
+        let path = ran_in.join(&span.file_name);
+        let Ok(uri) = lsp::Uri::from_file_path(&path) else {
+            continue;
+        };
+        let Some(text) = text_of(texts, &path, read) else {
+            continue;
+        };
+        places.push(lsp::DiagnosticRelatedInformation {
+            location: lsp::Location {
+                uri,
+                range: lsp::Range {
+                    start: utf16_position_of(text, span.byte_start),
+                    end: utf16_position_of(text, span.byte_end),
+                },
+            },
+            message: label.to_string(),
+        });
+    }
+    (!places.is_empty()).then_some(places)
 }
 
 /// Every fix this message handed over, its own and its children's.
@@ -690,6 +743,142 @@ mod tests {
                 "the advice is still in what the error says: {}",
                 one.diagnostic.message
             );
+        }
+    }
+
+    /// The other place a reassignment error is about -- the first write --
+    /// keeps its own position rather than being glued into the message. The
+    /// line it is on is Cyrillic, so a byte count and a UTF-16 count of that
+    /// place are different numbers, and only one of them is the protocol's.
+    #[test]
+    fn a_non_primary_span_becomes_a_related_place_at_its_own_position() {
+        let line = MULTIBYTE_SOURCE
+            .lines()
+            .nth(1)
+            .expect("the line the binding is on");
+        let inside = line.find("счётчик").expect("the binding");
+
+        // Three counts of the same place, all different.
+        assert_eq!(line[..inside].len(), 42, "bytes");
+        assert_eq!(line[..inside].chars().count(), 29, "characters");
+        assert_eq!(line[..inside].encode_utf16().count(), 31, "UTF-16 units");
+
+        let reported = reported_over(MULTIBYTE, MULTIBYTE_SOURCE);
+        let one = reported.first().expect("the error");
+
+        // The place the error is filed under is the second write, unmoved.
+        assert_eq!(
+            one.diagnostic.range,
+            lsp::Range {
+                start: lsp::Position::new(2, 4),
+                end: lsp::Position::new(2, 16),
+            }
+        );
+        assert_eq!(
+            one.diagnostic.related_information,
+            Some(vec![lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: lsp::Uri::from_file_path("/project/src/lib.rs")
+                        .expect("an absolute path is a file URI"),
+                    range: lsp::Range {
+                        start: lsp::Position::new(1, 31),
+                        end: lsp::Position::new(1, 38),
+                    },
+                },
+                message: "first assignment to `счётчик`".to_string(),
+            }]),
+            "the protocol's own unit -- not the 42 bytes the compiler counted from"
+        );
+    }
+
+    /// A type error names the return type it had to match, and that place is
+    /// on another line entirely. It arrives as a place and not as text.
+    #[test]
+    fn the_return_type_a_type_error_had_to_match_arrives_as_a_place() {
+        let reported =
+            what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
+        let mismatched = reported.first().expect("the type error");
+        let related = mismatched
+            .diagnostic
+            .related_information
+            .as_ref()
+            .expect("the return type is a place of its own");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "expected `u32` because of return type");
+        assert_eq!(
+            related[0].location.range,
+            lsp::Range {
+                start: byte_position_in(&library(), 18),
+                end: byte_position_in(&library(), 21),
+            }
+        );
+        assert_ne!(
+            related[0].location.range.start.line, mismatched.diagnostic.range.start.line,
+            "the two places are on different lines, which is the whole point of keeping both"
+        );
+    }
+
+    /// A warning about one place carries no related place at all, rather
+    /// than one pointing back at itself.
+    #[test]
+    fn a_message_about_one_place_carries_no_related_place() {
+        let reported =
+            what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
+        let unused = &reported[1];
+        assert!(
+            unused.diagnostic.message.starts_with("unused variable"),
+            "{}",
+            unused.diagnostic.message
+        );
+        assert_eq!(unused.diagnostic.related_information, None);
+    }
+
+    /// Which diagnostics are reported and where each one points. Keeping the
+    /// other places must not add, drop or move one of them.
+    #[test]
+    fn which_diagnostics_are_reported_and_where_they_point_is_unchanged() {
+        let reported =
+            what_the_compiler_reported(REAL_OUTPUT, Path::new("/project"), |_| Some(library()));
+        let placed: Vec<(Option<&str>, lsp::Range)> = reported
+            .iter()
+            .map(|one| {
+                let code = match &one.diagnostic.code {
+                    Some(lsp::NumberOrString::String(code)) => Some(code.as_str()),
+                    _ => None,
+                };
+                (code, one.diagnostic.range)
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    Some("E0308"),
+                    lsp::Range {
+                        start: byte_position_in(&library(), 28),
+                        end: byte_position_in(&library(), 38),
+                    }
+                ),
+                (
+                    Some("unused_variables"),
+                    lsp::Range {
+                        start: byte_position_in(&library(), 68),
+                        end: byte_position_in(&library(), 78),
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// Where a byte offset falls, walked separately from the reader's own
+    /// conversion so that a test pinning a place cannot be satisfied by
+    /// whatever the reader happened to compute.
+    fn byte_position_in(text: &str, byte: usize) -> lsp::Position {
+        let before = &text[..byte];
+        let line_starts_at = before.rfind('\n').map_or(0, |newline| newline + 1);
+        lsp::Position {
+            line: before.matches('\n').count() as u32,
+            character: before[line_starts_at..].encode_utf16().count() as u32,
         }
     }
 

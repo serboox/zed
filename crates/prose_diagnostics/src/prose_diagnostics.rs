@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use harper_core::linting::{LintGroup, LintKind, Linter};
+use harper_core::linting::{LintGroup, LintKind};
 use harper_core::spell::{Dictionary, FstDictionary};
 use harper_core::{Dialect, Document, Span};
 
@@ -69,24 +69,31 @@ pub fn what_harper_said(text: &str, prose: &Prose) -> Vec<lsp::Diagnostic> {
         } else {
             Document::new_plain_english_curated(&lifted.prose)
         };
-        for lint in rules.lint(&document) {
-            if !lifted.read_as_markdown && lint.lint_kind == LintKind::Spelling {
-                continue;
+        // Asked rule by rule rather than as one list, because the rule's own
+        // name is only knowable here: a `Lint` carries the kind it belongs to
+        // and not the rule that raised it, so two rules of the same kind are
+        // otherwise indistinguishable. This yields the same lints in the same
+        // order -- harper's own `Linter` impl is these lints flattened.
+        for (rule, lints) in rules.organized_lints(&document) {
+            for lint in lints {
+                if !lifted.read_as_markdown && lint.lint_kind == LintKind::Spelling {
+                    continue;
+                }
+                let Some(bytes) = lifted.back_in_the_file(&lint.span) else {
+                    continue;
+                };
+                said.push(lsp::Diagnostic {
+                    range: lsp::Range {
+                        start: utf16_position_at(text, bytes.start),
+                        end: utf16_position_at(text, bytes.end),
+                    },
+                    severity: Some(lsp::DiagnosticSeverity::HINT),
+                    code: Some(lsp::NumberOrString::String(rule.clone())),
+                    source: Some("harper".to_string()),
+                    message: lint.message,
+                    ..Default::default()
+                });
             }
-            let Some(bytes) = lifted.back_in_the_file(&lint.span) else {
-                continue;
-            };
-            said.push(lsp::Diagnostic {
-                range: lsp::Range {
-                    start: utf16_position_at(text, bytes.start),
-                    end: utf16_position_at(text, bytes.end),
-                },
-                severity: Some(lsp::DiagnosticSeverity::HINT),
-                code: Some(lsp::NumberOrString::String(lint.lint_kind.to_string())),
-                source: Some("harper".to_string()),
-                message: lint.message,
-                ..Default::default()
-            });
         }
     }
     said
@@ -298,6 +305,7 @@ pub fn dictionary_word_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harper_core::linting::Linter;
     use pretty_assertions::assert_eq;
 
     fn rust_markers() -> Vec<String> {
@@ -351,6 +359,66 @@ mod tests {
             assert!(!mark.is_empty(), "a diagnostic marking nothing");
             assert!(!mark.contains('/'), "{mark:?} runs back over the marker");
         }
+    }
+
+    /// Every rule harper can raise, by the name harper knows it by.
+    fn every_rule_name() -> Vec<String> {
+        let dictionary = FstDictionary::curated();
+        LintGroup::new_curated(dictionary, DIALECT)
+            .iter_keys()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A finding says which rule raised it, not which kind of rule it was.
+    /// The kind lumps every repeated word, every article and every
+    /// capitalisation together, so a reader who wants to know what is being
+    /// objected to -- or to turn one rule off -- cannot tell two apart.
+    #[test]
+    fn a_finding_names_the_rule_that_raised_it_rather_than_the_kind_of_rule() {
+        let text =
+            "// The results are cached for the the next caller, and a index is kept.\nfn s() {}\n";
+        let said = in_rust_comments(text);
+        assert!(!said.is_empty(), "harper found nothing to say");
+
+        let names = every_rule_name();
+        let codes: Vec<String> = said
+            .iter()
+            .map(|one| match &one.code {
+                Some(lsp::NumberOrString::String(code)) => code.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        for code in &codes {
+            assert!(
+                names.contains(code),
+                "{code:?} is not one of harper's rule names; found {codes:?}"
+            );
+        }
+        assert!(
+            codes.iter().any(|code| code == "RepeatedWords"),
+            "the repeated `the` is raised by RepeatedWords; found {codes:?}"
+        );
+        assert!(
+            codes.iter().any(|code| code == "AnA"),
+            "`a index` is raised by AnA; found {codes:?}"
+        );
+    }
+
+    /// Which words are advised on, and where. Naming the rule must not add,
+    /// drop or move a finding: harper's own list is these same lints with the
+    /// rule names thrown away, so asking rule by rule has to yield exactly
+    /// what asking for the list did.
+    #[test]
+    fn which_findings_are_reported_and_what_they_mark_is_unchanged() {
+        let text =
+            "// The results are cached for the the next caller, and a index is kept.\nfn s() {}\n";
+        let said = in_rust_comments(text);
+        assert_eq!(
+            marks(text, &said),
+            vec!["a".to_string(), "the the".to_string()]
+        );
+        assert!(said.iter().all(|one| one.range.start.line == 0), "{said:?}");
     }
 
     /// A comment with nothing wrong with it says nothing. A checker that

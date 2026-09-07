@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 
 use collections::HashMap;
 use serde::Deserialize;
@@ -40,14 +41,23 @@ struct Finding {
     filename: String,
     #[serde(default)]
     help: Option<String>,
+    /// Where oxlint documents the rule that fired. Absent where nothing
+    /// fired: a parse error and a redeclaration come out of the parser
+    /// itself, which has no rule page.
+    #[serde(default)]
+    url: Option<String>,
     /// Where the finding is. The first is the primary place; a rule that
-    /// needs to point at two things, like a duplicate key, adds the others.
+    /// needs to point at two things, like a redeclaration, adds the others.
     labels: Vec<Label>,
 }
 
 #[derive(Deserialize)]
 struct Label {
     span: Span,
+    /// What this place contributes -- "It can not be redeclared here". Only
+    /// a place oxlint had something to say about carries one.
+    #[serde(rename = "label", default)]
+    text: Option<String>,
 }
 
 /// A stretch of a file, counted in bytes from the start of the file.
@@ -100,22 +110,77 @@ pub fn what_oxlint_reported(
         let Some(text) = text else {
             continue;
         };
+        let range = lsp::Range {
+            start: utf16_position_at(text, span.offset),
+            end: utf16_position_at(text, span.offset.saturating_add(span.length)),
+        };
+        let related_information = the_other_places(&finding, text, &path);
         reported.push(Reported {
             diagnostic: lsp::Diagnostic {
-                range: lsp::Range {
-                    start: utf16_position_at(text, span.offset),
-                    end: utf16_position_at(text, span.offset.saturating_add(span.length)),
-                },
+                range,
                 severity: Some(severity_of(finding.severity.as_deref())),
                 code: finding.code.clone().map(lsp::NumberOrString::String),
+                code_description: documented_at(finding.url.as_deref()),
                 source: Some("oxlint".to_string()),
                 message: what_it_said(&finding),
+                related_information,
                 ..Default::default()
             },
             path,
         });
     }
     Some(reported)
+}
+
+/// Where the rule that fired is documented, as the protocol carries it.
+///
+/// oxlint gives the link itself, so nothing here is constructed from a rule
+/// code: a link built by pattern would 404 for every rule whose page is
+/// named differently, and a link that goes nowhere is worse than no link.
+fn documented_at(url: Option<&str>) -> Option<lsp::CodeDescription> {
+    let href = lsp::Uri::from_str(url?).ok()?;
+    Some(lsp::CodeDescription { href: Some(href) })
+}
+
+/// Every place this finding points at except the first, each keeping its own
+/// position.
+///
+/// A redeclaration is about two places at once, and the second one is half
+/// the answer: the message says a name was declared twice and only the
+/// labels say where. Folding them into the text would leave the reader
+/// hunting for a line number the editor already knows how to jump to.
+///
+/// A place oxlint gave no words for is dropped. The editor shows a related
+/// location by its message, so one with nothing to say would draw an empty
+/// row over the reader's code.
+fn the_other_places(
+    finding: &Finding,
+    text: &str,
+    path: &Path,
+) -> Option<Vec<lsp::DiagnosticRelatedInformation>> {
+    let uri = lsp::Uri::from_file_path(path).ok()?;
+    let others: Vec<lsp::DiagnosticRelatedInformation> = finding
+        .labels
+        .iter()
+        .skip(1)
+        .filter_map(|label| {
+            let message = label.text.clone().filter(|text| !text.is_empty())?;
+            Some(lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: uri.clone(),
+                    range: lsp::Range {
+                        start: utf16_position_at(text, label.span.offset),
+                        end: utf16_position_at(
+                            text,
+                            label.span.offset.saturating_add(label.span.length),
+                        ),
+                    },
+                },
+                message,
+            })
+        })
+        .collect();
+    (!others.is_empty()).then_some(others)
 }
 
 /// The whole of what one finding says: its own text, and the advice it came
@@ -188,15 +253,22 @@ mod tests {
     /// report at all.
     const CLEAN_OUTPUT: &str = include_str!("../test_data/oxlint-clean.json");
 
+    /// Real output from the same command over [`DUPES`], whose one finding
+    /// points at two places: the declaration and the redeclaration. It is
+    /// the shape a single label cannot carry.
+    const TWO_LABELS: &str = include_str!("../test_data/oxlint-two-labels.json");
+
     /// The files the fixtures were captured over, byte for byte.
     const LINTED: &str = include_str!("../test_data/lint_me.ts");
     const BROKEN: &str = include_str!("../test_data/bad.ts");
+    const DUPES: &str = include_str!("../test_data/dupes.ts");
 
     fn over_the_real_files(output: &str) -> Vec<Reported> {
         what_oxlint_reported(output, Path::new("/project"), |path| {
             match path.to_str().unwrap_or_default() {
                 "/project/lint_me.ts" => Some(LINTED.to_string()),
                 "/project/bad.ts" => Some(BROKEN.to_string()),
+                "/project/dupes.ts" => Some(DUPES.to_string()),
                 _ => None,
             }
         })
@@ -400,6 +472,118 @@ mod tests {
     /// An offset past the end of the text, or inside a character, lands on
     /// the nearest boundary at or before it. oxlint measured them against a
     /// file the editor may have changed since.
+    /// The findings this reader reports, and where each one points. Carrying
+    /// a link or a second place must not add, drop or move one of them.
+    #[test]
+    fn which_findings_are_reported_and_where_they_point_is_unchanged() {
+        let reported = over_the_real_files(REAL_OUTPUT);
+        let placed: Vec<(&str, lsp::Range)> = reported
+            .iter()
+            .map(|one| (one.diagnostic.message.as_str(), one.diagnostic.range))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    "Identifier 'readFile' is imported but never used.\nhelp: Consider removing this import.",
+                    lsp::Range {
+                        start: lsp::Position::new(0, 9),
+                        end: lsp::Position::new(0, 17),
+                    }
+                ),
+                (
+                    "Variable 'café' is declared but never used. Unused variables should start with a '_'.\nhelp: Consider removing this declaration.",
+                    lsp::Range {
+                        start: lsp::Position::new(3, 10),
+                        end: lsp::Position::new(3, 14),
+                    }
+                ),
+                (
+                    "`debugger` statement is not allowed\nhelp: Remove the debugger statement",
+                    lsp::Range {
+                        start: lsp::Position::new(3, 25),
+                        end: lsp::Position::new(3, 34),
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A rule oxlint documents carries the link to that documentation, and
+    /// nothing is invented for a finding that came with none.
+    #[test]
+    fn a_documented_rule_carries_its_link_and_a_parser_finding_carries_none() {
+        let documented = &over_the_real_files(REAL_OUTPUT)[2];
+        assert_eq!(
+            documented.diagnostic.code_description,
+            Some(lsp::CodeDescription {
+                href: Some(
+                    lsp::Uri::from_str(
+                        "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-debugger.html"
+                    )
+                    .expect("oxlint's own link parses")
+                )
+            })
+        );
+
+        // A redeclaration comes out of the parser rather than a rule, and
+        // oxlint gives it no page. Nothing is built from the message.
+        let from_the_parser = &over_the_real_files(TWO_LABELS)[0];
+        assert_eq!(from_the_parser.diagnostic.code_description, None);
+    }
+
+    /// A finding about two places keeps the second one as a place, at its own
+    /// position and in the protocol's own unit. Folding it into the message
+    /// would leave the reader hunting for a line the editor could have
+    /// jumped to.
+    #[test]
+    fn a_second_place_is_kept_as_a_related_location_at_its_own_position() {
+        let line = DUPES.lines().nth(4).expect("the second `pour`");
+        let inside = line.find("pour").expect("the method name");
+
+        // Three counts of the same place, all different.
+        assert_eq!(line[..inside].len(), 17, "bytes");
+        assert_eq!(line[..inside].chars().count(), 11, "characters");
+        assert_eq!(line[..inside].encode_utf16().count(), 13, "UTF-16 units");
+
+        let reported = over_the_real_files(TWO_LABELS);
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        let redeclared = &reported[0];
+
+        // The primary place is the first label, as it always was.
+        assert_eq!(
+            redeclared.diagnostic.range,
+            lsp::Range {
+                start: lsp::Position::new(3, 13),
+                end: lsp::Position::new(3, 17),
+            }
+        );
+        assert_eq!(
+            redeclared.diagnostic.related_information,
+            Some(vec![lsp::DiagnosticRelatedInformation {
+                location: lsp::Location {
+                    uri: lsp::Uri::from_file_path("/project/dupes.ts")
+                        .expect("an absolute path is a file URI"),
+                    range: lsp::Range {
+                        start: lsp::Position::new(4, 13),
+                        end: lsp::Position::new(4, 17),
+                    },
+                },
+                message: "It can not be redeclared here".to_string(),
+            }]),
+            "the protocol's own unit -- not the 17 bytes oxlint counted"
+        );
+    }
+
+    /// A finding that points at one place carries no related location at
+    /// all, rather than one pointing at itself.
+    #[test]
+    fn a_finding_about_one_place_carries_no_related_location() {
+        for one in over_the_real_files(REAL_OUTPUT) {
+            assert_eq!(one.diagnostic.related_information, None, "{one:?}");
+        }
+    }
+
     #[test]
     fn a_place_past_the_end_or_inside_a_character_lands_on_a_boundary() {
         assert_eq!(
