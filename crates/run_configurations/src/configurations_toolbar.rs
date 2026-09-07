@@ -32,6 +32,16 @@ const PLAQUE_HEIGHT: f32 = 28.0;
 /// that outgrows the bar it sits in.
 const SEGMENT_CONTENT_HEIGHT: f32 = 26.0;
 
+/// The width the lit segment's label sits in, whichever of the three it is.
+///
+/// Sized for the longest of `Index`, `Types` and `All`: five characters of
+/// `LabelSize::Small`, whose type is 13px, and a character of the UI face takes
+/// about three fifths of its type size. Fixed rather than grown from the text,
+/// because a label that sizes its own parent gives the gauge a different width
+/// in every mode, so pressing a segment would resize the gauge and shift
+/// everything beside it in the bar.
+const LABEL_SLOT_WIDTH: f32 = 5.0 * 13.0 * 0.6;
+
 /// How often the pair looks to see whether the run it points at is still going.
 /// Nothing in a terminal tells the title bar that a task has ended, so the pair
 /// asks; a draw is only asked for when the answer changes.
@@ -164,12 +174,13 @@ impl AnsweringMode {
     }
 
     /// Shown on the lit segment alone: three labels do not fit in the bar, and
-    /// one makes the state unmistakable.
+    /// one makes the state unmistakable. Kept to five characters at most, so the
+    /// slot the label sits in -- [`LABEL_SLOT_WIDTH`] -- costs the gauge little.
     fn label(self) -> &'static str {
         match self {
             Self::Index => "Index",
             Self::Types => "Types",
-            Self::Everything => "Everything",
+            Self::Everything => "All",
         }
     }
 
@@ -860,7 +871,7 @@ impl AnsweringModeGauge {
 impl Render for AnsweringModeGauge {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let in_effect = AnsweringMode::in_effect(cx);
-        cyberpunk::segmented(AnsweringMode::ALL.map(|mode| {
+        let gauge = cyberpunk::segmented(AnsweringMode::ALL.map(|mode| {
             let lit = in_effect == Some(mode);
             // Every stop up to the one in effect is tinted, and all of them in
             // that stop's colour: how far the gauge is filled and what the mode
@@ -889,9 +900,22 @@ impl Render for AnsweringModeGauge {
                                     .color(Color::Custom(load.border())),
                             )
                             .child(
-                                Label::new(mode.label())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Custom(load.border())),
+                                // A slot of one width for all three labels, the
+                                // text centred in it and clipped rather than
+                                // widening it: the gauge is then the same width
+                                // whichever mode is lit, and pressing a segment
+                                // moves nothing beside it.
+                                div()
+                                    .flex_none()
+                                    .w(px(LABEL_SLOT_WIDTH))
+                                    .overflow_hidden()
+                                    .flex()
+                                    .justify_center()
+                                    .child(
+                                        Label::new(mode.label())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Custom(load.border())),
+                                    ),
                             ),
                     )
                     .into_any_element(),
@@ -937,7 +961,8 @@ impl Render for AnsweringModeGauge {
                     )
                 })
                 .into_any_element()
-        }))
+        }));
+        gauge.debug_selector(|| "answering-mode-gauge".to_string())
     }
 }
 
@@ -1949,6 +1974,41 @@ mod tests {
                     mode.segment_selector()
                 );
             }
+        }
+    }
+
+    /// The gauge is one width in all three modes, so pressing a segment moves
+    /// nothing beside it in the bar. Only the lit segment carries a label, so
+    /// without a slot of a fixed width the gauge is as wide as whichever word is
+    /// lit.
+    #[gpui::test]
+    async fn the_gauge_is_the_same_width_in_all_three_modes(cx: &mut TestAppContext) {
+        let (_toolbar, bar, mut cx) = a_bar_with_the_plaque(THREE_TASKS, cx).await;
+        draw_the_bar(bar, &mut cx);
+
+        let mut widths = Vec::new();
+        for mode in AnsweringMode::ALL {
+            let segment = cx
+                .debug_bounds(mode.segment_selector())
+                .unwrap_or_else(|| panic!("{} is painted in the gauge", mode.segment_selector()));
+            cx.simulate_click(segment.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            draw_the_bar(bar, &mut cx);
+
+            let gauge = cx
+                .debug_bounds("answering-mode-gauge")
+                .expect("the gauge is painted");
+            widths.push((mode, gauge.size.width));
+        }
+
+        let [(first_mode, first), ..] = widths.as_slice() else {
+            panic!("one width per mode");
+        };
+        for (mode, width) in &widths {
+            assert_eq!(
+                width, first,
+                "the gauge is {width:?} wide with {mode:?} lit and {first:?} wide with                  {first_mode:?} lit; pressing a segment must not resize it. All three: {widths:?}"
+            );
         }
     }
 
