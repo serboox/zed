@@ -898,6 +898,105 @@ pub fn in_process_formatting_for(
         .cloned()
 }
 
+/// What an in-process semantics source may use, taken out before the project
+/// was leased, for the same reason [`InProcessProject`] exists.
+pub struct InProcessSemanticsContext {
+    /// The absolute path of every visible worktree, longest first, so the one
+    /// that contains a file is the first that matches it.
+    pub worktree_roots: Vec<PathBuf>,
+}
+
+/// One span of one file, as an in-process source names it: an absolute path, a
+/// byte range in the text the source read, and the text that range held.
+///
+/// The text travels with the range because the source and the editor do not
+/// always read the same bytes: a source that read a file from disk while the
+/// editor holds unsaved edits to it named a range that has since moved, and
+/// pointing a reader at it would send them to a word they never asked about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InProcessSpan {
+    pub path: PathBuf,
+    pub range: Range<usize>,
+    pub text: String,
+}
+
+impl InProcessSpan {
+    /// The range this span names in a buffer, or nothing where the buffer no
+    /// longer holds the text the source read there.
+    pub fn found_in(&self, snapshot: &language::BufferSnapshot) -> Option<Range<usize>> {
+        if self.range.start > self.range.end || self.range.end > snapshot.len() {
+            return None;
+        }
+        let held: String = snapshot.text_for_range(self.range.clone()).collect();
+        (held == self.text).then(|| self.range.clone())
+    }
+}
+
+/// A source of definitions, references and renames that runs inside this
+/// process, with no language server behind it.
+///
+/// Every method answers `None` where the source has nothing to say. An empty
+/// answer would read as "this symbol has none", so only `None` lets the caller
+/// fall through to whatever answered the question before this source existed.
+pub trait InProcessSemantics: Send + Sync {
+    /// Where the symbol at that position is defined.
+    fn definitions(
+        &self,
+        context: &InProcessSemanticsContext,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        cx: &mut App,
+    ) -> Task<Option<Vec<InProcessSpan>>>;
+
+    /// Every occurrence of the symbol at that position, across the project.
+    fn references(
+        &self,
+        context: &InProcessSemanticsContext,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        cx: &mut App,
+    ) -> Task<Option<Vec<InProcessSpan>>>;
+
+    /// The range in this buffer a rename would replace, where the source would
+    /// perform one at all.
+    fn rename_range(
+        &self,
+        context: &InProcessSemanticsContext,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        cx: &mut App,
+    ) -> Task<Option<Range<usize>>>;
+
+    /// Every span that has to become `new_name` for the rename to be complete.
+    fn rename(
+        &self,
+        context: &InProcessSemanticsContext,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        new_name: String,
+        cx: &mut App,
+    ) -> Task<Option<Vec<InProcessSpan>>>;
+}
+
+#[derive(Default)]
+struct InProcessSemanticsSources(Vec<Arc<dyn InProcessSemantics>>);
+
+impl Global for InProcessSemanticsSources {}
+
+/// Registers a semantics source contributed by a crate that `project` does not
+/// depend on (e.g. Python names resolved in `python_types`).
+pub fn register_in_process_semantics(source: Arc<dyn InProcessSemantics>, cx: &mut App) {
+    cx.default_global::<InProcessSemanticsSources>()
+        .0
+        .push(source);
+}
+
+/// Every registered semantics source, in the order they were registered.
+pub fn in_process_semantics(cx: &App) -> Vec<Arc<dyn InProcessSemantics>> {
+    cx.try_global::<InProcessSemanticsSources>()
+        .map_or_else(Vec::new, |sources| sources.0.clone())
+}
+
 /// Response from language server completion request.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreCompletionResponse {
@@ -4669,7 +4768,7 @@ impl Project {
 
     /// The absolute path of every visible worktree, longest first, so the one
     /// that contains a file is the first that matches it.
-    fn sorted_visible_worktree_roots(&self, cx: &App) -> Vec<PathBuf> {
+    pub fn sorted_visible_worktree_roots(&self, cx: &App) -> Vec<PathBuf> {
         self.visible_worktrees(cx)
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
             .sorted_by_key(|root| std::cmp::Reverse(root.components().count()))
@@ -5000,6 +5099,69 @@ impl Project {
             },
             cx,
         )
+    }
+
+    /// Replaces every span an in-process semantics source named with
+    /// `new_name`, as one undoable transaction per buffer.
+    ///
+    /// Nothing at all is edited unless every span still holds the text the
+    /// source read there. A rename that renamed some of a symbol's occurrences
+    /// and left the rest would break the project in a way the reader cannot
+    /// see, and is worse than a rename that visibly did nothing.
+    pub fn apply_in_process_rename(
+        &self,
+        spans: Vec<InProcessSpan>,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ProjectTransaction>> {
+        cx.spawn(async move |project, cx| {
+            let mut per_buffer: Vec<(Entity<Buffer>, Vec<Range<usize>>)> = Vec::new();
+            for span in spans {
+                let buffer = project
+                    .update(cx, |project, cx| project.open_local_buffer(&span.path, cx))?
+                    .await?;
+                let range = buffer.read_with(cx, |buffer, _| span.found_in(&buffer.snapshot()));
+                let Some(range) = range else {
+                    anyhow::bail!(
+                        "{} has changed since the rename was worked out",
+                        span.path.display()
+                    );
+                };
+                match per_buffer
+                    .iter_mut()
+                    .find(|(already, _)| already == &buffer)
+                {
+                    Some((_, ranges)) => ranges.push(range),
+                    None => per_buffer.push((buffer, vec![range])),
+                }
+            }
+
+            let mut applied = ProjectTransaction::default();
+            for (buffer, mut ranges) in per_buffer {
+                let transaction = buffer.update(cx, |buffer, cx| {
+                    // Every range was worked out against the text as it is now,
+                    // so the whole set has to arrive in one call and in order:
+                    // applying them one at a time would move the ground under
+                    // the ranges still to come.
+                    ranges.sort_by_key(|range| (range.start, range.end));
+                    let edits = ranges
+                        .into_iter()
+                        .map(|range| (range, new_name.clone()))
+                        .collect::<Vec<_>>();
+                    buffer.finalize_last_transaction();
+                    buffer.start_transaction();
+                    buffer.edit(edits, None, cx);
+                    buffer.end_transaction(cx).and_then(|transaction_id| {
+                        buffer.finalize_last_transaction();
+                        buffer.get_transaction(transaction_id).cloned()
+                    })
+                });
+                if let Some(transaction) = transaction {
+                    applied.0.insert(buffer, transaction);
+                }
+            }
+            Ok(applied)
+        })
     }
 
     pub fn on_type_format<T: ToPointUtf16>(

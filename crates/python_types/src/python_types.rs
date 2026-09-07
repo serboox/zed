@@ -1,4 +1,5 @@
 mod edited_system;
+mod name_semantics;
 mod type_completions;
 
 use std::collections::HashMap;
@@ -18,15 +19,16 @@ use ty_project::{ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
 use crate::edited_system::{EditedSystem, OpenBuffers};
 
-/// Answers hover and completion for Python out of `ty`'s type inference, in
-/// this process.
+/// Answers hover, completion, go-to-definition, find-references and rename for
+/// Python out of `ty`'s own resolution, in this process.
 ///
-/// One source object behind both, so the two share the project databases they
-/// answer out of rather than each building its own.
+/// One source object behind all of them, so they share the project databases
+/// they answer out of rather than each building its own.
 pub fn init(cx: &mut App) {
     let types = Arc::new(TypesFromTy::default());
     project::register_in_process_hover(types.clone(), cx);
-    project::register_in_process_completions(types, cx);
+    project::register_in_process_completions(types.clone(), cx);
+    project::register_in_process_semantics(types, cx);
 }
 
 #[derive(Default)]
@@ -329,14 +331,37 @@ mod tests {
                 }
             }
         }
+        let after_completions = resident_bytes();
+
+        // The same database is then asked the three questions that resolve a
+        // name rather than infer a type, at every offset inside a name -- which
+        // is every place a reader could ask one of them from.
+        let mut resolved = 0;
+        for (name, source) in modules {
+            for (offset, character) in source.char_indices() {
+                if !(character.is_alphanumeric() || character == '_') {
+                    continue;
+                }
+                let asked = asked_about(name, source, offset);
+                for found in [
+                    crate::name_semantics::definitions_of(&project, &asked),
+                    crate::name_semantics::references_of(&project, &asked),
+                    crate::name_semantics::rename_of(&project, &asked, "renamed"),
+                ] {
+                    resolved += found.map_or(0, |spans| spans.len());
+                }
+            }
+        }
         let after = resident_bytes();
         assert!(answered > 0, "the measurement needs real answers");
         assert!(offered > 0, "the measurement needs real suggestions");
+        assert!(resolved > 0, "the measurement needs real resolutions");
         println!(
-            "resident memory over {} modules, {answered} hovers and {offered} suggestions: {:.1} MB before, {:.1} MB after hovers, {:.1} MB after completions, {:.1} MB for the database",
+            "resident memory over {} modules, {answered} hovers, {offered} suggestions and {resolved} resolved spans: {:.1} MB before, {:.1} MB after hovers, {:.1} MB after completions, {:.1} MB after definitions, references and renames, {:.1} MB for the database",
             modules.len(),
             before as f64 / 1e6,
             after_hovers as f64 / 1e6,
+            after_completions as f64 / 1e6,
             after as f64 / 1e6,
             after.saturating_sub(before) as f64 / 1e6
         );
