@@ -215,6 +215,7 @@ members = [
     "crates/settings_profile_selector",
     "crates/settings_ui",
     "crates/shell_command_parser",
+    "crates/shell_diagnostics",
     "crates/sidebar",
     "crates/snippet",
     "crates/snippet_provider",
@@ -264,6 +265,7 @@ members = [
     "crates/workspace",
     "crates/toml_diagnostics",
     "crates/worktree",
+    "crates/xml_diagnostics",
     "crates/yaml_diagnostics",
     "crates/worktree_benchmarks",
     "crates/x_ai",
@@ -506,6 +508,7 @@ settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
 settings_ui = { path = "crates/settings_ui" }
 shell_command_parser = { path = "crates/shell_command_parser" }
+shell_diagnostics = { path = "crates/shell_diagnostics" }
 snippet = { path = "crates/snippet" }
 snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
@@ -553,6 +556,7 @@ web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 toml_diagnostics = { path = "crates/toml_diagnostics" }
 worktree = { path = "crates/worktree" }
+xml_diagnostics = { path = "crates/xml_diagnostics" }
 yaml_diagnostics = { path = "crates/yaml_diagnostics" }
 x_ai = { path = "crates/x_ai" }
 zed = { path = "crates/zed" }
