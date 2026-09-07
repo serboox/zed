@@ -152,11 +152,19 @@ fn watch_one(
     .detach();
 }
 
+/// Whether saving this buffer is a reason to ask the toolchain again.
+///
+/// `go.mod` and `go.work` are their own languages in the editor and neither is
+/// named "Go", so a check that only accepted "Go" never ran for them -- and
+/// those two files are exactly the ones whose edit invalidates the answer for
+/// every other file in the module. Requiring a dependency, raising the language
+/// version or dropping a module from the workspace changes what builds; asking
+/// again after such a save is the point.
 fn is_go(buffer: &Entity<Buffer>, cx: &App) -> bool {
     buffer
         .read(cx)
         .language()
-        .is_some_and(|language| language.name().as_ref() == "Go")
+        .is_some_and(|language| matches!(language.name().as_ref(), "Go" | "Go Mod" | "Go Work"))
 }
 
 /// Starts a check, cancelling whichever one was running. The previous answer is
@@ -406,5 +414,46 @@ mod tests {
         let (telling, now) = what_to_tell(Vec::new(), &HashSet::default());
         assert!(telling.is_empty());
         assert!(now.is_empty());
+    }
+
+    /// The three languages a Go module is actually written in all reach the
+    /// check, and nothing else does.
+    ///
+    /// `go.mod` and `go.work` are separate languages in the editor, named
+    /// neither of them "Go", and they are the two files whose edit invalidates
+    /// every other file's answer. A gate that reads the language name has to
+    /// name all three or those saves are silently dropped.
+    #[gpui::test]
+    fn every_language_a_go_module_is_written_in_reaches_the_check(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        for (language, expected) in [
+            ("Go", true),
+            ("Go Mod", true),
+            ("Go Work", true),
+            ("Rust", false),
+            ("Markdown", false),
+        ] {
+            let buffer = cx.new(|cx| language::Buffer::local("", cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_language(
+                    Some(Arc::new(language::Language::new(
+                        language::LanguageConfig {
+                            name: language.into(),
+                            ..Default::default()
+                        },
+                        None,
+                    ))),
+                    cx,
+                );
+            });
+            cx.update(|cx| {
+                assert_eq!(
+                    is_go(&buffer, cx),
+                    expected,
+                    "a save of a {language} buffer"
+                );
+            });
+        }
     }
 }
