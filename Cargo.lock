@@ -9993,6 +9993,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "fs",
  "gpui",
  "language",
  "log",
@@ -10001,7 +10002,9 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "settings",
  "smol",
+ "util",
  "which 6.0.3",
  "workspace",
 ]
@@ -18078,6 +18081,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "php_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "picker"
 version = "0.1.0"
 dependencies = [
@@ -19295,15 +19314,26 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "editor",
+ "fs",
+ "futures 0.3.32",
  "gpui",
  "language",
  "log",
  "lsp",
  "pretty_assertions",
  "project",
+ "python_types",
+ "release_channel",
+ "semver 1.0.27",
  "serde",
  "serde_json",
+ "settings",
  "smol",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "util",
  "which 6.0.3",
  "workspace",
 ]
@@ -20672,6 +20702,22 @@ name = "rtrb"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad8388ea1a9e0ea807e442e8263a699e7edcb320ecbcd21b4fa8ff859acce3ba"
+
+[[package]]
+name = "ruby_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
 
 [[package]]
 name = "ruff_annotate_snippets"
@@ -24017,6 +24063,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "shellexpand"
 version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25402,6 +25466,7 @@ dependencies = [
  "lsp",
  "paths",
  "project",
+ "python_types",
  "semantic_index",
  "serde_json",
  "settings",
@@ -31750,6 +31815,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "xml_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "pretty_assertions",
+ "project",
+ "quick-xml 0.38.3",
+ "workspace",
+]
+
+[[package]]
 name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32158,6 +32239,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "pdf_preview",
+ "php_diagnostics",
  "picker",
  "pkg-config",
  "platform_title_bar",
@@ -32180,6 +32262,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "ruby_diagnostics",
  "run_configurations",
  "sandbox",
  "search",
@@ -32191,6 +32274,7 @@ dependencies = [
  "settings",
  "settings_profile_selector",
  "settings_ui",
+ "shell_diagnostics",
  "shellexpand",
  "sidebar",
  "smol",
@@ -32236,6 +32320,7 @@ dependencies = [
  "windows 0.61.3",
  "windows_resources",
  "workspace",
+ "xml_diagnostics",
  "yaml_diagnostics",
  "zed-reqwest",
  "zed_actions",
