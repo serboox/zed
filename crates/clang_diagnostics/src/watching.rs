@@ -156,7 +156,13 @@ fn watch_one(
 /// has to say which language its code block is in, and "C" and "C++" are not
 /// the same answer.
 pub(crate) fn c_or_cpp(buffer: &Entity<Buffer>, cx: &App) -> Option<&'static str> {
-    match buffer.read(cx).language()?.name().as_ref() {
+    front_end_language(buffer.read(cx).language()?.name().as_ref())
+}
+
+/// The same question asked of a language's name alone, which is what the front
+/// end is gated on everywhere in this crate.
+pub(crate) fn front_end_language(name: &str) -> Option<&'static str> {
+    match name {
         "C" => Some("C"),
         "C++" => Some("C++"),
         _ => None,
