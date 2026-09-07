@@ -1,13 +1,14 @@
+use crate::request_view::RequestView;
 use crate::response_view::{ResponseData, ResponseTab, format_size};
-use api_client::TestResult;
+use api_client::{RequestId, TestResult};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, div,
+    AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Window, div,
 };
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{IconName, Label, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
-use workspace::{Item, ItemHandle as _, Workspace, dock::Panel as _};
+use workspace::{Item, ItemHandle as _, Pane, SaveIntent, Workspace, dock::Panel as _};
 
 /// Everything the dock needs to render a completed response. The body
 /// editors are the very same `Entity<Editor>` the originating `RequestView`
@@ -26,7 +27,7 @@ pub struct DockResponseEntry {
     pub visualize_data: Option<serde_json::Value>,
 }
 
-enum ResponseDockDisplay {
+pub(crate) enum ResponseDockDisplay {
     Idle,
     Sending {
         request_title: SharedString,
@@ -70,20 +71,34 @@ fn next_response_tab(
     }
 }
 
-/// A single bottom-dock surface shared by every request, always showing the
-/// most recent send regardless of which request produced it -- a second send
-/// simply replaces `display`, matching the "one shared response view" this
-/// panel exists to provide instead of each request tab keeping its own.
-/// Identifies one send, so updates that arrive out of order can be told apart.
+/// Identifies one send of one request, so updates that arrive out of order can
+/// be told apart: a slow reply must not land on top of the newer one that
+/// replaced it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SendGeneration(u64);
 
+/// Which request a response tab answers: the request in the store, the title
+/// the tab wears, and the request tab it is paired with.
+#[derive(Clone)]
+pub(crate) struct PairedRequest {
+    pub request_id: RequestId,
+    pub request_item: EntityId,
+    pub title: SharedString,
+}
+
+/// One reply, in the bottom dock, belonging to one request. A reply belongs to
+/// its request rather than to the window: with several requests open, each has
+/// its own tab here, so the body on screen always answers the request in front
+/// of it. The two tabs live and die together -- closing either closes the other.
 pub struct ResponseDockPanel {
     focus_handle: FocusHandle,
-    display: ResponseDockDisplay,
+    pub(crate) request_id: RequestId,
+    request_title: SharedString,
+    pub(crate) display: ResponseDockDisplay,
     generation: SendGeneration,
     response_tab: ResponseTab,
     scroll_handle: ScrollHandle,
+    _pairing: Option<Subscription>,
 }
 
 /// A tab carries no events of its own; the enum exists because `Item` needs one.
@@ -95,7 +110,7 @@ impl Item for ResponseDockPanel {
     type Event = ResponseTabEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "API Response".into()
+        self.request_title.clone()
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
@@ -103,28 +118,118 @@ impl Item for ResponseDockPanel {
     }
 }
 
-/// The tab every reply lands in, opened beside the terminals if it is not there
-/// yet, activated and revealed. One tab for all requests: a later reply replaces
-/// what the tab shows rather than stacking another tab beside it.
-pub fn reveal_response_tab(
+/// This request's own response tab, opened beside the terminals if it is not
+/// there yet, activated and revealed. Every request keeps its own tab, so a
+/// second request's reply stacks a tab beside this one rather than overwriting
+/// what it shows.
+pub(crate) fn reveal_response_tab(
     workspace: &mut Workspace,
+    request: PairedRequest,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<ResponseDockPanel>> {
-    let pane = workspace
-        .panel::<TerminalPanel>(cx)
-        .and_then(|panel| panel.read(cx).pane())?;
-    let existing = pane.read(cx).items_of_type::<ResponseDockPanel>().next();
-    let tab = match existing {
+    let pane = response_pane(workspace, cx)?;
+    let tab = match response_tab_for(&pane, request.request_id, cx) {
         Some(tab) => tab,
         None => {
-            let tab = cx.new(ResponseDockPanel::new);
+            let tab = cx.new(|cx| ResponseDockPanel::new(request.clone(), cx));
             pane.update(cx, |pane, cx| {
                 pane.add_item(Box::new(tab.clone()), false, false, None, window, cx);
             });
             tab
         }
     };
+    let workspace_handle = cx.entity();
+    tab.update(cx, |tab, cx| {
+        tab.pair_with_request(request.request_item, &workspace_handle, window, cx)
+    });
+    activate_without_focusing(&pane, &tab, window, cx);
+    // Revealed rather than merely opened: a zoomed item elsewhere would leave the
+    // tab activated but hidden behind it.
+    workspace.reveal_panel::<TerminalPanel>(window, cx);
+    Some(tab)
+}
+
+/// Brings this request's reply to the front of the dock, leaving the caret where
+/// it is. Opens nothing: a request that was never sent has no reply to show, and
+/// the dock stays as the reader left it.
+pub(crate) fn activate_response_tab(
+    workspace: &Workspace,
+    request_id: RequestId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(pane) = response_pane(workspace, cx) else {
+        return;
+    };
+    let Some(tab) = response_tab_for(&pane, request_id, cx) else {
+        return;
+    };
+    // Activating what is already at the front would emit another active-item
+    // change and bring us straight back here.
+    if pane.read(cx).active_item().map(|item| item.item_id()) == Some(tab.item_id()) {
+        return;
+    }
+    activate_without_focusing(&pane, &tab, window, cx);
+}
+
+/// Opens the active request's response tab and puts the caret in it, for the
+/// reader who asked for it by its own shortcut rather than by sending something.
+pub fn focus_response_tab(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(request) = workspace
+        .active_item(cx)
+        .and_then(|item| item.downcast::<RequestView>())
+    else {
+        return;
+    };
+    let paired = RequestView::paired_request(&request, cx);
+    let Some(tab) = reveal_response_tab(workspace, paired, window, cx) else {
+        return;
+    };
+    let tab_item = tab.item_id();
+    request.update(cx, |request, _| request.remember_response_tab(tab_item));
+    let handle = tab.read(cx).focus_handle.clone();
+    window.focus(&handle, cx);
+}
+
+/// This request's response tab if it is already open, without opening one.
+pub(crate) fn existing_response_tab(
+    workspace: &Workspace,
+    request_id: RequestId,
+    cx: &App,
+) -> Option<Entity<ResponseDockPanel>> {
+    let pane = response_pane(workspace, cx)?;
+    response_tab_for(&pane, request_id, cx)
+}
+
+/// The pane the replies live in: the terminal panel's own, so the answers sit
+/// with the rest of the output. It belongs to that panel rather than to the
+/// workspace, which is why removals from it have to be watched on the pane
+/// itself.
+pub(crate) fn response_pane(workspace: &Workspace, cx: &App) -> Option<Entity<Pane>> {
+    workspace.panel::<TerminalPanel>(cx)?.read(cx).pane()
+}
+
+fn response_tab_for(
+    pane: &Entity<Pane>,
+    request_id: RequestId,
+    cx: &App,
+) -> Option<Entity<ResponseDockPanel>> {
+    pane.read(cx)
+        .items_of_type::<ResponseDockPanel>()
+        .find(|tab| tab.read(cx).request_id == request_id)
+}
+
+fn activate_without_focusing(
+    pane: &Entity<Pane>,
+    tab: &Entity<ResponseDockPanel>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let index = pane
         .read(cx)
         .items()
@@ -136,34 +241,32 @@ pub fn reveal_response_tab(
             pane.activate_item(index, false, false, window, cx);
         });
     }
-    // Revealed rather than merely opened: a zoomed item elsewhere would leave the
-    // tab activated but hidden behind it.
-    workspace.reveal_panel::<TerminalPanel>(window, cx);
-    Some(tab)
 }
 
-/// Opens the response tab and puts the caret in it, for the reader who asked for
-/// it by its own shortcut rather than by sending something.
-pub fn focus_response_tab(
-    workspace: &mut Workspace,
+/// Closes one half of a request/response pair the way the reader's own close
+/// does. `SaveIntent::Close` rather than `Skip` on purpose: skipping reloads the
+/// item instead of asking, which throws unsaved edits away, and a request closed
+/// by way of its response tab must still get the chance to be saved. Deferred
+/// because this runs while the other half is being removed, and closing an item
+/// re-entrant with that removal reorders the pane underneath it.
+pub(crate) fn close_paired_tab(
+    workspace: &Entity<Workspace>,
+    item_id: EntityId,
     window: &mut Window,
-    cx: &mut Context<Workspace>,
+    cx: &mut App,
 ) {
-    if let Some(tab) = reveal_response_tab(workspace, window, cx) {
-        let handle = tab.read(cx).focus_handle.clone();
-        window.focus(&handle, cx);
-    }
-}
-
-/// The response tab if it is already open, without opening one.
-pub fn existing_response_tab(workspace: &Workspace, cx: &App) -> Option<Entity<ResponseDockPanel>> {
-    workspace
-        .panel::<TerminalPanel>(cx)?
-        .read(cx)
-        .pane()?
-        .read(cx)
-        .items_of_type::<ResponseDockPanel>()
-        .next()
+    let workspace = workspace.clone();
+    window.defer(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            let Some(pane) = workspace.pane_for_item_id(item_id) else {
+                return;
+            };
+            pane.update(cx, |pane, cx| {
+                pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+            })
+            .detach_and_log_err(cx);
+        });
+    });
 }
 
 impl Focusable for ResponseDockPanel {
@@ -173,14 +276,42 @@ impl Focusable for ResponseDockPanel {
 }
 
 impl ResponseDockPanel {
-    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(request: PairedRequest, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            request_id: request.request_id,
+            request_title: request.title,
             display: ResponseDockDisplay::Idle,
             generation: SendGeneration::default(),
             response_tab: ResponseTab::Pretty,
             scroll_handle: ScrollHandle::new(),
+            _pairing: None,
         }
+    }
+
+    /// Ties this tab to the request tab it answers, so closing the request
+    /// closes the reply with it. Watched from here rather than from the request:
+    /// the tab being removed can already be dropped by the time the workspace
+    /// reports it, so each half watches the half that is still alive.
+    fn pair_with_request(
+        &mut self,
+        request_item: EntityId,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._pairing = Some(cx.subscribe_in(
+            workspace,
+            window,
+            move |_this, workspace, event, window, cx| {
+                if let workspace::Event::ItemRemoved { item_id } = event
+                    && *item_id == request_item
+                {
+                    let response_item = cx.entity_id();
+                    close_paired_tab(workspace, response_item, window, cx);
+                }
+            },
+        ));
     }
 
     /// Switching tabs starts at the top: the offset left over from the tab
@@ -713,6 +844,17 @@ mod tests {
         }
     }
 
+    fn test_panel(cx: &mut Context<ResponseDockPanel>) -> ResponseDockPanel {
+        ResponseDockPanel::new(
+            PairedRequest {
+                request_id: RequestId::new_v4(),
+                request_item: cx.entity_id(),
+                title: "Request".into(),
+            },
+            cx,
+        )
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -722,13 +864,12 @@ mod tests {
         });
     }
 
-    /// The dock is one shared surface: sending a second response must
-    /// replace the first entirely, regardless of which request produced
-    /// either one -- there is no per-request slot to fall back to.
+    /// A tab holds one reply: sending the same request again must replace what
+    /// the tab shows entirely, since there is no second slot to fall back to.
     #[gpui::test]
     fn showing_a_second_response_replaces_the_first(cx: &mut TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let window = cx.add_window(|_, cx| test_panel(cx));
         let dock = window.root(cx).unwrap();
 
         let first_editor = window
@@ -794,7 +935,7 @@ mod tests {
     #[gpui::test]
     fn a_long_body_fills_the_tab_instead_of_a_guessed_height(cx: &mut TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let window = cx.add_window(|_, cx| test_panel(cx));
         let dock = window.root(cx).unwrap();
         let long_json: String = std::iter::repeat_n("  \"key\": \"value\",\n", 400).collect();
         let editor = window
@@ -861,7 +1002,7 @@ mod tests {
     #[gpui::test]
     fn a_long_headers_list_keeps_the_tab_scrollable(cx: &mut TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let window = cx.add_window(|_, cx| test_panel(cx));
         let dock = window.root(cx).unwrap();
         let editor = window
             .update(cx, |_, window, cx| {
@@ -901,13 +1042,12 @@ mod tests {
         );
     }
 
-    /// Requests finish in whatever order the network answers, and the dock shows
-    /// one response for the whole workspace, so a slow earlier send must not land
-    /// on top of a newer one's reply.
+    /// Sends finish in whatever order the network answers, and a tab shows one
+    /// reply, so a slow earlier send must not land on top of a newer one.
     #[gpui::test]
     fn a_late_reply_does_not_replace_a_newer_one(cx: &mut TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let window = cx.add_window(|_, cx| test_panel(cx));
         let dock = window.root(cx).unwrap();
         let editor = window
             .update(cx, |_, window, cx| {
@@ -955,7 +1095,7 @@ mod tests {
     #[gpui::test]
     fn sending_and_error_states_replace_a_previous_success(cx: &mut TestAppContext) {
         init_test(cx);
-        let window = cx.add_window(|_, cx| ResponseDockPanel::new(cx));
+        let window = cx.add_window(|_, cx| test_panel(cx));
         let dock = window.root(cx).unwrap();
         let editor = window
             .update(cx, |_, window, cx| {
