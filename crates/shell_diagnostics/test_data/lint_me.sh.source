@@ -1,0 +1,9 @@
+#!/bin/bash
+label="café 🦀🔥"; echo $label
+if [ $# == 1 ]; then
+  cd /tmp
+  rm -rf "$label"/
+fi
+here=`pwd`
+echo "$here" > /dev/null
+[ -z $label ] && exit

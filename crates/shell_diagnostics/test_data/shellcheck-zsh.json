@@ -1,0 +1,1 @@
+{"comments":[{"file":"z.zsh","line":1,"endLine":1,"column":1,"endColumn":1,"level":"error","code":1071,"message":"ShellCheck only supports sh/bash/dash/ksh/'busybox sh' scripts. Sorry!","fix":null}]}
