@@ -780,6 +780,7 @@ fn main() {
         go_diagnostics::init(cx);
         python_diagnostics::init(cx);
         json_diagnostics::init(cx);
+        prose_diagnostics::init(cx);
         clang_diagnostics::init(cx);
         yaml_diagnostics::init(cx);
         toml_diagnostics::init(cx);

@@ -182,6 +182,7 @@ platform_title_bar.workspace = true
 profiling.workspace = true
 project.workspace = true
 project_panel.workspace = true
+prose_diagnostics.workspace = true
 project_symbols.workspace = true
 search_everywhere.workspace = true
 prompt_store.workspace = true

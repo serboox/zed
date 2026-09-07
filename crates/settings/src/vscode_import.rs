@@ -180,6 +180,7 @@ impl VsCodeSettings {
             open_in_preview: None,
             run_configurations: None,
             typo_diagnostics: None,
+            prose_diagnostics: None,
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,
             collaboration_panel: None,

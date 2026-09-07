@@ -1621,6 +1621,15 @@
   // opens showing that view rather than its source. Alt-1 shows the source,
   // alt-2 shows both.
   "open_in_preview": true,
+  // How documents and comments are read for grammar and spelling. The reading
+  // happens in this binary, with no language server; it is English only, and in
+  // source files it looks at whole-line comments and never at code.
+  "prose_diagnostics": {
+    // Whether documents and comments are read at all.
+    "enabled": true,
+    // Whether the comments of source files are read as well as Markdown.
+    "check_comments": true
+  },
   // How run configurations behave.
   "run_configurations": {
     // How many of the ways run on the spot are kept before the oldest is
