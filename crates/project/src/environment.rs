@@ -210,12 +210,22 @@ impl ProjectEnvironment {
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
+                    // A shell that never finishes must not hold this up
+                    // forever: the terminals of a restored session each wait on
+                    // one of these, and a shell that prints an environment and
+                    // then fails to exit once left every one of them waiting for
+                    // as long as the editor ran. The timer is the executor's, so
+                    // a test moves it rather than waiting on it.
+                    let give_up_on_it = cx
+                        .background_executor()
+                        .timer(util::shell_env::NO_LONGER_THAN);
                     let mut shell_env = match cx
                         .background_spawn(load_directory_shell_environment(
                             shell,
                             abs_path.clone(),
                             load_direnv,
                             tx,
+                            give_up_on_it,
                         ))
                         .await
                     {
@@ -315,6 +325,7 @@ async fn load_directory_shell_environment(
     abs_path: Arc<Path>,
     load_direnv: DirenvSettings,
     tx: mpsc::UnboundedSender<String>,
+    give_up_on_it: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<HashMap<String, String>> {
     if let DirenvSettings::Disabled = load_direnv {
         return Ok(HashMap::default());
@@ -340,7 +351,7 @@ async fn load_directory_shell_environment(
     };
 
     let (shell, args) = shell.program_and_args();
-    let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
+    let mut envs = util::shell_env::capture(shell.clone(), args, abs_path, give_up_on_it)
         .await
         .with_context(|| {
             tx.unbounded_send("Failed to load environment variables".into())

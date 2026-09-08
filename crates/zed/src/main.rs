@@ -448,10 +448,21 @@ fn main() {
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
     if !stdout_is_a_pty() {
         app.background_executor()
-            .spawn(async {
+            .spawn({
+                // The patience is made here rather than inside the capture, so
+                // that it is this executor's timer -- the one a test can move
+                // -- and not a clock of the capture's own.
                 #[cfg(unix)]
-                util::load_login_shell_environment().await.log_err();
-                shell_env_loaded_tx.send(()).ok();
+                let give_up_on_it = app
+                    .background_executor()
+                    .timer(util::shell_env::NO_LONGER_THAN);
+                async move {
+                    #[cfg(unix)]
+                    util::load_login_shell_environment(give_up_on_it)
+                        .await
+                        .log_err();
+                    shell_env_loaded_tx.send(()).ok();
+                }
             })
             .detach();
     } else {

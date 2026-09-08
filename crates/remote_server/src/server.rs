@@ -623,9 +623,14 @@ pub fn execute_run(
     #[cfg(unix)]
     let shell_env_loaded_rx = {
         let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+        let give_up_on_it = app
+            .background_executor()
+            .timer(util::shell_env::NO_LONGER_THAN);
         app.background_executor()
-            .spawn(async {
-                util::load_login_shell_environment().await.log_err();
+            .spawn(async move {
+                util::load_login_shell_environment(give_up_on_it)
+                    .await
+                    .log_err();
                 shell_env_loaded_tx.send(()).ok();
             })
             .detach();

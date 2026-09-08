@@ -404,7 +404,9 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-pub async fn load_login_shell_environment() -> Result<()> {
+pub async fn load_login_shell_environment(
+    give_up_on_it: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     use anyhow::Context as _;
 
     load_shell_from_passwd().log_err();
@@ -414,9 +416,10 @@ pub async fn load_login_shell_environment() -> Result<()> {
     // into shell's `cd` command (and hooks) to manipulate env.
     // We do this so that we get the env a user would have when spawning a shell
     // in home directory.
-    for (name, value) in shell_env::capture(get_system_shell(), &[], paths::home_dir())
-        .await
-        .with_context(|| format!("capturing environment with {:?}", get_system_shell()))?
+    for (name, value) in
+        shell_env::capture(get_system_shell(), &[], paths::home_dir(), give_up_on_it)
+            .await
+            .with_context(|| format!("capturing environment with {:?}", get_system_shell()))?
     {
         // Skip SHLVL to prevent it from polluting Zed's process environment.
         // The login shell used for env capture increments SHLVL, and if we propagate it,
