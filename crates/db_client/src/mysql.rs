@@ -17,6 +17,170 @@ use crate::schema::{
     ProcedureKind, QueryResult, QueryTiming, TableInfo, TableKind, TriggerInfo, UserInfo,
 };
 
+/// A transaction being held open, and the connection it lives on.
+struct HeldTransaction {
+    connection: sqlx::MySqlConnection,
+    /// The database this connection was switched to. Kept apart from the
+    /// provider's `current_database`, which describes the pool's connection:
+    /// these are two different connections and each remembers its own.
+    database: String,
+}
+
+/// What a statement does to a transaction, read from the statement itself.
+///
+/// Read from the text because the reader types these by hand -- `START
+/// TRANSACTION;` in the console is the ordinary way to open one, not a menu
+/// item. A transaction the editor did not notice being opened is the worst of
+/// the possible states: it holds locks, nothing shows it, and nothing will
+/// ever close it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatItDoesToTheTransaction {
+    Opens,
+    Finishes,
+    /// A savepoint, a rollback to one, or a commit that chains straight into
+    /// the next transaction: each of these belongs inside the transaction and
+    /// must reach the held connection, and none of them leaves the connection
+    /// free to be let go of.
+    Inside,
+    Nothing,
+}
+
+/// Reads a statement's effect on the transaction.
+///
+/// `SET autocommit` counts as opening one: turning autocommit off means every
+/// following statement is staged until a commit, which is a transaction in
+/// everything but name, and one nothing would otherwise be watching.
+fn what_it_does_to_the_transaction(sql: &str) -> WhatItDoesToTheTransaction {
+    let words = words_of(sql);
+    if words == "BEGIN"
+        || words == "BEGIN WORK"
+        || starts_the_statement(&words, "START TRANSACTION")
+        || turns_this_session_autocommit_off(&words)
+    {
+        return WhatItDoesToTheTransaction::Opens;
+    }
+    // These read as endings but leave the connection inside a transaction, so
+    // they are answered before the plain forms below rather than after them.
+    // `COMMIT AND CHAIN` ends one transaction and begins the next on the same
+    // connection with no idle moment between them, so letting the connection
+    // go on it would abandon a live transaction. `ROLLBACK TO SAVEPOINT`
+    // undoes part of a transaction that carries on -- and MySQL spells it
+    // `ROLLBACK [WORK] TO [SAVEPOINT] name`, so the `WORK` form has to be
+    // recognised too or it reads as a plain rollback and ends the wrong thing.
+    if chains_into_the_next_transaction(&words)
+        || rolls_back_to_a_savepoint(&words)
+        || starts_the_statement(&words, "SAVEPOINT")
+        || starts_the_statement(&words, "RELEASE SAVEPOINT")
+    {
+        return WhatItDoesToTheTransaction::Inside;
+    }
+    if starts_the_statement(&words, "COMMIT") || starts_the_statement(&words, "ROLLBACK") {
+        return WhatItDoesToTheTransaction::Finishes;
+    }
+    WhatItDoesToTheTransaction::Nothing
+}
+
+/// The statement as upper-case words separated by one space each, with any
+/// comments in front of it and any trailing semicolons gone.
+///
+/// Classification reads the first keyword, and a reader who writes a note
+/// above `START TRANSACTION;` would otherwise hide that keyword behind it --
+/// leaving a transaction open that nothing is watching, which is the one
+/// state this whole mechanism exists to prevent.
+fn words_of(sql: &str) -> String {
+    let statement = without_leading_comments(sql).trim().trim_end_matches(';');
+    statement
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `words` is `keyword` exactly, or `keyword` followed by arguments.
+///
+/// Not a plain `starts_with`, which also matches a statement whose first word
+/// merely begins with the keyword -- `COMMITTED` is not a `COMMIT`.
+fn starts_the_statement(words: &str, keyword: &str) -> bool {
+    words == keyword
+        || words
+            .strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// Whether the statement ends the current transaction and opens the next one
+/// on the same connection. `AND NO CHAIN` says the opposite and must not match.
+fn chains_into_the_next_transaction(words: &str) -> bool {
+    (starts_the_statement(words, "COMMIT") || starts_the_statement(words, "ROLLBACK"))
+        && words.contains(" AND CHAIN")
+}
+
+/// Whether the statement rolls back to a savepoint rather than ending the
+/// transaction. MySQL spells it `ROLLBACK [WORK] TO [SAVEPOINT] name`.
+fn rolls_back_to_a_savepoint(words: &str) -> bool {
+    words.starts_with("ROLLBACK TO ") || words.starts_with("ROLLBACK WORK TO ")
+}
+
+/// Whether the statement turns autocommit off for *this* session.
+///
+/// Scope decides it. `SET GLOBAL autocommit = 0` and the `PERSIST` forms
+/// change what later sessions start with and leave this one exactly as it was,
+/// so nothing is opened here and nothing has to be held.
+fn turns_this_session_autocommit_off(words: &str) -> bool {
+    let Some(rest) = words.strip_prefix("SET ") else {
+        return false;
+    };
+    let rest = ["SESSION ", "LOCAL "]
+        .iter()
+        .find_map(|scope| rest.strip_prefix(scope))
+        .unwrap_or(rest);
+    // `@@SESSION.` and `@@LOCAL.` before the bare `@@`, which is the same
+    // session scope written shorter.
+    let rest = ["@@SESSION.", "@@LOCAL.", "@@"]
+        .iter()
+        .find_map(|scope| rest.strip_prefix(scope))
+        .unwrap_or(rest);
+    let Some(value) = rest.strip_prefix("AUTOCOMMIT") else {
+        return false;
+    };
+    let Some(value) = value.trim_start().strip_prefix('=') else {
+        return false;
+    };
+    matches!(value.trim(), "0" | "OFF" | "FALSE")
+}
+
+/// The statement with any comments in front of it removed.
+fn without_leading_comments(sql: &str) -> &str {
+    let mut rest = sql.trim_start();
+    loop {
+        let after = if let Some(after) = rest.strip_prefix("--") {
+            // MySQL reads `--` as a comment only when whitespace follows it;
+            // without that it is the subtraction operator written twice.
+            if !after.starts_with([' ', '\t', '\r', '\n']) {
+                return rest;
+            }
+            after.split_once('\n').map_or("", |(_, tail)| tail)
+        } else if let Some(after) = rest.strip_prefix('#') {
+            after.split_once('\n').map_or("", |(_, tail)| tail)
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            after.split_once("*/").map_or("", |(_, tail)| tail)
+        } else {
+            return rest;
+        };
+        rest = after.trim_start();
+    }
+}
+
+/// Whether the statement answers with rows, and so has to be streamed rather
+/// than executed for a count of rows it changed.
+fn is_a_read_query(sql: &str) -> bool {
+    let words = words_of(sql);
+    let first_word = words.split(' ').next().unwrap_or_default();
+    matches!(
+        first_word,
+        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH"
+    )
+}
+
 pub struct MySqlProvider {
     pool: RwLock<MySqlPool>,
     connect_options: MySqlConnectOptions,
@@ -30,6 +194,31 @@ pub struct MySqlProvider {
     // single-flight -- two callers can never build and swap in two
     // replacement pools at once.
     op_lock: AsyncMutex<()>,
+    /// The transaction this connection is holding open, if any, and the one
+    /// physical connection it lives on.
+    ///
+    /// Kept outside the pool on purpose. The pool closes a connection that has
+    /// been idle for its idle timeout and retires one that reaches its maximum
+    /// lifetime, and either would end a transaction mid-way with nothing said
+    /// -- the reader's next statement would then run outside the transaction
+    /// they believed they were in, and a commit would report success over work
+    /// the server had already discarded.
+    /// Lock order is `op_lock` first, then this, and never the other way
+    /// round: an operation already inside `op_lock` may go on to take this
+    /// one, so a caller holding this and waiting for `op_lock` would wedge
+    /// the provider for good.
+    held: AsyncMutex<Option<HeldTransaction>>,
+    /// When the held transaction was opened, or nothing where none is.
+    ///
+    /// A plain lock rather than a field of `HeldTransaction` because
+    /// `transaction_open_since` is synchronous -- whatever draws the reader's
+    /// badge cannot await -- while `held` is an async lock that stays taken
+    /// for as long as a statement inside the transaction is running. Reading
+    /// `held` through `try_lock` would answer "nothing open" for the whole of
+    /// a slow statement, which is exactly when the reader most needs to be
+    /// told otherwise. Written only while `held` is taken, so the two cannot
+    /// come to disagree.
+    transaction_opened_at: Mutex<Option<Instant>>,
     /// The database this connection was last switched to. The switch is a round
     /// trip of its own, and on a distant server that costs as much as the query
     /// it precedes, so it is not repeated for a database already current.
@@ -109,6 +298,19 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// arriving -- only a genuine stall trips it.
 const ROW_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a transaction the reader opened by typing `START TRANSACTION;`
+/// may sit silent before the server closes its connection and InnoDB rolls it
+/// back.
+///
+/// A transaction opened through `begin_transaction` is told how long by
+/// whoever opened it. One the reader opens by hand in the console has nobody
+/// to ask, and the alternative to a number here is a transaction with no
+/// server-side guard at all -- which is the state that holds its locks
+/// against everyone else until a person notices. An hour is long enough that
+/// nobody loses work they were still thinking about, and short enough that an
+/// editor killed before lunch is not still holding rows after it.
+const CONSOLE_TRANSACTION_ABANDONED_AFTER: Duration = Duration::from_secs(60 * 60);
+
 fn mysql_ssl_mode(mode: SslMode) -> MySqlSslMode {
     match mode {
         SslMode::Disabled => MySqlSslMode::Disabled,
@@ -155,6 +357,8 @@ impl MySqlProvider {
             pool: RwLock::new(pool),
             connect_options: opts,
             op_lock: AsyncMutex::new(()),
+            held: AsyncMutex::new(None),
+            transaction_opened_at: Mutex::new(None),
             current_database: Mutex::new(None),
         })
     }
@@ -214,8 +418,116 @@ impl MySqlProvider {
         Ok(())
     }
 
-    /// One attempt at the caller's SQL on the connection given, with the
-    /// database switched first when it is not already the current one.
+    /// Switches the database on the held connection, unless it is already the
+    /// one asked for.
+    ///
+    /// Deliberately does not touch `current_database`. That memo describes the
+    /// pool's one connection, and writing the held connection's database into
+    /// it would make the next pooled query skip a `USE` it still needs and run
+    /// against whatever database the pool was last left on.
+    async fn switch_the_held_connection_to(
+        transaction: &mut HeldTransaction,
+        database: &str,
+    ) -> Result<()> {
+        if !needs_a_switch(Some(transaction.database.as_str()), database) {
+            return Ok(());
+        }
+        let use_stmt = format!("USE `{}`", database.replace('`', "``"));
+        tokio::time::timeout(
+            ROW_FETCH_TIMEOUT,
+            sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&mut transaction.connection),
+        )
+        .await
+        .context("Timed out switching database -- the connection stalled")?
+        .context("Failed to switch database")?;
+        transaction.database = database.to_string();
+        Ok(())
+    }
+
+    /// Opens a transaction on a connection of its own and keeps hold of it.
+    ///
+    /// `opening_statement` is the SQL that opens it, so the reader's own
+    /// wording survives: `START TRANSACTION WITH CONSISTENT SNAPSHOT` and
+    /// `SET autocommit = 0` do not mean the same thing as a bare `START
+    /// TRANSACTION` and must not be quietly replaced by one.
+    ///
+    /// Called with `op_lock` and then `held` already taken, in that order.
+    async fn open_a_held_transaction(
+        &self,
+        held: &mut Option<HeldTransaction>,
+        database: &str,
+        abandoned_after: Duration,
+        opening_statement: &str,
+    ) -> Result<QueryResult> {
+        if held.is_some() {
+            anyhow::bail!(
+                "A transaction is already open on this connection -- commit or roll it back \
+                 before opening another."
+            );
+        }
+        // A connection of its own, never one from the pool. The pool is
+        // `max_connections(1)` and sqlx 0.9 defaults to closing a connection
+        // idle for 10 minutes and retiring one that reaches 30 minutes of
+        // life, both enforced on the connection once it is back in the pool.
+        // A transaction staged while the reader reads over their own diff
+        // would be closed underneath them and rolled back by the server with
+        // nothing said: the next statement would run outside the transaction
+        // they believe they are in, and the commit after it would report
+        // success over work that no longer existed.
+        let mut connection =
+            <sqlx::MySqlConnection as sqlx::Connection>::connect_with(&self.connect_options)
+                .await
+                .context("Failed to open a connection for the transaction")?;
+
+        // The one guard that survives the editor being killed. MySQL upstream
+        // has no idle-transaction killer of its own -- `kill_idle_transaction`
+        // is Percona's -- so the honest tool is to have the server close the
+        // connection when it goes silent, which is what makes InnoDB roll the
+        // transaction back. `wait_timeout` and not `interactive_timeout`
+        // because sqlx does not send the `CLIENT_INTERACTIVE` capability flag
+        // on connect (its client capability set is built in
+        // `MySqlStream::with_socket`), and it is that flag which would make
+        // the server seed this session's wait from `interactive_timeout`
+        // instead. The unit is seconds, and MySQL accepts 1..=31536000.
+        let seconds = abandoned_after.as_secs().clamp(1, 31_536_000);
+        sqlx::raw_sql(AssertSqlSafe(
+            format!("SET SESSION wait_timeout = {seconds}").as_str(),
+        ))
+        .execute(&mut connection)
+        .await
+        .context("Failed to set the transaction's abandonment guard")?;
+
+        let mut transaction = HeldTransaction {
+            connection,
+            database: String::new(),
+        };
+        Self::switch_the_held_connection_to(&mut transaction, database).await?;
+        let answer = run_the_statement(&mut transaction.connection, opening_statement, 0).await?;
+        self.remember_the_transaction_opened(Some(Instant::now()));
+        *held = Some(transaction);
+        Ok(answer)
+    }
+
+    /// Takes the held transaction out and lets its connection go.
+    ///
+    /// Dropping the connection is what ends the transaction on the server:
+    /// the socket closing makes InnoDB roll back whatever was still open on
+    /// it, so nothing is left half-applied even when the statement that was
+    /// supposed to end it failed.
+    fn release_the_transaction(&self, held: &mut Option<HeldTransaction>) {
+        *held = None;
+        self.remember_the_transaction_opened(None);
+    }
+
+    fn remember_the_transaction_opened(&self, at: Option<Instant>) {
+        *self
+            .transaction_opened_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = at;
+    }
+
+    /// One attempt at the caller's SQL on the pool, with the database
+    /// switched first when it is not already the current one.
     async fn run_the_query(
         &self,
         pool: &MySqlPool,
@@ -224,133 +536,7 @@ impl MySqlProvider {
         pool_wait_ms: u64,
     ) -> Result<QueryResult> {
         self.switch_to(pool, database).await?;
-
-        let start = Instant::now();
-        let trimmed_upper = sql.trim().to_uppercase();
-        let is_read_query = trimmed_upper.starts_with("SELECT")
-            || trimmed_upper.starts_with("SHOW")
-            || trimmed_upper.starts_with("DESCRIBE")
-            || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESC")
-            || trimmed_upper.starts_with("WITH");
-        // Stored-program DDL (procedures, functions, triggers, events) is
-        // rejected by MySQL's prepared/binary protocol with error 1295 --
-        // per MySQL's own list of statements permitted as prepared
-        // statements, CREATE/ALTER/DROP PROCEDURE/FUNCTION/TRIGGER/EVENT are
-        // simply absent from it. These must go through the text protocol,
-        // the same way the `USE` statement above does.
-        let requires_text_protocol =
-            ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]
-                .iter()
-                .any(|keyword| {
-                    trimmed_upper.starts_with(&format!("CREATE {keyword}"))
-                        || trimmed_upper.starts_with(&format!("CREATE OR REPLACE {keyword}"))
-                        || trimmed_upper.starts_with(&format!("ALTER {keyword}"))
-                        || trimmed_upper.starts_with(&format!("DROP {keyword}"))
-                        || trimmed_upper.starts_with(&format!("DROP TEMPORARY {keyword}"))
-                });
-        let prefixed = format!(
-            "{}{}",
-            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
-            sql
-        );
-
-        if is_read_query {
-            // Stream rows instead of buffering the whole result. Each row is
-            // decoded and its cells capped before the next row is read, so a huge
-            // result (many rows or multi-megabyte BLOB cells) cannot be pulled
-            // into memory all at once and freeze the client.
-            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(pool);
-            let mut columns: Vec<String> = Vec::new();
-            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
-            // Set once the first row (or end-of-stream) arrives, splitting
-            // `execute_ms` (submit the query, wait for the server to start
-            // answering) from `streaming_ms` (pull and decode the rest).
-            let mut execute_ms: Option<u64> = None;
-            let mut first_row_at: Option<Instant> = None;
-
-            loop {
-                // Bound each row fetch so a connection that goes silently dead
-                // mid-result cannot block forever while `op_lock` is held; the
-                // guard then drops on return and the next query can reconnect.
-                let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
-                    Ok(Ok(Some(row))) => row,
-                    Ok(Ok(None)) => {
-                        if execute_ms.is_none() {
-                            execute_ms = Some(start.elapsed().as_millis() as u64);
-                        }
-                        break;
-                    }
-                    Ok(Err(error)) => return Err(error).context("Query execution failed"),
-                    Err(_elapsed) => anyhow::bail!(
-                        "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
-                         the database connection stalled mid-result"
-                    ),
-                };
-                if execute_ms.is_none() {
-                    execute_ms = Some(start.elapsed().as_millis() as u64);
-                    first_row_at = Some(Instant::now());
-                }
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|column| column.name().to_string())
-                        .collect();
-                }
-
-                let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| cell_to_string(&row, index))
-                    .collect();
-                result_rows.push(decoded);
-
-                if result_rows.len() >= MAX_RESULT_ROWS {
-                    break;
-                }
-            }
-
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            let rows_affected = result_rows.len() as u64;
-            let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
-            Ok(QueryResult {
-                raw_documents: None,
-                columns,
-                rows: result_rows,
-                rows_affected,
-                execution_time_ms,
-                timing: Some(QueryTiming {
-                    pool_wait_ms,
-                    execute_ms: execute_ms.unwrap_or(execution_time_ms),
-                    streaming_ms,
-                }),
-            })
-        } else {
-            let result = if requires_text_protocol {
-                sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
-                    .execute(pool)
-                    .await
-                    .context("Query execution failed")?
-            } else {
-                sqlx::query(AssertSqlSafe(prefixed.as_str()))
-                    .execute(pool)
-                    .await
-                    .context("Query execution failed")?
-            };
-
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            Ok(QueryResult {
-                raw_documents: None,
-                columns: vec![],
-                rows: vec![],
-                rows_affected: result.rows_affected(),
-                execution_time_ms,
-                timing: Some(QueryTiming {
-                    pool_wait_ms,
-                    execute_ms: execution_time_ms,
-                    streaming_ms: None,
-                }),
-            })
-        }
+        run_the_statement(pool, sql, pool_wait_ms).await
     }
 
     fn current_pool(&self) -> MySqlPool {
@@ -453,6 +639,210 @@ impl MySqlProvider {
             })
             .collect())
     }
+}
+
+/// Runs one statement and reads back whatever it answers with.
+///
+/// Generic over the executor rather than written once per executor: the pool
+/// and the connection a transaction is held on are two different executors,
+/// and the row streaming and cell capping below are delicate enough that a
+/// second copy of them would drift away from this one.
+///
+/// The executor is taken by value and used exactly once, because that is the
+/// shape both callers can satisfy -- `&MySqlPool` is `Copy` but the held
+/// connection arrives as `&mut MySqlConnection`, which is not -- so the
+/// database switch has to have happened before this is called.
+///
+/// Everything the reader types goes over the text protocol, reads and writes
+/// alike. MySQL permits only a fixed list of statements as prepared
+/// statements and rejects the rest with error 1295; `START TRANSACTION`,
+/// `USE`, `SAVEPOINT` and stored-program DDL are all absent from that list,
+/// so a driver that prepares user SQL fails on them one keyword at a time and
+/// every such failure reads to the reader as their own SQL being wrong.
+/// Chasing the list with a predicate is a game that cannot be won, and the
+/// prepared protocol buys nothing here anyway: console SQL carries its values
+/// inline and binds no parameters. One protocol for all of it is the only
+/// version that cannot be incomplete.
+async fn run_the_statement<'e, E>(executor: E, sql: &str, pool_wait_ms: u64) -> Result<QueryResult>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    let start = Instant::now();
+    let prefixed = format!(
+        "{}{}",
+        crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        sql
+    );
+
+    if is_a_read_query(sql) {
+        return stream_the_rows(executor, &prefixed, start, pool_wait_ms).await;
+    }
+
+    let result = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
+        .execute(executor)
+        .await
+        .context("Query execution failed")?;
+    let execution_time_ms = start.elapsed().as_millis() as u64;
+    Ok(QueryResult {
+        raw_documents: None,
+        columns: vec![],
+        rows: vec![],
+        rows_affected: result.rows_affected(),
+        execution_time_ms,
+        timing: Some(QueryTiming {
+            pool_wait_ms,
+            execute_ms: execution_time_ms,
+            streaming_ms: None,
+        }),
+    })
+}
+
+/// Streams a read query's rows into a `QueryResult`, stopping at
+/// `MAX_RESULT_ROWS`.
+///
+/// Rows are streamed rather than buffered: each one is decoded and its cells
+/// capped before the next is read, so a huge result -- many rows, or a single
+/// multi-megabyte BLOB cell -- cannot be pulled into memory all at once and
+/// freeze the client.
+async fn stream_the_rows<'e, E>(
+    executor: E,
+    prefixed: &str,
+    start: Instant,
+    pool_wait_ms: u64,
+) -> Result<QueryResult>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed)).fetch(executor);
+    let mut columns: Vec<String> = Vec::new();
+    let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+    // Set once the first row (or end-of-stream) arrives, splitting
+    // `execute_ms` (submit the query, wait for the server to start answering)
+    // from `streaming_ms` (pull and decode the rest).
+    let mut execute_ms: Option<u64> = None;
+    let mut first_row_at: Option<Instant> = None;
+
+    loop {
+        // Bound each row fetch so a connection that goes silently dead
+        // mid-result cannot block forever while `op_lock` is held; the guard
+        // then drops on return and the next query can reconnect.
+        let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
+            Ok(Ok(Some(row))) => row,
+            Ok(Ok(None)) => {
+                if execute_ms.is_none() {
+                    execute_ms = Some(start.elapsed().as_millis() as u64);
+                }
+                break;
+            }
+            Ok(Err(error)) => return Err(error).context("Query execution failed"),
+            Err(_elapsed) => anyhow::bail!(
+                "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
+                 the database connection stalled mid-result"
+            ),
+        };
+        if execute_ms.is_none() {
+            execute_ms = Some(start.elapsed().as_millis() as u64);
+            first_row_at = Some(Instant::now());
+        }
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect();
+        }
+
+        let decoded: Vec<Option<String>> = (0..columns.len())
+            .map(|index| cell_to_string(&row, index))
+            .collect();
+        result_rows.push(decoded);
+
+        if result_rows.len() >= MAX_RESULT_ROWS {
+            break;
+        }
+    }
+
+    let execution_time_ms = start.elapsed().as_millis() as u64;
+    let rows_affected = result_rows.len() as u64;
+    let streaming_ms = first_row_at.map(|instant| instant.elapsed().as_millis() as u64);
+    Ok(QueryResult {
+        raw_documents: None,
+        columns,
+        rows: result_rows,
+        rows_affected,
+        execution_time_ms,
+        timing: Some(QueryTiming {
+            pool_wait_ms,
+            execute_ms: execute_ms.unwrap_or(execution_time_ms),
+            streaming_ms,
+        }),
+    })
+}
+
+/// Pushes a read query's rows straight into `sink`, with no cap on how many.
+///
+/// Shares the executor shape of [`run_the_statement`] for the same reason and
+/// sends user SQL over the same one protocol. Unlike `stream_the_rows` this
+/// never breaks at `MAX_RESULT_ROWS`: the whole point of an export is result
+/// sets too large for the grid. Cells are still capped against a single
+/// multi-megabyte BLOB, but the row count itself is unbounded.
+async fn stream_into_the_sink<'e, E>(
+    executor: E,
+    sql: &str,
+    sink: &mut dyn crate::provider::RowSink,
+) -> Result<u64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    let prefixed = format!(
+        "{}{}",
+        crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        sql
+    );
+
+    if !is_a_read_query(sql) {
+        sqlx::raw_sql(AssertSqlSafe(prefixed.as_str()))
+            .execute(executor)
+            .await
+            .context("Query execution failed")?;
+        return Ok(0);
+    }
+
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(executor);
+    let mut columns: Vec<String> = Vec::new();
+    let mut row_count: u64 = 0;
+
+    loop {
+        // Bounded for the same reason as in `stream_the_rows`.
+        let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
+            Ok(Ok(Some(row))) => row,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => return Err(error).context("Query execution failed"),
+            Err(_elapsed) => anyhow::bail!(
+                "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
+                 the database connection stalled mid-result"
+            ),
+        };
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect();
+            sink.write_columns(&columns)?;
+        }
+
+        let decoded: Vec<Option<String>> = (0..columns.len())
+            .map(|index| cell_to_string(&row, index))
+            .collect();
+        sink.write_row(&decoded)?;
+        row_count += 1;
+    }
+
+    if columns.is_empty() {
+        sink.write_columns(&[])?;
+    }
+    Ok(row_count)
 }
 
 /// Renders one cell as the text a reader sees, which is the text the `mysql`
@@ -629,6 +1019,200 @@ mod connect_options_tests {
         config.ssl_mode = SslMode::VerifyFull;
         let opts = mysql_connect_options(&config);
         assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::VerifyIdentity));
+    }
+}
+
+#[cfg(test)]
+mod transaction_statement_tests {
+    use super::{
+        WhatItDoesToTheTransaction as Effect, is_a_read_query, what_it_does_to_the_transaction,
+        without_leading_comments,
+    };
+
+    fn effect(sql: &str) -> Effect {
+        what_it_does_to_the_transaction(sql)
+    }
+
+    /// The reader types these by hand, in whatever case and spacing they
+    /// like, and a transaction the editor failed to notice being opened is
+    /// the one state this whole mechanism exists to prevent.
+    #[test]
+    fn the_statements_that_open_a_transaction_are_recognised_however_they_are_written() {
+        assert_eq!(effect("BEGIN"), Effect::Opens);
+        assert_eq!(effect("begin"), Effect::Opens);
+        assert_eq!(effect("  Begin ;  "), Effect::Opens);
+        assert_eq!(effect("BEGIN WORK"), Effect::Opens);
+        assert_eq!(effect("begin   work ;"), Effect::Opens);
+        assert_eq!(effect("START TRANSACTION"), Effect::Opens);
+        assert_eq!(effect("start transaction;"), Effect::Opens);
+        assert_eq!(effect("  start    TRANSACTION  ; "), Effect::Opens);
+        assert_eq!(
+            effect("START TRANSACTION WITH CONSISTENT SNAPSHOT"),
+            Effect::Opens
+        );
+        assert_eq!(
+            effect("start transaction with consistent snapshot, read only;"),
+            Effect::Opens
+        );
+        assert_eq!(effect("START TRANSACTION READ ONLY"), Effect::Opens);
+    }
+
+    /// Turning autocommit off stages every statement after it until a commit,
+    /// which is a transaction in everything but name.
+    #[test]
+    fn turning_this_sessions_autocommit_off_opens_a_transaction() {
+        assert_eq!(effect("SET autocommit = 0"), Effect::Opens);
+        assert_eq!(effect("set autocommit=0"), Effect::Opens);
+        assert_eq!(effect("SET   AUTOCOMMIT   =   0 ;"), Effect::Opens);
+        assert_eq!(effect("SET SESSION autocommit = 0"), Effect::Opens);
+        assert_eq!(effect("set session autocommit=0;"), Effect::Opens);
+        assert_eq!(effect("SET LOCAL autocommit = 0"), Effect::Opens);
+        assert_eq!(effect("SET @@autocommit = 0"), Effect::Opens);
+        assert_eq!(effect("SET @@session.autocommit = 0"), Effect::Opens);
+        assert_eq!(effect("SET @@local.autocommit=0"), Effect::Opens);
+        // MySQL takes any of these three as off for a boolean variable.
+        assert_eq!(effect("SET autocommit = OFF"), Effect::Opens);
+        assert_eq!(effect("SET autocommit = false"), Effect::Opens);
+    }
+
+    /// A global or persisted setting changes what later sessions start with
+    /// and leaves this one exactly as it was, so there is nothing here to
+    /// hold a connection open for.
+    #[test]
+    fn autocommit_off_for_other_sessions_opens_nothing_here() {
+        assert_eq!(effect("SET GLOBAL autocommit = 0"), Effect::Nothing);
+        assert_eq!(effect("SET @@global.autocommit = 0"), Effect::Nothing);
+        assert_eq!(effect("SET PERSIST autocommit = 0"), Effect::Nothing);
+        assert_eq!(effect("SET autocommit = 1"), Effect::Nothing);
+        assert_eq!(effect("SET autocommit = ON"), Effect::Nothing);
+    }
+
+    #[test]
+    fn the_statements_that_end_a_transaction_are_recognised() {
+        assert_eq!(effect("COMMIT"), Effect::Finishes);
+        assert_eq!(effect("commit;"), Effect::Finishes);
+        assert_eq!(effect("  COMMIT  WORK ; "), Effect::Finishes);
+        assert_eq!(effect("COMMIT AND NO CHAIN"), Effect::Finishes);
+        assert_eq!(effect("COMMIT RELEASE"), Effect::Finishes);
+        assert_eq!(effect("ROLLBACK"), Effect::Finishes);
+        assert_eq!(effect("rollback ;"), Effect::Finishes);
+        assert_eq!(effect("ROLLBACK WORK"), Effect::Finishes);
+        assert_eq!(effect("ROLLBACK AND NO CHAIN"), Effect::Finishes);
+    }
+
+    /// `COMMIT AND CHAIN` ends one transaction and begins the next on the
+    /// same connection with no idle moment between them. Reading it as an
+    /// ending would let the connection go while a live transaction sat on it.
+    #[test]
+    fn a_commit_that_chains_keeps_the_connection_inside_a_transaction() {
+        assert_eq!(effect("COMMIT AND CHAIN"), Effect::Inside);
+        assert_eq!(effect("commit work and chain;"), Effect::Inside);
+        assert_eq!(effect("ROLLBACK AND CHAIN"), Effect::Inside);
+        assert_eq!(effect("rollback  and  chain"), Effect::Inside);
+    }
+
+    /// A rollback to a savepoint reads as a rollback but ends nothing, and
+    /// MySQL spells it `ROLLBACK [WORK] TO [SAVEPOINT] name` -- so the `WORK`
+    /// form has to be recognised too or the connection is let go of while the
+    /// transaction is still open on it.
+    #[test]
+    fn a_rollback_to_a_savepoint_ends_nothing() {
+        assert_eq!(effect("ROLLBACK TO SAVEPOINT sp1"), Effect::Inside);
+        assert_eq!(effect("rollback to sp1;"), Effect::Inside);
+        assert_eq!(effect("ROLLBACK WORK TO SAVEPOINT sp1"), Effect::Inside);
+        assert_eq!(effect("rollback  work  to  sp1 ;"), Effect::Inside);
+        assert_eq!(effect("SAVEPOINT sp1"), Effect::Inside);
+        assert_eq!(effect("savepoint sp1;"), Effect::Inside);
+        assert_eq!(effect("RELEASE SAVEPOINT sp1"), Effect::Inside);
+        assert_eq!(effect("release   savepoint   sp1 ;"), Effect::Inside);
+    }
+
+    #[test]
+    fn ordinary_statements_touch_no_transaction() {
+        assert_eq!(effect("SELECT 1"), Effect::Nothing);
+        assert_eq!(
+            effect("select * from orders where id = 1;"),
+            Effect::Nothing
+        );
+        assert_eq!(
+            effect("INSERT INTO orders (id) VALUES (1)"),
+            Effect::Nothing
+        );
+        assert_eq!(effect("UPDATE orders SET total = 2"), Effect::Nothing);
+        assert_eq!(effect("DELETE FROM orders"), Effect::Nothing);
+        assert_eq!(effect("SET @x = 1"), Effect::Nothing);
+        assert_eq!(effect("SET NAMES utf8"), Effect::Nothing);
+        assert_eq!(effect("SET SESSION sql_mode = ''"), Effect::Nothing);
+        assert_eq!(effect("CREATE TABLE t (id INT)"), Effect::Nothing);
+        assert_eq!(effect(""), Effect::Nothing);
+        assert_eq!(effect("   "), Effect::Nothing);
+    }
+
+    /// A keyword is only a keyword when it is the whole first word. A plain
+    /// prefix match reads `COMMITTED` as a commit.
+    #[test]
+    fn a_word_that_merely_starts_with_a_keyword_is_not_that_keyword() {
+        assert_eq!(
+            effect("SELECT * FROM committed_orders"),
+            Effect::Nothing,
+            "a table name is not a COMMIT"
+        );
+        assert_eq!(effect("COMMITTED"), Effect::Nothing);
+        assert_eq!(effect("BEGINNING"), Effect::Nothing);
+        assert_eq!(effect("SAVEPOINTS"), Effect::Nothing);
+        assert_eq!(effect("ROLLBACKS"), Effect::Nothing);
+    }
+
+    /// A note written above the statement must not hide the keyword under it:
+    /// the statement would then run on the pool and open a transaction that
+    /// nothing is holding and nothing will ever close.
+    #[test]
+    fn a_comment_in_front_does_not_hide_the_statement() {
+        assert_eq!(
+            effect("-- staging the price fix\nSTART TRANSACTION;"),
+            Effect::Opens
+        );
+        assert_eq!(effect("# staging the price fix\nBEGIN;"), Effect::Opens);
+        assert_eq!(effect("/* staging */ START TRANSACTION;"), Effect::Opens);
+        assert_eq!(
+            effect("/* one */ -- two\n/* three */ COMMIT;"),
+            Effect::Finishes
+        );
+        assert_eq!(
+            effect("/* ApplicationName=Zed */ ROLLBACK"),
+            Effect::Finishes
+        );
+        // `--` is only a comment when whitespace follows it; otherwise it is
+        // the subtraction operator written twice.
+        assert_eq!(without_leading_comments("--1+2"), "--1+2");
+        assert_eq!(without_leading_comments("-- a\nSELECT 1"), "SELECT 1");
+        assert_eq!(without_leading_comments("SELECT 1"), "SELECT 1");
+        // An unterminated comment leaves no statement, rather than reading
+        // the comment's own text as one.
+        assert_eq!(without_leading_comments("/* never closed"), "");
+    }
+
+    /// Which branch a statement takes decides whether its rows are read back
+    /// at all -- a read query sent down the write branch answers with an
+    /// empty grid.
+    #[test]
+    fn read_queries_are_told_apart_from_the_rest() {
+        assert!(is_a_read_query("SELECT 1"));
+        assert!(is_a_read_query("  select 1 ;"));
+        assert!(is_a_read_query("SHOW DATABASES"));
+        assert!(is_a_read_query("DESCRIBE orders"));
+        assert!(is_a_read_query("DESC orders"));
+        assert!(is_a_read_query("EXPLAIN SELECT 1"));
+        assert!(is_a_read_query("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(
+            is_a_read_query("/* ApplicationName=Zed */ SELECT 1"),
+            "a comment in front must not send a read query down the write branch"
+        );
+        assert!(!is_a_read_query("INSERT INTO orders (id) VALUES (1)"));
+        assert!(!is_a_read_query("START TRANSACTION"));
+        assert!(!is_a_read_query("COMMIT"));
+        assert!(!is_a_read_query("SELECTION"), "not the whole first word");
+        assert!(!is_a_read_query(""));
     }
 }
 
@@ -902,7 +1486,55 @@ impl DbProvider for MySqlProvider {
     }
 
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult> {
+        // Lock order is `op_lock` then `held`, the same way round everywhere
+        // -- see the note on the `held` field.
         let _guard = self.op_lock.lock().await;
+        let mut held = self.held.lock().await;
+        let effect = what_it_does_to_the_transaction(sql);
+
+        // The console's own statements are the only ones routed onto the held
+        // connection, because that connection is the only place they would be
+        // inside the transaction. The metadata and schema calls deliberately
+        // never reach here: they go on using the pool, so browsing the tree
+        // while work is staged never joins the reader's transaction, never
+        // waits on its locks and never shows its uncommitted rows as though
+        // they were the schema.
+        if let Some(transaction) = held.as_mut() {
+            if effect == WhatItDoesToTheTransaction::Opens {
+                // MySQL would implicitly commit the open transaction here.
+                // Committing staged work because the reader typed `START
+                // TRANSACTION` a second time is the worst outcome available,
+                // so this refuses and leaves the choice with them.
+                anyhow::bail!(
+                    "A transaction is already open on this connection -- commit or roll it back \
+                     before opening another."
+                );
+            }
+            Self::switch_the_held_connection_to(transaction, database).await?;
+            // No reconnect-and-retry on this path, unlike the pooled one
+            // below. A connection that died under an open transaction took
+            // the transaction with it, and sending the statement again on a
+            // fresh connection would run it outside the transaction the
+            // reader still believes they are in.
+            let answer = run_the_statement(&mut transaction.connection, sql, 0).await;
+            if effect == WhatItDoesToTheTransaction::Finishes && answer.is_ok() {
+                self.release_the_transaction(&mut held);
+            }
+            return answer;
+        }
+
+        if effect == WhatItDoesToTheTransaction::Opens {
+            return self
+                .open_a_held_transaction(
+                    &mut held,
+                    database,
+                    CONSOLE_TRANSACTION_ABANDONED_AFTER,
+                    sql,
+                )
+                .await;
+        }
+        drop(held);
+
         // The connection is not probed first. A probe is a round trip of its
         // own, and on a distant server it costs as much as the query it guards
         // -- measured against a stage server over a corporate link, a `SELECT 1`
@@ -930,83 +1562,92 @@ impl DbProvider for MySqlProvider {
         sink: &mut dyn crate::provider::RowSink,
     ) -> Result<u64> {
         let _guard = self.op_lock.lock().await;
+        let mut held = self.held.lock().await;
+
+        // Transaction control is refused here rather than routed. This path
+        // exists to write a result set to a file, and a `COMMIT` sent down it
+        // has no rows to write while quietly ending the transaction the
+        // console is still showing as open.
+        if matches!(
+            what_it_does_to_the_transaction(sql),
+            WhatItDoesToTheTransaction::Opens | WhatItDoesToTheTransaction::Finishes
+        ) {
+            anyhow::bail!(
+                "Transaction control belongs in the console rather than in an export -- run \
+                 this as a query instead."
+            );
+        }
+
+        // Routed the same way as `execute_query`, and for the same reason: an
+        // export taken while work is staged must see that work, so it has to
+        // run inside the transaction rather than beside it.
+        if let Some(transaction) = held.as_mut() {
+            Self::switch_the_held_connection_to(transaction, database).await?;
+            return stream_into_the_sink(&mut transaction.connection, sql, sink).await;
+        }
+        drop(held);
+
         let pool = self.ensure_live_pool().await?;
+        self.switch_to(&pool, database).await?;
+        stream_into_the_sink(&pool, sql, sink).await
+    }
 
-        if !database.is_empty() {
-            // Bounded for the same reason as in `execute_query`: a silent
-            // connection death here must not hang forever holding `op_lock`.
-            let use_stmt = format!("USE `{}`", database.replace('`', "``"));
-            tokio::time::timeout(
-                ROW_FETCH_TIMEOUT,
-                sqlx::raw_sql(AssertSqlSafe(use_stmt.as_str())).execute(&pool),
-            )
+    fn holds_transactions(&self) -> bool {
+        true
+    }
+
+    async fn begin_transaction(&self, database: &str, abandoned_after: Duration) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+        let mut held = self.held.lock().await;
+        self.open_a_held_transaction(&mut held, database, abandoned_after, "START TRANSACTION")
+            .await?;
+        Ok(())
+    }
+
+    async fn commit_transaction(&self) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+        let mut held = self.held.lock().await;
+        let Some(mut transaction) = held.take() else {
+            anyhow::bail!("No transaction is open on this connection.");
+        };
+        // Taken out before the commit is even attempted, and its connection
+        // let go of on the way out either way. A commit that fails leaves
+        // nothing to carry on with -- the connection closing rolls back
+        // whatever was still open on it -- and a `held` entry kept over a
+        // transaction that is gone would route the next statement onto a
+        // connection with nothing staged on it at all.
+        self.remember_the_transaction_opened(None);
+        sqlx::raw_sql("COMMIT")
+            .execute(&mut transaction.connection)
             .await
-            .context("Timed out switching database -- the connection stalled")?
-            .context("Failed to switch database")?;
-        }
+            .context("Failed to commit the transaction")?;
+        Ok(())
+    }
 
-        let trimmed_upper = sql.trim().to_uppercase();
-        let is_read_query = trimmed_upper.starts_with("SELECT")
-            || trimmed_upper.starts_with("SHOW")
-            || trimmed_upper.starts_with("DESCRIBE")
-            || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESC")
-            || trimmed_upper.starts_with("WITH");
-        let prefixed = format!(
-            "{}{}",
-            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
-            sql
-        );
+    async fn rollback_transaction(&self) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+        let mut held = self.held.lock().await;
+        // Nothing open is not a failure. This is what every failure path
+        // reaches for -- a window closing, a connection being edited, an idle
+        // transaction reaching its limit -- and none of them can check and
+        // then act without a gap in between, so it has to be safe to call
+        // over a transaction that already ended.
+        let Some(mut transaction) = held.take() else {
+            return Ok(());
+        };
+        self.remember_the_transaction_opened(None);
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut transaction.connection)
+            .await
+            .context("Failed to roll the transaction back")?;
+        Ok(())
+    }
 
-        if !is_read_query {
-            sqlx::query(AssertSqlSafe(prefixed.as_str()))
-                .execute(&pool)
-                .await
-                .context("Query execution failed")?;
-            return Ok(0);
-        }
-
-        // Unlike `execute_query`, this never breaks at `MAX_RESULT_ROWS` — the
-        // whole point of "execute to file" is exporting result sets too large
-        // for the grid. Cells are still capped for safety against a single
-        // multi-megabyte BLOB, but the row count itself is unbounded.
-        let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&pool);
-        let mut columns: Vec<String> = Vec::new();
-        let mut row_count: u64 = 0;
-
-        loop {
-            // Bound each row fetch so a connection that goes silently dead
-            // mid-result cannot block forever while `op_lock` is held; the
-            // guard then drops on return and the next query can reconnect.
-            let row = match tokio::time::timeout(ROW_FETCH_TIMEOUT, stream.try_next()).await {
-                Ok(Ok(Some(row))) => row,
-                Ok(Ok(None)) => break,
-                Ok(Err(error)) => return Err(error).context("Query execution failed"),
-                Err(_elapsed) => anyhow::bail!(
-                    "Query results stopped streaming after {ROW_FETCH_TIMEOUT:?} — \
-                     the database connection stalled mid-result"
-                ),
-            };
-            if columns.is_empty() {
-                columns = row
-                    .columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect();
-                sink.write_columns(&columns)?;
-            }
-
-            let decoded: Vec<Option<String>> = (0..columns.len())
-                .map(|index| cell_to_string(&row, index))
-                .collect();
-            sink.write_row(&decoded)?;
-            row_count += 1;
-        }
-
-        if columns.is_empty() {
-            sink.write_columns(&[])?;
-        }
-        Ok(row_count)
+    fn transaction_open_since(&self) -> Option<Instant> {
+        *self
+            .transaction_opened_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
