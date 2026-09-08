@@ -1,10 +1,12 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
+use smol::lock::Mutex as AsyncMutex;
 use sqlx::AssertSqlSafe;
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::{Column as _, Row as _, ValueRef as _};
-use std::time::Instant;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::{Column as _, Connection as _, Row as _, ValueRef as _};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::MAX_RESULT_ROWS;
 use crate::connection::{ConnectionConfig, SslMode};
@@ -16,6 +18,295 @@ use crate::schema::{
 
 pub struct PostgresProvider {
     pool: PgPool,
+    /// Kept so a held transaction can open a physical connection of its own
+    /// rather than borrow the pool's -- see [`HeldTransaction`].
+    connect_options: PgConnectOptions,
+    held_transaction: AsyncMutex<Option<HeldTransaction>>,
+    /// When the held transaction opened, deliberately outside the async mutex
+    /// above. A statement running inside the transaction holds that mutex for
+    /// as long as the statement takes, so a `transaction_open_since` that
+    /// waited for it would freeze whatever displays the elapsed time, and one
+    /// that gave up on it would report "no transaction" for the whole of every
+    /// long statement -- the two moments a reader most wants to see the clock.
+    /// Written only under the async mutex, in the same critical section that
+    /// sets or clears the transaction, so the two cannot disagree.
+    transaction_opened_at: Mutex<Option<Instant>>,
+}
+
+/// A transaction the console holds open across statements, and the one physical
+/// connection it lives on.
+struct HeldTransaction {
+    /// A standalone connection, established from `connect_options` rather than
+    /// taken from the pool.
+    ///
+    /// Not from the pool for two reasons, either of them sufficient. First,
+    /// `connect` sets only `max_connections(1)` and leaves sqlx's pool
+    /// lifecycle defaults in place -- `idle_timeout` of 10 minutes and
+    /// `max_lifetime` of 30 minutes -- so a pooled connection sitting inside a
+    /// transaction while the reader thinks about their next statement would be
+    /// closed out from under them with nothing said: the statement after it
+    /// would run outside the transaction they believed they were in, and a
+    /// commit would report success over work the server had already discarded.
+    /// Second, that pool has exactly one connection, so a transaction holding
+    /// it would leave nothing for schema browsing to run on at all.
+    connection: PgConnection,
+    /// The schema `search_path` was last set to on this connection. The switch
+    /// is a round trip of its own, so it is not repeated for a schema already
+    /// current, and dropping the connection is what invalidates it.
+    search_path: String,
+}
+
+/// How long the server waits on a silent connection before ending a
+/// transaction the reader opened by typing `BEGIN` themselves.
+///
+/// A hand-typed `BEGIN` arrives with nobody having stated their patience, and
+/// the alternative to picking a number here is no server-side guard at all on
+/// exactly the transaction the editor is least aware of.
+const HAND_TYPED_TRANSACTION_ABANDONED_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// What a statement the reader typed does to the transaction the console is
+/// holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionEffect {
+    /// Opens one: `BEGIN`, `BEGIN TRANSACTION ISOLATION LEVEL ...`,
+    /// `START TRANSACTION`.
+    Opens,
+    /// Ends the one that is open, whether or not the work survives: `COMMIT`,
+    /// `END`, `ROLLBACK`, `ABORT`, `PREPARE TRANSACTION`.
+    Ends,
+    /// Leaves it exactly as it was.
+    Neither,
+}
+
+/// Classifies a statement by what it does to an open transaction.
+///
+/// This exists because a transaction the editor did not notice being opened is
+/// the worst state to be in: it holds its locks, nothing on screen says it is
+/// there, and nothing will ever close it. So a `BEGIN` the reader typed has to
+/// be recognised as opening one, and a `COMMIT` as closing it, exactly as if
+/// the editor's own buttons had been pressed.
+///
+/// Two shapes are easy to get wrong. `ROLLBACK TO SAVEPOINT x` (and its
+/// `ROLLBACK TO x` short form) reads like a rollback and ends nothing -- it
+/// undoes back to a point and leaves the transaction open and still holding
+/// everything. And `COMMIT PREPARED 'x'` / `ROLLBACK PREPARED 'x'` act on some
+/// other, already-prepared transaction by name and cannot even run inside a
+/// transaction block, so they end nothing here either.
+///
+/// PostgreSQL has no server-side autocommit setting to watch for. `psql`'s
+/// `\set AUTOCOMMIT off` is the client wrapping statements in `BEGIN` itself,
+/// and `SET autocommit` was removed from the server long ago, so unlike MySQL
+/// there is no statement here that silently changes whether the next statement
+/// starts a transaction.
+fn transaction_effect(sql: &str) -> TransactionEffect {
+    let words = statement_keywords(sql);
+    let mut words = words.iter().map(String::as_str);
+    match (words.next(), words.next()) {
+        (Some("BEGIN"), _) | (Some("START"), Some("TRANSACTION")) => TransactionEffect::Opens,
+        (Some("ABORT"), _) => TransactionEffect::Ends,
+        (Some("COMMIT") | Some("ROLLBACK"), Some("PREPARED")) => TransactionEffect::Neither,
+        (Some("ROLLBACK"), Some("TO")) => TransactionEffect::Neither,
+        (Some("COMMIT") | Some("ROLLBACK") | Some("END"), _) => TransactionEffect::Ends,
+        (Some("PREPARE"), Some("TRANSACTION")) => TransactionEffect::Ends,
+        _ => TransactionEffect::Neither,
+    }
+}
+
+/// The leading words of a statement, upper-cased, with the leading comments,
+/// surrounding whitespace and trailing semicolons that a reader's editor buffer
+/// is full of taken off.
+///
+/// Only the first few words are ever looked at, so the rest of the statement is
+/// not scanned; every caller here decides on at most two.
+fn statement_keywords(sql: &str) -> Vec<String> {
+    let mut rest = sql.trim_start();
+    // Every statement this crate sends gets an `ApplicationName` comment
+    // prepended, so the first word of a statement as the server sees it is
+    // routinely not the first word of the text.
+    while let Some(after_open) = rest.strip_prefix("/*") {
+        match after_open.find("*/") {
+            Some(end) => rest = after_open[end + 2..].trim_start(),
+            None => return Vec::new(),
+        }
+    }
+    rest.split(|character: char| character.is_whitespace() || character == ';')
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .map(str::to_uppercase)
+        .collect()
+}
+
+/// The session-scope guard that ends an abandoned transaction even though the
+/// editor is not there to end it.
+///
+/// `idle_in_transaction_session_timeout` takes milliseconds when no unit is
+/// given, zero disables it, and when it fires the server *terminates the
+/// session*, which rolls the transaction back and releases its locks. That last
+/// part is why it is this parameter and not `statement_timeout`: a statement
+/// timeout aborts the statement and leaves the transaction open and holding
+/// everything, which is not a guard against abandonment at all.
+///
+/// Clamped to at least one millisecond because a patience under half a
+/// millisecond would round to zero, and zero means "never give up" -- the exact
+/// opposite of what asking for a short one says. Clamped at the top to what the
+/// parameter can hold.
+fn idle_in_transaction_timeout_statement(abandoned_after: Duration) -> String {
+    let milliseconds = abandoned_after.as_millis().clamp(1, i32::MAX as u128);
+    format!("SET SESSION idle_in_transaction_session_timeout = {milliseconds}")
+}
+
+/// Whether a statement returns rows, and so has to be read as a stream rather
+/// than executed for a row count.
+fn is_read_query(sql: &str) -> bool {
+    let trimmed_upper = sql.trim().to_uppercase();
+    trimmed_upper.starts_with("SELECT")
+        || trimmed_upper.starts_with("SHOW")
+        || trimmed_upper.starts_with("EXPLAIN")
+        || trimmed_upper.starts_with("DESCRIBE")
+        || trimmed_upper.starts_with("DESC")
+        || trimmed_upper.starts_with("TABLE")
+        || trimmed_upper.starts_with("WITH")
+}
+
+fn search_path_statement(schema: &str) -> String {
+    format!("SET search_path = \"{}\"", schema.replace('"', "\"\""))
+}
+
+fn prefixed_statement(sql: &str) -> String {
+    format!(
+        "{}{}",
+        crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
+        sql
+    )
+}
+
+fn rows_result(
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    start: Instant,
+) -> QueryResult {
+    let rows_affected = rows.len() as u64;
+    QueryResult {
+        raw_documents: None,
+        columns,
+        rows,
+        rows_affected,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+        timing: None,
+    }
+}
+
+fn affected_result(rows_affected: u64, start: Instant) -> QueryResult {
+    QueryResult {
+        raw_documents: None,
+        columns: vec![],
+        rows: vec![],
+        rows_affected,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+        timing: None,
+    }
+}
+
+async fn execute_statement<'e, E>(executor: E, sql: &str) -> Result<u64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let result = sqlx::query(AssertSqlSafe(sql))
+        .execute(executor)
+        .await
+        .context("Query execution failed")?;
+    Ok(result.rows_affected())
+}
+
+async fn collect_rows<'e, E>(
+    executor: E,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(executor);
+    let mut columns: Vec<String> = Vec::new();
+    let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+
+    while let Some(row) = stream.try_next().await.context("Query execution failed")? {
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect();
+        }
+        let decoded: Vec<Option<String>> = (0..columns.len())
+            .map(|index| PostgresProvider::extract_cell(&row, index))
+            .collect();
+        result_rows.push(decoded);
+
+        if result_rows.len() >= MAX_RESULT_ROWS {
+            break;
+        }
+    }
+    Ok((columns, result_rows))
+}
+
+/// Unlike [`collect_rows`], this never breaks at `MAX_RESULT_ROWS` — the whole
+/// point of "execute to file" is exporting result sets too large for the grid.
+async fn stream_rows<'e, E>(
+    executor: E,
+    sql: &str,
+    sink: &mut dyn crate::provider::RowSink,
+) -> Result<u64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch(executor);
+    let mut columns: Vec<String> = Vec::new();
+    let mut row_count: u64 = 0;
+
+    while let Some(row) = stream.try_next().await.context("Query execution failed")? {
+        if columns.is_empty() {
+            columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect();
+            sink.write_columns(&columns)?;
+        }
+        let decoded: Vec<Option<String>> = (0..columns.len())
+            .map(|index| PostgresProvider::extract_cell(&row, index))
+            .collect();
+        sink.write_row(&decoded)?;
+        row_count += 1;
+    }
+
+    if columns.is_empty() {
+        sink.write_columns(&[])?;
+    }
+    Ok(row_count)
+}
+
+async fn run_on_pool(
+    pool: &PgPool,
+    schema: &str,
+    sql: &str,
+    prefixed: &str,
+) -> Result<QueryResult> {
+    if !schema.is_empty() {
+        let set_path = search_path_statement(schema);
+        sqlx::query(AssertSqlSafe(set_path.as_str()))
+            .execute(pool)
+            .await
+            .context("Failed to set search_path")?;
+    }
+
+    let start = Instant::now();
+    if is_read_query(sql) {
+        let (columns, rows) = collect_rows(pool, prefixed).await?;
+        Ok(rows_result(columns, rows, start))
+    } else {
+        let rows_affected = execute_statement(pool, prefixed).await?;
+        Ok(affected_result(rows_affected, start))
+    }
 }
 
 fn postgres_ssl_mode(mode: SslMode) -> PgSslMode {
@@ -166,10 +457,138 @@ impl PostgresProvider {
         // connection is acceptable for a single-user GUI client.
         let pool = PgPoolOptions::new()
             .max_connections(1)
-            .connect_with(opts)
+            .connect_with(opts.clone())
             .await
             .context("Failed to connect to PostgreSQL")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            connect_options: opts,
+            held_transaction: AsyncMutex::new(None),
+            transaction_opened_at: Mutex::new(None),
+        })
+    }
+
+    /// Opens a connection of its own, tells the server how long to wait on it
+    /// in silence, and runs `opening_statement` on it.
+    ///
+    /// Takes the statement rather than always sending `BEGIN` so that a reader
+    /// who typed `BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE` gets the
+    /// isolation level they asked for instead of a plain `BEGIN` alongside it.
+    ///
+    /// The guard is set before the transaction opens, not inside it: `SET`
+    /// issued inside a transaction block is undone when that block ends, so a
+    /// guard set there would be gone by the time the next transaction on this
+    /// connection needed it.
+    async fn open_held_transaction(
+        &self,
+        schema: &str,
+        abandoned_after: Duration,
+        opening_statement: &str,
+    ) -> Result<HeldTransaction> {
+        let mut connection = PgConnection::connect_with(&self.connect_options)
+            .await
+            .context("Failed to open a connection for the transaction")?;
+
+        let guard = idle_in_transaction_timeout_statement(abandoned_after);
+        sqlx::query(AssertSqlSafe(guard.as_str()))
+            .execute(&mut connection)
+            .await
+            .context("Failed to set the transaction's idle timeout")?;
+
+        let mut search_path = String::new();
+        if !schema.is_empty() {
+            let set_path = search_path_statement(schema);
+            sqlx::query(AssertSqlSafe(set_path.as_str()))
+                .execute(&mut connection)
+                .await
+                .context("Failed to set search_path")?;
+            search_path = schema.to_string();
+        }
+
+        sqlx::query(AssertSqlSafe(opening_statement))
+            .execute(&mut connection)
+            .await
+            .context("Failed to begin the transaction")?;
+
+        Ok(HeldTransaction {
+            connection,
+            search_path,
+        })
+    }
+
+    /// Decides whether a transaction whose statement just failed is still there
+    /// to be finished by hand.
+    ///
+    /// A failed statement normally leaves the transaction open and aborted, and
+    /// only `ROLLBACK` gets out of that -- so it must stay held. But the same
+    /// failure is what the reader sees when the server has ended the session
+    /// itself, whether on the idle guard or otherwise, and holding a dead
+    /// connection would wedge the console: every later statement, `ROLLBACK`
+    /// included, would fail on it forever with no way left to clear it.
+    async fn keep_if_alive(mut transaction: HeldTransaction) -> Option<HeldTransaction> {
+        match transaction.connection.ping().await {
+            Ok(()) => Some(transaction),
+            Err(_) => None,
+        }
+    }
+
+    /// Hangs up on a transaction's connection, having already committed or
+    /// rolled it back.
+    async fn release(transaction: HeldTransaction) -> Result<()> {
+        transaction
+            .connection
+            .close()
+            .await
+            .context("Failed to close the transaction's connection")
+    }
+
+    /// Points `search_path` at `schema` on the held connection, unless it is
+    /// already there.
+    async fn point_at_schema(transaction: &mut HeldTransaction, schema: &str) -> Result<()> {
+        if schema.is_empty() || transaction.search_path == schema {
+            return Ok(());
+        }
+        let set_path = search_path_statement(schema);
+        sqlx::query(AssertSqlSafe(set_path.as_str()))
+            .execute(&mut transaction.connection)
+            .await
+            .context("Failed to set search_path")?;
+        transaction.search_path = schema.to_string();
+        Ok(())
+    }
+
+    async fn run_held(
+        transaction: &mut HeldTransaction,
+        schema: &str,
+        sql: &str,
+        prefixed: &str,
+    ) -> Result<QueryResult> {
+        Self::point_at_schema(transaction, schema).await?;
+        let start = Instant::now();
+        if is_read_query(sql) {
+            let (columns, rows) = collect_rows(&mut transaction.connection, prefixed).await?;
+            Ok(rows_result(columns, rows, start))
+        } else {
+            let rows_affected = execute_statement(&mut transaction.connection, prefixed).await?;
+            Ok(affected_result(rows_affected, start))
+        }
+    }
+
+    // A poisoned lock here means a panic happened while a timestamp was being
+    // written; the timestamp itself cannot be left half-written, so the value
+    // is taken back rather than propagated as an error nobody could act on.
+    fn record_transaction_opened_at(&self, opened_at: Option<Instant>) {
+        match self.transaction_opened_at.lock() {
+            Ok(mut slot) => *slot = opened_at,
+            Err(poisoned) => *poisoned.into_inner() = opened_at,
+        }
+    }
+
+    fn transaction_opened_at(&self) -> Option<Instant> {
+        match self.transaction_opened_at.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
     }
 
     /// Renders one cell as the text a reader sees, which is the text `psql` shows
@@ -409,77 +828,124 @@ impl DbProvider for PostgresProvider {
         }
     }
 
-    async fn execute_query(&self, schema: &str, sql: &str) -> Result<QueryResult> {
-        if !schema.is_empty() {
-            let set_path = format!("SET search_path = \"{}\"", schema.replace('"', "\"\""));
-            sqlx::query(AssertSqlSafe(set_path.as_str()))
-                .execute(&self.pool)
-                .await
-                .context("Failed to set search_path")?;
-        }
+    fn holds_transactions(&self) -> bool {
+        true
+    }
 
-        let start = Instant::now();
-        let trimmed_upper = sql.trim().to_uppercase();
-        let is_read_query = trimmed_upper.starts_with("SELECT")
-            || trimmed_upper.starts_with("SHOW")
-            || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESCRIBE")
-            || trimmed_upper.starts_with("DESC")
-            || trimmed_upper.starts_with("TABLE")
-            || trimmed_upper.starts_with("WITH");
-        let prefixed = format!(
-            "{}{}",
-            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
-            sql
+    async fn begin_transaction(&self, schema: &str, abandoned_after: Duration) -> Result<()> {
+        let mut held = self.held_transaction.lock().await;
+        anyhow::ensure!(
+            held.is_none(),
+            "a transaction is already open on this connection"
         );
+        let transaction = self
+            .open_held_transaction(schema, abandoned_after, "BEGIN")
+            .await?;
+        self.record_transaction_opened_at(Some(Instant::now()));
+        *held = Some(transaction);
+        Ok(())
+    }
 
-        if is_read_query {
-            let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
-            let mut columns: Vec<String> = Vec::new();
-            let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
-
-            while let Some(row) = stream.try_next().await.context("Query execution failed")? {
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|column| column.name().to_string())
-                        .collect();
-                }
-                let decoded: Vec<Option<String>> = (0..columns.len())
-                    .map(|index| Self::extract_cell(&row, index))
-                    .collect();
-                result_rows.push(decoded);
-
-                if result_rows.len() >= MAX_RESULT_ROWS {
-                    break;
-                }
+    async fn commit_transaction(&self) -> Result<()> {
+        let mut held = self.held_transaction.lock().await;
+        let mut transaction = held
+            .take()
+            .context("no transaction is open on this connection")?;
+        match sqlx::query("COMMIT")
+            .execute(&mut transaction.connection)
+            .await
+        {
+            Ok(_) => {
+                self.record_transaction_opened_at(None);
+                Self::release(transaction).await
             }
+            Err(error) => {
+                // A commit can fail on its own merits -- a deferred
+                // constraint, a serialization failure -- and PostgreSQL rolls
+                // the transaction back when it does. Keeping it held anyway,
+                // when the connection is still there, is the honest state to
+                // be in: nothing here can tell the reader's transaction is
+                // gone, and offering them a rollback that reports "nothing
+                // open" would be worse than one that says so from the server.
+                match Self::keep_if_alive(transaction).await {
+                    Some(transaction) => *held = Some(transaction),
+                    None => self.record_transaction_opened_at(None),
+                }
+                Err(error).context("Failed to commit the transaction")
+            }
+        }
+    }
 
-            let execution_time_ms = start.elapsed().as_millis() as u64;
-            let rows_affected = result_rows.len() as u64;
-            Ok(QueryResult {
-                raw_documents: None,
-                columns,
-                rows: result_rows,
-                rows_affected,
-                execution_time_ms,
-                timing: None,
-            })
-        } else {
-            let result = sqlx::query(AssertSqlSafe(prefixed.as_str()))
-                .execute(&self.pool)
-                .await
-                .context("Query execution failed")?;
+    async fn rollback_transaction(&self) -> Result<()> {
+        let mut held = self.held_transaction.lock().await;
+        let Some(mut transaction) = held.take() else {
+            return Ok(());
+        };
+        self.record_transaction_opened_at(None);
+        let hung_up = sqlx::query("ROLLBACK")
+            .execute(&mut transaction.connection)
+            .await
+            .is_err();
+        // A failed `ROLLBACK` is not a failure to roll back. Hanging up makes
+        // the server roll the transaction back and release its locks either
+        // way, and the ordinary reason the statement fails is that the server
+        // has already ended the session for us. What the failure does say is
+        // that waiting for a polite shutdown handshake would wait on a socket
+        // nobody is reading, so drop the connection instead of closing it.
+        if hung_up {
+            return Ok(());
+        }
+        Self::release(transaction).await
+    }
 
-            Ok(QueryResult {
-                raw_documents: None,
-                columns: vec![],
-                rows: vec![],
-                rows_affected: result.rows_affected(),
-                execution_time_ms: start.elapsed().as_millis() as u64,
-                timing: None,
-            })
+    fn transaction_open_since(&self) -> Option<Instant> {
+        self.transaction_opened_at()
+    }
+
+    async fn execute_query(&self, schema: &str, sql: &str) -> Result<QueryResult> {
+        // The reader's own statements are the only ones routed to the held
+        // connection. Every metadata and schema call in this file goes to the
+        // pool instead, on purpose: browsing a schema must not become part of
+        // the reader's transaction, where it would read under their snapshot
+        // and hold its own locks until they were finished.
+        let mut held = self.held_transaction.lock().await;
+        let effect = transaction_effect(sql);
+        let prefixed = prefixed_statement(sql);
+
+        let Some(mut transaction) = held.take() else {
+            if effect == TransactionEffect::Opens {
+                let transaction = self
+                    .open_held_transaction(
+                        schema,
+                        HAND_TYPED_TRANSACTION_ABANDONED_AFTER,
+                        prefixed.as_str(),
+                    )
+                    .await?;
+                self.record_transaction_opened_at(Some(Instant::now()));
+                *held = Some(transaction);
+                return Ok(affected_result(0, Instant::now()));
+            }
+            return run_on_pool(&self.pool, schema, sql, prefixed.as_str()).await;
+        };
+
+        let outcome = Self::run_held(&mut transaction, schema, sql, prefixed.as_str()).await;
+        match outcome {
+            Ok(result) => {
+                if effect == TransactionEffect::Ends {
+                    self.record_transaction_opened_at(None);
+                    Self::release(transaction).await?;
+                } else {
+                    *held = Some(transaction);
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                match Self::keep_if_alive(transaction).await {
+                    Some(transaction) => *held = Some(transaction),
+                    None => self.record_transaction_opened_at(None),
+                }
+                Err(error)
+            }
         }
     }
 
@@ -489,64 +955,69 @@ impl DbProvider for PostgresProvider {
         sql: &str,
         sink: &mut dyn crate::provider::RowSink,
     ) -> Result<u64> {
-        if !schema.is_empty() {
-            let set_path = format!("SET search_path = \"{}\"", schema.replace('"', "\"\""));
-            sqlx::query(AssertSqlSafe(set_path.as_str()))
-                .execute(&self.pool)
-                .await
-                .context("Failed to set search_path")?;
-        }
+        // Routed exactly as `execute_query` is, and for the same reason: an
+        // export the reader asked for inside their transaction has to see the
+        // rows their transaction sees, not the rows everyone else does.
+        let mut held = self.held_transaction.lock().await;
+        let effect = transaction_effect(sql);
+        let prefixed = prefixed_statement(sql);
 
-        let trimmed_upper = sql.trim().to_uppercase();
-        let is_read_query = trimmed_upper.starts_with("SELECT")
-            || trimmed_upper.starts_with("SHOW")
-            || trimmed_upper.starts_with("EXPLAIN")
-            || trimmed_upper.starts_with("DESCRIBE")
-            || trimmed_upper.starts_with("DESC")
-            || trimmed_upper.starts_with("TABLE")
-            || trimmed_upper.starts_with("WITH");
-        let prefixed = format!(
-            "{}{}",
-            crate::application_name_comment(crate::DEFAULT_APPLICATION_NAME),
-            sql
-        );
-
-        if !is_read_query {
-            sqlx::query(AssertSqlSafe(prefixed.as_str()))
-                .execute(&self.pool)
-                .await
-                .context("Query execution failed")?;
-            return Ok(0);
-        }
-
-        // Unlike `execute_query`, this never breaks at `MAX_RESULT_ROWS` — the
-        // whole point of "execute to file" is exporting result sets too large
-        // for the grid. Cells are still capped for safety against a single
-        // multi-megabyte value, but the row count itself is unbounded.
-        let mut stream = sqlx::raw_sql(AssertSqlSafe(prefixed.as_str())).fetch(&self.pool);
-        let mut columns: Vec<String> = Vec::new();
-        let mut row_count: u64 = 0;
-
-        while let Some(row) = stream.try_next().await.context("Query execution failed")? {
-            if columns.is_empty() {
-                columns = row
-                    .columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect();
-                sink.write_columns(&columns)?;
+        let Some(mut transaction) = held.take() else {
+            if effect == TransactionEffect::Opens {
+                let transaction = self
+                    .open_held_transaction(
+                        schema,
+                        HAND_TYPED_TRANSACTION_ABANDONED_AFTER,
+                        prefixed.as_str(),
+                    )
+                    .await?;
+                self.record_transaction_opened_at(Some(Instant::now()));
+                *held = Some(transaction);
+                sink.write_columns(&[])?;
+                return Ok(0);
             }
-            let decoded: Vec<Option<String>> = (0..columns.len())
-                .map(|index| Self::extract_cell(&row, index))
-                .collect();
-            sink.write_row(&decoded)?;
-            row_count += 1;
-        }
+            if !schema.is_empty() {
+                let set_path = search_path_statement(schema);
+                sqlx::query(AssertSqlSafe(set_path.as_str()))
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to set search_path")?;
+            }
+            if !is_read_query(sql) {
+                execute_statement(&self.pool, prefixed.as_str()).await?;
+                return Ok(0);
+            }
+            return stream_rows(&self.pool, prefixed.as_str(), sink).await;
+        };
 
-        if columns.is_empty() {
-            sink.write_columns(&[])?;
+        let outcome = async {
+            Self::point_at_schema(&mut transaction, schema).await?;
+            if !is_read_query(sql) {
+                execute_statement(&mut transaction.connection, prefixed.as_str()).await?;
+                return Ok(0);
+            }
+            stream_rows(&mut transaction.connection, prefixed.as_str(), sink).await
         }
-        Ok(row_count)
+        .await;
+
+        match outcome {
+            Ok(row_count) => {
+                if effect == TransactionEffect::Ends {
+                    self.record_transaction_opened_at(None);
+                    Self::release(transaction).await?;
+                } else {
+                    *held = Some(transaction);
+                }
+                Ok(row_count)
+            }
+            Err(error) => {
+                match Self::keep_if_alive(transaction).await {
+                    Some(transaction) => *held = Some(transaction),
+                    None => self.record_transaction_opened_at(None),
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn list_indexes(&self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
@@ -807,6 +1278,142 @@ mod rename_table_tests {
         assert_eq!(
             rename_table_sql("pu\"blic", "us\"ers", "cust\"omers"),
             "-- name: RenameTable :exec\nALTER TABLE \"pu\"\"blic\".\"us\"\"ers\" RENAME TO \"cust\"\"omers\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod transaction_statement_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_every_statement_a_reader_can_type() {
+        let cases: &[(&str, TransactionEffect)] = &[
+            ("BEGIN", TransactionEffect::Opens),
+            ("begin", TransactionEffect::Opens),
+            ("  BeGiN ;  ", TransactionEffect::Opens),
+            ("BEGIN;", TransactionEffect::Opens),
+            ("BEGIN WORK", TransactionEffect::Opens),
+            ("BEGIN TRANSACTION", TransactionEffect::Opens),
+            (
+                "begin transaction isolation level serializable",
+                TransactionEffect::Opens,
+            ),
+            ("START TRANSACTION", TransactionEffect::Opens),
+            ("start\ttransaction ;", TransactionEffect::Opens),
+            ("COMMIT", TransactionEffect::Ends),
+            ("commit;", TransactionEffect::Ends),
+            ("Commit Work", TransactionEffect::Ends),
+            ("END", TransactionEffect::Ends),
+            ("end transaction", TransactionEffect::Ends),
+            ("ROLLBACK", TransactionEffect::Ends),
+            ("  rollback ; ", TransactionEffect::Ends),
+            ("ROLLBACK TRANSACTION", TransactionEffect::Ends),
+            ("ABORT", TransactionEffect::Ends),
+            ("PREPARE TRANSACTION 'gid'", TransactionEffect::Ends),
+            // Reads like a rollback and ends nothing: it undoes back to a
+            // point and leaves the transaction open, still holding its locks.
+            ("ROLLBACK TO SAVEPOINT a", TransactionEffect::Neither),
+            ("rollback to savepoint a;", TransactionEffect::Neither),
+            ("ROLLBACK TO a", TransactionEffect::Neither),
+            ("SAVEPOINT a", TransactionEffect::Neither),
+            ("savepoint a;", TransactionEffect::Neither),
+            ("RELEASE SAVEPOINT a", TransactionEffect::Neither),
+            ("RELEASE a", TransactionEffect::Neither),
+            // These name someone else's prepared transaction and cannot even
+            // run inside a transaction block.
+            ("COMMIT PREPARED 'gid'", TransactionEffect::Neither),
+            ("rollback prepared 'gid'", TransactionEffect::Neither),
+            ("SELECT 1", TransactionEffect::Neither),
+            ("UPDATE t SET a = 1", TransactionEffect::Neither),
+            ("", TransactionEffect::Neither),
+            ("   ", TransactionEffect::Neither),
+            (";", TransactionEffect::Neither),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transaction_effect(sql), *expected, "misclassified {sql:?}");
+        }
+    }
+
+    #[test]
+    fn classifies_a_statement_behind_the_application_name_comment() {
+        let commit = prefixed_statement("commit;");
+        assert_eq!(transaction_effect(&commit), TransactionEffect::Ends);
+        let begin = prefixed_statement("  BEGIN  ");
+        assert_eq!(transaction_effect(&begin), TransactionEffect::Opens);
+        let savepoint = prefixed_statement("ROLLBACK TO SAVEPOINT a");
+        assert_eq!(transaction_effect(&savepoint), TransactionEffect::Neither);
+    }
+
+    #[test]
+    fn an_unterminated_comment_hides_the_whole_statement() {
+        assert_eq!(
+            transaction_effect("/* never closed COMMIT"),
+            TransactionEffect::Neither
+        );
+    }
+
+    #[test]
+    fn the_idle_guard_is_written_in_milliseconds_at_session_scope() {
+        assert_eq!(
+            idle_in_transaction_timeout_statement(Duration::from_secs(90)),
+            "SET SESSION idle_in_transaction_session_timeout = 90000"
+        );
+    }
+
+    #[test]
+    fn a_patience_that_would_round_to_zero_still_guards() {
+        // Zero means "never give up" to the server, which is the opposite of
+        // what asking for a very short patience says.
+        assert_eq!(
+            idle_in_transaction_timeout_statement(Duration::ZERO),
+            "SET SESSION idle_in_transaction_session_timeout = 1"
+        );
+        assert_eq!(
+            idle_in_transaction_timeout_statement(Duration::from_nanos(1)),
+            "SET SESSION idle_in_transaction_session_timeout = 1"
+        );
+    }
+
+    #[test]
+    fn a_patience_beyond_the_parameter_is_capped_to_what_it_holds() {
+        assert_eq!(
+            idle_in_transaction_timeout_statement(Duration::from_secs(60 * 60 * 24 * 365)),
+            format!(
+                "SET SESSION idle_in_transaction_session_timeout = {}",
+                i32::MAX
+            )
+        );
+    }
+
+    #[test]
+    fn read_queries_are_told_apart_from_statements() {
+        for sql in [
+            "SELECT 1",
+            "  select 1",
+            "with x as (select 1) select * from x",
+            "EXPLAIN SELECT 1",
+            "TABLE users",
+            "SHOW search_path",
+        ] {
+            assert!(is_read_query(sql), "{sql:?} should be read as a query");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "COMMIT",
+            "BEGIN",
+            "CREATE TABLE t (a int)",
+            "",
+        ] {
+            assert!(!is_read_query(sql), "{sql:?} should not be read as a query");
+        }
+    }
+
+    #[test]
+    fn a_schema_holding_a_quote_cannot_end_the_quoting_early() {
+        assert_eq!(
+            search_path_statement("pu\"blic"),
+            "SET search_path = \"pu\"\"blic\""
         );
     }
 }
