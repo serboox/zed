@@ -28,8 +28,9 @@ pub use grpc_descriptor::{
 pub use grpc_reflection::discover_via_reflection;
 pub use history::HistoryEntry;
 pub use http_send::{
-    AUTO_HEADER_DEFAULTS, HttpResponseSummary, ParsedCookie, ResolvedRequest, Timings,
-    build_resolved_request, execute, parse_set_cookie_headers, path_places, query_of, query_pairs,
+    AUTO_HEADER_DEFAULTS, FilesForABody, HttpResponseSummary, ParsedCookie, ResolvedRequest,
+    Timings, build_resolved_request, build_resolved_request_with_files, execute,
+    files_a_body_needs, parse_set_cookie_headers, path_places, query_of, query_pairs,
     url_with_query, url_without_query,
 };
 pub use jwt::sign_jwt;

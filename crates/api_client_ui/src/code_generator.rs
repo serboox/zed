@@ -1,12 +1,13 @@
 use api_client::{
-    Request, ResolveMode, ResolvedRequest, SystemDynamicVariableSource, VariableContext,
-    build_resolved_request, resolve,
+    FilesForABody, Request, ResolveMode, ResolvedRequest, SystemDynamicVariableSource,
+    VariableContext, build_resolved_request_with_files, resolve,
 };
 
 /// The shapes a request can be copied in: a shell command, the raw exchange, or
 /// working code in one of the languages this editor is used for.
 ///
-/// Every one is built from `build_resolved_request`, the same call Send makes, so
+/// Every one is built from `build_resolved_request_with_files`, the same call
+/// Send makes, so
 /// a snippet cannot drift from what the editor would actually send: the same
 /// variables resolved, the same auth, the same headers the reader set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,9 +61,16 @@ impl Snippet {
     }
 }
 
-/// The request in the shape asked for.
-pub fn generate(snippet: Snippet, request: &Request, context: &VariableContext) -> String {
-    let resolved = as_it_was_written(request, context);
+/// The request in the shape asked for. `files` is what
+/// `api_client::files_a_body_needs` named, already read: a snippet shows what
+/// Send would send, so a file body has to be in it.
+pub fn generate(
+    snippet: Snippet,
+    request: &Request,
+    context: &VariableContext,
+    files: &FilesForABody,
+) -> String {
+    let resolved = as_it_was_written(request, context, files);
     let body = resolved
         .body
         .as_ref()
@@ -93,10 +101,14 @@ pub fn generate(snippet: Snippet, request: &Request, context: &VariableContext) 
 /// needs headers it does not need, which is how a reader ends up copying
 /// `ZedApiClient/1.0` into a bug report. A header the reader set by hand is kept
 /// even when it happens to have the same name as one of ours.
-fn as_it_was_written(request: &Request, context: &VariableContext) -> ResolvedRequest {
+fn as_it_was_written(
+    request: &Request,
+    context: &VariableContext,
+    files: &FilesForABody,
+) -> ResolvedRequest {
     let dynamic = SystemDynamicVariableSource;
     let resolver = |text: &str| resolve(text, context, &dynamic, ResolveMode::ForSend);
-    let mut resolved = build_resolved_request(request, &resolver);
+    let mut resolved = build_resolved_request_with_files(request, &resolver, files);
     let written_by_hand: Vec<String> = request
         .headers
         .iter()
@@ -504,7 +516,7 @@ mod tests {
         };
 
         for snippet in Snippet::ALL {
-            let code = generate(snippet, &request, &context);
+            let code = generate(snippet, &request, &context, &FilesForABody::default());
 
             // The raw form writes the host and the path on separate lines, as the
             // wire does; everything else writes the whole address.
@@ -551,7 +563,7 @@ mod tests {
         };
 
         for snippet in Snippet::ALL {
-            let code = generate(snippet, &request, &context);
+            let code = generate(snippet, &request, &context, &FilesForABody::default());
 
             match snippet {
                 // Neither of these is code. A shell's single quotes hold a newline
@@ -599,7 +611,12 @@ mod tests {
             global: &global,
         };
 
-        let text = generate(Snippet::HttpText, &request, &context);
+        let text = generate(
+            Snippet::HttpText,
+            &request,
+            &context,
+            &FilesForABody::default(),
+        );
 
         assert!(
             text.starts_with("GET /v1/things?page=2 HTTP/1.1\nHost: api.example.com"),
@@ -650,7 +667,7 @@ mod tests {
         let global = Environment::global();
         let context = the_global_context(&global);
 
-        let curl = generate(Snippet::Curl, &request, &context);
+        let curl = generate(Snippet::Curl, &request, &context, &FilesForABody::default());
         assert_eq!(
             curl,
             "curl --location 'https://api.example.com/v1/things' \\\n  \
@@ -659,7 +676,7 @@ mod tests {
         );
 
         for snippet in Snippet::ALL {
-            let code = generate(snippet, &request, &context);
+            let code = generate(snippet, &request, &context, &FilesForABody::default());
             assert!(
                 !code.contains("ZedApiClient"),
                 "{:?} must not tell another tool to call itself this editor:\n{code}",
@@ -689,14 +706,14 @@ mod tests {
 
         let get = a_request_named("Read", "https://api.example.com/things");
         assert_eq!(
-            generate(Snippet::Curl, &get, &context),
+            generate(Snippet::Curl, &get, &context, &FilesForABody::default()),
             "curl --location 'https://api.example.com/things'"
         );
 
         let mut post = a_request_named("Create", "https://api.example.com/things");
         post.method = HttpMethod::Post;
         let post = with_a_body(post);
-        let written = generate(Snippet::Curl, &post, &context);
+        let written = generate(Snippet::Curl, &post, &context, &FilesForABody::default());
         assert!(
             written.starts_with("curl --location 'https://api.example.com/things'"),
             "a POST with a body needs no --request: {written}"
@@ -707,7 +724,7 @@ mod tests {
         put.method = HttpMethod::Put;
         let put = with_a_body(put);
         assert!(
-            generate(Snippet::Curl, &put, &context)
+            generate(Snippet::Curl, &put, &context, &FilesForABody::default())
                 .starts_with("curl --location --request PUT 'https://api.example.com/things/1'"),
             "every other method has to be named"
         );
@@ -715,7 +732,7 @@ mod tests {
         let mut delete = a_request_named("Remove", "https://api.example.com/things/1");
         delete.method = HttpMethod::Delete;
         assert!(
-            generate(Snippet::Curl, &delete, &context)
+            generate(Snippet::Curl, &delete, &context, &FilesForABody::default())
                 .starts_with("curl --location --request DELETE"),
             "a DELETE without a body still has to be named"
         );
@@ -723,8 +740,13 @@ mod tests {
         let read_with_a_body =
             with_a_body(a_request_named("Odd", "https://api.example.com/search"));
         assert!(
-            generate(Snippet::Curl, &read_with_a_body, &context)
-                .starts_with("curl --location --request GET"),
+            generate(
+                Snippet::Curl,
+                &read_with_a_body,
+                &context,
+                &FilesForABody::default()
+            )
+            .starts_with("curl --location --request GET"),
             "a GET that carries a body has to say so, or curl would send a POST"
         );
     }
@@ -751,7 +773,7 @@ mod tests {
         let context = the_global_context(&global);
 
         assert_eq!(
-            generate(Snippet::Curl, &request, &context),
+            generate(Snippet::Curl, &request, &context, &FilesForABody::default()),
             "curl --location 'http://financials.example.com/v1/instruments/6408/balance-sheet'",
             "nothing else belongs in it: no body, no headers of ours, no --request"
         );
@@ -767,7 +789,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate(Snippet::Curl, &request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx, &FilesForABody::default());
         assert_eq!(curl, "curl --location 'https://api.example.com/ping'");
     }
 
@@ -787,7 +809,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate(Snippet::Curl, &request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx, &FilesForABody::default());
         assert!(curl.contains("--header 'Accept: application/json'"));
     }
 
@@ -806,7 +828,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate(Snippet::Curl, &request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx, &FilesForABody::default());
         assert!(curl.contains(r#"--data '{"name":"O'\''Brien"}'"#));
     }
 
@@ -824,7 +846,7 @@ mod tests {
             collection: None,
             global: &global,
         };
-        let curl = generate(Snippet::Curl, &request, &ctx);
+        let curl = generate(Snippet::Curl, &request, &ctx, &FilesForABody::default());
         assert!(curl.contains("https://staging.example.com/ping"));
     }
 }

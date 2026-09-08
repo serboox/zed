@@ -1856,18 +1856,30 @@ impl ApiClientPanel {
         };
         let languages = workspace.read(cx).app_state().languages.clone();
         let store = self.store.clone();
-        workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                crate::request_view::CodeSnippetModal::new(
-                    request,
-                    store,
-                    languages,
-                    crate::code_generator::Snippet::Curl,
-                    window,
-                    cx,
-                )
-            });
-        });
+        let workspace = workspace.downgrade();
+        // The files first: the window shows the body Send would send, and reading
+        // them is not something the thread that draws it can do.
+        cx.spawn_in(window, async move |_, cx| {
+            let files =
+                api_client::FilesForABody::read_them(api_client::files_a_body_needs(&request.body))
+                    .await;
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        crate::request_view::CodeSnippetModal::new(
+                            request,
+                            files,
+                            store,
+                            languages,
+                            crate::code_generator::Snippet::Curl,
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .log_err();
+        })
+        .detach();
     }
 
     /// Whether `collection_id` can move up/down among all top-level
