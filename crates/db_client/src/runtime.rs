@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::task::Poll;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -111,6 +112,39 @@ impl DbProvider for RuntimeProvider {
     async fn ping(&self) -> Result<()> {
         let inner = self.inner.clone();
         on_runtime(async move { inner.ping().await }).await
+    }
+
+    // Every method of the wrapped provider is forwarded by hand, and the
+    // transaction ones are no exception -- a method left out here would fall
+    // back to the trait's default, which for these is a refusal. The driver
+    // underneath would be perfectly able to hold a transaction and nothing
+    // would ever ask it to.
+    fn holds_transactions(&self) -> bool {
+        self.inner.holds_transactions()
+    }
+
+    async fn begin_transaction(&self, database: &str, abandoned_after: Duration) -> Result<()> {
+        let inner = self.inner.clone();
+        let database = database.to_owned();
+        on_runtime(async move { inner.begin_transaction(&database, abandoned_after).await }).await
+    }
+
+    async fn commit_transaction(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        on_runtime(async move { inner.commit_transaction().await }).await
+    }
+
+    async fn rollback_transaction(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        on_runtime(async move { inner.rollback_transaction().await }).await
+    }
+
+    /// Answered here rather than on the runtime: it reads a remembered instant
+    /// and talks to nothing, so sending it through the runtime would cost a
+    /// hop for a field read -- and this is asked on every frame that draws the
+    /// transaction's age.
+    fn transaction_open_since(&self) -> Option<std::time::Instant> {
+        self.inner.transaction_open_since()
     }
 
     async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
