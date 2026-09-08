@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -44,6 +46,62 @@ pub trait DbProvider: Send + Sync {
     }
     async fn execute_query(&self, database: &str, sql: &str) -> Result<QueryResult>;
     async fn get_table_ddl(&self, database: &str, table: &str) -> Result<String>;
+
+    /// Whether this driver can hold a transaction open across statements.
+    ///
+    /// Answered by the driver rather than assumed, because a transaction that
+    /// is not really held is worse than no transaction at all: the statements
+    /// after it would run and commit one by one while the reader believed they
+    /// were staged and could still be rolled back. A driver that returns false
+    /// must refuse the three calls below rather than pretend.
+    fn holds_transactions(&self) -> bool {
+        false
+    }
+
+    /// Opens a transaction, and pins whatever connection it lives on for as
+    /// long as it is open.
+    ///
+    /// The pinning is the substance of this. A transaction belongs to one
+    /// physical connection: statements sent on another are outside it, and the
+    /// connection it began on sits inside it holding locks. So while this is
+    /// open, every statement from the console goes to that one connection --
+    /// and the connection is kept out of the pool, where an idle timeout or a
+    /// maximum lifetime would otherwise close it and roll the work back with
+    /// nothing said.
+    ///
+    /// `abandoned_after` is how long the server should wait on a silent
+    /// connection before closing it itself, and it is not the same guard as
+    /// the editor's own idle timer. The editor's timer cannot run if the
+    /// editor is killed, and a transaction left open then would hold its locks
+    /// against everyone else until a person noticed. Told to the server at the
+    /// moment the transaction opens, it is the one guard that survives the
+    /// editor not being there to keep its promises.
+    async fn begin_transaction(&self, _database: &str, _abandoned_after: Duration) -> Result<()> {
+        anyhow::bail!("this connection cannot hold a transaction open")
+    }
+
+    /// Commits the open transaction and releases the connection it was on.
+    async fn commit_transaction(&self) -> Result<()> {
+        anyhow::bail!("this connection cannot hold a transaction open")
+    }
+
+    /// Rolls the open transaction back and releases the connection it was on.
+    ///
+    /// Must be safe to call when nothing is open: it is what everything that
+    /// goes wrong reaches for -- a window closing, a connection being edited,
+    /// an idle transaction reaching its limit -- and none of those can first
+    /// check and then act without a gap in between.
+    async fn rollback_transaction(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// When the open transaction was opened, or nothing where none is.
+    ///
+    /// The instant rather than a duration, so that whoever displays it decides
+    /// how often to recount and nothing has to be refreshed here.
+    fn transaction_open_since(&self) -> Option<std::time::Instant> {
+        None
+    }
 
     /// Like `execute_query`, but pushes rows to `sink` as they arrive instead
     /// of collecting them into a `QueryResult`, and is not bound by
