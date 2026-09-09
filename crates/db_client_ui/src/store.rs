@@ -274,6 +274,41 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
+/// The transaction a connection held before a statement ran and after it did.
+///
+/// `tracks` is the provider's own answer to whether it holds transactions at
+/// all: without it a connection that never tracks one is indistinguishable from
+/// one whose transaction just ended, and every statement on ClickHouse or
+/// Cassandra would read as having closed something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionEdge {
+    pub tracks: bool,
+    pub before: Option<Instant>,
+    pub after: Option<Instant>,
+}
+
+impl TransactionEdge {
+    /// The statement left a transaction open that was not open before it.
+    pub fn opened(&self) -> bool {
+        self.tracks && self.before.is_none() && self.after.is_some()
+    }
+
+    /// The statement ended the transaction that was open before it.
+    pub fn closed(&self) -> bool {
+        self.tracks && self.before.is_some() && self.after.is_none()
+    }
+
+    /// It ended one and opened another, which is what `COMMIT AND CHAIN` does.
+    pub fn chained(&self) -> bool {
+        self.tracks && self.before.is_some() && self.after.is_some() && self.before != self.after
+    }
+
+    /// A transaction was open throughout and is the same one.
+    pub fn stayed_open(&self) -> bool {
+        self.tracks && self.before.is_some() && self.before == self.after
+    }
+}
+
 #[derive(Clone)]
 pub struct ActiveConnection {
     pub config: ConnectionConfig,
@@ -301,6 +336,12 @@ pub struct ActiveConnection {
     /// `ROLLBACK`, to decide whether to let the connection go. A second reading
     /// of the same statements here would disagree with it on exactly those.
     pub transaction_open_since: Option<Instant>,
+    /// What the last statement on this connection did to its transaction.
+    ///
+    /// The level above says what is open now; this says what changed, and only
+    /// the change can tell a `COMMIT` that ended a transaction from a `COMMIT`
+    /// that had none to end. Both look identical afterwards.
+    pub last_transaction_edge: Option<TransactionEdge>,
     /// Bumped every time the connection is torn down or replaced. Tasks capture
     /// it before they start and compare on completion, so a slow connect,
     /// refresh or prefetch belonging to a previous incarnation cannot write its
@@ -328,6 +369,7 @@ impl ActiveConnection {
             expanded_database_set: HashSet::new(),
             expanded_table_set: HashSet::new(),
             transaction_open_since: None,
+            last_transaction_edge: None,
             epoch: 0,
         }
     }
@@ -2481,6 +2523,9 @@ impl DatabaseStore {
         if conn.config.read_only && crate::db_agent_tools::requires_confirmation(&sql) {
             return Task::ready(Err(read_only_error(&conn.config.label)));
         }
+        // Read before the statement runs, so what it did to the transaction can
+        // be told from the pair rather than guessed from the level afterwards.
+        let transaction_before = conn.transaction_open_since;
 
         self.record_query_history(sql.clone(), cx);
 
@@ -2500,15 +2545,21 @@ impl DatabaseStore {
             match &result {
                 Ok(_) => {
                     let open_since = provider.transaction_open_since();
+                    let edge = TransactionEdge {
+                        tracks: provider.holds_transactions(),
+                        before: transaction_before,
+                        after: open_since,
+                    };
                     this.update(cx, |store, cx| {
                         // The transaction belongs to the connection this
                         // statement ran on, not to whatever replaced it.
-                        if let Some(conn) = store.connection_at_epoch(id, epoch)
-                            && conn.transaction_open_since != open_since
-                        {
-                            conn.transaction_open_since = open_since;
-                            cx.emit(DatabaseStoreEvent::ConnectionsChanged);
-                            cx.notify();
+                        if let Some(conn) = store.connection_at_epoch(id, epoch) {
+                            conn.last_transaction_edge = Some(edge);
+                            if conn.transaction_open_since != open_since {
+                                conn.transaction_open_since = open_since;
+                                cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+                                cx.notify();
+                            }
                         }
                     })
                     .ok();

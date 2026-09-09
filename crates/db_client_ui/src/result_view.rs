@@ -1019,9 +1019,31 @@ fn sql_effective_start(sql: &str) -> &str {
                 Some(newline) => rest = after[newline + 1..].trim_start(),
                 None => return "",
             }
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            match after.find("*/") {
-                Some(close) => rest = after[close + 2..].trim_start(),
+        } else if rest.starts_with("/*") {
+            // Counted, not found: PostgreSQL nests block comments, so stopping
+            // at the first `*/` leaves the tail of a comment being read as the
+            // statement.
+            let mut depth = 0usize;
+            let bytes = rest.as_bytes();
+            let mut at = 0usize;
+            let mut after = None;
+            while at + 1 < bytes.len() {
+                if bytes[at] == b'/' && bytes[at + 1] == b'*' {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at] == b'*' && bytes[at + 1] == b'/' {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        after = Some(at);
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+            match after {
+                Some(at) => rest = rest[at..].trim_start(),
                 None => return "",
             }
         } else {
@@ -1058,16 +1080,224 @@ fn returns_no_result_set(result: &QueryResult, sql: Option<&str>) -> bool {
 /// Reporting it as "0 rows" is what makes it look like a failure: a reader takes
 /// that as a query that found nothing, when the truth is there was never
 /// anything to find and the statement did what it was asked.
-fn statement_outcome(result: &QueryResult) -> (String, String) {
+/// The statement as upper-case words separated by one space, with leading
+/// comments and trailing semicolons gone, so a keyword can be matched as a
+/// whole word. The same normalisation MySQL's own classifier does.
+fn statement_words(sql: &str) -> String {
+    sql_effective_start(sql)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `words` is exactly `keyword`, or `keyword` followed by arguments.
+/// `COMMITTED` is not a `COMMIT`.
+fn is_the_statement(words: &str, keyword: &str) -> bool {
+    words == keyword
+        || words
+            .strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// What the statement was, as far as its leading words say.
+///
+/// Only what it says, never what it did: what it did is the connection's
+/// business, and the two are combined in [`statement_outcome`]. Reading the
+/// words alone is how a `COMMIT` with nothing open comes to be reported as
+/// having committed something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatementKind {
+    OpensTransaction,
+    Commits,
+    RollsBack,
+    RollsBackToSavepoint,
+    MarksSavepoint,
+    ReleasesSavepoint,
+    Creates(&'static str),
+    Alters(&'static str),
+    Drops(&'static str),
+    Empties(&'static str),
+    Grants,
+    Revokes,
+    Other,
+}
+
+fn statement_kind(sql: &str) -> StatementKind {
+    let words = statement_words(sql);
+    // Two-phase commit acts on some other, already-prepared transaction by
+    // name. It is not this session's, and reporting it as this session's is
+    // exactly the confusion this function exists to remove.
+    if words.starts_with("COMMIT PREPARED")
+        || words.starts_with("ROLLBACK PREPARED")
+        || words.starts_with("PREPARE TRANSACTION")
+    {
+        return StatementKind::Other;
+    }
+    // Before the plain forms: these read like endings and are not.
+    if words.starts_with("ROLLBACK TO ") || words.starts_with("ROLLBACK WORK TO ") {
+        return StatementKind::RollsBackToSavepoint;
+    }
+    if is_the_statement(&words, "SAVEPOINT") {
+        return StatementKind::MarksSavepoint;
+    }
+    if is_the_statement(&words, "RELEASE") {
+        return StatementKind::ReleasesSavepoint;
+    }
+    if is_the_statement(&words, "BEGIN") || is_the_statement(&words, "START TRANSACTION") {
+        return StatementKind::OpensTransaction;
+    }
+    if is_the_statement(&words, "COMMIT") {
+        return StatementKind::Commits;
+    }
+    if is_the_statement(&words, "ROLLBACK") || is_the_statement(&words, "ABORT") {
+        return StatementKind::RollsBack;
+    }
+    if is_the_statement(&words, "GRANT") {
+        return StatementKind::Grants;
+    }
+    if is_the_statement(&words, "REVOKE") {
+        return StatementKind::Revokes;
+    }
+    for (verb, wrap) in [
+        (
+            "CREATE",
+            StatementKind::Creates as fn(&'static str) -> StatementKind,
+        ),
+        (
+            "ALTER",
+            StatementKind::Alters as fn(&'static str) -> StatementKind,
+        ),
+        (
+            "DROP",
+            StatementKind::Drops as fn(&'static str) -> StatementKind,
+        ),
+        (
+            "TRUNCATE",
+            StatementKind::Empties as fn(&'static str) -> StatementKind,
+        ),
+    ] {
+        if is_the_statement(&words, verb) {
+            // `TRUNCATE users` is the shorthand for `TRUNCATE TABLE users`, and
+            // a table is the only thing the verb acts on.
+            let object = match (verb, object_of(&words)) {
+                ("TRUNCATE", "Object") => "Table",
+                (_, object) => object,
+            };
+            return wrap(object);
+        }
+    }
+    StatementKind::Other
+}
+
+/// The kind of thing a DDL statement acts on, so the panel can say what was
+/// made rather than repeat the statement back.
+///
+/// Words like `OR REPLACE`, `UNIQUE`, `TEMPORARY` and `IF EXISTS` sit between
+/// the verb and the object, so the object is the first word that names one, not
+/// the second word of the statement.
+fn object_of(words: &str) -> &'static str {
+    const OBJECTS: [(&str, &str); 15] = [
+        ("TABLE", "Table"),
+        ("VIEW", "View"),
+        ("INDEX", "Index"),
+        ("DATABASE", "Database"),
+        ("SCHEMA", "Schema"),
+        ("TRIGGER", "Trigger"),
+        ("PROCEDURE", "Procedure"),
+        ("FUNCTION", "Function"),
+        ("SEQUENCE", "Sequence"),
+        ("EVENT", "Event"),
+        ("USER", "User"),
+        ("ROLE", "Role"),
+        ("TYPE", "Type"),
+        ("EXTENSION", "Extension"),
+        ("KEYSPACE", "Keyspace"),
+    ];
+    words
+        .split(' ')
+        .find_map(|word| {
+            OBJECTS
+                .iter()
+                .find(|(keyword, _)| *keyword == word)
+                .map(|(_, name)| *name)
+        })
+        .unwrap_or("Object")
+}
+
+/// What to say about such a statement, as a headline and a line beneath it.
+///
+/// Reporting it as "0 rows" is what makes it look like a failure: a reader takes
+/// that as a query that found nothing, when the truth is there was never
+/// anything to find and the statement did what it was asked.
+///
+/// "Statement completed" is the same failure one step along: a reader who opened
+/// a transaction is told nothing about the transaction. So every claim about one
+/// is made from `edge` -- what the connection held before the statement and
+/// after it -- and the statement's own words only choose between the readings
+/// that the edge allows. Where the two disagree, or the edge is unknown, or the
+/// driver holds no transactions at all, the old wording stands: it is vague, and
+/// vague beats wrong.
+fn statement_outcome(
+    result: &QueryResult,
+    sql: Option<&str>,
+    edge: Option<crate::store::TransactionEdge>,
+) -> (String, String) {
     let elapsed = format!("{} ms", result.execution_time_ms);
-    match result.rows_affected {
+    let generic = || match result.rows_affected {
         0 => (
             "Statement completed".to_string(),
             format!("It returns no rows · {elapsed}"),
         ),
-        1 => ("1 row affected".to_string(), elapsed),
-        affected => (format!("{affected} rows affected"), elapsed),
-    }
+        1 => ("1 row affected".to_string(), elapsed.clone()),
+        affected => (format!("{affected} rows affected"), elapsed.clone()),
+    };
+    let Some(sql) = sql else {
+        return generic();
+    };
+    let kind = statement_kind(sql);
+    let headline = match (kind, edge) {
+        (StatementKind::OpensTransaction, Some(edge)) if edge.opened() => "Transaction open",
+        (StatementKind::Commits, Some(edge)) if edge.closed() => "Transaction committed",
+        (StatementKind::Commits, Some(edge)) if edge.chained() => {
+            "Committed; a new transaction is open"
+        }
+        (StatementKind::RollsBack, Some(edge)) if edge.closed() => "Transaction rolled back",
+        (StatementKind::RollsBack, Some(edge)) if edge.chained() => {
+            "Rolled back; a new transaction is open"
+        }
+        (StatementKind::RollsBackToSavepoint, Some(edge)) if edge.stayed_open() => {
+            "Rolled back to the savepoint"
+        }
+        (StatementKind::MarksSavepoint, Some(edge)) if edge.stayed_open() => "Savepoint set",
+        (StatementKind::ReleasesSavepoint, Some(edge)) if edge.stayed_open() => {
+            "Savepoint released"
+        }
+        // A count is the more informative fact, and `CREATE TABLE ... AS SELECT`
+        // has one. Only a statement that touched nothing is named by what it
+        // made.
+        (_, _) if result.rows_affected != 0 => return generic(),
+        // `IF NOT EXISTS` and `IF EXISTS` succeed whether or not they did
+        // anything, and nothing in the answer says which. "Table created" would
+        // be a guess with a coin-flip's odds.
+        (_, _)
+            if statement_words(sql).contains("IF NOT EXISTS")
+                || statement_words(sql).contains("IF EXISTS") =>
+        {
+            return generic();
+        }
+        (StatementKind::Creates(object), _) => return (format!("{object} created"), elapsed),
+        (StatementKind::Alters(object), _) => return (format!("{object} altered"), elapsed),
+        (StatementKind::Drops(object), _) => return (format!("{object} dropped"), elapsed),
+        (StatementKind::Empties(object), _) => return (format!("{object} emptied"), elapsed),
+        (StatementKind::Grants, _) => "Permissions granted",
+        (StatementKind::Revokes, _) => "Permissions revoked",
+        _ => return generic(),
+    };
+    (headline.to_string(), elapsed)
 }
 
 fn detect_special_result(sql: Option<&str>, columns: &[String]) -> SpecialResult {
@@ -1237,6 +1467,14 @@ pub struct ResultView {
     /// Set while a click on the blank row is waiting for the column types. A
     /// second click in that window would make a second row.
     promoting_blank_row: bool,
+    /// What the statement now shown did to its connection's transaction, taken
+    /// once when the result arrived.
+    ///
+    /// Snapshotted rather than read at paint time, because a commit made
+    /// somewhere else -- the connection tree's own button -- would otherwise
+    /// relabel a statement that finished minutes ago, and the panel and the
+    /// status strip repaint at different moments and would disagree.
+    statement_edge: Option<crate::store::TransactionEdge>,
     // An open enum/set dropdown popup, if any. At most one at a time.
     enum_popup: Option<EnumPopup>,
     // An open calendar popup for a DATE/DATETIME cell, if any. At most one at a time.
@@ -1591,6 +1829,7 @@ impl ResultView {
             fk_columns: std::collections::HashMap::new(),
             column_metadata_load: None,
             promoting_blank_row: false,
+            statement_edge: None,
             enum_popup: None,
             date_popup: None,
             value_editor_open: false,
@@ -2800,6 +3039,10 @@ impl ResultView {
     pub fn set_result(&mut self, result: QueryResult, cx: &mut Context<Self>) {
         self.result = Some(result);
         self.reset_special_view();
+        // A result that did not come from running a statement carries no
+        // transaction story, and inheriting the previous one would tell it
+        // about the wrong statement.
+        self.statement_edge = None;
         self.error = None;
         self.cell_edit = None;
         self.status_message = None;
@@ -3169,6 +3412,10 @@ impl ResultView {
         self.start_fill(cx);
     }
 
+    /// `edge` is what the statement did to its connection's transaction, and
+    /// the caller must read it the moment the statement finished. The store
+    /// keeps only the last one, so a caller that fetched it later could hand
+    /// over the next statement's answer about this one.
     pub fn set_query_result(
         &mut self,
         store: WeakEntity<DatabaseStore>,
@@ -3176,6 +3423,7 @@ impl ResultView {
         database: String,
         base_sql: String,
         result: QueryResult,
+        edge: Option<crate::store::TransactionEdge>,
         cx: &mut Context<Self>,
     ) {
         self.fill_cancel.store(true, Ordering::SeqCst);
@@ -3201,6 +3449,9 @@ impl ResultView {
         self.hidden_columns.clear();
         self.loaded_rows = result.rows.len();
         self.set_result(result, cx);
+        // After `set_result`, which clears it: this result did come from
+        // running a statement, and that statement's edge is the one to keep.
+        self.statement_edge = edge;
     }
 
     fn start_fill(&mut self, cx: &mut Context<Self>) {
@@ -6158,7 +6409,8 @@ impl ResultView {
         // statement with no result set too, or it goes on counting rows that were
         // never asked for.
         let row_summary = if returns_no_result_set(result, self.base_sql.as_deref()) {
-            let (headline, _) = statement_outcome(result);
+            let (headline, _) =
+                statement_outcome(result, self.base_sql.as_deref(), self.statement_edge);
             headline
         } else {
             format!(
@@ -6385,7 +6637,8 @@ impl ResultView {
         let Some(result) = self.result.as_ref() else {
             return div().into_any_element();
         };
-        let (headline, detail) = statement_outcome(result);
+        let (headline, detail) =
+            statement_outcome(result, self.base_sql.as_deref(), self.statement_edge);
         v_flex()
             .id("statement-outcome")
             .debug_selector(|| "STATEMENT_OUTCOME".to_string())
@@ -12215,6 +12468,7 @@ mod tests {
                 "public".to_string(),
                 "select * from users".to_string(),
                 result,
+                None,
                 cx,
             );
             view
@@ -13965,22 +14219,197 @@ mod tests {
     #[test]
     fn a_statement_is_reported_by_what_it_did_and_never_as_zero_rows() {
         use super::statement_outcome;
-        let (headline, detail) = statement_outcome(&statement_result(0));
+        let (headline, detail) =
+            statement_outcome(&statement_result(0), Some("ANALYZE TABLE t"), None);
         assert_eq!(headline, "Statement completed");
         assert!(
             !headline.contains("row") && !headline.contains("0"),
-            "a CREATE reported as rows reads as a query that found none: {headline:?}"
+            "a statement reported as rows reads as a query that found none: {headline:?}"
         );
         assert!(
             detail.contains("860 ms"),
             "the time it took is worth keeping"
         );
 
-        assert_eq!(statement_outcome(&statement_result(1)).0, "1 row affected");
         assert_eq!(
-            statement_outcome(&statement_result(20_000)).0,
+            statement_outcome(&statement_result(1), None, None).0,
+            "1 row affected"
+        );
+        assert_eq!(
+            statement_outcome(&statement_result(20_000), None, None).0,
             "20000 rows affected"
         );
+    }
+
+    fn edge(tracks: bool, before: bool, after: bool) -> Option<crate::store::TransactionEdge> {
+        // Two different instants, so "open before" and "open after" can be told
+        // apart from "the same transaction throughout".
+        let first = std::time::Instant::now();
+        let second = first + Duration::from_millis(1);
+        Some(crate::store::TransactionEdge {
+            tracks,
+            before: before.then_some(first),
+            after: after.then_some(if before { first } else { second }),
+        })
+    }
+
+    /// What a transaction statement did is read off the connection, not off its
+    /// own words. Every one of these was "Statement completed · It returns no
+    /// rows" before, which reads as a query that found nothing.
+    #[test]
+    fn a_transaction_statement_says_what_became_of_the_transaction() {
+        use super::statement_outcome;
+        let open = edge(true, false, true);
+        let closed = edge(true, true, false);
+        let held = edge(true, true, true);
+        let chained = Some(crate::store::TransactionEdge {
+            tracks: true,
+            before: Some(std::time::Instant::now()),
+            after: Some(std::time::Instant::now() + Duration::from_millis(1)),
+        });
+
+        for (sql, edge, headline) in [
+            ("START TRANSACTION", open, "Transaction open"),
+            ("BEGIN", open, "Transaction open"),
+            (
+                "  -- open one\n  START TRANSACTION;\n",
+                open,
+                "Transaction open",
+            ),
+            ("COMMIT", closed, "Transaction committed"),
+            (
+                "COMMIT AND CHAIN",
+                chained,
+                "Committed; a new transaction is open",
+            ),
+            ("ROLLBACK", closed, "Transaction rolled back"),
+            (
+                "ROLLBACK AND CHAIN",
+                chained,
+                "Rolled back; a new transaction is open",
+            ),
+            ("SAVEPOINT before_the_fix", held, "Savepoint set"),
+            (
+                "ROLLBACK TO SAVEPOINT before_the_fix",
+                held,
+                "Rolled back to the savepoint",
+            ),
+            (
+                "RELEASE SAVEPOINT before_the_fix",
+                held,
+                "Savepoint released",
+            ),
+        ] {
+            assert_eq!(
+                statement_outcome(&statement_result(0), Some(sql), edge).0,
+                headline,
+                "{sql} was reported as something else"
+            );
+        }
+    }
+
+    /// The words alone are never enough. A driver that holds no transaction, an
+    /// edge that disagrees with the statement, and a statement that acts on some
+    /// other transaction by name all keep the old, vague wording -- which is
+    /// true, where a confident sentence would not be.
+    #[test]
+    fn nothing_is_claimed_about_a_transaction_the_connection_did_not_report() {
+        use super::statement_outcome;
+        let nothing_happened = edge(true, false, false);
+
+        assert_eq!(
+            statement_outcome(&statement_result(0), Some("COMMIT"), nothing_happened).0,
+            "Statement completed",
+            "a COMMIT with nothing open committed nothing, and must not say it did"
+        );
+        assert_eq!(
+            statement_outcome(&statement_result(0), Some("ROLLBACK"), nothing_happened).0,
+            "Statement completed",
+            "nor may a ROLLBACK claim to have discarded work that never existed"
+        );
+        assert_eq!(
+            statement_outcome(
+                &statement_result(0),
+                Some("COMMIT"),
+                edge(false, true, false)
+            )
+            .0,
+            "Statement completed",
+            "a driver that holds no transactions has none to commit"
+        );
+        assert_eq!(
+            statement_outcome(&statement_result(0), Some("BEGIN"), None).0,
+            "Statement completed",
+            "with no connection behind it there is nothing to read"
+        );
+        assert_eq!(
+            statement_outcome(
+                &statement_result(0),
+                Some("COMMIT PREPARED 'x'"),
+                edge(true, true, false)
+            )
+            .0,
+            "Statement completed",
+            "two-phase commit acts on another transaction by name, not this session's"
+        );
+        assert_eq!(
+            statement_outcome(
+                &statement_result(0),
+                Some("SET NAMES utf8mb4"),
+                edge(true, true, true)
+            )
+            .0,
+            "Statement completed",
+            "a SET inside a transaction did not open it and must not be read as having"
+        );
+    }
+
+    /// A statement that made something says what it made -- unless it also
+    /// reports a count, which is the more informative fact.
+    #[test]
+    fn a_ddl_statement_names_what_it_made() {
+        use super::statement_outcome;
+        for (sql, headline) in [
+            ("CREATE TABLE t (id int)", "Table created"),
+            ("CREATE OR REPLACE VIEW v AS SELECT 1", "View created"),
+            ("CREATE UNIQUE INDEX i ON t (id)", "Index created"),
+            ("ALTER TABLE t ADD COLUMN name text", "Table altered"),
+            ("DROP TABLE t", "Table dropped"),
+            ("TRUNCATE TABLE t", "Table emptied"),
+            ("TRUNCATE users", "Table emptied"),
+            ("GRANT SELECT ON t TO reader", "Permissions granted"),
+            ("REVOKE SELECT ON t FROM reader", "Permissions revoked"),
+        ] {
+            assert_eq!(
+                statement_outcome(&statement_result(0), Some(sql), None).0,
+                headline,
+                "{sql} was reported as something else"
+            );
+        }
+
+        assert_eq!(
+            statement_outcome(
+                &statement_result(500),
+                Some("CREATE TABLE t2 AS SELECT * FROM t"),
+                None
+            )
+            .0,
+            "500 rows affected",
+            "a count is worth more than the noun, so the count wins"
+        );
+
+        // A conditional one succeeds whether or not it did anything, and
+        // nothing in the answer says which.
+        for sql in [
+            "CREATE TABLE IF NOT EXISTS t (id int)",
+            "DROP TABLE IF EXISTS t",
+        ] {
+            assert_eq!(
+                statement_outcome(&statement_result(0), Some(sql), None).0,
+                "Statement completed",
+                "{sql} may have done nothing, and must not claim it did"
+            );
+        }
     }
 
     #[test]
@@ -17475,6 +17904,7 @@ mod tests {
                 "public".to_string(),
                 "SELECT * FROM some_other_table".to_string(),
                 wide_table_result(),
+                None,
                 cx,
             );
 

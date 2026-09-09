@@ -4440,12 +4440,18 @@ fn run_sql_from_editor(
                     // transaction the connection is left holding, which is what
                     // decides whether the mark is staged. The store has already
                     // taken it from the provider by the time the task resolves.
-                    let staged_in = store.read_with(cx, |store, _| {
-                        store
+                    // Both read here, in the same turn the statement finished
+                    // and before anything can await: the store keeps only the
+                    // last of each, and the next statement overwrites them.
+                    let (staged_in, transaction_edge) = store.read_with(cx, |store, _| {
+                        let connection = store
                             .connections()
                             .iter()
-                            .find(|connection| connection.config.id == conn_id)
-                            .and_then(|connection| connection.transaction_open_since)
+                            .find(|connection| connection.config.id == conn_id);
+                        (
+                            connection.and_then(|connection| connection.transaction_open_since),
+                            connection.and_then(|connection| connection.last_transaction_edge),
+                        )
                     });
                     editor.update(cx, |editor, cx| {
                         if let Some((id, addon)) =
@@ -4485,6 +4491,7 @@ fn run_sql_from_editor(
                             db_name.clone(),
                             sql.clone(),
                             result,
+                            transaction_edge,
                             cx,
                         );
                         match table_context {
