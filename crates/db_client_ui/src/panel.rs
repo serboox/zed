@@ -55,7 +55,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use terminal_view::terminal_panel::TerminalPanel;
 use time::OffsetDateTime;
 use time::macros::format_description;
@@ -462,6 +462,18 @@ struct QueryExecutionMarker {
     // buffer snapshot to resolve the anchor itself.
     row: u32,
     status: QueryExecutionStatus,
+    // The transaction the connection was holding once this statement had run,
+    // or `None` when it held none. Taken from the provider through the store
+    // rather than read out of the statement's own words: the provider is the
+    // one holding the connection and already tells `COMMIT AND CHAIN` from
+    // `COMMIT`.
+    //
+    // What makes the mark staged is not this value on its own but its equality
+    // with what the connection reports now. Nothing has to be swept when a
+    // transaction ends: the instant simply stops matching, and a second
+    // transaction opened after the first is a different instant, so the marks
+    // of the first do not silently join it.
+    staged_in: Option<Instant>,
 }
 
 struct DbQueryEditorAddon {
@@ -477,16 +489,25 @@ impl editor::Addon for DbQueryEditorAddon {
         _: u32,
         buffer_row: Option<u32>,
         _: &mut Window,
-        _: &mut Context<Editor>,
+        cx: &mut Context<Editor>,
     ) -> Option<gpui::AnyElement> {
         let row = buffer_row?;
-        let status = self
-            .query_markers
-            .iter()
-            .find(|marker| marker.row == row)?
-            .status;
+        let marker = self.query_markers.iter().find(|marker| marker.row == row)?;
 
-        Some(render_query_status_indicator(row, status).into_any_element())
+        // A statement that ran inside a transaction is only staged while that
+        // same transaction is still open. Once it commits or rolls back the
+        // instant stops matching and the mark goes, which is what a reader
+        // asked for: the marks of a transaction are cleared by its ending and
+        // by nothing else.
+        match (marker.staged_in, self.open_transaction(cx)) {
+            (None, _) => {}
+            (staged, open) if staged == open => {
+                return Some(render_staged_indicator(row).into_any_element());
+            }
+            _ => return None,
+        }
+
+        Some(render_query_status_indicator(row, marker.status).into_any_element())
     }
 
     fn to_any(&self) -> &dyn std::any::Any {
@@ -508,8 +529,30 @@ impl DbQueryEditorAddon {
         }
     }
 
-    fn clear_query_markers(&mut self) {
-        self.query_markers.clear();
+    /// The transaction this addon's connection is holding right now, as the
+    /// store has it. `None` when it holds none, when the connection is gone,
+    /// or when there is no store -- in all three the marks are not staged, and
+    /// claiming otherwise would be a guess.
+    fn open_transaction(&self, cx: &App) -> Option<Instant> {
+        DatabaseStore::global(cx)?
+            .read(cx)
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == self.connection_id)
+            .and_then(|connection| connection.transaction_open_since)
+    }
+
+    /// Drops every mark except the ones staged in the transaction that is open
+    /// now.
+    ///
+    /// A run used to wipe the lot, so a second Ctrl+Enter erased the record of
+    /// the first even while the server was still holding its work uncommitted.
+    /// With a transaction open the reader needs to see everything that is in
+    /// it, and `open` being `None` -- no transaction, or none this addon can
+    /// see -- clears everything, which is the old behaviour.
+    fn keep_only_what_the_open_transaction_holds(&mut self, open: Option<Instant>) {
+        self.query_markers
+            .retain(|marker| marker.staged_in.is_some() && marker.staged_in == open);
     }
 
     // Adds a marker for the statement spanning `range`, or updates the existing
@@ -540,6 +583,9 @@ impl DbQueryEditorAddon {
             marker.text = text;
             marker.row = row;
             marker.status = status;
+            // A re-run starts over: what the previous run was staged in says
+            // nothing about what this one will be.
+            marker.staged_in = None;
         } else {
             self.query_markers.push(QueryExecutionMarker {
                 id,
@@ -547,6 +593,7 @@ impl DbQueryEditorAddon {
                 text,
                 row,
                 status,
+                staged_in: None,
             });
         }
         id
@@ -556,9 +603,18 @@ impl DbQueryEditorAddon {
     // If that marker was dropped because its statement was edited, or replaced
     // by a newer run, this is a no-op, so a finished run cannot resurrect or
     // overwrite the indicator of a query the user has already changed or re-run.
-    fn set_query_status(&mut self, id: usize, status: QueryExecutionStatus) {
+    //
+    // `staged_in` is the transaction the connection was holding once the
+    // statement had run, which only a caller that has the store can say.
+    fn set_query_status(
+        &mut self,
+        id: usize,
+        status: QueryExecutionStatus,
+        staged_in: Option<Instant>,
+    ) {
         if let Some(marker) = self.query_markers.iter_mut().find(|marker| marker.id == id) {
             marker.status = status;
+            marker.staged_in = staged_in;
         }
     }
 
@@ -616,6 +672,29 @@ fn render_query_status_indicator(row: u32, status: QueryExecutionStatus) -> impl
                 .color(Color::Error)
                 .into_any_element(),
         })
+}
+
+/// The mark on a statement the server has run but not yet made permanent.
+///
+/// A dot rather than a check, and its own selector: the green check means the
+/// server has the work, and a statement inside an open transaction does not
+/// have that yet. The difference is a shape before it is a colour, so it
+/// survives a screen showing no colour at all.
+fn render_staged_indicator(row: u32) -> impl IntoElement {
+    div()
+        .id(ElementId::from(SharedString::from(format!(
+            "sql-query-uncommitted-{row}"
+        ))))
+        .debug_selector(move || format!("SQL_QUERY_UNCOMMITTED-{row}"))
+        .size_5()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(IconName::Circle)
+                .size(IconSize::Small)
+                .color(Color::Warning),
+        )
 }
 
 /// Past this age a cached-and-otherwise-quiet schema still earns a subtle
@@ -4013,13 +4092,6 @@ fn run_sql_from_editor(
         return;
     }
 
-    editor.update(cx, |editor, cx| {
-        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
-            addon.clear_query_markers();
-            cx.notify();
-        }
-    });
-
     let connection = {
         let store_ref = store.read(cx);
         let resolved = store_ref
@@ -4051,6 +4123,29 @@ fn run_sql_from_editor(
         Some(connection) => connection,
         None => return,
     };
+
+    // Below the connection rather than above it. What may be kept depends on
+    // the transaction the connection this run resolved to is holding, and that
+    // is not known until here.
+    //
+    // This also means a press that resolves no connection now leaves the gutter
+    // alone where it used to blank it. That is deliberate: nothing ran, so
+    // erasing the record of what did run earlier says something false about the
+    // server rather than something true about the press.
+    let open_transaction = {
+        let store_ref = store.read(cx);
+        store_ref
+            .connections()
+            .iter()
+            .find(|connection| connection.config.id == conn_id)
+            .and_then(|connection| connection.transaction_open_since)
+    };
+    editor.update(cx, |editor, cx| {
+        if let Some(addon) = editor.addon_mut::<DbQueryEditorAddon>() {
+            addon.keep_only_what_the_open_transaction_holds(open_transaction);
+            cx.notify();
+        }
+    });
 
     // Results open as tabs in the terminal panel's pane — the same bottom-dock
     // area where terminals open — with one reused tab per connection. Reveal the
@@ -4132,7 +4227,7 @@ fn run_sql_from_editor(
                         if let Some((id, addon)) =
                             marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
                         {
-                            addon.set_query_status(id, QueryExecutionStatus::Error);
+                            addon.set_query_status(id, QueryExecutionStatus::Error, None);
                             cx.notify();
                         }
                     });
@@ -4160,11 +4255,22 @@ fn run_sql_from_editor(
                 result_view.read_with(cx, |view, _| view.is_current_request(request_token));
             match result {
                 Ok(result) => {
+                    // Read after the statement, not before: this is the
+                    // transaction the connection is left holding, which is what
+                    // decides whether the mark is staged. The store has already
+                    // taken it from the provider by the time the task resolves.
+                    let staged_in = store.read_with(cx, |store, _| {
+                        store
+                            .connections()
+                            .iter()
+                            .find(|connection| connection.config.id == conn_id)
+                            .and_then(|connection| connection.transaction_open_since)
+                    });
                     editor.update(cx, |editor, cx| {
                         if let Some((id, addon)) =
                             marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
                         {
-                            addon.set_query_status(id, QueryExecutionStatus::Success);
+                            addon.set_query_status(id, QueryExecutionStatus::Success, staged_in);
                             cx.notify();
                         }
                     });
@@ -4200,7 +4306,7 @@ fn run_sql_from_editor(
                         if let Some((id, addon)) =
                             marker_id.zip(editor.addon_mut::<DbQueryEditorAddon>())
                         {
-                            addon.set_query_status(id, QueryExecutionStatus::Error);
+                            addon.set_query_status(id, QueryExecutionStatus::Error, None);
                             cx.notify();
                         }
                     });
@@ -13953,6 +14059,12 @@ mod tests {
         });
         let _ = terminal_panel;
 
+        // As `DatabasePanel::new` does when it builds the real one: the console
+        // gutter reads the transaction off the global store, so a harness that
+        // keeps its store to itself leaves the gutter with nothing to read.
+        cx.update(|_window, cx| {
+            cx.set_global(crate::store::GlobalDatabaseStore(store.clone()));
+        });
         store.update(&mut cx, |store, cx| {
             store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
         });
@@ -14042,6 +14154,68 @@ mod tests {
                 .is_none(),
             "the transaction-open badge must disappear once the transaction is committed"
         );
+
+        // The gutter, through the same Ctrl+Enter the reader presses. Calling
+        // the addon directly would prove the rule and not the run path, and it
+        // is the run path that used to wipe the gutter on every press.
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("START TRANSACTION;\nSELECT 1;\nROLLBACK;", window, cx);
+        });
+        cx.run_until_parked();
+
+        run_statement_at_row(&editor, &mut cx, 0);
+        assert!(
+            cx.debug_bounds(uncommitted_selector(0)).is_some(),
+            "the statement that opened the transaction is marked as not yet committed"
+        );
+
+        run_statement_at_row(&editor, &mut cx, 1);
+        assert!(
+            cx.debug_bounds(uncommitted_selector(0)).is_some(),
+            "a second run must not wipe the mark of a statement the transaction still holds"
+        );
+        assert!(
+            cx.debug_bounds(uncommitted_selector(1)).is_some(),
+            "and the statement just run carries a mark of its own"
+        );
+
+        run_statement_at_row(&editor, &mut cx, 2);
+        for row in 0..2u32 {
+            assert!(
+                cx.debug_bounds(uncommitted_selector(row)).is_none(),
+                "row {row} kept its mark after the transaction was rolled back"
+            );
+            assert!(
+                cx.debug_bounds(status_selector(row)).is_none(),
+                "row {row} kept a mark of any kind after the transaction was rolled back"
+            );
+        }
+        assert!(
+            cx.debug_bounds(status_selector(2)).is_some(),
+            "the rollback itself ran outside any transaction, so it keeps a plain mark"
+        );
+    }
+
+    /// Puts the cursor on `row` and presses Ctrl+Enter, the way a reader runs
+    /// one statement out of a console buffer.
+    fn run_statement_at_row(editor: &Entity<Editor>, cx: &mut VisualTestContext, row: u32) {
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = language::Point::new(row, 0).to_offset(&snapshot);
+            editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([offset..offset]);
+            });
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -17241,11 +17415,23 @@ mod tests {
         id: usize,
         status: QueryExecutionStatus,
     ) {
+        set_status_staged_in(editor, cx, id, status, None);
+    }
+
+    /// The same, saying which transaction the connection was left holding once
+    /// the statement had run.
+    fn set_status_staged_in(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        id: usize,
+        status: QueryExecutionStatus,
+        staged_in: Option<Instant>,
+    ) {
         editor.update(cx, |editor, _cx| {
             editor
                 .addon_mut::<DbQueryEditorAddon>()
                 .expect("console editor has the db addon")
-                .set_query_status(id, status);
+                .set_query_status(id, status, staged_in);
         });
     }
 
@@ -17303,6 +17489,207 @@ mod tests {
             Some((1, QueryExecutionStatus::Success)),
             "run B's own completion updates its marker"
         );
+    }
+
+    /// A console editor whose addon points at a connected store, so the gutter
+    /// can read the transaction that connection is holding. The plain marker
+    /// console has no store at all, where every mark reads as belonging to no
+    /// transaction and the staged path is never taken.
+    async fn open_console_on_a_connection(
+        cx: &mut TestAppContext,
+        text: &str,
+    ) -> (
+        Entity<Editor>,
+        Entity<DatabaseStore>,
+        ConnectionId,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual_cx;
+
+        let config = db_client::ConnectionConfig {
+            label: "test".to_string(),
+            ..Default::default()
+        };
+        let connection_id = config.id;
+        let store = cx.update(|_window, cx| cx.new(|cx| DatabaseStore::new(cx)));
+        store.update(cx, |store, cx| {
+            store.add_connected_for_test(config, std::sync::Arc::new(MockProvider::default()), cx);
+        });
+        cx.update(|_window, cx| {
+            cx.set_global(crate::store::GlobalDatabaseStore(store.clone()));
+        });
+
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+            let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(multi, None, window, cx);
+                editor.register_addon(DbQueryEditorAddon::new(connection_id));
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        (editor, store, connection_id, visual_cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// Everything run inside an open transaction keeps its mark, and the marks
+    /// go when the transaction does.
+    ///
+    /// A run used to wipe the gutter before doing anything else, so the only
+    /// statement ever marked was the last one -- and a reader three statements
+    /// into a transaction had no way of seeing which of them the server was
+    /// still holding.
+    #[gpui::test]
+    async fn a_transaction_keeps_the_mark_on_everything_it_holds(cx: &mut TestAppContext) {
+        let (editor, store, connection_id, mut cx) = open_console_on_a_connection(
+            cx,
+            "START TRANSACTION;\nSELECT 1;\nUPDATE t SET a = 1;\nROLLBACK;",
+        )
+        .await;
+        let cx = &mut cx;
+
+        let opened_at = Instant::now();
+        store.update(cx, |store, cx| {
+            store.set_transaction_open_for_test(connection_id, Some(opened_at), cx);
+        });
+
+        for row in 0..3u32 {
+            let id = mark_statement_running(&editor, cx, row);
+            set_status_staged_in(
+                &editor,
+                cx,
+                id,
+                QueryExecutionStatus::Success,
+                Some(opened_at),
+            );
+        }
+        draw(cx);
+
+        for row in 0..3u32 {
+            assert!(
+                cx.debug_bounds(uncommitted_selector(row)).is_some(),
+                "row {row} ran inside the open transaction and has to say so"
+            );
+            assert!(
+                cx.debug_bounds(status_selector(row)).is_none(),
+                "row {row} is not committed, so it must not carry the green check"
+            );
+        }
+
+        // What the next run does before it starts: it keeps what this
+        // transaction is holding instead of wiping the gutter, which is what
+        // let the marks accumulate in the first place.
+        editor.update(cx, |editor, _cx| {
+            editor
+                .addon_mut::<DbQueryEditorAddon>()
+                .expect("console editor has the db addon")
+                .keep_only_what_the_open_transaction_holds(Some(opened_at));
+        });
+        draw(cx);
+        for row in 0..3u32 {
+            assert!(
+                cx.debug_bounds(uncommitted_selector(row)).is_some(),
+                "row {row} lost its mark to the next run while the transaction was still open"
+            );
+        }
+
+        // The transaction ends. Nothing sweeps the markers; the instant they
+        // were staged in simply stops matching what the connection reports.
+        store.update(cx, |store, cx| {
+            store.set_transaction_open_for_test(connection_id, None, cx);
+        });
+        draw(cx);
+
+        for row in 0..3u32 {
+            assert!(
+                cx.debug_bounds(uncommitted_selector(row)).is_none(),
+                "row {row} kept its mark after the transaction ended"
+            );
+            assert!(
+                cx.debug_bounds(status_selector(row)).is_none(),
+                "row {row} kept a mark of any kind after the transaction ended"
+            );
+        }
+
+        // And the next run after the ending really does drop them, rather than
+        // leaving them to be hidden at paint time for the rest of the session.
+        editor.update(cx, |editor, _cx| {
+            let addon = editor
+                .addon_mut::<DbQueryEditorAddon>()
+                .expect("console editor has the db addon");
+            addon.keep_only_what_the_open_transaction_holds(None);
+            assert!(
+                addon.query_markers().is_empty(),
+                "a run with no transaction open clears the gutter, as it always did"
+            );
+        });
+    }
+
+    /// A second transaction is not the first one. Marks staged in a transaction
+    /// that ended must not silently join the next one -- which is what a rule
+    /// written as "is a transaction open?" rather than "is it *this* one?"
+    /// would do, and is exactly the shape of COMMIT AND CHAIN.
+    #[gpui::test]
+    async fn marks_of_an_ended_transaction_do_not_join_the_next(cx: &mut TestAppContext) {
+        let (editor, store, connection_id, mut cx) =
+            open_console_on_a_connection(cx, "SELECT 1;\nSELECT 2;").await;
+        let cx = &mut cx;
+
+        let first = Instant::now();
+        store.update(cx, |store, cx| {
+            store.set_transaction_open_for_test(connection_id, Some(first), cx);
+        });
+        let id = mark_statement_running(&editor, cx, 0);
+        set_status_staged_in(&editor, cx, id, QueryExecutionStatus::Success, Some(first));
+        draw(cx);
+        assert!(
+            cx.debug_bounds(uncommitted_selector(0)).is_some(),
+            "the first transaction's statement is marked while it is open"
+        );
+
+        let second = Instant::now();
+        assert_ne!(first, second, "the two transactions are different instants");
+        store.update(cx, |store, cx| {
+            store.set_transaction_open_for_test(connection_id, Some(second), cx);
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds(uncommitted_selector(0)).is_none(),
+            "a statement from the previous transaction must not read as part of this one"
+        );
+    }
+
+    fn uncommitted_selector(row: u32) -> &'static str {
+        format!("SQL_QUERY_UNCOMMITTED-{row}").leak()
+    }
+
+    fn status_selector(row: u32) -> &'static str {
+        format!("SQL_QUERY_STATUS-{row}").leak()
     }
 
     fn init_test(cx: &mut TestAppContext) {

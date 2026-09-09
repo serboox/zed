@@ -1309,6 +1309,26 @@ impl DatabaseStore {
         cx.notify();
     }
 
+    /// Says a connection is holding a transaction opened at `at`, or none.
+    ///
+    /// The real value is taken from the provider after every statement, which
+    /// a test with no server has no way of driving. Everything that reads it
+    /// reads it from here, so setting it directly is the same fact arriving by
+    /// a shorter road.
+    #[cfg(test)]
+    pub(crate) fn set_transaction_open_for_test(
+        &mut self,
+        id: ConnectionId,
+        at: Option<Instant>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connection) = self.connections.iter_mut().find(|c| c.config.id == id) {
+            connection.transaction_open_since = at;
+            cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+            cx.notify();
+        }
+    }
+
     pub fn add_connection(&mut self, mut config: ConnectionConfig, cx: &mut Context<Self>) {
         config.order = self.next_order_in(config.folder_id);
         self.connections.push(ActiveConnection::new(config));
